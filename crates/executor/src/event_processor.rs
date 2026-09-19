@@ -218,7 +218,11 @@ impl EventProcessor {
                     latency_ms = started.elapsed().as_millis() as u64,
                     "metadata read"
                 );
-                return Ok(if rule.enabled { vec![rule] } else { vec![] });
+                return Ok(if rule.enabled && rule.retired_at.is_none() {
+                    vec![rule]
+                } else {
+                    vec![]
+                });
             }
 
             // Event is for a specific rule - only match that rule
@@ -229,7 +233,7 @@ impl EventProcessor {
             match RuleRepository::find_by_id(pool, rule_id).await? {
                 Some(rule) => {
                     rule_cache_by_id.insert(id_key, rule.clone()).await;
-                    if rule.enabled {
+                    if rule.enabled && rule.retired_at.is_none() {
                         debug!(
                             entity = "rule",
                             operation = "find_matching_rules",
@@ -259,7 +263,10 @@ impl EventProcessor {
         } else {
             let trigger_key = event.trigger_ref.clone();
             if let Some(rules) = rule_cache_by_trigger_ref.get(&trigger_key).await {
-                let matching_rules: Vec<Rule> = rules.into_iter().filter(|r| r.enabled).collect();
+                let matching_rules: Vec<Rule> = rules
+                    .into_iter()
+                    .filter(|rule| rule.enabled && rule.retired_at.is_none())
+                    .collect();
                 debug!(
                     entity = "rule",
                     operation = "find_matching_rules",
@@ -288,8 +295,10 @@ impl EventProcessor {
             rule_cache_by_trigger_ref
                 .insert(trigger_key, matching_rules.clone())
                 .await;
-            let matching_rules: Vec<Rule> =
-                matching_rules.into_iter().filter(|r| r.enabled).collect();
+            let matching_rules: Vec<Rule> = matching_rules
+                .into_iter()
+                .filter(|rule| rule.enabled && rule.retired_at.is_none())
+                .collect();
             debug!(
                 entity = "rule",
                 operation = "find_matching_rules",
@@ -352,6 +361,13 @@ impl EventProcessor {
             None => ActionRepository::find_by_ref(pool, &rule.action_ref).await?,
         }
         .ok_or_else(|| anyhow::anyhow!("Action '{}' not found", rule.action_ref))?;
+        if !action.enabled || action.retired_at.is_some() {
+            debug!(
+                "Rule {} references inactive action {}, skipping",
+                rule.r#ref, action.r#ref
+            );
+            return Ok(());
+        }
         validate_secret_destination_paths(
             action.param_schema.as_ref(),
             &rendered_params.secret_paths,

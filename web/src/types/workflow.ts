@@ -75,8 +75,15 @@ export interface WorkflowTask {
   concurrency?: number;
   /** Join barrier count */
   join?: number;
+  /** External prerequisite that must resolve before this task is dispatched */
+  wait_for?: TaskWaitFor;
   /** Visual position on canvas */
   position: NodePosition;
+}
+
+export interface TaskWaitFor {
+  /** Inquiry ID or template expression that resolves to one */
+  inquiry: number | string;
 }
 
 export type CacheOwnerType =
@@ -373,6 +380,7 @@ export interface WorkflowYamlTask {
   timeout?: number | string;
   next?: WorkflowYamlTransition[];
   join?: number;
+  wait_for?: TaskWaitFor;
   /** Visual metadata (position) — ignored by backend */
   __chart_meta__?: TaskChartMeta;
 }
@@ -581,6 +589,7 @@ export function builderStateToGraph(
     if (task.retry) yamlTask.retry = task.retry;
     if (task.timeout) yamlTask.timeout = task.timeout;
     if (task.join) yamlTask.join = task.join;
+    if (task.wait_for) yamlTask.wait_for = task.wait_for;
 
     // Persist canvas position in __chart_meta__ so layout is restored on reload
     yamlTask.__chart_meta__ = {
@@ -994,6 +1003,7 @@ export function definitionToBuilderState(
         task.concurrency as number | null | undefined,
       ),
       join: normalizeNullable(task.join as number | null | undefined),
+      wait_for: task.wait_for,
       // Placeholder; overwritten below if the workflow needs auto-layout.
       position: task.__chart_meta__?.position ?? {
         x: 300,

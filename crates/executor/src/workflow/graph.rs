@@ -10,7 +10,9 @@
 //!   - `publish` — variables to publish into the workflow context
 //!   - `do` — next tasks to invoke when the condition is met
 
-use attune_common::workflow::{IterateCacheConfig, Task, TaskType, WorkflowDefinition};
+use attune_common::workflow::{
+    IterateCacheConfig, Task, TaskType, TaskWaitFor, WorkflowDefinition,
+};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 
@@ -72,6 +74,10 @@ pub struct TaskNode {
 
     /// Conditional execution (task-level — controls whether the task runs at all)
     pub when: Option<String>,
+
+    /// Optional prerequisite checked before this task's child execution exists.
+    #[serde(default)]
+    pub wait_for: Option<TaskWaitFor>,
 
     /// With-items iteration
     pub with_items: Option<String>,
@@ -393,6 +399,7 @@ impl GraphBuilder {
             worker_tolerations: task.worker_tolerations.clone(),
             worker_affinity: task.worker_affinity.clone(),
             when: task.when.clone(),
+            wait_for: task.wait_for.clone(),
             with_items: task.with_items.clone(),
             iterate_cache: task.iterate_cache.clone(),
             batch_size: task.batch_size,
@@ -1146,5 +1153,31 @@ tasks:
         assert_eq!(failure_publish.len(), 1);
         assert_eq!(failure_publish[0].name, "validation_passed");
         assert_eq!(failure_publish[0].value, JsonValue::Bool(false));
+    }
+
+    #[test]
+    fn test_inquiry_prerequisite_is_snapshotted() {
+        let yaml = r#"
+version: "1.0.0"
+tasks:
+  - name: deploy
+    action: app.deploy
+    wait_for:
+      inquiry: "{{ task.request.inquiry_id }}"
+"#;
+
+        let workflow = workflow::parse_workflow_yaml(yaml).unwrap();
+        let graph = TaskGraph::from_workflow(&workflow).unwrap();
+        let node = graph.get_task("deploy").unwrap();
+        assert_eq!(
+            node.wait_for.as_ref().unwrap().inquiry,
+            serde_json::json!("{{ task.request.inquiry_id }}")
+        );
+
+        let stored = serde_json::to_value(&graph).unwrap();
+        assert_eq!(
+            stored["nodes"]["deploy"]["wait_for"]["inquiry"],
+            serde_json::json!("{{ task.request.inquiry_id }}")
+        );
     }
 }

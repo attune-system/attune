@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import { OpenAPI } from "@/api";
 import type { ActionResponse } from "@/api";
 import MultiSelect from "@/components/common/MultiSelect";
@@ -47,6 +48,7 @@ export default function ExecuteActionModal({
   initialTimeoutSeconds,
 }: ExecuteActionModalProps) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { user } = useAuth();
 
   const paramSchema: ParamSchema = (action.param_schema as ParamSchema) || {};
@@ -218,7 +220,7 @@ export default function ExecuteActionModal({
       queryClient.invalidateQueries({ queryKey: ["executions"] });
       onClose();
       if (data?.data?.id) {
-        window.location.href = `/executions/${data.data.id}`;
+        navigate(`/executions/${data.data.id}`);
       }
     },
   });

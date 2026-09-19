@@ -161,6 +161,7 @@ mod tests {
             entrypoint: "do.sh".to_string(),
             runtime: None,
             enabled: true,
+            enabled_override: None,
             runtime_version_constraint: None,
             required_worker_runtimes: json!({}),
             worker_selector: json!({}),
@@ -182,6 +183,7 @@ mod tests {
             parameter_delivery: Default::default(),
             parameter_format: Default::default(),
             output_format: Default::default(),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         }
@@ -200,6 +202,7 @@ mod tests {
             label: "Happened".to_string(),
             description: None,
             enabled: true,
+            enabled_override: None,
             param_schema: None,
             out_schema: None,
             webhook_enabled: false,
@@ -210,6 +213,7 @@ mod tests {
             is_adhoc: false,
             reference_visibility: visibility,
             reference_allowed_pack_refs: allowed.into_iter().map(ToOwned::to_owned).collect(),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         }
@@ -229,6 +233,7 @@ mod tests {
             label: "Inbox".to_string(),
             description: None,
             enabled: true,
+            enabled_override: None,
             accepting_new_items: true,
             dispatch_action: Some(1),
             dispatch_action_ref: "owner.process".to_string(),
@@ -243,6 +248,7 @@ mod tests {
             config: json!({}),
             reference_visibility: visibility,
             reference_allowed_pack_refs: allowed.into_iter().map(ToOwned::to_owned).collect(),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         }

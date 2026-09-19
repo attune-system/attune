@@ -25,10 +25,12 @@ export type InquiryResponse = {
    * Prompt text displayed to the user
    */
   prompt: string;
+  purpose?: string | null;
   /**
    * When the inquiry was responded to
    */
   responded_at?: string | null;
+  responded_by?: null | i64;
   /**
    * Response data provided by the user
    */
@@ -49,4 +51,6 @@ export type InquiryResponse = {
    * Last update timestamp
    */
   updated: string;
+  workflow_execution?: null | i64;
+  workflow_task_name?: string | null;
 };

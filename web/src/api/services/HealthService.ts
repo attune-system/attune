@@ -8,15 +8,32 @@ import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class HealthService {
   /**
-   * Basic health check endpoint
-   * Returns 200 OK if the service is running
-   * @returns any Service is healthy
+   * Platform health check endpoint.
+   * @returns any Database and exact platform catalog are ready
    * @throws ApiError
    */
   public static health(): CancelablePromise<Record<string, any>> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/health",
+      errors: {
+        503: `Platform is not ready`,
+      },
+    });
+  }
+  /**
+   * Transitional content and coarse host-capability health.
+   * Required-pack locks and candidate evidence replace this contract in issue #75.
+   * @returns any Core content and coarse host capabilities are available
+   * @throws ApiError
+   */
+  public static content(): CancelablePromise<Record<string, any>> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/health/content",
+      errors: {
+        503: `Content or coarse host capabilities are absent`,
+      },
     });
   }
   /**

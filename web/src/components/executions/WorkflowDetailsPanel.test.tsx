@@ -2,10 +2,13 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import WorkflowDetailsPanel from "@/components/executions/WorkflowDetailsPanel";
+import { WorkflowTaskWaitKind, WorkflowTaskWaitState } from "@/api";
 import {
   useChildExecutions,
   useWorkflowCacheIterations,
 } from "@/hooks/useExecutions";
+import { useWorkflow } from "@/hooks/useWorkflows";
+import { useWorkflowTaskWaits } from "@/hooks/useWorkflowTaskWaits";
 
 vi.mock("@/hooks/useExecutions", () => ({
   useChildExecutions: vi.fn(),
@@ -14,6 +17,14 @@ vi.mock("@/hooks/useExecutions", () => ({
 
 vi.mock("@/hooks/useExecutionStream", () => ({
   useExecutionStream: vi.fn(),
+}));
+
+vi.mock("@/hooks/useWorkflows", () => ({
+  useWorkflow: vi.fn(),
+}));
+
+vi.mock("@/hooks/useWorkflowTaskWaits", () => ({
+  useWorkflowTaskWaits: vi.fn(),
 }));
 
 vi.mock("@/components/executions/workflow-timeline", () => ({
@@ -34,6 +45,7 @@ function renderPanel() {
       <WorkflowDetailsPanel
         parentExecution={parentExecution}
         actionRef={parentExecution.action_ref}
+        defaultTab="tasks"
       />
     </MemoryRouter>,
   );
@@ -46,6 +58,20 @@ describe("WorkflowDetailsPanel cache iteration status", () => {
       isLoading: false,
       error: null,
     } as ReturnType<typeof useChildExecutions>);
+    vi.mocked(useWorkflowTaskWaits).mockReturnValue({
+      data: { data: [] },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useWorkflowTaskWaits>);
+    vi.mocked(useWorkflow).mockReturnValue({
+      data: {
+        data: {
+          definition: {
+            tasks: [{ name: "approve_deploy", action: "core.deploy" }],
+          },
+        },
+      },
+    } as ReturnType<typeof useWorkflow>);
   });
 
   it("renders the safe operational fields and bounds the error summary", () => {
@@ -133,5 +159,131 @@ describe("WorkflowDetailsPanel cache iteration status", () => {
       </MemoryRouter>,
     );
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("WorkflowDetailsPanel inquiry waits", () => {
+  beforeEach(() => {
+    vi.mocked(useChildExecutions).mockReturnValue({
+      data: { items: [] },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useChildExecutions>);
+    vi.mocked(useWorkflowCacheIterations).mockReturnValue({
+      data: { data: [], unsupported: true },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useWorkflowCacheIterations>);
+    vi.mocked(useWorkflow).mockReturnValue({
+      data: {
+        data: {
+          definition: {
+            tasks: [{ name: "approve_deploy", action: "core.deploy" }],
+          },
+        },
+      },
+    } as ReturnType<typeof useWorkflow>);
+  });
+
+  it("keeps a no-child waiting task visible, counted, and linked", () => {
+    vi.mocked(useWorkflowTaskWaits).mockReturnValue({
+      data: {
+        data: [
+          {
+            id: 7,
+            inquiry_id: 91,
+            kind: WorkflowTaskWaitKind.INQUIRY,
+            state: WorkflowTaskWaitState.WAITING,
+            task_name: "approve_deploy",
+            created: "2026-08-05T10:00:00Z",
+            updated: "2026-08-05T10:01:00Z",
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useWorkflowTaskWaits>);
+
+    renderPanel();
+
+    expect(screen.getByText("(1 task)")).toBeInTheDocument();
+    expect(screen.getByText("approve_deploy")).toBeInTheDocument();
+    expect(screen.getByText("core.deploy")).toBeInTheDocument();
+    expect(screen.getByText("waiting").closest("a")).toHaveAttribute(
+      "href",
+      "/inquiries/91",
+    );
+  });
+
+  it.each([
+    [WorkflowTaskWaitState.TIMED_OUT, "timeout"],
+    [WorkflowTaskWaitState.CANCELLED, "cancelled"],
+    [WorkflowTaskWaitState.FAILED, "failed"],
+    [WorkflowTaskWaitState.RELEASED, "released (no child)"],
+  ])("renders a %s wait without a child", (state, label) => {
+    vi.mocked(useWorkflowTaskWaits).mockReturnValue({
+      data: {
+        data: [
+          {
+            id: 7,
+            inquiry_id: 91,
+            kind: WorkflowTaskWaitKind.INQUIRY,
+            state,
+            task_name: "approve_deploy",
+            created: "2026-08-05T10:00:00Z",
+            updated: "2026-08-05T10:01:00Z",
+            resolved_at: "2026-08-05T10:01:00Z",
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useWorkflowTaskWaits>);
+
+    renderPanel();
+    expect(screen.getByText(label)).toBeInTheDocument();
+  });
+
+  it("suppresses the wait once its direct child execution exists", () => {
+    vi.mocked(useWorkflowTaskWaits).mockReturnValue({
+      data: {
+        data: [
+          {
+            id: 7,
+            inquiry_id: 91,
+            kind: WorkflowTaskWaitKind.INQUIRY,
+            state: WorkflowTaskWaitState.RELEASED,
+            task_name: "approve_deploy",
+            created: "2026-08-05T10:00:00Z",
+            updated: "2026-08-05T10:01:00Z",
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useWorkflowTaskWaits>);
+    vi.mocked(useChildExecutions).mockReturnValue({
+      data: {
+        items: [
+          {
+            id: 101,
+            parent: 42,
+            action_ref: "core.deploy",
+            status: "requested",
+            created: "2026-08-05T10:01:00Z",
+            updated: "2026-08-05T10:01:00Z",
+            workflow_task: { task_name: "approve_deploy" },
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useChildExecutions>);
+
+    renderPanel();
+    expect(screen.queryByText("released (no child)")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: /approve_deploy/ }),
+    ).toHaveAttribute("href", "/executions/101");
   });
 });

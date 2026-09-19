@@ -474,6 +474,7 @@ mod tests {
             }),
             auto_detected: false,
             detection_config: json!({}),
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         };
@@ -518,6 +519,7 @@ mod tests {
             }),
             auto_detected: false,
             detection_config: json!({}),
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         };

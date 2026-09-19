@@ -195,7 +195,7 @@ pub async fn create_event(
         .ok_or_else(|| {
             ApiError::NotFound(format!("Trigger '{}' not found", payload.trigger_ref))
         })?;
-    if !trigger.enabled {
+    if !trigger.enabled || trigger.retired_at.is_some() {
         return Err(ApiError::BadRequest(format!(
             "Trigger '{}' is disabled",
             payload.trigger_ref

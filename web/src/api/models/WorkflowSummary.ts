@@ -30,6 +30,7 @@ export type WorkflowSummary = {
    * Unique reference identifier
    */
   ref: string;
+  retired_at?: string | null;
   /**
    * Tags
    */

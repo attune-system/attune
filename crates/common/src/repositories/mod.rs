@@ -32,6 +32,7 @@ pub mod analytics;
 pub mod artifact;
 pub mod artifact_upload_grant;
 pub mod cache;
+pub mod component_lifecycle;
 pub mod dashboard;
 pub mod entity_history;
 pub mod event;
@@ -40,6 +41,7 @@ pub mod execution;
 pub mod execution_admission;
 pub mod execution_log_stream_lease;
 pub mod execution_secret_value;
+pub mod health;
 pub mod identity;
 pub mod inquiry;
 pub mod integration_token;
@@ -54,6 +56,7 @@ pub mod pack_registry_index;
 pub mod pack_release;
 pub mod pack_retention;
 pub mod pack_test;
+pub mod platform_catalog;
 pub mod queue_stats;
 pub mod retention;
 pub mod rule;
@@ -69,6 +72,7 @@ pub mod work_queue;
 pub mod workflow;
 pub mod workflow_cache_iteration;
 pub mod workflow_log_outbox;
+pub mod workflow_task_wait;
 
 pub(crate) fn ref_filter_like_pattern(filter: &str) -> Option<String> {
     if !filter.contains('*') {
@@ -138,6 +142,9 @@ pub use cache::{
     CacheEntryRepository, CacheGenerationRepository, CacheIngestRepository,
     CacheNamespaceRepository,
 };
+pub use component_lifecycle::{
+    ComponentLifecycleRepository, PackProjectionIds, RetiredPackComponent,
+};
 pub use dashboard::{DashboardRepository, DashboardVersionRepository};
 pub use entity_history::EntityHistoryRepository;
 pub use event::{EnforcementRepository, EventRepository};
@@ -145,6 +152,7 @@ pub use execution::ExecutionRepository;
 pub use execution_admission::ExecutionAdmissionRepository;
 pub use execution_log_stream_lease::ExecutionLogStreamLeaseRepository;
 pub use execution_secret_value::ExecutionSecretValueRepository;
+pub use health::HealthRepository;
 pub use identity::{
     DeleteIdentityOutcome, IdentityRepository, PermissionAssignmentRepository,
     PermissionSetRepository,
@@ -174,6 +182,7 @@ pub use trigger::{SensorRepository, TriggerRepository};
 pub use work_queue::{WorkQueueDispatchRepository, WorkQueueItemRepository, WorkQueueRepository};
 pub use workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository};
 pub use workflow_cache_iteration::WorkflowCacheIterationRepository;
+pub use workflow_task_wait::WorkflowTaskWaitRepository;
 
 /// Explicit patch operation for update inputs where callers must distinguish
 /// between "leave unchanged", "set value", and "clear to NULL".

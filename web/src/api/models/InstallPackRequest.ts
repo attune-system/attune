@@ -2,10 +2,15 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AbsentMetadataPolicy } from "./AbsentMetadataPolicy";
 /**
  * Request DTO for installing a pack from remote source
  */
 export type InstallPackRequest = {
+  /**
+   * How to handle pack-managed metadata omitted by this release.
+   */
+  absent_metadata_policy?: AbsentMetadataPolicy;
   /**
    * Replace an existing pack with the same ref
    */

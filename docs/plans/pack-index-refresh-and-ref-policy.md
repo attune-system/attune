@@ -2,6 +2,18 @@
 
 **Status:** proposed implementation specification; not implemented.
 
+**Owner-approved pre-production contract:** Ship one canonical **v1** pack release
+and catalog format, as specified in `docs/packs/pack-release-artifacts-spec.md`
+and issue #71. The catalog requires `format_version: "1.0"`, channels, immutable
+releases and checksum-pinned canonical archives. Exact/range/channel selectors
+resolve to an exact release; an omitted selector means `stable`. No Git fallback,
+old-format reader or synthetic compatibility adapter is required. Superseded
+development catalogs must be regenerated or explicitly converted before cutover.
+Refresh policies operate on these saved snapshots independently of selection.
+Git-specific controls below concern separately supported development inputs only;
+they do not restrict canonical archive versions or weaken archive integrity.
+Stage A/B are delivery stages, not format versions. They do not imply v1/v2.
+
 This document records the requested plan only. API routes, fields, YAML upload,
 and index format extensions described as proposed below do not exist yet.
 Field tables are normative proposed schemas: together with the validation and
@@ -86,8 +98,8 @@ HTTPS/source-checksum controls and address signed catalog trust separately.
 | Installation, no saved snapshot | Fail `index_not_initialized` | Fetch once | Fetch once |
 | Installation, saved snapshot fresh | Use snapshot | Use snapshot | Use snapshot |
 | Installation, snapshot age reaches interval | Use snapshot | Refresh before resolution | Use snapshot |
-| Explicit pack/version missing | Fail without fetching | Resolve after ordinary freshness check; no extra miss refresh | Refresh once, retry, then fail if still absent |
-| Unversioned / `latest` request, pack exists | Use saved latest | Use latest from freshness-checked snapshot | Use saved latest; do not refresh just to discover newer releases |
+| Pack or exact/range/channel selection unresolved | Fail without fetching | Resolve after ordinary freshness check; no extra miss refresh | Refresh once, retry, then fail if still unresolved |
+| Omitted / channel / range request resolves from saved pack | Use saved resolved release | Resolve after freshness check | Use saved resolved release; do not refresh just to discover newer releases |
 | Requested pack itself absent | Fail without fetching | Ordinary freshness check only | Refresh once and retry, including an unversioned request |
 | Browse/search/detail metadata request | Saved snapshot only | Saved snapshot only | Saved snapshot only |
 | Explicit administrator refresh | Fetch regardless of age | Fetch regardless of age | Fetch regardless of age |
@@ -181,11 +193,14 @@ silently waive indexed release metadata/checksums.
   merely because it is a hash.
 - For an explicit `ref_spec`, check the supplied Git ref against the pattern and
   require `allow_unindexed_git_refs: true`.
-- For `latest` or an omitted version, resolve the latest release first, then check
-  that release version. Do not test the literal word `latest` against the pattern.
+- Resolve canonical omitted/range/channel selectors to an exact release first.
+  Evaluate any applicable release policy against that exact version, never the
+  selector expression or channel name. Canonical archive releases are not Git
+  refs and are not constrained by a Git-only pattern.
 - Reject disallowed explicit refs before a network refresh or Git operation.
-- The pattern applies to Git installations, including Git-to-archive fallback of
-  the same selected release. An archive-only pack has no Git ref to authorize.
+- The pattern applies only to separately supported development Git installations.
+  Canonical registry releases are archive-only and never fall back to Git; they
+  have no Git ref to authorize.
 - Regex matching alone does not distinguish a branch called `1.2.3` from a tag
   called `1.2.3`. Tag-only enforcement is not promised by this feature.
 - Resolve accepted mutable Git refs to an immutable commit before fetching/installing;
@@ -687,45 +702,36 @@ API/import credentials supplied securely by the caller.
 
 ## 8. Version catalogs and installation request schema
 
-### 8.1 Proposed remote index v2 extension
+### 8.1 Canonical remote index format 1
 
-Keep v1 readable by adapting its single entry into one indexed release. Publish a
-v2 catalog schema before producers adopt historical releases; do not relax v1
-unknown-field validation in place.
+Use the single canonical catalog from `docs/packs/pack-release-artifacts-spec.md`;
+issue #71 owns its parser, producer support and immutable dependency locks. This
+refresh plan does not define a second catalog schema.
 
-Proposed v2 envelope retains `registry_name`, `registry_url`, `last_updated`, and
-`packs` from the existing catalog specification; `version` is exactly `"2.0"`.
-Each pack retains existing descriptive fields, contents, and metadata from
-`docs/packs/pack-registry-spec.md`, but replaces pack-level `version` and
-`install_sources` with:
+- Require `format_version: "1.0"`; reject missing/unknown formats and the obsolete
+  top-level `version` discriminator. Do not adapt the old development catalog at
+  runtime, even if it also called itself version 1.
+- Packs expose `channels` and immutable `releases`, with descriptive metadata.
+  Releases carry the canonical archive URL, media type, size and digest, release
+  compatibility requirements, dependency hints and evidence defined by that spec.
+- Exact versions, ranges and named channels resolve against one eligible saved
+  snapshot; omitted selection uses `stable`. Lock the selected exact version and
+  digest. Dependencies/identity must match the authoritative archive manifest.
+- Canonical archives never fall back to Git or a source snapshot on failure.
+  Git-only policy controls cannot impose an unrelated archive version restriction.
+- Future explicit development Git-ref support requires its own reviewed source
+  binding and provenance contract; no `git_repository` escape hatch is implicitly
+  added to the canonical production format here.
 
-| Field | Type | Meaning |
-|---|---|---|
-| `latest_version` | nonempty string, required | Must exactly reference one member of `releases` |
-| `releases` | nonempty array of `Release`, required | Unique version strings per pack |
-| `git_repository` | approved HTTPS repository URL or null, optional | Explicit repository for unindexed ref requests; never use the homepage field |
-
-`Release` fields are exactly:
-- `version`: required nonempty string, max 255 characters.
-- `install_sources`: required nonempty array of existing `InstallSource` objects;
-  retain current Git/archive shapes and source-specific checksums.
-- `dependencies`: optional existing `PackDependencies` object, scoped to the release.
-
-Move dependency requirements to each release in v2; descriptive pack metadata is
-not an authority for historical release dependencies. Continue to validate the
-installed manifest identity/version against the selected indexed release.
-
-This v2 extension is a proposal, not a complete replacement of the catalog spec;
-implementation must publish the fully expanded v2 JSON Schema, including the
-existing nested source/contents/dependency definitions, alongside the current v1
-schema. The complete new *configuration* and *upload* documents are sections 5–7.
+Publish the fully expanded canonical v1 JSON Schema and producer fixtures before
+rollout. Configuration/upload schemas in sections 5–7 are separate documents.
 
 ### 8.1.1 Historical catalog growth and artifact availability
 
-Do not raise `index_max_bytes` indefinitely to accommodate release history. Stage A
-supports bounded v1 catalogs; the v2 format must not ship as an unbounded flat
-history. Before adopting v2, specify either bounded retained-history guarantees
-with explicit unavailable-version errors, or a partitioned catalog. Preferred
+Do not raise `index_max_bytes` indefinitely to accommodate release history. The
+initial canonical v1 snapshot must have bounded retained history and explicit
+unavailable-version errors. A future partitioned catalog is a separate protocol,
+not a reason to introduce a competing format during pre-production. Preferred
 partitioning is a small root snapshot with content-addressed per-pack release
 manifests, bounded document size/count/aggregate fetch budget, and digest-pinned
 links. Publish the complete schema and producer tests before rollout.
@@ -756,7 +762,7 @@ semantics:
 
 | Field | Type | Required / default | Behavior |
 |---|---|---|---|
-| `source` | nonempty string | required | Existing registry `pack`, `pack@version`, `pack@latest`, or direct source syntax |
+| `source` | nonempty string | required | Registry `pack` (stable), `pack@version`, `pack@range`, `pack@channel`, or separately supported direct source syntax |
 | `ref_spec` | nonempty string or null | optional, null | Explicit Git ref; for registry requests requires unversioned `source` and index opt-in |
 | `registry_id` | positive i64 or null | optional, null | Pin to managed index; registry requests only |
 | `no_registry` | boolean | optional, false | Require an explicit URL/local path, preserving existing direct-source semantics |
@@ -767,8 +773,9 @@ semantics:
 Reject registry `source` containing `@version` together with non-null `ref_spec`.
 Reject `registry_id` together with `no_registry: true` or a direct source. Git refs
 must also pass Git's applicable ref/object-ID validation, not just the allowlist;
-never interpolate them into shell command strings. Exact releases are not semver
-ranges, and unsupported selector syntax must produce validation errors.
+never interpolate them into shell command strings. Canonical registry selectors support exact versions, semver ranges and named
+channels through #71; the omitted selector resolves `stable`. Unsupported syntax
+must produce validation errors, not be reinterpreted as a Git ref.
 
 Examples:
 
@@ -877,19 +884,21 @@ Expose counts/latency/failures and coalesced refresh metrics with bounded cardin
 4. Separate HTTP fetching from snapshot access; implement source/credential fencing,
    static identity ownership, and durable asynchronous refresh operations.
 5. Implement automatic/lazy modes, shared cooldown/backoff, bounded negative lookup
-   caching, indexed-release selector policy, and immutable provenance using v1 data.
+   caching, applicable release policy, and immutable provenance using the canonical
+   v1 catalog and selector/lock implementation owned by #71.
 6. Extend API/import/CLI/UI together, with operation polling, idempotent retry,
    explicit invalidation, outage guidance, and migration diagnostics.
 7. Generate OpenAPI/web client and YAML-compatible JSON Schema. Validate migration,
    multi-replica behavior, and operator runbooks before rollout.
 
-Stage A can discover a newly published v1 latest version via lazy refresh; it does
-not promise installation of historical releases omitted from that snapshot.
+Stage A can discover a missing canonical release through bounded lazy refresh;
+a successful saved exact/range/channel selection does not refresh just to find a
+newer release. Historical releases omitted from retained metadata are unavailable.
 
 ### Stage B: additional resolution capabilities
 
-8. Specify and implement bounded historical catalogs/v2 producer support, including
-   dependency metadata, source checksums, and a growth/partitioning strategy.
+8. Evaluate additional history/partitioning capabilities separately from the
+   bounded canonical v1 history delivered by #71; do not duplicate its schema.
 9. Separately review and implement unindexed Git-ref opt-in, immutable commit
    resolution, integrity provenance, and policy-bypass tests. Do not make Stage A
    depend on approval or completion of this security-sensitive feature.
@@ -976,7 +985,8 @@ configuration/schema compatibility and desired policy are explicitly restored.
 - Automatic hits before expiry do not fetch; at expiry fetch before resolution.
 - Lazy missing version fetches once and retries; successful cached resolution does
   not fetch; absent pack and initial empty snapshot have bounded attempts.
-- Manual/automatic/lazy `latest` semantics match section 3.
+- Manual/automatic/lazy omitted/stable, exact, range and channel semantics match
+  section 3 and the canonical v1 selector contract.
 - Snapshots/status are shared across replicas and survive process restarts.
 - Single/batch refresh returns 202 promptly, survives disconnect/restart, exposes
   per-target progress and partial failure, and safely deduplicates idempotent retries.
@@ -998,7 +1008,7 @@ configuration/schema compatibility and desired policy are explicitly restored.
 - Stage A rejects unindexed opt-in/ref requests as unsupported. Stage B private
   explicit commit refs require both allowlist and unindexed opt-in; integrity
   provenance is truthful. Fallback/direct paths cannot claim policy verification.
-- Catalog growth is bounded; Stage B producer/schema tests cover history limits and
+- Catalog growth is bounded; canonical v1 producer/schema tests cover history limits and
   generation consistency. Missing upstream artifacts fail distinctly even when
   metadata exists; never claim a saved snapshot alone guarantees reproducibility.
 - Regex compilation, full matching, invalid patterns, interval bounds, null/omission
@@ -1026,8 +1036,9 @@ saving this document:
    30 seconds, seven-day interval cap, operation retention, queue bounds, and backoff.
 3. Specify the internal static-manifest acceptance/deployment protocol and preflight
    conversion interface before rollout; retain the no-last-writer-wins invariant.
-4. Publish the complete bounded historical catalog v2 schema with producers before
-   Stage B, including history partitioning/retention and dependency placement.
+4. Publish the complete bounded canonical v1 catalog schema with producers before
+   initial rollout, including history retention and dependency placement. Later
+   partitioning is a separate protocol review, not a second pre-production format.
 5. Review Stage B's unindexed integrity exception independently of Stage A. If
    actual tag/branch/commit-kind restrictions are needed, specify a separate policy
    and Git-resolution checks; regex inference is not sufficient.

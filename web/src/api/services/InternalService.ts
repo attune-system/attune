@@ -29,6 +29,7 @@ export class InternalService {
         400: `Invalid file path`,
         401: `Unauthorized`,
         404: `File not found`,
+        416: `Requested range is not satisfiable`,
       },
     });
   }
@@ -117,37 +118,6 @@ export class InternalService {
     });
   }
   /**
-   * Append content to an existing file (or create it).
-   * Used for streaming log writes — workers send periodic chunks.
-   * @returns void
-   * @throws ApiError
-   */
-  public static appendToFile({
-    filePath,
-    requestBody,
-  }: {
-    /**
-     * Relative artifact file path
-     */
-    filePath: string;
-    requestBody: string;
-  }): CancelablePromise<void> {
-    return __request(OpenAPI, {
-      method: "PATCH",
-      url: "/api/v1/internal/files/{file_path}",
-      path: {
-        file_path: filePath,
-      },
-      body: requestBody,
-      mediaType: "application/octet-stream",
-      errors: {
-        400: `Invalid file path`,
-        401: `Unauthorized`,
-        413: `Payload too large`,
-      },
-    });
-  }
-  /**
    * Stream the staged candidate for a pending pack-install test.
    * @returns any Candidate pack archive
    * @throws ApiError
@@ -181,7 +151,7 @@ export class InternalService {
     });
   }
   /**
-   * Stream a pack directory as a `.tar.gz` archive.
+   * Return the deterministic archive for a pack's active release.
    * Used by remote workers/sensors to download pack contents when they
    * don't share a mounted volume with the API.
    * @returns any Pack archive
@@ -205,6 +175,7 @@ export class InternalService {
         400: `Invalid pack reference`,
         401: `Unauthorized`,
         404: `Pack not found`,
+        416: `Requested range is not satisfiable`,
       },
     });
   }

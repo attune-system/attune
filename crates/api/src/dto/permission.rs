@@ -49,6 +49,7 @@ pub struct PermissionSetSummary {
     pub label: Option<String>,
     pub description: Option<String>,
     pub grants: JsonValue,
+    pub retired_at: Option<chrono::DateTime<chrono::Utc>>,
     pub roles: Vec<PermissionSetRoleAssignmentResponse>,
 }
 

@@ -104,6 +104,9 @@ pub struct WorkflowContext {
     /// Completed task results keyed by task name. Canonical namespace: `task`.
     task_results: Arc<DashMap<String, JsonValue>>,
 
+    /// Persisted awaited inquiries keyed by guarded task name.
+    inquiries: Arc<DashMap<String, JsonValue>>,
+
     /// System-provided variables. Canonical namespace: `system`.
     system: Arc<DashMap<String, JsonValue>>,
 
@@ -151,6 +154,7 @@ impl WorkflowContext {
             variables: Arc::new(variables),
             parameters: Arc::new(parameters),
             task_results: Arc::new(DashMap::new()),
+            inquiries: Arc::new(DashMap::new()),
             system: Arc::new(system),
             pack_config: Arc::new(JsonValue::Null),
             keystore: Arc::new(JsonValue::Null),
@@ -193,6 +197,7 @@ impl WorkflowContext {
             variables: Arc::new(variables),
             parameters: Arc::new(parameters),
             task_results: Arc::new(results),
+            inquiries: Arc::new(DashMap::new()),
             system: Arc::new(system),
             pack_config: Arc::new(JsonValue::Null),
             keystore: Arc::new(JsonValue::Null),
@@ -220,6 +225,10 @@ impl WorkflowContext {
     #[allow(dead_code)] // Part of complete context API; used in tests
     pub fn set_task_result(&mut self, task_name: &str, result: JsonValue) {
         self.task_results.insert(task_name.to_string(), result);
+    }
+
+    pub fn set_inquiry(&mut self, task_name: &str, inquiry: JsonValue) {
+        self.inquiries.insert(task_name.to_string(), inquiry);
     }
 
     /// Get a task result by task name.
@@ -646,6 +655,12 @@ impl WorkflowContext {
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
 
+        let inquiries: HashMap<String, JsonValue> = self
+            .inquiries
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
         let system: HashMap<String, JsonValue> = self
             .system
             .iter()
@@ -656,6 +671,7 @@ impl WorkflowContext {
             "variables": variables,
             "parameters": self.parameters.as_ref(),
             "task_results": task_results,
+            "inquiries": inquiries,
             "system": system,
             "pack_config": self.pack_config.as_ref(),
             "keystore": self.keystore.as_ref(),
@@ -681,6 +697,13 @@ impl WorkflowContext {
             }
         }
 
+        let inquiries = DashMap::new();
+        if let Some(obj) = data["inquiries"].as_object() {
+            for (k, v) in obj {
+                inquiries.insert(k.clone(), v.clone());
+            }
+        }
+
         let system = DashMap::new();
         if let Some(obj) = data["system"].as_object() {
             for (k, v) in obj {
@@ -695,6 +718,7 @@ impl WorkflowContext {
             variables: Arc::new(variables),
             parameters: Arc::new(parameters),
             task_results: Arc::new(task_results),
+            inquiries: Arc::new(inquiries),
             system: Arc::new(system),
             pack_config: Arc::new(pack_config),
             keystore: Arc::new(keystore),
@@ -867,6 +891,15 @@ impl EvalContext for WorkflowContext {
             "task" | "tasks" => {
                 let map: serde_json::Map<String, JsonValue> = self
                     .task_results
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect();
+                Ok(JsonValue::Object(map))
+            }
+
+            "inquiry" => {
+                let map: serde_json::Map<String, JsonValue> = self
+                    .inquiries
                     .iter()
                     .map(|entry| (entry.key().clone(), entry.value().clone()))
                     .collect();
@@ -1520,6 +1553,7 @@ mod tests {
         let mut ctx = WorkflowContext::new(json!({"key": "value"}), HashMap::new());
         ctx.set_var("test", json!("data"));
         ctx.set_task_result("task1", json!({"result": "ok"}));
+        ctx.set_inquiry("deploy", json!({"id": 42, "response": {"approved": true}}));
         ctx.set_pack_config(json!({"setting": "val"}));
         ctx.set_keystore(json!({"secret": "hidden"}));
 
@@ -1538,6 +1572,12 @@ mod tests {
         assert_eq!(
             imported.evaluate_expression("keystore.secret").unwrap(),
             json!("hidden")
+        );
+        assert_eq!(
+            imported
+                .evaluate_expression("inquiry.deploy.response.approved")
+                .unwrap(),
+            json!(true)
         );
     }
 

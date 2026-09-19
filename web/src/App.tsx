@@ -35,6 +35,9 @@ const ExecutionsPage = lazy(() => import("@/pages/executions/ExecutionsPage"));
 const ExecutionDetailPage = lazy(
   () => import("@/pages/executions/ExecutionDetailPage"),
 );
+const InquiryDetailPage = lazy(
+  () => import("@/pages/inquiries/InquiryDetailPage"),
+);
 const ArtifactsPage = lazy(() => import("@/pages/artifacts/ArtifactsPage"));
 const ArtifactDetailPage = lazy(
   () => import("@/pages/artifacts/ArtifactDetailPage"),
@@ -157,6 +160,7 @@ function App() {
                     path="executions/:id"
                     element={<ExecutionDetailPage />}
                   />
+                  <Route path="inquiries/:id" element={<InquiryDetailPage />} />
                   <Route path="artifacts" element={<ArtifactsPage />} />
                   <Route
                     path="artifacts/:id"

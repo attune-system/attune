@@ -724,6 +724,7 @@ export class PermissionsService {
       label?: string | null;
       pack_ref?: string | null;
       ref: string;
+      retired_at?: string | null;
       roles: Array<PermissionSetRoleAssignmentResponse>;
     };
     /**

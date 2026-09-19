@@ -9,19 +9,19 @@ import type { i64 } from "./i64";
 export type CreateInquiryRequest = {
   assigned_to?: null | i64;
   /**
-   * Execution ID this inquiry belongs to
-   */
-  execution: i64;
-  /**
    * Prompt text to display to the user
    */
   prompt: string;
+  /**
+   * Stable purpose used to make creation idempotent within this workflow task attempt.
+   */
+  purpose: string;
   /**
    * Optional schema for the expected response format (flat format with inline required/secret)
    */
   response_schema: Record<string, any>;
   /**
-   * Optional timeout timestamp (when inquiry expires)
+   * Optional relative timeout in seconds.
    */
-  timeout_at?: string | null;
+  timeout_seconds?: number | null;
 };

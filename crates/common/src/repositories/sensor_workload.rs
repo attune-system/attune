@@ -61,13 +61,11 @@ impl SensorWorkloadRepository {
             "UPDATE sensor_workload AS workload SET \
                  pack_release = pr.id, pack_release_digest = pr.digest, \
                  executable_snapshot = jsonb_build_object( \
-                     'release', jsonb_build_object('id', pr.id, 'digest', pr.digest, 'content_path', pr.content_path), \
-                     'sensor', to_jsonb(s), 'runtime', to_jsonb(r), \
-                     'runtime_versions', COALESCE((SELECT jsonb_agg(to_jsonb(rv) ORDER BY rv.version, rv.id) FROM runtime_version rv WHERE rv.runtime = r.id), '[]'::jsonb) \
-                 ), updated = NOW() \
-             FROM sensor s JOIN pack p ON p.id = s.pack \
-             JOIN pack_release pr ON pr.id = p.active_release \
-             JOIN runtime r ON r.id = s.runtime \
+                     'release', jsonb_build_object('id', pr.id, 'digest', pr.digest, 'content_path', pr.content_path) \
+                 ) || executable.snapshot, updated = NOW() \
+             FROM sensor s JOIN pack_release pr ON pr.id = s.managed_release \
+             JOIN pack_release_executable executable ON executable.release = pr.id \
+                  AND executable.component_kind = 'sensor' AND executable.component_id = s.id \
              WHERE workload.sensor = s.id AND workload.sensor = $1 AND workload.workload_key = $2 \
              RETURNING workload.id, workload.sensor, workload.workload_key, workload.pack_release, \
                  workload.pack_release_digest, workload.executable_snapshot, workload.created, workload.updated",
@@ -344,9 +342,9 @@ impl SensorWorkloadRepository {
             "SELECT EXISTS ( \
                  SELECT 1 \
                  FROM sensor_workload sw \
-                 JOIN rule r ON r.id = $3 AND r.enabled = TRUE \
-                 JOIN trigger t ON t.id = r.trigger AND t.id = $4 AND t.enabled = TRUE \
-                 JOIN sensor s ON s.id = sw.sensor AND s.enabled = TRUE \
+                 JOIN rule r ON r.id = $3 AND r.effective_enabled AND r.retired_at IS NULL \
+                 JOIN trigger t ON t.id = r.trigger AND t.id = $4 AND t.effective_enabled AND t.retired_at IS NULL \
+                 JOIN sensor s ON s.id = sw.sensor AND s.effective_enabled AND s.retired_at IS NULL \
                  WHERE sw.id = $2 AND sw.sensor = $1 AND t.sensor = sw.sensor \
              )",
         )
@@ -368,8 +366,8 @@ impl SensorWorkloadRepository {
             "SELECT EXISTS ( \
                  SELECT 1 \
                  FROM sensor_workload sw \
-                 JOIN trigger t ON t.id = $3 AND t.enabled = TRUE \
-                 JOIN sensor s ON s.id = sw.sensor AND s.enabled = TRUE \
+                 JOIN trigger t ON t.id = $3 AND t.effective_enabled AND t.retired_at IS NULL \
+                 JOIN sensor s ON s.id = sw.sensor AND s.effective_enabled AND s.retired_at IS NULL \
                  WHERE sw.id = $2 AND sw.sensor = $1 AND t.sensor = sw.sensor \
              )",
         )
@@ -387,12 +385,12 @@ impl SensorWorkloadRepository {
         sqlx::query(
             "INSERT INTO sensor_workload (sensor, workload_key, pack_release, pack_release_digest, executable_snapshot) \
              SELECT s.id, $2, pr.id, pr.digest, jsonb_build_object( \
-                 'release', jsonb_build_object('id', pr.id, 'digest', pr.digest, 'content_path', pr.content_path), \
-                 'sensor', to_jsonb(s), 'runtime', to_jsonb(r), \
-                 'runtime_versions', COALESCE((SELECT jsonb_agg(to_jsonb(rv) ORDER BY rv.version, rv.id) FROM runtime_version rv WHERE rv.runtime = r.id), '[]'::jsonb) \
-             ) \
-             FROM sensor s JOIN pack p ON p.id = s.pack JOIN pack_release pr ON pr.id = p.active_release \
-             JOIN runtime r ON r.id = s.runtime WHERE s.id = $1 \
+                  'release', jsonb_build_object('id', pr.id, 'digest', pr.digest, 'content_path', pr.content_path) \
+              ) || executable.snapshot \
+             FROM sensor s JOIN pack_release pr ON pr.id = s.managed_release \
+             JOIN pack_release_executable executable ON executable.release = pr.id \
+                  AND executable.component_kind = 'sensor' AND executable.component_id = s.id \
+             WHERE s.id = $1 \
              ON CONFLICT (sensor, workload_key) DO NOTHING",
         )
         .bind(sensor_id)

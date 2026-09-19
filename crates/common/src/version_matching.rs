@@ -584,6 +584,7 @@ mod tests {
             available,
             verified_at: None,
             meta: json!({}),
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         }

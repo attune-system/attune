@@ -98,11 +98,11 @@ impl SensorAdmissionRepository {
     ) -> Result<Vec<SensorAdmissionFailure>> {
         let rows = sqlx::query(
             "SELECT DISTINCT sensor_id FROM ( \
-                 SELECT sensor.id AS sensor_id FROM sensor WHERE sensor.pack = $1 \
+                 SELECT sensor.id AS sensor_id FROM sensor WHERE sensor.pack = $1 AND sensor.retired_at IS NULL \
                  UNION \
                  SELECT trigger.sensor AS sensor_id \
                  FROM rule JOIN trigger ON trigger.id = rule.trigger \
-                 WHERE rule.pack = $1 AND trigger.sensor IS NOT NULL \
+                 WHERE rule.pack = $1 AND rule.retired_at IS NULL AND trigger.retired_at IS NULL AND trigger.sensor IS NOT NULL \
              ) affected ORDER BY sensor_id",
         )
         .bind(pack_id)
@@ -119,7 +119,7 @@ impl SensorAdmissionRepository {
         let unmanaged_rules = sqlx::query_as::<_, Rule>(&format!(
             "SELECT {} FROM rule \
              LEFT JOIN trigger ON trigger.id = rule.trigger \
-             WHERE rule.pack = $1 AND trigger.sensor IS NULL ORDER BY rule.ref",
+             WHERE rule.pack = $1 AND rule.retired_at IS NULL AND trigger.retired_at IS NULL AND trigger.sensor IS NULL ORDER BY rule.ref",
             crate::repositories::rule::SELECT_COLUMNS
                 .split(", ")
                 .map(|column| format!("rule.{column}"))
@@ -146,11 +146,12 @@ impl SensorAdmissionRepository {
         runtime_id: Id,
         requirement: SensorAdmissionRequirement,
     ) -> Result<Vec<SensorAdmissionFailure>> {
-        let sensor_ids =
-            sqlx::query_scalar::<_, Id>("SELECT id FROM sensor WHERE runtime = $1 ORDER BY id")
-                .bind(runtime_id)
-                .fetch_all(&mut *connection)
-                .await?;
+        let sensor_ids = sqlx::query_scalar::<_, Id>(
+            "SELECT id FROM sensor WHERE runtime = $1 AND retired_at IS NULL ORDER BY id",
+        )
+        .bind(runtime_id)
+        .fetch_all(&mut *connection)
+        .await?;
 
         let mut failures = Vec::new();
         for sensor_id in sensor_ids {
@@ -221,7 +222,7 @@ impl SensorAdmissionRepository {
             .map(|sensor| sensor.runtime)
             .collect::<Vec<_>>();
         let runtimes = sqlx::query_as::<_, Runtime>(&format!(
-            "SELECT {} FROM runtime WHERE id = ANY($1)",
+            "SELECT {} FROM runtime WHERE id = ANY($1) AND retired_at IS NULL",
             crate::repositories::runtime::SELECT_COLUMNS
         ))
         .bind(&runtime_ids)
@@ -232,7 +233,7 @@ impl SensorAdmissionRepository {
         .collect::<HashMap<_, _>>();
         let mut runtime_versions = HashMap::<Id, Vec<RuntimeVersion>>::new();
         let versions = sqlx::query_as::<_, RuntimeVersion>(&format!(
-            "SELECT {} FROM runtime_version WHERE runtime = ANY($1)",
+            "SELECT {} FROM runtime_version WHERE runtime = ANY($1) AND retired_at IS NULL",
             crate::repositories::runtime_version::SELECT_COLUMNS
         ))
         .bind(&runtime_ids)
@@ -253,8 +254,8 @@ impl SensorAdmissionRepository {
              FROM trigger \
              JOIN rule ON rule.trigger = trigger.id \
              WHERE trigger.sensor = ANY($1) \
-               AND trigger.enabled = TRUE \
-               AND rule.enabled = TRUE",
+               AND trigger.effective_enabled AND trigger.retired_at IS NULL \
+               AND rule.effective_enabled AND rule.retired_at IS NULL",
         )
         .bind(&sensor_ids)
         .fetch_all(&mut *connection)
@@ -319,7 +320,7 @@ impl SensorAdmissionRepository {
                 .await?
                 .unwrap_or(false);
         if !worker_exists
-            || !sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM sensor WHERE id = $1)")
+            || !sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM sensor WHERE id = $1 AND retired_at IS NULL AND effective_enabled)")
                 .bind(sensor_id)
                 .fetch_one(&mut *connection)
                 .await?
@@ -332,7 +333,11 @@ impl SensorAdmissionRepository {
             .trigger_rules
             .iter()
             .any(|(trigger, rule)| trigger.enabled && rule.enabled);
-        if !snapshot.sensor.enabled || !has_active_rule {
+        if !snapshot.sensor.enabled
+            || snapshot.sensor.retired_at.is_some()
+            || snapshot.runtime.retired_at.is_some()
+            || !has_active_rule
+        {
             return Ok(false);
         }
 

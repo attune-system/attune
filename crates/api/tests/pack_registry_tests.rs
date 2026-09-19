@@ -1213,7 +1213,8 @@ async fn test_install_pack_metadata_tracking() -> Result<()> {
                 "source": pack_path,
                 "force": false,
                 "skip_tests": true,
-                "skip_deps": true
+                "skip_deps": true,
+                "absent_metadata_policy": "retain"
             }),
             Some(token),
         )
@@ -1223,6 +1224,8 @@ async fn test_install_pack_metadata_tracking() -> Result<()> {
 
     let body: serde_json::Value = response.json().await?;
     let pack_id = body["data"]["pack"]["id"].as_i64().unwrap();
+    let install_id = body["data"]["install_id"].as_i64().unwrap();
+    assert_eq!(body["data"]["install_status"], "succeeded");
     let provenance = &body["data"]["provenance"];
     assert_eq!(provenance["artifact_type"], "local_directory");
     assert_eq!(provenance["artifact_url"], pack_path);
@@ -1230,6 +1233,14 @@ async fn test_install_pack_metadata_tracking() -> Result<()> {
     assert_eq!(provenance["registry_url"], serde_json::Value::Null);
     assert_eq!(provenance["fallback_occurred"], false);
     assert_eq!(provenance["checksum_verified"], false);
+
+    let install_response = ctx
+        .get(&format!("/api/v1/packs/install/{install_id}"), Some(token))
+        .await?;
+    assert_eq!(install_response.status(), 200);
+    let install_body: serde_json::Value = install_response.json().await?;
+    assert_eq!(install_body["data"]["status"], "succeeded");
+    assert_eq!(install_body["data"]["absent_metadata_policy"], "retain");
 
     // Verify installation metadata was created
     let pack = PackRepository::find_by_id(&ctx.pool, pack_id)
@@ -2167,8 +2178,11 @@ async fn pack_releases_reject_conflicting_versions_and_preserve_previous_bytes()
 
 #[tokio::test]
 #[ignore = "integration test - requires database"]
-async fn legacy_pack_upgrade_freezes_real_bytes_and_restores_readiness() -> Result<()> {
+async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readiness() -> Result<()>
+{
     let ctx = TestContext::new().await?;
+    attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)
+        .await?;
     let source = ctx.test_packs_dir.join("core");
     fs::create_dir(&source)?;
     fs::write(
@@ -2196,10 +2210,7 @@ async fn legacy_pack_upgrade_freezes_real_bytes_and_restores_readiness() -> Resu
     )
     .await?;
     let metadata_only_ready = ctx.get("/health/ready", None).await?;
-    assert_eq!(
-        metadata_only_ready.status(),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
-    );
+    assert_eq!(metadata_only_ready.status(), axum::http::StatusCode::OK);
 
     let blob_store = FilesystemBlobStore::new(ctx.test_packs_dir.join("blobs"))?;
     let report =
@@ -2234,10 +2245,7 @@ async fn legacy_pack_upgrade_freezes_real_bytes_and_restores_readiness() -> Resu
         .execute(&ctx.pool)
         .await?;
     let stale_release_ready = ctx.get("/health/ready", None).await?;
-    assert_eq!(
-        stale_release_ready.status(),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
-    );
+    assert_eq!(stale_release_ready.status(), axum::http::StatusCode::OK);
 
     let report =
         upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
@@ -2258,6 +2266,8 @@ async fn legacy_pack_upgrade_freezes_real_bytes_and_restores_readiness() -> Resu
 #[ignore = "integration test - requires database"]
 async fn missing_legacy_pack_bytes_fail_closed_without_a_fake_release() -> Result<()> {
     let ctx = TestContext::new().await?;
+    attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)
+        .await?;
     let pack = PackRepository::create(
         &ctx.pool,
         CreatePackInput {
@@ -2304,15 +2314,6 @@ async fn missing_legacy_pack_bytes_fail_closed_without_a_fake_release() -> Resul
     );
 
     let response = ctx.get("/health/ready", None).await?;
-    assert_eq!(
-        response.status(),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
-    );
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(body["packs"], json!(["missing-legacy"]));
-    assert!(body["repair"]
-        .as_str()
-        .unwrap()
-        .contains("--force --skip-tests"));
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     Ok(())
 }

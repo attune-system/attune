@@ -37,6 +37,29 @@ pub use workflow::*;
 /// Common ID type used throughout the system
 pub type Id = i64;
 
+/// Lifecycle ownership is independent of the namespace in a component ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagementOrigin {
+    Platform {
+        catalog_revision: i32,
+    },
+    /// Legacy installations can have no immutable release until their upgrade.
+    Pack {
+        pack_id: Id,
+        release_id: Option<Id>,
+    },
+    AdHoc,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct IntrinsicHandler {
+    pub r#ref: String,
+    pub catalog_revision: i32,
+    pub allowed_component_refs: Vec<String>,
+    pub param_schema: JsonSchema,
+    pub out_schema: JsonSchema,
+}
+
 /// JSON dictionary type
 pub type JsonDict = JsonValue;
 
@@ -351,6 +374,30 @@ pub mod enums {
         Completed,
         Failed,
         Cancelled,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[sqlx(type_name = "workflow_task_wait_kind_enum", rename_all = "lowercase")]
+    #[serde(rename_all = "lowercase")]
+    pub enum WorkflowTaskWaitKind {
+        Inquiry,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[sqlx(type_name = "workflow_task_wait_state_enum", rename_all = "snake_case")]
+    #[serde(rename_all = "snake_case")]
+    pub enum WorkflowTaskWaitState {
+        Waiting,
+        Failed,
+        TimedOut,
+        Cancelled,
+        Released,
+    }
+
+    impl WorkflowTaskWaitState {
+        pub fn is_terminal(self) -> bool {
+            self != Self::Waiting
+        }
     }
 
     impl WorkflowCacheIterationState {
@@ -1125,6 +1172,8 @@ pub mod runtime {
         pub execution_config: JsonDict,
         pub auto_detected: bool,
         pub detection_config: JsonDict,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1170,6 +1219,8 @@ pub mod runtime {
         pub verified_at: Option<DateTime<Utc>>,
         /// Arbitrary version-specific metadata
         pub meta: JsonDict,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1226,6 +1277,8 @@ pub mod trigger {
         pub label: String,
         pub description: Option<String>,
         pub enabled: bool,
+        #[serde(default)]
+        pub enabled_override: Option<bool>,
         pub param_schema: Option<JsonSchema>,
         pub out_schema: Option<JsonSchema>,
         pub webhook_enabled: bool,
@@ -1237,6 +1290,8 @@ pub mod trigger {
         pub is_adhoc: bool,
         pub reference_visibility: ActionReferenceVisibility,
         pub reference_allowed_pack_refs: Vec<String>,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1256,6 +1311,8 @@ pub mod trigger {
         /// (e.g., ">=3.12", ">=3.12,<4.0", "~18.0"). NULL means any version.
         pub runtime_version_constraint: Option<String>,
         pub enabled: bool,
+        #[serde(default)]
+        pub enabled_override: Option<bool>,
         pub param_schema: Option<JsonSchema>,
         pub config: Option<JsonValue>,
         #[sqlx(default)]
@@ -1268,6 +1325,8 @@ pub mod trigger {
         pub log_retention_limit: Option<i32>,
         pub artifact_retention_policy: Option<RetentionPolicyType>,
         pub artifact_retention_limit: Option<i32>,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1397,6 +1456,8 @@ pub mod action {
         pub entrypoint: String,
         pub runtime: Option<Id>,
         pub enabled: bool,
+        #[serde(default)]
+        pub enabled_override: Option<bool>,
         /// Optional semver version constraint for the runtime
         /// (e.g., ">=3.12", ">=3.12,<4.0", "~18.0"). NULL means any version.
         pub runtime_version_constraint: Option<String>,
@@ -1434,6 +1495,8 @@ pub mod action {
         pub parameter_format: ParameterFormat,
         #[sqlx(default)]
         pub output_format: OutputFormat,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1475,6 +1538,8 @@ pub mod action {
         pub action: Option<Id>,
         pub action_ref: Option<String>,
         pub enabled: bool,
+        #[serde(default)]
+        pub enabled_override: Option<bool>,
         pub priority: i32,
         pub parameters: Vec<String>,
         pub method: Option<PolicyMethod>,
@@ -1485,6 +1550,8 @@ pub mod action {
         pub name: String,
         pub description: Option<String>,
         pub tags: Vec<String>,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1518,11 +1585,15 @@ pub mod rule {
         pub trace_tag_template: Option<String>,
         pub permission_set_refs: Option<Vec<String>>,
         pub enabled: bool,
+        #[serde(default)]
+        pub enabled_override: Option<bool>,
         pub is_adhoc: bool,
         /// Identity that registered the rule. Used to attribute rule-triggered
         /// executions. NULL for system-loaded rules (init pack loader); those
         /// fall back to the system identity at execution-creation time.
         pub owner_identity: Option<Id>,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1609,11 +1680,17 @@ pub mod execution {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ReleasedActionExecutableSnapshot {
+        pub release: PackReleasePin,
+        pub executable: ActionExecutableSnapshot,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ExecutionExecutableSnapshot {
         pub release: PackReleasePin,
         pub executable: ActionExecutableSnapshot,
         #[serde(default)]
-        pub pack_executables: std::collections::BTreeMap<String, ActionExecutableSnapshot>,
+        pub pack_executables: std::collections::BTreeMap<String, ReleasedActionExecutableSnapshot>,
     }
 
     /// Workflow-specific task metadata
@@ -1798,16 +1875,28 @@ pub mod inquiry {
     pub struct Inquiry {
         pub id: Id,
         pub execution: Id,
+        pub workflow_execution: Option<Id>,
+        pub workflow_task_name: Option<String>,
+        pub action_attempt_family: Option<Id>,
+        pub purpose: Option<String>,
         pub prompt: String,
         pub response_schema: Option<JsonSchema>,
         pub assigned_to: Option<Id>,
         pub status: InquiryStatus,
         pub response: Option<JsonDict>,
         pub timeout_at: Option<DateTime<Utc>>,
+        pub timeout_seconds: Option<i64>,
+        pub responded_by: Option<Id>,
+        pub provider_actor: Option<JsonValue>,
         pub responded_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
+
+    pub const INQUIRY_SELECT_COLUMNS: &str =
+        "id, execution, workflow_execution, workflow_task_name, \
+        action_attempt_family, purpose, prompt, response_schema, assigned_to, status, response, \
+        timeout_at, timeout_seconds, responded_by, provider_actor, responded_at, created, updated";
 }
 
 /// Identity and permissions
@@ -1835,6 +1924,8 @@ pub mod identity {
         pub label: Option<String>,
         pub description: Option<String>,
         pub grants: JsonValue,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1950,6 +2041,8 @@ pub mod cache {
         pub max_staging_generations: i32,
         pub tombstoned_at: Option<DateTime<Utc>>,
         pub tombstone_reason: Option<String>,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1960,7 +2053,7 @@ pub mod cache {
             consecutive_refresh_failures, last_refresh_failure_at, \
             freshness_target_seconds, max_records_per_generation, \
             max_generation_bytes, max_retained_bytes, max_retained_generations, max_staging_generations, \
-            tombstoned_at, tombstone_reason, created, updated";
+            tombstoned_at, tombstone_reason, retired_at, created, updated";
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct CacheGeneration {
@@ -2234,6 +2327,8 @@ pub mod work_queue {
         pub label: String,
         pub description: Option<String>,
         pub enabled: bool,
+        #[serde(default)]
+        pub enabled_override: Option<bool>,
         pub accepting_new_items: bool,
         pub dispatch_action: Option<Id>,
         pub dispatch_action_ref: String,
@@ -2252,14 +2347,16 @@ pub mod work_queue {
         pub config: JsonDict,
         pub reference_visibility: ActionReferenceVisibility,
         pub reference_allowed_pack_refs: Vec<String>,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
 
     pub const WORK_QUEUE_SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, is_adhoc, label, \
-         description, enabled, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, \
+         description, effective_enabled AS enabled, enabled_override, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, \
          allow_pending_update, update_strategy, batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, \
-         reference_visibility, reference_allowed_pack_refs, created, updated";
+         reference_visibility, reference_allowed_pack_refs, retired_at, created, updated";
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct WorkQueueItem {
@@ -2561,6 +2658,8 @@ pub mod workflow {
         pub out_schema: Option<JsonSchema>,
         pub definition: JsonDict,
         pub tags: Vec<String>,
+        #[serde(default)]
+        pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -2582,18 +2681,22 @@ pub mod workflow {
             pub label: String,
             pub description: Option<String>,
             pub enabled: bool,
+            #[serde(default)]
+            pub enabled_override: Option<bool>,
             pub is_default_home: bool,
             pub revision: i32,
             pub spec_version: i32,
             pub spec: JsonDict,
             pub tags: Vec<String>,
+            #[serde(default)]
+            pub retired_at: Option<DateTime<Utc>>,
             pub created: DateTime<Utc>,
             pub updated: DateTime<Utc>,
         }
 
         pub const DASHBOARD_SELECT_COLUMNS: &str = "id, ref, scope_type, scope_ref, pack, owner_identity, \
-             visibility, is_adhoc, label, description, enabled, is_default_home, revision, spec_version, \
-             spec, tags, created, updated";
+             visibility, is_adhoc, label, description, effective_enabled AS enabled, enabled_override, is_default_home, revision, spec_version, \
+             spec, tags, retired_at, created, updated";
 
         #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
         pub struct DashboardVersion {
@@ -2630,6 +2733,24 @@ pub mod workflow {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct WorkflowTaskWait {
+        pub id: Id,
+        pub workflow_execution: Id,
+        pub task_name: String,
+        pub kind: WorkflowTaskWaitKind,
+        pub state: WorkflowTaskWaitState,
+        pub inquiry: Id,
+        pub result: Option<JsonValue>,
+        pub resolved_at: Option<DateTime<Utc>>,
+        pub released_at: Option<DateTime<Utc>>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    pub const WORKFLOW_TASK_WAIT_SELECT_COLUMNS: &str = "id, workflow_execution, task_name, kind, \
+        state, inquiry, result, resolved_at, released_at, created, updated";
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct WorkflowCacheIteration {
         pub id: Id,
         pub workflow_execution: Id,
@@ -2660,6 +2781,22 @@ pub mod workflow {
 pub mod pack_install {
     use super::*;
     use utoipa::ToSchema;
+
+    /// How an installation handles pack-managed metadata omitted by the new release.
+    #[derive(
+        Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema,
+    )]
+    #[serde(rename_all = "lowercase")]
+    #[sqlx(type_name = "absent_metadata_policy", rename_all = "lowercase")]
+    pub enum AbsentMetadataPolicy {
+        /// Retire omitted metadata. This preserves stable IDs and relationships.
+        #[default]
+        Remove,
+        /// Keep omitted metadata but suppress toggleable components.
+        Disable,
+        /// Do not change omitted metadata.
+        Retain,
+    }
 
     /// Installation lifecycle status
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -2702,6 +2839,7 @@ pub mod pack_install {
         pub pack_version: String,
         pub status: String,
         pub trigger_reason: String,
+        pub absent_metadata_policy: AbsentMetadataPolicy,
         pub pack_id: Option<Id>,
         pub requested_by: Option<Id>,
         pub assigned_worker_id: Option<Id>,

@@ -18,10 +18,11 @@ use attune_common::{
         execution::ExecutionRepository,
         identity::IdentityRepository,
         inquiry::{
-            CreateInquiryInput, InquiryRepository, InquirySearchFilters, InquiryVisibilityContext,
-            UpdateInquiryInput,
+            CreateWorkflowInquiryInput, InquiryRepository, InquirySearchFilters,
+            InquiryVisibilityContext,
         },
-        Create, Delete, FindById, Update,
+        workflow::WorkflowExecutionRepository,
+        FindById,
     },
 };
 
@@ -30,17 +31,18 @@ use crate::auth::{
     middleware::{AuthenticatedUser, RequireAuth},
 };
 use crate::{
-    authz::AuthorizationService,
+    authz::{AuthorizationCheck, AuthorizationService},
     dto::{
         common::{PaginatedResponse, PaginationParams},
         inquiry::{
             CreateInquiryRequest, InquiryQueryParams, InquiryRespondRequest, InquiryResponse,
-            InquirySummary, UpdateInquiryRequest,
+            InquirySummary,
         },
-        ApiResponse, SuccessResponse,
+        ApiResponse,
     },
     middleware::{ApiError, ApiResult},
     state::AppState,
+    validation::validate_inquiry_response,
 };
 
 /// List all inquiries with pagination and optional filters
@@ -256,32 +258,48 @@ pub async fn list_inquiries_by_execution(
     )
 )]
 pub async fn create_inquiry(
-    _user: RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateInquiryRequest>,
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
     request.validate()?;
 
-    // Verify execution exists
-    let _execution = ExecutionRepository::find_by_id(&state.db, request.execution)
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("Execution with ID {} not found", request.execution))
-        })?;
+    if user.claims.token_type != TokenType::Execution {
+        return Err(ApiError::Forbidden(
+            "Workflow inquiries must be created with an execution token".to_string(),
+        ));
+    }
+    let execution = user.execution_id().ok_or_else(|| {
+        ApiError::Unauthorized("Execution token is missing its execution scope".to_string())
+    })?;
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    state
+        .authorization_service()
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Inquiries,
+                action: RbacAction::Create,
+                context: AuthorizationContext::new(identity_id),
+            },
+        )
+        .await?;
 
-    // Create inquiry input
-    let inquiry_input = CreateInquiryInput {
-        execution: request.execution,
+    let inquiry_input = CreateWorkflowInquiryInput {
+        execution,
+        purpose: request.purpose,
         prompt: request.prompt,
         response_schema: request.response_schema,
         assigned_to: request.assigned_to,
-        status: attune_common::models::enums::InquiryStatus::Pending,
-        response: None,
-        timeout_at: request.timeout_at,
+        timeout_seconds: request.timeout_seconds,
     };
 
-    let inquiry = InquiryRepository::create(&state.db, inquiry_input).await?;
+    let mut conn = state.db.acquire().await?;
+    let inquiry =
+        InquiryRepository::create_workflow_inquiry_idempotent(&mut conn, inquiry_input).await?;
 
     let response = ApiResponse::with_message(
         InquiryResponse::from(inquiry),
@@ -289,56 +307,6 @@ pub async fn create_inquiry(
     );
 
     Ok((StatusCode::CREATED, Json(response)))
-}
-
-/// Update an existing inquiry
-#[utoipa::path(
-    put,
-    path = "/api/v1/inquiries/{id}",
-    tag = "inquiries",
-    params(
-        ("id" = i64, Path, description = "Inquiry ID")
-    ),
-    request_body = UpdateInquiryRequest,
-    security(("bearer_auth" = [])),
-    responses(
-        (status = 200, description = "Inquiry updated successfully", body = ApiResponse<InquiryResponse>),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Inquiry not found"),
-        (status = 500, description = "Internal server error")
-    )
-)]
-pub async fn update_inquiry(
-    _user: RequireAuth,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-    Json(request): Json<UpdateInquiryRequest>,
-) -> ApiResult<impl IntoResponse> {
-    // Validate request
-    request.validate()?;
-
-    // Verify inquiry exists
-    let _existing = InquiryRepository::find_by_id(&state.db, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {} not found", id)))?;
-
-    // Create update input
-    let update_input = UpdateInquiryInput {
-        status: request.status,
-        response: request.response,
-        responded_at: None, // Let the database handle this if needed
-        assigned_to: request.assigned_to,
-    };
-
-    let updated_inquiry = InquiryRepository::update(&state.db, id, update_input).await?;
-
-    let response = ApiResponse::with_message(
-        InquiryResponse::from(updated_inquiry),
-        "Inquiry updated successfully",
-    );
-
-    Ok((StatusCode::OK, Json(response)))
 }
 
 /// Respond to an inquiry (user-facing endpoint)
@@ -397,7 +365,7 @@ pub async fn respond_to_inquiry(
     }
 
     // Privilege-loop guard: an execution that created an inquiry (e.g., via
-    // `core.ask`) must not be allowed to respond to it using its own
+    // an action-owned inquiry) must not be allowed to respond to it using its own
     // execution-scoped token. The triggering identity may still respond from
     // a separate session (their normal access token), but a callback bearing
     // the *same* execution scope as the one that created the inquiry would
@@ -465,33 +433,52 @@ pub async fn respond_to_inquiry(
     // Check if inquiry has timed out
     if let Some(timeout_at) = inquiry.timeout_at {
         if timeout_at < chrono::Utc::now() {
-            // Update inquiry to timeout status
-            let timeout_input = UpdateInquiryInput {
-                status: Some(attune_common::models::enums::InquiryStatus::Timeout),
-                response: None,
-                responded_at: None,
-                assigned_to: None,
-            };
-            let _ = InquiryRepository::update(&state.db, id, timeout_input).await?;
-
             return Err(ApiError::BadRequest(
                 "Inquiry has timed out and can no longer be responded to".to_string(),
             ));
         }
     }
 
-    // TODO: Validate response against response_schema if present
-    // For now, just accept the response as-is
+    validate_inquiry_response(id, inquiry.response_schema.as_ref(), &request.response)?;
 
-    // Create update input with response
-    let update_input = UpdateInquiryInput {
-        status: Some(attune_common::models::enums::InquiryStatus::Responded),
-        response: Some(request.response.clone()),
-        responded_at: Some(chrono::Utc::now()),
-        assigned_to: None,
-    };
-
-    let updated_inquiry = InquiryRepository::update(&state.db, id, update_input).await?;
+    let mut transaction = state.db.begin().await?;
+    if let Some(workflow_execution_id) = inquiry.workflow_execution {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(workflow_execution_id)
+            .execute(&mut *transaction)
+            .await?;
+        let workflow = WorkflowExecutionRepository::find_by_id_for_update(
+            &mut *transaction,
+            workflow_execution_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::Conflict("Owning workflow no longer exists".to_string()))?;
+        if matches!(
+            workflow.status,
+            attune_common::models::enums::ExecutionStatus::Completed
+                | attune_common::models::enums::ExecutionStatus::Failed
+                | attune_common::models::enums::ExecutionStatus::Canceling
+                | attune_common::models::enums::ExecutionStatus::Cancelled
+                | attune_common::models::enums::ExecutionStatus::Timeout
+                | attune_common::models::enums::ExecutionStatus::Abandoned
+        ) {
+            return Err(ApiError::Conflict(
+                "Owning workflow is cancelling or terminal".to_string(),
+            ));
+        }
+    }
+    let updated_inquiry = InquiryRepository::respond_pending(
+        &mut *transaction,
+        id,
+        request.response.clone(),
+        responded_by,
+        None,
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::Conflict("Inquiry is no longer pending or has timed out".to_string())
+    })?;
+    transaction.commit().await?;
 
     // Publish InquiryResponded message if publisher is available
     if let Some(publisher) = state.get_publisher().await {
@@ -833,59 +820,67 @@ async fn redact_page_execution_visibility(
     Ok(items)
 }
 
-/// Delete an inquiry
+/// Cancel an inquiry from its creator execution.
 #[utoipa::path(
-    delete,
-    path = "/api/v1/inquiries/{id}",
+    post,
+    path = "/api/v1/inquiries/{id}/cancel",
     tag = "inquiries",
     params(
         ("id" = i64, Path, description = "Inquiry ID")
     ),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "Inquiry deleted successfully", body = SuccessResponse),
+        (status = 200, description = "Inquiry cancelled", body = ApiResponse<InquiryResponse>),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only the creator execution can cancel the inquiry"),
+        (status = 409, description = "Inquiry is no longer pending"),
         (status = 404, description = "Inquiry not found"),
         (status = 500, description = "Internal server error")
     )
 )]
-pub async fn delete_inquiry(
-    _user: RequireAuth,
+pub async fn cancel_inquiry(
+    RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
-    // Verify inquiry exists
-    let _inquiry = InquiryRepository::find_by_id(&state.db, id)
+    if user.claims.token_type != TokenType::Execution {
+        return Err(ApiError::Forbidden(
+            "Only an execution token can cancel an action-owned inquiry".to_string(),
+        ));
+    }
+    let creator_execution = user.execution_id().ok_or_else(|| {
+        ApiError::Unauthorized("Execution token is missing its execution scope".to_string())
+    })?;
+    let inquiry = InquiryRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {} not found", id)))?;
-
-    // Delete the inquiry
-    let deleted = InquiryRepository::delete(&state.db, id).await?;
-
-    if !deleted {
-        return Err(ApiError::NotFound(format!(
-            "Inquiry with ID {} not found",
-            id
-        )));
+    if inquiry.execution != creator_execution {
+        return Err(ApiError::Forbidden(
+            "Only the creator execution can cancel this inquiry".to_string(),
+        ));
     }
-
-    let response = SuccessResponse::new("Inquiry deleted successfully");
-
-    Ok((StatusCode::OK, Json(response)))
+    let cancelled = InquiryRepository::cancel_pending_by_creator(&state.db, id, creator_execution)
+        .await?
+        .ok_or_else(|| ApiError::Conflict("Inquiry is no longer pending".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::with_message(
+            InquiryResponse::from(cancelled),
+            "Inquiry cancelled",
+        )),
+    ))
 }
 
 /// Register inquiry routes
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/inquiries", get(list_inquiries).post(create_inquiry))
-        .route(
-            "/inquiries/{id}",
-            get(get_inquiry).put(update_inquiry).delete(delete_inquiry),
-        )
+        .route("/inquiries/{id}", get(get_inquiry))
         .route("/inquiries/status/{status}", get(list_inquiries_by_status))
         .route(
             "/executions/{execution_id}/inquiries",
             get(list_inquiries_by_execution),
         )
         .route("/inquiries/{id}/respond", post(respond_to_inquiry))
+        .route("/inquiries/{id}/cancel", post(cancel_inquiry))
 }

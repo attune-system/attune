@@ -65,7 +65,6 @@ export type {
   InquiryResponse,
   InquirySummary,
   CreateInquiryRequest,
-  UpdateInquiryRequest,
   InquiryRespondRequest,
 
   // Secrets/Keys

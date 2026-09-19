@@ -7,9 +7,11 @@ use utoipa::{IntoParams, ToSchema};
 
 use attune_common::models::enums::ExecutionStatus;
 use attune_common::models::enums::RetentionPolicyType;
-use attune_common::models::enums::WorkflowCacheIterationState;
+use attune_common::models::enums::{
+    WorkflowCacheIterationState, WorkflowTaskWaitKind, WorkflowTaskWaitState,
+};
 use attune_common::models::execution::WorkflowTaskMetadata;
-use attune_common::models::WorkflowCacheIteration;
+use attune_common::models::{WorkflowCacheIteration, WorkflowTaskWait};
 use attune_common::repositories::execution::ExecutionWithRefs;
 
 const MAX_WORKFLOW_CACHE_ITERATION_ERROR_SUMMARY_CHARS: usize = 1024;
@@ -240,6 +242,34 @@ impl From<WorkflowCacheIteration> for WorkflowCacheIterationResponse {
                     .take(MAX_WORKFLOW_CACHE_ITERATION_ERROR_SUMMARY_CHARS)
                     .collect()
             }),
+        }
+    }
+}
+
+/// Safe operational metadata for one workflow task wait.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WorkflowTaskWaitResponse {
+    pub id: i64,
+    pub task_name: String,
+    pub kind: WorkflowTaskWaitKind,
+    pub state: WorkflowTaskWaitState,
+    pub inquiry_id: i64,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+impl From<WorkflowTaskWait> for WorkflowTaskWaitResponse {
+    fn from(wait: WorkflowTaskWait) -> Self {
+        Self {
+            id: wait.id,
+            task_name: wait.task_name,
+            kind: wait.kind,
+            state: wait.state,
+            inquiry_id: wait.inquiry,
+            created: wait.created,
+            updated: wait.updated,
+            resolved_at: wait.resolved_at,
         }
     }
 }
@@ -592,5 +622,45 @@ mod tests {
         assert!(json.get("next_batch_index").is_none());
         assert!(json.get("workflow_execution").is_none());
         assert!(json.get("id").is_none());
+    }
+
+    #[test]
+    fn workflow_task_wait_response_contains_only_safe_metadata() {
+        let now = Utc::now();
+        let response = WorkflowTaskWaitResponse::from(WorkflowTaskWait {
+            id: 1,
+            workflow_execution: 2,
+            task_name: "approve".to_string(),
+            kind: WorkflowTaskWaitKind::Inquiry,
+            state: WorkflowTaskWaitState::Released,
+            inquiry: 3,
+            result: Some(serde_json::json!({"approved": true})),
+            resolved_at: Some(now),
+            released_at: Some(now),
+            created: now,
+            updated: now,
+        });
+
+        let json = serde_json::to_value(response).unwrap();
+        let mut fields: Vec<_> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "created",
+                "id",
+                "inquiry_id",
+                "kind",
+                "resolved_at",
+                "state",
+                "task_name",
+                "updated",
+            ]
+        );
     }
 }

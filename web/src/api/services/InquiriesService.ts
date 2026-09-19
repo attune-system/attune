@@ -8,8 +8,6 @@ import type { i64 } from "../models/i64";
 import type { InquiryRespondRequest } from "../models/InquiryRespondRequest";
 import type { InquiryStatus } from "../models/InquiryStatus";
 import type { PaginatedResponse_InquirySummary } from "../models/PaginatedResponse_InquirySummary";
-import type { SuccessResponse } from "../models/SuccessResponse";
-import type { UpdateInquiryRequest } from "../models/UpdateInquiryRequest";
 import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
@@ -193,58 +191,29 @@ export class InquiriesService {
     });
   }
   /**
-   * Update an existing inquiry
-   * @returns ApiResponse_InquiryResponse Inquiry updated successfully
+   * Cancel an inquiry from its creator execution.
+   * @returns ApiResponse_InquiryResponse Inquiry cancelled
    * @throws ApiError
    */
-  public static updateInquiry({
+  public static cancelInquiry({
     id,
-    requestBody,
   }: {
     /**
      * Inquiry ID
      */
     id: number;
-    requestBody: UpdateInquiryRequest;
   }): CancelablePromise<ApiResponse_InquiryResponse> {
     return __request(OpenAPI, {
-      method: "PUT",
-      url: "/api/v1/inquiries/{id}",
-      path: {
-        id: id,
-      },
-      body: requestBody,
-      mediaType: "application/json",
-      errors: {
-        400: `Invalid request`,
-        401: `Unauthorized`,
-        404: `Inquiry not found`,
-        500: `Internal server error`,
-      },
-    });
-  }
-  /**
-   * Delete an inquiry
-   * @returns SuccessResponse Inquiry deleted successfully
-   * @throws ApiError
-   */
-  public static deleteInquiry({
-    id,
-  }: {
-    /**
-     * Inquiry ID
-     */
-    id: number;
-  }): CancelablePromise<SuccessResponse> {
-    return __request(OpenAPI, {
-      method: "DELETE",
-      url: "/api/v1/inquiries/{id}",
+      method: "POST",
+      url: "/api/v1/inquiries/{id}/cancel",
       path: {
         id: id,
       },
       errors: {
         401: `Unauthorized`,
+        403: `Only the creator execution can cancel the inquiry`,
         404: `Inquiry not found`,
+        409: `Inquiry is no longer pending`,
         500: `Internal server error`,
       },
     });

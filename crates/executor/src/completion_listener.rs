@@ -35,7 +35,6 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    inquiry_handler::InquiryHandler,
     queue_manager::ExecutionQueueManager,
     scheduler::{ExecutionScheduler, SchedulerMetadataCaches},
     work_queue_events,
@@ -276,39 +275,6 @@ impl CompletionListener {
                     }
                     // Non-retryable workflow advancement errors are logged but
                     // do not fail the entire completion processing path.
-                }
-            }
-
-            // Check if execution result contains an inquiry request
-            if let Some(result) = &exec.result {
-                if InquiryHandler::has_inquiry_request(result) {
-                    info!(
-                        "Execution {} result contains inquiry request, creating inquiry",
-                        execution_id
-                    );
-
-                    match InquiryHandler::create_inquiry_from_result(
-                        pool,
-                        publisher,
-                        execution_id,
-                        result,
-                    )
-                    .await
-                    {
-                        Ok(inquiry) => {
-                            info!(
-                                "Created inquiry {} for execution {}, execution paused for response",
-                                inquiry.id, execution_id
-                            );
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to create inquiry for execution {}: {}",
-                                execution_id, e
-                            );
-                            // Continue processing - don't fail the entire completion
-                        }
-                    }
                 }
             }
         } else {

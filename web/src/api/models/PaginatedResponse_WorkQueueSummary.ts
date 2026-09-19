@@ -25,6 +25,7 @@ export type PaginatedResponse_WorkQueueSummary = {
     ref: string;
     reference_allowed_pack_refs: Array<string>;
     reference_visibility: ActionReferenceVisibility;
+    retired_at?: string | null;
     trace_tag_template?: string | null;
     updated: string;
   }>;

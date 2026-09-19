@@ -17,6 +17,7 @@ export type PolicyResponse = {
   quotas: Array<QuotaPolicyResponse>;
   rate_limit?: null | RateLimitPolicyResponse;
   ref: string;
+  retired_at?: string | null;
   scope: PolicyScopeResponse;
   tags: Array<string>;
   updated: string;

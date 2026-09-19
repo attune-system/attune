@@ -145,7 +145,7 @@ impl FindById for WorkQueueRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM work_queue WHERE id = $1",
+            "SELECT {} FROM work_queue WHERE id = $1 AND retired_at IS NULL",
             WORK_QUEUE_SELECT_COLUMNS
         );
         sqlx::query_as::<_, WorkQueue>(&query)
@@ -163,7 +163,7 @@ impl FindByRef for WorkQueueRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM work_queue WHERE ref = $1",
+            "SELECT {} FROM work_queue WHERE ref = $1 AND retired_at IS NULL",
             WORK_QUEUE_SELECT_COLUMNS
         );
         sqlx::query_as::<_, WorkQueue>(&query)
@@ -181,7 +181,7 @@ impl List for WorkQueueRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM work_queue ORDER BY ref ASC LIMIT 1000",
+            "SELECT {} FROM work_queue WHERE retired_at IS NULL ORDER BY ref ASC LIMIT 1000",
             WORK_QUEUE_SELECT_COLUMNS
         );
         sqlx::query_as::<_, WorkQueue>(&query)
@@ -352,7 +352,7 @@ impl Update for WorkQueueRepository {
             if has_updates {
                 query.push(", ");
             }
-            query.push("enabled = ").push_bind(enabled);
+            query.push("enabled_override = ").push_bind(enabled);
             has_updates = true;
         }
 
@@ -522,12 +522,28 @@ impl Delete for WorkQueueRepository {
 }
 
 impl WorkQueueRepository {
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<WorkQueue>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, WorkQueue>(&format!(
+            "SELECT {WORK_QUEUE_SELECT_COLUMNS} FROM work_queue WHERE ref = $1"
+        ))
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn find_by_pack<'e, E>(executor: E, pack_id: Id) -> Result<Vec<WorkQueue>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM work_queue WHERE pack = $1 ORDER BY ref ASC",
+            "SELECT {} FROM work_queue WHERE pack = $1 AND retired_at IS NULL ORDER BY ref ASC",
             WORK_QUEUE_SELECT_COLUMNS
         );
         sqlx::query_as::<_, WorkQueue>(&query)
@@ -542,7 +558,7 @@ impl WorkQueueRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM work_queue WHERE enabled = TRUE ORDER BY ref ASC",
+            "SELECT {} FROM work_queue WHERE effective_enabled AND retired_at IS NULL ORDER BY ref ASC",
             WORK_QUEUE_SELECT_COLUMNS
         );
         sqlx::query_as::<_, WorkQueue>(&query)
@@ -556,7 +572,7 @@ impl WorkQueueRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM work_queue WHERE pack_ref = $1 ORDER BY ref ASC",
+            "SELECT {} FROM work_queue WHERE pack_ref = $1 AND retired_at IS NULL ORDER BY ref ASC",
             WORK_QUEUE_SELECT_COLUMNS
         );
         sqlx::query_as::<_, WorkQueue>(&query)
@@ -574,12 +590,12 @@ impl WorkQueueRepository {
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
         let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
-            "SELECT {} FROM work_queue",
+            "SELECT {} FROM work_queue WHERE retired_at IS NULL",
             WORK_QUEUE_SELECT_COLUMNS
         ));
         let mut count_qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new("SELECT COUNT(*) FROM work_queue");
-        let mut has_where = false;
+            QueryBuilder::new("SELECT COUNT(*) FROM work_queue WHERE retired_at IS NULL");
+        let mut has_where = true;
 
         macro_rules! push_condition {
             ($sql:expr, $value:expr) => {{
@@ -606,7 +622,7 @@ impl WorkQueueRepository {
             push_condition!("dispatch_action = ", dispatch_action);
         }
         if let Some(enabled) = filters.enabled {
-            push_condition!("enabled = ", enabled);
+            push_condition!("effective_enabled = ", enabled);
         }
         if let Some(is_adhoc) = filters.is_adhoc {
             push_condition!("is_adhoc = ", is_adhoc);

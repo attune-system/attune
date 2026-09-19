@@ -18,11 +18,17 @@ DB_USER="${DB_USER:-attune}"
 DB_PASSWORD="${DB_PASSWORD:-attune}"
 DB_NAME="${DB_NAME:-attune}"
 DB_SCHEMA="${DB_SCHEMA:-attune}"
+export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-5}"
 
 # Test user configuration
 TEST_LOGIN="${TEST_LOGIN:-test@attune.local}"
 TEST_DISPLAY_NAME="${TEST_DISPLAY_NAME:-Test User}"
 TEST_PASSWORD="${TEST_PASSWORD:-TestPass123!}"
+BOOTSTRAP_TIMEOUT_SECONDS="${ATTUNE_BOOTSTRAP_TIMEOUT_SECONDS:-300}"
+if [ "$BOOTSTRAP_TIMEOUT_SECONDS" -gt 300 ]; then
+    BOOTSTRAP_TIMEOUT_SECONDS=300
+fi
+BOOTSTRAP_DEADLINE=$(( $(date +%s) + BOOTSTRAP_TIMEOUT_SECONDS ))
 
 # Pre-computed Argon2id hash for "TestPass123!"
 # Using: m=19456, t=2, p=1 (default Argon2id parameters)
@@ -44,6 +50,10 @@ echo ""
 # Wait for database to be ready
 echo -e "${YELLOW}→${NC} Waiting for database to be ready..."
 until PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c '\q' 2>/dev/null; do
+  if [ "$(date +%s)" -ge "$BOOTSTRAP_DEADLINE" ]; then
+    echo -e "${RED}✗${NC} Database did not become ready within ${BOOTSTRAP_TIMEOUT_SECONDS}s"
+    exit 1
+  fi
   echo -e "${YELLOW}  ...${NC} Database is unavailable - sleeping"
   sleep 2
 done
@@ -109,6 +119,42 @@ EOF
         exit 1
     fi
 fi
+
+echo -e "${YELLOW}→${NC} Waiting for platform-owned core.admin..."
+while :; do
+    ASSIGNED=$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+      --set=test_login="$TEST_LOGIN" -tA << EOF
+WITH assignment AS (
+    INSERT INTO ${DB_SCHEMA}.permission_assignment (identity, permset)
+    SELECT identity.id, permission_set.id
+    FROM ${DB_SCHEMA}.identity
+    JOIN ${DB_SCHEMA}.permission_set ON permission_set.ref = 'core.admin'
+      AND permission_set.management_origin = 'platform'
+    WHERE identity.login = :'test_login'
+    ON CONFLICT (identity, permset) DO NOTHING
+    RETURNING 1
+)
+SELECT EXISTS (
+    SELECT 1
+    FROM ${DB_SCHEMA}.permission_assignment assignment
+    JOIN ${DB_SCHEMA}.identity ON identity.id = assignment.identity
+    JOIN ${DB_SCHEMA}.permission_set ON permission_set.id = assignment.permset
+    WHERE identity.login = :'test_login'
+      AND permission_set.ref = 'core.admin'
+      AND permission_set.management_origin = 'platform'
+);
+EOF
+)
+    if [ "$ASSIGNED" = "t" ]; then
+        echo -e "${GREEN}✓${NC} Platform core.admin assignment ensured"
+        break
+    fi
+    if [ "$(date +%s)" -ge "$BOOTSTRAP_DEADLINE" ]; then
+        echo -e "${RED}✗${NC} Platform core.admin did not become available within ${BOOTSTRAP_TIMEOUT_SECONDS}s"
+        exit 1
+    fi
+    sleep 2
+done
 
 echo ""
 echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"

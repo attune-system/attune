@@ -139,6 +139,13 @@ impl PackReleaseRepository {
         pack: i64,
         release: i64,
     ) -> Result<()> {
+        // Lock the pack before releases or components. Component inserts take a
+        // conflicting SHARE lock while selecting their managed release.
+        sqlx::query("SELECT id FROM pack WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(pack)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| Error::not_found("pack", "id", pack.to_string()))?;
         sqlx::query(
             "UPDATE pack_release SET inactive_since = NOW() WHERE pack = $1 \
              AND id = (SELECT active_release FROM pack WHERE id = $1) AND id <> $2",
@@ -161,5 +168,28 @@ impl PackReleaseRepository {
             return Err(Error::not_found("pack release", "id", release.to_string()));
         }
         Ok(())
+    }
+
+    pub async fn activate_projected(
+        transaction: &mut Transaction<'_, Postgres>,
+        pack: i64,
+        release: i64,
+        projections: &super::component_lifecycle::PackProjectionIds,
+    ) -> Result<()> {
+        Self::activate(transaction, pack, release).await?;
+        super::component_lifecycle::ComponentLifecycleRepository::stamp_release(
+            transaction,
+            pack,
+            release,
+            projections,
+        )
+        .await?;
+        super::executable_snapshot::ExecutableSnapshotRepository::capture_present(
+            transaction,
+            release,
+            &projections.actions,
+            &projections.sensors,
+        )
+        .await
     }
 }

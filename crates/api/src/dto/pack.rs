@@ -6,6 +6,8 @@ use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
+pub use attune_common::models::AbsentMetadataPolicy;
+
 use crate::dto::common::PaginationParams;
 
 fn default_page() -> u32 {
@@ -128,6 +130,10 @@ pub struct RegisterPackRequest {
     #[serde(default)]
     #[schema(example = false)]
     pub force: bool,
+
+    /// How to handle pack-managed metadata omitted by this release.
+    #[serde(default)]
+    pub absent_metadata_policy: AbsentMetadataPolicy,
 }
 
 /// Request DTO for installing a pack from remote source
@@ -163,6 +169,10 @@ pub struct InstallPackRequest {
     #[serde(default)]
     #[schema(example = false)]
     pub skip_deps: bool,
+
+    /// How to handle pack-managed metadata omitted by this release.
+    #[serde(default)]
+    pub absent_metadata_policy: AbsentMetadataPolicy,
 }
 
 /// API-managed pack registry index configuration.
@@ -309,6 +319,8 @@ pub struct PackInstallStatusResponse {
     pub status: String,
     /// Why the install was triggered (install, update, manual, validation)
     pub trigger_reason: String,
+    /// Policy applied to metadata omitted by this release.
+    pub absent_metadata_policy: AbsentMetadataPolicy,
     /// ID of the pack_test_execution row produced by the run, when available
     pub test_execution_id: Option<i64>,
     /// Snapshot of the PackTestResult, when available
@@ -329,6 +341,7 @@ impl From<attune_common::models::PackInstall> for PackInstallStatusResponse {
             pack_version: record.pack_version,
             status: record.status,
             trigger_reason: record.trigger_reason,
+            absent_metadata_policy: record.absent_metadata_policy,
             test_execution_id: record.test_execution_id,
             test_result: record.test_result,
             error_message: record.error_message,
@@ -503,6 +516,46 @@ pub struct PackResponse {
     /// Last update timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub updated: DateTime<Utc>,
+}
+
+/// Public metadata for an immutable pack release.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PackReleaseResponse {
+    pub id: i64,
+    pub version: String,
+    pub digest: String,
+    pub archive_size: i64,
+    pub created: DateTime<Utc>,
+    pub inactive_since: Option<DateTime<Utc>>,
+    pub is_active: bool,
+}
+
+/// A component removed from the active projection of an installed pack.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RetiredPackComponentResponse {
+    pub kind: String,
+    pub id: i64,
+    pub component_ref: Option<String>,
+    pub managed_release: Option<i64>,
+    pub retired_at: DateTime<Utc>,
+}
+
+/// Compatibility between the database catalog and this API build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformCatalogStatus {
+    Current,
+    UpgradeRequired,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlatformCatalogStateResponse {
+    pub compatibility_epoch: i32,
+    pub revision: i32,
+    pub expected_compatibility_epoch: i32,
+    pub expected_revision: i32,
+    pub status: PlatformCatalogStatus,
 }
 
 /// Simplified pack response (for list endpoints)
@@ -939,6 +992,10 @@ pub struct RegisterPacksRequest {
     #[serde(default)]
     #[schema(example = false)]
     pub force: bool,
+
+    /// How to handle pack-managed metadata omitted by each release.
+    #[serde(default)]
+    pub absent_metadata_policy: AbsentMetadataPolicy,
 }
 
 /// Response DTO for register packs operation

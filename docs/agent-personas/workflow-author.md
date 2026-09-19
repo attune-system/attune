@@ -35,7 +35,7 @@ If some items are missing, make explicit placeholders and assumptions.
 5. Ordered task list: action refs, inputs, expected result shapes, failure behavior, retries, and timeouts.
 6. Branching needs: success, failure, timeout, unconditional, and custom expression conditions.
 7. Data flow: what each task publishes into `workflow.*` and what `output_map` returns.
-8. Whether human approval/input is required with `core.ask`.
+8. Whether an action must create an inquiry for a later `wait_for.inquiry` task.
 9. Whether iteration uses an in-context array with `with_items` or a Data Cache
    with `iterate_cache`, including item shape, batch size, scan page size,
    freshness, and `concurrency`.
@@ -155,7 +155,9 @@ tasks:
           - deploy_regions
 
   - name: ask_for_approval
-    action: core.ask
+    action: slack.request_approval
+    permission_set_refs:
+      - workflow-inquiry-create
     input:
       prompt: "Approve production deployment of {{ parameters.app_name }} {{ parameters.version }}?"
       assigned_to: "{{ parameters.approver_identity_id }}"
@@ -165,14 +167,23 @@ tasks:
           required: true
         note:
           type: string
-    timeout: 3600
     next:
-      - when: "{{ succeeded() and result().response.approved == true }}"
+      - do:
+          - check_approval
+
+  - name: check_approval
+    action: deployments.check_approval
+    wait_for:
+      inquiry: "{{ task.ask_for_approval.inquiry_id }}"
+    input:
+      response: "{{ inquiry.check_approval.response }}"
+    next:
+      - when: "{{ succeeded() and inquiry.check_approval.response.approved == true }}"
         publish:
           - approved: true
         do:
           - deploy_regions
-      - when: "{{ succeeded() and result().response.approved != true }}"
+      - when: "{{ succeeded() and inquiry.check_approval.response.approved != true }}"
         do:
           - cancelled
       - when: "{{ timed_out() }}"
@@ -468,38 +479,20 @@ error summary. Child inputs are deliberate disclosure to the called action.
 `with_items` for arrays already in workflow context; use `iterate_cache` for
 bounded, lazy, generation-pinned cache traversal.
 
-### core.ask human-in-the-loop pattern
+### Action-owned inquiry pattern
 
-`core.ask` is a native action, but the scheduler intercepts `core.ask` when it is a workflow task: it creates an inquiry, marks the child execution running, and does not send it to a worker. When the inquiry is answered, the task completes with result shape `{"response": ...}`. If the task timeout expires, use a `timed_out()` transition.
+An integration action creates and delivers an inquiry, then returns its `inquiry_id`. Put `wait_for.inquiry` on the guarded task. The executor does not create the guarded child until the inquiry is answered.
 
 ```yaml
-- name: approval
-  action: core.ask
+- name: continue_deploy
+  action: deployments.release
+  wait_for:
+    inquiry: "{{ task.request_approval.inquiry_id }}"
   input:
-    prompt: "Approve deployment to {{ parameters.environment }}?"
-    assigned_to: "{{ parameters.approver_identity_id }}"
-    response_schema:
-      approved:
-        type: boolean
-        required: true
-      reason:
-        type: string
-  timeout: 1800
-  next:
-    - when: "{{ succeeded() and result().response.approved == true }}"
-      publish:
-        - approved: true
-      do:
-        - continue_deploy
-    - when: "{{ succeeded() and result().response.approved != true }}"
-      do:
-        - stop_deploy
-    - when: "{{ timed_out() }}"
-      do:
-        - approval_timed_out
+    approved: "{{ inquiry.continue_deploy.response.approved }}"
 ```
 
-`assigned_to` is an identity id, not a role name or email string.
+The creator action needs a named permission set that grants `inquiries:create`. See `docs/workflows/inquiry-handling.md` for the API and idempotency contract.
 
 ### Task permission_set_refs
 
@@ -554,10 +547,10 @@ When working inside the Attune repository, verify against source before making s
 - `crates/common/src/workflow/parser.rs`: workflow YAML model, transition normalization, task fields, publish directives.
 - `crates/executor/src/workflow/context.rs`: namespaces, expression evaluation, type-preserving rendering.
 - `crates/executor/src/workflow/graph.rs`: `next` transition graph representation.
-- `crates/executor/src/scheduler.rs`: workflow orchestration, `with_items`, `permission_set_refs`, `core.ask`, `output_map`.
+- `crates/executor/src/scheduler.rs`: workflow orchestration, `with_items`, inquiry waits, `permission_set_refs`, and `output_map`.
 - `crates/api/src/routes/workflows.rs`: visual-builder save format and action/workflow file generation.
 - `crates/common/src/pack_registry/loader.rs`: `workflow_file` handling and workflow action runtime behavior.
-- `packs/core/actions/ask.yaml`: current `core.ask` action parameters.
+- `docs/workflows/inquiry-handling.md`: action-owned inquiry creation and durable waits.
 - `docs/examples/cache-iteration-workflow-action.yaml` and
   `docs/examples/cache-iteration-workflow.workflow.yaml`: canonical two-file
   native cache iteration example.
@@ -579,7 +572,7 @@ When working inside the Attune repository, verify against source before making s
       freshness, page and batch sizes, read permission, and safe `concurrency`.
 - [ ] Cache batch values and external IDs are not published, logged, or returned
       unintentionally.
-- [ ] `core.ask` tasks use `prompt`, optional `response_schema`, numeric `assigned_to`, and timeout handling.
+- [ ] Inquiry creator actions have an explicit `inquiries:create` permission set and return `inquiry_id`.
 - [ ] `permission_set_refs` are minimal and intentional.
 - [ ] Worker placement is omitted unless required or intentionally cleared.
 - [ ] Output mapping returns stable documented values.
@@ -620,10 +613,10 @@ The guidance above is based on current Attune implementation details:
 - Visual-builder/API saves write action YAML to `actions/<name>.yaml` and graph-only workflow YAML to `actions/workflows/<name>.workflow.yaml`.
 - Parser fields include `next`, `publish`, `with_items`, `batch_size`, `concurrency`, `permission_set_refs`, and worker placement overrides.
 - Legacy transition fields are normalized into `next` during parsing, but new workflows should emit `next` directly.
-- Workflow context supports `parameters`, `workflow`, `task`, `config`, `keystore`, `item`, `index`, and `system`; aliases are backward-compatible only.
+- Workflow context supports `parameters`, `workflow`, `task`, `inquiry`, `config`, `keystore`, `item`, `index`, and `system`; aliases are backward-compatible only.
 - Pure `{{ ... }}` templates preserve JSON values; mixed strings stringify.
 - `with_items` defaults to concurrency `1` and publishes deferred items as earlier siblings complete.
 - `iterate_cache` scans one pinned cache generation into typed child batches;
   `generation` defaults to `active`, `require_fresh` to `false`, `page_size` to
   `100`, and task `batch_size` and concurrency to `1`.
-- `core.ask` workflow tasks create inquiries and complete with `result().response` when answered.
+- Guarded workflow tasks read responses through `inquiry.<task_name>.response`.

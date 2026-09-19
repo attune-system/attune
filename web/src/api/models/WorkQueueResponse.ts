@@ -30,6 +30,7 @@ export type WorkQueueResponse = {
   reference_allowed_pack_refs: Array<string>;
   reference_visibility: ActionReferenceVisibility;
   resolved_dispatch_tuning?: null | ResolvedWorkQueueDispatchTuningResponse;
+  retired_at?: string | null;
   trace_tag_template?: string | null;
   update_strategy: WorkQueueUpdateStrategy;
   updated: string;

@@ -596,6 +596,7 @@ mod tests {
             action_ref: "test.action".to_string(),
             action: Some(1),
             enabled: false, // Disabled
+            enabled_override: None,
             conditions: json!({}),
             action_params: json!({}),
             trigger_params: json!({}),
@@ -606,6 +607,7 @@ mod tests {
             permission_set_refs: None,
             is_adhoc: false,
             owner_identity: None,
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         };
@@ -658,6 +660,7 @@ mod tests {
             action_ref: "test.action".to_string(),
             action: Some(1),
             enabled: true,
+            enabled_override: None,
             conditions: json!({}),
             action_params: json!({}),
             trigger_params: json!({}),
@@ -668,6 +671,7 @@ mod tests {
             permission_set_refs: None,
             is_adhoc: false,
             owner_identity: None,
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         }

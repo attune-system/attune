@@ -50,6 +50,7 @@ export type ApiResponse_WorkflowResponse = {
      * Unique reference identifier
      */
     ref: string;
+    retired_at?: string | null;
     /**
      * Tags
      */

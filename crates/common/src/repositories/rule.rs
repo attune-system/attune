@@ -13,7 +13,7 @@ use super::{
 
 /// Columns selected when reading `rule` rows. Keep in sync with the `Rule`
 /// model struct in `crates/common/src/models.rs`.
-pub const SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, action, action_ref, trigger, trigger_ref, conditions, action_params, trigger_params, sensor_worker_selector, sensor_worker_tolerations, sensor_worker_affinity, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated";
+pub const SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, action, action_ref, trigger, trigger_ref, conditions, action_params, trigger_params, sensor_worker_selector, sensor_worker_tolerations, sensor_worker_affinity, trace_tag_template, permission_set_refs, effective_enabled AS enabled, enabled_override, is_adhoc, owner_identity, retired_at, created, updated";
 
 #[derive(Debug, Clone)]
 pub struct RuleSensorPlacementInput {
@@ -154,11 +154,12 @@ impl FindById for RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rule =
-            sqlx::query_as::<_, Rule>(&format!("SELECT {SELECT_COLUMNS} FROM rule WHERE id = $1"))
-                .bind(id)
-                .fetch_optional(executor)
-                .await?;
+        let rule = sqlx::query_as::<_, Rule>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE id = $1 AND retired_at IS NULL"
+        ))
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
 
         Ok(rule)
     }
@@ -170,11 +171,12 @@ impl FindByRef for RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rule =
-            sqlx::query_as::<_, Rule>(&format!("SELECT {SELECT_COLUMNS} FROM rule WHERE ref = $1"))
-                .bind(ref_str)
-                .fetch_optional(executor)
-                .await?;
+        let rule = sqlx::query_as::<_, Rule>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE ref = $1 AND retired_at IS NULL"
+        ))
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await?;
 
         Ok(rule)
     }
@@ -187,7 +189,7 @@ impl List for RuleRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let rules = sqlx::query_as::<_, Rule>(&format!(
-            "SELECT {SELECT_COLUMNS} FROM rule ORDER BY ref ASC"
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE retired_at IS NULL ORDER BY ref ASC"
         ))
         .fetch_all(executor)
         .await?;
@@ -210,6 +212,20 @@ impl Create for RuleRepository {
 }
 
 impl RuleRepository {
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<Rule>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Rule>(&format!("SELECT {SELECT_COLUMNS} FROM rule WHERE ref = $1"))
+            .bind(ref_str)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn create_with_sensor_placement<'e, E>(
         executor: E,
         input: CreateRuleInput,
@@ -228,7 +244,7 @@ impl RuleRepository {
             RETURNING id, ref, pack, pack_ref, label, description, action, action_ref,
                       trigger, trigger_ref, conditions, action_params, trigger_params,
                       sensor_worker_selector, sensor_worker_tolerations, sensor_worker_affinity,
-                      trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
+                       trace_tag_template, permission_set_refs, effective_enabled AS enabled, enabled_override, is_adhoc, owner_identity, retired_at, created, updated
             "#,
         )
         .bind(&input.r#ref)
@@ -428,7 +444,7 @@ impl Update for RuleRepository {
             if has_updates {
                 query.push(", ");
             }
-            query.push("enabled = ");
+            query.push("enabled_override = ");
             query.push_bind(enabled);
             has_updates = true;
         }
@@ -494,12 +510,13 @@ impl RuleRepository {
     {
         let select_cols = SELECT_COLUMNS;
 
-        let mut qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new(format!("SELECT {select_cols} FROM rule"));
+        let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+            "SELECT {select_cols} FROM rule WHERE retired_at IS NULL"
+        ));
         let mut count_qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new("SELECT COUNT(*) FROM rule");
+            QueryBuilder::new("SELECT COUNT(*) FROM rule WHERE retired_at IS NULL");
 
-        let mut has_where = false;
+        let mut has_where = true;
 
         macro_rules! push_condition {
             ($cond_prefix:expr, $value:expr) => {{
@@ -537,7 +554,7 @@ impl RuleRepository {
             push_condition!("trigger_ref = ", trigger_ref);
         }
         if let Some(enabled) = filters.enabled {
-            push_condition!("enabled = ", enabled);
+            push_condition!("effective_enabled = ", enabled);
         }
         for pattern in text_search_patterns(filters.query.as_deref()) {
             if !has_where {
@@ -632,7 +649,7 @@ impl RuleRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let rules = sqlx::query_as::<_, Rule>(&format!(
-            "SELECT {SELECT_COLUMNS} FROM rule WHERE pack = $1 ORDER BY ref ASC"
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE pack = $1 AND retired_at IS NULL ORDER BY ref ASC"
         ))
         .bind(pack_id)
         .fetch_all(executor)
@@ -646,10 +663,11 @@ impl RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rule WHERE pack_ref = $1")
-            .bind(pack_ref)
-            .fetch_one(executor)
-            .await?;
+        let result: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM rule WHERE pack_ref = $1 AND retired_at IS NULL")
+                .bind(pack_ref)
+                .fetch_one(executor)
+                .await?;
         Ok(result.0)
     }
 
@@ -659,7 +677,7 @@ impl RuleRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let rules = sqlx::query_as::<_, Rule>(&format!(
-            "SELECT {SELECT_COLUMNS} FROM rule WHERE action = $1 ORDER BY ref ASC"
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE action = $1 AND retired_at IS NULL ORDER BY ref ASC"
         ))
         .bind(action_id)
         .fetch_all(executor)
@@ -674,7 +692,7 @@ impl RuleRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let rules = sqlx::query_as::<_, Rule>(&format!(
-            "SELECT {SELECT_COLUMNS} FROM rule WHERE trigger = $1 ORDER BY ref ASC"
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE trigger = $1 AND retired_at IS NULL ORDER BY ref ASC"
         ))
         .bind(trigger_id)
         .fetch_all(executor)
@@ -689,7 +707,7 @@ impl RuleRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let rules = sqlx::query_as::<_, Rule>(&format!(
-            "SELECT {SELECT_COLUMNS} FROM rule WHERE enabled = true ORDER BY ref ASC"
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE effective_enabled AND retired_at IS NULL ORDER BY ref ASC"
         ))
         .fetch_all(executor)
         .await?;

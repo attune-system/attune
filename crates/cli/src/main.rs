@@ -12,6 +12,33 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // Release operations must not read profiles, create config, or initialize a client.
+    if let Commands::Pack {
+        command: commands::pack::PackCommands::Release { command },
+    } = &cli.command
+    {
+        if cli.output == Some(CliOutputFormat::Ndjson) {
+            eprintln!(
+                "Error: --output ndjson is only supported by 'attune cache entry scan --all'"
+            );
+            process::exit(1);
+        }
+        let format = if cli.json {
+            output::OutputFormat::Json
+        } else if cli.yaml {
+            output::OutputFormat::Yaml
+        } else {
+            cli.output
+                .map(output::OutputFormat::from)
+                .unwrap_or(output::OutputFormat::Table)
+        };
+        if let Err(error) = commands::pack_release::handle(command.clone(), format).await {
+            eprintln!("Error: {error:#}");
+            process::exit(1);
+        }
+        return;
+    }
+
     // Completion is deliberately read-only. In particular, avoid the normal
     // configuration/output initialization because it creates a default config.
     match &cli.command {

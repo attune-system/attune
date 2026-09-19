@@ -7,6 +7,8 @@
  */
 
 import type { ExecutionSummary } from "@/api";
+import { WorkflowTaskWaitState } from "@/api";
+import type { WorkflowTaskWait } from "@/hooks/useWorkflowTaskWaits";
 import type {
   TimelineTask,
   TimelineEdge,
@@ -107,40 +109,6 @@ function transitionMatchesStatus(
   }
 }
 
-/**
- * Determine the representative terminal status for a task name from a group
- * of executions.  For with_items tasks, if any item failed that dominates;
- * otherwise use the first terminal status found.
- */
-function representativeStatus(
-  executions: ExecutionSummary[],
-): string | undefined {
-  let hasCompleted = false;
-  let hasFailed = false;
-  let hasTimeout = false;
-
-  for (const exec of executions) {
-    switch (exec.status) {
-      case "failed":
-        hasFailed = true;
-        break;
-      case "timeout":
-        hasTimeout = true;
-        break;
-      case "completed":
-        hasCompleted = true;
-        break;
-    }
-  }
-
-  // Failure takes priority (matches how advance_workflow determines outcome)
-  if (hasFailed) return "failed";
-  if (hasTimeout) return "timeout";
-  if (hasCompleted) return "completed";
-  // No terminal status yet — return undefined
-  return undefined;
-}
-
 /** Derive a short human-readable label for a `when` expression */
 function labelForWhen(when?: string, chartLabel?: string): string | undefined {
   if (chartLabel) return chartLabel;
@@ -227,6 +195,16 @@ function groupByTaskName(
   return groups;
 }
 
+function timelineTaskIdsByName(tasks: TimelineTask[]): Map<string, string[]> {
+  const groups = new Map<string, string[]>();
+  for (const task of tasks) {
+    const ids = groups.get(task.name) ?? [];
+    ids.push(task.id);
+    groups.set(task.name, ids);
+  }
+  return groups;
+}
+
 // ---------------------------------------------------------------------------
 // Public API: buildTimelineTasks
 // ---------------------------------------------------------------------------
@@ -298,11 +276,78 @@ export function buildTimelineTasks(
       retryCount: wt?.retry_count ?? 0,
       maxRetries: wt?.max_retries ?? 0,
       durationMs,
-      execution: exec,
+      destination: { kind: "execution", executionId: exec.id },
     });
   }
 
   return tasks;
+}
+
+function waitStateToTaskState(state: WorkflowTaskWaitState): TaskState {
+  switch (state) {
+    case WorkflowTaskWaitState.WAITING:
+      return "waiting";
+    case WorkflowTaskWaitState.RELEASED:
+      return "released";
+    case WorkflowTaskWaitState.TIMED_OUT:
+      return "timeout";
+    case WorkflowTaskWaitState.CANCELLED:
+      return "cancelled";
+    case WorkflowTaskWaitState.FAILED:
+      return "failed";
+  }
+}
+
+export function buildSyntheticWaitTasks({
+  waits,
+  childExecutions,
+  workflowDef,
+  parentExecutionId,
+  nowMs = Date.now(),
+}: {
+  waits: WorkflowTaskWait[];
+  childExecutions: ExecutionSummary[];
+  workflowDef?: WorkflowDefinition | null;
+  parentExecutionId: number;
+  nowMs?: number;
+}): TimelineTask[] {
+  const dispatchedTaskNames = new Set(
+    childExecutions
+      .filter((execution) => execution.parent === parentExecutionId)
+      .map((execution) => execution.workflow_task?.task_name)
+      .filter((taskName): taskName is string => taskName != null),
+  );
+  const definitionsByName = new Map(
+    workflowDef?.tasks?.map((task) => [task.name, task]) ?? [],
+  );
+
+  return waits
+    .filter((wait) => !dispatchedTaskNames.has(wait.task_name))
+    .map((wait) => {
+      const definition = definitionsByName.get(wait.task_name);
+      const startMs = new Date(wait.created).getTime();
+      const endMs =
+        wait.state === WorkflowTaskWaitState.WAITING
+          ? nowMs
+          : new Date(wait.resolved_at ?? wait.updated).getTime();
+
+      return {
+        id: `__wait_${wait.id}__`,
+        name: wait.task_name,
+        actionRef: definition?.action ?? wait.task_name,
+        state: waitStateToTaskState(wait.state),
+        startMs,
+        endMs,
+        upstreamIds: [],
+        downstreamIds: [],
+        taskIndex: null,
+        timedOut: wait.state === WorkflowTaskWaitState.TIMED_OUT,
+        retryCount: 0,
+        maxRetries: 0,
+        durationMs: Math.max(0, endMs - startMs),
+        destination: { kind: "inquiry", inquiryId: wait.inquiry_id },
+      };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +502,7 @@ export function collapseWithItemsGroups(
       retryCount: 0,
       maxRetries: 0,
       durationMs,
-      execution: representative.execution,
+      destination: representative.destination,
       groupInfo,
     });
 
@@ -909,6 +954,65 @@ export function buildEdges(
       }
     }
 
+    // A wait has no execution yet, so triggered_by cannot describe its edges.
+    // Fill only the definition edges that touch a synthetic wait node.
+    if (
+      workflowDef?.tasks &&
+      tasks.some((task) => task.destination.kind === "inquiry")
+    ) {
+      const allTaskIdsByName = timelineTaskIdsByName(tasks);
+      const syntheticIds = new Set(
+        tasks
+          .filter((task) => task.destination.kind === "inquiry")
+          .map((task) => task.id),
+      );
+      const taskById = new Map(tasks.map((task) => [task.id, task]));
+      const edgeKeys = new Set(edges.map((edge) => `${edge.from}→${edge.to}`));
+
+      for (const definitionTask of workflowDef.tasks) {
+        const sourceIds = allTaskIdsByName.get(definitionTask.name) ?? [];
+        for (const transition of normalizeLegacyTransitions(definitionTask)) {
+          const kind = classifyWhen(transition.when);
+          const sourceState = sourceIds
+            .map((id) => taskById.get(id)?.state)
+            .find((state) => state != null);
+          if (!transitionMatchesStatus(kind, sourceState)) continue;
+
+          for (const targetName of transition.do ?? []) {
+            const targetIds = allTaskIdsByName.get(targetName) ?? [];
+            if (
+              !sourceIds.some((id) => syntheticIds.has(id)) &&
+              !targetIds.some((id) => syntheticIds.has(id))
+            ) {
+              continue;
+            }
+
+            const meta = lookupTransitionMeta(
+              definitionTask.name,
+              targetName,
+              kind,
+              workflowDef,
+            );
+            for (const sourceId of sourceIds) {
+              for (const targetId of targetIds) {
+                const key = `${sourceId}→${targetId}`;
+                if (sourceId === targetId || edgeKeys.has(key)) continue;
+                edgeKeys.add(key);
+                linkConnectivity(globalTaskById, [sourceId], [targetId]);
+                edges.push({
+                  from: sourceId,
+                  to: targetId,
+                  kind,
+                  label: meta.label,
+                  color: meta.color,
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+
     // Deduplicate connectivity (linkConnectivity may add duplicates)
     for (const task of tasks) {
       task.upstreamIds = [...new Set(task.upstreamIds)];
@@ -925,14 +1029,15 @@ export function buildEdges(
     // its `succeeded()` and `always` transitions are drawn — the
     // `failed()` branch is omitted because that path was never taken.
     // ---------------------------------------------------------------
-    const groups = groupByTaskName(childExecutions);
-    const taskIdsByName = new Map<string, string[]>();
+    const taskIdsByName = timelineTaskIdsByName(tasks);
     // Build a map of task name → representative terminal status
     const taskStatusByName = new Map<string, string | undefined>();
-    for (const [name, execs] of groups) {
-      const ids = [...new Set(execs.map((e) => resolve(String(e.id))))];
-      taskIdsByName.set(name, ids);
-      taskStatusByName.set(name, representativeStatus(execs));
+    const taskById = new Map(tasks.map((task) => [task.id, task]));
+    for (const [name, ids] of taskIdsByName) {
+      taskStatusByName.set(
+        name,
+        ids.map((id) => taskById.get(id)?.state).find((state) => state != null),
+      );
     }
 
     for (const defTask of workflowDef.tasks) {

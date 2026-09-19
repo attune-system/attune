@@ -19,6 +19,7 @@ export type ApiResponse_DashboardMetadataResponse = {
     owner_identity?: number | null;
     pack?: number | null;
     ref: string;
+    retired_at?: string | null;
     revision: number;
     scope_ref: string;
     scope_type: DashboardScopeType;

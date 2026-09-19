@@ -439,6 +439,7 @@ pub async fn list_permission_sets(
             label: permission_set.label,
             description: permission_set.description,
             grants: permission_set.grants,
+            retired_at: permission_set.retired_at,
             roles: roles
                 .into_iter()
                 .map(|assignment| PermissionSetRoleAssignmentResponse {
@@ -524,6 +525,7 @@ pub async fn update_permission_set(
             label: updated.label,
             description: updated.description,
             grants: updated.grants,
+            retired_at: updated.retired_at,
             roles: roles
                 .into_iter()
                 .map(|assignment| PermissionSetRoleAssignmentResponse {

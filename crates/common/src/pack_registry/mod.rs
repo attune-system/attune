@@ -12,6 +12,7 @@ pub mod dependency;
 pub mod installer;
 pub mod loader;
 pub mod outbound;
+pub mod policy;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};

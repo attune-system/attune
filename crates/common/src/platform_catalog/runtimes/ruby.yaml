@@ -1,0 +1,29 @@
+ref: core.ruby
+pack_ref: core
+name: Ruby
+aliases: [ruby, rb]
+description: Ruby runtime for script execution with automatic gem environment management
+distributions:
+  verification:
+    commands:
+      - {binary: ruby, args: ["--version"], exit_code: 0, pattern: 'ruby \d+\.', priority: 1}
+  min_version: "2.7"
+  recommended_version: "3.2"
+installation:
+  package_managers: [gem, bundler]
+  interpreters: [ruby]
+  portable: false
+execution_config:
+  interpreter: {binary: ruby, args: [], file_extension: .rb}
+  environment:
+    env_type: gem_home
+    dir_name: gems
+    create_command: [sh, "-c", "mkdir -p {env_dir}/gems"]
+    interpreter_path: null
+  dependencies:
+    manifest_file: Gemfile
+    install_command: [sh, "-c", "cd {pack_dir} && GEM_HOME={env_dir}/gems GEM_PATH={env_dir}/gems bundle install --quiet 2>/dev/null || true"]
+  env_vars:
+    GEM_HOME: "{env_dir}/gems"
+    GEM_PATH: "{env_dir}/gems"
+    BUNDLE_PATH: "{env_dir}/gems"

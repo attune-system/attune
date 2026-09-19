@@ -275,6 +275,23 @@ impl WorkerRegistration {
             self.capabilities.insert(key, value);
         }
 
+        // Native execution has no interpreter dependency and is always registered
+        // by WorkerService, including when an interpreter allow-list is configured.
+        let runtimes = self
+            .capabilities
+            .get_mut("runtimes")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| {
+                Error::Internal("Runtime detection did not return a runtime list".into())
+            })?;
+        if !runtimes.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|name| normalize_runtime_name(name) == "native")
+        }) {
+            runtimes.push(json!("native"));
+        }
+
         info!("Worker capabilities detected: {:?}", self.capabilities);
 
         Ok(())
@@ -613,7 +630,12 @@ mod tests {
             server: attune_common::config::ServerConfig::default(),
             log: attune_common::config::LogConfig::default(),
             security: attune_common::config::SecurityConfig::default(),
-            worker: None,
+            worker: Some(
+                serde_json::from_value(json!({
+                    "capabilities": {"runtimes": ["python"]}
+                }))
+                .unwrap(),
+            ),
             sensor: None,
             packs_base_dir: "/tmp/packs".to_string(),
             packs: attune_common::config::PacksConfig::default(),
@@ -632,6 +654,12 @@ mod tests {
             cache_admission: attune_common::config::CacheAdmissionConfig::default(),
         };
         let mut registration = WorkerRegistration::new(pool, &config);
+
+        registration.detect_capabilities(&config).await.unwrap();
+        assert!(registration.capabilities["runtimes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("native")));
 
         registration.set_detected_runtimes(vec![
             DetectedRuntime {

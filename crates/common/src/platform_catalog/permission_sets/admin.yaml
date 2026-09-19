@@ -1,0 +1,25 @@
+ref: core.admin
+label: Admin
+description: Full administrative access across Attune resources.
+grants:
+  - {resource: packs, actions: [read, create, install, configure, delete]}
+  - {resource: actions, actions: [read, create, update, delete, execute]}
+  - {resource: policies, actions: [read, create, update, delete]}
+  - {resource: queues, actions: [read, create, update, delete]}
+  - {resource: queue_items, actions: [read, create, update, delete]}
+  - {resource: rules, actions: [read, create, update, delete]}
+  - {resource: triggers, actions: [read, create, update, delete]}
+  - {resource: executions, actions: [read, update, cancel, decrypt]}
+  - {resource: events, actions: [read, decrypt]}
+  - {resource: enforcements, actions: [read, decrypt]}
+  - {resource: inquiries, actions: [read, create, update, delete, respond]}
+  - {resource: keys, actions: [read, create, update, delete, decrypt]}
+  - {resource: caches, actions: [read, create, update, delete]}
+  - {resource: artifacts, actions: [read, create, update, delete]}
+  - {resource: runtimes, actions: [read, create, update, delete]}
+  - {resource: workers, actions: [read, manage]}
+  - {resource: dashboards, actions: [read, create, update, delete]}
+  - {resource: retention, actions: [read, update]}
+  - {resource: identities, actions: [read, create, update, delete]}
+  - {resource: permissions, actions: [read, create, update, delete, manage]}
+  - {resource: audit_log, actions: [read]}

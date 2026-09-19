@@ -39,6 +39,9 @@ async fn test_health_check() {
     let ctx = TestContext::new()
         .await
         .expect("Failed to create test context");
+    attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)
+        .await
+        .expect("Failed to reconcile platform catalog");
 
     let response = ctx
         .get("/health", None)
@@ -58,6 +61,9 @@ async fn test_health_detailed() {
     let ctx = TestContext::new()
         .await
         .expect("Failed to create test context");
+    attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)
+        .await
+        .expect("Failed to reconcile platform catalog");
 
     let response = ctx
         .get("/health/detailed", None)
@@ -79,6 +85,95 @@ async fn test_health_ready() {
     let ctx = TestContext::new()
         .await
         .expect("Failed to create test context");
+    attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)
+        .await
+        .expect("Failed to reconcile platform catalog");
+
+    let response = ctx
+        .get("/health/ready", None)
+        .await
+        .expect("Failed to make request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["catalog"]["compatibility_epoch"], 1);
+    assert_eq!(body["catalog"]["revision"], 1);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_health_content_is_unavailable_without_core_or_hosts() {
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)
+        .await
+        .expect("Failed to reconcile platform catalog");
+
+    let response = ctx
+        .get("/health/content", None)
+        .await
+        .expect("Failed to make request");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["content"]["core_active"], false);
+    assert_eq!(body["capabilities"]["action_host_available"], false);
+    assert_eq!(body["capabilities"]["sensor_host_available"], false);
+    assert_eq!(body["transitional"], true);
+
+    sqlx::query(
+        "INSERT INTO worker (name, worker_type, worker_role, status, last_heartbeat) VALUES
+            ('health-action-host', 'container', 'action', 'active', clock_timestamp()),
+            ('health-sensor-host', 'container', 'sensor', 'active', clock_timestamp())",
+    )
+    .execute(&ctx.pool)
+    .await
+    .expect("Failed to register fresh hosts");
+
+    let response = ctx
+        .get("/health/content", None)
+        .await
+        .expect("Failed to make request");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["content"]["core_active"], false);
+    assert_eq!(body["capabilities"]["action_host_available"], false);
+    assert_eq!(body["capabilities"]["sensor_host_available"], false);
+
+    sqlx::query(
+        "UPDATE worker SET capabilities = CASE worker_role
+            WHEN 'action' THEN '{\"runtimes\":[\"python\"]}'::jsonb
+            ELSE '{\"runtimes\":[\"native\"]}'::jsonb
+         END
+         WHERE name IN ('health-action-host', 'health-sensor-host')",
+    )
+    .execute(&ctx.pool)
+    .await
+    .expect("Failed to advertise host runtimes");
+
+    let response = ctx
+        .get("/health/content", None)
+        .await
+        .expect("Failed to make request");
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["capabilities"]["action_host_available"], true);
+    assert_eq!(body["capabilities"]["sensor_host_available"], true);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_health_ready_rejects_non_current_catalog_revision() {
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    sqlx::query("UPDATE platform_catalog_state SET revision = 0 WHERE singleton")
+        .execute(&ctx.pool)
+        .await
+        .expect("Failed to set stale catalog revision");
 
     let response = ctx
         .get("/health/ready", None)
@@ -86,9 +181,9 @@ async fn test_health_ready() {
         .expect("Failed to make request");
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
     let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
-    assert_eq!(body["packs"][0], "core");
+    assert_eq!(body["catalog"]["revision"], 0);
+    assert_eq!(body["catalog"]["expected_revision"], 1);
 }
 
 #[tokio::test]

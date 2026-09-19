@@ -33,6 +33,7 @@ pub struct DashboardMetadataResponse {
     #[schema(value_type = Object)]
     pub spec: JsonValue,
     pub tags: Vec<String>,
+    pub retired_at: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }
@@ -56,6 +57,7 @@ impl From<Dashboard> for DashboardMetadataResponse {
             spec_version: value.spec_version,
             spec: value.spec,
             tags: value.tags,
+            retired_at: value.retired_at,
             created: value.created,
             updated: value.updated,
         }
@@ -74,6 +76,7 @@ pub struct DashboardListItemResponse {
     pub is_default_home: bool,
     pub revision: i32,
     pub tags: Vec<String>,
+    pub retired_at: Option<DateTime<Utc>>,
     pub updated: DateTime<Utc>,
 }
 
@@ -90,6 +93,7 @@ impl From<Dashboard> for DashboardListItemResponse {
             is_default_home: value.is_default_home,
             revision: value.revision,
             tags: value.tags,
+            retired_at: value.retired_at,
             updated: value.updated,
         }
     }

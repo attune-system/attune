@@ -390,6 +390,8 @@ pub struct ActionResponse {
     #[schema(example = 300, nullable = true)]
     pub timeout_seconds: Option<i32>,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -510,6 +512,8 @@ pub struct ActionSummary {
     #[schema(example = 300, nullable = true)]
     pub timeout_seconds: Option<i32>,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -555,6 +559,7 @@ impl From<attune_common::models::action::Action> for ActionResponse {
             log_retention_policy: action.log_retention_policy,
             log_retention_limit: action.log_retention_limit,
             timeout_seconds: action.timeout_seconds,
+            retired_at: action.retired_at,
             created: action.created,
             updated: action.updated,
         }
@@ -593,6 +598,7 @@ impl From<attune_common::models::action::Action> for ActionSummary {
             log_retention_policy: action.log_retention_policy,
             log_retention_limit: action.log_retention_limit,
             timeout_seconds: action.timeout_seconds,
+            retired_at: action.retired_at,
             created: action.created,
             updated: action.updated,
         }

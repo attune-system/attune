@@ -51,6 +51,7 @@ export type CacheNamespaceResponse = {
    * Active generation record count, when populated.
    */
   record_count: number | null;
+  retired_at: string | null;
   /**
    * Active generation size in bytes, when populated.
    */

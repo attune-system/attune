@@ -11,6 +11,8 @@ use attune_common::{
         WorkQueueItemStatus, WorkQueueUpdateStrategy,
     },
     repositories::{
+        action::ActionRepository,
+        component_lifecycle::{ComponentLifecycleRepository, PackProjectionIds},
         event::{CreateEnforcementInput, EnforcementRepository},
         executable_snapshot::ExecutableSnapshotRepository,
         execution::{CreateExecutionInput, ExecutionRepository},
@@ -25,6 +27,7 @@ use attune_common::{
             CreateWorkQueueInput, CreateWorkQueueItemInput, LeaseWorkQueueItemsInput,
             WorkQueueItemRepository, WorkQueueRepository,
         },
+        workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
         Create, Delete, FindById,
     },
 };
@@ -70,6 +73,19 @@ async fn activate(pool: &PgPool, pack_id: i64, release_id: i64) {
     tx.commit().await.expect("commit activation transaction");
 }
 
+async fn activate_projected(
+    pool: &PgPool,
+    pack_id: i64,
+    release_id: i64,
+    projections: &PackProjectionIds,
+) {
+    let mut tx = pool.begin().await.expect("begin activation transaction");
+    PackReleaseRepository::activate_projected(&mut tx, pack_id, release_id, projections)
+        .await
+        .expect("activate projected release");
+    tx.commit().await.expect("commit activation transaction");
+}
+
 fn execution_input(
     action: &attune_common::models::Action,
     parent: Option<i64>,
@@ -101,7 +117,16 @@ async fn action_fixture() -> (
         .await
         .expect("action");
     let release_a = create_release(&pool, &pack, "1.0.0", 'a').await;
-    activate(&pool, pack.id, release_a.id).await;
+    activate_projected(
+        &pool,
+        pack.id,
+        release_a.id,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            ..Default::default()
+        },
+    )
+    .await;
     let snapshot = ExecutableSnapshotRepository::resolve_for_action(&pool, action.id)
         .await
         .expect("release A snapshot");
@@ -196,6 +221,90 @@ async fn queued_dispatch_keeps_release_a_after_b_activates() {
 
 #[tokio::test]
 #[ignore = "integration test; requires database"]
+async fn retired_action_keeps_pinned_execution_and_external_queue_reference() {
+    let (pool, pack, action, release, snapshot) = action_fixture().await;
+    let execution =
+        ExecutionRepository::create_pinned(&pool, execution_input(&action, None), &snapshot)
+            .await
+            .expect("pinned execution");
+    let queue_pack = PackFixture::new_unique("external_queue")
+        .create(&pool)
+        .await
+        .expect("queue pack");
+    let queue = WorkQueueRepository::create(
+        &pool,
+        CreateWorkQueueInput {
+            r#ref: format!("{}.inbox", queue_pack.r#ref),
+            pack: Some(queue_pack.id),
+            pack_ref: Some(queue_pack.r#ref),
+            is_adhoc: false,
+            label: "External queue".to_string(),
+            description: None,
+            enabled: true,
+            accepting_new_items: true,
+            dispatch_action: Some(action.id),
+            dispatch_action_ref: action.r#ref.clone(),
+            default_priority: 0,
+            allow_pending_update: false,
+            update_strategy: WorkQueueUpdateStrategy::Immutable,
+            batch_mode: WorkQueueBatchMode::Single,
+            item_schema: json!({}),
+            action_params: json!({}),
+            trace_tag_template: None,
+            permission_set_refs: None,
+            config: json!({}),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
+        },
+    )
+    .await
+    .expect("external queue");
+
+    let mut connection = pool.acquire().await.expect("connection");
+    ComponentLifecycleRepository::reconcile_omissions(
+        &mut connection,
+        pack.id,
+        &PackProjectionIds::default(),
+    )
+    .await
+    .expect("retire action");
+
+    assert!(ActionRepository::find_by_id(&pool, action.id)
+        .await
+        .expect("active action lookup")
+        .is_none());
+    assert_eq!(
+        ActionRepository::find_by_id_including_retired(&pool, action.id)
+            .await
+            .expect("historical action lookup")
+            .expect("retired action")
+            .id,
+        action.id
+    );
+    let stored_execution = ExecutionRepository::find_by_id(&pool, execution.id)
+        .await
+        .expect("execution lookup")
+        .expect("execution");
+    assert_eq!(
+        stored_execution
+            .executable_snapshot
+            .expect("retained execution snapshot")
+            .release
+            .id,
+        release.id
+    );
+    assert_eq!(
+        WorkQueueRepository::find_by_id(&pool, queue.id)
+            .await
+            .expect("queue lookup")
+            .expect("external queue")
+            .dispatch_action,
+        Some(action.id)
+    );
+}
+
+#[tokio::test]
+#[ignore = "integration test; requires database"]
 async fn workflow_transition_keeps_root_release_a_after_b_activates() {
     let (pool, pack, action, release_a, snapshot_a) = action_fixture().await;
     let root =
@@ -215,6 +324,84 @@ async fn workflow_transition_keeps_root_release_a_after_b_activates() {
 
     assert_eq!(child.pack_release, Some(release_a.id));
     assert_eq!(child.executable_snapshot.unwrap().release.id, release_a.id);
+}
+
+#[tokio::test]
+#[ignore = "integration test; requires database"]
+async fn workflow_snapshot_pins_each_action_to_its_defining_release() {
+    let pool = create_test_pool().await.expect("test database");
+    let pack = PackFixture::new_unique("mixed_workflow")
+        .create(&pool)
+        .await
+        .expect("pack");
+    let child = ActionFixture::new_unique(pack.id, &pack.r#ref, "child")
+        .with_entrypoint("child-a.py")
+        .create(&pool)
+        .await
+        .expect("child action");
+    let root = ActionFixture::new_unique(pack.id, &pack.r#ref, "workflow")
+        .with_entrypoint("workflow-a.yaml")
+        .create(&pool)
+        .await
+        .expect("workflow action");
+    let workflow = WorkflowDefinitionRepository::create(
+        &pool,
+        CreateWorkflowDefinitionInput {
+            r#ref: root.r#ref.clone(),
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            label: "Mixed release workflow".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            param_schema: None,
+            out_schema: None,
+            definition: json!({}),
+            tags: Vec::new(),
+        },
+    )
+    .await
+    .expect("workflow definition");
+    let root = ActionRepository::link_workflow_def(&pool, root.id, workflow.id)
+        .await
+        .expect("link workflow action");
+
+    let release_a = create_release(&pool, &pack, "1.0.0", 'a').await;
+    activate_projected(
+        &pool,
+        pack.id,
+        release_a.id,
+        &PackProjectionIds {
+            actions: vec![child.id, root.id],
+            workflows: vec![workflow.id],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let release_b = create_release(&pool, &pack, "2.0.0", 'b').await;
+    activate_projected(
+        &pool,
+        pack.id,
+        release_b.id,
+        &PackProjectionIds {
+            actions: vec![root.id],
+            workflows: vec![workflow.id],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&pool, root.id)
+        .await
+        .expect("mixed release workflow snapshot");
+    let child_snapshot = snapshot
+        .pack_executables
+        .get(&child.r#ref)
+        .expect("child snapshot");
+
+    assert_eq!(snapshot.release.id, release_b.id);
+    assert_eq!(child_snapshot.release.id, release_a.id);
+    assert_eq!(child_snapshot.executable.action.entrypoint, "child-a.py");
 }
 
 #[tokio::test]
@@ -282,12 +469,32 @@ async fn managed_sensor_replacement_keeps_desired_release_a_after_b_activates() 
     .await
     .expect("sensor");
     let release_a = create_release(&pool, &pack, "1.0.0", 'a').await;
-    activate(&pool, pack.id, release_a.id).await;
+    activate_projected(
+        &pool,
+        pack.id,
+        release_a.id,
+        &PackProjectionIds {
+            runtimes: vec![runtime.id],
+            sensors: vec![sensor.id],
+            ..Default::default()
+        },
+    )
+    .await;
     SensorWorkloadRepository::ensure_default_for_sensor(&pool, sensor.id)
         .await
         .expect("desired release A workload");
     let release_b = create_release(&pool, &pack, "2.0.0", 'b').await;
-    activate(&pool, pack.id, release_b.id).await;
+    activate_projected(
+        &pool,
+        pack.id,
+        release_b.id,
+        &PackProjectionIds {
+            runtimes: vec![runtime.id],
+            sensors: vec![sensor.id],
+            ..Default::default()
+        },
+    )
+    .await;
 
     let worker_id = WorkerRepository::create(
         &pool,
@@ -793,7 +1000,7 @@ async fn deleting_pack_preserves_historical_release_snapshot() {
 #[tokio::test]
 #[ignore = "integration test; requires database"]
 async fn deleting_pack_rejects_nonterminal_pinned_work() {
-    let (pool, pack, action, _, snapshot) = action_fixture().await;
+    let (pool, pack, action, release, snapshot) = action_fixture().await;
     ExecutionRepository::create_pinned(&*pool, execution_input(&action, None), &snapshot)
         .await
         .expect("nonterminal execution");
@@ -884,6 +1091,17 @@ async fn deleting_pack_rejects_nonterminal_pinned_work() {
     .create(&pool)
     .await
     .expect("sensor");
+    activate_projected(
+        &pool,
+        pack.id,
+        release.id,
+        &PackProjectionIds {
+            runtimes: vec![runtime.id],
+            sensors: vec![sensor.id],
+            ..Default::default()
+        },
+    )
+    .await;
     let worker_id = WorkerRepository::create(
         &*pool,
         CreateWorkerInput {

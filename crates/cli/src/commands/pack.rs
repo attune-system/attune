@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -9,8 +9,21 @@ use crate::commands::pack_index;
 use crate::config::CliConfig;
 use crate::output::{self, OutputFormat};
 
+#[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AbsentMetadataPolicyArg {
+    Remove,
+    Disable,
+    Retain,
+}
+
 #[derive(Subcommand)]
 pub enum PackCommands {
+    /// Build, verify, and inspect canonical release archives offline
+    Release {
+        #[command(subcommand)]
+        command: super::pack_release::ReleaseCommands,
+    },
     /// Create an empty pack
     ///
     /// Creates a new pack with no actions, triggers, rules, or sensors.
@@ -82,6 +95,10 @@ pub enum PackCommands {
         /// Don't search registries (treat source as explicit URL/path)
         #[arg(long)]
         no_registry: bool,
+
+        /// How to handle metadata omitted by the new release
+        #[arg(long, value_enum, default_value_t = AbsentMetadataPolicyArg::Remove)]
+        absent_metadata_policy: AbsentMetadataPolicyArg,
     },
     /// Update a pack
     Update {
@@ -121,6 +138,10 @@ pub enum PackCommands {
         /// Skip running pack tests during registration
         #[arg(long)]
         skip_tests: bool,
+
+        /// How to handle metadata omitted by the new release
+        #[arg(long, value_enum, default_value_t = AbsentMetadataPolicyArg::Remove)]
+        absent_metadata_policy: AbsentMetadataPolicyArg,
     },
     /// Upload a local pack directory to the API server and register it
     ///
@@ -137,6 +158,10 @@ pub enum PackCommands {
         /// Skip running pack tests after upload
         #[arg(long)]
         skip_tests: bool,
+
+        /// How to handle metadata omitted by the new release
+        #[arg(long, value_enum, default_value_t = AbsentMetadataPolicyArg::Remove)]
+        absent_metadata_policy: AbsentMetadataPolicyArg,
     },
     /// Check a local pack's metadata without contacting an Attune server
     Check {
@@ -399,6 +424,7 @@ struct InstallPackRequest {
     force: bool,
     skip_tests: bool,
     skip_deps: bool,
+    absent_metadata_policy: AbsentMetadataPolicyArg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,6 +477,7 @@ struct RegisterPackRequest {
     path: String,
     force: bool,
     skip_tests: bool,
+    absent_metadata_policy: AbsentMetadataPolicyArg,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -484,6 +511,9 @@ pub async fn handle_pack_command(
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
+        PackCommands::Release { command } => {
+            super::pack_release::handle(command, output_format).await
+        }
         PackCommands::Create {
             r#ref,
             label,
@@ -517,6 +547,7 @@ pub async fn handle_pack_command(
             skip_tests,
             skip_deps,
             no_registry,
+            absent_metadata_policy,
         } => {
             handle_install(
                 profile,
@@ -527,6 +558,7 @@ pub async fn handle_pack_command(
                 skip_tests,
                 skip_deps,
                 no_registry,
+                absent_metadata_policy,
                 api_url,
                 output_format,
             )
@@ -539,12 +571,36 @@ pub async fn handle_pack_command(
             path,
             force,
             skip_tests,
-        } => handle_register(profile, path, force, skip_tests, api_url, output_format).await,
+            absent_metadata_policy,
+        } => {
+            handle_register(
+                profile,
+                path,
+                force,
+                skip_tests,
+                absent_metadata_policy,
+                api_url,
+                output_format,
+            )
+            .await
+        }
         PackCommands::Upload {
             path,
             force,
             skip_tests,
-        } => handle_upload(profile, path, force, skip_tests, api_url, output_format).await,
+            absent_metadata_policy,
+        } => {
+            handle_upload(
+                profile,
+                path,
+                force,
+                skip_tests,
+                absent_metadata_policy,
+                api_url,
+                output_format,
+            )
+            .await
+        }
         PackCommands::Check { path } => handle_check(path, output_format),
         PackCommands::Test {
             pack,
@@ -944,6 +1000,7 @@ async fn handle_install(
     skip_tests: bool,
     skip_deps: bool,
     no_registry: bool,
+    absent_metadata_policy: AbsentMetadataPolicyArg,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -972,6 +1029,7 @@ async fn handle_install(
         force,
         skip_tests,
         skip_deps,
+        absent_metadata_policy,
     };
 
     // Note: Progress reporting will be added when API supports streaming
@@ -1155,6 +1213,7 @@ async fn handle_upload(
     path: String,
     force: bool,
     skip_tests: bool,
+    absent_metadata_policy: AbsentMetadataPolicyArg,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -1226,6 +1285,13 @@ async fn handle_upload(
     if skip_tests {
         extra_fields.push(("skip_tests", "true".to_string()));
     }
+    extra_fields.push((
+        "absent_metadata_policy",
+        serde_json::to_value(absent_metadata_policy)?
+            .as_str()
+            .expect("absence policy serializes as a string")
+            .to_string(),
+    ));
 
     let archive_name = format!("{}.tar.gz", pack_ref);
     let mut response: UploadPackResponse = client
@@ -1344,6 +1410,7 @@ async fn handle_register(
     path: String,
     force: bool,
     skip_tests: bool,
+    absent_metadata_policy: AbsentMetadataPolicyArg,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -1373,6 +1440,7 @@ async fn handle_register(
         path: path.clone(),
         force,
         skip_tests,
+        absent_metadata_policy,
     };
 
     let mut response: PackInstallResponse = client.post("/packs/register", &request).await?;

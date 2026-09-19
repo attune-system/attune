@@ -38,7 +38,22 @@ impl PackRetentionRepository {
                    AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.pack_release = r.id) \
                    AND NOT EXISTS (SELECT 1 FROM enforcement e WHERE e.pack_release = r.id) \
                    AND NOT EXISTS (SELECT 1 FROM work_queue_item q WHERE q.pack_release = r.id) \
-                   AND NOT EXISTS (SELECT 1 FROM sensor_workload s WHERE s.pack_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM sensor_workload s WHERE s.pack_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM execution e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM enforcement e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM work_queue_item q CROSS JOIN LATERAL jsonb_each(COALESCE(q.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM runtime c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM runtime_version c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM permission_set c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM trigger c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM action c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM sensor c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM rule c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM policy c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM work_queue c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM workflow_definition c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM dashboard c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM cache_namespace c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
                  ORDER BY r.inactive_since, r.id FOR UPDATE OF r SKIP LOCKED LIMIT $3",
         )
         .bind(rollback_cutoff)
@@ -53,6 +68,21 @@ impl PackRetentionRepository {
                AND NOT EXISTS (SELECT 1 FROM enforcement e WHERE e.pack_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM work_queue_item q WHERE q.pack_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM sensor_workload s WHERE s.pack_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM execution e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM enforcement e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM work_queue_item q CROSS JOIN LATERAL jsonb_each(COALESCE(q.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM runtime c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM runtime_version c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM permission_set c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM trigger c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM action c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM sensor c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM rule c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM policy c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM work_queue c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM workflow_definition c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM dashboard c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM cache_namespace c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
               RETURNING r.digest, r.content_path",
         )
         .bind(&candidate_ids)

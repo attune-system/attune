@@ -7,6 +7,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 
 ### Status / Change Policy
 - **Pre-production**: no stable release or backward-compatibility promise yet.
+- **Initial formats stay v1**: revise the canonical pre-production contract in place; do not invent v2 formats, dual readers, or legacy compatibility adapters without explicit approval. Safe data conversion/reset is separate from runtime backward compatibility.
 - **Breaking changes are allowed** when they improve architecture, APIs, or developer experience.
 - **Internal contracts still matter**: keep API ↔ web UI and service ↔ service expectations coherent.
 
@@ -251,6 +252,16 @@ make db-migrate
   and repeated only because the agent timeout was too short.
 - After schema changes, run `cargo sqlx prepare`.
 - Before finishing code work, run targeted validation plus `cargo check --all-targets --workspace`.
+
+### Test Authoring / Isolation
+- Prefer deterministic pure tests for logic; retain real repository/API/service tests for boundary contracts. `cargo test --lib` is not necessarily infrastructure-free.
+- Reuse owning fixtures and minimal repository/API seed builders. Give mutable DB, MQ, filesystem, account, and service resources explicit run/test ownership; never clean up unowned resources or rows by age alone.
+- Await teardown: stop and join background writers/processes before closing pools and removing resources. Surface cleanup failures; `Drop` and janitors are fallback recovery, not proof of successful cleanup.
+- Prefer instance-local config/caches/clocks over process-global mutation. Environment restoration alone does not protect concurrent readers.
+- Synchronize on readiness/completion signals or bounded predicates with diagnostic deadlines, not fixed sleeps. Preserve real-time tests when elapsed time is the contract.
+- Prefer local mock servers, ephemeral bound ports, owned temp roots, and offline pinned dependency fixtures over public internet or developer-machine state.
+- Keep global retention, service-restart, migration, and destructive scenarios on exclusively owned disposable infrastructure. Do not increase concurrency until the affected class passes isolation/resource-budget gates.
+- Compare identical test coverage and cold/warm timings; do not claim speedups from omitted tests, hidden retries, or skipped setup. See `docs/plans/test-isolation-and-speed.md` for the transformation sequence and acceptance gates.
 
 ### Zero-Warnings Policy
 - New warnings are regressions.

@@ -48,6 +48,7 @@ export type PaginatedResponse_TriggerSummary = {
      * Pack-level visibility for rule subscriptions.
      */
     reference_visibility: ActionReferenceVisibility;
+    retired_at?: string | null;
     /**
      * Last update timestamp
      */

@@ -56,15 +56,19 @@ pub use event::{
 pub use execution::{
     CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams,
     ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
-    WorkflowCacheIterationResponse,
+    WorkflowCacheIterationResponse, WorkflowTaskWaitResponse,
 };
 pub use history::{HistoryEntityTypePath, HistoryQueryParams, HistoryRecordResponse};
 pub use inquiry::{
     CreateInquiryRequest, InquiryQueryParams, InquiryRespondRequest, InquiryResponse,
-    InquirySummary, UpdateInquiryRequest,
+    InquirySummary,
 };
 pub use key::{CreateKeyRequest, KeyQueryParams, KeyResponse, KeySummary, UpdateKeyRequest};
-pub use pack::{CreatePackRequest, PackResponse, PackSummary, UpdatePackRequest};
+pub use pack::{
+    CreatePackRequest, PackReleaseResponse, PackResponse, PackSummary,
+    PlatformCatalogStateResponse, PlatformCatalogStatus, RetiredPackComponentResponse,
+    UpdatePackRequest,
+};
 pub use permission::{
     CreateIdentityRequest, CreateIdentityRoleAssignmentRequest, CreateIntegrationTokenRequest,
     CreateIntegrationTokenResponse, CreatePermissionAssignmentRequest,

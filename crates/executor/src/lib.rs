@@ -23,7 +23,7 @@ pub mod workflow;
 
 // Re-export commonly used types for convenience
 pub use dead_letter_handler::{create_dlq_consumer_config, DeadLetterHandler};
-pub use inquiry_handler::{InquiryHandler, InquiryRequest, INQUIRY_RESULT_KEY};
+pub use inquiry_handler::InquiryHandler;
 pub use policy_enforcer::{
     ExecutionPolicy, PolicyEnforcer, PolicyScope, PolicyViolation, RateLimit,
 };

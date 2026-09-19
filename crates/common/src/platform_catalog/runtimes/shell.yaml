@@ -1,0 +1,17 @@
+ref: core.shell
+pack_ref: core
+name: Shell
+aliases: [shell, bash, sh]
+description: Shell (bash/sh) runtime for script execution - always available
+distributions:
+  verification:
+    commands:
+      - {binary: sh, args: ["--version"], exit_code: 0, optional: true, priority: 1}
+      - {binary: bash, args: ["--version"], exit_code: 0, optional: true, priority: 2}
+    always_available: true
+installation:
+  interpreters: [sh, bash, dash]
+  portable: true
+execution_config:
+  interpreter: {binary: /bin/bash, args: [], file_extension: .sh}
+  inline_execution: {strategy: temp_file, extension: .sh, inject_shell_helpers: true}

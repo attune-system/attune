@@ -1,0 +1,26 @@
+ref: core.r
+pack_ref: core
+name: R
+aliases: [r, rscript]
+description: R runtime for statistical computing and data analysis scripts
+distributions:
+  verification:
+    commands:
+      - {binary: Rscript, args: ["--version"], exit_code: 0, pattern: '\d+\.\d+\.\d+', priority: 1}
+  min_version: "4.0.0"
+  recommended_version: "4.4.0"
+installation:
+  package_managers: [install.packages, renv]
+  interpreters: [Rscript, R]
+execution_config:
+  interpreter: {binary: Rscript, args: ["--vanilla"], file_extension: .R}
+  environment:
+    env_type: renv
+    dir_name: renv
+    create_command: [sh, "-c", "mkdir -p {env_dir}/library"]
+    interpreter_path: null
+  dependencies:
+    manifest_file: renv.lock
+    install_command: [sh, "-c", 'cd {pack_dir} && R_LIBS_USER={env_dir}/library Rscript -e "if (file.exists(''renv.lock'')) renv::restore(library=''{env_dir}/library'', prompt=FALSE)" 2>/dev/null || true']
+  env_vars:
+    R_LIBS_USER: "{env_dir}/library"

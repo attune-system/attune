@@ -19,6 +19,12 @@ pub struct InquiryResponse {
     #[schema(example = 1)]
     pub execution: Id,
 
+    pub workflow_execution: Option<Id>,
+
+    pub workflow_task_name: Option<String>,
+
+    pub purpose: Option<String>,
+
     /// Prompt text displayed to the user
     #[schema(example = "Approve deployment to production?")]
     pub prompt: String,
@@ -43,6 +49,8 @@ pub struct InquiryResponse {
     #[schema(example = "2024-01-13T11:30:00Z")]
     pub timeout_at: Option<DateTime<Utc>>,
 
+    pub responded_by: Option<Id>,
+
     /// When the inquiry was responded to
     #[schema(example = "2024-01-13T10:45:00Z")]
     pub responded_at: Option<DateTime<Utc>>,
@@ -61,12 +69,16 @@ impl From<Inquiry> for InquiryResponse {
         Self {
             id: inquiry.id,
             execution: inquiry.execution,
+            workflow_execution: inquiry.workflow_execution,
+            workflow_task_name: inquiry.workflow_task_name,
+            purpose: inquiry.purpose,
             prompt: inquiry.prompt,
             response_schema: inquiry.response_schema,
             assigned_to: inquiry.assigned_to,
             status: inquiry.status,
             response: inquiry.response,
             timeout_at: inquiry.timeout_at,
+            responded_by: inquiry.responded_by,
             responded_at: inquiry.responded_at,
             created: inquiry.created,
             updated: inquiry.updated,
@@ -128,9 +140,10 @@ impl From<Inquiry> for InquirySummary {
 /// Request to create a new inquiry
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
 pub struct CreateInquiryRequest {
-    /// Execution ID this inquiry belongs to
-    #[schema(example = 1)]
-    pub execution: Id,
+    /// Stable purpose used to make creation idempotent within this workflow task attempt.
+    #[validate(length(min = 1, max = 255))]
+    #[schema(example = "approval")]
+    pub purpose: String,
 
     /// Prompt text to display to the user
     #[validate(length(min = 1, max = 10000))]
@@ -145,25 +158,10 @@ pub struct CreateInquiryRequest {
     #[schema(example = 1)]
     pub assigned_to: Option<Id>,
 
-    /// Optional timeout timestamp (when inquiry expires)
-    #[schema(example = "2024-01-13T11:30:00Z")]
-    pub timeout_at: Option<DateTime<Utc>>,
-}
-
-/// Request to update an inquiry
-#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
-pub struct UpdateInquiryRequest {
-    /// Update the inquiry status
-    #[schema(example = "responded")]
-    pub status: Option<InquiryStatus>,
-
-    /// Update the response data
-    #[schema(value_type = Object, nullable = true)]
-    pub response: Option<JsonDict>,
-
-    /// Update the assigned_to identity
-    #[schema(example = 2)]
-    pub assigned_to: Option<Id>,
+    /// Optional relative timeout in seconds.
+    #[validate(range(min = 1))]
+    #[schema(example = 3600)]
+    pub timeout_seconds: Option<i64>,
 }
 
 /// Request to respond to an inquiry (user-facing endpoint)

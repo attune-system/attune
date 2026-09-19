@@ -29,13 +29,13 @@ def request(url, *, data=None, headers=None, method=None):
 def wait_for_api(base_url, deadline):
     while time.monotonic() < deadline:
         try:
-            with request(f"{base_url}/health") as response:
+            with request(f"{base_url}/health/ready") as response:
                 if response.status == 200:
                     return
         except (OSError, urllib.error.URLError):
             pass
         time.sleep(2)
-    raise TimeoutError("Attune API did not become healthy before the deadline")
+    raise TimeoutError("Attune API platform did not become ready before the deadline")
 
 
 def token_login(base_url, token):
@@ -199,7 +199,7 @@ def delete_bootstrap_identity(database_url, identity_id):
 def wait_for_core(base_url, deadline):
     while time.monotonic() < deadline:
         try:
-            with request(f"{base_url}/health/ready") as response:
+            with request(f"{base_url}/health/content") as response:
                 if response.status == 200:
                     return
         except (OSError, KeyError, urllib.error.URLError):
@@ -213,7 +213,10 @@ def main():
     parser.add_argument("command", choices=("publish", "wait"))
     args = parser.parse_args()
     base_url = os.environ["ATTUNE_API_URL"].rstrip("/")
-    deadline = time.monotonic() + int(os.environ.get("ATTUNE_BOOTSTRAP_TIMEOUT_SECONDS", "600"))
+    timeout_seconds = min(
+        300, max(1, int(os.environ.get("ATTUNE_BOOTSTRAP_TIMEOUT_SECONDS", "300")))
+    )
+    deadline = time.monotonic() + timeout_seconds
     wait_for_api(base_url, deadline)
     if args.command == "publish":
         pack_dir = Path(os.environ.get("SOURCE_PACKS_DIR", "/source/packs")) / "core"

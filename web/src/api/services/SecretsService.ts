@@ -139,8 +139,8 @@ export class SecretsService {
     });
   }
   /**
-   * Get a single key by reference (includes decrypted value)
-   * @returns any Key details with decrypted value
+   * Get a single key by reference
+   * @returns any Key details; encrypted values require decrypt permission
    * @throws ApiError
    */
   public static getKey({

@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { PacksService, ApiError } from "@/api";
+import { AbsentMetadataPolicy, PacksService, ApiError } from "@/api";
 
 // Fetch test history for a pack
 export function usePackTestHistory(
@@ -129,11 +129,13 @@ export function useInstallPack() {
       refSpec,
       skipTests = false,
       skipDeps = false,
+      absentMetadataPolicy = AbsentMetadataPolicy.REMOVE,
     }: {
       source: string;
       refSpec?: string;
       skipTests?: boolean;
       skipDeps?: boolean;
+      absentMetadataPolicy?: AbsentMetadataPolicy;
     }) => {
       return PacksService.installPack({
         requestBody: {
@@ -141,6 +143,7 @@ export function useInstallPack() {
           ref_spec: refSpec,
           skip_tests: skipTests,
           skip_deps: skipDeps,
+          absent_metadata_policy: absentMetadataPolicy,
         },
       });
     },

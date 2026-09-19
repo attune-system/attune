@@ -1,0 +1,18 @@
+ref: core.queue_started
+label: Queue Started
+description: Emitted when a work queue starts processing records after being empty
+enabled: true
+type: system
+parameters: {}
+output:
+  event_type: {type: string, description: Lifecycle event type; always queue_started, required: true}
+  queue_id: {type: integer, description: Database ID of the work queue, required: true}
+  queue_ref: {type: string, description: Reference of the work queue, required: true}
+  pack_ref: {type: string, description: "Pack reference that owns the queue, when available"}
+  dispatch_id: {type: integer, description: Work queue dispatch record that started processing, required: true}
+  execution_id: {type: integer, description: Execution created to process the leased queue item(s), required: true}
+  dispatch_action_ref: {type: string, description: Action reference used to process queue items, required: true}
+  leased_item_count: {type: integer, description: Number of queue items leased for this dispatch, required: true}
+  leased_item_ids: {type: array, description: Queue item IDs leased for this dispatch}
+  observed_at: {type: string, format: date-time, description: Timestamp when Attune observed the queue start, required: true}
+tags: [system, queue, operations]

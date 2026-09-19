@@ -2,10 +2,15 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AbsentMetadataPolicy } from "./AbsentMetadataPolicy";
 /**
  * Request DTO for registering multiple packs
  */
 export type RegisterPacksRequest = {
+  /**
+   * How to handle pack-managed metadata omitted by each release.
+   */
+  absent_metadata_policy?: AbsentMetadataPolicy;
   /**
    * Force registration (replace if exists)
    */

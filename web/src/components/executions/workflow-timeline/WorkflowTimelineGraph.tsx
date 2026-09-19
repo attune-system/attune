@@ -18,6 +18,7 @@ import type { ExecutionSummary } from "@/api";
 import { useWorkflow } from "@/hooks/useWorkflows";
 import { useChildExecutions } from "@/hooks/useExecutions";
 import { useExecutionStream } from "@/hooks/useExecutionStream";
+import { useWorkflowTaskWaits } from "@/hooks/useWorkflowTaskWaits";
 import {
   ChartGantt,
   ChevronDown,
@@ -36,6 +37,7 @@ import type {
 import { DEFAULT_LAYOUT } from "./types";
 import {
   buildTimelineTasks,
+  buildSyntheticWaitTasks,
   collapseWithItemsGroups,
   buildEdges,
   buildMilestones,
@@ -106,20 +108,6 @@ export default function WorkflowTimelineGraph({
     "abandoned",
   ].includes(parentExecution.status);
 
-  // ---- Smooth animation via requestAnimationFrame ----
-  // While the workflow is running and the panel is visible, tick at display
-  // refresh rate (~60fps) so running task bars and the time axis grow smoothly.
-  useEffect(() => {
-    if (isTerminal || (!embedded && isCollapsed)) return;
-    let rafId: number;
-    const tick = () => {
-      setNowMs(Date.now());
-      rafId = requestAnimationFrame(tick);
-    };
-    rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
-  }, [isTerminal, isCollapsed, embedded]);
-
   // ---- Data fetching ----
 
   // Fetch child executions, including descendants spawned via MCP so that
@@ -127,6 +115,10 @@ export default function WorkflowTimelineGraph({
   const { data: childData, isLoading: childrenLoading } = useChildExecutions(
     parentExecution.id,
     { includeDescendants: true },
+  );
+  const { data: waitsData, isLoading: waitsLoading } = useWorkflowTaskWaits(
+    parentExecution.id,
+    parentExecution.status,
   );
 
   // Subscribe to real-time execution updates so child tasks update live
@@ -139,6 +131,20 @@ export default function WorkflowTimelineGraph({
   const childExecutions: ExecutionSummary[] = useMemo(() => {
     return childData?.items ?? [];
   }, [childData]);
+  const waits = useMemo(() => waitsData?.data ?? [], [waitsData]);
+  const hasWaitingTask = waits.some((wait) => wait.state === "waiting");
+
+  // Keep active execution and inquiry-wait bars moving with wall-clock time.
+  useEffect(() => {
+    if ((isTerminal && !hasWaitingTask) || (!embedded && isCollapsed)) return;
+    let rafId: number;
+    const tick = () => {
+      setNowMs(Date.now());
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [isTerminal, hasWaitingTask, isCollapsed, embedded]);
 
   const workflowDef: WorkflowDefinition | null = useMemo(() => {
     if (!workflowData?.data?.definition) return null;
@@ -174,21 +180,21 @@ export default function WorkflowTimelineGraph({
   // `buildEdges` mutates tasks' upstreamIds/downstreamIds, so we must call
   // it in the same memo that creates the task objects.
   const { structuralTasks, taskEdges } = useMemo(() => {
-    if (childExecutions.length === 0) {
-      return {
-        structuralTasks: [] as TimelineTask[],
-        taskEdges: [] as TimelineEdge[],
-      };
-    }
-
     // Build individual tasks, then collapse large with_items groups into
     // single synthetic nodes before computing edges.
     const rawTasks = buildTimelineTasks(childExecutions, workflowDef);
-    const { tasks: structuralTasks, memberToGroup } = collapseWithItemsGroups(
+    const { tasks: executionTasks, memberToGroup } = collapseWithItemsGroups(
       rawTasks,
       childExecutions,
       workflowDef,
     );
+    const syntheticTasks = buildSyntheticWaitTasks({
+      waits,
+      childExecutions,
+      workflowDef,
+      parentExecutionId: parentExecution.id,
+    });
+    const structuralTasks = [...executionTasks, ...syntheticTasks];
 
     // Derive dependency edges (purely structural — no time dependency).
     // Pass the collapse mapping so edges redirect to group nodes.
@@ -200,7 +206,7 @@ export default function WorkflowTimelineGraph({
     );
 
     return { structuralTasks, taskEdges };
-  }, [childExecutions, workflowDef]);
+  }, [childExecutions, waits, workflowDef, parentExecution.id]);
 
   // Phase 2: Patch running-task time positions and build milestones.
   // This runs every animation frame while the workflow is active.
@@ -219,7 +225,10 @@ export default function WorkflowTimelineGraph({
       // We shallow-clone each task that needs updating to keep React diffing
       // efficient (unchanged tasks keep the same object identity).
       const tasks = structuralTasks.map((t) => {
-        if (t.state === "running" && t.startMs != null) {
+        if (
+          (t.state === "running" || t.state === "waiting") &&
+          t.startMs != null
+        ) {
           const endMs = nowMs;
           return { ...t, endMs, durationMs: endMs - t.startMs };
         }
@@ -291,7 +300,11 @@ export default function WorkflowTimelineGraph({
 
   const handleTaskClick = useCallback(
     (task: TimelineTask) => {
-      navigate(`/executions/${task.id}`);
+      if (task.destination.kind === "inquiry") {
+        navigate(`/inquiries/${task.destination.inquiryId}`);
+      } else {
+        navigate(`/executions/${task.destination.executionId}`);
+      }
     },
     [navigate],
   );
@@ -299,17 +312,11 @@ export default function WorkflowTimelineGraph({
   // ---- Summary stats ----
 
   const summary = useMemo(() => {
-    const total = childExecutions.length;
-    const completed = childExecutions.filter(
-      (e) => e.status === "completed",
-    ).length;
-    const failed = childExecutions.filter((e) => e.status === "failed").length;
-    const running = childExecutions.filter(
-      (e) =>
-        e.status === "running" ||
-        e.status === "requested" ||
-        e.status === "scheduling" ||
-        e.status === "scheduled",
+    const total = tasks.length;
+    const completed = tasks.filter((task) => task.state === "completed").length;
+    const failed = tasks.filter((task) => task.state === "failed").length;
+    const running = tasks.filter(
+      (task) => task.state === "running" || task.state === "waiting",
     ).length;
     const other = total - completed - failed - running;
 
@@ -328,11 +335,11 @@ export default function WorkflowTimelineGraph({
     }
 
     return { total, completed, failed, running, other, durationMs };
-  }, [childExecutions, tasks]);
+  }, [tasks]);
 
   // ---- Early returns ----
 
-  if (childrenLoading && childExecutions.length === 0) {
+  if ((childrenLoading || waitsLoading) && tasks.length === 0) {
     return (
       <div className={embedded ? "" : "bg-white shadow rounded-lg"}>
         <div className="flex items-center gap-3 p-4">
@@ -345,7 +352,7 @@ export default function WorkflowTimelineGraph({
     );
   }
 
-  if (childExecutions.length === 0) {
+  if (tasks.length === 0) {
     if (embedded) {
       return (
         <div className="flex items-center justify-center py-8 text-sm text-gray-500">

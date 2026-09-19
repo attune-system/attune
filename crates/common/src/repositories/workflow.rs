@@ -2,9 +2,11 @@
 
 use crate::models::{enums::ExecutionStatus, workflow::*, Id, JsonDict, JsonSchema};
 use crate::Result;
-use sqlx::{Executor, Postgres, QueryBuilder};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
 
 use super::{Create, Delete, FindById, FindByRef, List, Repository, Update};
+
+const WORKFLOW_DEFINITION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, retired_at, created, updated";
 
 // ============================================================================
 // Workflow Definition Search
@@ -79,11 +81,9 @@ impl FindById for WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, WorkflowDefinition>(
-            "SELECT id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated
-             FROM workflow_definition
-             WHERE id = $1"
-        )
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
+            "SELECT {WORKFLOW_DEFINITION_COLUMNS} FROM workflow_definition WHERE id = $1 AND retired_at IS NULL"
+        ))
         .bind(id)
         .fetch_optional(executor)
         .await
@@ -97,11 +97,9 @@ impl FindByRef for WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, WorkflowDefinition>(
-            "SELECT id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated
-             FROM workflow_definition
-             WHERE ref = $1"
-        )
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
+            "SELECT {WORKFLOW_DEFINITION_COLUMNS} FROM workflow_definition WHERE ref = $1 AND retired_at IS NULL"
+        ))
         .bind(ref_str)
         .fetch_optional(executor)
         .await
@@ -115,12 +113,9 @@ impl List for WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, WorkflowDefinition>(
-            "SELECT id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated
-             FROM workflow_definition
-             ORDER BY created DESC
-             LIMIT 1000"
-        )
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
+            "SELECT {WORKFLOW_DEFINITION_COLUMNS} FROM workflow_definition WHERE retired_at IS NULL ORDER BY created DESC LIMIT 1000"
+        ))
         .fetch_all(executor)
         .await
         .map_err(Into::into)
@@ -135,12 +130,12 @@ impl Create for WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, WorkflowDefinition>(
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
             "INSERT INTO workflow_definition
              (ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             RETURNING id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated"
-        )
+             RETURNING {WORKFLOW_DEFINITION_COLUMNS}"
+        ))
         .bind(&input.r#ref)
         .bind(input.pack)
         .bind(&input.pack_ref)
@@ -219,7 +214,7 @@ impl Update for WorkflowDefinitionRepository {
         }
 
         query.push(", updated = NOW() WHERE id = ").push_bind(id);
-        query.push(" RETURNING id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated");
+        query.push(" RETURNING ").push(WORKFLOW_DEFINITION_COLUMNS);
 
         query
             .build_query_as::<WorkflowDefinition>()
@@ -244,6 +239,38 @@ impl Delete for WorkflowDefinitionRepository {
 }
 
 impl WorkflowDefinitionRepository {
+    pub async fn find_by_id_including_retired<'e, E>(
+        executor: E,
+        id: Id,
+    ) -> Result<Option<WorkflowDefinition>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
+            "SELECT {WORKFLOW_DEFINITION_COLUMNS} FROM workflow_definition WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<WorkflowDefinition>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
+            "SELECT {WORKFLOW_DEFINITION_COLUMNS} FROM workflow_definition WHERE ref = $1"
+        ))
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Search workflow definitions with all filters pushed into SQL.
     ///
     /// All filter fields are combinable (AND). Pagination is server-side.
@@ -256,14 +283,15 @@ impl WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let select_cols = "id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated";
+        let select_cols = WORKFLOW_DEFINITION_COLUMNS;
 
-        let mut qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new(format!("SELECT {select_cols} FROM workflow_definition"));
+        let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+            "SELECT {select_cols} FROM workflow_definition WHERE retired_at IS NULL"
+        ));
         let mut count_qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new("SELECT COUNT(*) FROM workflow_definition");
+            QueryBuilder::new("SELECT COUNT(*) FROM workflow_definition WHERE retired_at IS NULL");
 
-        let mut has_where = false;
+        let mut has_where = true;
 
         macro_rules! push_condition {
             ($cond_prefix:expr, $value:expr) => {{
@@ -342,12 +370,10 @@ impl WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, WorkflowDefinition>(
-            "SELECT id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated
-             FROM workflow_definition
-             WHERE pack = $1
-             ORDER BY label"
-        )
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
+            "SELECT {WORKFLOW_DEFINITION_COLUMNS} FROM workflow_definition \
+             WHERE pack = $1 AND retired_at IS NULL ORDER BY label"
+        ))
         .bind(pack_id)
         .fetch_all(executor)
         .await
@@ -362,12 +388,10 @@ impl WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, WorkflowDefinition>(
-            "SELECT id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated
-             FROM workflow_definition
-             WHERE pack_ref = $1
-             ORDER BY label"
-        )
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
+            "SELECT {WORKFLOW_DEFINITION_COLUMNS} FROM workflow_definition \
+             WHERE pack_ref = $1 AND retired_at IS NULL ORDER BY label"
+        ))
         .bind(pack_ref)
         .fetch_all(executor)
         .await
@@ -379,11 +403,12 @@ impl WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM workflow_definition WHERE pack_ref = $1")
-                .bind(pack_ref)
-                .fetch_one(executor)
-                .await?;
+        let result: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workflow_definition WHERE pack_ref = $1 AND retired_at IS NULL",
+        )
+        .bind(pack_ref)
+        .fetch_one(executor)
+        .await?;
         Ok(result.0)
     }
 
@@ -392,12 +417,10 @@ impl WorkflowDefinitionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, WorkflowDefinition>(
-            "SELECT id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, created, updated
-             FROM workflow_definition
-             WHERE $1 = ANY(tags)
-             ORDER BY label"
-        )
+        sqlx::query_as::<_, WorkflowDefinition>(&format!(
+            "SELECT {WORKFLOW_DEFINITION_COLUMNS} FROM workflow_definition \
+             WHERE $1 = ANY(tags) AND retired_at IS NULL ORDER BY label"
+        ))
         .bind(tag)
         .fetch_all(executor)
         .await
@@ -612,6 +635,83 @@ impl Delete for WorkflowExecutionRepository {
 }
 
 impl WorkflowExecutionRepository {
+    pub async fn cancel_with_prerequisites(
+        pool: &PgPool,
+        id: Id,
+        error_message: &str,
+        parent_update: Option<(ExecutionStatus, Option<serde_json::Value>)>,
+    ) -> Result<Option<WorkflowExecution>> {
+        let mut transaction = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        let Some(workflow) = Self::find_by_id_for_update(&mut *transaction, id).await? else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        if workflow.status == ExecutionStatus::Cancelled {
+            transaction.commit().await?;
+            return Ok(Some(workflow));
+        }
+        if matches!(
+            workflow.status,
+            ExecutionStatus::Completed
+                | ExecutionStatus::Failed
+                | ExecutionStatus::Timeout
+                | ExecutionStatus::Abandoned
+        ) {
+            if parent_update.is_some() {
+                return Err(crate::Error::InvalidState(format!(
+                    "workflow execution {} completed before cancellation acquired its lock",
+                    workflow.id
+                )));
+            }
+            transaction.commit().await?;
+            return Ok(Some(workflow));
+        }
+        if let Some((status, result)) = parent_update {
+            let updated = sqlx::query(
+                "UPDATE execution SET status = $2, result = COALESCE($3, result), updated = NOW() \
+                 WHERE id = $1 \
+                   AND status IN ('requested', 'scheduling', 'scheduled', 'running', 'canceling', 'cancelled')",
+            )
+            .bind(workflow.execution)
+            .bind(status)
+            .bind(result)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() == 0 {
+                return Err(crate::Error::InvalidState(format!(
+                    "execution {} completed before workflow cancellation acquired its lock",
+                    workflow.execution
+                )));
+            }
+        }
+
+        super::inquiry::InquiryRepository::cancel_pending_for_workflow(&mut *transaction, id)
+            .await?;
+        super::workflow_task_wait::WorkflowTaskWaitRepository::cancel_waiting_for_workflow(
+            &mut *transaction,
+            id,
+            serde_json::json!({"reason": "workflow cancelled"}),
+        )
+        .await?;
+        let updated = Self::update(
+            &mut *transaction,
+            id,
+            UpdateWorkflowExecutionInput {
+                status: Some(ExecutionStatus::Cancelled),
+                error_message: Some(error_message.to_string()),
+                current_tasks: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(updated))
+    }
+
     pub async fn find_by_id_for_update<'e, E>(
         executor: E,
         id: Id,

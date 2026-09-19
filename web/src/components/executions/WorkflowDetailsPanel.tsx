@@ -23,9 +23,16 @@ import {
   type WorkflowCacheIteration,
 } from "@/hooks/useExecutions";
 import { useExecutionStream } from "@/hooks/useExecutionStream";
+import { useWorkflow } from "@/hooks/useWorkflows";
+import { useWorkflowTaskWaits } from "@/hooks/useWorkflowTaskWaits";
 import WorkflowTimelineDAG, {
   type ParentExecutionInfo,
 } from "@/components/executions/workflow-timeline";
+import { buildSyntheticWaitTasks } from "@/components/executions/workflow-timeline/data";
+import type {
+  TimelineTask,
+  WorkflowDefinition,
+} from "@/components/executions/workflow-timeline/types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,7 +78,10 @@ function getStatusIcon(status: string) {
     case "failed":
       return <XCircle className="h-4 w-4 text-red-500" />;
     case "running":
+    case "waiting":
       return <Loader2 className="h-4 w-4 text-blue-500 animate-spin" />;
+    case "released":
+      return <Clock className="h-4 w-4 text-purple-500" />;
     case "requested":
     case "scheduling":
     case "scheduled":
@@ -96,7 +106,10 @@ function getStatusBadgeClasses(status: string): string {
       return "bg-red-100 text-red-800";
     case "running":
     case "scanning":
+    case "waiting":
       return "bg-blue-100 text-blue-800";
+    case "released":
+      return "bg-purple-100 text-purple-800";
     case "requested":
     case "scheduling":
     case "scheduled":
@@ -143,6 +156,12 @@ export default function WorkflowDetailsPanel({
     isLoading: cacheIterationsLoading,
     error: cacheIterationsError,
   } = useWorkflowCacheIterations(parentExecution.id);
+  const {
+    data: waitData,
+    isLoading: waitsLoading,
+    error: waitsError,
+  } = useWorkflowTaskWaits(parentExecution.id, parentExecution.status);
+  const { data: workflowData } = useWorkflow(actionRef);
 
   // Subscribe to unfiltered execution stream so child execution WebSocket
   // notifications update the query cache in real-time.
@@ -151,6 +170,19 @@ export default function WorkflowDetailsPanel({
   const tasks = useMemo(() => data?.items ?? [], [data]);
   const cacheIterations = cacheIterationData?.data ?? [];
   const cacheIterationsUnsupported = cacheIterationData?.unsupported ?? false;
+  const waits = useMemo(() => waitData?.data ?? [], [waitData]);
+  const workflowDef: WorkflowDefinition | null =
+    workflowData?.data?.definition ?? null;
+  const syntheticWaitTasks = useMemo(
+    () =>
+      buildSyntheticWaitTasks({
+        waits,
+        childExecutions: tasks,
+        workflowDef,
+        parentExecutionId: parentExecution.id,
+      }),
+    [waits, tasks, workflowDef, parentExecution.id],
+  );
 
   // Order tasks so descendants appear nested under their parent. We sort by:
   //   1. immediate children of the panel's root execution first (in id order)
@@ -189,28 +221,36 @@ export default function WorkflowDetailsPanel({
   }, [tasks, parentExecution.id]);
 
   const summary = useMemo(() => {
-    const total = tasks.length;
+    const total = tasks.length + syntheticWaitTasks.length;
     const completed = tasks.filter((t) => t.status === "completed").length;
     const failed = tasks.filter((t) => t.status === "failed").length;
-    const running = tasks.filter(
-      (t) =>
-        t.status === "running" ||
-        t.status === "requested" ||
-        t.status === "scheduling" ||
-        t.status === "scheduled",
+    const running =
+      tasks.filter(
+        (t) =>
+          t.status === "running" ||
+          t.status === "requested" ||
+          t.status === "scheduling" ||
+          t.status === "scheduled",
+      ).length +
+      syntheticWaitTasks.filter((task) => task.state === "waiting").length;
+    const waitFailures = syntheticWaitTasks.filter((task) =>
+      ["failed", "timeout", "cancelled"].includes(task.state),
     ).length;
-    const other = total - completed - failed - running;
-    return { total, completed, failed, running, other };
-  }, [tasks]);
+    const other = total - completed - failed - waitFailures - running;
+    return { total, completed, failed: failed + waitFailures, running, other };
+  }, [tasks, syntheticWaitTasks]);
 
   // Don't render at all if there are no children and we're done loading
   if (
     !isLoading &&
+    !waitsLoading &&
     !cacheIterationsLoading &&
     tasks.length === 0 &&
     cacheIterations.length === 0 &&
+    syntheticWaitTasks.length === 0 &&
     !error &&
-    !cacheIterationsError
+    !cacheIterationsError &&
+    !waitsError
   ) {
     return null;
   }
@@ -232,7 +272,7 @@ export default function WorkflowDetailsPanel({
           )}
           <Workflow className="h-5 w-5 text-indigo-500" />
           <h2 className="text-xl font-semibold">{title}</h2>
-          {!isLoading && (
+          {!isLoading && !waitsLoading && (
             <span className="text-sm text-gray-500">
               ({summary.total} task{summary.total !== 1 ? "s" : ""})
             </span>
@@ -311,9 +351,10 @@ export default function WorkflowDetailsPanel({
           <div className={activeTab === "tasks" ? "" : "hidden"}>
             <TasksTab
               tasks={orderedTasks}
+              waitTasks={syntheticWaitTasks}
               rootId={parentExecution.id}
-              isLoading={isLoading}
-              error={error}
+              isLoading={isLoading || waitsLoading}
+              error={error ?? waitsError}
             />
           </div>
         </div>
@@ -476,11 +517,13 @@ function TabButton({
 
 function TasksTab({
   tasks,
+  waitTasks,
   rootId,
   isLoading,
   error,
 }: {
   tasks: ExecutionSummary[];
+  waitTasks: TimelineTask[];
   rootId: number;
   isLoading: boolean;
   error: unknown;
@@ -511,7 +554,7 @@ function TasksTab({
     );
   }
 
-  if (tasks.length === 0) {
+  if (tasks.length === 0 && waitTasks.length === 0) {
     return (
       <div className="flex items-center justify-center py-8 text-sm text-gray-500">
         No workflow tasks yet.
@@ -533,6 +576,47 @@ function TasksTab({
         </div>
 
         {/* Task rows */}
+        {waitTasks.map((task, idx) => (
+          <Link
+            key={task.id}
+            to={
+              task.destination.kind === "inquiry"
+                ? `/inquiries/${task.destination.inquiryId}`
+                : `/executions/${task.destination.executionId}`
+            }
+            className="grid grid-cols-12 gap-3 px-3 py-3 rounded-lg hover:bg-gray-50 transition-colors items-center group"
+          >
+            <div className="col-span-1 text-sm text-gray-400 font-mono">
+              {idx + 1}
+            </div>
+            <div className="col-span-3 flex items-center gap-2 min-w-0">
+              {getStatusIcon(task.state)}
+              <span className="text-sm font-medium text-gray-900 truncate group-hover:text-blue-600">
+                {task.name}
+              </span>
+            </div>
+            <div className="col-span-3 min-w-0">
+              <span className="text-sm text-gray-600 truncate block">
+                {task.actionRef}
+              </span>
+            </div>
+            <div className="col-span-2">
+              <span
+                className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${getStatusBadgeClasses(task.state)}`}
+              >
+                {task.state === "released" ? "released (no child)" : task.state}
+              </span>
+            </div>
+            <div className="col-span-2 text-sm text-gray-500">
+              {task.durationMs != null && task.durationMs > 0 ? (
+                formatDuration(task.durationMs)
+              ) : (
+                <span className="text-gray-300">—</span>
+              )}
+            </div>
+            <div className="col-span-1 text-sm text-gray-300">—</div>
+          </Link>
+        ))}
         {tasks.map((task, idx) => {
           const wt = task.workflow_task;
           const depth = Math.max(0, (depthById.get(task.id) ?? 1) - 1);
@@ -567,7 +651,7 @@ function TasksTab({
             >
               {/* Index */}
               <div className="col-span-1 text-sm text-gray-400 font-mono">
-                {idx + 1}
+                {waitTasks.length + idx + 1}
               </div>
 
               {/* Task name */}

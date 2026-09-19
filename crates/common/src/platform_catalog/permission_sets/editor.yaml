@@ -1,0 +1,17 @@
+ref: core.editor
+label: Editor
+description: Create and update operational resources without full administrative control.
+grants:
+  - {resource: packs, actions: [read, create, install, configure]}
+  - {resource: actions, actions: [read, create, update, execute]}
+  - {resource: policies, actions: [read, create, update]}
+  - {resource: queues, actions: [read, create, update, delete]}
+  - {resource: queue_items, actions: [read, create, update, delete]}
+  - {resource: rules, actions: [read, create, update]}
+  - {resource: triggers, actions: [read]}
+  - {resource: executions, actions: [read, cancel]}
+  - {resource: keys, actions: [read, update, decrypt]}
+  - {resource: artifacts, actions: [read]}
+  - {resource: runtimes, actions: [read, create, update]}
+  - {resource: workers, actions: [read]}
+  - {resource: dashboards, actions: [read, create, update, delete]}

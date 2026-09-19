@@ -1,0 +1,16 @@
+ref: core.java
+pack_ref: core
+name: Java
+aliases: [java, jdk, openjdk]
+description: Java runtime for executing Java programs and scripts
+distributions:
+  verification:
+    commands:
+      - {binary: java, args: ["-version"], exit_code: 0, pattern: 'version "\d+', priority: 1}
+  min_version: "11"
+  recommended_version: "21"
+installation:
+  interpreters: [java, javac]
+  package_managers: [maven, gradle]
+execution_config:
+  interpreter: {binary: java, args: [], file_extension: .java}

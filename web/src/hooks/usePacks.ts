@@ -5,11 +5,10 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { PacksService } from "@/api";
-import { request as __request } from "@/api/core/request";
-import { OpenAPI } from "@/api/core/OpenAPI";
 import type {
   CreatePackRequest,
-  PaginatedResponse_PackSummary,
+  CreatePackRegistryIndexRequest,
+  UpdatePackRegistryIndexRequest,
   UpdatePackRequest,
 } from "@/api";
 
@@ -39,10 +38,10 @@ export function useInfinitePacks(query?: string) {
     queryKey: ["packs", "infinite", query],
     initialPageParam: 1,
     queryFn: ({ pageParam }) =>
-      __request<PaginatedResponse_PackSummary>(OpenAPI, {
-        method: "GET",
-        url: "/api/v1/packs",
-        query: { page: pageParam, page_size: 50, q: query || undefined },
+      PacksService.listPacks({
+        page: pageParam,
+        pageSize: 50,
+        q: query || undefined,
       }),
     getNextPageParam: (lastPage) =>
       lastPage.pagination.has_next ? lastPage.pagination.page + 1 : undefined,
@@ -120,12 +119,7 @@ export function useDeletePack() {
 export function usePackIndices() {
   return useQuery({
     queryKey: ["pack-indices"],
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    queryFn: (): Promise<any> =>
-      __request(OpenAPI, {
-        method: "GET",
-        url: "/api/v1/pack-indices",
-      }),
+    queryFn: () => PacksService.listPackIndices(),
     staleTime: 30000,
   });
 }
@@ -133,19 +127,8 @@ export function usePackIndices() {
 export function useCreatePackIndex() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (data: {
-      name?: string;
-      url: string;
-      position?: number;
-      enabled: boolean;
-      headers: Record<string, string>;
-    }) =>
-      __request(OpenAPI, {
-        method: "POST",
-        url: "/api/v1/pack-indices",
-        body: data,
-        mediaType: "application/json",
-      }),
+    mutationFn: (data: CreatePackRegistryIndexRequest) =>
+      PacksService.createPackIndex({ requestBody: data }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["pack-indices"] });
       queryClient.invalidateQueries({ queryKey: ["indexed-packs"] });
@@ -161,20 +144,8 @@ export function useUpdatePackIndex() {
       data,
     }: {
       id: number;
-      data: {
-        name?: string | null;
-        url?: string;
-        position?: number;
-        enabled?: boolean;
-      };
-    }) =>
-      __request(OpenAPI, {
-        method: "PUT",
-        url: "/api/v1/pack-indices/{id}",
-        path: { id },
-        body: data,
-        mediaType: "application/json",
-      }),
+      data: UpdatePackRegistryIndexRequest;
+    }) => PacksService.updatePackIndex({ id, requestBody: data }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["pack-indices"] });
       queryClient.invalidateQueries({ queryKey: ["indexed-packs"] });
@@ -185,12 +156,7 @@ export function useUpdatePackIndex() {
 export function useDeletePackIndex() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: number) =>
-      __request(OpenAPI, {
-        method: "DELETE",
-        url: "/api/v1/pack-indices/{id}",
-        path: { id },
-      }),
+    mutationFn: (id: number) => PacksService.deletePackIndex({ id }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["pack-indices"] });
       queryClient.invalidateQueries({ queryKey: ["indexed-packs"] });
@@ -201,13 +167,33 @@ export function useDeletePackIndex() {
 export function useIndexedPacks(query?: string) {
   return useQuery({
     queryKey: ["indexed-packs", query],
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    queryFn: (): Promise<any> =>
-      __request(OpenAPI, {
-        method: "GET",
-        url: "/api/v1/pack-indices/packs",
-        query: { q: query || undefined },
-      }),
+    queryFn: () => PacksService.browseIndexedPacks({ q: query || undefined }),
     staleTime: 30000,
+  });
+}
+
+export function usePackReleases(ref: string) {
+  return useQuery({
+    queryKey: ["packs", ref, "releases"],
+    queryFn: () => PacksService.getPackReleases({ ref }),
+    enabled: !!ref,
+    staleTime: 30000,
+  });
+}
+
+export function useRetiredPackComponents(ref: string, enabled = true) {
+  return useQuery({
+    queryKey: ["packs", ref, "retired-components"],
+    queryFn: () => PacksService.getRetiredPackComponents({ ref }),
+    enabled: !!ref && enabled,
+    staleTime: 30000,
+  });
+}
+
+export function usePlatformCatalog() {
+  return useQuery({
+    queryKey: ["platform-catalog"],
+    queryFn: () => PacksService.getPlatformCatalog(),
+    staleTime: 60000,
   });
 }

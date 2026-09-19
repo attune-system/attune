@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { AllocateFileVersionByRefRequest } from "../models/AllocateFileVersionByRefRequest";
 import type { AppendProgressRequest } from "../models/AppendProgressRequest";
+import type { ArtifactBodyState } from "../models/ArtifactBodyState";
 import type { ArtifactClassification } from "../models/ArtifactClassification";
 import type { ArtifactType } from "../models/ArtifactType";
 import type { ArtifactVersionByRefUploadForm } from "../models/ArtifactVersionByRefUploadForm";
@@ -308,6 +309,7 @@ export class ArtifactsService {
        * Parent artifact ID
        */
       artifact: number;
+      body_state?: null | ArtifactBodyState;
       content_json?: null | Value;
       /**
        * MIME content type
@@ -337,6 +339,18 @@ export class ArtifactsService {
        */
       id: number;
       meta?: null | Value;
+      /**
+       * Immutable object-store locator.
+       */
+      object_key?: string | null;
+      /**
+       * Opaque provider generation, version ID, or ETag pinned for reads.
+       */
+      provider_version?: string | null;
+      /**
+       * SHA-256 digest of the ready body.
+       */
+      sha256?: string | null;
       /**
        * Size of content in bytes
        */
@@ -411,6 +425,7 @@ export class ArtifactsService {
        * Parent artifact ID
        */
       artifact: number;
+      body_state?: null | ArtifactBodyState;
       content_json?: null | Value;
       /**
        * MIME content type
@@ -440,6 +455,18 @@ export class ArtifactsService {
        */
       id: number;
       meta?: null | Value;
+      /**
+       * Immutable object-store locator.
+       */
+      object_key?: string | null;
+      /**
+       * Opaque provider generation, version ID, or ETag pinned for reads.
+       */
+      provider_version?: string | null;
+      /**
+       * SHA-256 digest of the ready body.
+       */
+      sha256?: string | null;
       /**
        * Size of content in bytes
        */
@@ -807,6 +834,7 @@ export class ArtifactsService {
       },
       errors: {
         404: `Artifact not found or no versions`,
+        416: `Requested range is not satisfiable`,
       },
     });
   }
@@ -968,6 +996,7 @@ export class ArtifactsService {
     id: number;
   }): CancelablePromise<{
     data: Array<{
+      body_state?: null | ArtifactBodyState;
       /**
        * MIME content type
        */
@@ -992,6 +1021,9 @@ export class ArtifactsService {
        * Version ID
        */
       id: number;
+      object_key?: string | null;
+      provider_version?: string | null;
+      sha256?: string | null;
       /**
        * Size of content in bytes
        */
@@ -1040,6 +1072,7 @@ export class ArtifactsService {
        * Parent artifact ID
        */
       artifact: number;
+      body_state?: null | ArtifactBodyState;
       content_json?: null | Value;
       /**
        * MIME content type
@@ -1069,6 +1102,18 @@ export class ArtifactsService {
        */
       id: number;
       meta?: null | Value;
+      /**
+       * Immutable object-store locator.
+       */
+      object_key?: string | null;
+      /**
+       * Opaque provider generation, version ID, or ETag pinned for reads.
+       */
+      provider_version?: string | null;
+      /**
+       * SHA-256 digest of the ready body.
+       */
+      sha256?: string | null;
       /**
        * Size of content in bytes
        */
@@ -1125,6 +1170,7 @@ export class ArtifactsService {
        * Parent artifact ID
        */
       artifact: number;
+      body_state?: null | ArtifactBodyState;
       content_json?: null | Value;
       /**
        * MIME content type
@@ -1154,6 +1200,18 @@ export class ArtifactsService {
        */
       id: number;
       meta?: null | Value;
+      /**
+       * Immutable object-store locator.
+       */
+      object_key?: string | null;
+      /**
+       * Opaque provider generation, version ID, or ETag pinned for reads.
+       */
+      provider_version?: string | null;
+      /**
+       * SHA-256 digest of the ready body.
+       */
+      sha256?: string | null;
       /**
        * Size of content in bytes
        */
@@ -1203,6 +1261,7 @@ export class ArtifactsService {
        * Parent artifact ID
        */
       artifact: number;
+      body_state?: null | ArtifactBodyState;
       content_json?: null | Value;
       /**
        * MIME content type
@@ -1232,6 +1291,18 @@ export class ArtifactsService {
        */
       id: number;
       meta?: null | Value;
+      /**
+       * Immutable object-store locator.
+       */
+      object_key?: string | null;
+      /**
+       * Opaque provider generation, version ID, or ETag pinned for reads.
+       */
+      provider_version?: string | null;
+      /**
+       * SHA-256 digest of the ready body.
+       */
+      sha256?: string | null;
       /**
        * Size of content in bytes
        */
@@ -1284,6 +1355,7 @@ export class ArtifactsService {
        * Parent artifact ID
        */
       artifact: number;
+      body_state?: null | ArtifactBodyState;
       content_json?: null | Value;
       /**
        * MIME content type
@@ -1313,6 +1385,18 @@ export class ArtifactsService {
        */
       id: number;
       meta?: null | Value;
+      /**
+       * Immutable object-store locator.
+       */
+      object_key?: string | null;
+      /**
+       * Opaque provider generation, version ID, or ETag pinned for reads.
+       */
+      provider_version?: string | null;
+      /**
+       * SHA-256 digest of the ready body.
+       */
+      sha256?: string | null;
       /**
        * Size of content in bytes
        */
@@ -1368,6 +1452,7 @@ export class ArtifactsService {
        * Parent artifact ID
        */
       artifact: number;
+      body_state?: null | ArtifactBodyState;
       content_json?: null | Value;
       /**
        * MIME content type
@@ -1397,6 +1482,18 @@ export class ArtifactsService {
        */
       id: number;
       meta?: null | Value;
+      /**
+       * Immutable object-store locator.
+       */
+      object_key?: string | null;
+      /**
+       * Opaque provider generation, version ID, or ETag pinned for reads.
+       */
+      provider_version?: string | null;
+      /**
+       * SHA-256 digest of the ready body.
+       */
+      sha256?: string | null;
       /**
        * Size of content in bytes
        */
@@ -1482,6 +1579,7 @@ export class ArtifactsService {
       },
       errors: {
         404: `Artifact, version, or content not found`,
+        416: `Requested range is not satisfiable`,
       },
     });
   }

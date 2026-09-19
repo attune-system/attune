@@ -16,5 +16,6 @@ export type RuntimeResponse = {
   pack?: number | null;
   pack_ref?: string | null;
   ref: string;
+  retired_at?: string | null;
   updated: string;
 };

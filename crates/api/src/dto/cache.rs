@@ -154,6 +154,8 @@ pub struct CacheNamespaceResponse {
     pub max_staging_generations: i32,
     /// Whether the namespace is tombstoned and pending bounded cleanup.
     pub tombstoned: bool,
+    #[schema(required = true, nullable = true)]
+    pub retired_at: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
     /// True when there is no active generation (uninitialized dataset).

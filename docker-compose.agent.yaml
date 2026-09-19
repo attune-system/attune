@@ -35,8 +35,8 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
+      api:
+        condition: service_healthy
       migrations:
         condition: service_completed_successfully
       postgres:
@@ -87,8 +87,8 @@ services:
   #   depends_on:
   #     init-agent:
   #       condition: service_completed_successfully
-  #     init-packs:
-  #       condition: service_completed_successfully
+  #     api:
+  #       condition: service_healthy
   #     migrations:
   #       condition: service_completed_successfully
   #     postgres:
@@ -137,8 +137,8 @@ services:
   #   depends_on:
   #     init-agent:
   #       condition: service_completed_successfully
-  #     init-packs:
-  #       condition: service_completed_successfully
+  #     api:
+  #       condition: service_healthy
   #     migrations:
   #       condition: service_completed_successfully
   #     postgres:
@@ -188,8 +188,8 @@ services:
   #   depends_on:
   #     init-agent:
   #       condition: service_completed_successfully
-  #     init-packs:
-  #       condition: service_completed_successfully
+  #     api:
+  #       condition: service_healthy
   #     migrations:
   #       condition: service_completed_successfully
   #     postgres:

@@ -1,0 +1,20 @@
+ref: core.queue_empty
+label: Queue Empty
+description: Emitted after the last queue-processing execution terminates and the work queue is still empty
+enabled: true
+type: system
+parameters: {}
+output:
+  event_type: {type: string, description: Lifecycle event type; always queue_empty, required: true}
+  queue_id: {type: integer, description: Database ID of the work queue, required: true}
+  queue_ref: {type: string, description: Reference of the work queue, required: true}
+  pack_ref: {type: string, description: "Pack reference that owns the queue, when available"}
+  dispatch_id: {type: integer, description: Terminal work queue dispatch record, required: true}
+  execution_id: {type: integer, description: Execution that finished processing the last leased queue item(s), required: true}
+  dispatch_action_ref: {type: string, description: Action reference used to process queue items, required: true}
+  leased_item_count: {type: integer, description: Number of queue items handled by the terminal dispatch, required: true}
+  terminal_dispatch_status: {type: string, description: Terminal status recorded on the work queue dispatch, required: true}
+  active_dispatch_count: {type: integer, description: Active dispatch count observed after the terminal execution, required: true}
+  ready_item_count: {type: integer, description: Queued or retry item count observed after the terminal execution, required: true}
+  observed_at: {type: string, format: date-time, description: Timestamp when Attune observed the queue empty state, required: true}
+tags: [system, queue, operations]

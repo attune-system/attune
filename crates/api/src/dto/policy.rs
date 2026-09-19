@@ -242,6 +242,7 @@ pub struct PolicySummary {
     pub rate_limit: Option<RateLimitPolicyResponse>,
     pub quotas: Vec<QuotaPolicyResponse>,
     pub tags: Vec<String>,
+    pub retired_at: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }
@@ -259,6 +260,7 @@ pub struct PolicyResponse {
     pub rate_limit: Option<RateLimitPolicyResponse>,
     pub quotas: Vec<QuotaPolicyResponse>,
     pub tags: Vec<String>,
+    pub retired_at: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }
@@ -278,6 +280,7 @@ impl From<Policy> for PolicySummary {
             rate_limit: detail.rate_limit,
             quotas: detail.quotas,
             tags: detail.tags,
+            retired_at: detail.retired_at,
             created: detail.created,
             updated: detail.updated,
         }
@@ -328,6 +331,7 @@ impl From<Policy> for PolicyResponse {
             },
             quotas: quotas_from_json(&policy.quotas),
             tags: policy.tags,
+            retired_at: policy.retired_at,
             created: policy.created,
             updated: policy.updated,
         }

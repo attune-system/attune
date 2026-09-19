@@ -296,7 +296,7 @@ async fn test_create_inquiry_with_assigned_user() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
-async fn test_create_inquiry_with_invalid_execution_fails() {
+async fn test_create_inquiry_allows_dangling_execution_reference() {
     let pool = create_test_pool().await.unwrap();
 
     // Try to create inquiry with non-existent execution ID
@@ -310,10 +310,315 @@ async fn test_create_inquiry_with_invalid_execution_fails() {
         timeout_at: None,
     };
 
-    let result = InquiryRepository::create(&pool, input).await;
+    let inquiry = InquiryRepository::create(&pool, input).await.unwrap();
 
-    assert!(result.is_err());
-    // Foreign key constraint violation
+    assert_eq!(inquiry.execution, 99999);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
+    use attune_common::{
+        models::{
+            enums::{ExecutionStatus, WorkflowTaskWaitKind, WorkflowTaskWaitState},
+            execution::WorkflowTaskMetadata,
+        },
+        repositories::{
+            execution::{CreateExecutionInput, ExecutionRepository},
+            inquiry::CreateWorkflowInquiryInput,
+            workflow::{
+                CreateWorkflowDefinitionInput, CreateWorkflowExecutionInput,
+                WorkflowDefinitionRepository, WorkflowExecutionRepository,
+            },
+            workflow_task_wait::{CreateWorkflowTaskWaitInput, WorkflowTaskWaitRepository},
+        },
+    };
+
+    let pool = create_test_pool().await.unwrap();
+    let pack = PackFixture::new_unique("workflow_inquiry")
+        .create(&pool)
+        .await
+        .unwrap();
+    let workflow_action = ActionFixture::new_unique(pack.id, &pack.r#ref, "workflow")
+        .create(&pool)
+        .await
+        .unwrap();
+    let creator_action = ActionFixture::new_unique(pack.id, &pack.r#ref, "request_approval")
+        .create(&pool)
+        .await
+        .unwrap();
+    let parent = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: Some(workflow_action.id),
+            action_ref: workflow_action.r#ref.clone(),
+            status: ExecutionStatus::Running,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let definition = WorkflowDefinitionRepository::create(
+        &pool,
+        CreateWorkflowDefinitionInput {
+            r#ref: format!("{}.approval", pack.r#ref),
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            label: "Approval".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            param_schema: None,
+            out_schema: None,
+            definition: json!({}),
+            tags: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let workflow = WorkflowExecutionRepository::create(
+        &pool,
+        CreateWorkflowExecutionInput {
+            execution: parent.id,
+            workflow_def: definition.id,
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let creator = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: Some(creator_action.id),
+            action_ref: creator_action.r#ref,
+            parent: Some(parent.id),
+            status: ExecutionStatus::Completed,
+            workflow_task: Some(WorkflowTaskMetadata {
+                workflow_execution: workflow.id,
+                task_name: "request_approval".to_string(),
+                triggered_by: None,
+                task_index: None,
+                task_batch: None,
+                retry_count: 0,
+                max_retries: 2,
+                next_retry_at: None,
+                timeout_seconds: None,
+                timed_out: false,
+                duration_ms: Some(1),
+                started_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let create_input = CreateWorkflowInquiryInput {
+        execution: creator.id,
+        purpose: "approval".to_string(),
+        prompt: "Approve deployment?".to_string(),
+        response_schema: Some(json!({"approved": {"type": "boolean", "required": true}})),
+        assigned_to: None,
+        timeout_seconds: Some(3600),
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let inquiry =
+        InquiryRepository::create_workflow_inquiry_idempotent(&mut conn, create_input.clone())
+            .await
+            .unwrap();
+    let duplicate =
+        InquiryRepository::create_workflow_inquiry_idempotent(&mut conn, create_input.clone())
+            .await
+            .unwrap();
+    assert_eq!(duplicate.id, inquiry.id);
+    assert_eq!(inquiry.workflow_execution, Some(workflow.id));
+    assert_eq!(
+        inquiry.workflow_task_name.as_deref(),
+        Some("request_approval")
+    );
+    assert_eq!(inquiry.action_attempt_family, Some(creator.id));
+
+    let conflicting = InquiryRepository::create_workflow_inquiry_idempotent(
+        &mut conn,
+        CreateWorkflowInquiryInput {
+            prompt: "Different prompt".to_string(),
+            ..create_input
+        },
+    )
+    .await;
+    assert!(matches!(conflicting, Err(Error::AlreadyExists { .. })));
+
+    let wait = WorkflowTaskWaitRepository::create_or_get(
+        &mut conn,
+        CreateWorkflowTaskWaitInput {
+            workflow_execution: workflow.id,
+            task_name: "deploy".to_string(),
+            kind: WorkflowTaskWaitKind::Inquiry,
+            inquiry: inquiry.id,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(wait.state, WorkflowTaskWaitState::Waiting);
+    let waits = WorkflowTaskWaitRepository::list_by_execution(&pool, parent.id)
+        .await
+        .unwrap();
+    assert_eq!(waits.len(), 1);
+    assert_eq!(waits[0].id, wait.id);
+    assert!(
+        WorkflowTaskWaitRepository::list_by_execution(&pool, creator.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let identity = attune_common::repositories::identity::IdentityRepository::create(
+        &pool,
+        attune_common::repositories::identity::CreateIdentityInput {
+            login: format!("responder_{}", unique_test_id()),
+            display_name: Some("Responder".to_string()),
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await
+    .unwrap();
+    let responded = InquiryRepository::respond_pending(
+        &pool,
+        inquiry.id,
+        json!({"approved": true}),
+        identity.id,
+        Some(json!({"provider": "test", "actor": "external-1"})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(responded.status, InquiryStatus::Responded);
+    assert_eq!(responded.responded_by, Some(identity.id));
+    assert!(InquiryRepository::respond_pending(
+        &pool,
+        inquiry.id,
+        json!({"approved": false}),
+        identity.id,
+        None,
+    )
+    .await
+    .unwrap()
+    .is_none());
+
+    let released = WorkflowTaskWaitRepository::transition_waiting(
+        &pool,
+        wait.id,
+        WorkflowTaskWaitState::Released,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(released.state, WorkflowTaskWaitState::Released);
+    assert!(released.resolved_at.is_some());
+    assert!(released.released_at.is_some());
+
+    let terminal_wait = WorkflowTaskWaitRepository::create_or_get(
+        &mut conn,
+        CreateWorkflowTaskWaitInput {
+            workflow_execution: workflow.id,
+            task_name: "verify_timeout_delivery".to_string(),
+            kind: WorkflowTaskWaitKind::Inquiry,
+            inquiry: inquiry.id,
+        },
+    )
+    .await
+    .unwrap();
+    WorkflowTaskWaitRepository::transition_waiting(
+        &pool,
+        terminal_wait.id,
+        WorkflowTaskWaitState::TimedOut,
+        Some(json!({"code": "inquiry_timeout"})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let resolvable = WorkflowTaskWaitRepository::find_resolvable(&pool, 100)
+        .await
+        .unwrap();
+    assert!(resolvable.iter().any(|wait| wait.id == terminal_wait.id));
+    assert!(
+        WorkflowTaskWaitRepository::mark_terminal_delivery_complete(&pool, terminal_wait.id)
+            .await
+            .unwrap()
+    );
+    let resolvable = WorkflowTaskWaitRepository::find_resolvable(&pool, 100)
+        .await
+        .unwrap();
+    assert!(!resolvable.iter().any(|wait| wait.id == terminal_wait.id));
+
+    let pending_inquiry = InquiryRepository::create_workflow_inquiry_idempotent(
+        &mut conn,
+        CreateWorkflowInquiryInput {
+            execution: creator.id,
+            purpose: "cancellation".to_string(),
+            prompt: "Cancel this inquiry".to_string(),
+            response_schema: None,
+            assigned_to: None,
+            timeout_seconds: None,
+        },
+    )
+    .await
+    .unwrap();
+    let pending_wait = WorkflowTaskWaitRepository::create_or_get(
+        &mut conn,
+        CreateWorkflowTaskWaitInput {
+            workflow_execution: workflow.id,
+            task_name: "cancelled_task".to_string(),
+            kind: WorkflowTaskWaitKind::Inquiry,
+            inquiry: pending_inquiry.id,
+        },
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let cancelled_workflow = WorkflowExecutionRepository::cancel_with_prerequisites(
+        &pool,
+        workflow.id,
+        "cancelled by test",
+        Some((ExecutionStatus::Canceling, None)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(cancelled_workflow.status, ExecutionStatus::Cancelled);
+    assert_eq!(
+        ExecutionRepository::find_by_id(&pool, parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Canceling
+    );
+    assert_eq!(
+        InquiryRepository::find_by_id(&pool, pending_inquiry.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InquiryStatus::Cancelled
+    );
+    assert_eq!(
+        WorkflowTaskWaitRepository::find_by_workflow_task(
+            &pool,
+            workflow.id,
+            &pending_wait.task_name,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .state,
+        WorkflowTaskWaitState::Cancelled
+    );
 }
 
 // ============================================================================

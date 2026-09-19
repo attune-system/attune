@@ -1,0 +1,27 @@
+ref: core.perl
+pack_ref: core
+name: Perl
+aliases: [perl, perl5]
+description: Perl runtime for script execution with optional CPAN dependency management
+distributions:
+  verification:
+    commands:
+      - {binary: perl, args: ["--version"], exit_code: 0, pattern: 'perl.*v\d+\.', priority: 1}
+  min_version: "5.20"
+  recommended_version: "5.38"
+installation:
+  package_managers: [cpanm, cpan]
+  interpreters: [perl]
+execution_config:
+  interpreter: {binary: perl, args: [], file_extension: .pl}
+  environment:
+    env_type: local_lib
+    dir_name: perl5
+    create_command: [sh, "-c", "mkdir -p {env_dir}/lib/perl5"]
+    interpreter_path: null
+  dependencies:
+    manifest_file: cpanfile
+    install_command: [sh, "-c", "cd {pack_dir} && PERL5LIB={env_dir}/lib/perl5 PERL_LOCAL_LIB_ROOT={env_dir} cpanm --local-lib {env_dir} --installdeps --quiet . 2>/dev/null || true"]
+  env_vars:
+    PERL5LIB: "{env_dir}/lib/perl5"
+    PERL_LOCAL_LIB_ROOT: "{env_dir}"

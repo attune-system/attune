@@ -6,7 +6,7 @@
 //! - Tokens without a resolvable identity are rejected with 403.
 //! - Execution-scoped tokens whose `execution_id` matches `inquiry.execution`
 //!   are blocked (privilege-loop guard) — an execution cannot answer an
-//!   inquiry it created via `core.ask`.
+//!   inquiry it created.
 //! - Execution-scoped tokens for a *different* execution may respond when
 //!   they belong to the assignee.
 //! - When `assigned_to` is unset, any authenticated caller may respond
@@ -465,6 +465,7 @@ async fn responded_by_recorded_for_access_token() -> TResult<()> {
         stored.status,
         attune_common::models::enums::InquiryStatus::Responded
     );
+    assert_eq!(stored.responded_by, Some(assignee.id));
     assert_eq!(stored.response, Some(json!({ "approved": true })));
     Ok(())
 }

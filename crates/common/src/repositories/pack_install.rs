@@ -5,7 +5,7 @@
 //! be queried by pack ref.
 
 use crate::error::Result;
-use crate::models::{Id, PackInstall, PackInstallStatus};
+use crate::models::{AbsentMetadataPolicy, Id, PackInstall, PackInstallStatus};
 use sqlx::{PgConnection, PgPool};
 
 /// Repository for pack install lifecycle records
@@ -13,7 +13,8 @@ pub struct PackInstallRepository {
     pool: PgPool,
 }
 
-const PACK_INSTALL_COLUMNS: &str = "id, pack_ref, pack_version, status, trigger_reason, \
+const PACK_INSTALL_COLUMNS: &str =
+    "id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, \
     pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, test_execution_id, \
     test_result, error_message, started_at, updated_at, finished_at";
 
@@ -36,9 +37,29 @@ impl PackInstallRepository {
         pack_id: Option<Id>,
         requested_by: Option<Id>,
     ) -> Result<PackInstall> {
+        self.create_with_policy(
+            pack_ref,
+            pack_version,
+            trigger_reason,
+            AbsentMetadataPolicy::Remove,
+            pack_id,
+            requested_by,
+        )
+        .await
+    }
+
+    pub async fn create_with_policy(
+        &self,
+        pack_ref: &str,
+        pack_version: &str,
+        trigger_reason: &str,
+        absent_metadata_policy: AbsentMetadataPolicy,
+        pack_id: Option<Id>,
+        requested_by: Option<Id>,
+    ) -> Result<PackInstall> {
         let sql = format!(
-            "INSERT INTO pack_install (pack_ref, pack_version, status, trigger_reason, pack_id, requested_by) \
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING {}",
+            "INSERT INTO pack_install (pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, pack_id, requested_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {}",
             PACK_INSTALL_COLUMNS
         );
         let record = sqlx::query_as::<_, PackInstall>(sql.as_str())
@@ -46,6 +67,7 @@ impl PackInstallRepository {
             .bind(pack_version)
             .bind(PackInstallStatus::Pending.as_str())
             .bind(trigger_reason)
+            .bind(absent_metadata_policy)
             .bind(pack_id)
             .bind(requested_by)
             .fetch_one(&self.pool)
@@ -101,6 +123,19 @@ impl PackInstallRepository {
             .bind(PackInstallStatus::Running.as_str())
             .bind(worker_id)
             .bind(candidate_access_token_hash)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// Move a test-free install directly into API-side activation.
+    pub async fn begin_activation(&self, id: Id) -> Result<Option<PackInstall>> {
+        let sql = format!(
+            "UPDATE pack_install SET status = 'activating', updated_at = NOW() \
+             WHERE id = $1 AND status = 'pending' RETURNING {}",
+            PACK_INSTALL_COLUMNS
+        );
+        Ok(sqlx::query_as::<_, PackInstall>(sql.as_str())
+            .bind(id)
             .fetch_optional(&self.pool)
             .await?)
     }

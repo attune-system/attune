@@ -383,7 +383,7 @@ impl WorkQueueDispatcher {
         } else {
             None
         };
-        let _action = match action {
+        let action = match action {
             Some(action) => Some(action),
             None => ActionRepository::find_by_ref(pool, &queue.dispatch_action_ref).await?,
         }
@@ -394,6 +394,13 @@ impl WorkQueueDispatcher {
                 queue.r#ref
             )
         })?;
+        if !action.enabled || action.retired_at.is_some() {
+            return Err(anyhow!(
+                "dispatch action '{}' for queue '{}' is not active",
+                queue.dispatch_action_ref,
+                queue.r#ref
+            ));
+        }
 
         let pack = if let Some(pack_id) = queue.pack {
             PackRepository::find_by_id(pool, pack_id).await?
@@ -1264,6 +1271,7 @@ mod tests {
             label: "Inbox".to_string(),
             description: None,
             enabled: true,
+            enabled_override: None,
             accepting_new_items: true,
             dispatch_action: Some(11),
             dispatch_action_ref: "core.process".to_string(),
@@ -1278,6 +1286,7 @@ mod tests {
             config,
             reference_visibility: ActionReferenceVisibility::Public,
             reference_allowed_pack_refs: Vec::new(),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         }

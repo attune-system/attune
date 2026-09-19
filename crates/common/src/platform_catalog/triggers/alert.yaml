@@ -1,0 +1,19 @@
+ref: core.alert
+label: System Alert
+description: Emitted when Attune detects unexpected operational activity that may require operator attention
+enabled: true
+type: system
+parameters: {}
+output:
+  severity: {type: string, enum: [info, warning, error, critical], description: Alert severity, required: true}
+  category: {type: string, description: High-level alert category, required: true}
+  failure_type: {type: string, description: Machine-readable failure type, required: true}
+  component_type: {type: string, description: Type of component that produced the alert, required: true}
+  component_id: {type: integer, description: "Database ID of the component, when available"}
+  component_ref: {type: string, description: Human-readable component reference or name}
+  worker_role: {type: string, enum: [action, sensor], description: "Worker role, when the component is a worker"}
+  observed_at: {type: string, format: date-time, description: Timestamp when Attune observed the condition, required: true}
+  summary: {type: string, description: Short human-readable alert summary, required: true}
+  details: {type: object, description: Structured alert details for notification formatting}
+  correlation_id: {type: string, description: Stable identifier for grouping duplicate alert events}
+tags: [system, alert, operations]

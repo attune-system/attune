@@ -59,8 +59,10 @@ impl PackDeletionState {
 }
 
 const PACK_DELETION_QUERY: &str = r#"
-    WITH locked_releases AS MATERIALIZED (
-        SELECT id FROM pack_release WHERE pack = $1 FOR UPDATE
+    WITH locked_pack AS MATERIALIZED (
+        SELECT id FROM pack WHERE id = $1 FOR UPDATE
+    ), locked_releases AS MATERIALIZED (
+        SELECT id FROM pack_release WHERE pack IN (SELECT id FROM locked_pack) FOR UPDATE
     ), blockers AS MATERIALIZED (
         SELECT
             EXISTS(

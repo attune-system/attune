@@ -90,14 +90,14 @@ impl WorkflowValidator {
 
         // Validate each task
         for task in &workflow.tasks {
-            Self::validate_task(task)?;
+            Self::validate_task(task, false)?;
         }
 
         Ok(())
     }
 
     /// Validate a single task
-    fn validate_task(task: &Task) -> ValidationResult<()> {
+    fn validate_task(task: &Task, nested_in_parallel: bool) -> ValidationResult<()> {
         // Action tasks must have an action reference
         if task.r#type == TaskType::Action && task.action.is_none() {
             return Err(ValidationError::SemanticError(format!(
@@ -131,6 +131,27 @@ impl WorkflowValidator {
                 "Task '{}' of type 'workflow' must have an action field",
                 task.name
             )));
+        }
+
+        if task.wait_for.is_some() {
+            if task.r#type != TaskType::Action {
+                return Err(ValidationError::SemanticError(format!(
+                    "Task '{}' wait_for is only supported for action tasks",
+                    task.name
+                )));
+            }
+            if nested_in_parallel {
+                return Err(ValidationError::SemanticError(format!(
+                    "Task '{}' wait_for is not supported on nested parallel tasks",
+                    task.name
+                )));
+            }
+            if task.with_items.is_some() || task.iterate_cache.is_some() {
+                return Err(ValidationError::SemanticError(format!(
+                    "Task '{}' wait_for cannot be combined with task iteration",
+                    task.name
+                )));
+            }
         }
 
         // Validate retry configuration
@@ -229,7 +250,7 @@ impl WorkflowValidator {
         // Recursively validate parallel sub-tasks
         if let Some(ref tasks) = task.tasks {
             for subtask in tasks {
-                Self::validate_task(subtask)?;
+                Self::validate_task(subtask, true)?;
             }
         }
 
@@ -274,7 +295,14 @@ impl WorkflowValidator {
             }
         }
 
-        // Cycles are now allowed - no cycle detection needed
+        for task in &workflow.tasks {
+            if task.wait_for.is_some() && Self::task_reaches_itself(task.name.as_str(), &graph) {
+                return Err(ValidationError::GraphError(format!(
+                    "Task '{}' wait_for is not supported in cyclic graph regions",
+                    task.name
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -294,6 +322,22 @@ impl WorkflowValidator {
         }
 
         graph
+    }
+
+    fn task_reaches_itself(task_name: &str, graph: &HashMap<String, Vec<String>>) -> bool {
+        let mut stack = graph.get(task_name).cloned().unwrap_or_default();
+        let mut visited = HashSet::new();
+        while let Some(candidate) = stack.pop() {
+            if candidate == task_name {
+                return true;
+            }
+            if visited.insert(candidate.clone()) {
+                if let Some(next) = graph.get(&candidate) {
+                    stack.extend(next.iter().cloned());
+                }
+            }
+        }
+        false
     }
 
     /// Find tasks that have no predecessors (entry points)

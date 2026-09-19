@@ -982,6 +982,7 @@ mod tests {
             entrypoint: "run.sh".to_string(),
             runtime: None,
             enabled: true,
+            enabled_override: None,
             runtime_version_constraint: None,
             required_worker_runtimes: serde_json::json!({}),
             worker_selector: serde_json::json!({}),
@@ -1003,6 +1004,7 @@ mod tests {
             parameter_delivery: attune_common::models::enums::ParameterDelivery::Stdin,
             parameter_format: attune_common::models::enums::ParameterFormat::Json,
             output_format: attune_common::models::enums::OutputFormat::Json,
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         }

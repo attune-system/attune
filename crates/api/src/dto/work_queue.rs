@@ -240,6 +240,8 @@ pub struct WorkQueueResponse {
     #[schema(nullable = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_dispatch_tuning: Option<ResolvedWorkQueueDispatchTuningResponse>,
+
+    pub retired_at: Option<DateTime<Utc>>,
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
     #[schema(example = "2024-01-13T10:30:00Z")]
@@ -275,6 +277,8 @@ pub struct WorkQueueSummary {
     pub reference_visibility: ActionReferenceVisibility,
     #[schema(example = json!(["incident_response", "deployments"]))]
     pub reference_allowed_pack_refs: Vec<String>,
+
+    pub retired_at: Option<DateTime<Utc>>,
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
     #[schema(example = "2024-01-13T10:30:00Z")]
@@ -548,6 +552,7 @@ impl From<WorkQueue> for WorkQueueResponse {
             reference_visibility: queue.reference_visibility,
             reference_allowed_pack_refs: queue.reference_allowed_pack_refs,
             resolved_dispatch_tuning: None,
+            retired_at: queue.retired_at,
             created: queue.created,
             updated: queue.updated,
         }
@@ -580,6 +585,7 @@ impl From<WorkQueue> for WorkQueueSummary {
             trace_tag_template: queue.trace_tag_template,
             reference_visibility: queue.reference_visibility,
             reference_allowed_pack_refs: queue.reference_allowed_pack_refs,
+            retired_at: queue.retired_at,
             created: queue.created,
             updated: queue.updated,
         }

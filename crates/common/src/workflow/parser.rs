@@ -177,6 +177,15 @@ pub struct TaskTransition {
 // Task definition
 // ---------------------------------------------------------------------------
 
+/// A durable prerequisite that must be satisfied before an action task is
+/// scheduled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskWaitFor {
+    /// A literal inquiry ID or a template that resolves to a positive `i64`.
+    pub inquiry: JsonValue,
+}
+
 /// Task definition - can be action, parallel, or workflow type.
 ///
 /// Supports both the new `next` transition format and legacy flat fields
@@ -238,6 +247,11 @@ pub struct Task {
 
     /// Conditional execution (task-level — controls whether this task runs)
     pub when: Option<String>,
+
+    /// Optional prerequisite evaluated after graph readiness and before child
+    /// execution creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for: Option<TaskWaitFor>,
 
     /// With-items iteration
     pub with_items: Option<String>,
@@ -655,24 +669,59 @@ fn validate_workflow_structure(workflow: &WorkflowDefinition) -> ParseResult<()>
 
     // Validate each task
     for task in &workflow.tasks {
-        validate_task(task, &task_names)?;
+        validate_task(task, &task_names, false)?;
     }
 
-    // Cycles are now allowed in workflows - no cycle detection needed
-    // Workflows are directed graphs (not DAGs) and cycles are supported
-    // for use cases like monitoring loops, retry patterns, etc.
+    let graph: std::collections::HashMap<&str, Vec<&str>> = workflow
+        .tasks
+        .iter()
+        .map(|task| (task.name.as_str(), task.all_transition_targets()))
+        .collect();
+    for task in &workflow.tasks {
+        if task.wait_for.is_some() && task_reaches_itself(task.name.as_str(), &graph) {
+            return Err(ParseError::InvalidField {
+                field: format!("Task '{}' wait_for", task.name),
+                reason: "wait_for is not supported on tasks in cyclic graph regions".to_string(),
+            });
+        }
+    }
 
     Ok(())
 }
 
 /// Validate a single task
-fn validate_task(task: &Task, task_names: &std::collections::HashSet<&str>) -> ParseResult<()> {
+fn validate_task(
+    task: &Task,
+    task_names: &std::collections::HashSet<&str>,
+    nested_in_parallel: bool,
+) -> ParseResult<()> {
     // Validate action reference exists for action-type tasks
     if task.r#type == TaskType::Action && task.action.is_none() {
         return Err(ParseError::MissingField(format!(
             "Task '{}' of type 'action' must have an 'action' field",
             task.name
         )));
+    }
+
+    if task.wait_for.is_some() {
+        if task.r#type != TaskType::Action {
+            return Err(ParseError::InvalidField {
+                field: format!("Task '{}' wait_for", task.name),
+                reason: "wait_for is only supported for action tasks".to_string(),
+            });
+        }
+        if nested_in_parallel {
+            return Err(ParseError::InvalidField {
+                field: format!("Task '{}' wait_for", task.name),
+                reason: "wait_for is not supported on nested parallel tasks".to_string(),
+            });
+        }
+        if task.with_items.is_some() || task.iterate_cache.is_some() {
+            return Err(ParseError::InvalidField {
+                field: format!("Task '{}' wait_for", task.name),
+                reason: "wait_for cannot be combined with task iteration".to_string(),
+            });
+        }
     }
 
     // Validate parallel tasks
@@ -712,11 +761,30 @@ fn validate_task(task: &Task, task_names: &std::collections::HashSet<&str>) -> P
         let subtask_names: std::collections::HashSet<_> =
             tasks.iter().map(|t| t.name.as_str()).collect();
         for subtask in tasks {
-            validate_task(subtask, &subtask_names)?;
+            validate_task(subtask, &subtask_names, true)?;
         }
     }
 
     Ok(())
+}
+
+fn task_reaches_itself<'a>(
+    task_name: &'a str,
+    graph: &std::collections::HashMap<&'a str, Vec<&'a str>>,
+) -> bool {
+    let mut stack = graph.get(task_name).cloned().unwrap_or_default();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(candidate) = stack.pop() {
+        if candidate == task_name {
+            return true;
+        }
+        if visited.insert(candidate) {
+            if let Some(next) = graph.get(candidate) {
+                stack.extend(next.iter().copied());
+            }
+        }
+    }
+    false
 }
 
 // Cycle detection functions removed - cycles are now valid in workflow graphs
@@ -1818,5 +1886,83 @@ tasks:
             workflow.cancellation_policy,
             CancellationPolicy::AllowFinish
         );
+    }
+
+    #[test]
+    fn parses_templated_inquiry_prerequisite() {
+        let yaml = r#"
+version: "1.0.0"
+tasks:
+  - name: request
+    action: provider.request
+    next:
+      - do: [deploy]
+  - name: deploy
+    action: app.deploy
+    wait_for:
+      inquiry: "{{ task.request.inquiry_id }}"
+"#;
+
+        let workflow = parse_workflow_yaml(yaml).unwrap();
+        assert_eq!(
+            workflow.tasks[1].wait_for.as_ref().unwrap().inquiry,
+            serde_json::json!("{{ task.request.inquiry_id }}")
+        );
+        assert_eq!(
+            workflow_to_json(&workflow).unwrap()["tasks"][1]["wait_for"]["inquiry"],
+            serde_json::json!("{{ task.request.inquiry_id }}")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_inquiry_prerequisite_fields() {
+        let yaml = r#"
+version: "1.0.0"
+tasks:
+  - name: deploy
+    action: app.deploy
+    wait_for:
+      inquiry: 42
+      timeout: 60
+"#;
+
+        assert!(parse_workflow_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_inquiry_prerequisite_with_iteration() {
+        let yaml = r#"
+version: "1.0.0"
+tasks:
+  - name: deploy
+    action: app.deploy
+    wait_for:
+      inquiry: 42
+    with_items: "{{ parameters.targets }}"
+"#;
+
+        let error = parse_workflow_yaml(yaml).unwrap_err().to_string();
+        assert!(error.contains("cannot be combined with task iteration"));
+    }
+
+    #[test]
+    fn rejects_inquiry_prerequisite_in_cycle() {
+        let yaml = r#"
+version: "1.0.0"
+tasks:
+  - name: first
+    action: app.first
+    wait_for:
+      inquiry: 42
+    next:
+      - do: [second]
+  - name: second
+    action: app.second
+    next:
+      - do: [first]
+"#;
+
+        let error = parse_workflow_yaml(yaml).unwrap_err().to_string();
+        assert!(error.contains("cyclic graph regions"));
     }
 }

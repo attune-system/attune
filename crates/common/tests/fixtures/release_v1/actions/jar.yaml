@@ -1,0 +1,8 @@
+ref: release_smoke.jar
+runner_type: java
+launch:
+  type: java_jar
+  artifact: app
+parameter_delivery: stdin
+parameter_format: json
+output_format: json

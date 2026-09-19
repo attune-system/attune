@@ -459,7 +459,7 @@ pub async fn receive_webhook(
 
     // Verify the trigger itself is enabled. A disabled trigger rejects all
     // event ingress, including webhooks.
-    if !trigger.enabled {
+    if !trigger.enabled || trigger.retired_at.is_some() {
         let _ = log_webhook_event(
             &state,
             &trigger,

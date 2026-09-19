@@ -42,7 +42,7 @@ use attune_common::repositories::{
     log_stream::LogStreamRepository,
     maintenance::MaintenanceRepository,
     workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository},
-    FindById, FindByRef, Update, WorkflowCacheIterationRepository,
+    FindById, FindByRef, Update, WorkflowCacheIterationRepository, WorkflowTaskWaitRepository,
 };
 use attune_common::scheduling::{
     parse_worker_affinity, parse_worker_selector, parse_worker_tolerations,
@@ -65,7 +65,7 @@ use crate::{
         execution::{
             CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams,
             ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
-            WorkflowCacheIterationResponse,
+            WorkflowCacheIterationResponse, WorkflowTaskWaitResponse,
         },
         ApiResponse,
     },
@@ -111,7 +111,7 @@ pub async fn create_execution(
     let action = ActionRepository::find_by_ref(&state.db, &request.action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", request.action_ref)))?;
-    if !action.enabled {
+    if !action.enabled || action.retired_at.is_some() {
         return Err(ApiError::BadRequest(format!(
             "Action '{}' is disabled",
             request.action_ref
@@ -1036,7 +1036,6 @@ pub async fn get_execution(
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
-
     // Load identity attributes + effective grants once, and memoize the
     // (potentially recursive) visibility-anchor and ancestor-chain lookups,
     // so that the Read and conditional Decrypt authorization checks below
@@ -1136,6 +1135,50 @@ pub async fn list_workflow_cache_iterations(
             .collect();
 
     Ok((StatusCode::OK, Json(ApiResponse::new(iterations))))
+}
+
+/// List safe workflow task wait metadata for an execution.
+#[utoipa::path(
+    get,
+    path = "/api/v1/executions/{id}/workflow-task-waits",
+    tag = "executions",
+    params(("id" = i64, Path, description = "Execution ID")),
+    responses(
+        (status = 200, description = "Workflow task wait metadata", body = inline(ApiResponse<Vec<WorkflowTaskWaitResponse>>)),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Execution is not visible to the caller"),
+        (status = 404, description = "Execution not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_workflow_task_waits(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let execution = ExecutionRepository::find_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {id} not found")))?;
+
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
+    authorize_execution_access(
+        &state,
+        &user,
+        &execution,
+        Action::Read,
+        authz_snapshot.as_ref(),
+        &mut ExecutionVisibilityCache::default(),
+    )
+    .await?;
+
+    let waits: Vec<WorkflowTaskWaitResponse> =
+        WorkflowTaskWaitRepository::list_by_execution(&state.db, id)
+            .await?
+            .into_iter()
+            .map(WorkflowTaskWaitResponse::from)
+            .collect();
+
+    Ok((StatusCode::OK, Json(ApiResponse::new(waits))))
 }
 
 /// List executions by status
@@ -1366,6 +1409,30 @@ pub async fn cancel_execution(
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
+    let workflow_execution = WorkflowExecutionRepository::find_by_execution(&state.db, id).await?;
+
+    if matches!(
+        execution.status,
+        ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+    ) && workflow_execution.as_ref().is_some_and(|workflow| {
+        !matches!(
+            workflow.status,
+            ExecutionStatus::Completed
+                | ExecutionStatus::Failed
+                | ExecutionStatus::Cancelled
+                | ExecutionStatus::Timeout
+                | ExecutionStatus::Abandoned
+        )
+    }) {
+        let workflow = workflow_execution.as_ref().unwrap();
+        WorkflowExecutionRepository::cancel_with_prerequisites(
+            &state.db,
+            workflow.id,
+            "Cancelled: parent workflow execution was cancelled",
+            None,
+        )
+        .await?;
+    }
 
     // Check if the execution is in a cancellable state
     let cancellable = matches!(
@@ -1375,7 +1442,8 @@ pub async fn cancel_execution(
             | ExecutionStatus::Scheduled
             | ExecutionStatus::Running
             | ExecutionStatus::Canceling
-    );
+    ) || (execution.status == ExecutionStatus::Cancelled
+        && workflow_execution.is_some());
 
     if !cancellable {
         return Err(ApiError::Conflict(format!(
@@ -1385,50 +1453,100 @@ pub async fn cancel_execution(
         )));
     }
 
-    // If already canceling, just return the current state
-    if execution.status == ExecutionStatus::Canceling {
-        let response = ApiResponse::new(ExecutionResponse::from(execution));
+    let publisher = state.get_publisher().await;
+
+    if matches!(
+        execution.status,
+        ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+    ) {
+        cancel_workflow_children(&state.db, publisher.as_deref(), id).await;
+        let repaired = ExecutionRepository::find_by_id(&state.db, id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
+        let response = ApiResponse::new(ExecutionResponse::from(repaired));
         return Ok((StatusCode::OK, Json(response)));
     }
-
-    let publisher = state.get_publisher().await;
 
     // For executions that haven't reached a worker yet, cancel immediately
     if matches!(
         execution.status,
         ExecutionStatus::Requested | ExecutionStatus::Scheduling | ExecutionStatus::Scheduled
     ) {
-        let update = UpdateExecutionInput {
-            status: Some(ExecutionStatus::Cancelled),
-            result: Some(
-                serde_json::json!({"error": "Cancelled by user before execution started"}),
-            ),
-            ..Default::default()
+        let result = serde_json::json!({"error": "Cancelled by user before execution started"});
+        let updated = if let Some(workflow) = &workflow_execution {
+            WorkflowExecutionRepository::cancel_with_prerequisites(
+                &state.db,
+                workflow.id,
+                "Cancelled: parent workflow execution was cancelled",
+                Some((ExecutionStatus::Cancelled, Some(result))),
+            )
+            .await?;
+            ExecutionRepository::find_by_id(&state.db, id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?
+        } else {
+            ExecutionRepository::update_if_status(
+                &state.db,
+                id,
+                execution.status,
+                UpdateExecutionInput {
+                    status: Some(ExecutionStatus::Cancelled),
+                    result: Some(result),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                ApiError::Conflict(format!(
+                    "Execution {} completed while cancellation was being requested",
+                    id
+                ))
+            })?
         };
-        let updated = ExecutionRepository::update(&state.db, id, update).await?;
-        let delegated_to_executor = publish_status_change_to_executor(
+        publish_status_change_to_executor(
             publisher.as_deref(),
             &execution,
             ExecutionStatus::Cancelled,
             "api-service",
         )
         .await;
-
-        if !delegated_to_executor {
-            cancel_workflow_children(&state.db, publisher.as_deref(), id).await;
-        }
+        cancel_workflow_children(&state.db, publisher.as_deref(), id).await;
 
         let response = ApiResponse::new(ExecutionResponse::from(updated));
         return Ok((StatusCode::OK, Json(response)));
     }
 
     // For running executions, set status to Canceling and send cancel message to the worker
-    let update = UpdateExecutionInput {
-        status: Some(ExecutionStatus::Canceling),
-        ..Default::default()
+    let updated = if let Some(workflow) = &workflow_execution {
+        WorkflowExecutionRepository::cancel_with_prerequisites(
+            &state.db,
+            workflow.id,
+            "Cancelled: parent workflow execution was cancelled",
+            Some((ExecutionStatus::Canceling, None)),
+        )
+        .await?;
+        ExecutionRepository::find_by_id(&state.db, id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?
+    } else {
+        ExecutionRepository::update_if_status(
+            &state.db,
+            id,
+            execution.status,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Canceling),
+                ..Default::default()
+            },
+        )
+        .await?
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "Execution {} completed while cancellation was being requested",
+                id
+            ))
+        })?
     };
-    let updated = ExecutionRepository::update(&state.db, id, update).await?;
-    let delegated_to_executor = publish_status_change_to_executor(
+    publish_status_change_to_executor(
         publisher.as_deref(),
         &execution,
         ExecutionStatus::Canceling,
@@ -1446,9 +1564,7 @@ pub async fn cancel_execution(
         );
     }
 
-    if !delegated_to_executor {
-        cancel_workflow_children(&state.db, publisher.as_deref(), id).await;
-    }
+    cancel_workflow_children(&state.db, publisher.as_deref(), id).await;
 
     let response = ApiResponse::new(ExecutionResponse::from(updated));
     Ok((StatusCode::OK, Json(response)))
@@ -1689,10 +1805,13 @@ async fn resolve_cancellation_policy(
             _ => return CancellationPolicy::default(),
         };
 
-    let wf_def = match WorkflowDefinitionRepository::find_by_id(db, wf_exec.workflow_def).await {
-        Ok(Some(def)) => def,
-        _ => return CancellationPolicy::default(),
-    };
+    let wf_def =
+        match WorkflowDefinitionRepository::find_by_id_including_retired(db, wf_exec.workflow_def)
+            .await
+        {
+            Ok(Some(def)) => def,
+            _ => return CancellationPolicy::default(),
+        };
 
     // Deserialise the stored JSON definition to extract the policy field.
     match serde_json::from_value::<WorkflowDefinition>(wf_def.definition) {
@@ -1746,6 +1865,26 @@ async fn cancel_workflow_children_with_policy(
     parent_execution_id: i64,
     policy: CancellationPolicy,
 ) {
+    if let Ok(Some(workflow)) =
+        WorkflowExecutionRepository::find_by_execution(db, parent_execution_id).await
+    {
+        if let Err(error) = WorkflowExecutionRepository::cancel_with_prerequisites(
+            db,
+            workflow.id,
+            "Cancelled: parent workflow execution was cancelled",
+            None,
+        )
+        .await
+        {
+            tracing::error!(
+                "Failed to cancel workflow_execution {} prerequisites: {}",
+                workflow.id,
+                error
+            );
+            return;
+        }
+    }
+
     // Find all child executions that are still incomplete
     let children: Vec<attune_common::models::Execution> = match sqlx::query_as::<
         _,
@@ -1769,16 +1908,14 @@ async fn cancel_workflow_children_with_policy(
         }
     };
 
-    if children.is_empty() {
-        return;
+    if !children.is_empty() {
+        tracing::info!(
+            "Cascading cancellation from execution {} to {} child execution(s) (policy: {:?})",
+            parent_execution_id,
+            children.len(),
+            policy,
+        );
     }
-
-    tracing::info!(
-        "Cascading cancellation from execution {} to {} child execution(s) (policy: {:?})",
-        parent_execution_id,
-        children.len(),
-        policy,
-    );
 
     for child in &children {
         let child_id = child.id;
@@ -1845,41 +1982,6 @@ async fn cancel_workflow_children_with_policy(
         .await;
     }
 
-    // Also mark any associated workflow_execution record as Cancelled so that
-    // advance_workflow short-circuits and does not dispatch new tasks.
-    // A workflow_execution is linked to the parent execution via its `execution` column.
-    if let Ok(Some(wf_exec)) =
-        WorkflowExecutionRepository::find_by_execution(db, parent_execution_id).await
-    {
-        if !matches!(
-            wf_exec.status,
-            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
-        ) {
-            let wf_update = attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
-                status: Some(ExecutionStatus::Cancelled),
-                error_message: Some(
-                    "Cancelled: parent workflow execution was cancelled".to_string(),
-                ),
-                current_tasks: Some(vec![]),
-                completed_tasks: None,
-                failed_tasks: None,
-                skipped_tasks: None,
-                variables: None,
-                paused: None,
-                pause_reason: None,
-            };
-            if let Err(e) = WorkflowExecutionRepository::update(db, wf_exec.id, wf_update).await {
-                tracing::error!("Failed to cancel workflow_execution {}: {}", wf_exec.id, e);
-            } else {
-                tracing::info!(
-                    "Cancelled workflow_execution {} for parent execution {}",
-                    wf_exec.id,
-                    parent_execution_id
-                );
-            }
-        }
-    }
-
     // If no children are still running (all were pre-running or were
     // cancelled), finalize the parent execution as Cancelled immediately.
     // Without this, the parent would stay stuck in "Canceling" because no
@@ -1916,17 +2018,27 @@ async fn cancel_workflow_children_with_policy(
             })),
             ..Default::default()
         };
-        if let Err(e) = ExecutionRepository::update(db, parent_execution_id, update).await {
-            tracing::error!(
+        match ExecutionRepository::update_if_status(
+            db,
+            parent_execution_id,
+            ExecutionStatus::Canceling,
+            update,
+        )
+        .await
+        {
+            Ok(Some(_)) => tracing::info!(
+                "Finalized parent execution {} as Cancelled (no running children remain)",
+                parent_execution_id
+            ),
+            Ok(None) => tracing::debug!(
+                "Parent execution {} left Canceling before cancellation finalization",
+                parent_execution_id
+            ),
+            Err(e) => tracing::error!(
                 "Failed to finalize parent execution {} as Cancelled: {}",
                 parent_execution_id,
                 e
-            );
-        } else {
-            tracing::info!(
-                "Finalized parent execution {} as Cancelled (no running children remain)",
-                parent_execution_id
-            );
+            ),
         }
     }
 }
@@ -3229,6 +3341,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/executions/{id}/workflow-cache-iterations",
             get(list_workflow_cache_iterations),
+        )
+        .route(
+            "/executions/{id}/workflow-task-waits",
+            get(list_workflow_task_waits),
         )
         .route(
             "/executions/{id}/cancel",

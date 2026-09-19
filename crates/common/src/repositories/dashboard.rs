@@ -80,6 +80,7 @@ struct ResolvedDashboardUpdate {
     label: String,
     description: Option<String>,
     enabled: bool,
+    updates_enabled: bool,
     is_default_home: bool,
     spec_version: i32,
     spec: JsonDict,
@@ -97,7 +98,7 @@ impl FindById for DashboardRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM dashboard WHERE id = $1",
+            "SELECT {} FROM dashboard WHERE id = $1 AND retired_at IS NULL",
             DASHBOARD_SELECT_COLUMNS
         );
         sqlx::query_as::<_, Dashboard>(&query)
@@ -115,7 +116,7 @@ impl List for DashboardRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM dashboard ORDER BY scope_type ASC, scope_ref ASC, ref ASC LIMIT 1000",
+            "SELECT {} FROM dashboard WHERE retired_at IS NULL ORDER BY scope_type ASC, scope_ref ASC, ref ASC LIMIT 1000",
             DASHBOARD_SELECT_COLUMNS
         );
         sqlx::query_as::<_, Dashboard>(&query)
@@ -284,7 +285,7 @@ impl Update for DashboardRepository {
         }
         if let Some(enabled) = input.enabled {
             push_comma!();
-            query.push("enabled = ").push_bind(enabled);
+            query.push("enabled_override = ").push_bind(enabled);
             has_updates = true;
         }
         if let Some(is_default_home) = input.is_default_home {
@@ -407,6 +408,7 @@ impl DashboardRepository {
             Some(Patch::Clear) => None,
             None => current.description.clone(),
         };
+        let updates_enabled = enabled.is_some();
         let enabled = enabled.unwrap_or(current.enabled);
         let is_default_home = is_default_home.unwrap_or(current.is_default_home);
         let spec_version = spec_version.unwrap_or(current.spec_version);
@@ -448,6 +450,7 @@ impl DashboardRepository {
             label,
             description,
             enabled,
+            updates_enabled,
             is_default_home,
             spec_version,
             spec,
@@ -479,7 +482,7 @@ impl DashboardRepository {
                     is_adhoc = $8, \
                     label = $9, \
                     description = $10, \
-                    enabled = $11, \
+                    enabled_override = CASE WHEN $18 THEN $11 ELSE enabled_override END, \
                     is_default_home = $1, \
                     spec_version = $12, \
                     spec = $13, \
@@ -517,6 +520,7 @@ impl DashboardRepository {
             .bind(resolved.expected_revision)
             .bind(resolved.updated_by)
             .bind(record_version && resolved.records_spec_revision)
+            .bind(resolved.updates_enabled)
             .fetch_optional(executor)
             .await?;
 
@@ -642,6 +646,26 @@ impl DashboardRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
+            "SELECT {} FROM dashboard WHERE ref = $1 AND scope_type = $2 AND scope_ref = $3 AND retired_at IS NULL",
+            DASHBOARD_SELECT_COLUMNS
+        );
+        sqlx::query_as::<_, Dashboard>(&query)
+            .bind(&scoped_ref.r#ref)
+            .bind(scoped_ref.scope_type)
+            .bind(&scoped_ref.scope_ref)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn find_by_ref_in_scope_including_retired<'e, E>(
+        executor: E,
+        scoped_ref: &DashboardScopedRef,
+    ) -> Result<Option<Dashboard>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
             "SELECT {} FROM dashboard WHERE ref = $1 AND scope_type = $2 AND scope_ref = $3",
             DASHBOARD_SELECT_COLUMNS
         );
@@ -663,7 +687,7 @@ impl DashboardRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM dashboard WHERE scope_type = $1 AND scope_ref = $2 ORDER BY ref ASC",
+            "SELECT {} FROM dashboard WHERE scope_type = $1 AND scope_ref = $2 AND retired_at IS NULL ORDER BY ref ASC",
             DASHBOARD_SELECT_COLUMNS
         );
         sqlx::query_as::<_, Dashboard>(&query)
@@ -683,7 +707,7 @@ impl DashboardRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM dashboard WHERE scope_type = $1 AND scope_ref = $2 AND is_default_home = TRUE",
+            "SELECT {} FROM dashboard WHERE scope_type = $1 AND scope_ref = $2 AND is_default_home = TRUE AND retired_at IS NULL",
             DASHBOARD_SELECT_COLUMNS
         );
         sqlx::query_as::<_, Dashboard>(&query)
@@ -733,6 +757,7 @@ mod tests {
             label: "Ops".to_string(),
             description: Some("Operations".to_string()),
             enabled: true,
+            enabled_override: None,
             is_default_home: false,
             revision: 3,
             spec_version: 1,
@@ -758,6 +783,7 @@ mod tests {
                 ]
             }),
             tags: vec!["ops".to_string()],
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         }

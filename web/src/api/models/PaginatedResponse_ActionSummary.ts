@@ -77,6 +77,7 @@ export type PaginatedResponse_ActionSummary = {
      * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
      */
     required_worker_runtimes?: Record<string, any>;
+    retired_at?: string | null;
     /**
      * Runtime ID
      */

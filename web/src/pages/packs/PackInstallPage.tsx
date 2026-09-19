@@ -19,37 +19,19 @@ import {
   X,
   GripVertical,
 } from "lucide-react";
+import { useAuth } from "@/contexts/AuthContext";
+import { hasPermission } from "@/lib/permissions";
+import PlatformCatalogStatus from "@/components/packs/PlatformCatalogStatus";
+import { AbsentMetadataPolicy } from "@/api";
 
 type SourceType = "git" | "archive" | "registry";
 type IndexedPackContentKey =
   "actions" | "sensors" | "triggers" | "rules" | "workflows";
 
-interface PackRegistryIndex {
-  id: number;
-  name?: string | null;
-  url: string;
-  position: number;
-  enabled: boolean;
-}
-
-interface IndexedPackEntry {
-  ref: string;
-  label?: string | null;
-  description?: string | null;
-  use_case?: string | null;
-  version?: string | null;
-  contents?: Partial<Record<IndexedPackContentKey, unknown[]>>;
-}
-
-interface IndexedPackResult {
-  pack: IndexedPackEntry;
-  registry: {
-    name?: string | null;
-    url: string;
-  };
-}
-
 export default function PackInstallPage() {
+  const { user } = useAuth();
+  const canInstallPacks = hasPermission(user, "packs", "install");
+  const canConfigurePacks = hasPermission(user, "packs", "configure");
   const navigate = useNavigate();
   const installPack = useInstallPack();
   const packIndices = usePackIndices();
@@ -57,7 +39,9 @@ export default function PackInstallPage() {
   const updatePackIndex = useUpdatePackIndex();
   const deletePackIndex = useDeletePackIndex();
 
-  const [sourceType, setSourceType] = useState<SourceType>("git");
+  const [sourceType, setSourceType] = useState<SourceType>(() =>
+    canInstallPacks ? "git" : "registry",
+  );
   const [isIndexModalOpen, setIsIndexModalOpen] = useState(false);
   const [indexForm, setIndexForm] = useState({
     name: "",
@@ -71,11 +55,10 @@ export default function PackInstallPage() {
     refSpec: "",
     skipTests: false,
     skipDeps: false,
+    absentMetadataPolicy: AbsentMetadataPolicy.REMOVE,
   });
-  const configuredIndices = (packIndices.data?.data ??
-    []) as PackRegistryIndex[];
-  const indexedPackResults = (indexedPacks.data?.data ??
-    []) as IndexedPackResult[];
+  const configuredIndices = packIndices.data?.data ?? [];
+  const indexedPackResults = indexedPacks.data?.data ?? [];
 
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -109,6 +92,7 @@ export default function PackInstallPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canInstallPacks) return;
     setError(null);
     setSuccess(null);
 
@@ -123,6 +107,7 @@ export default function PackInstallPage() {
         refSpec: formData.refSpec || undefined,
         skipTests: formData.skipTests,
         skipDeps: formData.skipDeps,
+        absentMetadataPolicy: formData.absentMetadataPolicy,
       });
 
       const packRef = result.data.pack.ref;
@@ -189,7 +174,7 @@ export default function PackInstallPage() {
             ? Promise.resolve()
             : updatePackIndex.mutateAsync({
                 id: index.id,
-                data: { position },
+                data: { position, headers: null },
               }),
         ),
       );
@@ -255,14 +240,20 @@ export default function PackInstallPage() {
         <p className="mt-2 text-gray-600">
           Install a pack from git, archive URL, or pack registry
         </p>
-        <button
-          type="button"
-          onClick={() => setIsIndexModalOpen(true)}
-          className="mt-4 inline-flex items-center gap-2 px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors text-sm font-medium"
-        >
-          <Settings className="w-4 h-4" />
-          Manage Pack Indices
-        </button>
+        {canConfigurePacks && (
+          <button
+            type="button"
+            onClick={() => setIsIndexModalOpen(true)}
+            className="mt-4 inline-flex items-center gap-2 px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors text-sm font-medium"
+          >
+            <Settings className="w-4 h-4" />
+            Manage Pack Indices
+          </button>
+        )}
+      </div>
+
+      <div className="mb-6">
+        <PlatformCatalogStatus />
       </div>
 
       {/* Info Box */}
@@ -356,31 +347,37 @@ export default function PackInstallPage() {
             <label className="block text-sm font-medium text-gray-700 mb-2">
               Installation Source Type <span className="text-red-500">*</span>
             </label>
-            <div className="grid grid-cols-3 gap-3">
-              <button
-                type="button"
-                onClick={() => setSourceType("git")}
-                className={`px-4 py-3 border rounded-lg text-sm font-medium transition-colors ${
-                  sourceType === "git"
-                    ? "border-blue-500 bg-blue-50 text-blue-700"
-                    : "border-gray-300 bg-white text-gray-700 hover:bg-gray-50"
-                }`}
-              >
-                <GitBranch className="w-4 h-4 mx-auto mb-1" />
-                Git Repository
-              </button>
-              <button
-                type="button"
-                onClick={() => setSourceType("archive")}
-                className={`px-4 py-3 border rounded-lg text-sm font-medium transition-colors ${
-                  sourceType === "archive"
-                    ? "border-blue-500 bg-blue-50 text-blue-700"
-                    : "border-gray-300 bg-white text-gray-700 hover:bg-gray-50"
-                }`}
-              >
-                <Package className="w-4 h-4 mx-auto mb-1" />
-                Archive URL
-              </button>
+            <div
+              className={`grid gap-3 ${canInstallPacks ? "grid-cols-3" : "grid-cols-1"}`}
+            >
+              {canInstallPacks && (
+                <button
+                  type="button"
+                  onClick={() => setSourceType("git")}
+                  className={`px-4 py-3 border rounded-lg text-sm font-medium transition-colors ${
+                    sourceType === "git"
+                      ? "border-blue-500 bg-blue-50 text-blue-700"
+                      : "border-gray-300 bg-white text-gray-700 hover:bg-gray-50"
+                  }`}
+                >
+                  <GitBranch className="w-4 h-4 mx-auto mb-1" />
+                  Git Repository
+                </button>
+              )}
+              {canInstallPacks && (
+                <button
+                  type="button"
+                  onClick={() => setSourceType("archive")}
+                  className={`px-4 py-3 border rounded-lg text-sm font-medium transition-colors ${
+                    sourceType === "archive"
+                      ? "border-blue-500 bg-blue-50 text-blue-700"
+                      : "border-gray-300 bg-white text-gray-700 hover:bg-gray-50"
+                  }`}
+                >
+                  <Package className="w-4 h-4 mx-auto mb-1" />
+                  Archive URL
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setSourceType("registry")}
@@ -406,13 +403,15 @@ export default function PackInstallPage() {
                 >
                   Search Indexed Packs <span className="text-red-500">*</span>
                 </label>
-                <button
-                  type="button"
-                  onClick={() => setIsIndexModalOpen(true)}
-                  className="text-sm text-blue-600 hover:text-blue-800"
-                >
-                  Manage indices
-                </button>
+                {canConfigurePacks && (
+                  <button
+                    type="button"
+                    onClick={() => setIsIndexModalOpen(true)}
+                    className="text-sm text-blue-600 hover:text-blue-800"
+                  >
+                    Manage indices
+                  </button>
+                )}
               </div>
               <input
                 type="search"
@@ -556,128 +555,182 @@ export default function PackInstallPage() {
           )}
 
           {/* Installation Options */}
-          <div className="border-t border-gray-200 pt-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-4">
-              Installation Options
-            </h3>
+          {canInstallPacks && (
+            <div className="border-t border-gray-200 pt-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                Installation Options
+              </h3>
 
-            <div className="space-y-4">
-              {/* Skip Dependencies */}
-              <div className="flex items-start">
-                <div className="flex items-center h-5">
-                  <input
-                    type="checkbox"
-                    id="skipDeps"
-                    name="skipDeps"
-                    checked={formData.skipDeps}
-                    onChange={handleChange}
-                    className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-                  />
-                </div>
-                <div className="ml-3">
+              <div className="space-y-4">
+                <div>
                   <label
-                    htmlFor="skipDeps"
-                    className="text-sm font-medium text-gray-700"
+                    htmlFor="absentMetadataPolicy"
+                    className="block text-sm font-medium text-gray-700 mb-2"
                   >
-                    Skip Dependency Validation
+                    Metadata omitted by this release
                   </label>
-                  <p className="text-sm text-gray-500">
-                    Skip checking for required runtime dependencies and pack
-                    dependencies. Use with caution.
+                  <select
+                    id="absentMetadataPolicy"
+                    name="absentMetadataPolicy"
+                    value={formData.absentMetadataPolicy}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      let absentMetadataPolicy: AbsentMetadataPolicy;
+                      switch (value) {
+                        case AbsentMetadataPolicy.DISABLE:
+                          absentMetadataPolicy = AbsentMetadataPolicy.DISABLE;
+                          break;
+                        case AbsentMetadataPolicy.RETAIN:
+                          absentMetadataPolicy = AbsentMetadataPolicy.RETAIN;
+                          break;
+                        default:
+                          absentMetadataPolicy = AbsentMetadataPolicy.REMOVE;
+                      }
+                      setFormData((previous) => ({
+                        ...previous,
+                        absentMetadataPolicy,
+                      }));
+                    }}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  >
+                    <option value={AbsentMetadataPolicy.REMOVE}>
+                      Remove omitted metadata
+                    </option>
+                    <option value={AbsentMetadataPolicy.DISABLE}>
+                      Keep and disable runnable metadata
+                    </option>
+                    <option value={AbsentMetadataPolicy.RETAIN}>
+                      Retain current metadata unchanged
+                    </option>
+                  </select>
+                  <p className="mt-2 text-sm text-gray-500">
+                    Remove retires omitted pack components. Disable keeps them
+                    but blocks new work. Retain leaves their current state
+                    unchanged.
                   </p>
                 </div>
-              </div>
 
-              {/* Skip Tests */}
-              <div className="flex items-start">
-                <div className="flex items-center h-5">
-                  <input
-                    type="checkbox"
-                    id="skipTests"
-                    name="skipTests"
-                    checked={formData.skipTests}
-                    onChange={handleChange}
-                    className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-                  />
+                {/* Skip Dependencies */}
+                <div className="flex items-start">
+                  <div className="flex items-center h-5">
+                    <input
+                      type="checkbox"
+                      id="skipDeps"
+                      name="skipDeps"
+                      checked={formData.skipDeps}
+                      onChange={handleChange}
+                      className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                    />
+                  </div>
+                  <div className="ml-3">
+                    <label
+                      htmlFor="skipDeps"
+                      className="text-sm font-medium text-gray-700"
+                    >
+                      Skip Dependency Validation
+                    </label>
+                    <p className="text-sm text-gray-500">
+                      Skip checking for required runtime dependencies and pack
+                      dependencies. Use with caution.
+                    </p>
+                  </div>
                 </div>
-                <div className="ml-3">
-                  <label
-                    htmlFor="skipTests"
-                    className="text-sm font-medium text-gray-700"
-                  >
-                    Skip Tests
-                  </label>
-                  <p className="text-sm text-gray-500">
-                    Skip running pack tests during installation. Useful when
-                    tests are not available or trusted.
-                  </p>
+
+                {/* Skip Tests */}
+                <div className="flex items-start">
+                  <div className="flex items-center h-5">
+                    <input
+                      type="checkbox"
+                      id="skipTests"
+                      name="skipTests"
+                      checked={formData.skipTests}
+                      onChange={handleChange}
+                      className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                    />
+                  </div>
+                  <div className="ml-3">
+                    <label
+                      htmlFor="skipTests"
+                      className="text-sm font-medium text-gray-700"
+                    >
+                      Skip Tests
+                    </label>
+                    <p className="text-sm text-gray-500">
+                      Skip running pack tests during installation. Useful when
+                      tests are not available or trusted.
+                    </p>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
+          )}
 
           {/* Info Box */}
-          <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
-            <div className="flex items-start gap-3">
-              <Info className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
-              <div>
-                <h4 className="text-sm font-semibold text-amber-900 mb-2">
-                  Installation Process
-                </h4>
-                <ul className="text-sm text-amber-800 space-y-1 list-disc list-inside">
-                  <li>Pack is downloaded from the specified source</li>
-                  {!formData.skipDeps && (
-                    <li className="font-medium">
-                      Dependencies are validated (runtime & pack dependencies)
+          {canInstallPacks && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+              <div className="flex items-start gap-3">
+                <Info className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                <div>
+                  <h4 className="text-sm font-semibold text-amber-900 mb-2">
+                    Installation Process
+                  </h4>
+                  <ul className="text-sm text-amber-800 space-y-1 list-disc list-inside">
+                    <li>Pack is downloaded from the specified source</li>
+                    {!formData.skipDeps && (
+                      <li className="font-medium">
+                        Dependencies are validated (runtime & pack dependencies)
+                      </li>
+                    )}
+                    <li>Pack metadata is registered in the database</li>
+                    <li>
+                      Pack files are copied to permanent storage (
+                      {sourceType === "git" && "cloned from git"}
+                      {sourceType === "archive" && "extracted from archive"}
+                      {sourceType === "registry" && "downloaded from registry"})
                     </li>
-                  )}
-                  <li>Pack metadata is registered in the database</li>
-                  <li>
-                    Pack files are copied to permanent storage (
-                    {sourceType === "git" && "cloned from git"}
-                    {sourceType === "archive" && "extracted from archive"}
-                    {sourceType === "registry" && "downloaded from registry"})
-                  </li>
-                  <li>Workflows are automatically synced</li>
-                  {!formData.skipTests && (
-                    <li className="font-medium">
-                      Tests are executed and must pass (unless forced)
-                    </li>
-                  )}
-                  {formData.skipDeps && (
-                    <li className="text-amber-600 font-medium">
-                      ⚠️ Dependency validation will be skipped
-                    </li>
-                  )}
-                  {formData.skipTests && (
-                    <li className="text-amber-600 font-medium">
-                      ⚠️ Tests will be skipped
-                    </li>
-                  )}
-                </ul>
+                    <li>Workflows are automatically synced</li>
+                    {!formData.skipTests && (
+                      <li className="font-medium">
+                        Tests are executed and must pass (unless forced)
+                      </li>
+                    )}
+                    {formData.skipDeps && (
+                      <li className="text-amber-600 font-medium">
+                        ⚠️ Dependency validation will be skipped
+                      </li>
+                    )}
+                    {formData.skipTests && (
+                      <li className="text-amber-600 font-medium">
+                        ⚠️ Tests will be skipped
+                      </li>
+                    )}
+                  </ul>
+                </div>
               </div>
             </div>
-          </div>
+          )}
 
           {/* Actions */}
           <div className="flex items-center gap-3 pt-6 border-t border-gray-200">
-            <button
-              type="submit"
-              disabled={installPack.isPending || !!success}
-              className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium flex items-center gap-2"
-            >
-              {installPack.isPending ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Installing...
-                </>
-              ) : (
-                <>
-                  <Package className="w-4 h-4" />
-                  Install Pack
-                </>
-              )}
-            </button>
+            {canInstallPacks && (
+              <button
+                type="submit"
+                disabled={installPack.isPending || !!success}
+                className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium flex items-center gap-2"
+              >
+                {installPack.isPending ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Installing...
+                  </>
+                ) : (
+                  <>
+                    <Package className="w-4 h-4" />
+                    Install Pack
+                  </>
+                )}
+              </button>
+            )}
             <Link
               to="/packs"
               className="px-6 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors font-medium"
@@ -721,7 +774,7 @@ export default function PackInstallPage() {
         </div>
       </div>
 
-      {isIndexModalOpen && (
+      {isIndexModalOpen && canConfigurePacks && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-2xl max-h-[90vh] overflow-auto rounded-lg bg-white shadow-xl">
             <div className="flex items-center justify-between border-b border-gray-200 p-5">
@@ -826,7 +879,10 @@ export default function PackInstallPage() {
                           onClick={() =>
                             updatePackIndex.mutate({
                               id: index.id,
-                              data: { enabled: !index.enabled },
+                              data: {
+                                enabled: !index.enabled,
+                                headers: null,
+                              },
                             })
                           }
                           className="text-blue-600 hover:text-blue-800"

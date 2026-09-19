@@ -102,6 +102,15 @@ pub fn validate_workflow_expressions(
             }
         }
 
+        if let Some(ref wait_for) = task.wait_for {
+            collect_json_templates(
+                &wait_for.inquiry,
+                &format!("{task_loc} wait_for.inquiry"),
+                &known_names,
+                &mut warnings,
+            );
+        }
+
         // ── task-level when condition ────────────────────────────────
         if let Some(ref expr) = task.when {
             validate_template(
@@ -191,6 +200,7 @@ const CANONICAL_NAMESPACES: &[&str] = &[
     "variables",
     "task",
     "tasks",
+    "inquiry",
     "config",
     "keystore",
     "item",
@@ -413,6 +423,7 @@ mod tests {
             worker_tolerations: None,
             worker_affinity: None,
             when: None,
+            wait_for: None,
             with_items: None,
             iterate_cache: None,
             batch_size: None,
@@ -714,5 +725,35 @@ mod tests {
         let wf = minimal_workflow(vec![task]);
         let warnings = validate_workflow_expressions(&wf, None);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn test_inquiry_prerequisite_and_namespace_are_validated() {
+        let mut task = action_task("deploy");
+        task.wait_for = Some(super::super::parser::TaskWaitFor {
+            inquiry: serde_json::json!("{{ task.request.inquiry_id }}"),
+        });
+        task.input.insert(
+            "approval".to_string(),
+            serde_json::json!("{{ inquiry['deploy-prod'].response }}"),
+        );
+
+        let wf = minimal_workflow(vec![task]);
+        let warnings = validate_workflow_expressions(&wf, None);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn test_inquiry_prerequisite_reports_unknown_reference() {
+        let mut task = action_task("deploy");
+        task.wait_for = Some(super::super::parser::TaskWaitFor {
+            inquiry: serde_json::json!("{{ missing.inquiry_id }}"),
+        });
+
+        let wf = minimal_workflow(vec![task]);
+        let warnings = validate_workflow_expressions(&wf, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].location.contains("wait_for.inquiry"));
+        assert!(warnings[0].message.contains("unknown variable 'missing'"));
     }
 }

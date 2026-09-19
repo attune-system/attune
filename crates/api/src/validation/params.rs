@@ -311,6 +311,19 @@ pub fn validate_queue_item_payload(queue: &WorkQueue, payload: &Value) -> Result
     )
 }
 
+pub fn validate_inquiry_response(
+    inquiry_id: i64,
+    response_schema: Option<&Value>,
+    response: &Value,
+) -> Result<(), ApiError> {
+    validate_params_against_flat_schema(
+        "inquiry response for inquiry",
+        &inquiry_id.to_string(),
+        response_schema,
+        response,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +340,7 @@ mod tests {
             label: "Test Trigger".to_string(),
             description: None,
             enabled: true,
+            enabled_override: None,
             param_schema: schema,
             out_schema: None,
             webhook_enabled: false,
@@ -337,6 +351,7 @@ mod tests {
             is_adhoc: false,
             reference_visibility: Default::default(),
             reference_allowed_pack_refs: Vec::new(),
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         }
@@ -353,6 +368,7 @@ mod tests {
             entrypoint: "test.sh".to_string(),
             runtime: Some(1),
             enabled: true,
+            enabled_override: None,
             runtime_version_constraint: None,
             required_worker_runtimes: serde_json::json!({}),
             worker_selector: serde_json::json!({}),
@@ -374,6 +390,7 @@ mod tests {
             parameter_delivery: attune_common::models::ParameterDelivery::default(),
             parameter_format: attune_common::models::ParameterFormat::default(),
             output_format: attune_common::models::OutputFormat::default(),
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         }

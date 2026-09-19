@@ -1,0 +1,27 @@
+ref: core.go
+pack_ref: core
+name: Go
+aliases: [go, golang]
+description: Go runtime for compiling and running Go scripts and programs
+distributions:
+  verification:
+    commands:
+      - {binary: go, args: [version], exit_code: 0, pattern: 'go\d+\.', priority: 1}
+  min_version: "1.18"
+  recommended_version: "1.22"
+installation:
+  package_managers: [apt, snap, brew]
+  module_support: true
+execution_config:
+  interpreter: {binary: go, args: [run], file_extension: .go}
+  environment:
+    env_type: gopath
+    dir_name: gopath
+    create_command: [sh, "-c", "mkdir -p {env_dir}"]
+    interpreter_path: null
+  dependencies:
+    manifest_file: go.mod
+    install_command: [sh, "-c", "cd {pack_dir} && GOPATH={env_dir} go mod download 2>/dev/null || true"]
+  env_vars:
+    GOPATH: "{env_dir}"
+    GOMODCACHE: "{env_dir}/pkg/mod"

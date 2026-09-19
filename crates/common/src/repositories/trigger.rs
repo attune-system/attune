@@ -14,10 +14,11 @@ use super::{
 };
 
 /// Columns selected in all Trigger queries. Must match the `Trigger` model's `FromRow` fields.
-pub const TRIGGER_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, enabled, \
+pub const TRIGGER_COLUMNS: &str =
+    "id, ref, pack, pack_ref, label, description, effective_enabled AS enabled, enabled_override, \
     param_schema, out_schema, webhook_enabled, webhook_key, webhook_config, \
     sensor, sensor_ref, is_adhoc, reference_visibility, reference_allowed_pack_refs, \
-    created, updated";
+    retired_at, created, updated";
 
 // ============================================================================
 // Trigger Search
@@ -254,7 +255,7 @@ impl FindById for TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let trigger = sqlx::query_as::<_, Trigger>(&format!(
-            "SELECT {} FROM trigger WHERE id = $1",
+            "SELECT {} FROM trigger WHERE id = $1 AND retired_at IS NULL",
             TRIGGER_COLUMNS
         ))
         .bind(id)
@@ -272,7 +273,7 @@ impl FindByRef for TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let trigger = sqlx::query_as::<_, Trigger>(&format!(
-            "SELECT {} FROM trigger WHERE ref = $1",
+            "SELECT {} FROM trigger WHERE ref = $1 AND retired_at IS NULL",
             TRIGGER_COLUMNS
         ))
         .bind(ref_str)
@@ -290,7 +291,7 @@ impl List for TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let triggers = sqlx::query_as::<_, Trigger>(&format!(
-            "SELECT {} FROM trigger ORDER BY ref ASC",
+            "SELECT {} FROM trigger WHERE retired_at IS NULL ORDER BY ref ASC",
             TRIGGER_COLUMNS
         ))
         .fetch_all(executor)
@@ -319,10 +320,10 @@ impl Create for TriggerRepository {
                                  param_schema, out_schema, sensor, sensor_ref, is_adhoc,
                                  reference_visibility, reference_allowed_pack_refs)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING id, ref, pack, pack_ref, label, description, enabled,
+            RETURNING id, ref, pack, pack_ref, label, description, effective_enabled AS enabled, enabled_override,
                       param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
                       sensor, sensor_ref, is_adhoc, reference_visibility, reference_allowed_pack_refs,
-                      created, updated
+                      retired_at, created, updated
             "#,
         )
         .bind(&input.r#ref)
@@ -406,7 +407,7 @@ impl Update for TriggerRepository {
             if has_updates {
                 query.push(", ");
             }
-            query.push("enabled = ");
+            query.push("enabled_override = ");
             query.push_bind(enabled);
             has_updates = true;
         }
@@ -519,6 +520,35 @@ impl Delete for TriggerRepository {
 }
 
 impl TriggerRepository {
+    pub async fn find_by_id_including_retired<'e, E>(executor: E, id: Id) -> Result<Option<Trigger>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM trigger WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<Trigger>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM trigger WHERE ref = $1"
+        ))
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Delete non-adhoc triggers belonging to a pack whose refs are NOT in the given set.
     ///
     /// Used during pack reinstallation to clean up triggers that were removed
@@ -532,13 +562,13 @@ impl TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let result = if keep_refs.is_empty() {
-            sqlx::query("DELETE FROM trigger WHERE pack = $1 AND is_adhoc = false")
+            sqlx::query("DELETE FROM trigger WHERE pack = $1 AND management_origin = 'pack'")
                 .bind(pack_id)
                 .execute(executor)
                 .await?
         } else {
             sqlx::query(
-                "DELETE FROM trigger WHERE pack = $1 AND is_adhoc = false AND ref != ALL($2)",
+                "DELETE FROM trigger WHERE pack = $1 AND management_origin = 'pack' AND ref != ALL($2)",
             )
             .bind(pack_id)
             .bind(keep_refs)
@@ -561,12 +591,13 @@ impl TriggerRepository {
     {
         let select_cols = TRIGGER_COLUMNS;
 
-        let mut qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new(format!("SELECT {select_cols} FROM trigger"));
+        let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+            "SELECT {select_cols} FROM trigger WHERE retired_at IS NULL"
+        ));
         let mut count_qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new("SELECT COUNT(*) FROM trigger");
+            QueryBuilder::new("SELECT COUNT(*) FROM trigger WHERE retired_at IS NULL");
 
-        let mut has_where = false;
+        let mut has_where = true;
 
         macro_rules! push_condition {
             ($cond_prefix:expr, $value:expr) => {{
@@ -592,7 +623,7 @@ impl TriggerRepository {
             push_condition!("sensor = ", sensor_id);
         }
         if let Some(enabled) = filters.enabled {
-            push_condition!("enabled = ", enabled);
+            push_condition!("effective_enabled = ", enabled);
         }
         for pattern in text_search_patterns(filters.query.as_deref()) {
             if !has_where {
@@ -656,7 +687,7 @@ impl TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let triggers = sqlx::query_as::<_, Trigger>(&format!(
-            "SELECT {} FROM trigger WHERE pack = $1 ORDER BY ref ASC",
+            "SELECT {} FROM trigger WHERE pack = $1 AND retired_at IS NULL ORDER BY ref ASC",
             TRIGGER_COLUMNS
         ))
         .bind(pack_id)
@@ -671,10 +702,12 @@ impl TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM trigger WHERE pack_ref = $1")
-            .bind(pack_ref)
-            .fetch_one(executor)
-            .await?;
+        let result: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM trigger WHERE pack_ref = $1 AND retired_at IS NULL",
+        )
+        .bind(pack_ref)
+        .fetch_one(executor)
+        .await?;
         Ok(result.0)
     }
 
@@ -684,7 +717,7 @@ impl TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let triggers = sqlx::query_as::<_, Trigger>(&format!(
-            "SELECT {} FROM trigger WHERE enabled = true ORDER BY ref ASC",
+            "SELECT {} FROM trigger WHERE effective_enabled AND retired_at IS NULL ORDER BY ref ASC",
             TRIGGER_COLUMNS
         ))
         .fetch_all(executor)
@@ -699,7 +732,7 @@ impl TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let triggers = sqlx::query_as::<_, Trigger>(&format!(
-            "SELECT {} FROM trigger WHERE sensor = $1 ORDER BY ref ASC",
+            "SELECT {} FROM trigger WHERE sensor = $1 AND retired_at IS NULL ORDER BY ref ASC",
             TRIGGER_COLUMNS
         ))
         .bind(sensor_id)
@@ -715,7 +748,7 @@ impl TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let triggers = sqlx::query_as::<_, Trigger>(&format!(
-            "SELECT {} FROM trigger WHERE sensor_ref = $1 ORDER BY ref ASC",
+            "SELECT {} FROM trigger WHERE sensor_ref = $1 AND retired_at IS NULL ORDER BY ref ASC",
             TRIGGER_COLUMNS
         ))
         .bind(sensor_ref)
@@ -734,7 +767,7 @@ impl TriggerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let trigger = sqlx::query_as::<_, Trigger>(&format!(
-            "SELECT {} FROM trigger WHERE webhook_key = $1",
+            "SELECT {} FROM trigger WHERE webhook_key = $1 AND retired_at IS NULL",
             TRIGGER_COLUMNS
         ))
         .bind(webhook_key)
@@ -969,9 +1002,9 @@ impl Repository for SensorRepository {
 }
 
 const SENSOR_SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, entrypoint, \
-     runtime, runtime_ref, runtime_version_constraint, enabled, param_schema, config, \
+     runtime, runtime_ref, runtime_version_constraint, effective_enabled AS enabled, enabled_override, param_schema, config, \
      worker_selector, worker_tolerations, worker_affinity, log_retention_policy, \
-     log_retention_limit, artifact_retention_policy, artifact_retention_limit, created, updated";
+     log_retention_limit, artifact_retention_policy, artifact_retention_limit, retired_at, created, updated";
 
 fn validate_log_retention_limit(limit: i32) -> Result<()> {
     if limit <= 0 {
@@ -1034,7 +1067,7 @@ impl FindById for SensorRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sensor = sqlx::query_as::<_, Sensor>(&format!(
-            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE id = $1"
+            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE id = $1 AND retired_at IS NULL"
         ))
         .bind(id)
         .fetch_optional(executor)
@@ -1051,7 +1084,7 @@ impl FindByRef for SensorRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sensor = sqlx::query_as::<_, Sensor>(&format!(
-            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE ref = $1"
+            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE ref = $1 AND retired_at IS NULL"
         ))
         .bind(ref_str)
         .fetch_optional(executor)
@@ -1068,7 +1101,7 @@ impl List for SensorRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sensors = sqlx::query_as::<_, Sensor>(&format!(
-            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor ORDER BY ref ASC"
+            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE retired_at IS NULL ORDER BY ref ASC"
         ))
         .fetch_all(executor)
         .await?;
@@ -1177,7 +1210,7 @@ impl Update for SensorRepository {
             if has_updates {
                 query.push(", ");
             }
-            query.push("enabled = ");
+            query.push("enabled_override = ");
             query.push_bind(enabled);
             has_updates = true;
         }
@@ -1357,6 +1390,22 @@ fn push_sensor_visibility_predicate(
 }
 
 impl SensorRepository {
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<Sensor>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Sensor>(&format!(
+            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE ref = $1"
+        ))
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Delete non-adhoc sensors belonging to a pack whose refs are NOT in the given set.
     ///
     /// Used during pack reinstallation to clean up sensors that were removed
@@ -1370,12 +1419,12 @@ impl SensorRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let result = if keep_refs.is_empty() {
-            sqlx::query("DELETE FROM sensor WHERE pack = $1")
+            sqlx::query("DELETE FROM sensor WHERE pack = $1 AND management_origin = 'pack'")
                 .bind(pack_id)
                 .execute(executor)
                 .await?
         } else {
-            sqlx::query("DELETE FROM sensor WHERE pack = $1 AND ref != ALL($2)")
+            sqlx::query("DELETE FROM sensor WHERE pack = $1 AND management_origin = 'pack' AND ref != ALL($2)")
                 .bind(pack_id)
                 .bind(keep_refs)
                 .execute(executor)
@@ -1397,12 +1446,13 @@ impl SensorRepository {
     {
         let select_cols = SENSOR_SELECT_COLUMNS;
 
-        let mut qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new(format!("SELECT {select_cols} FROM sensor"));
+        let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+            "SELECT {select_cols} FROM sensor WHERE retired_at IS NULL"
+        ));
         let mut count_qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new("SELECT COUNT(*) FROM sensor");
+            QueryBuilder::new("SELECT COUNT(*) FROM sensor WHERE retired_at IS NULL");
 
-        let mut has_where = false;
+        let mut has_where = true;
 
         macro_rules! push_condition {
             ($cond_prefix:expr, $value:expr) => {{
@@ -1425,7 +1475,7 @@ impl SensorRepository {
             push_condition!("pack = ", pack_id);
         }
         if let Some(enabled) = filters.enabled {
-            push_condition!("enabled = ", enabled);
+            push_condition!("effective_enabled = ", enabled);
         }
         for pattern in text_search_patterns(filters.query.as_deref()) {
             if !has_where {
@@ -1489,7 +1539,7 @@ impl SensorRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sensors = sqlx::query_as::<_, Sensor>(&format!(
-            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE enabled = true ORDER BY ref ASC"
+            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE effective_enabled AND retired_at IS NULL ORDER BY ref ASC"
         ))
         .fetch_all(executor)
         .await?;
@@ -1503,7 +1553,7 @@ impl SensorRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sensors = sqlx::query_as::<_, Sensor>(&format!(
-            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE pack = $1 ORDER BY ref ASC"
+            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE pack = $1 AND retired_at IS NULL ORDER BY ref ASC"
         ))
         .bind(pack_id)
         .fetch_all(executor)
@@ -1517,10 +1567,12 @@ impl SensorRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sensor WHERE pack_ref = $1")
-            .bind(pack_ref)
-            .fetch_one(executor)
-            .await?;
+        let result: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sensor WHERE pack_ref = $1 AND retired_at IS NULL",
+        )
+        .bind(pack_ref)
+        .fetch_one(executor)
+        .await?;
         Ok(result.0)
     }
 }

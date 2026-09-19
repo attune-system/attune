@@ -1,0 +1,11 @@
+ref: release_smoke.native
+runner_type: native
+launch:
+  type: native
+  artifact: native
+parameter_delivery: stdin
+parameter_format: json
+output_format: json
+param_schema:
+  message:
+    type: string

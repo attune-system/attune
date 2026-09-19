@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AbsentMetadataPolicy } from "./AbsentMetadataPolicy";
 /**
  * Standard API response wrapper
  */
@@ -10,6 +11,10 @@ export type ApiResponse_PackInstallStatusResponse = {
    * Response describing a tracked pack installation attempt.
    */
   data: {
+    /**
+     * Policy applied to metadata omitted by this release.
+     */
+    absent_metadata_policy: AbsentMetadataPolicy;
     /**
      * Failure detail, when the install failed
      */

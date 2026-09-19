@@ -55,7 +55,26 @@ impl DetachedTestDatabase {
 impl TestDatabase {
     /// Clone a fully migrated template into a uniquely owned test database.
     pub async fn create(config: &DatabaseConfig) -> Result<Self> {
-        let detached = Self::create_detached(config).await?;
+        Self::create_with_migrations(config, migration_sql()?).await
+    }
+
+    /// Create an owned database immediately before the named migration.
+    pub async fn create_before(config: &DatabaseConfig, migration_filename: &str) -> Result<Self> {
+        let migrations = migration_sql()?
+            .iter()
+            .take_while(|(path, _)| {
+                path.file_name().and_then(|name| name.to_str()) < Some(migration_filename)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Self::create_with_migrations(config, &migrations).await
+    }
+
+    async fn create_with_migrations(
+        config: &DatabaseConfig,
+        migrations: &[(PathBuf, String)],
+    ) -> Result<Self> {
+        let detached = Self::create_detached_with_migrations(config, migrations).await?;
         let DetachedTestDatabase {
             database_name,
             database_url,
@@ -99,7 +118,13 @@ impl TestDatabase {
 
     /// Create a migrated clone without opening a runtime-bound connection pool.
     pub async fn create_detached(config: &DatabaseConfig) -> Result<DetachedTestDatabase> {
-        let migrations = migration_sql()?;
+        Self::create_detached_with_migrations(config, migration_sql()?).await
+    }
+
+    async fn create_detached_with_migrations(
+        config: &DatabaseConfig,
+        migrations: &[(PathBuf, String)],
+    ) -> Result<DetachedTestDatabase> {
         let run_token = test_run_token()?;
         let template_name = template_database_name(&run_token, migrations);
         let database_name = test_database_name(&run_token);

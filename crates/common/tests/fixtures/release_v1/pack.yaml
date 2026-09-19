@@ -1,0 +1,7 @@
+ref: release_smoke
+label: Release format smoke fixture
+version: 1.0.0
+runtime_deps: [native, java]
+conf_schema:
+  message:
+    type: string

@@ -14,6 +14,7 @@ use attune_common::{
     },
     observability,
     repositories::pack_install::PackInstallRepository,
+    repositories::platform_catalog::PlatformCatalogRepository,
 };
 use clap::Parser;
 use std::sync::Arc;
@@ -195,6 +196,7 @@ async fn authz_metadata_invalidation_loop(mq_url: String) {
                         &[
                             routing_keys::METADATA_PERMISSION_SET_CHANGED,
                             routing_keys::METADATA_IDENTITY_AUTHORIZATION_CHANGED,
+                            routing_keys::METADATA_PACK_CHANGED,
                         ],
                         "api.authz.metadata.invalidation",
                         32,
@@ -221,6 +223,9 @@ async fn authz_metadata_invalidation_loop(mq_url: String) {
                                                     },
                                                 )?;
                                             attune_api::authz::AuthorizationService::handle_permission_set_metadata_change(payload).await;
+                                        }
+                                        MessageType::PackChanged => {
+                                            attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
                                         }
                                         MessageType::IdentityAuthorizationChanged => {
                                             let payload: IdentityAuthorizationChangedPayload =
@@ -306,6 +311,7 @@ async fn main() -> Result<()> {
         if args.migrate {
             database.migrate().await?;
         }
+        PlatformCatalogRepository::reconcile(database.pool()).await?;
 
         let upgrade_result = if args.upgrade_pack_releases {
             let state = AppState::new(database.pool().clone(), config.clone());
@@ -377,6 +383,8 @@ async fn main() -> Result<()> {
     info!("Connecting to database...");
     let database = Database::new(&config.database).await?;
     info!("Database connection established");
+    PlatformCatalogRepository::reconcile(database.pool()).await?;
+    info!("Platform catalog reconciled");
 
     // Spawn the audit writer task. The emitter is cheap and clone-able; we
     // store it in AppState so handlers and middleware can record audit events

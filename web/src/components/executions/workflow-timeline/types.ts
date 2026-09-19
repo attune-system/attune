@@ -6,8 +6,6 @@
  * on a time axis with curved dependency edges showing the DAG structure.
  */
 
-import type { ExecutionSummary } from "@/api";
-
 // ---------------------------------------------------------------------------
 // Core data types
 // ---------------------------------------------------------------------------
@@ -19,7 +17,13 @@ export type TaskState =
   | "pending"
   | "timeout"
   | "cancelled"
-  | "abandoned";
+  | "abandoned"
+  | "waiting"
+  | "released";
+
+export type TimelineTaskDestination =
+  | { kind: "execution"; executionId: number }
+  | { kind: "inquiry"; inquiryId: number };
 
 /**
  * Metadata for a collapsed with_items group node.
@@ -73,8 +77,8 @@ export interface TimelineTask {
   maxRetries: number;
   /** Duration in ms (from metadata or computed) */
   durationMs: number | null;
-  /** Original execution summary for tooltip details */
-  execution: ExecutionSummary;
+  /** Detail page opened from the task */
+  destination: TimelineTaskDestination;
   /**
    * Present only on collapsed with_items group nodes.
    * When set, this task represents multiple item executions merged into one.
@@ -239,6 +243,7 @@ export interface WorkflowDefinitionTask {
   with_items?: string;
   /** Max concurrent items for with_items (default 1 = serial) */
   concurrency?: number;
+  wait_for?: { inquiry: number | string };
   // Legacy fields (auto-converted to next)
   on_success?: string | string[];
   on_failure?: string | string[];
@@ -267,6 +272,8 @@ export const STATE_COLORS: Record<
   timeout: { bg: "#ffedd5", border: "#f97316", text: "#c2410c" },
   cancelled: { bg: "#f3f4f6", border: "#9ca3af", text: "#6b7280" },
   abandoned: { bg: "#fee2e2", border: "#f87171", text: "#b91c1c" },
+  waiting: { bg: "#fef3c7", border: "#f59e0b", text: "#92400e" },
+  released: { bg: "#ede9fe", border: "#8b5cf6", text: "#6d28d9" },
 };
 
 export const EDGE_KIND_COLORS: Record<EdgeKind, string> = {

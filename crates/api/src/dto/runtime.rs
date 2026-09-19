@@ -143,6 +143,8 @@ pub struct RuntimeResponse {
     #[schema(example = "Python")]
     pub name: String,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     #[schema(value_type = Object)]
     pub distributions: JsonValue,
 
@@ -177,6 +179,8 @@ pub struct RuntimeSummary {
     #[schema(example = "Python")]
     pub name: String,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
 
@@ -196,6 +200,7 @@ impl From<attune_common::models::runtime::Runtime> for RuntimeResponse {
             distributions: runtime.distributions,
             installation: runtime.installation,
             execution_config: runtime.execution_config,
+            retired_at: runtime.retired_at,
             created: runtime.created,
             updated: runtime.updated,
         }
@@ -210,6 +215,7 @@ impl From<attune_common::models::runtime::Runtime> for RuntimeSummary {
             pack_ref: runtime.pack_ref,
             description: runtime.description,
             name: runtime.name,
+            retired_at: runtime.retired_at,
             created: runtime.created,
             updated: runtime.updated,
         }

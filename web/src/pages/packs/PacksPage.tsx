@@ -29,6 +29,9 @@ import {
 } from "@/hooks/usePackTests";
 import { FlaskConical, Loader2 } from "lucide-react";
 import { safeErrorSummary } from "@/lib/safe-error-summary";
+import PackReleaseHistory from "@/components/packs/PackReleaseHistory";
+import RetiredPackComponents from "@/components/packs/RetiredPackComponents";
+import PlatformCatalogStatus from "@/components/packs/PlatformCatalogStatus";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonValue = any;
@@ -82,7 +85,7 @@ export default function PacksPage() {
       {/* Left sidebar - Packs List */}
       <div
         ref={sidebarRef}
-        className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50"
+        className={`${ref ? "hidden md:block" : "w-full"} md:w-96 border-r border-gray-200 overflow-y-auto bg-gray-50`}
       >
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <div className="flex items-center justify-between mb-2">
@@ -262,7 +265,9 @@ export default function PacksPage() {
       </div>
 
       {/* Right panel - Pack Detail or Empty State */}
-      <div className="flex-1 overflow-y-auto">
+      <div
+        className={`${ref ? "block" : "hidden md:block"} min-w-0 flex-1 overflow-y-auto`}
+      >
         {ref ? (
           <PackDetail packRef={ref} />
         ) : (
@@ -401,10 +406,16 @@ function PackDetail({ packRef }: { packRef: string }) {
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
+      <Link
+        to="/packs"
+        className="mb-4 inline-block text-sm font-medium text-blue-600 hover:text-blue-800 md:hidden"
+      >
+        Back to packs
+      </Link>
       {/* Header */}
       <div className="mb-6">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+        <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-wrap items-center gap-3 sm:gap-4">
             <h1 className="text-3xl font-bold">{pack.data?.label}</h1>
             {pack.data?.is_standard && (
               <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-blue-100 text-blue-800">
@@ -509,6 +520,8 @@ function PackDetail({ packRef }: { packRef: string }) {
               </div>
             </dl>
           </div>
+
+          <PackReleaseHistory packRef={packRef} />
 
           {/* Pack Config */}
           <PackConfiguration pack={pack.data} />
@@ -652,6 +665,10 @@ function PackDetail({ packRef }: { packRef: string }) {
               })}
             </div>
           </div>
+
+          <RetiredPackComponents packRef={packRef} />
+
+          <PlatformCatalogStatus />
 
           {/* Dependencies */}
           <div className="bg-white shadow rounded-lg p-6">

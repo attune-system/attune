@@ -23,6 +23,7 @@ import type { PackTestResult } from "../models/PackTestResult";
 import type { PackUploadForm } from "../models/PackUploadForm";
 import type { PaginatedResponse_PackSummary } from "../models/PaginatedResponse_PackSummary";
 import type { PaginationMeta } from "../models/PaginationMeta";
+import type { PlatformCatalogStatus } from "../models/PlatformCatalogStatus";
 import type { RegisterPackRequest } from "../models/RegisterPackRequest";
 import type { RegisterPacksRequest } from "../models/RegisterPacksRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
@@ -946,6 +947,80 @@ export class PacksService {
     });
   }
   /**
+   * @returns any Immutable pack release history
+   * @throws ApiError
+   */
+  public static getPackReleases({
+    ref,
+  }: {
+    /**
+     * Pack reference identifier
+     */
+    ref: string;
+  }): CancelablePromise<{
+    data: Array<{
+      archive_size: number;
+      created: string;
+      digest: string;
+      id: number;
+      inactive_since?: string | null;
+      is_active: boolean;
+      version: string;
+    }>;
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{ref}/releases",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        401: `Unauthorized`,
+        404: `Pack not found`,
+      },
+    });
+  }
+  /**
+   * @returns any Retired pack-managed components
+   * @throws ApiError
+   */
+  public static getRetiredPackComponents({
+    ref,
+  }: {
+    /**
+     * Pack reference identifier
+     */
+    ref: string;
+  }): CancelablePromise<{
+    data: Array<{
+      component_ref?: string | null;
+      id: number;
+      kind: string;
+      managed_release?: number | null;
+      retired_at: string;
+    }>;
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{ref}/retired-components",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        401: `Unauthorized`,
+        404: `Pack not found`,
+      },
+    });
+  }
+  /**
    * Execute tests for a pack
    * @returns any Tests accepted
    * @throws ApiError
@@ -1211,6 +1286,32 @@ export class PacksService {
       errors: {
         404: `Pack not found`,
         500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * @returns any Platform catalog compatibility state
+   * @throws ApiError
+   */
+  public static getPlatformCatalog(): CancelablePromise<{
+    data: {
+      compatibility_epoch: number;
+      expected_compatibility_epoch: number;
+      expected_revision: number;
+      revision: number;
+      status: PlatformCatalogStatus;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/platform/catalog",
+      errors: {
+        401: `Unauthorized`,
+        403: `Forbidden`,
       },
     });
   }

@@ -289,6 +289,8 @@ pub struct RuleResponse {
     #[schema(example = true)]
     pub enabled: bool,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Whether this is an ad-hoc rule (not from pack installation)
     #[schema(example = false)]
     pub is_adhoc: bool,
@@ -367,6 +369,8 @@ pub struct RuleSummary {
     #[schema(example = true)]
     pub enabled: bool,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -399,6 +403,7 @@ impl From<attune_common::models::rule::Rule> for RuleResponse {
             trace_tag_template: rule.trace_tag_template,
             permission_set_refs: rule.permission_set_refs,
             enabled: rule.enabled,
+            retired_at: rule.retired_at,
             is_adhoc: rule.is_adhoc,
             owner_identity: rule.owner_identity,
             created: rule.created,
@@ -426,6 +431,7 @@ impl From<attune_common::models::rule::Rule> for RuleSummary {
             trace_tag_template: rule.trace_tag_template,
             permission_set_refs: rule.permission_set_refs,
             enabled: rule.enabled,
+            retired_at: rule.retired_at,
             created: rule.created,
             updated: rule.updated,
         }

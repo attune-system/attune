@@ -8,6 +8,8 @@ import type { ExecutionStatus } from "../models/ExecutionStatus";
 import type { PaginatedResponse_ExecutionSummary } from "../models/PaginatedResponse_ExecutionSummary";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
 import type { WorkflowCacheIterationState } from "../models/WorkflowCacheIterationState";
+import type { WorkflowTaskWaitKind } from "../models/WorkflowTaskWaitKind";
+import type { WorkflowTaskWaitState } from "../models/WorkflowTaskWaitState";
 import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
@@ -266,11 +268,16 @@ export class ExecutionsService {
    */
   public static getExecution({
     id,
+    includeSecretValues,
   }: {
     /**
      * Execution ID
      */
     id: number;
+    /**
+     * Include decrypted secret parameter/result values. Requires executions:decrypt.
+     */
+    includeSecretValues?: boolean;
   }): CancelablePromise<{
     /**
      * Response DTO for execution information
@@ -377,6 +384,9 @@ export class ExecutionsService {
       url: "/api/v1/executions/{id}",
       path: {
         id: id,
+      },
+      query: {
+        include_secret_values: includeSecretValues,
       },
       errors: {
         404: `Execution not found`,
@@ -521,8 +531,9 @@ export class ExecutionsService {
   }
   /**
    * Stream stdout/stderr for an execution as SSE.
-   * This tails immutable log segments committed by the worker. The stream may
-   * not exist yet when the worker has not allocated its log artifacts.
+   * This tails the stream backend selected when the worker allocates its log
+   * artifacts. The stream may not exist yet while allocation is pending.
+   * An explicit `offset` query parameter takes precedence over `Last-Event-ID`.
    * @returns any SSE stream of execution log content
    * @throws ApiError
    */
@@ -530,6 +541,7 @@ export class ExecutionsService {
     id,
     stream,
     offset,
+    lastEventId,
   }: {
     /**
      * Execution ID
@@ -540,9 +552,13 @@ export class ExecutionsService {
      */
     stream: string;
     /**
-     * Resume streaming from this byte offset
+     * Resume from this byte offset; takes precedence over Last-Event-ID
      */
     offset?: number;
+    /**
+     * Resume from this byte offset when offset is omitted
+     */
+    lastEventId?: number | null;
   }): CancelablePromise<any> {
     return __request(OpenAPI, {
       method: "GET",
@@ -551,12 +567,16 @@ export class ExecutionsService {
         id: id,
         stream: stream,
       },
+      headers: {
+        "Last-Event-ID": lastEventId,
+      },
       query: {
         offset: offset,
       },
       errors: {
         401: `Unauthorized`,
         404: `Execution not found`,
+        429: `Execution log stream limit reached`,
       },
     });
   }
@@ -650,6 +670,47 @@ export class ExecutionsService {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/executions/{id}/workflow-cache-iterations",
+      path: {
+        id: id,
+      },
+      errors: {
+        401: `Unauthorized`,
+        403: `Execution is not visible to the caller`,
+        404: `Execution not found`,
+      },
+    });
+  }
+  /**
+   * List safe workflow task wait metadata for an execution.
+   * @returns any Workflow task wait metadata
+   * @throws ApiError
+   */
+  public static listWorkflowTaskWaits({
+    id,
+  }: {
+    /**
+     * Execution ID
+     */
+    id: number;
+  }): CancelablePromise<{
+    data: Array<{
+      created: string;
+      id: number;
+      inquiry_id: number;
+      kind: WorkflowTaskWaitKind;
+      resolved_at?: string | null;
+      state: WorkflowTaskWaitState;
+      task_name: string;
+      updated: string;
+    }>;
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/executions/{id}/workflow-task-waits",
       path: {
         id: id,
       },

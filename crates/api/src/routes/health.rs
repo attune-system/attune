@@ -12,7 +12,10 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 
 use crate::state::AppState;
-use attune_common::repositories::{pack::PackRepository, pack_release::PackReleaseRepository};
+use attune_common::{
+    platform_catalog::{CATALOG_REVISION, COMPATIBILITY_EPOCH},
+    repositories::HealthRepository,
+};
 
 /// Health check response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -27,24 +30,18 @@ pub struct HealthResponse {
     pub database: String,
 }
 
-/// Basic health check endpoint
-///
-/// Returns 200 OK if the service is running
+/// Platform health check endpoint.
 #[utoipa::path(
     get,
     path = "/health",
     tag = "health",
     responses(
-        (status = 200, description = "Service is healthy", body = inline(Object), example = json!({"status": "ok"}))
+        (status = 200, description = "Database and exact platform catalog are ready", body = inline(Object)),
+        (status = 503, description = "Platform is not ready", body = inline(Object))
     )
 )]
-pub async fn health() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok"
-        })),
-    )
+pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    platform_health(&state, "ok").await
 }
 
 /// Detailed health check endpoint
@@ -62,9 +59,29 @@ pub async fn health() -> impl IntoResponse {
 pub async fn health_detailed(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    // Check database connectivity
-    let db_status = match sqlx::query("SELECT 1").fetch_one(&state.db).await {
-        Ok(_) => "connected",
+    let db_status = match HealthRepository::platform(&state.db).await {
+        Ok(platform)
+            if platform.compatibility_epoch == COMPATIBILITY_EPOCH
+                && platform.catalog_revision == CATALOG_REVISION =>
+        {
+            "connected"
+        }
+        Ok(platform) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "database": "connected",
+                    "error": "Platform catalog version does not match this API",
+                    "catalog": {
+                        "compatibility_epoch": platform.compatibility_epoch,
+                        "revision": platform.catalog_revision,
+                        "expected_compatibility_epoch": COMPATIBILITY_EPOCH,
+                        "expected_revision": CATALOG_REVISION
+                    }
+                })),
+            ));
+        }
         Err(e) => {
             tracing::error!("Database health check failed: {}", e);
             return Err((
@@ -100,44 +117,94 @@ pub async fn health_detailed(
     )
 )]
 pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match PackRepository::list_requiring_release(&state.db).await {
-        Ok(packs) if packs.is_empty() => {
-            match PackReleaseRepository::find_active_by_pack_ref(&state.db, "core").await {
-                Ok(Some(_)) => StatusCode::OK.into_response(),
-                Ok(None) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "status": "not_ready",
-                        "error": "core pack has no active immutable release",
-                        "packs": ["core"]
-                    })),
-                )
-                    .into_response(),
-                Err(e) => {
-                    tracing::error!("Core pack readiness check failed: {}", e);
-                    StatusCode::SERVICE_UNAVAILABLE.into_response()
-                }
-            }
-        }
-        Ok(packs) => {
-            let pack_refs = packs.into_iter().map(|pack| pack.r#ref).collect::<Vec<_>>();
-            tracing::error!(
-                ?pack_refs,
-                "Readiness blocked by packs without immutable releases"
-            );
+    platform_health(&state, "ready").await
+}
+
+async fn platform_health(state: &AppState, ready_status: &'static str) -> axum::response::Response {
+    match HealthRepository::platform(&state.db).await {
+        Ok(platform)
+            if platform.compatibility_epoch == COMPATIBILITY_EPOCH
+                && platform.catalog_revision == CATALOG_REVISION =>
+        {
             (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::OK,
                 Json(serde_json::json!({
-                    "status": "not_ready",
-                    "error": "installed packs require immutable release upgrade",
-                    "packs": pack_refs,
-                    "repair": "restore each pack's exact installed directory, then run: attune pack register <server-visible-pack-directory> --force --skip-tests"
+                    "status": ready_status,
+                    "catalog": {
+                        "compatibility_epoch": platform.compatibility_epoch,
+                        "revision": platform.catalog_revision
+                    }
                 })),
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::error!("Readiness check failed: {}", e);
+        Ok(platform) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "error": "platform catalog version mismatch",
+                "catalog": {
+                    "compatibility_epoch": platform.compatibility_epoch,
+                    "revision": platform.catalog_revision,
+                    "expected_compatibility_epoch": COMPATIBILITY_EPOCH,
+                    "expected_revision": CATALOG_REVISION
+                }
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Platform health check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "not_ready",
+                    "error": "database or platform catalog unavailable"
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Transitional content and coarse host-capability health.
+///
+/// Required-pack locks and candidate evidence replace this contract in issue #75.
+#[utoipa::path(
+    get,
+    path = "/health/content",
+    tag = "health",
+    responses(
+        (status = 200, description = "Core content and coarse host capabilities are available", body = inline(Object)),
+        (status = 503, description = "Content or coarse host capabilities are absent", body = inline(Object))
+    )
+)]
+pub async fn content(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match HealthRepository::content(&state.db).await {
+        Ok(content) => {
+            let ready = content.core_active
+                && content.action_host_available
+                && content.sensor_host_available;
+            (
+                if ready {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                Json(serde_json::json!({
+                    "status": if ready { "ready" } else { "not_ready" },
+                    "content": { "core_active": content.core_active },
+                    "capabilities": {
+                        "action_host_available": content.action_host_available,
+                        "sensor_host_available": content.sensor_host_available
+                    },
+                    "transitional": true,
+                    "transition": "Replaced by required-pack locks and candidate evidence in issue #75"
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "Content health check failed");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -173,5 +240,6 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/health/detailed", get(health_detailed))
         .route("/health/ready", get(readiness))
         .route("/health/live", get(liveness))
+        .route("/health/content", get(content))
         .route("/metrics", get(metrics))
 }

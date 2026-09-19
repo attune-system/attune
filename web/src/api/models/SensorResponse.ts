@@ -59,6 +59,7 @@ export type SensorResponse = {
    * Unique reference identifier
    */
   ref: string;
+  retired_at?: string | null;
   /**
    * Runtime ID
    */

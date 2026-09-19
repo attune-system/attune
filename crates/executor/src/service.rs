@@ -479,6 +479,7 @@ impl ExecutorService {
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
             Arc::new(inquiry_consumer),
+            self.inner.config.security.encryption_key.clone(),
         );
         handles.push(tokio::spawn(async move { inquiry_handler.start().await }));
 
@@ -509,8 +510,15 @@ impl ExecutorService {
         info!("Starting inquiry timeout checker...");
         let timeout_pool = self.inner.pool.clone();
         let timeout_publisher = self.inner.publisher.clone();
+        let timeout_encryption_key = self.inner.config.security.encryption_key.clone();
         handles.push(tokio::spawn(async move {
-            InquiryHandler::timeout_check_loop(timeout_pool, timeout_publisher, 1).await;
+            InquiryHandler::timeout_check_loop(
+                timeout_pool,
+                timeout_publisher,
+                timeout_encryption_key,
+                1,
+            )
+            .await;
             Ok(())
         }));
 

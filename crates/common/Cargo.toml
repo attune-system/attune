@@ -36,6 +36,15 @@ reqwest = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
+ignore = { workspace = true }
+tempfile = { workspace = true }
+# Format-1 encoding and Unicode 15.1 are byte-level contracts.
+miniz_oxide = "=0.9.1"
+icu_casemap = "=1.5.1"
+icu_casemap_data = "=1.5.1"
+icu_normalizer_v1 = { package = "icu_normalizer", version = "=1.5.0" }
+icu_normalizer_data_v1 = { package = "icu_normalizer_data", version = "=1.5.1" }
+serde_jcs = "=0.2.0"
 
 # Message Queue
 lapin = { workspace = true }

@@ -493,6 +493,8 @@ fn extract_pack_archive(
             match entry_type {
                 EntryType::Directory => fs::create_dir_all(&target)?,
                 EntryType::Regular => {
+                    #[cfg(unix)]
+                    let executable = entry.header().mode()? & 0o111 != 0;
                     if let Some(parent) = target.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -522,6 +524,12 @@ fn extract_pack_archive(
                             io::ErrorKind::InvalidData,
                             "Pack archive exceeds the total extracted size limit",
                         ));
+                    }
+                    #[cfg(unix)]
+                    if executable {
+                        use std::os::unix::fs::PermissionsExt;
+
+                        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
                     }
                 }
                 _ => unreachable!("entry type validated above"),
@@ -757,19 +765,28 @@ mod tests {
         );
     }
 
-    fn archive_with_entry(path: &str, contents: &[u8], entry_type: tar::EntryType) -> Vec<u8> {
+    fn archive_with_entry_mode(
+        path: &str,
+        contents: &[u8],
+        entry_type: tar::EntryType,
+        mode: u32,
+    ) -> Vec<u8> {
         use flate2::{write::GzEncoder, Compression};
 
         let encoder = GzEncoder::new(Vec::new(), Compression::default());
         let mut archive = tar::Builder::new(encoder);
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(entry_type);
-        header.set_mode(0o644);
+        header.set_mode(mode);
         header.set_size(contents.len() as u64);
         header.set_cksum();
         archive.append_data(&mut header, path, contents).unwrap();
         let encoder = archive.into_inner().unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn archive_with_entry(path: &str, contents: &[u8], entry_type: tar::EntryType) -> Vec<u8> {
+        archive_with_entry_mode(path, contents, entry_type, 0o644)
     }
 
     #[test]
@@ -805,6 +822,42 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".attune-pack-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_preserves_executable_intent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        use flate2::{write::GzEncoder, Compression};
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, contents, mode) in [
+            ("demo/pack.yaml", b"ref: demo\n".as_slice(), 0o644),
+            ("demo/run", b"#!/bin/sh\n".as_slice(), 0o755),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(mode);
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            archive.append_data(&mut header, path, contents).unwrap();
+        }
+        let encoder = archive.into_inner().unwrap();
+        let bytes = encoder.finish().unwrap();
+
+        extract_pack_archive(bytes.as_slice(), tmp.path(), "demo").unwrap();
+
+        let mode = std::fs::metadata(tmp.path().join("demo/run"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0);
+        let mode = std::fs::metadata(tmp.path().join("demo/pack.yaml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0);
     }
 
     #[test]

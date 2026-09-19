@@ -10,6 +10,7 @@ export type DashboardListItemResponse = {
   is_default_home: boolean;
   label: string;
   ref: string;
+  retired_at?: string | null;
   revision: number;
   scope_ref: string;
   scope_type: DashboardScopeType;

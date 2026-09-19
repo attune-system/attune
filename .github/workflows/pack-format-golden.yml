@@ -1,0 +1,33 @@
+name: Pack format-1 golden vectors
+
+on:
+  pull_request:
+    paths:
+      - 'crates/common/**'
+      - 'crates/cli/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/pack-format-golden.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  golden:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      SQLX_OFFLINE: 'true'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Check shared byte vectors and malformed inputs
+        run: cargo +stable test --locked -p attune-common --lib pack_format -- --nocapture
+      - name: Check offline CLI and flag parsing
+        run: cargo +stable test --locked -p attune-cli --test pack_release_tests

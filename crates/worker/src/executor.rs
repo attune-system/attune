@@ -559,7 +559,9 @@ impl ActionExecutor {
 
         // Try to load by action ID if available
         if let Some(action_id) = execution.action {
-            if let Some(action) = ActionRepository::find_by_id(&self.pool, action_id).await? {
+            if let Some(action) =
+                ActionRepository::find_by_id_including_retired(&self.pool, action_id).await?
+            {
                 self.cache_action(&action).await;
                 debug!(
                     entity = "action",
@@ -2564,6 +2566,7 @@ mod tests {
             execution_config: serde_json::json!({}),
             auto_detected: false,
             detection_config: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         };
@@ -2590,6 +2593,7 @@ mod tests {
             available: true,
             verified_at: None,
             meta: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         };
@@ -2639,6 +2643,7 @@ mod tests {
             execution_config: serde_json::json!({}),
             auto_detected: false,
             detection_config: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         };

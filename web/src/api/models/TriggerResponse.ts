@@ -59,6 +59,7 @@ export type TriggerResponse = {
    * Pack-level visibility for rule subscriptions.
    */
   reference_visibility: ActionReferenceVisibility;
+  retired_at?: string | null;
   /**
    * Sensor ID (optional — webhook triggers have no sensor)
    */

@@ -394,8 +394,9 @@ impl FindById for CacheNamespaceRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let query =
-            format!("SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace WHERE id = $1");
+        let query = format!(
+            "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace WHERE id = $1 AND tombstoned_at IS NULL AND retired_at IS NULL"
+        );
         sqlx::query_as::<_, CacheNamespace>(&query)
             .bind(id)
             .fetch_optional(executor)
@@ -412,7 +413,7 @@ impl List for CacheNamespaceRepository {
     {
         let query = format!(
             "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace \
-             WHERE tombstoned_at IS NULL ORDER BY owner_type, owner, namespace LIMIT 1000"
+             WHERE tombstoned_at IS NULL AND retired_at IS NULL ORDER BY owner_type, owner, namespace LIMIT 1000"
         );
         sqlx::query_as::<_, CacheNamespace>(&query)
             .fetch_all(executor)
@@ -636,7 +637,7 @@ impl CacheNamespaceRepository {
         let canonical_owner = owner.canonical_owner()?;
         let query = format!(
             "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace \
-             WHERE owner_type = $1 AND owner = $2 AND namespace = $3 AND tombstoned_at IS NULL"
+             WHERE owner_type = $1 AND owner = $2 AND namespace = $3 AND tombstoned_at IS NULL AND retired_at IS NULL"
         );
         sqlx::query_as::<_, CacheNamespace>(&query)
             .bind(owner.owner_type)
@@ -658,7 +659,7 @@ impl CacheNamespaceRepository {
         let query = format!(
             "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace \
              WHERE managing_pack_ref = $1 AND definition_ref = $2 \
-               AND tombstoned_at IS NULL"
+               AND tombstoned_at IS NULL AND retired_at IS NULL"
         );
         sqlx::query_as::<_, CacheNamespace>(&query)
             .bind(managing_pack_ref)
@@ -725,7 +726,7 @@ impl CacheNamespaceRepository {
             let canonical_owner = owner.canonical_owner()?;
             let query = format!(
                 "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace \
-                 WHERE owner_type = $1 AND owner = $2 AND tombstoned_at IS NULL \
+                  WHERE owner_type = $1 AND owner = $2 AND tombstoned_at IS NULL AND retired_at IS NULL \
                    AND ($3::BIGINT IS NULL OR id > $3) \
                  ORDER BY id LIMIT $4"
             );
@@ -740,7 +741,7 @@ impl CacheNamespaceRepository {
         } else {
             let query = format!(
                 "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace \
-                 WHERE tombstoned_at IS NULL AND ($1::BIGINT IS NULL OR id > $1) \
+                  WHERE tombstoned_at IS NULL AND retired_at IS NULL AND ($1::BIGINT IS NULL OR id > $1) \
                  ORDER BY id LIMIT $2"
             );
             let items = sqlx::query_as::<_, CacheNamespace>(&query)
@@ -795,7 +796,7 @@ impl CacheNamespaceRepository {
             Some(namespaces) => {
                 let query = format!(
                     "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace \
-                     WHERE owner_type = $1 AND owner = $2 AND tombstoned_at IS NULL \
+                     WHERE owner_type = $1 AND owner = $2 AND tombstoned_at IS NULL AND retired_at IS NULL \
                        AND namespace = ANY($3) AND ($4::BIGINT IS NULL OR id > $4) \
                      ORDER BY id LIMIT $5"
                 );
@@ -812,7 +813,7 @@ impl CacheNamespaceRepository {
             None => {
                 let query = format!(
                     "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace \
-                     WHERE owner_type = $1 AND owner = $2 AND tombstoned_at IS NULL \
+                     WHERE owner_type = $1 AND owner = $2 AND tombstoned_at IS NULL AND retired_at IS NULL \
                        AND ($3::BIGINT IS NULL OR id > $3) \
                      ORDER BY id LIMIT $4"
                 );
@@ -872,7 +873,7 @@ impl CacheNamespaceRepository {
                 let query = format!(
                     "SELECT {} FROM cache_namespace n \
                      LEFT JOIN cache_generation active ON active.id = n.active_generation \
-                     WHERE n.owner_type = $1 AND n.owner = $2 AND n.tombstoned_at IS NULL \
+                     WHERE n.owner_type = $1 AND n.owner = $2 AND n.tombstoned_at IS NULL AND n.retired_at IS NULL \
                        AND n.namespace = ANY($3) AND ($4::BIGINT IS NULL OR n.id > $4) \
                        AND ($5::TEXT IS NULL OR n.namespace LIKE $5 ESCAPE '\\') \
                        AND {freshness_predicate} \
@@ -896,7 +897,7 @@ impl CacheNamespaceRepository {
                 let query = format!(
                     "SELECT {} FROM cache_namespace n \
                      LEFT JOIN cache_generation active ON active.id = n.active_generation \
-                     WHERE n.owner_type = $1 AND n.owner = $2 AND n.tombstoned_at IS NULL \
+                     WHERE n.owner_type = $1 AND n.owner = $2 AND n.tombstoned_at IS NULL AND n.retired_at IS NULL \
                        AND ($3::BIGINT IS NULL OR n.id > $3) \
                        AND ($4::TEXT IS NULL OR n.namespace LIKE $4 ESCAPE '\\') \
                        AND {freshness_predicate} \
@@ -941,7 +942,7 @@ impl CacheNamespaceRepository {
         let mut query: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
             "SELECT {} FROM cache_namespace n \
              LEFT JOIN cache_generation active ON active.id = n.active_generation \
-             WHERE n.tombstoned_at IS NULL AND ",
+              WHERE n.tombstoned_at IS NULL AND n.retired_at IS NULL AND ",
             qualified_columns("n", CACHE_NAMESPACE_SELECT_COLUMNS),
         ));
 
@@ -986,7 +987,7 @@ impl CacheNamespaceRepository {
              max_records_per_generation = $3, max_generation_bytes = $4, \
              max_retained_bytes = $5, max_retained_generations = $6, \
              max_staging_generations = $7 \
-             WHERE id = $1 AND tombstoned_at IS NULL \
+             WHERE id = $1 AND tombstoned_at IS NULL AND retired_at IS NULL \
              RETURNING {CACHE_NAMESPACE_SELECT_COLUMNS}"
         );
         sqlx::query_as::<_, CacheNamespace>(&query)
@@ -1117,7 +1118,7 @@ impl CacheNamespaceRepository {
     ) -> Result<RemovedCacheOwnerCleanupSummary> {
         let action_ids = sqlx::query_scalar::<_, Id>(
             "SELECT id FROM action \
-             WHERE pack = $1 AND is_adhoc = false \
+             WHERE pack = $1 AND management_origin = 'pack' \
                AND (cardinality($2::TEXT[]) = 0 OR ref != ALL($2)) \
              ORDER BY id FOR UPDATE",
         )
@@ -1127,7 +1128,7 @@ impl CacheNamespaceRepository {
         .await?;
         let sensor_ids = sqlx::query_scalar::<_, Id>(
             "SELECT id FROM sensor \
-             WHERE pack = $1 \
+             WHERE pack = $1 AND management_origin = 'pack' \
                AND (cardinality($2::TEXT[]) = 0 OR ref != ALL($2)) \
              ORDER BY id FOR UPDATE",
         )
@@ -1912,7 +1913,7 @@ impl CacheGenerationRepository {
         let query = format!(
             "SELECT {} FROM cache_generation g \
              JOIN cache_namespace n ON n.id = g.namespace \
-             WHERE n.id = $1 AND g.id = $2 AND n.tombstoned_at IS NULL \
+             WHERE n.id = $1 AND g.id = $2 AND n.tombstoned_at IS NULL AND n.retired_at IS NULL \
              AND (g.state = 'active' OR (g.state = 'retired' AND g.readable_until > NOW()))",
             qualified_columns("g", CACHE_GENERATION_SELECT_COLUMNS),
         );
@@ -2202,7 +2203,7 @@ impl CacheEntryRepository {
             "SELECT {} FROM cache_entry e \
              JOIN cache_namespace n ON n.active_generation = e.generation \
              JOIN cache_generation g ON g.id = e.generation \
-             WHERE n.id = $1 AND n.tombstoned_at IS NULL AND g.state = 'active' \
+             WHERE n.id = $1 AND n.tombstoned_at IS NULL AND n.retired_at IS NULL AND g.state = 'active' \
              AND e.external_id = $2",
             qualified_columns("e", CACHE_ENTRY_SELECT_COLUMNS),
         );
@@ -2229,7 +2230,7 @@ impl CacheEntryRepository {
         let mut tx = pool.begin().await?;
         let active_generation: Option<Id> = sqlx::query_scalar(
             "SELECT active_generation FROM cache_namespace \
-             WHERE id = $1 AND tombstoned_at IS NULL FOR SHARE",
+             WHERE id = $1 AND tombstoned_at IS NULL AND retired_at IS NULL FOR SHARE",
         )
         .bind(namespace_id)
         .fetch_optional(&mut *tx)
@@ -3042,7 +3043,7 @@ async fn ensure_namespace_admission(
 ) -> Result<()> {
     let (global_count, owner_count): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE owner_type = $1 AND owner = $2) \
-         FROM cache_namespace WHERE tombstoned_at IS NULL",
+         FROM cache_namespace WHERE tombstoned_at IS NULL AND retired_at IS NULL",
     )
     .bind(owner_type)
     .bind(owner)

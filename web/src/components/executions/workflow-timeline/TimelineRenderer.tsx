@@ -464,7 +464,8 @@ export default function TimelineRenderer({
               const barRadius = 4;
 
               // Running tasks (or groups with running items) get a subtle pulse
-              const isRunning = task.state === "running";
+              const isRunning =
+                task.state === "running" || task.state === "waiting";
 
               return (
                 <g
@@ -628,6 +629,7 @@ export default function TimelineRenderer({
                   {/* Terminal indicator — right-side end-cap for leaf tasks */}
                   {task.downstreamIds.length === 0 &&
                     task.state !== "running" &&
+                    task.state !== "waiting" &&
                     task.state !== "pending" && (
                       <rect
                         x={node.x + node.width - 3}
@@ -867,6 +869,7 @@ function TaskTooltip({
           )}
           {task.downstreamIds.length === 0 &&
             task.state !== "running" &&
+            task.state !== "waiting" &&
             task.state !== "pending" && (
               <Row
                 label="Terminal"

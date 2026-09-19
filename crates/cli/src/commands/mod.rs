@@ -8,6 +8,7 @@ pub mod execution;
 pub mod key;
 pub mod pack;
 pub mod pack_index;
+pub mod pack_release;
 pub mod policy;
 pub mod queue;
 pub mod rule;

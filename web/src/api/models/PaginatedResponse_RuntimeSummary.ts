@@ -17,6 +17,7 @@ export type PaginatedResponse_RuntimeSummary = {
     name: string;
     pack_ref?: string | null;
     ref: string;
+    retired_at?: string | null;
     updated: string;
   }>;
   /**

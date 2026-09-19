@@ -2,12 +2,18 @@
 
 use crate::models::{enums::InquiryStatus, inquiry::*, Id, JsonDict, JsonSchema};
 use crate::rbac::{Action, ExecutionScopeConstraint, Grant, OwnerConstraint, Resource};
-use crate::Result;
+use crate::{Error, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Executor, Postgres, QueryBuilder};
+use serde_json::Value as JsonValue;
+use sqlx::{Executor, PgConnection, Postgres, QueryBuilder};
 use std::collections::HashMap;
 
 use super::{Create, Delete, FindById, List, Repository, Update};
+
+const INQUIRY_SELECT_COLUMNS_QUALIFIED: &str = "i.id, i.execution, i.workflow_execution, \
+    i.workflow_task_name, i.action_attempt_family, i.purpose, i.prompt, i.response_schema, \
+    i.assigned_to, i.status, i.response, i.timeout_at, i.timeout_seconds, i.responded_by, \
+    i.provider_actor, i.responded_at, i.created, i.updated";
 
 /// Filters for [`InquiryRepository::search`].
 ///
@@ -75,6 +81,16 @@ pub struct CreateInquiryInput {
     pub timeout_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CreateWorkflowInquiryInput {
+    pub execution: Id,
+    pub purpose: String,
+    pub prompt: String,
+    pub response_schema: Option<JsonSchema>,
+    pub assigned_to: Option<Id>,
+    pub timeout_seconds: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UpdateInquiryInput {
     pub status: Option<InquiryStatus>,
@@ -89,9 +105,12 @@ impl FindById for InquiryRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, Inquiry>(
-            "SELECT id, execution, prompt, response_schema, assigned_to, status, response, timeout_at, responded_at, created, updated FROM inquiry WHERE id = $1"
-        ).bind(id).fetch_optional(executor).await.map_err(Into::into)
+        let query = format!("SELECT {INQUIRY_SELECT_COLUMNS} FROM inquiry WHERE id = $1");
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -101,9 +120,13 @@ impl List for InquiryRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, Inquiry>(
-            "SELECT id, execution, prompt, response_schema, assigned_to, status, response, timeout_at, responded_at, created, updated FROM inquiry ORDER BY created DESC LIMIT 1000"
-        ).fetch_all(executor).await.map_err(Into::into)
+        let query = format!(
+            "SELECT {INQUIRY_SELECT_COLUMNS} FROM inquiry ORDER BY created DESC LIMIT 1000"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -114,9 +137,21 @@ impl Create for InquiryRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, Inquiry>(
-            "INSERT INTO inquiry (execution, prompt, response_schema, assigned_to, status, response, timeout_at) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, execution, prompt, response_schema, assigned_to, status, response, timeout_at, responded_at, created, updated"
-        ).bind(input.execution).bind(&input.prompt).bind(&input.response_schema).bind(input.assigned_to).bind(input.status).bind(&input.response).bind(input.timeout_at).fetch_one(executor).await.map_err(Into::into)
+        let query = format!(
+            "INSERT INTO inquiry (execution, prompt, response_schema, assigned_to, status, response, timeout_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {INQUIRY_SELECT_COLUMNS}"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(input.execution)
+            .bind(&input.prompt)
+            .bind(&input.response_schema)
+            .bind(input.assigned_to)
+            .bind(input.status)
+            .bind(&input.response)
+            .bind(input.timeout_at)
+            .fetch_one(executor)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -163,7 +198,7 @@ impl Update for InquiryRepository {
         }
 
         query.push(", updated = NOW() WHERE id = ").push_bind(id);
-        query.push(" RETURNING id, execution, prompt, response_schema, assigned_to, status, response, timeout_at, responded_at, created, updated");
+        query.push(" RETURNING ").push(INQUIRY_SELECT_COLUMNS);
 
         query
             .build_query_as::<Inquiry>()
@@ -188,42 +223,236 @@ impl Delete for InquiryRepository {
 }
 
 impl InquiryRepository {
+    pub async fn find_by_id_for_update(conn: &mut PgConnection, id: Id) -> Result<Option<Inquiry>> {
+        let query =
+            format!("SELECT {INQUIRY_SELECT_COLUMNS} FROM inquiry WHERE id = $1 FOR UPDATE");
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(id)
+            .fetch_optional(conn)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Creates an inquiry in the authenticated action execution's workflow scope.
+    /// Repeating an equivalent request returns the existing row.
+    pub async fn create_workflow_inquiry_idempotent(
+        conn: &mut PgConnection,
+        mut input: CreateWorkflowInquiryInput,
+    ) -> Result<Inquiry> {
+        input.purpose = input.purpose.trim().to_string();
+        if input.purpose.is_empty() {
+            return Err(Error::Validation(
+                "inquiry purpose must not be empty".to_string(),
+            ));
+        }
+        if input.timeout_seconds.is_some_and(|timeout| timeout <= 0) {
+            return Err(Error::Validation(
+                "inquiry timeout_seconds must be positive".to_string(),
+            ));
+        }
+
+        let insert = format!(
+            "INSERT INTO inquiry (execution, workflow_execution, workflow_task_name, \
+             action_attempt_family, purpose, prompt, response_schema, assigned_to, status, \
+             timeout_at, timeout_seconds) \
+             SELECT e.id, (e.workflow_task->>'workflow_execution')::BIGINT, \
+                    e.workflow_task->>'task_name', COALESCE(e.original_execution, e.id), \
+                    $2, $3, $4, $5, $6, \
+                    CASE WHEN $7::BIGINT IS NULL THEN NULL \
+                         ELSE NOW() + make_interval(secs => $7::DOUBLE PRECISION) END, $7 \
+             FROM execution e \
+             WHERE e.id = $1 AND e.workflow_task IS NOT NULL \
+             ON CONFLICT (workflow_execution, workflow_task_name, action_attempt_family, purpose) \
+             WHERE workflow_execution IS NOT NULL DO NOTHING \
+             RETURNING {INQUIRY_SELECT_COLUMNS}"
+        );
+        if let Some(inquiry) = sqlx::query_as::<_, Inquiry>(&insert)
+            .bind(input.execution)
+            .bind(&input.purpose)
+            .bind(&input.prompt)
+            .bind(&input.response_schema)
+            .bind(input.assigned_to)
+            .bind(InquiryStatus::Pending)
+            .bind(input.timeout_seconds)
+            .fetch_optional(&mut *conn)
+            .await?
+        {
+            return Ok(inquiry);
+        }
+
+        let existing_query = format!(
+            "SELECT {INQUIRY_SELECT_COLUMNS_QUALIFIED} \
+             FROM inquiry i JOIN execution e ON e.id = $1 \
+             WHERE i.workflow_execution = (e.workflow_task->>'workflow_execution')::BIGINT \
+               AND i.workflow_task_name = e.workflow_task->>'task_name' \
+               AND i.action_attempt_family = COALESCE(e.original_execution, e.id) \
+               AND i.purpose = $2"
+        );
+        let existing = sqlx::query_as::<_, Inquiry>(&existing_query)
+            .bind(input.execution)
+            .bind(&input.purpose)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| {
+                Error::Validation(
+                    "inquiries may only be created by workflow task executions".to_string(),
+                )
+            })?;
+
+        if existing.prompt != input.prompt
+            || existing.response_schema != input.response_schema
+            || existing.assigned_to != input.assigned_to
+            || existing.timeout_seconds != input.timeout_seconds
+        {
+            return Err(Error::AlreadyExists {
+                entity: "inquiry".to_string(),
+                field: "workflow task purpose".to_string(),
+                value: input.purpose,
+            });
+        }
+        Ok(existing)
+    }
+
+    /// Records the first valid response. Callers must perform authorization and
+    /// response-schema validation before entering this compare-and-set update.
+    pub async fn respond_pending<'e, E>(
+        executor: E,
+        id: Id,
+        response: JsonDict,
+        responded_by: Id,
+        provider_actor: Option<JsonValue>,
+    ) -> Result<Option<Inquiry>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "UPDATE inquiry SET status = $2, response = $3, responded_by = $4, \
+             provider_actor = $5, responded_at = NOW(), updated = NOW() \
+             WHERE id = $1 AND status = $6 \
+               AND (timeout_at IS NULL OR timeout_at > NOW()) \
+             RETURNING {INQUIRY_SELECT_COLUMNS}"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(id)
+            .bind(InquiryStatus::Responded)
+            .bind(response)
+            .bind(responded_by)
+            .bind(provider_actor)
+            .bind(InquiryStatus::Pending)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn cancel_pending_by_creator<'e, E>(
+        executor: E,
+        id: Id,
+        creator_execution: Id,
+    ) -> Result<Option<Inquiry>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "UPDATE inquiry SET status = $3, updated = NOW() \
+             WHERE id = $1 AND execution = $2 AND status = $4 \
+             RETURNING {INQUIRY_SELECT_COLUMNS}"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(id)
+            .bind(creator_execution)
+            .bind(InquiryStatus::Cancelled)
+            .bind(InquiryStatus::Pending)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn cancel_pending_for_workflow<'e, E>(
+        executor: E,
+        workflow_execution: Id,
+    ) -> Result<Vec<Inquiry>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "UPDATE inquiry SET status = $2, updated = NOW() \
+             WHERE workflow_execution = $1 AND status = $3 \
+             RETURNING {INQUIRY_SELECT_COLUMNS}"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(workflow_execution)
+            .bind(InquiryStatus::Cancelled)
+            .bind(InquiryStatus::Pending)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Atomically mark all expired pending inquiries as timed out.
     pub async fn timeout_expired_pending<'e, E>(executor: E) -> Result<Vec<Inquiry>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, Inquiry>(
+        let query = format!(
             "UPDATE inquiry \
              SET status = $1, updated = NOW() \
              WHERE status = $2 \
                AND timeout_at IS NOT NULL \
                AND timeout_at <= NOW() \
-             RETURNING id, execution, prompt, response_schema, assigned_to, status, response, timeout_at, responded_at, created, updated",
-        )
-        .bind(InquiryStatus::Timeout)
-        .bind(InquiryStatus::Pending)
-        .fetch_all(executor)
-        .await
-        .map_err(Into::into)
+             RETURNING {INQUIRY_SELECT_COLUMNS}"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(InquiryStatus::Timeout)
+            .bind(InquiryStatus::Pending)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn find_by_status<'e, E>(executor: E, status: InquiryStatus) -> Result<Vec<Inquiry>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, Inquiry>(
-            "SELECT id, execution, prompt, response_schema, assigned_to, status, response, timeout_at, responded_at, created, updated FROM inquiry WHERE status = $1 ORDER BY created DESC"
-        ).bind(status).fetch_all(executor).await.map_err(Into::into)
+        let query = format!(
+            "SELECT {INQUIRY_SELECT_COLUMNS} FROM inquiry WHERE status = $1 ORDER BY created DESC"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(status)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn find_by_execution<'e, E>(executor: E, execution_id: Id) -> Result<Vec<Inquiry>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, Inquiry>(
-            "SELECT id, execution, prompt, response_schema, assigned_to, status, response, timeout_at, responded_at, created, updated FROM inquiry WHERE execution = $1 ORDER BY created DESC"
-        ).bind(execution_id).fetch_all(executor).await.map_err(Into::into)
+        let query = format!(
+            "SELECT {INQUIRY_SELECT_COLUMNS} FROM inquiry WHERE execution = $1 ORDER BY created DESC"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(execution_id)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn find_by_workflow_execution<'e, E>(
+        executor: E,
+        workflow_execution: Id,
+    ) -> Result<Vec<Inquiry>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "SELECT {INQUIRY_SELECT_COLUMNS} FROM inquiry \
+             WHERE workflow_execution = $1 ORDER BY id"
+        );
+        sqlx::query_as::<_, Inquiry>(&query)
+            .bind(workflow_execution)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
     }
 
     /// Search inquiries with all filters pushed into SQL.
@@ -233,10 +462,8 @@ impl InquiryRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let select_cols = "id, execution, prompt, response_schema, assigned_to, status, response, timeout_at, responded_at, created, updated";
-
         let mut qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new(format!("SELECT {select_cols} FROM inquiry"));
+            QueryBuilder::new(format!("SELECT {INQUIRY_SELECT_COLUMNS} FROM inquiry"));
         let mut count_qb: QueryBuilder<'_, Postgres> =
             QueryBuilder::new("SELECT COUNT(*) FROM inquiry");
 
@@ -313,10 +540,8 @@ impl InquiryRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let select_cols = "i.id, i.execution, i.prompt, i.response_schema, i.assigned_to, i.status, i.response, i.timeout_at, i.responded_at, i.created, i.updated";
-
         let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
-            "SELECT {select_cols} FROM inquiry i LEFT JOIN execution e ON e.id = i.execution"
+            "SELECT {INQUIRY_SELECT_COLUMNS_QUALIFIED} FROM inquiry i LEFT JOIN execution e ON e.id = i.execution"
         ));
 
         let mut has_where = false;

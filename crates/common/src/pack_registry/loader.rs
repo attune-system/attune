@@ -19,7 +19,7 @@
 //! All loaders use **upsert** semantics: if an entity with the same ref already
 //! exists it is updated in place (preserving its database ID); otherwise a new
 //! row is created. After loading, entities that belong to the pack but whose
-//! refs are no longer present in the YAML files are deleted.
+//! refs are no longer present in the YAML files are retired.
 //!
 //! ## Workflow Actions
 //!
@@ -47,10 +47,12 @@ use crate::action_visibility::{
 use crate::config::CacheAdmissionConfig;
 use crate::dashboard_spec::validate_dashboard_spec;
 use crate::error::{Error, Result};
+use crate::models::ManagementOrigin;
 use crate::models::{
     ActionReferenceVisibility, DashboardScopeType, DashboardVisibility, Id, RetentionPolicyType,
 };
 use crate::pack_cache_definition::{CacheDefinitionOwnerType, CacheDefinitionYaml};
+use crate::platform_catalog::{is_legacy_definition, ManagedComponentKind};
 use crate::policy_control::parse_policy_controls;
 use crate::queue_definition::parse_work_queue_definition_yaml;
 use crate::rbac::{validate_cache_grant_constraints, Grant, Resource};
@@ -61,12 +63,14 @@ use crate::repositories::action::{
 use crate::repositories::cache::{
     CacheNamespaceRepository, CacheOwnerScope, ManagedCacheNamespaceDefinition,
 };
+use crate::repositories::component_lifecycle::{ComponentLifecycleRepository, PackProjectionIds};
 use crate::repositories::dashboard::{
     CreateDashboardInput, DashboardRepository, DashboardScopedRef, UpdateDashboardInput,
 };
 use crate::repositories::identity::{
     CreatePermissionSetInput, PermissionSetRepository, UpdatePermissionSetInput,
 };
+use crate::repositories::platform_catalog::PlatformCatalogRepository;
 use crate::repositories::rule::{
     CreateRuleInput, RuleRepository, RuleSensorPlacementInput, UpdateRuleInput,
 };
@@ -83,7 +87,7 @@ use crate::repositories::workflow::{
 use crate::repositories::{
     runtime::{CreateRuntimeInput, RuntimeRepository, UpdateRuntimeInput},
     work_queue::{CreateWorkQueueInput, UpdateWorkQueueInput, WorkQueueRepository},
-    Create, Delete, FindById, FindByRef, Patch, Update,
+    Create, FindById, FindByRef, Patch, Update,
 };
 use crate::scheduling::parse_rule_sensor_placement;
 use crate::schema::RefValidator;
@@ -106,6 +110,8 @@ struct CleanupRefs<'a> {
 /// Result of loading pack components into the database.
 #[derive(Debug, Default)]
 pub struct PackLoadResult {
+    /// Stable IDs written by this load. Activation stamps only these rows.
+    pub projections: PackProjectionIds,
     /// Number of permission sets created
     pub permission_sets_loaded: usize,
     /// Number of permission sets updated
@@ -220,6 +226,7 @@ pub struct PackComponentLoader<'a> {
     pack_id: Id,
     pack_ref: String,
     cache_admission: CacheAdmissionConfig,
+    absent_metadata_policy: crate::models::AbsentMetadataPolicy,
 }
 
 impl<'a> PackComponentLoader<'a> {
@@ -234,7 +241,16 @@ impl<'a> PackComponentLoader<'a> {
             pack_id,
             pack_ref: pack_ref.to_string(),
             cache_admission: cache_admission.clone(),
+            absent_metadata_policy: crate::models::AbsentMetadataPolicy::Remove,
         }
+    }
+
+    pub fn with_absent_metadata_policy(
+        mut self,
+        policy: crate::models::AbsentMetadataPolicy,
+    ) -> Self {
+        self.absent_metadata_policy = policy;
+        self
     }
 
     /// Load all components from the pack directory.
@@ -261,6 +277,9 @@ impl<'a> PackComponentLoader<'a> {
             pack_id: self.pack_id,
             pack_ref: self.pack_ref.clone(),
             cache_admission: self.cache_admission.clone(),
+            legacy_platform_refs: HashSet::new(),
+            absent_metadata_policy: self.absent_metadata_policy,
+            runtime_version_ids: Vec::new(),
         };
         loader.load_all(pack_dir).await
     }
@@ -271,10 +290,14 @@ struct TransactionalPackComponentLoader<'a> {
     pack_id: Id,
     pack_ref: String,
     cache_admission: CacheAdmissionConfig,
+    legacy_platform_refs: HashSet<(ManagedComponentKind, String)>,
+    absent_metadata_policy: crate::models::AbsentMetadataPolicy,
+    runtime_version_ids: Vec<Id>,
 }
 
 impl TransactionalPackComponentLoader<'_> {
     async fn load_all(&mut self, pack_dir: &Path) -> Result<PackLoadResult> {
+        PlatformCatalogRepository::check_compatibility(&mut *self.connection).await?;
         // Cache definitions load after every other component because their
         // owners must already exist. Validate their deterministic file/schema
         // constraints before mutating any component so a malformed cache file
@@ -325,22 +348,28 @@ impl TransactionalPackComponentLoader<'_> {
             .await?;
 
         // 11. Clean up entities that are no longer in the pack's YAML files
-        self.cleanup_removed_entities(
-            CleanupRefs {
-                permission_sets: &permission_set_refs,
-                runtimes: &runtime_refs,
-                triggers: &trigger_refs,
-                actions: &action_refs,
-                dashboards: &dashboard_refs,
-                queues: &queue_refs,
-                policies: &policy_refs,
-                rules: &rule_refs,
-                sensors: &sensor_refs,
-                caches: &cache_refs,
-            },
-            &mut result,
+        let cleanup_refs = CleanupRefs {
+            permission_sets: &permission_set_refs,
+            runtimes: &runtime_refs,
+            triggers: &trigger_refs,
+            actions: &action_refs,
+            dashboards: &dashboard_refs,
+            queues: &queue_refs,
+            policies: &policy_refs,
+            rules: &rule_refs,
+            sensors: &sensor_refs,
+            caches: &cache_refs,
+        };
+        result.projections = self.resolve_projection_ids(&cleanup_refs).await?;
+        result.removed = ComponentLifecycleRepository::reconcile_omissions_with_policy(
+            &mut *self.connection,
+            self.pack_id,
+            &result.projections,
+            self.absent_metadata_policy,
         )
-        .await;
+        .await? as usize;
+        self.validate_active_dependencies(&result.projections)
+            .await?;
 
         info!(
             "Pack '{}' component loading complete: {} created, {} updated, {} skipped, {} removed, {} warnings",
@@ -387,36 +416,35 @@ impl TransactionalPackComponentLoader<'_> {
                 }
                 validate_pack_component_ref(&self.pack_ref, kind, component_ref)?;
 
-                let owner = match directory {
-                    "permission_sets" => {
-                        PermissionSetRepository::find_by_ref(&mut *self.connection, component_ref)
-                            .await?
-                            .map(|item| item.pack)
-                    }
-                    "runtimes" => {
-                        RuntimeRepository::find_by_ref(&mut *self.connection, component_ref)
-                            .await?
-                            .map(|item| item.pack)
-                    }
-                    "triggers" => {
-                        TriggerRepository::find_by_ref(&mut *self.connection, component_ref)
-                            .await?
-                            .map(|item| item.pack)
-                    }
-                    "actions" => {
-                        ActionRepository::find_by_ref(&mut *self.connection, component_ref)
-                            .await?
-                            .map(|item| Some(item.pack))
-                    }
-                    "sensors" => {
-                        SensorRepository::find_by_ref(&mut *self.connection, component_ref)
-                            .await?
-                            .map(|item| item.pack)
-                    }
+                let component_kind = match directory {
+                    "permission_sets" => ManagedComponentKind::PermissionSet,
+                    "runtimes" => ManagedComponentKind::Runtime,
+                    "triggers" => ManagedComponentKind::Trigger,
+                    "actions" => ManagedComponentKind::Action,
+                    "sensors" => ManagedComponentKind::Sensor,
                     _ => unreachable!(),
                 };
-                if let Some(owner) = owner {
-                    ensure_existing_owner(kind, component_ref, owner, self.pack_id)?;
+                if matches!(
+                    PlatformCatalogRepository::origin(
+                        &mut *self.connection,
+                        component_kind,
+                        component_ref
+                    )
+                    .await?,
+                    Some(ManagementOrigin::Platform { .. })
+                ) && self.pack_ref == "core"
+                    && is_legacy_definition(component_kind, &serde_json::to_value(&data)?)?
+                {
+                    self.legacy_platform_refs
+                        .insert((component_kind, component_ref.to_string()));
+                } else {
+                    PlatformCatalogRepository::ensure_pack_owner(
+                        &mut *self.connection,
+                        component_kind,
+                        component_ref,
+                        self.pack_id,
+                    )
+                    .await?;
                 }
             }
         }
@@ -441,18 +469,18 @@ impl TransactionalPackComponentLoader<'_> {
                     })?;
                 let component_ref = qualify_pack_ref(&self.pack_ref, raw_ref);
                 validate_pack_component_ref(&self.pack_ref, kind, &component_ref)?;
-                let owner = if directory == "policies" {
-                    PolicyRepository::find_by_ref(&mut *self.connection, &component_ref)
-                        .await?
-                        .map(|item| item.pack)
+                let component_kind = if directory == "policies" {
+                    ManagedComponentKind::Policy
                 } else {
-                    RuleRepository::find_by_ref(&mut *self.connection, &component_ref)
-                        .await?
-                        .map(|item| Some(item.pack))
+                    ManagedComponentKind::Rule
                 };
-                if let Some(owner) = owner {
-                    ensure_existing_owner(kind, &component_ref, owner, self.pack_id)?;
-                }
+                PlatformCatalogRepository::ensure_pack_owner(
+                    &mut *self.connection,
+                    component_kind,
+                    &component_ref,
+                    self.pack_id,
+                )
+                .await?;
             }
         }
 
@@ -465,9 +493,18 @@ impl TransactionalPackComponentLoader<'_> {
                     ))
                 })?;
                 validate_pack_component_ref(&self.pack_ref, "work queue", &definition.r#ref)?;
-                if let Some(existing) =
-                    WorkQueueRepository::find_by_ref(&mut *self.connection, &definition.r#ref)
-                        .await?
+                PlatformCatalogRepository::ensure_pack_owner(
+                    &mut *self.connection,
+                    ManagedComponentKind::WorkQueue,
+                    &definition.r#ref,
+                    self.pack_id,
+                )
+                .await?;
+                if let Some(existing) = WorkQueueRepository::find_by_ref_including_retired(
+                    &mut *self.connection,
+                    &definition.r#ref,
+                )
+                .await?
                 {
                     ensure_existing_owner(
                         "work queue",
@@ -521,9 +558,18 @@ impl TransactionalPackComponentLoader<'_> {
                     workflow.r#ref.as_str()
                 };
                 validate_pack_component_ref(&self.pack_ref, "workflow", workflow_ref)?;
-                if let Some(existing) =
-                    WorkflowDefinitionRepository::find_by_ref(&mut *self.connection, workflow_ref)
-                        .await?
+                PlatformCatalogRepository::ensure_pack_owner(
+                    &mut *self.connection,
+                    ManagedComponentKind::Workflow,
+                    workflow_ref,
+                    self.pack_id,
+                )
+                .await?;
+                if let Some(existing) = WorkflowDefinitionRepository::find_by_ref_including_retired(
+                    &mut *self.connection,
+                    workflow_ref,
+                )
+                .await?
                 {
                     ensure_existing_owner(
                         "workflow",
@@ -637,6 +683,14 @@ impl TransactionalPackComponentLoader<'_> {
                 }
             };
 
+            if self.legacy_platform_refs.contains(&(
+                ManagedComponentKind::PermissionSet,
+                permission_set_ref.clone(),
+            )) {
+                loaded_refs.push(permission_set_ref);
+                continue;
+            }
+
             let label = data
                 .get("label")
                 .and_then(|v| v.as_str())
@@ -683,9 +737,11 @@ impl TransactionalPackComponentLoader<'_> {
                 }
             }
 
-            if let Some(existing) =
-                PermissionSetRepository::find_by_ref(&mut *self.connection, &permission_set_ref)
-                    .await?
+            if let Some(existing) = PermissionSetRepository::find_by_ref_including_retired(
+                &mut *self.connection,
+                &permission_set_ref,
+            )
+            .await?
             {
                 ensure_existing_owner(
                     "permission set",
@@ -693,6 +749,12 @@ impl TransactionalPackComponentLoader<'_> {
                     existing.pack,
                     self.pack_id,
                 )?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::PermissionSet,
+                    existing.id,
+                )
+                .await?;
                 let update_input = UpdatePermissionSetInput {
                     label,
                     description,
@@ -713,15 +775,7 @@ impl TransactionalPackComponentLoader<'_> {
                         );
                         result.permission_sets_updated += 1;
                     }
-                    Err(e) => {
-                        let msg = format!(
-                            "Failed to update permission set '{}': {}",
-                            permission_set_ref, e
-                        );
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                        result.permission_sets_skipped += 1;
-                    }
+                    Err(e) => return Err(e),
                 }
                 loaded_refs.push(permission_set_ref);
                 continue;
@@ -745,15 +799,7 @@ impl TransactionalPackComponentLoader<'_> {
                     result.permission_sets_loaded += 1;
                     loaded_refs.push(permission_set_ref);
                 }
-                Err(e) => {
-                    let msg = format!(
-                        "Failed to create permission set '{}': {}",
-                        permission_set_ref, e
-                    );
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                    result.permission_sets_skipped += 1;
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -802,6 +848,14 @@ impl TransactionalPackComponentLoader<'_> {
                 }
             };
 
+            if self
+                .legacy_platform_refs
+                .contains(&(ManagedComponentKind::Runtime, runtime_ref.clone()))
+            {
+                loaded_refs.push(runtime_ref);
+                continue;
+            }
+
             let name = data
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -838,10 +892,19 @@ impl TransactionalPackComponentLoader<'_> {
                 .unwrap_or_default();
 
             // Check if runtime already exists — update in place if so
-            if let Some(existing) =
-                RuntimeRepository::find_by_ref(&mut *self.connection, &runtime_ref).await?
+            if let Some(existing) = RuntimeRepository::find_by_ref_including_retired(
+                &mut *self.connection,
+                &runtime_ref,
+            )
+            .await?
             {
                 ensure_existing_owner("runtime", &runtime_ref, existing.pack, self.pack_id)?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::Runtime,
+                    existing.id,
+                )
+                .await?;
                 let update_input = UpdateRuntimeInput {
                     description: Some(match description {
                         Some(description) => Patch::Set(description),
@@ -867,13 +930,9 @@ impl TransactionalPackComponentLoader<'_> {
 
                         // Also upsert version entries
                         self.load_runtime_versions(&data, existing.id, &runtime_ref, result)
-                            .await;
+                            .await?;
                     }
-                    Err(e) => {
-                        let msg = format!("Failed to update runtime '{}': {}", runtime_ref, e);
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                    }
+                    Err(e) => return Err(e),
                 }
                 loaded_refs.push(runtime_ref);
                 continue;
@@ -901,7 +960,7 @@ impl TransactionalPackComponentLoader<'_> {
 
                     // Load version entries from the optional `versions` array
                     self.load_runtime_versions(&data, rt.id, &runtime_ref, result)
-                        .await;
+                        .await?;
                 }
                 Err(e) => {
                     // Check for unique constraint violation (race condition)
@@ -916,9 +975,7 @@ impl TransactionalPackComponentLoader<'_> {
                             continue;
                         }
                     }
-                    let msg = format!("Failed to create runtime '{}': {}", runtime_ref, e);
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
+                    return Err(e);
                 }
             }
         }
@@ -936,11 +993,12 @@ impl TransactionalPackComponentLoader<'_> {
         runtime_id: Id,
         runtime_ref: &str,
         result: &mut PackLoadResult,
-    ) {
-        let versions = match data.get("versions").and_then(|v| v.as_sequence()) {
-            Some(seq) => seq,
-            None => return, // No versions defined — that's fine
-        };
+    ) -> Result<()> {
+        let versions = data
+            .get("versions")
+            .and_then(|value| value.as_sequence())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
 
         info!(
             "Loading {} version(s) for runtime '{}'",
@@ -989,13 +1047,15 @@ impl TransactionalPackComponentLoader<'_> {
                 .unwrap_or_else(|| serde_json::json!({}));
 
             // Check if this version already exists — update in place if so
-            if let Ok(Some(existing)) = RuntimeVersionRepository::find_by_runtime_and_version(
-                &mut *self.connection,
-                runtime_id,
-                &version_str,
-            )
-            .await
+            if let Some(existing) =
+                RuntimeVersionRepository::find_by_runtime_and_version_including_retired(
+                    &mut *self.connection,
+                    runtime_id,
+                    &version_str,
+                )
+                .await?
             {
+                RuntimeVersionRepository::reactivate(&mut *self.connection, existing.id).await?;
                 let update_input = UpdateRuntimeVersionInput {
                     version: None, // version string doesn't change
                     version_major: Some(match version_major {
@@ -1031,16 +1091,10 @@ impl TransactionalPackComponentLoader<'_> {
                             version_str, runtime_ref, existing.id
                         );
                     }
-                    Err(e) => {
-                        let msg = format!(
-                            "Failed to update version '{}' for runtime '{}': {}",
-                            version_str, runtime_ref, e
-                        );
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                    }
+                    Err(e) => return Err(e),
                 }
                 loaded_versions.push(version_str);
+                self.runtime_version_ids.push(existing.id);
                 continue;
             }
 
@@ -1065,6 +1119,7 @@ impl TransactionalPackComponentLoader<'_> {
                         version_str, runtime_ref, rv.id
                     );
                     loaded_versions.push(version_str);
+                    self.runtime_version_ids.push(rv.id);
                 }
                 Err(e) => {
                     // Check for unique constraint violation (race condition)
@@ -1078,37 +1133,26 @@ impl TransactionalPackComponentLoader<'_> {
                             continue;
                         }
                     }
-                    let msg = format!(
-                        "Failed to create version '{}' for runtime '{}': {}",
-                        version_str, runtime_ref, e
-                    );
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
+                    return Err(e);
                 }
             }
         }
 
-        // Clean up versions that are no longer in the YAML
-        if let Ok(existing_versions) =
-            RuntimeVersionRepository::find_by_runtime(&mut *self.connection, runtime_id).await
-        {
+        if self.absent_metadata_policy == crate::models::AbsentMetadataPolicy::Remove {
+            let existing_versions =
+                RuntimeVersionRepository::find_by_runtime(&mut *self.connection, runtime_id)
+                    .await?;
             for existing in existing_versions {
                 if !loaded_versions.contains(&existing.version) {
                     info!(
-                        "Removing stale version '{}' for runtime '{}'",
+                        "Retiring stale version '{}' for runtime '{}'",
                         existing.version, runtime_ref
                     );
-                    if let Err(e) =
-                        RuntimeVersionRepository::delete(&mut *self.connection, existing.id).await
-                    {
-                        warn!(
-                            "Failed to delete stale version '{}' for runtime '{}': {}",
-                            existing.version, runtime_ref, e
-                        );
-                    }
+                    RuntimeVersionRepository::retire(&mut *self.connection, existing.id).await?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Load trigger definitions from `pack_dir/triggers/*.yaml`.
@@ -1151,6 +1195,17 @@ impl TransactionalPackComponentLoader<'_> {
                 }
             };
 
+            if self
+                .legacy_platform_refs
+                .contains(&(ManagedComponentKind::Trigger, trigger_ref.clone()))
+            {
+                let trigger =
+                    TriggerRepository::get_by_ref(&mut *self.connection, &trigger_ref).await?;
+                trigger_ids.insert(trigger_ref.clone(), trigger.id);
+                loaded_refs.push(trigger_ref);
+                continue;
+            }
+
             let name = extract_name_from_ref(&trigger_ref);
             let label = data
                 .get("label")
@@ -1182,17 +1237,26 @@ impl TransactionalPackComponentLoader<'_> {
                 .and_then(|v| serde_json::to_value(v).ok());
 
             // Check if trigger already exists — update in place if so
-            if let Some(existing) =
-                TriggerRepository::find_by_ref(&mut *self.connection, &trigger_ref).await?
+            if let Some(existing) = TriggerRepository::find_by_ref_including_retired(
+                &mut *self.connection,
+                &trigger_ref,
+            )
+            .await?
             {
                 ensure_existing_owner("trigger", &trigger_ref, existing.pack, self.pack_id)?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::Trigger,
+                    existing.id,
+                )
+                .await?;
                 let update_input = UpdateTriggerInput {
                     label: Some(label),
                     description: Some(match description {
                         Some(description) => Patch::Set(description),
                         None => Patch::Clear,
                     }),
-                    enabled,
+                    enabled: None,
                     param_schema: Some(match param_schema {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
@@ -1211,14 +1275,17 @@ impl TransactionalPackComponentLoader<'_> {
                     .await
                 {
                     Ok(_) => {
+                        ComponentLifecycleRepository::set_declared_enabled(
+                            &mut *self.connection,
+                            ManagedComponentKind::Trigger,
+                            existing.id,
+                            enabled.unwrap_or(true),
+                        )
+                        .await?;
                         info!("Updated trigger '{}' (ID: {})", trigger_ref, existing.id);
                         result.triggers_updated += 1;
                     }
-                    Err(e) => {
-                        let msg = format!("Failed to update trigger '{}': {}", trigger_ref, e);
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                    }
+                    Err(e) => return Err(e),
                 }
                 trigger_ids.insert(trigger_ref.clone(), existing.id);
                 loaded_refs.push(trigger_ref);
@@ -1248,11 +1315,7 @@ impl TransactionalPackComponentLoader<'_> {
                     loaded_refs.push(trigger_ref);
                     result.triggers_loaded += 1;
                 }
-                Err(e) => {
-                    let msg = format!("Failed to create trigger '{}': {}", trigger_ref, e);
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1475,9 +1538,16 @@ impl TransactionalPackComponentLoader<'_> {
 
             // Check if action already exists — update in place if so
             if let Some(existing) =
-                ActionRepository::find_by_ref(&mut *self.connection, &action_ref).await?
+                ActionRepository::find_by_ref_including_retired(&mut *self.connection, &action_ref)
+                    .await?
             {
                 ensure_existing_owner("action", &action_ref, Some(existing.pack), self.pack_id)?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::Action,
+                    existing.id,
+                )
+                .await?;
                 let update_input = UpdateActionInput {
                     label: Some(label),
                     description: Some(match description {
@@ -1486,7 +1556,7 @@ impl TransactionalPackComponentLoader<'_> {
                     }),
                     entrypoint: Some(entrypoint),
                     runtime: runtime_id,
-                    enabled,
+                    enabled: None,
                     runtime_version_constraint: Some(match runtime_version_constraint {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
@@ -1532,30 +1602,36 @@ impl TransactionalPackComponentLoader<'_> {
                     .await
                 {
                     Ok(_) => {
+                        ComponentLifecycleRepository::set_declared_enabled(
+                            &mut *self.connection,
+                            ManagedComponentKind::Action,
+                            existing.id,
+                            enabled.unwrap_or(true),
+                        )
+                        .await?;
                         info!("Updated action '{}' (ID: {})", action_ref, existing.id);
                         result.actions_updated += 1;
 
-                        // Re-link workflow definition if present
-                        if let Some(wf_id) = workflow_def_id {
-                            if let Err(e) = ActionRepository::link_workflow_def(
-                                &mut *self.connection,
-                                existing.id,
-                                wf_id,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "Failed to link workflow def {} to action '{}': {}",
-                                    wf_id, action_ref, e
-                                );
+                        match workflow_def_id {
+                            Some(wf_id) => {
+                                ActionRepository::link_workflow_def(
+                                    &mut *self.connection,
+                                    existing.id,
+                                    wf_id,
+                                )
+                                .await?;
                             }
+                            None if existing.workflow_def.is_some() => {
+                                ActionRepository::unlink_workflow_def(
+                                    &mut *self.connection,
+                                    existing.id,
+                                )
+                                .await?;
+                            }
+                            None => {}
                         }
                     }
-                    Err(e) => {
-                        let msg = format!("Failed to update action '{}': {}", action_ref, e);
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                    }
+                    Err(e) => return Err(e),
                 }
                 loaded_refs.push(action_ref);
                 continue;
@@ -1618,20 +1694,12 @@ impl TransactionalPackComponentLoader<'_> {
 
                     // Link workflow definition if present
                     if let Some(wf_id) = workflow_def_id {
-                        if let Err(e) =
-                            ActionRepository::link_workflow_def(&mut *self.connection, id, wf_id)
-                                .await
-                        {
-                            warn!(
-                                "Failed to link workflow def {} to new action '{}': {}",
-                                wf_id, action_ref, e
-                            );
-                        } else {
-                            info!(
-                                "Linked action '{}' (ID: {}) to workflow definition (ID: {})",
-                                action_ref, id, wf_id
-                            );
-                        }
+                        ActionRepository::link_workflow_def(&mut *self.connection, id, wf_id)
+                            .await?;
+                        info!(
+                            "Linked action '{}' (ID: {}) to workflow definition (ID: {})",
+                            action_ref, id, wf_id
+                        );
                     }
                 }
                 Err(e) => {
@@ -1647,9 +1715,7 @@ impl TransactionalPackComponentLoader<'_> {
                             continue;
                         }
                     }
-                    let msg = format!("Failed to create action '{}': {}", action_ref, e);
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
+                    return Err(e.into());
                 }
             }
         }
@@ -1774,7 +1840,7 @@ impl TransactionalPackComponentLoader<'_> {
                 continue;
             }
 
-            if let Some(existing) = DashboardRepository::find_by_ref_in_scope(
+            if let Some(existing) = DashboardRepository::find_by_ref_in_scope_including_retired(
                 &mut *self.connection,
                 &DashboardScopedRef {
                     scope_type,
@@ -1785,6 +1851,17 @@ impl TransactionalPackComponentLoader<'_> {
             .await?
             {
                 ensure_existing_owner("dashboard", &dashboard_ref, existing.pack, self.pack_id)?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::Dashboard,
+                    existing.id,
+                )
+                .await?;
+                if existing.is_adhoc {
+                    return Err(Error::validation(format!(
+                        "Cannot replace ad-hoc dashboard '{dashboard_ref}'"
+                    )));
+                }
                 let update_input = UpdateDashboardInput {
                     scope_type: Some(scope_type),
                     scope_ref: Some(scope_ref.clone()),
@@ -1797,7 +1874,7 @@ impl TransactionalPackComponentLoader<'_> {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
                     }),
-                    enabled: Some(enabled),
+                    enabled: None,
                     is_default_home: Some(is_default_home),
                     spec_version: Some(spec_version),
                     spec: Some(spec),
@@ -1814,6 +1891,13 @@ impl TransactionalPackComponentLoader<'_> {
                 .await
                 {
                     Ok(_) => {
+                        ComponentLifecycleRepository::set_declared_enabled(
+                            &mut *self.connection,
+                            ManagedComponentKind::Dashboard,
+                            existing.id,
+                            enabled,
+                        )
+                        .await?;
                         info!(
                             "Updated dashboard '{}' (ID: {})",
                             dashboard_ref, existing.id
@@ -1821,12 +1905,7 @@ impl TransactionalPackComponentLoader<'_> {
                         result.dashboards_updated += 1;
                         loaded_refs.push(dashboard_ref);
                     }
-                    Err(e) => {
-                        let msg = format!("Failed to update dashboard '{}': {}", dashboard_ref, e);
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                        result.dashboards_skipped += 1;
-                    }
+                    Err(e) => return Err(e),
                 }
                 continue;
             }
@@ -1861,12 +1940,7 @@ impl TransactionalPackComponentLoader<'_> {
                     result.dashboards_loaded += 1;
                     loaded_refs.push(dashboard.r#ref);
                 }
-                Err(e) => {
-                    let msg = format!("Failed to create dashboard '{}': {}", dashboard_ref, e);
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                    result.dashboards_skipped += 1;
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1944,8 +2018,11 @@ impl TransactionalPackComponentLoader<'_> {
                 .get("accepting_new_items")
                 .and_then(|value| value.as_bool());
 
-            if let Some(existing) =
-                WorkQueueRepository::find_by_ref(&mut *self.connection, &definition.r#ref).await?
+            if let Some(existing) = WorkQueueRepository::find_by_ref_including_retired(
+                &mut *self.connection,
+                &definition.r#ref,
+            )
+            .await?
             {
                 ensure_existing_owner(
                     "work queue",
@@ -1953,6 +2030,12 @@ impl TransactionalPackComponentLoader<'_> {
                     existing.pack,
                     self.pack_id,
                 )?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::WorkQueue,
+                    existing.id,
+                )
+                .await?;
                 let update_input = UpdateWorkQueueInput {
                     pack: Some(Patch::Set(self.pack_id)),
                     pack_ref: Some(Patch::Set(self.pack_ref.clone())),
@@ -1962,7 +2045,7 @@ impl TransactionalPackComponentLoader<'_> {
                         Some(description) => Patch::Set(description),
                         None => Patch::Clear,
                     }),
-                    enabled,
+                    enabled: None,
                     accepting_new_items,
                     dispatch_action: Some(Patch::Set(dispatch_action.id)),
                     dispatch_action_ref: Some(definition.dispatch_action.clone()),
@@ -1991,6 +2074,13 @@ impl TransactionalPackComponentLoader<'_> {
                     .await
                 {
                     Ok(_) => {
+                        ComponentLifecycleRepository::set_declared_enabled(
+                            &mut *self.connection,
+                            ManagedComponentKind::WorkQueue,
+                            existing.id,
+                            enabled.unwrap_or(true),
+                        )
+                        .await?;
                         info!(
                             "Updated work queue '{}' (ID: {})",
                             definition.r#ref, existing.id
@@ -1998,13 +2088,7 @@ impl TransactionalPackComponentLoader<'_> {
                         result.queues_updated += 1;
                         loaded_refs.push(definition.r#ref);
                     }
-                    Err(e) => {
-                        let msg =
-                            format!("Failed to update work queue '{}': {}", definition.r#ref, e);
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                        result.queues_skipped += 1;
-                    }
+                    Err(e) => return Err(e),
                 }
                 continue;
             }
@@ -2042,12 +2126,7 @@ impl TransactionalPackComponentLoader<'_> {
                     result.queues_loaded += 1;
                     loaded_refs.push(queue.r#ref);
                 }
-                Err(e) => {
-                    let msg = format!("Failed to create work queue '{}': {}", definition.r#ref, e);
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                    result.queues_skipped += 1;
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -2190,11 +2269,18 @@ impl TransactionalPackComponentLoader<'_> {
             let quotas = controls.quotas;
 
             if let Some(existing) =
-                PolicyRepository::find_by_ref(&mut *self.connection, &policy_ref).await?
+                PolicyRepository::find_by_ref_including_retired(&mut *self.connection, &policy_ref)
+                    .await?
             {
                 ensure_existing_owner("policy", &policy_ref, existing.pack, self.pack_id)?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::Policy,
+                    existing.id,
+                )
+                .await?;
                 let update = UpdatePolicyInput {
-                    enabled: Some(enabled),
+                    enabled: None,
                     priority: Some(priority),
                     parameters: Some(parameters),
                     method: Some(method),
@@ -2209,16 +2295,18 @@ impl TransactionalPackComponentLoader<'_> {
 
                 match PolicyRepository::update(&mut *self.connection, existing.id, update).await {
                     Ok(_) => {
+                        ComponentLifecycleRepository::set_declared_enabled(
+                            &mut *self.connection,
+                            ManagedComponentKind::Policy,
+                            existing.id,
+                            enabled,
+                        )
+                        .await?;
                         info!("Updated policy '{}' (ID: {})", policy_ref, existing.id);
                         result.policies_updated += 1;
                         loaded_refs.push(policy_ref);
                     }
-                    Err(e) => {
-                        let msg = format!("Failed to update policy '{}': {}", policy_ref, e);
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                        result.policies_skipped += 1;
-                    }
+                    Err(e) => return Err(e),
                 }
                 continue;
             }
@@ -2248,12 +2336,7 @@ impl TransactionalPackComponentLoader<'_> {
                     result.policies_loaded += 1;
                     loaded_refs.push(policy.r#ref);
                 }
-                Err(e) => {
-                    let msg = format!("Failed to create policy '{}': {}", policy_ref, e);
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                    result.policies_skipped += 1;
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -2438,9 +2521,16 @@ impl TransactionalPackComponentLoader<'_> {
             )?;
 
             if let Some(existing) =
-                RuleRepository::find_by_ref(&mut *self.connection, &rule_ref).await?
+                RuleRepository::find_by_ref_including_retired(&mut *self.connection, &rule_ref)
+                    .await?
             {
                 ensure_existing_owner("rule", &rule_ref, Some(existing.pack), self.pack_id)?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::Rule,
+                    existing.id,
+                )
+                .await?;
                 let update_input = UpdateRuleInput {
                     pack: Some(self.pack_id),
                     pack_ref: Some(self.pack_ref.clone()),
@@ -2464,12 +2554,19 @@ impl TransactionalPackComponentLoader<'_> {
                         Some(refs) => Patch::Set(refs),
                         None => Patch::Clear,
                     }),
-                    enabled,
+                    enabled: None,
                     is_adhoc: Some(false),
                     owner_identity: Some(Patch::Clear),
                 };
 
                 RuleRepository::update(&mut *self.connection, existing.id, update_input).await?;
+                ComponentLifecycleRepository::set_declared_enabled(
+                    &mut *self.connection,
+                    ManagedComponentKind::Rule,
+                    existing.id,
+                    enabled.unwrap_or(true),
+                )
+                .await?;
                 RuleRepository::update_sensor_placement(
                     &mut *self.connection,
                     existing.id,
@@ -2580,14 +2677,15 @@ impl TransactionalPackComponentLoader<'_> {
         let workflow_ref = workflow_yaml.r#ref.clone();
         validate_pack_component_ref(&self.pack_ref, "workflow", &workflow_ref)?;
         for action_ref in collect_workflow_action_refs(&workflow_yaml) {
-            let action = ActionRepository::find_by_ref(&mut *self.connection, &action_ref)
-                .await?
-                .ok_or_else(|| {
-                    Error::validation(format!(
-                        "Workflow '{}' references unknown action '{}'",
-                        workflow_ref, action_ref
-                    ))
-                })?;
+            let action =
+                ActionRepository::find_by_ref_including_retired(&mut *self.connection, &action_ref)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::validation(format!(
+                            "Workflow '{}' references unknown action '{}'",
+                            workflow_ref, action_ref
+                        ))
+                    })?;
             ensure_action_reference_allowed(
                 &action,
                 Some(&self.pack_ref),
@@ -2620,10 +2718,19 @@ impl TransactionalPackComponentLoader<'_> {
         let tags = workflow_yaml.tags.clone();
 
         // Check if this workflow definition already exists
-        if let Some(existing) =
-            WorkflowDefinitionRepository::find_by_ref(&mut *self.connection, &workflow_ref).await?
+        if let Some(existing) = WorkflowDefinitionRepository::find_by_ref_including_retired(
+            &mut *self.connection,
+            &workflow_ref,
+        )
+        .await?
         {
             ensure_existing_owner("workflow", &workflow_ref, Some(existing.pack), self.pack_id)?;
+            ComponentLifecycleRepository::reactivate_pack_component(
+                &mut *self.connection,
+                ManagedComponentKind::Workflow,
+                existing.id,
+            )
+            .await?;
             debug!(
                 "Updating existing workflow definition '{}' (ID: {})",
                 workflow_ref, existing.id
@@ -2736,8 +2843,11 @@ impl TransactionalPackComponentLoader<'_> {
                 result.warnings.push(msg);
             } else if sensor_runtime_id != 0 && !is_native_runner {
                 // Verify the resolved runtime has a non-empty execution_config
-                if let Some(runtime) =
-                    RuntimeRepository::find_by_id(&mut *self.connection, sensor_runtime_id).await?
+                if let Some(runtime) = RuntimeRepository::find_by_id_including_retired(
+                    &mut *self.connection,
+                    sensor_runtime_id,
+                )
+                .await?
                 {
                     let exec_config = runtime.parsed_execution_config();
                     if exec_config.interpreter.binary.is_empty()
@@ -2827,9 +2937,16 @@ impl TransactionalPackComponentLoader<'_> {
             // Upsert: update existing sensors so re-registration corrects
             // stale metadata (especially runtime assignments).
             if let Some(existing) =
-                SensorRepository::find_by_ref(&mut *self.connection, &sensor_ref).await?
+                SensorRepository::find_by_ref_including_retired(&mut *self.connection, &sensor_ref)
+                    .await?
             {
                 ensure_existing_owner("sensor", &sensor_ref, existing.pack, self.pack_id)?;
+                ComponentLifecycleRepository::reactivate_pack_component(
+                    &mut *self.connection,
+                    ManagedComponentKind::Sensor,
+                    existing.id,
+                )
+                .await?;
                 let update_input = UpdateSensorInput {
                     label: Some(label),
                     description: Some(match description {
@@ -2843,7 +2960,7 @@ impl TransactionalPackComponentLoader<'_> {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
                     }),
-                    enabled,
+                    enabled: None,
                     param_schema: Some(match param_schema {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
@@ -2874,19 +2991,22 @@ impl TransactionalPackComponentLoader<'_> {
                     .await
                 {
                     Ok(_) => {
+                        ComponentLifecycleRepository::set_declared_enabled(
+                            &mut *self.connection,
+                            ManagedComponentKind::Sensor,
+                            existing.id,
+                            enabled.unwrap_or(true),
+                        )
+                        .await?;
                         info!(
                             "Updated sensor '{}' (ID: {}, runtime: {} → {})",
                             sensor_ref, existing.id, existing.runtime_ref, sensor_runtime_ref
                         );
                         self.link_triggers_to_sensor(existing.id, &sensor_ref, &sensor_triggers)
-                            .await;
+                            .await?;
                         result.sensors_updated += 1;
                     }
-                    Err(e) => {
-                        let msg = format!("Failed to update sensor '{}': {}", sensor_ref, e);
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                    }
+                    Err(e) => return Err(e),
                 }
                 loaded_refs.push(sensor_ref);
                 continue;
@@ -2918,15 +3038,11 @@ impl TransactionalPackComponentLoader<'_> {
                 Ok(sensor) => {
                     info!("Created sensor '{}' (ID: {})", sensor_ref, sensor.id);
                     self.link_triggers_to_sensor(sensor.id, &sensor_ref, &sensor_triggers)
-                        .await;
+                        .await?;
                     loaded_refs.push(sensor_ref);
                     result.sensors_loaded += 1;
                 }
-                Err(e) => {
-                    let msg = format!("Failed to create sensor '{}': {}", sensor_ref, e);
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -3006,15 +3122,17 @@ impl TransactionalPackComponentLoader<'_> {
                         result.caches_skipped += 1;
                         continue;
                     }
-                    let action =
-                        ActionRepository::find_by_ref(&mut *self.connection, &definition.owner_ref)
-                            .await?
-                            .ok_or_else(|| {
-                                Error::validation(format!(
-                                    "Cache definition '{}' action owner '{}' was not loaded",
-                                    definition.r#ref, definition.owner_ref
-                                ))
-                            })?;
+                    let action = ActionRepository::find_by_ref_including_retired(
+                        &mut *self.connection,
+                        &definition.owner_ref,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        Error::validation(format!(
+                            "Cache definition '{}' action owner '{}' was not loaded",
+                            definition.r#ref, definition.owner_ref
+                        ))
+                    })?;
                     if action.pack != self.pack_id {
                         return Err(Error::validation(format!(
                             "Cache definition '{}' action owner '{}' belongs to another pack",
@@ -3040,15 +3158,17 @@ impl TransactionalPackComponentLoader<'_> {
                         result.caches_skipped += 1;
                         continue;
                     }
-                    let sensor =
-                        SensorRepository::find_by_ref(&mut *self.connection, &definition.owner_ref)
-                            .await?
-                            .ok_or_else(|| {
-                                Error::validation(format!(
-                                    "Cache definition '{}' sensor owner '{}' was not loaded",
-                                    definition.r#ref, definition.owner_ref
-                                ))
-                            })?;
+                    let sensor = SensorRepository::find_by_ref_including_retired(
+                        &mut *self.connection,
+                        &definition.owner_ref,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        Error::validation(format!(
+                            "Cache definition '{}' sensor owner '{}' was not loaded",
+                            definition.r#ref, definition.owner_ref
+                        ))
+                    })?;
                     if sensor.pack != Some(self.pack_id) {
                         return Err(Error::validation(format!(
                             "Cache definition '{}' sensor owner '{}' belongs to another pack",
@@ -3123,9 +3243,12 @@ impl TransactionalPackComponentLoader<'_> {
 
         for runtime_ref in &refs_to_try {
             if let Some(runtime) =
-                RuntimeRepository::find_by_ref(&mut *self.connection, runtime_ref).await?
+                RuntimeRepository::find_by_ref_including_retired(&mut *self.connection, runtime_ref)
+                    .await?
             {
-                return Ok((runtime.id, runtime.r#ref));
+                if runtime.retired_at.is_none() || runtime.pack == Some(self.pack_id) {
+                    return Ok((runtime.id, runtime.r#ref));
+                }
             }
         }
 
@@ -3196,7 +3319,7 @@ impl TransactionalPackComponentLoader<'_> {
         sensor_id: Id,
         sensor_ref: &str,
         trigger_refs: &[(Option<Id>, String)],
-    ) {
+    ) -> Result<()> {
         for (trigger_id_opt, trigger_ref) in trigger_refs {
             let trigger_id = match trigger_id_opt {
                 Some(id) => *id,
@@ -3209,19 +3332,14 @@ impl TransactionalPackComponentLoader<'_> {
                 }
             };
 
-            match TriggerRepository::find_by_id(&mut *self.connection, trigger_id).await {
-                Ok(Some(trigger)) if trigger.pack == Some(self.pack_id) => {}
-                Ok(_) => {
+            match TriggerRepository::find_by_id_including_retired(&mut *self.connection, trigger_id)
+                .await?
+            {
+                Some(trigger) if trigger.pack == Some(self.pack_id) => {}
+                _ => {
                     warn!(
                         "Skipping trigger linkage for '{}' because it is not owned by pack '{}'",
                         trigger_ref, self.pack_ref
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    warn!(
-                        "Failed to verify trigger '{}' ownership: {}",
-                        trigger_ref, error
                     );
                     continue;
                 }
@@ -3233,277 +3351,207 @@ impl TransactionalPackComponentLoader<'_> {
                 ..Default::default()
             };
 
-            match TriggerRepository::update(&mut *self.connection, trigger_id, update_input).await {
-                Ok(_) => {
-                    info!("Linked trigger '{}' → sensor '{}'", trigger_ref, sensor_ref);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to link trigger '{}' → sensor '{}': {}",
-                        trigger_ref, sensor_ref, e
-                    );
-                }
-            }
+            TriggerRepository::update(&mut *self.connection, trigger_id, update_input).await?;
+            info!("Linked trigger '{}' → sensor '{}'", trigger_ref, sensor_ref);
         }
+        Ok(())
     }
 
-    /// Remove entities that belong to this pack but whose refs are no longer
+    /// Retire entities that belong to this pack but whose refs are no longer
     /// present in the pack's YAML files.
     ///
     /// This handles the case where an action/trigger/sensor/runtime was removed
     /// from the pack between versions. Ad-hoc (user-created) entities are never
-    /// removed.
-    async fn cleanup_removed_entities(
+    /// retired.
+    async fn resolve_projection_ids(
         &mut self,
-        refs: CleanupRefs<'_>,
-        result: &mut PackLoadResult,
-    ) {
-        match PermissionSetRepository::delete_by_pack_excluding(
-            &mut *self.connection,
-            self.pack_id,
-            refs.permission_sets,
-        )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        "Removed {} stale permission set(s) from pack '{}'",
-                        count, self.pack_ref
-                    );
-                    result.removed += count as usize;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to clean up stale permission sets for pack '{}': {}",
-                    self.pack_ref, e
-                );
-            }
+        refs: &CleanupRefs<'_>,
+    ) -> Result<PackProjectionIds> {
+        async fn ids(
+            connection: &mut PgConnection,
+            table: &str,
+            ref_column: &str,
+            owner_column: &str,
+            pack_id: Id,
+            refs: &[String],
+        ) -> Result<Vec<Id>> {
+            let rows = sqlx::query_scalar::<_, Id>(&format!(
+                "SELECT id FROM {table} WHERE {owner_column} = $1 AND management_origin = 'pack' AND {ref_column} = ANY($2::TEXT[]) ORDER BY id"
+            ))
+            .bind(pack_id)
+            .bind(refs)
+            .fetch_all(connection)
+            .await?;
+            Ok(rows)
         }
 
-        match CacheNamespaceRepository::tombstone_managed_by_pack_excluding_in_transaction(
-            &mut *self.connection,
-            self.pack_id,
-            refs.caches,
-        )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        "Tombstoned {} stale cache definition(s) from pack '{}'",
-                        count, self.pack_ref
-                    );
-                    result.removed += count as usize;
-                }
-            }
-            Err(e) => {
-                let msg = format!(
-                    "Failed to tombstone stale cache definitions for pack '{}': {}",
-                    self.pack_ref, e
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-            }
-        }
-
-        // Clean up queues before actions for consistency with load order; action deletion would
-        // null out queue dispatch_action references via ON DELETE SET NULL, so either order works.
-        match DashboardRepository::delete_non_adhoc_by_pack_excluding(
-            &mut *self.connection,
-            self.pack_id,
-            refs.dashboards,
-        )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        "Removed {} stale dashboard(s) from pack '{}'",
-                        count, self.pack_ref
-                    );
-                    result.removed += count as usize;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to clean up stale dashboards for pack '{}': {}",
-                    self.pack_ref, e
-                );
-            }
-        }
-
-        // Clean up queues before actions for consistency with load order; action deletion would
-        // null out queue dispatch_action references via ON DELETE SET NULL, so either order works.
-        match WorkQueueRepository::delete_non_adhoc_by_pack_excluding(
-            &mut *self.connection,
-            self.pack_id,
-            refs.queues,
-        )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        "Removed {} stale work queue(s) from pack '{}'",
-                        count, self.pack_ref
-                    );
-                    result.removed += count as usize;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to clean up stale work queues for pack '{}': {}",
-                    self.pack_ref, e
-                );
-            }
-        }
-
-        match PolicyRepository::delete_by_pack_excluding(
-            &mut *self.connection,
-            self.pack_id,
-            refs.policies,
-        )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        "Removed {} stale policy(s) from pack '{}'",
-                        count, self.pack_ref
-                    );
-                    result.removed += count as usize;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to clean up stale policies for pack '{}': {}",
-                    self.pack_ref, e
-                );
-            }
-        }
-
-        // Clean up rules before actions/triggers; rule FKs use ON DELETE SET NULL,
-        // but deleting stale declarative rules first preserves clear pack semantics.
-        match RuleRepository::delete_by_pack_excluding(
-            &mut *self.connection,
-            self.pack_id,
-            refs.rules,
-        )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        "Removed {} stale rule(s) from pack '{}'",
-                        count, self.pack_ref
-                    );
-                    result.removed += count as usize;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to clean up stale rules for pack '{}': {}",
-                    self.pack_ref, e
-                );
-            }
-        }
-
-        // Clean up stale cache owners after their dependents, but before
-        // triggers/runtimes. Cache tombstoning and owner deletion are one
-        // repository transaction so a lifecycle failure cannot partially
-        // delete actions or sensors.
-        match CacheNamespaceRepository::delete_removed_pack_owners_in_transaction(
-            &mut *self.connection,
-            self.pack_id,
-            refs.actions,
-            refs.sensors,
-        )
-        .await
-        {
-            Ok(summary) => {
-                if summary.tombstoned_namespaces > 0 {
-                    info!(
-                        "Tombstoned {} cache namespace(s) whose pack owner was removed from '{}'",
-                        summary.tombstoned_namespaces, self.pack_ref
-                    );
-                    result.removed += summary.tombstoned_namespaces as usize;
-                }
-                if summary.deleted_sensors > 0 {
-                    info!(
-                        "Removed {} stale sensor(s) from pack '{}'",
-                        summary.deleted_sensors, self.pack_ref
-                    );
-                    result.removed += summary.deleted_sensors as usize;
-                }
-                if summary.deleted_actions > 0 {
-                    info!(
-                        "Removed {} stale action(s) from pack '{}'",
-                        summary.deleted_actions, self.pack_ref
-                    );
-                    result.removed += summary.deleted_actions as usize;
-                }
-            }
-            Err(e) => {
-                let msg = format!(
-                    "Failed to atomically clean up stale cache owners for pack '{}': {}",
-                    self.pack_ref, e
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-            }
-        }
-
-        // Clean up triggers (ad-hoc preserved)
-        match TriggerRepository::delete_non_adhoc_by_pack_excluding(
-            &mut *self.connection,
-            self.pack_id,
-            refs.triggers,
-        )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        "Removed {} stale trigger(s) from pack '{}'",
-                        count, self.pack_ref
-                    );
-                    result.removed += count as usize;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to clean up stale triggers for pack '{}': {}",
-                    self.pack_ref, e
-                );
-            }
-        }
-
-        // Clean up runtimes last (actions/sensors may reference them)
-        match RuntimeRepository::delete_by_pack_excluding(
-            &mut *self.connection,
+        let runtimes = ids(
+            self.connection,
+            "runtime",
+            "ref",
+            "pack",
             self.pack_id,
             refs.runtimes,
         )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        "Removed {} stale runtime(s) from pack '{}'",
-                        count, self.pack_ref
-                    );
-                    result.removed += count as usize;
+        .await?;
+        let actions = ids(
+            self.connection,
+            "action",
+            "ref",
+            "pack",
+            self.pack_id,
+            refs.actions,
+        )
+        .await?;
+        let workflows = sqlx::query_scalar::<_, Id>(
+            "SELECT DISTINCT wd.id FROM workflow_definition wd JOIN action a ON a.workflow_def = wd.id \
+             WHERE wd.pack = $1 AND wd.management_origin = 'pack' AND a.id = ANY($2::BIGINT[]) ORDER BY wd.id",
+        )
+        .bind(self.pack_id)
+        .bind(&actions)
+        .fetch_all(&mut *self.connection)
+        .await?;
+        self.runtime_version_ids.sort_unstable();
+        self.runtime_version_ids.dedup();
+        let runtime_versions = self.runtime_version_ids.clone();
+
+        Ok(PackProjectionIds {
+            runtimes,
+            runtime_versions,
+            permission_sets: ids(
+                self.connection,
+                "permission_set",
+                "ref",
+                "pack",
+                self.pack_id,
+                refs.permission_sets,
+            )
+            .await?,
+            triggers: ids(
+                self.connection,
+                "trigger",
+                "ref",
+                "pack",
+                self.pack_id,
+                refs.triggers,
+            )
+            .await?,
+            actions,
+            sensors: ids(
+                self.connection,
+                "sensor",
+                "ref",
+                "pack",
+                self.pack_id,
+                refs.sensors,
+            )
+            .await?,
+            rules: ids(
+                self.connection,
+                "rule",
+                "ref",
+                "pack",
+                self.pack_id,
+                refs.rules,
+            )
+            .await?,
+            policies: ids(
+                self.connection,
+                "policy",
+                "ref",
+                "pack",
+                self.pack_id,
+                refs.policies,
+            )
+            .await?,
+            work_queues: ids(
+                self.connection,
+                "work_queue",
+                "ref",
+                "pack",
+                self.pack_id,
+                refs.queues,
+            )
+            .await?,
+            workflows,
+            dashboards: ids(
+                self.connection,
+                "dashboard",
+                "ref",
+                "pack",
+                self.pack_id,
+                refs.dashboards,
+            )
+            .await?,
+            caches: ids(
+                self.connection,
+                "cache_namespace",
+                "definition_ref",
+                "managing_pack",
+                self.pack_id,
+                refs.caches,
+            )
+            .await?,
+        })
+    }
+
+    async fn validate_active_dependencies(&mut self, ids: &PackProjectionIds) -> Result<()> {
+        for action_id in &ids.actions {
+            let action = ActionRepository::find_by_id(&mut *self.connection, *action_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::invalid_state(format!(
+                        "Active pack projection action {action_id} was not found"
+                    ))
+                })?;
+            if let Some(runtime_id) = action.runtime {
+                if RuntimeRepository::find_by_id(&mut *self.connection, runtime_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(Error::validation(format!(
+                        "Action '{}' references retired runtime {runtime_id}",
+                        action.r#ref
+                    )));
                 }
             }
-            Err(e) => {
-                warn!(
-                    "Failed to clean up stale runtimes for pack '{}': {}",
-                    self.pack_ref, e
-                );
+        }
+
+        for workflow_id in &ids.workflows {
+            let workflow =
+                WorkflowDefinitionRepository::find_by_id(&mut *self.connection, *workflow_id)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::invalid_state(format!(
+                            "Active pack projection workflow {workflow_id} was not found"
+                        ))
+                    })?;
+            let definition =
+                serde_json::from_value(workflow.definition.clone()).map_err(|error| {
+                    Error::validation(format!(
+                        "Failed to parse active workflow '{}': {error}",
+                        workflow.r#ref
+                    ))
+                })?;
+            for action_ref in collect_workflow_action_refs(&definition) {
+                let action = ActionRepository::find_by_ref(&mut *self.connection, &action_ref)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::validation(format!(
+                            "Workflow '{}' references retired action '{}'",
+                            workflow.r#ref, action_ref
+                        ))
+                    })?;
+                ensure_action_reference_allowed(
+                    &action,
+                    Some(&self.pack_ref),
+                    "workflow",
+                    &workflow.r#ref,
+                )?;
             }
         }
+
+        Ok(())
     }
 }
 

@@ -39,15 +39,14 @@ use crate::dto::{
         ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
         WorkflowCacheIterationResponse,
     },
-    inquiry::{
-        CreateInquiryRequest, InquiryRespondRequest, InquiryResponse, InquirySummary,
-        UpdateInquiryRequest,
-    },
+    inquiry::{CreateInquiryRequest, InquiryRespondRequest, InquiryResponse, InquirySummary},
     key::{CreateKeyRequest, KeyResponse, KeySummary, UpdateKeyRequest},
     pack::{
         CreatePackRequest, InstallPackRequest, PackInstallProvenance, PackInstallResponse,
-        PackInstallStatusResponse, PackResponse, PackSummary, PackWorkflowSyncResponse,
-        PackWorkflowValidationResponse, RegisterPackRequest, UpdatePackRequest, WorkflowSyncResult,
+        PackInstallStatusResponse, PackReleaseResponse, PackResponse, PackSummary,
+        PackWorkflowSyncResponse, PackWorkflowValidationResponse, PlatformCatalogStateResponse,
+        PlatformCatalogStatus, RegisterPackRequest, RetiredPackComponentResponse,
+        UpdatePackRequest, WorkflowSyncResult,
     },
     permission::{
         CreateIdentityRequest, CreateIdentityRoleAssignmentRequest, CreateIntegrationTokenRequest,
@@ -116,6 +115,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::health::health_detailed,
         crate::routes::health::readiness,
         crate::routes::health::liveness,
+        crate::routes::health::content,
 
         // Authentication
         crate::routes::auth::auth_settings,
@@ -135,6 +135,9 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         // Packs
         crate::routes::packs::list_packs,
         crate::routes::packs::get_pack,
+        crate::routes::packs::get_pack_releases,
+        crate::routes::packs::get_retired_pack_components,
+        crate::routes::packs::get_platform_catalog,
         crate::routes::packs::get_pack_icon,
         crate::routes::packs::create_pack,
         crate::routes::packs::update_pack,
@@ -250,6 +253,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::executions::list_executions,
         crate::routes::executions::get_execution,
         crate::routes::executions::list_workflow_cache_iterations,
+        crate::routes::executions::list_workflow_task_waits,
         crate::routes::executions::list_executions_by_status,
         crate::routes::executions::list_executions_by_enforcement,
         crate::routes::executions::get_execution_stats,
@@ -276,9 +280,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::inquiries::list_inquiries_by_status,
         crate::routes::inquiries::list_inquiries_by_execution,
         crate::routes::inquiries::create_inquiry,
-        crate::routes::inquiries::update_inquiry,
         crate::routes::inquiries::respond_to_inquiry,
-        crate::routes::inquiries::delete_inquiry,
+        crate::routes::inquiries::cancel_inquiry,
 
         // Keys/Secrets
         crate::routes::keys::list_keys,
@@ -421,6 +424,9 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<AuthSettingsResponse>,
             ApiResponse<CurrentUserResponse>,
             ApiResponse<PackResponse>,
+            ApiResponse<Vec<PackReleaseResponse>>,
+            ApiResponse<Vec<RetiredPackComponentResponse>>,
+            ApiResponse<PlatformCatalogStateResponse>,
             ApiResponse<PackInstallResponse>,
             ApiResponse<ActionResponse>,
             ApiResponse<PolicyResponse>,
@@ -501,6 +507,10 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             InstallPackRequest,
             PackResponse,
             PackSummary,
+            PackReleaseResponse,
+            RetiredPackComponentResponse,
+            PlatformCatalogStateResponse,
+            PlatformCatalogStatus,
             PackInstallResponse,
             PackInstallStatusResponse,
             PackInstallProvenance,
@@ -619,7 +629,6 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
             // Inquiry DTOs
             CreateInquiryRequest,
-            UpdateInquiryRequest,
             InquiryRespondRequest,
             InquiryResponse,
             InquirySummary,
@@ -860,12 +869,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 185,
+            path_count, 191,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 244,
+            operation_count, 248,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 

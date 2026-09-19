@@ -18,19 +18,19 @@ use super::{
 
 /// Columns selected in all Action queries. Must match the `Action` model's `FromRow` fields.
 pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, entrypoint, \
-    runtime, enabled, runtime_version_constraint, required_worker_runtimes, \
+    runtime, effective_enabled AS enabled, enabled_override, runtime_version_constraint, required_worker_runtimes, \
     worker_selector, worker_tolerations, worker_affinity, \
     param_schema, out_schema, workflow_def, is_adhoc, accesses_mcp, \
     default_execution_permission_set_refs, \
     reference_visibility, reference_allowed_pack_refs, \
     log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, \
     timeout_seconds, \
-    parameter_delivery, parameter_format, output_format, created, updated";
+    parameter_delivery, parameter_format, output_format, retired_at, created, updated";
 
 /// Columns selected in all Policy queries. Must match the `Policy` model's `FromRow` fields.
-pub const POLICY_COLUMNS: &str = "id, ref, pack, pack_ref, action, action_ref, enabled, priority, \
+pub const POLICY_COLUMNS: &str = "id, ref, pack, pack_ref, action, action_ref, effective_enabled AS enabled, enabled_override, priority, \
     parameters, method, threshold, rate_limit_max_executions, rate_limit_window_seconds, quotas, \
-    name, description, tags, created, updated";
+    name, description, tags, retired_at, created, updated";
 
 /// Filters for [`ActionRepository::list_search`].
 ///
@@ -207,7 +207,7 @@ impl FindById for ActionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let action = sqlx::query_as::<_, Action>(&format!(
-            "SELECT {} FROM action WHERE id = $1",
+            "SELECT {} FROM action WHERE id = $1 AND retired_at IS NULL",
             ACTION_COLUMNS
         ))
         .bind(id)
@@ -225,7 +225,7 @@ impl FindByRef for ActionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let action = sqlx::query_as::<_, Action>(&format!(
-            "SELECT {} FROM action WHERE ref = $1",
+            "SELECT {} FROM action WHERE ref = $1 AND retired_at IS NULL",
             ACTION_COLUMNS
         ))
         .bind(ref_str)
@@ -243,7 +243,7 @@ impl List for ActionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let actions = sqlx::query_as::<_, Action>(&format!(
-            "SELECT {} FROM action ORDER BY ref ASC",
+            "SELECT {} FROM action WHERE retired_at IS NULL ORDER BY ref ASC",
             ACTION_COLUMNS
         ))
         .fetch_all(executor)
@@ -446,7 +446,7 @@ impl Update for ActionRepository {
             if has_updates {
                 query.push(", ");
             }
-            query.push("enabled = ");
+            query.push("enabled_override = ");
             query.push_bind(enabled);
             has_updates = true;
         }
@@ -680,6 +680,35 @@ impl Delete for ActionRepository {
 }
 
 impl ActionRepository {
+    pub async fn find_by_id_including_retired<'e, E>(executor: E, id: Id) -> Result<Option<Action>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Action>(&format!(
+            "SELECT {ACTION_COLUMNS} FROM action WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<Action>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Action>(&format!(
+            "SELECT {ACTION_COLUMNS} FROM action WHERE ref = $1"
+        ))
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Search actions with all filters pushed into SQL.
     ///
     /// All filter fields are combinable (AND). Pagination is server-side.
@@ -690,12 +719,14 @@ impl ActionRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let mut qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new(format!("SELECT {} FROM action", ACTION_COLUMNS));
+        let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+            "SELECT {} FROM action WHERE retired_at IS NULL",
+            ACTION_COLUMNS
+        ));
         let mut count_qb: QueryBuilder<'_, Postgres> =
-            QueryBuilder::new("SELECT COUNT(*) FROM action");
+            QueryBuilder::new("SELECT COUNT(*) FROM action WHERE retired_at IS NULL");
 
-        let mut has_where = false;
+        let mut has_where = true;
 
         // Combine the single-pack shorthand and the multi-pack filter into one
         // `pack = ANY($N)` clause. Treating them as conjunctive (AND) creates
@@ -797,7 +828,7 @@ impl ActionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let actions = sqlx::query_as::<_, Action>(&format!(
-            "SELECT {} FROM action WHERE pack = $1 ORDER BY ref ASC",
+            "SELECT {} FROM action WHERE pack = $1 AND retired_at IS NULL ORDER BY ref ASC",
             ACTION_COLUMNS
         ))
         .bind(pack_id)
@@ -812,10 +843,12 @@ impl ActionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM action WHERE pack_ref = $1")
-            .bind(pack_ref)
-            .fetch_one(executor)
-            .await?;
+        let result: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM action WHERE pack_ref = $1 AND retired_at IS NULL",
+        )
+        .bind(pack_ref)
+        .fetch_one(executor)
+        .await?;
         Ok(result.0)
     }
 
@@ -825,7 +858,7 @@ impl ActionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let actions = sqlx::query_as::<_, Action>(&format!(
-            "SELECT {} FROM action WHERE runtime = $1 ORDER BY ref ASC",
+            "SELECT {} FROM action WHERE runtime = $1 AND retired_at IS NULL ORDER BY ref ASC",
             ACTION_COLUMNS
         ))
         .bind(runtime_id)
@@ -842,7 +875,7 @@ impl ActionRepository {
     {
         let search_pattern = format!("%{}%", query.to_lowercase());
         let actions = sqlx::query_as::<_, Action>(&format!(
-            "SELECT {} FROM action WHERE LOWER(ref) LIKE $1 OR LOWER(label) LIKE $1 OR LOWER(description) LIKE $1 ORDER BY ref ASC",
+            "SELECT {} FROM action WHERE retired_at IS NULL AND (LOWER(ref) LIKE $1 OR LOWER(label) LIKE $1 OR LOWER(description) LIKE $1) ORDER BY ref ASC",
             ACTION_COLUMNS
         ))
         .bind(&search_pattern)
@@ -858,7 +891,7 @@ impl ActionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let actions = sqlx::query_as::<_, Action>(&format!(
-            "SELECT {} FROM action WHERE workflow_def IS NOT NULL ORDER BY ref ASC",
+            "SELECT {} FROM action WHERE workflow_def IS NOT NULL AND retired_at IS NULL ORDER BY ref ASC",
             ACTION_COLUMNS
         ))
         .fetch_all(executor)
@@ -876,7 +909,7 @@ impl ActionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let action = sqlx::query_as::<_, Action>(&format!(
-            "SELECT {} FROM action WHERE workflow_def = $1",
+            "SELECT {} FROM action WHERE workflow_def = $1 AND retired_at IS NULL",
             ACTION_COLUMNS
         ))
         .bind(workflow_def_id)
@@ -936,6 +969,31 @@ impl ActionRepository {
         ))
         .bind(action_id)
         .bind(workflow_def_id)
+        .fetch_one(executor)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => Error::not_found("action", "id", action_id.to_string()),
+            _ => e.into(),
+        })?;
+
+        Ok(action)
+    }
+
+    /// Remove an action's workflow definition when it becomes a normal action.
+    pub async fn unlink_workflow_def<'e, E>(executor: E, action_id: Id) -> Result<Action>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let action = sqlx::query_as::<_, Action>(&format!(
+            r#"
+            UPDATE action
+            SET workflow_def = NULL, updated = NOW()
+            WHERE id = $1
+            RETURNING {}
+            "#,
+            ACTION_COLUMNS
+        ))
+        .bind(action_id)
         .fetch_one(executor)
         .await
         .map_err(|e| match e {
@@ -1075,7 +1133,7 @@ fn push_policy_filters<'args>(
         query.push_bind(action_ref);
     }
     if let Some(enabled) = filters.enabled {
-        query.push(" AND enabled = ");
+        query.push(" AND effective_enabled = ");
         query.push_bind(enabled);
     }
     if let Some(tag) = &filters.tag {
@@ -1176,7 +1234,10 @@ impl FindById for PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let query = format!("SELECT {} FROM policy WHERE id = $1", POLICY_COLUMNS);
+        let query = format!(
+            "SELECT {} FROM policy WHERE id = $1 AND retired_at IS NULL",
+            POLICY_COLUMNS
+        );
         let policy = sqlx::query_as::<_, Policy>(&query)
             .bind(id)
             .fetch_optional(executor)
@@ -1192,7 +1253,10 @@ impl FindByRef for PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let query = format!("SELECT {} FROM policy WHERE ref = $1", POLICY_COLUMNS);
+        let query = format!(
+            "SELECT {} FROM policy WHERE ref = $1 AND retired_at IS NULL",
+            POLICY_COLUMNS
+        );
         let policy = sqlx::query_as::<_, Policy>(&query)
             .bind(ref_str)
             .fetch_optional(executor)
@@ -1208,7 +1272,10 @@ impl List for PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let query = format!("SELECT {} FROM policy ORDER BY ref ASC", POLICY_COLUMNS);
+        let query = format!(
+            "SELECT {} FROM policy WHERE retired_at IS NULL ORDER BY ref ASC",
+            POLICY_COLUMNS
+        );
         let policies = sqlx::query_as::<_, Policy>(&query)
             .fetch_all(executor)
             .await?;
@@ -1283,7 +1350,7 @@ impl Update for PolicyRepository {
             if has_updates {
                 query.push(", ");
             }
-            query.push("enabled = ");
+            query.push("enabled_override = ");
             query.push_bind(enabled);
             has_updates = true;
         }
@@ -1410,6 +1477,22 @@ impl Delete for PolicyRepository {
 }
 
 impl PolicyRepository {
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<Policy>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Policy>(&format!(
+            "SELECT {POLICY_COLUMNS} FROM policy WHERE ref = $1"
+        ))
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn list_search<'e, E>(
         executor: E,
         filters: &PolicySearchFilters,
@@ -1426,7 +1509,7 @@ impl PolicyRepository {
 
         let mut query = QueryBuilder::new("SELECT ");
         query.push(POLICY_COLUMNS);
-        query.push(" FROM policy WHERE 1=1");
+        query.push(" FROM policy WHERE retired_at IS NULL");
         push_policy_filters(&mut query, filters);
         query.push(" ORDER BY priority DESC, ref ASC LIMIT ");
         query.push_bind(limit);
@@ -1435,7 +1518,8 @@ impl PolicyRepository {
 
         let rows = query.build_query_as::<Policy>().fetch_all(executor).await?;
 
-        let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM policy WHERE 1=1");
+        let mut count_query =
+            QueryBuilder::new("SELECT COUNT(*) FROM policy WHERE retired_at IS NULL");
         push_policy_filters(&mut count_query, filters);
         let total: i64 = count_query.build_query_scalar().fetch_one(executor).await?;
 
@@ -1451,7 +1535,7 @@ impl PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM policy WHERE action = $1 ORDER BY ref ASC",
+            "SELECT {} FROM policy WHERE action = $1 AND retired_at IS NULL ORDER BY ref ASC",
             POLICY_COLUMNS
         );
         let policies = sqlx::query_as::<_, Policy>(&query)
@@ -1468,7 +1552,7 @@ impl PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM policy WHERE $1 = ANY(tags) ORDER BY ref ASC",
+            "SELECT {} FROM policy WHERE $1 = ANY(tags) AND retired_at IS NULL ORDER BY ref ASC",
             POLICY_COLUMNS
         );
         let policies = sqlx::query_as::<_, Policy>(&query)
@@ -1485,7 +1569,7 @@ impl PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM policy WHERE enabled = true AND action = $1 ORDER BY priority DESC, created DESC LIMIT 1",
+            "SELECT {} FROM policy WHERE effective_enabled AND retired_at IS NULL AND action = $1 ORDER BY priority DESC, created DESC LIMIT 1",
             POLICY_COLUMNS
         );
         let policy = sqlx::query_as::<_, Policy>(&query)
@@ -1502,7 +1586,7 @@ impl PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM policy WHERE enabled = true AND pack = $1 AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
+            "SELECT {} FROM policy WHERE effective_enabled AND retired_at IS NULL AND pack = $1 AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
             POLICY_COLUMNS
         );
         let policy = sqlx::query_as::<_, Policy>(&query)
@@ -1519,7 +1603,7 @@ impl PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM policy WHERE enabled = true AND pack IS NULL AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
+            "SELECT {} FROM policy WHERE effective_enabled AND retired_at IS NULL AND pack IS NULL AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
             POLICY_COLUMNS
         );
         let policy = sqlx::query_as::<_, Policy>(&query)

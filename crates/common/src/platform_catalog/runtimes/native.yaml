@@ -1,0 +1,10 @@
+ref: core.native
+pack_ref: core
+name: Native
+aliases: [native, builtin, standalone]
+description: Native compiled runtime (Rust, Go, C, etc.) - executes binaries directly without an interpreter
+distributions:
+  verification: {always_available: true, check_required: false}
+  languages: [rust, go, c, c++]
+installation: {build_required: false, system_native: true}
+execution_config: {}

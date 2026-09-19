@@ -54,7 +54,7 @@ pub(crate) const SELECT_COLUMNS: &str = r#"
     id, runtime, runtime_ref, version,
     version_major, version_minor, version_patch,
     execution_config, distributions,
-    is_default, available, verified_at, meta,
+    is_default, available, verified_at, meta, retired_at,
     created, updated
 "#;
 
@@ -65,7 +65,7 @@ impl FindById for RuntimeVersionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let row = sqlx::query_as::<_, RuntimeVersion>(&format!(
-            "SELECT {} FROM runtime_version WHERE id = $1",
+            "SELECT {} FROM runtime_version WHERE id = $1 AND retired_at IS NULL",
             SELECT_COLUMNS
         ))
         .bind(id)
@@ -83,7 +83,7 @@ impl List for RuntimeVersionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let rows = sqlx::query_as::<_, RuntimeVersion>(&format!(
-            "SELECT {} FROM runtime_version ORDER BY runtime_ref ASC, version ASC",
+            "SELECT {} FROM runtime_version WHERE retired_at IS NULL ORDER BY runtime_ref ASC, version ASC",
             SELECT_COLUMNS
         ))
         .fetch_all(executor)
@@ -249,7 +249,7 @@ impl Update for RuntimeVersionRepository {
                 .ok_or_else(|| crate::Error::not_found("runtime_version", "id", id.to_string()));
         }
 
-        query.push(" WHERE id = ");
+        query.push(", retired_at = NULL WHERE id = ");
         query.push_bind(id);
         query.push(format!(" RETURNING {}", SELECT_COLUMNS));
 
@@ -280,6 +280,32 @@ impl Delete for RuntimeVersionRepository {
 
 /// Specialized queries
 impl RuntimeVersionRepository {
+    pub async fn reactivate<'e, E>(executor: E, id: Id) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let result = sqlx::query(
+            "UPDATE runtime_version SET retired_at = NULL, updated = NOW() WHERE id = $1 AND retired_at IS NOT NULL",
+        )
+        .bind(id)
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn retire<'e, E>(executor: E, id: Id) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let result = sqlx::query(
+            "UPDATE runtime_version SET retired_at = COALESCE(retired_at, NOW()), updated = NOW() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Find all versions for a given runtime ID.
     ///
     /// Returns versions ordered by major, minor, patch descending
@@ -292,7 +318,8 @@ impl RuntimeVersionRepository {
             r#"
             SELECT {}
             FROM runtime_version
-            WHERE runtime = $1
+            WHERE runtime = $1 AND retired_at IS NULL
+              AND EXISTS (SELECT 1 FROM runtime WHERE id = $1 AND retired_at IS NULL)
             ORDER BY version_major DESC NULLS LAST,
                      version_minor DESC NULLS LAST,
                      version_patch DESC NULLS LAST
@@ -318,7 +345,7 @@ impl RuntimeVersionRepository {
             r#"
             SELECT {}
             FROM runtime_version
-            WHERE runtime_ref = $1
+            WHERE runtime_ref = $1 AND retired_at IS NULL
             ORDER BY version_major DESC NULLS LAST,
                      version_minor DESC NULLS LAST,
                      version_patch DESC NULLS LAST
@@ -346,7 +373,8 @@ impl RuntimeVersionRepository {
             r#"
             SELECT {}
             FROM runtime_version
-            WHERE runtime = $1 AND available = TRUE
+            WHERE runtime = $1 AND available = TRUE AND retired_at IS NULL
+              AND EXISTS (SELECT 1 FROM runtime WHERE id = $1 AND retired_at IS NULL)
             ORDER BY version_major DESC NULLS LAST,
                      version_minor DESC NULLS LAST,
                      version_patch DESC NULLS LAST
@@ -374,7 +402,8 @@ impl RuntimeVersionRepository {
             r#"
             SELECT {}
             FROM runtime_version
-            WHERE runtime = $1 AND is_default = TRUE
+            WHERE runtime = $1 AND is_default = TRUE AND retired_at IS NULL
+              AND EXISTS (SELECT 1 FROM runtime WHERE id = $1 AND retired_at IS NULL)
             LIMIT 1
             "#,
             SELECT_COLUMNS
@@ -399,7 +428,7 @@ impl RuntimeVersionRepository {
             r#"
             SELECT {}
             FROM runtime_version
-            WHERE runtime = $1 AND version = $2
+            WHERE runtime = $1 AND version = $2 AND retired_at IS NULL
             "#,
             SELECT_COLUMNS
         ))
@@ -409,6 +438,24 @@ impl RuntimeVersionRepository {
         .await?;
 
         Ok(row)
+    }
+
+    pub async fn find_by_runtime_and_version_including_retired<'e, E>(
+        executor: E,
+        runtime_id: Id,
+        version: &str,
+    ) -> Result<Option<RuntimeVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, RuntimeVersion>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM runtime_version WHERE runtime = $1 AND version = $2"
+        ))
+        .bind(runtime_id)
+        .bind(version)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
     }
 
     /// Clear the `is_default` flag on all versions for a runtime.

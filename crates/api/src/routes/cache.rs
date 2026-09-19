@@ -1033,6 +1033,7 @@ fn namespace_response(
         max_retained_generations: namespace.max_retained_generations,
         max_staging_generations: namespace.max_staging_generations,
         tombstoned: namespace.tombstoned_at.is_some(),
+        retired_at: namespace.retired_at,
         created: namespace.created,
         updated: namespace.updated,
         cache_not_populated: namespace.active_generation.is_none(),

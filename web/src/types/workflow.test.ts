@@ -171,3 +171,29 @@ describe("iterate_cache workflow authoring", () => {
     );
   });
 });
+
+describe("inquiry wait workflow authoring", () => {
+  it("round-trips wait_for.inquiry through the graph model", () => {
+    const workflowState = state(
+      task({
+        wait_for: {
+          inquiry: "{{ task.request_approval.inquiry_id }}",
+        },
+      }),
+    );
+
+    const graph = builderStateToGraph(workflowState);
+    expect(graph.tasks[0].wait_for).toEqual(workflowState.tasks[0].wait_for);
+
+    const definition: WorkflowYamlDefinition = {
+      ref: "core.cache_workflow",
+      label: "Cache workflow",
+      version: "1.0.0",
+      tasks: graph.tasks,
+    };
+    expect(
+      definitionToBuilderState(definition, "core", "cache_workflow").tasks[0]
+        .wait_for,
+    ).toEqual(workflowState.tasks[0].wait_for);
+  });
+});

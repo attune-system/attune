@@ -50,6 +50,7 @@ export type PaginatedResponse_SensorSummary = {
      * Unique reference identifier
      */
     ref: string;
+    retired_at?: string | null;
     /**
      * Last update timestamp
      */

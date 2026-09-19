@@ -1825,13 +1825,13 @@ impl SensorManager {
                     continue;
                 }
             };
+            let Some(staged_size) = staged_size else {
+                continue;
+            };
 
             let size = match self.inner.artifact_transport.complete_file(file_path).await {
                 Ok(Some(size)) => size as i64,
-                Ok(None) => match staged_size {
-                    Some(size) => size as i64,
-                    None => continue,
-                },
+                Ok(None) => staged_size as i64,
                 Err(e) => {
                     warn!(
                         "Failed to publish sensor artifact '{}' for sensor '{}': {}",
@@ -2134,8 +2134,10 @@ impl SensorManager {
             FROM rule r
             JOIN trigger t ON r.trigger = t.id
             WHERE t.sensor = $1
-              AND r.enabled = TRUE
-              AND t.enabled = TRUE
+              AND r.effective_enabled
+              AND t.effective_enabled
+              AND r.retired_at IS NULL
+              AND t.retired_at IS NULL
             "#,
         )
         .bind(sensor_id)
@@ -2153,8 +2155,10 @@ impl SensorManager {
             FROM rule r
             JOIN trigger t ON r.trigger = t.id
             WHERE t.sensor = $1
-              AND r.enabled = TRUE
-              AND t.enabled = TRUE
+              AND r.effective_enabled
+              AND t.effective_enabled
+              AND r.retired_at IS NULL
+              AND t.retired_at IS NULL
             "#,
         )
         .bind(sensor_id)
@@ -2172,8 +2176,10 @@ impl SensorManager {
             FROM rule r
             JOIN trigger t ON t.id = r.trigger
             WHERE r.trigger = $1
-              AND r.enabled = TRUE
-              AND t.enabled = TRUE
+              AND r.effective_enabled
+              AND t.effective_enabled
+              AND r.retired_at IS NULL
+              AND t.retired_at IS NULL
             "#,
         )
         .bind(trigger_id)
@@ -3636,8 +3642,10 @@ impl SensorManager {
             FROM rule
             JOIN trigger ON trigger.id = rule.trigger
             WHERE trigger.sensor = ANY($1)
-              AND rule.enabled = TRUE
-              AND trigger.enabled = TRUE
+              AND rule.effective_enabled
+              AND trigger.effective_enabled
+              AND rule.retired_at IS NULL
+              AND trigger.retired_at IS NULL
             "#,
         )
         .bind(&running_sensor_ids)
@@ -3796,6 +3804,7 @@ mod tests {
             label: "Trigger".to_string(),
             description: None,
             enabled,
+            enabled_override: None,
             param_schema: None,
             out_schema: None,
             webhook_enabled: false,
@@ -3806,6 +3815,7 @@ mod tests {
             is_adhoc: false,
             reference_visibility: ActionReferenceVisibility::Public,
             reference_allowed_pack_refs: Vec::new(),
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         }
@@ -4259,6 +4269,7 @@ mod tests {
             runtime_ref: "core.shell".to_string(),
             runtime_version_constraint: None,
             enabled: true,
+            enabled_override: None,
             param_schema: None,
             config: None,
             worker_selector: serde_json::json!({}),
@@ -4268,6 +4279,7 @@ mod tests {
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            retired_at: None,
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         };

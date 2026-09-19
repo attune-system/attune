@@ -21,11 +21,14 @@ struct PackUploadForm {
     pack: String,
     force: Option<String>,
     skip_tests: Option<String>,
+    absent_metadata_policy: Option<String>,
 }
 
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::blob_store::{body_from_file, hash_file, BlobStoreError, ObjectKey};
-use attune_common::models::{pack_test::PackTestResult, Pack, PackInstall, PackInstallStatus};
+use attune_common::models::{
+    pack_test::PackTestResult, AbsentMetadataPolicy, Pack, PackInstall, PackInstallStatus,
+};
 use attune_common::mq::{
     MessageEnvelope, MessageType, PackChangedPayload, PackDeletedPayload, PackRegisteredPayload,
     PackTestRequestedPayload,
@@ -45,9 +48,10 @@ use attune_common::repositories::{
     pack_release::CreatePackReleaseInput,
     pack_retention::PackRetentionRepository,
     work_queue::WorkQueueRepository,
-    ActionRepository, Create, Delete, FindById, FindByRef, List, PackInstallRepository,
-    PackRegistryIndexRepository, PackReleaseRepository, PackRepository, PackTestRepository, Patch,
-    RuleRepository, SensorAdmissionRepository, SensorRepository, TriggerRepository, Update,
+    ActionRepository, ComponentLifecycleRepository, Create, Delete, FindById, FindByRef,
+    HealthRepository, List, PackInstallRepository, PackRegistryIndexRepository,
+    PackReleaseRepository, PackRepository, PackTestRepository, Patch, RuleRepository,
+    SensorAdmissionRepository, SensorRepository, TriggerRepository, Update,
 };
 use attune_common::runtime_cache::{
     pack_runtime_environment_relative_paths, stage_pack_runtime_environment_removal,
@@ -65,10 +69,11 @@ use crate::{
             DownloadPacksResponse, GetPackDependenciesRequest, GetPackDependenciesResponse,
             IndexedPackResponse, InstallPackRequest, PackDescriptionPatch, PackInstallProvenance,
             PackInstallResponse, PackInstallStatusResponse, PackListParams,
-            PackRegistryIndexResponse, PackRegistryIndexSummary, PackResponse, PackSummary,
-            PackWorkflowSyncResponse, PackWorkflowValidationResponse, RegisterPackRequest,
-            RegisterPacksRequest, RegisterPacksResponse, UpdatePackRegistryIndexRequest,
-            UpdatePackRequest, WorkflowSyncResult,
+            PackRegistryIndexResponse, PackRegistryIndexSummary, PackReleaseResponse, PackResponse,
+            PackSummary, PackWorkflowSyncResponse, PackWorkflowValidationResponse,
+            PlatformCatalogStateResponse, PlatformCatalogStatus, RegisterPackRequest,
+            RegisterPacksRequest, RegisterPacksResponse, RetiredPackComponentResponse,
+            UpdatePackRegistryIndexRequest, UpdatePackRequest, WorkflowSyncResult,
         },
         ApiResponse, SuccessResponse,
     },
@@ -95,6 +100,7 @@ struct PackRegistrationInput {
     path: String,
     force: bool,
     skip_tests: bool,
+    absent_metadata_policy: AbsentMetadataPolicy,
     installation_metadata: Option<PackInstallationMetadata>,
     replacement: Option<attune_common::pack_registry::PackReplacement>,
     activation_install_id: Option<i64>,
@@ -362,6 +368,136 @@ pub async fn get_pack(
     Ok((StatusCode::OK, Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/packs/{ref}/releases",
+    tag = "packs",
+    params(("ref" = String, Path, description = "Pack reference identifier")),
+    responses(
+        (status = 200, description = "Immutable pack release history", body = inline(ApiResponse<Vec<PackReleaseResponse>>)),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 404, description = "Pack not found", body = crate::middleware::error::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_pack_releases(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(pack_ref): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
+    authorize_pack_read(&state, &user, &pack).await?;
+
+    let active_release = pack.active_release;
+    let releases: Vec<PackReleaseResponse> =
+        PackReleaseRepository::list_by_pack(&state.db, pack.id)
+            .await?
+            .into_iter()
+            .rev()
+            .map(|release| PackReleaseResponse {
+                id: release.id,
+                version: release.version,
+                digest: release.digest,
+                archive_size: release.archive_size,
+                created: release.created,
+                inactive_since: release.inactive_since,
+                is_active: active_release == Some(release.id),
+            })
+            .collect();
+
+    Ok((StatusCode::OK, Json(ApiResponse::new(releases))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/packs/{ref}/retired-components",
+    tag = "packs",
+    params(("ref" = String, Path, description = "Pack reference identifier")),
+    responses(
+        (status = 200, description = "Retired pack-managed components", body = inline(ApiResponse<Vec<RetiredPackComponentResponse>>)),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 404, description = "Pack not found", body = crate::middleware::error::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_retired_pack_components(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(pack_ref): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
+    authorize_pack_read(&state, &user, &pack).await?;
+
+    let components: Vec<RetiredPackComponentResponse> =
+        ComponentLifecycleRepository::list_retired_by_pack(&state.db, pack.id)
+            .await?
+            .into_iter()
+            .map(|component| RetiredPackComponentResponse {
+                kind: component.kind,
+                id: component.id,
+                component_ref: component.component_ref,
+                managed_release: component.managed_release,
+                retired_at: component.retired_at,
+            })
+            .collect();
+
+    Ok((StatusCode::OK, Json(ApiResponse::new(components))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/platform/catalog",
+    tag = "packs",
+    responses(
+        (status = 200, description = "Platform catalog compatibility state", body = inline(ApiResponse<PlatformCatalogStateResponse>)),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_platform_catalog(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+) -> ApiResult<impl IntoResponse> {
+    authorize_global_pack_registry_action(&state, &user, Action::Read).await?;
+    let catalog = HealthRepository::platform(&state.db).await?;
+    let expected_epoch = attune_common::platform_catalog::COMPATIBILITY_EPOCH;
+    let expected_revision = attune_common::platform_catalog::CATALOG_REVISION;
+    let status = platform_catalog_status(
+        catalog.compatibility_epoch,
+        catalog.catalog_revision,
+        expected_epoch,
+        expected_revision,
+    );
+    let response = PlatformCatalogStateResponse {
+        compatibility_epoch: catalog.compatibility_epoch,
+        revision: catalog.catalog_revision,
+        expected_compatibility_epoch: expected_epoch,
+        expected_revision,
+        status,
+    };
+    Ok((StatusCode::OK, Json(ApiResponse::new(response))))
+}
+
+fn platform_catalog_status(
+    compatibility_epoch: i32,
+    revision: i32,
+    expected_epoch: i32,
+    expected_revision: i32,
+) -> PlatformCatalogStatus {
+    if compatibility_epoch != expected_epoch || revision > expected_revision {
+        PlatformCatalogStatus::Incompatible
+    } else if revision < expected_revision {
+        PlatformCatalogStatus::UpgradeRequired
+    } else {
+        PlatformCatalogStatus::Current
+    }
+}
+
 /// Serve the optional icon bundled at a pack root as `pack-icon.{jpg,png,ico,svg}`.
 #[utoipa::path(
     get,
@@ -424,6 +560,8 @@ async fn publish_pack_metadata_change(
     operation: &str,
     updated_at: chrono::DateTime<chrono::Utc>,
 ) {
+    AuthorizationService::invalidate_permission_set_caches().await;
+
     let Some(publisher) = state.get_publisher().await else {
         return;
     };
@@ -1020,15 +1158,17 @@ async fn record_pack_test_preflight_failure(
     pack_ref: &str,
     pack_version: &str,
     trigger_reason: &str,
+    absent_metadata_policy: AbsentMetadataPolicy,
     error_message: String,
 ) -> PackTestDispatchOutcome {
     let error = ApiError::BadRequest(error_message.clone());
     let repository = PackInstallRepository::new(state.db.clone());
     let install = match repository
-        .create(
+        .create_with_policy(
             pack_ref,
             pack_version,
             trigger_reason,
+            absent_metadata_policy,
             pack_id,
             Some(requested_by),
         )
@@ -1058,6 +1198,7 @@ async fn dispatch_and_track_pack_tests(
     pack_ref: &str,
     pack_version: &str,
     trigger_type: &str,
+    absent_metadata_policy: AbsentMetadataPolicy,
     pack_dir: &std::path::Path,
     candidate_path: Option<String>,
     worker_selector: serde_json::Value,
@@ -1126,6 +1267,7 @@ async fn dispatch_and_track_pack_tests(
                 pack_ref,
                 pack_version,
                 trigger_type,
+                absent_metadata_policy,
                 message,
             )
             .await;
@@ -1140,6 +1282,7 @@ async fn dispatch_and_track_pack_tests(
             pack_ref,
             pack_version,
             trigger_type,
+            absent_metadata_policy,
             message,
         )
         .await;
@@ -1158,10 +1301,11 @@ async fn dispatch_and_track_pack_tests(
 
     // Create the install tracking record (survives a rollback of a new pack).
     let install = match PackInstallRepository::new(state.db.clone())
-        .create(
+        .create_with_policy(
             pack_ref,
             pack_version,
             &trigger_reason,
+            absent_metadata_policy,
             pack_id,
             Some(requested_by),
         )
@@ -1383,6 +1527,7 @@ pub async fn upload_pack(
     let mut pack_archive: Option<tempfile::NamedTempFile> = None;
     let mut force = false;
     let mut skip_tests = false;
+    let mut absent_metadata_policy = AbsentMetadataPolicy::Remove;
 
     // Parse multipart fields
     while let Some(field) = multipart
@@ -1407,6 +1552,23 @@ pub async fn upload_pack(
                     ApiError::BadRequest(format!("Failed to read skip_tests field: {}", e))
                 })?;
                 skip_tests = val.trim().eq_ignore_ascii_case("true");
+            }
+            Some("absent_metadata_policy") => {
+                let value = field.text().await.map_err(|e| {
+                    ApiError::BadRequest(format!(
+                        "Failed to read absent_metadata_policy field: {e}"
+                    ))
+                })?;
+                absent_metadata_policy = match value.trim() {
+                    "remove" => AbsentMetadataPolicy::Remove,
+                    "disable" => AbsentMetadataPolicy::Disable,
+                    "retain" => AbsentMetadataPolicy::Retain,
+                    other => {
+                        return Err(ApiError::BadRequest(format!(
+                            "Invalid absent_metadata_policy '{other}'"
+                        )))
+                    }
+                };
             }
             _ => {
                 // Dropping a field lets the multipart parser discard it incrementally.
@@ -1495,6 +1657,7 @@ pub async fn upload_pack(
             path: pack_root.to_string_lossy().to_string(),
             force,
             skip_tests,
+            absent_metadata_policy,
             installation_metadata: None,
             replacement: Some(replacement),
             activation_install_id: None,
@@ -1618,6 +1781,7 @@ pub async fn register_pack(
             path: request.path.clone(),
             force: request.force,
             skip_tests: request.skip_tests,
+            absent_metadata_policy: request.absent_metadata_policy,
             installation_metadata: None,
             replacement: None,
             activation_install_id: None,
@@ -1679,6 +1843,7 @@ async fn register_pack_internal(
         path,
         force,
         skip_tests,
+        absent_metadata_policy,
         installation_metadata,
         mut replacement,
         activation_install_id,
@@ -1854,6 +2019,7 @@ async fn register_pack_internal(
             } else {
                 "install"
             },
+            absent_metadata_policy,
             &candidate_path,
             Some(candidate_path.to_string_lossy().to_string()),
             worker_selector.clone(),
@@ -1900,6 +2066,39 @@ async fn register_pack_internal(
                 let _ = std::fs::remove_dir_all(&candidate_path);
             }
         }
+    }
+
+    if activation_install_id.is_none() && test_install.is_none() {
+        let trigger_reason = if preflight_existing_pack.is_some() {
+            "update"
+        } else {
+            "install"
+        };
+        let repository = PackInstallRepository::new(state.db.clone());
+        let install = repository
+            .create_with_policy(
+                &pack_ref,
+                &version,
+                trigger_reason,
+                absent_metadata_policy,
+                preflight_existing_pack.as_ref().map(|pack| pack.id),
+                Some(
+                    user.identity_id()
+                        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?,
+                ),
+            )
+            .await?;
+        test_install = Some(
+            repository
+                .begin_activation(install.id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Conflict(format!(
+                        "Pack install {} could not begin activation",
+                        install.id
+                    ))
+                })?,
+        );
     }
 
     let active_install_id = activation_install_id.or_else(|| {
@@ -2105,7 +2304,7 @@ async fn register_pack_internal(
     let pack_path = published_release.pack_path.clone();
 
     // Load pack components (triggers, actions, sensors) into the database
-    {
+    let projections = {
         use attune_common::pack_registry::PackComponentLoader;
 
         let component_loader = PackComponentLoader::new(
@@ -2113,7 +2312,8 @@ async fn register_pack_internal(
             pack.id,
             &pack.r#ref,
             &state.config.cache_admission,
-        );
+        )
+        .with_absent_metadata_policy(absent_metadata_policy);
         match component_loader
             .load_all_in_transaction(&mut tx, &pack_path)
             .await
@@ -2145,6 +2345,7 @@ async fn register_pack_internal(
                 for warning in &load_result.warnings {
                     tracing::warn!("Pack component warning: {}", warning);
                 }
+                load_result.projections
             }
             Err(e) => {
                 let message = format!(
@@ -2154,7 +2355,7 @@ async fn register_pack_internal(
                 return Err(ApiError::BadRequest(message));
             }
         }
-    }
+    };
     let admission_failures = SensorAdmissionRepository::assess_pack(
         &mut tx,
         pack.id,
@@ -2185,7 +2386,7 @@ async fn register_pack_internal(
         )
         .await?;
     }
-    PackReleaseRepository::activate(&mut tx, pack.id, release.id).await?;
+    PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, &projections).await?;
     if let Some(install_id) = active_install_id {
         test_install = Some(
             PackInstallRepository::finish_activation_in_transaction(&mut tx, install_id, pack.id)
@@ -2213,37 +2414,6 @@ async fn register_pack_internal(
 
     if let Some(install) = test_install.as_mut() {
         attach_pack_test_history(&state, &pack, install).await;
-    }
-
-    // Auto-sync workflows after component loading succeeds.
-    let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
-    let service_config = PackWorkflowServiceConfig {
-        packs_base_dir: packs_base_dir.clone(),
-        skip_validation_errors: true,
-        update_existing: true,
-        max_file_size: 1024 * 1024,
-    };
-
-    let workflow_service = PackWorkflowService::new(state.db.clone(), service_config);
-
-    // Attempt to sync workflows but don't fail if it errors
-    match workflow_service.sync_pack_workflows(&pack.r#ref).await {
-        Ok(sync_result) => {
-            if sync_result.registered_count > 0 {
-                tracing::info!(
-                    "Auto-synced {} workflows for pack '{}'",
-                    sync_result.registered_count,
-                    pack.r#ref
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to auto-sync workflows for pack '{}': {}",
-                pack.r#ref,
-                e
-            );
-        }
     }
 
     // Since entities are now updated in place (IDs preserved), ad-hoc rules
@@ -3487,6 +3657,7 @@ pub async fn install_pack(
             } else {
                 "install"
             },
+            request.absent_metadata_policy,
             &candidate_path,
             Some(candidate_path.to_string_lossy().to_string()),
             worker_selector,
@@ -3596,6 +3767,7 @@ pub async fn install_pack(
             path: installed.path.to_string_lossy().to_string(),
             force: request.force,
             skip_tests: true,
+            absent_metadata_policy: request.absent_metadata_policy,
             installation_metadata: Some(installation_metadata),
             replacement: Some(replacement),
             activation_install_id,
@@ -4151,6 +4323,7 @@ pub async fn test_pack(
         &pack_ref,
         &pack.version,
         "manual",
+        AbsentMetadataPolicy::Remove,
         &candidate_path,
         Some(candidate_path.to_string_lossy().to_string()),
         pack.worker_selector.clone(),
@@ -4880,6 +5053,7 @@ pub async fn register_packs_batch(
             path: pack_path.clone(),
             force: request.force,
             skip_tests: request.skip_tests,
+            absent_metadata_policy: request.absent_metadata_policy,
         };
 
         match register_pack_internal(
@@ -4889,6 +5063,7 @@ pub async fn register_packs_batch(
                 path: register_req.path.clone(),
                 force: register_req.force,
                 skip_tests: register_req.skip_tests,
+                absent_metadata_policy: register_req.absent_metadata_policy,
                 installation_metadata: None,
                 replacement: None,
                 activation_install_id: None,
@@ -5004,6 +5179,12 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/packs/build-envs", axum::routing::post(build_pack_envs))
         .route("/packs/{ref}/icon", get(get_pack_icon))
+        .route("/packs/{ref}/releases", get(get_pack_releases))
+        .route(
+            "/packs/{ref}/retired-components",
+            get(get_retired_pack_components),
+        )
+        .route("/platform/catalog", get(get_platform_catalog))
         .route(
             "/packs/{ref}",
             get(get_pack).put(update_pack).delete(delete_pack),
@@ -5208,6 +5389,26 @@ mod tests {
     fn test_pack_routes_structure() {
         // Just verify the router can be constructed
         let _router = routes();
+    }
+
+    #[test]
+    fn catalog_status_compares_epoch_and_revision() {
+        assert_eq!(
+            platform_catalog_status(1, 3, 1, 3),
+            PlatformCatalogStatus::Current
+        );
+        assert_eq!(
+            platform_catalog_status(1, 2, 1, 3),
+            PlatformCatalogStatus::UpgradeRequired
+        );
+        assert_eq!(
+            platform_catalog_status(2, 3, 1, 3),
+            PlatformCatalogStatus::Incompatible
+        );
+        assert_eq!(
+            platform_catalog_status(1, 4, 1, 3),
+            PlatformCatalogStatus::Incompatible
+        );
     }
 
     #[test]

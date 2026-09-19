@@ -73,6 +73,7 @@ export class WorkflowsService {
        * Unique reference identifier
        */
       ref: string;
+      retired_at?: string | null;
       /**
        * Tags
        */
@@ -244,6 +245,7 @@ export class WorkflowsService {
        * Unique reference identifier
        */
       ref: string;
+      retired_at?: string | null;
       /**
        * Tags
        */
@@ -331,6 +333,7 @@ export class WorkflowsService {
        * Unique reference identifier
        */
       ref: string;
+      retired_at?: string | null;
       /**
        * Tags
        */
@@ -419,6 +422,7 @@ export class WorkflowsService {
        * Unique reference identifier
        */
       ref: string;
+      retired_at?: string | null;
       /**
        * Tags
        */
@@ -534,6 +538,7 @@ export class WorkflowsService {
        * Unique reference identifier
        */
       ref: string;
+      retired_at?: string | null;
       /**
        * Tags
        */

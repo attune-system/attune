@@ -79,14 +79,12 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
-        condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
       api:
         condition: service_healthy
+      pack-release-upgrade:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       rabbitmq:
@@ -141,14 +139,12 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
-        condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
       api:
         condition: service_healthy
+      pack-release-upgrade:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       rabbitmq:

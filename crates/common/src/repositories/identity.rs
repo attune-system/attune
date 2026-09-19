@@ -616,7 +616,7 @@ impl FindById for PermissionSetRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, PermissionSet>(
-            "SELECT id, ref, pack, pack_ref, label, description, grants, created, updated FROM permission_set WHERE id = $1"
+            "SELECT id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated FROM permission_set WHERE id = $1 AND retired_at IS NULL"
         ).bind(id).fetch_optional(executor).await.map_err(Into::into)
     }
 }
@@ -628,7 +628,7 @@ impl FindByRef for PermissionSetRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, PermissionSet>(
-            "SELECT id, ref, pack, pack_ref, label, description, grants, created, updated FROM permission_set WHERE ref = $1"
+            "SELECT id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated FROM permission_set WHERE ref = $1 AND retired_at IS NULL"
         )
         .bind(ref_str)
         .fetch_optional(executor)
@@ -644,7 +644,7 @@ impl List for PermissionSetRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, PermissionSet>(
-            "SELECT id, ref, pack, pack_ref, label, description, grants, created, updated FROM permission_set ORDER BY ref ASC"
+            "SELECT id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated FROM permission_set WHERE retired_at IS NULL ORDER BY ref ASC"
         ).fetch_all(executor).await.map_err(Into::into)
     }
 }
@@ -657,7 +657,7 @@ impl Create for PermissionSetRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, PermissionSet>(
-            "INSERT INTO permission_set (ref, pack, pack_ref, label, description, grants) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, ref, pack, pack_ref, label, description, grants, created, updated"
+            "INSERT INTO permission_set (ref, pack, pack_ref, label, description, grants) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated"
         ).bind(&input.r#ref).bind(input.pack).bind(&input.pack_ref).bind(&input.label).bind(&input.description).bind(&input.grants).fetch_one(executor).await.map_err(Into::into)
     }
 }
@@ -699,7 +699,7 @@ impl Update for PermissionSetRepository {
 
         query.push(", updated = NOW() WHERE id = ").push_bind(id);
         query.push(
-            " RETURNING id, ref, pack, pack_ref, label, description, grants, created, updated",
+            " RETURNING id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated",
         );
 
         query
@@ -725,6 +725,22 @@ impl Delete for PermissionSetRepository {
 }
 
 impl PermissionSetRepository {
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<PermissionSet>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, PermissionSet>(
+            "SELECT id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated FROM permission_set WHERE ref = $1",
+        )
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn find_by_refs<'e, E>(executor: E, refs: &[String]) -> Result<Vec<PermissionSet>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
@@ -734,9 +750,9 @@ impl PermissionSetRepository {
         }
 
         sqlx::query_as::<_, PermissionSet>(
-            "SELECT id, ref, pack, pack_ref, label, description, grants, created, updated
+            "SELECT id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated
              FROM permission_set
-             WHERE ref = ANY($1)
+             WHERE ref = ANY($1) AND retired_at IS NULL
              ORDER BY ref ASC",
         )
         .bind(refs)
@@ -750,10 +766,10 @@ impl PermissionSetRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, PermissionSet>(
-            "SELECT ps.id, ps.ref, ps.pack, ps.pack_ref, ps.label, ps.description, ps.grants, ps.created, ps.updated
+            "SELECT ps.id, ps.ref, ps.pack, ps.pack_ref, ps.label, ps.description, ps.grants, ps.retired_at, ps.created, ps.updated
              FROM permission_set ps
              INNER JOIN permission_assignment pa ON pa.permset = ps.id
-             WHERE pa.identity = $1
+             WHERE pa.identity = $1 AND ps.retired_at IS NULL
              ORDER BY ps.ref ASC",
         )
         .bind(identity_id)
@@ -771,10 +787,10 @@ impl PermissionSetRepository {
         }
 
         sqlx::query_as::<_, PermissionSet>(
-            "SELECT DISTINCT ps.id, ps.ref, ps.pack, ps.pack_ref, ps.label, ps.description, ps.grants, ps.created, ps.updated
+            "SELECT DISTINCT ps.id, ps.ref, ps.pack, ps.pack_ref, ps.label, ps.description, ps.grants, ps.retired_at, ps.created, ps.updated
              FROM permission_set ps
              INNER JOIN permission_set_role_assignment psra ON psra.permset = ps.id
-             WHERE psra.role = ANY($1)
+             WHERE psra.role = ANY($1) AND ps.retired_at IS NULL
              ORDER BY ps.ref ASC",
         )
         .bind(roles)
@@ -797,12 +813,12 @@ impl PermissionSetRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let result = if keep_refs.is_empty() {
-            sqlx::query("DELETE FROM permission_set WHERE pack = $1")
+            sqlx::query("DELETE FROM permission_set WHERE pack = $1 AND management_origin = 'pack'")
                 .bind(pack_id)
                 .execute(executor)
                 .await?
         } else {
-            sqlx::query("DELETE FROM permission_set WHERE pack = $1 AND ref != ALL($2)")
+            sqlx::query("DELETE FROM permission_set WHERE pack = $1 AND management_origin = 'pack' AND ref != ALL($2)")
                 .bind(pack_id)
                 .bind(keep_refs)
                 .execute(executor)

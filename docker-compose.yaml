@@ -100,13 +100,15 @@ services:
       TEST_DISPLAY_NAME: Test User
     command: ["/bin/sh", "/init-user.sh"]
     depends_on:
+      api:
+        condition: service_healthy
       migrations:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
     networks:
       - attune-network
-    restart: on-failure
+    restart: "no"
 
   # Build and extract statically-linked pack binaries (sensors, etc.)
   # These binaries are built with musl for cross-architecture compatibility
@@ -163,12 +165,46 @@ services:
         condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
+      init-user:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     networks:
       - attune-network
-    restart: on-failure
+    restart: "no"
     entrypoint: "" # Override Python image entrypoint
+
+  # Freeze volume-loaded packs into immutable releases after registration.
+  pack-release-upgrade:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.optimized
+      args:
+        SERVICE: api
+        BUILDKIT_INLINE_CACHE: 1
+    container_name: attune-pack-release-upgrade
+    command: ["/usr/local/bin/attune-service", "--upgrade-pack-releases"]
+    environment:
+      RUST_LOG: info
+      ATTUNE_CONFIG: /opt/attune/config/config.yaml
+      ATTUNE__SECURITY__JWT_SECRET: ${JWT_SECRET:-docker-dev-secret-change-in-production}
+      ATTUNE__SECURITY__ENCRYPTION_KEY: ${ENCRYPTION_KEY:-docker-dev-encryption-key-please-change-in-production-32plus}
+      ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
+      ATTUNE__DATABASE__SCHEMA: attune
+    volumes:
+      - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
+      - packs_data:/opt/attune/packs
+      - artifacts_data:/opt/attune/artifacts
+    depends_on:
+      init-packs:
+        condition: service_completed_successfully
+      migrations:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks:
+      - attune-network
+    restart: "no"
 
   # Agent binary volume population (builds the statically-linked worker and sensor agents)
   # Other containers can use these binaries by mounting agent_bin and running
@@ -239,10 +275,6 @@ services:
       - artifacts_data:/opt/attune/artifacts
       - supervisor_logs:/opt/attune/logs
     depends_on:
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
-        condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
       postgres:
@@ -301,10 +333,6 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
-        condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
       postgres:
@@ -312,6 +340,7 @@ services:
       rabbitmq:
         condition: service_healthy
     healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -351,9 +380,9 @@ services:
       - artifacts_data:/opt/attune/artifacts
       - executor_logs:/opt/attune/logs
     depends_on:
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
+      api:
+        condition: service_healthy
+      pack-release-upgrade:
         condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
@@ -402,9 +431,9 @@ services:
       - artifacts_data:/opt/attune/artifacts
       - executor_logs:/opt/attune/logs
     depends_on:
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
+      api:
+        condition: service_healthy
+      pack-release-upgrade:
         condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
@@ -477,9 +506,9 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
+      api:
+        condition: service_healthy
+      pack-release-upgrade:
         condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
@@ -547,9 +576,9 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
+      api:
+        condition: service_healthy
+      pack-release-upgrade:
         condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
@@ -617,9 +646,9 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
+      api:
+        condition: service_healthy
+      pack-release-upgrade:
         condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
@@ -667,9 +696,7 @@ services:
     environment:
       RUST_LOG: info
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
-      # Keep native support enabled explicitly; the agent auto-detects interpreters
-      # but "native" is a capability flag rather than a discoverable interpreter.
-      ATTUNE_WORKER_RUNTIMES: shell,python,node,native
+      ATTUNE_WORKER_RUNTIMES: shell,python,node
       ATTUNE_WORKER_TYPE: container
       ATTUNE_WORKER_NAME: worker-full-01
       HOME: /opt/attune/runtime_envs/.home/worker-full
@@ -690,9 +717,9 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
+      api:
+        condition: service_healthy
+      pack-release-upgrade:
         condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
@@ -729,9 +756,7 @@ services:
       HOME: /tmp
       RUST_LOG: debug
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
-      # Keep native support enabled explicitly; interpreter auto-detection does
-      # not infer the synthetic "native" capability.
-      ATTUNE_SENSOR_RUNTIMES: shell,python,node,native
+      ATTUNE_SENSOR_RUNTIMES: shell,python,node
       ATTUNE__SECURITY__JWT_SECRET: ${JWT_SECRET:-docker-dev-secret-change-in-production}
       ATTUNE__SECURITY__ENCRYPTION_KEY: ${ENCRYPTION_KEY:-docker-dev-encryption-key-please-change-in-production-32plus}
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
@@ -757,9 +782,9 @@ services:
     depends_on:
       init-agent:
         condition: service_completed_successfully
-      init-packs:
-        condition: service_completed_successfully
-      init-user:
+      api:
+        condition: service_healthy
+      pack-release-upgrade:
         condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully

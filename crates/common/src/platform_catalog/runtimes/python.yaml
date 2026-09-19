@@ -1,0 +1,71 @@
+ref: core.python
+pack_ref: core
+name: Python
+aliases: [python, python3]
+description: Python 3 runtime for actions and sensors with automatic environment management
+distributions:
+  verification:
+    commands:
+      - {binary: python3, args: ["--version"], exit_code: 0, pattern: 'Python 3\.', priority: 1}
+      - {binary: python, args: ["--version"], exit_code: 0, pattern: 'Python 3\.', priority: 2}
+  min_version: "3.8"
+  recommended_version: "3.12"
+installation:
+  package_managers: [pip, pipenv, poetry]
+  virtual_env_support: true
+execution_config:
+  interpreter: {binary: python3, args: ["-u"], file_extension: .py}
+  environment:
+    env_type: virtualenv
+    dir_name: .venv
+    create_command: [python3, "-m", venv, "--copies", "{env_dir}"]
+    interpreter_path: "{env_dir}/bin/python3"
+  dependencies: &dependencies
+    manifest_file: requirements.txt
+    install_command: ["{interpreter}", "-m", pip, install, "-r", "{manifest_path}"]
+  env_vars: &env_vars
+    PYTHONPATH: {operation: prepend, value: "{pack_dir}/lib", separator: ":"}
+versions:
+  - version: "3.11"
+    distributions:
+      verification:
+        commands:
+          - {binary: python3.11, args: ["--version"], exit_code: 0, pattern: 'Python 3\.11\.', priority: 1}
+    execution_config:
+      interpreter: {binary: python3.11, args: ["-u"], file_extension: .py}
+      environment:
+        env_type: virtualenv
+        dir_name: .venv
+        create_command: [python3.11, "-m", venv, "--copies", "{env_dir}"]
+        interpreter_path: "{env_dir}/bin/python3.11"
+      dependencies: *dependencies
+      env_vars: *env_vars
+  - version: "3.12"
+    is_default: true
+    distributions:
+      verification:
+        commands:
+          - {binary: python3.12, args: ["--version"], exit_code: 0, pattern: 'Python 3\.12\.', priority: 1}
+    execution_config:
+      interpreter: {binary: python3.12, args: ["-u"], file_extension: .py}
+      environment:
+        env_type: virtualenv
+        dir_name: .venv
+        create_command: [python3.12, "-m", venv, "--copies", "{env_dir}"]
+        interpreter_path: "{env_dir}/bin/python3.12"
+      dependencies: *dependencies
+      env_vars: *env_vars
+  - version: "3.13"
+    distributions:
+      verification:
+        commands:
+          - {binary: python3.13, args: ["--version"], exit_code: 0, pattern: 'Python 3\.13\.', priority: 1}
+    execution_config:
+      interpreter: {binary: python3.13, args: ["-u"], file_extension: .py}
+      environment:
+        env_type: virtualenv
+        dir_name: .venv
+        create_command: [python3.13, "-m", venv, "--copies", "{env_dir}"]
+        interpreter_path: "{env_dir}/bin/python3.13"
+      dependencies: *dependencies
+      env_vars: *env_vars

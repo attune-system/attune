@@ -26,9 +26,7 @@ use attune_common::{
     },
     repositories::{
         execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
-        workflow::{
-            UpdateWorkflowExecutionInput, WorkflowDefinitionRepository, WorkflowExecutionRepository,
-        },
+        workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository},
         FindById, Update,
     },
     workflow::{CancellationPolicy, WorkflowDefinition},
@@ -173,11 +171,15 @@ impl ExecutionManager {
                 _ => return CancellationPolicy::default(),
             };
 
-        let wf_def =
-            match WorkflowDefinitionRepository::find_by_id(pool, wf_exec.workflow_def).await {
-                Ok(Some(def)) => def,
-                _ => return CancellationPolicy::default(),
-            };
+        let wf_def = match WorkflowDefinitionRepository::find_by_id_including_retired(
+            pool,
+            wf_exec.workflow_def,
+        )
+        .await
+        {
+            Ok(Some(def)) => def,
+            _ => return CancellationPolicy::default(),
+        };
 
         match serde_json::from_value::<WorkflowDefinition>(wf_def.definition) {
             Ok(def) => def.cancellation_policy,
@@ -197,6 +199,18 @@ impl ExecutionManager {
         parent_execution_id: i64,
         policy: CancellationPolicy,
     ) -> Result<()> {
+        if let Some(workflow) =
+            WorkflowExecutionRepository::find_by_execution(pool, parent_execution_id).await?
+        {
+            WorkflowExecutionRepository::cancel_with_prerequisites(
+                pool,
+                workflow.id,
+                "Cancelled: parent workflow execution was cancelled",
+                None,
+            )
+            .await?;
+        }
+
         let children: Vec<Execution> = sqlx::query_as::<_, Execution>(&format!(
             "SELECT {} FROM execution WHERE parent = $1 AND status NOT IN ('completed', 'failed', 'timeout', 'cancelled', 'abandoned')",
             attune_common::repositories::execution::SELECT_COLUMNS
@@ -271,25 +285,6 @@ impl ExecutionManager {
             .await?;
         }
 
-        if let Some(wf_exec) =
-            WorkflowExecutionRepository::find_by_execution(pool, parent_execution_id).await?
-        {
-            if !matches!(
-                wf_exec.status,
-                ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
-            ) {
-                let wf_update = UpdateWorkflowExecutionInput {
-                    status: Some(ExecutionStatus::Cancelled),
-                    error_message: Some(
-                        "Cancelled: parent workflow execution was cancelled".to_string(),
-                    ),
-                    current_tasks: Some(vec![]),
-                    ..Default::default()
-                };
-                WorkflowExecutionRepository::update(pool, wf_exec.id, wf_update).await?;
-            }
-        }
-
         Self::finalize_cancelled_workflow_if_idle(pool, parent_execution_id).await
     }
 
@@ -314,7 +309,13 @@ impl ExecutionManager {
                 })),
                 ..Default::default()
             };
-            let _ = ExecutionRepository::update(pool, parent_execution_id, update).await?;
+            let _ = ExecutionRepository::update_if_status(
+                pool,
+                parent_execution_id,
+                ExecutionStatus::Canceling,
+                update,
+            )
+            .await?;
         }
 
         Ok(())
@@ -416,10 +417,10 @@ impl ExecutionManager {
 
         for action_ref in child_actions {
             let snapshot = match parent.executable_snapshot.as_ref().and_then(|root| {
-                root.pack_executables.get(action_ref).map(|executable| {
+                root.pack_executables.get(action_ref).map(|released| {
                     attune_common::models::ExecutionExecutableSnapshot {
-                        release: root.release.clone(),
-                        executable: executable.clone(),
+                        release: released.release.clone(),
+                        executable: released.executable.clone(),
                         pack_executables: root.pack_executables.clone(),
                     }
                 })

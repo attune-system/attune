@@ -84,6 +84,7 @@ class PackLoader:
         self.conn = None
         self.pack_id = None
         self.pack_ref = None
+        self.bootstrap_definitions = {}
 
     def connect(self):
         """Connect to the database"""
@@ -123,6 +124,46 @@ class PackLoader:
                 f"Resolved path '{candidate}' escapes pack root '{pack_root}'"
             )
         return candidate
+
+    def lock_catalog(self):
+        """Keep catalog reconciliation outside this entire bootstrap transaction."""
+        with self.conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT compatibility_epoch, revision, bootstrap_definitions "
+                "FROM platform_catalog_state WHERE singleton FOR SHARE"
+            )
+            epoch, revision, definitions = cursor.fetchone()
+            if epoch != 1 or revision > 1:
+                raise ValueError(
+                    f"Unsupported platform catalog epoch/revision {epoch}/{revision}"
+                )
+            self.bootstrap_definitions = definitions
+
+    def platform_component_id(self, cursor, table, ref, definition):
+        """Accept exact bundled metadata as a no-op; never write a platform row."""
+        if not ref.startswith(f"{self.pack_ref}."):
+            raise ValueError(f"Component '{ref}' is outside pack '{self.pack_ref}'")
+        cursor.execute(
+            sql.SQL("SELECT id, management_origin, pack FROM {} WHERE ref = %s FOR UPDATE")
+            .format(sql.Identifier(table)),
+            (ref,),
+        )
+        existing = cursor.fetchone()
+        if existing is None:
+            return None
+        component_id, origin, owner = existing
+        if origin == "platform":
+            expected = self.bootstrap_definitions.get(table, {}).get(ref)
+            if (
+                self.pack_ref != "core"
+                or expected is None
+                or json.dumps(expected, sort_keys=True) != json.dumps(definition, sort_keys=True)
+            ):
+                raise ValueError(f"Cannot replace platform-owned {table} '{ref}'")
+            return component_id
+        if origin != "pack" or owner != self.pack_id:
+            raise ValueError(f"Ownership conflict for {table} '{ref}': {origin}, pack {owner}")
+        return None
 
     def upsert_pack(self) -> int:
         """Create or update the pack"""
@@ -222,6 +263,10 @@ class PackLoader:
                 continue
 
             label = permission_set_data.get("label")
+            platform_id = self.platform_component_id(cursor, "permission_set", ref, permission_set_data)
+            if platform_id is not None:
+                permission_set_ids[ref] = platform_id
+                continue
             description = permission_set_data.get("description")
             grants = permission_set_data.get("grants", [])
 
@@ -283,6 +328,10 @@ class PackLoader:
                 ref = f"{self.pack_ref}.{trigger_data['name']}"
 
             # Extract name from ref for label generation
+            platform_id = self.platform_component_id(cursor, "trigger", ref, trigger_data)
+            if platform_id is not None:
+                trigger_ids[ref] = platform_id
+                continue
             name = ref.split(".")[-1] if "." in ref else ref
             label = trigger_data.get("label") or generate_label(name)
             description = trigger_data.get("description", "")
@@ -351,6 +400,10 @@ class PackLoader:
                 continue
 
             name = runtime_data.get("name", ref.split(".")[-1])
+            if self.platform_component_id(cursor, "runtime", ref, runtime_data) is not None:
+                # load_runtime_lookup already indexed the platform ref/name/aliases.
+                # Its version children are platform-owned too and must not be upserted.
+                continue
             description = runtime_data.get("description", "")
             aliases = [alias.lower() for alias in runtime_data.get("aliases", [])]
             distributions = json.dumps(runtime_data.get("distributions", {}))
@@ -1419,6 +1472,7 @@ class PackLoader:
 
         try:
             self.connect()
+            self.lock_catalog()
 
             # Load pack metadata
             self.upsert_pack()

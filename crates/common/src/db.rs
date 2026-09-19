@@ -132,6 +132,11 @@ impl Database {
 
         info!("Successfully connected to database");
 
+        crate::repositories::platform_catalog::PlatformCatalogRepository::check_existing_epoch(
+            &pool,
+        )
+        .await?;
+
         Ok(Self { pool, schema })
     }
 

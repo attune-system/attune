@@ -29,8 +29,7 @@ impl Repository for RuntimeRepository {
 /// schema changes only need one update.
 pub const SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, description, name, aliases, \
      distributions, installation, installers, execution_config, \
-     auto_detected, detection_config, \
-     created, updated";
+     auto_detected, detection_config, retired_at, created, updated";
 
 /// Input for creating a new runtime
 #[derive(Debug, Clone)]
@@ -83,7 +82,10 @@ impl FindById for RuntimeRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let query = format!("SELECT {} FROM runtime WHERE id = $1", SELECT_COLUMNS);
+        let query = format!(
+            "SELECT {} FROM runtime WHERE id = $1 AND retired_at IS NULL",
+            SELECT_COLUMNS
+        );
         let runtime = sqlx::query_as::<_, Runtime>(&query)
             .bind(id)
             .fetch_optional(executor)
@@ -99,7 +101,10 @@ impl FindByRef for RuntimeRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let query = format!("SELECT {} FROM runtime WHERE ref = $1", SELECT_COLUMNS);
+        let query = format!(
+            "SELECT {} FROM runtime WHERE ref = $1 AND retired_at IS NULL",
+            SELECT_COLUMNS
+        );
         let runtime = sqlx::query_as::<_, Runtime>(&query)
             .bind(ref_str)
             .fetch_optional(executor)
@@ -115,7 +120,10 @@ impl List for RuntimeRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let query = format!("SELECT {} FROM runtime ORDER BY ref ASC", SELECT_COLUMNS);
+        let query = format!(
+            "SELECT {} FROM runtime WHERE retired_at IS NULL ORDER BY ref ASC",
+            SELECT_COLUMNS
+        );
         let runtimes = sqlx::query_as::<_, Runtime>(&query)
             .fetch_all(executor)
             .await?;
@@ -282,6 +290,35 @@ impl Delete for RuntimeRepository {
 }
 
 impl RuntimeRepository {
+    pub async fn find_by_id_including_retired<'e, E>(executor: E, id: Id) -> Result<Option<Runtime>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Runtime>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM runtime WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_by_ref_including_retired<'e, E>(
+        executor: E,
+        ref_str: &str,
+    ) -> Result<Option<Runtime>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Runtime>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM runtime WHERE ref = $1"
+        ))
+        .bind(ref_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Lists runtimes with search, pagination, and totals evaluated in SQL.
     pub async fn list_search<'e, E>(
         db: E,
@@ -290,27 +327,22 @@ impl RuntimeRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let mut query = QueryBuilder::new(format!("SELECT {SELECT_COLUMNS} FROM runtime"));
-        let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM runtime");
-        let mut has_where = false;
+        let mut query = QueryBuilder::new(format!(
+            "SELECT {SELECT_COLUMNS} FROM runtime WHERE retired_at IS NULL"
+        ));
+        let mut count_query =
+            QueryBuilder::new("SELECT COUNT(*) FROM runtime WHERE retired_at IS NULL");
 
         if let Some(pack) = filters.pack {
-            query.push(" WHERE pack = ");
+            query.push(" AND pack = ");
             query.push_bind(pack);
-            count_query.push(" WHERE pack = ");
+            count_query.push(" AND pack = ");
             count_query.push_bind(pack);
-            has_where = true;
         }
 
         for pattern in text_search_patterns(filters.query.as_deref()) {
-            if has_where {
-                query.push(" AND ");
-                count_query.push(" AND ");
-            } else {
-                query.push(" WHERE ");
-                count_query.push(" WHERE ");
-                has_where = true;
-            }
+            query.push(" AND ");
+            count_query.push(" AND ");
             for search_query in [&mut query, &mut count_query] {
                 search_query.push("(LOWER(ref) LIKE ");
                 search_query.push_bind(pattern.clone());
@@ -343,7 +375,7 @@ impl RuntimeRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM runtime WHERE pack = $1 ORDER BY ref ASC",
+            "SELECT {} FROM runtime WHERE pack = $1 AND retired_at IS NULL ORDER BY ref ASC",
             SELECT_COLUMNS
         );
         let runtimes = sqlx::query_as::<_, Runtime>(&query)
@@ -366,7 +398,7 @@ impl RuntimeRepository {
             return Ok(std::collections::HashMap::new());
         }
         let rows: Vec<(Id, String)> =
-            sqlx::query_as("SELECT id, ref FROM runtime WHERE id = ANY($1)")
+            sqlx::query_as("SELECT id, ref FROM runtime WHERE id = ANY($1) AND retired_at IS NULL")
                 .bind(ids)
                 .fetch_all(executor)
                 .await?;
@@ -379,7 +411,7 @@ impl RuntimeRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM runtime WHERE LOWER(name) = LOWER($1) LIMIT 1",
+            "SELECT {} FROM runtime WHERE LOWER(name) = LOWER($1) AND retired_at IS NULL LIMIT 1",
             SELECT_COLUMNS
         );
         let runtime = sqlx::query_as::<_, Runtime>(&query)
@@ -397,7 +429,7 @@ impl RuntimeRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM runtime WHERE aliases @> ARRAY[$1]::text[] LIMIT 1",
+            "SELECT {} FROM runtime WHERE aliases @> ARRAY[$1]::text[] AND retired_at IS NULL LIMIT 1",
             SELECT_COLUMNS
         );
         let runtime = sqlx::query_as::<_, Runtime>(&query)
@@ -421,12 +453,12 @@ impl RuntimeRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let result = if keep_refs.is_empty() {
-            sqlx::query("DELETE FROM runtime WHERE pack = $1")
+            sqlx::query("DELETE FROM runtime WHERE pack = $1 AND management_origin = 'pack'")
                 .bind(pack_id)
                 .execute(executor)
                 .await?
         } else {
-            sqlx::query("DELETE FROM runtime WHERE pack = $1 AND ref != ALL($2)")
+            sqlx::query("DELETE FROM runtime WHERE pack = $1 AND management_origin = 'pack' AND ref != ALL($2)")
                 .bind(pack_id)
                 .bind(keep_refs)
                 .execute(executor)

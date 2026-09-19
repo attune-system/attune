@@ -152,6 +152,9 @@ impl SensorWorkerRegistration {
             }
         };
         runtime_names.sort();
+        if !runtime_names.iter().any(|name| name == "native") {
+            runtime_names.push("native".to_string());
+        }
 
         self.capabilities
             .insert("detected_interpreters".to_string(), json!(interpreters));
@@ -249,7 +252,7 @@ impl SensorWorkerRegistration {
             }
         }
 
-        // Placeholder for runtimes (will be detected asynchronously)
+        // Placeholder for runtimes (will be detected asynchronously).
         capabilities.insert("runtimes".to_string(), json!(Vec::<String>::new()));
 
         Self {
@@ -726,7 +729,26 @@ mod tests {
 
         assert_eq!(
             registration.capabilities.get("runtimes"),
-            Some(&json!(["python"]))
+            Some(&json!(["python", "native"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn sensor_registration_advertises_native_without_interpreters_or_override() {
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let _env = EnvGuard::preserve(&["ATTUNE_SENSOR_RUNTIMES"]);
+        std::env::remove_var("ATTUNE_SENSOR_RUNTIMES");
+        let config = test_config();
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/attune")
+            .expect("lazy pool");
+        let mut registration = SensorWorkerRegistration::new(pool, &config);
+
+        registration.set_detected_runtimes(Vec::new());
+
+        assert_eq!(
+            registration.capabilities.get("runtimes"),
+            Some(&json!(["native"]))
         );
     }
 

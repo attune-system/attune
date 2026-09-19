@@ -168,6 +168,8 @@ pub struct TriggerResponse {
     #[schema(example = json!(["incident_response", "deployments"]))]
     pub reference_allowed_pack_refs: Vec<String>,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Sensor ID (optional — webhook triggers have no sensor)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 1)]
@@ -226,6 +228,8 @@ pub struct TriggerSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schema(example = json!(["incident_response", "deployments"]))]
     pub reference_allowed_pack_refs: Vec<String>,
+
+    pub retired_at: Option<DateTime<Utc>>,
 
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
@@ -549,6 +553,8 @@ pub struct SensorResponse {
     #[schema(example = 4, nullable = true)]
     pub log_retention_limit: Option<i32>,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -605,6 +611,8 @@ pub struct SensorSummary {
     #[schema(example = 4, nullable = true)]
     pub log_retention_limit: Option<i32>,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -632,6 +640,7 @@ impl From<attune_common::models::trigger::Trigger> for TriggerResponse {
             is_adhoc: trigger.is_adhoc,
             reference_visibility: trigger.reference_visibility,
             reference_allowed_pack_refs: trigger.reference_allowed_pack_refs,
+            retired_at: trigger.retired_at,
             sensor: trigger.sensor,
             sensor_ref: trigger.sensor_ref,
             created: trigger.created,
@@ -653,6 +662,7 @@ impl From<attune_common::models::trigger::Trigger> for TriggerSummary {
             webhook_enabled: trigger.webhook_enabled,
             reference_visibility: trigger.reference_visibility,
             reference_allowed_pack_refs: trigger.reference_allowed_pack_refs,
+            retired_at: trigger.retired_at,
             created: trigger.created,
             updated: trigger.updated,
         }
@@ -685,6 +695,7 @@ impl From<attune_common::models::trigger::Sensor> for SensorResponse {
             artifact_retention_limit: sensor.artifact_retention_limit,
             log_retention_policy: sensor.log_retention_policy,
             log_retention_limit: sensor.log_retention_limit,
+            retired_at: sensor.retired_at,
             created: sensor.created,
             updated: sensor.updated,
         }
@@ -705,6 +716,7 @@ impl From<attune_common::models::trigger::Sensor> for SensorSummary {
             artifact_retention_limit: sensor.artifact_retention_limit,
             log_retention_policy: sensor.log_retention_policy,
             log_retention_limit: sensor.log_retention_limit,
+            retired_at: sensor.retired_at,
             created: sensor.created,
             updated: sensor.updated,
         }

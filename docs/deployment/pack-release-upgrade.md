@@ -8,12 +8,12 @@ transaction.
 
 The API does not create placeholder release rows. Metadata-only packs without a
 `storage_path` need no release. If a stored path is not a directory or cannot
-produce a valid archive, `/health/ready` returns HTTP 503 and names the affected
-pack refs. Existing pack rows and files remain in place.
+produce a valid archive, the API logs the affected pack refs and keeps the
+platform API ready for repair. Existing pack rows and files remain in place.
 
 ## Mandatory repair procedure
 
-For every pack named by `/health/ready`:
+For every failed pack named in the API startup logs:
 
 1. Restore the exact installed pack directory, including `pack.yaml`, under a
    path visible to the API container.
@@ -23,8 +23,13 @@ For every pack named by `/health/ready`:
    attune pack register <server-visible-pack-directory> --force --skip-tests
    ```
 
-3. Repeat `GET /health/ready`. Do not route execution or sensor traffic to the
-   API until it returns HTTP 200.
+3. Repeat the pack inspection and repair request. `/health/ready` covers the
+   database and exact platform catalog only; it does not close for pack content.
+
+`/health/content` is a transitional deployment check for active core and fresh
+action/sensor hosts. It returns HTTP 503 while those are absent. It does not yet
+prove required-pack locks or candidate evidence; issue #75 replaces this coarse
+contract. `/health/live` checks only the API process.
 
 If the original bytes cannot be recovered, install a known pack version with
 `attune pack install <source> --force --skip-tests`. This is a replacement, not

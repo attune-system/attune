@@ -392,15 +392,15 @@ impl WorkerService {
             runtime_registry.register(Box::new(shell_runtime));
             info!("Registered built-in shell ProcessRuntime");
 
-            // Native runtime (for compiled binaries)
-            runtime_registry.register(Box::new(NativeRuntime::new()));
-            info!("Registered built-in Native runtime");
-
             // Local runtime as catch-all fallback
             let local_runtime = LocalRuntime::new();
             runtime_registry.register(Box::new(local_runtime));
             info!("Registered Local runtime (fallback)");
         }
+
+        // Native execution is available alongside interpreter-backed catalog runtimes.
+        runtime_registry.register(Box::new(NativeRuntime::new()));
+        info!("Registered built-in Native runtime");
 
         // Validate all registered runtimes
         runtime_registry

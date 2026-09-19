@@ -261,6 +261,14 @@ export function useExecutionStream(options: UseExecutionStreamOptions = {}) {
           queryKey: ["executions", executionNotification.entity_id],
           exact: true,
         });
+        queryClient.invalidateQueries({
+          queryKey: [
+            "artifacts",
+            "execution",
+            executionNotification.entity_id,
+          ],
+          exact: true,
+        });
       }
 
       // Update execution list queries by modifying existing data.

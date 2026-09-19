@@ -553,7 +553,7 @@ async fn setup_environments_for_pack(
             Some(r) => r,
             None => {
                 // Try fetching from DB directly (might be a newly added runtime)
-                match RuntimeRepository::find_by_id(db_pool, runtime_id).await {
+                match RuntimeRepository::find_by_id_including_retired(db_pool, runtime_id).await {
                     Ok(Some(r)) => {
                         // Can't insert into the borrowed map, so just use it inline
                         let rt_name = r.name.to_lowercase();
@@ -1548,6 +1548,7 @@ mod tests {
             execution_config: serde_json::json!({}),
             auto_detected: false,
             detection_config: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         };
@@ -1589,6 +1590,7 @@ mod tests {
                 available: false,
                 verified_at: None,
                 meta: serde_json::json!({}),
+                retired_at: None,
                 created: Utc::now(),
                 updated: Utc::now(),
             },
@@ -1606,6 +1608,7 @@ mod tests {
                 available: true,
                 verified_at: None,
                 meta: serde_json::json!({}),
+                retired_at: None,
                 created: Utc::now(),
                 updated: Utc::now(),
             },
@@ -1643,6 +1646,7 @@ mod tests {
             execution_config: serde_json::json!({}),
             auto_detected: false,
             detection_config: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         };
@@ -1683,6 +1687,7 @@ mod tests {
             available: false,
             verified_at: None,
             meta: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         }];
@@ -1714,6 +1719,7 @@ mod tests {
             execution_config: serde_json::json!({}),
             auto_detected: false,
             detection_config: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         };
@@ -1731,6 +1737,7 @@ mod tests {
             available: true,
             verified_at: None,
             meta: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         }];
@@ -1760,6 +1767,7 @@ mod tests {
             execution_config: serde_json::json!({}),
             auto_detected: false,
             detection_config: serde_json::json!({}),
+            retired_at: None,
             created: Utc::now(),
             updated: Utc::now(),
         };
@@ -1801,6 +1809,7 @@ mod tests {
                 available: true,
                 verified_at: None,
                 meta: serde_json::json!({}),
+                retired_at: None,
                 created: Utc::now(),
                 updated: Utc::now(),
             },
@@ -1818,6 +1827,7 @@ mod tests {
                 available: true,
                 verified_at: None,
                 meta: serde_json::json!({}),
+                retired_at: None,
                 created: Utc::now(),
                 updated: Utc::now(),
             },

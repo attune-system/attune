@@ -216,6 +216,8 @@ pub struct WorkflowResponse {
     #[schema(example = json!(["incident", "slack", "approval"]))]
     pub tags: Vec<String>,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -256,6 +258,8 @@ pub struct WorkflowSummary {
     #[schema(example = json!(["incident", "slack", "approval"]))]
     pub tags: Vec<String>,
 
+    pub retired_at: Option<DateTime<Utc>>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -280,6 +284,7 @@ impl From<attune_common::models::workflow::WorkflowDefinition> for WorkflowRespo
             out_schema: workflow.out_schema,
             definition: workflow.definition,
             tags: workflow.tags,
+            retired_at: workflow.retired_at,
             created: workflow.created,
             updated: workflow.updated,
         }
@@ -297,6 +302,7 @@ impl From<attune_common::models::workflow::WorkflowDefinition> for WorkflowSumma
             description: workflow.description,
             version: workflow.version,
             tags: workflow.tags,
+            retired_at: workflow.retired_at,
             created: workflow.created,
             updated: workflow.updated,
         }
