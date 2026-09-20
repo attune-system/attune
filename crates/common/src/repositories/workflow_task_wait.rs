@@ -2,8 +2,8 @@
 
 use crate::{
     models::{
-        enums::{WorkflowTaskWaitKind, WorkflowTaskWaitState},
-        workflow::{WorkflowTaskWait, WORKFLOW_TASK_WAIT_SELECT_COLUMNS},
+        enums::WorkflowTaskWaitState,
+        workflow::{WorkflowTaskWait, WorkflowTaskWaitTarget, WORKFLOW_TASK_WAIT_SELECT_COLUMNS},
         Id,
     },
     Error, Result,
@@ -17,8 +17,7 @@ pub struct WorkflowTaskWaitRepository;
 pub struct CreateWorkflowTaskWaitInput {
     pub workflow_execution: Id,
     pub task_name: String,
-    pub kind: WorkflowTaskWaitKind,
-    pub inquiry: Id,
+    pub target: WorkflowTaskWaitTarget,
 }
 
 impl WorkflowTaskWaitRepository {
@@ -26,17 +25,25 @@ impl WorkflowTaskWaitRepository {
         conn: &mut PgConnection,
         input: CreateWorkflowTaskWaitInput,
     ) -> Result<WorkflowTaskWait> {
+        let (inquiry, target_execution, work_queue_item) = match input.target {
+            WorkflowTaskWaitTarget::Inquiry(id) => (Some(id), None, None),
+            WorkflowTaskWaitTarget::Execution(id) => (None, Some(id), None),
+            WorkflowTaskWaitTarget::WorkQueueItem(id) => (None, None, Some(id)),
+        };
         let query = format!(
-            "INSERT INTO workflow_task_wait (workflow_execution, task_name, kind, inquiry) \
-             VALUES ($1, $2, $3, $4) \
+            "INSERT INTO workflow_task_wait \
+                (workflow_execution, task_name, kind, inquiry, target_execution, work_queue_item, active_work_queue_item) \
+             VALUES ($1, $2, $3, $4, $5, $6, $6) \
              ON CONFLICT (workflow_execution, task_name) DO NOTHING \
              RETURNING {WORKFLOW_TASK_WAIT_SELECT_COLUMNS}"
         );
         if let Some(wait) = sqlx::query_as::<_, WorkflowTaskWait>(&query)
             .bind(input.workflow_execution)
             .bind(&input.task_name)
-            .bind(input.kind)
-            .bind(input.inquiry)
+            .bind(input.target.kind())
+            .bind(inquiry)
+            .bind(target_execution)
+            .bind(work_queue_item)
             .fetch_optional(&mut *conn)
             .await?
         {
@@ -49,7 +56,7 @@ impl WorkflowTaskWaitRepository {
                 .ok_or_else(|| {
                     Error::InvalidState("workflow task wait disappeared after conflict".to_string())
                 })?;
-        if existing.kind != input.kind || existing.inquiry != input.inquiry {
+        if existing.target()? != input.target {
             return Err(Error::InvalidState(format!(
                 "workflow task '{}' already waits on a different target",
                 input.task_name
@@ -120,32 +127,74 @@ impl WorkflowTaskWaitRepository {
             .map_err(Into::into)
     }
 
+    pub async fn find_reconcilable_by_target<'e, E>(
+        executor: E,
+        target: WorkflowTaskWaitTarget,
+    ) -> Result<Vec<WorkflowTaskWait>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let target_column = match target {
+            WorkflowTaskWaitTarget::Inquiry(_) => "inquiry",
+            WorkflowTaskWaitTarget::Execution(_) => "target_execution",
+            WorkflowTaskWaitTarget::WorkQueueItem(_) => "work_queue_item",
+        };
+        let query = format!(
+            "SELECT {WORKFLOW_TASK_WAIT_SELECT_COLUMNS} FROM workflow_task_wait \
+             WHERE kind = $1 AND {target_column} = $2 \
+               AND (state IN ($3, $4) OR (state IN ($5, $6) \
+                    AND (result->>'_delivery_complete') IS DISTINCT FROM 'true')) \
+             ORDER BY id"
+        );
+        sqlx::query_as::<_, WorkflowTaskWait>(&query)
+            .bind(target.kind())
+            .bind(target.id())
+            .bind(WorkflowTaskWaitState::Waiting)
+            .bind(WorkflowTaskWaitState::Released)
+            .bind(WorkflowTaskWaitState::TimedOut)
+            .bind(WorkflowTaskWaitState::Failed)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn find_resolvable<'e, E>(executor: E, limit: i64) -> Result<Vec<WorkflowTaskWait>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
             "SELECT {} FROM workflow_task_wait w \
-             JOIN inquiry i ON i.id = w.inquiry \
-             WHERE (w.state = $1 AND i.status <> $2) \
-                 OR (w.state = $4 AND EXISTS ( \
-                    SELECT 1 FROM execution e \
-                    WHERE e.workflow_task->>'workflow_execution' = w.workflow_execution::TEXT \
-                       AND e.workflow_task->>'task_name' = w.task_name \
-                       AND e.status = 'requested' \
-                )) \
-                 OR (w.state IN ($5, $6) \
-                     AND (w.result->>'_delivery_complete') IS DISTINCT FROM 'true') \
-             ORDER BY w.id LIMIT $3",
+             WHERE (w.state = 'waiting' AND ( \
+                    (w.kind = 'inquiry' AND EXISTS ( \
+                        SELECT 1 FROM inquiry i \
+                        WHERE i.id = w.inquiry AND i.status <> 'pending' \
+                    )) OR \
+                    (w.kind = 'execution' AND (NOT EXISTS ( \
+                        SELECT 1 FROM execution target WHERE target.id = w.target_execution \
+                    ) OR EXISTS ( \
+                        SELECT 1 FROM execution target WHERE target.id = w.target_execution \
+                          AND target.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned') \
+                    ))) OR \
+                    (w.kind = 'work_queue_item' AND (NOT EXISTS ( \
+                        SELECT 1 FROM work_queue_item item WHERE item.id = w.work_queue_item \
+                    ) OR EXISTS ( \
+                        SELECT 1 FROM work_queue_item item WHERE item.id = w.work_queue_item \
+                          AND item.status IN ('completed', 'failed', 'skipped', 'cancelled') \
+                    ))) \
+                 )) \
+                  OR (w.state = 'released' AND EXISTS ( \
+                     SELECT 1 FROM execution e \
+                     WHERE e.workflow_task->>'workflow_execution' = w.workflow_execution::TEXT \
+                        AND e.workflow_task->>'task_name' = w.task_name \
+                        AND e.status = 'requested' \
+                 )) \
+                  OR (w.state IN ('timed_out', 'failed') \
+                      AND (w.result->>'_delivery_complete') IS DISTINCT FROM 'true') \
+             ORDER BY w.id LIMIT $1",
             qualified_select_columns("w")
         );
         sqlx::query_as::<_, WorkflowTaskWait>(&query)
-            .bind(WorkflowTaskWaitState::Waiting)
-            .bind(crate::models::enums::InquiryStatus::Pending)
             .bind(limit)
-            .bind(WorkflowTaskWaitState::Released)
-            .bind(WorkflowTaskWaitState::TimedOut)
-            .bind(WorkflowTaskWaitState::Failed)
             .fetch_all(executor)
             .await
             .map_err(Into::into)
@@ -205,6 +254,7 @@ impl WorkflowTaskWaitRepository {
         }
         let query = format!(
             "UPDATE workflow_task_wait SET state = $2, result = $3, resolved_at = NOW(), \
+             active_work_queue_item = NULL, \
              released_at = CASE WHEN $2 = 'released' THEN NOW() ELSE NULL END \
              WHERE id = $1 AND state = $4 RETURNING {WORKFLOW_TASK_WAIT_SELECT_COLUMNS}"
         );
@@ -227,6 +277,26 @@ impl WorkflowTaskWaitRepository {
         )
         .bind(workflow_execution)
         .bind(WorkflowTaskWaitState::Waiting)
+        .fetch_one(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn count_pending_terminal_delivery<'e, E>(
+        executor: E,
+        workflow_execution: Id,
+    ) -> Result<i64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_task_wait \
+             WHERE workflow_execution = $1 AND state IN ($2, $3) \
+               AND (result->>'_delivery_complete') IS DISTINCT FROM 'true'",
+        )
+        .bind(workflow_execution)
+        .bind(WorkflowTaskWaitState::TimedOut)
+        .bind(WorkflowTaskWaitState::Failed)
         .fetch_one(executor)
         .await
         .map_err(Into::into)
@@ -259,7 +329,8 @@ impl WorkflowTaskWaitRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "UPDATE workflow_task_wait SET state = $2, result = $3, resolved_at = NOW() \
+            "UPDATE workflow_task_wait SET state = $2, result = $3, resolved_at = NOW(), \
+             active_work_queue_item = NULL \
              WHERE workflow_execution = $1 AND state = $4 \
              RETURNING {WORKFLOW_TASK_WAIT_SELECT_COLUMNS}"
         );

@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
+from ..models.absent_metadata_policy import AbsentMetadataPolicy
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="InstallPackRequest")
@@ -18,6 +19,8 @@ class InstallPackRequest:
 
     Attributes:
         source (str): Repository URL or source location Example: https://github.com/attune/pack-slack.git.
+        absent_metadata_policy (AbsentMetadataPolicy | Unset): How an installation handles pack-managed metadata omitted
+            by the new release.
         force (bool | Unset): Replace an existing pack with the same ref Example: False.
         no_registry (bool | Unset): Require an explicit URL or existing local path instead of registry lookup.
         ref_spec (None | str | Unset): Git branch, tag, or commit reference Example: main.
@@ -27,6 +30,7 @@ class InstallPackRequest:
     """
 
     source: str
+    absent_metadata_policy: AbsentMetadataPolicy | Unset = UNSET
     force: bool | Unset = UNSET
     no_registry: bool | Unset = UNSET
     ref_spec: None | str | Unset = UNSET
@@ -37,6 +41,10 @@ class InstallPackRequest:
 
     def to_dict(self) -> dict[str, Any]:
         source = self.source
+
+        absent_metadata_policy: str | Unset = UNSET
+        if not isinstance(self.absent_metadata_policy, Unset):
+            absent_metadata_policy = self.absent_metadata_policy.value
 
         force = self.force
 
@@ -65,6 +73,8 @@ class InstallPackRequest:
                 "source": source,
             }
         )
+        if absent_metadata_policy is not UNSET:
+            field_dict["absent_metadata_policy"] = absent_metadata_policy
         if force is not UNSET:
             field_dict["force"] = force
         if no_registry is not UNSET:
@@ -84,6 +94,13 @@ class InstallPackRequest:
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         source = d.pop("source")
+
+        _absent_metadata_policy = d.pop("absent_metadata_policy", UNSET)
+        absent_metadata_policy: AbsentMetadataPolicy | Unset
+        if isinstance(_absent_metadata_policy, Unset):
+            absent_metadata_policy = UNSET
+        else:
+            absent_metadata_policy = AbsentMetadataPolicy(_absent_metadata_policy)
 
         force = d.pop("force", UNSET)
 
@@ -113,6 +130,7 @@ class InstallPackRequest:
 
         install_pack_request = cls(
             source=source,
+            absent_metadata_policy=absent_metadata_policy,
             force=force,
             no_registry=no_registry,
             ref_spec=ref_spec,

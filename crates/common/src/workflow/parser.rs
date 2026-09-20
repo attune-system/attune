@@ -35,7 +35,7 @@
 //! transitions during parsing. The canonical internal representation always
 //! uses the `next` array.
 
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use validator::Validate;
@@ -179,11 +179,86 @@ pub struct TaskTransition {
 
 /// A durable prerequisite that must be satisfied before an action task is
 /// scheduled.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct TaskWaitFor {
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskWaitFor {
     /// A literal inquiry ID or a template that resolves to a positive `i64`.
-    pub inquiry: JsonValue,
+    Inquiry(JsonValue),
+    /// A literal execution ID or a template that resolves to a positive `i64`.
+    Execution(JsonValue),
+    /// A literal work queue item ID or a template that resolves to a positive `i64`.
+    WorkQueueItem(JsonValue),
+}
+
+impl TaskWaitFor {
+    pub fn target(&self) -> (&'static str, &JsonValue) {
+        match self {
+            Self::Inquiry(value) => ("inquiry", value),
+            Self::Execution(value) => ("execution", value),
+            Self::WorkQueueItem(value) => ("work_queue_item", value),
+        }
+    }
+}
+
+impl Serialize for TaskWaitFor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (name, value) = self.target();
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(name, value)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskWaitFor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Repr {
+            Inquiry { inquiry: JsonValue },
+            Execution { execution: JsonValue },
+            WorkQueueItem { work_queue_item: JsonValue },
+        }
+
+        let wait_for = match Repr::deserialize(deserializer)? {
+            Repr::Inquiry { inquiry } => Self::Inquiry(inquiry),
+            Repr::Execution { execution } => Self::Execution(execution),
+            Repr::WorkQueueItem { work_queue_item } => Self::WorkQueueItem(work_queue_item),
+        };
+        let (target_name, target) = wait_for.target();
+        validate_wait_target(target).map_err(|reason| {
+            serde::de::Error::custom(format!("wait_for.{target_name} {reason}"))
+        })?;
+        Ok(wait_for)
+    }
+}
+
+fn validate_wait_target(target: &JsonValue) -> std::result::Result<(), String> {
+    if target.as_i64().is_some_and(|id| id > 0) {
+        return Ok(());
+    }
+    let Some(template) = target.as_str().map(str::trim) else {
+        return Err("must be a positive i64 or pure template expression".to_string());
+    };
+    let Some(expression) = template
+        .strip_prefix("{{")
+        .and_then(|value| value.strip_suffix("}}"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err("must be a positive i64 or pure template expression".to_string());
+    };
+    let tokens = crate::workflow::expression::Tokenizer::new(expression)
+        .tokenize()
+        .map_err(|error| format!("contains an invalid template expression: {error}"))?;
+    crate::workflow::expression::Parser::new(&tokens)
+        .parse()
+        .map_err(|error| format!("contains an invalid template expression: {error}"))?;
+    Ok(())
 }
 
 /// Task definition - can be action, parallel, or workflow type.
@@ -1905,8 +1980,10 @@ tasks:
 
         let workflow = parse_workflow_yaml(yaml).unwrap();
         assert_eq!(
-            workflow.tasks[1].wait_for.as_ref().unwrap().inquiry,
-            serde_json::json!("{{ task.request.inquiry_id }}")
+            workflow.tasks[1].wait_for,
+            Some(TaskWaitFor::Inquiry(serde_json::json!(
+                "{{ task.request.inquiry_id }}"
+            )))
         );
         assert_eq!(
             workflow_to_json(&workflow).unwrap()["tasks"][1]["wait_for"]["inquiry"],
@@ -1924,6 +2001,78 @@ tasks:
     wait_for:
       inquiry: 42
       timeout: 60
+"#;
+
+        assert!(parse_workflow_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn wait_for_variants_round_trip_to_exact_object_shapes() {
+        for (key, expected) in [
+            ("inquiry", TaskWaitFor::Inquiry(serde_json::json!(42))),
+            (
+                "execution",
+                TaskWaitFor::Execution(serde_json::json!("{{ task.run.id }}")),
+            ),
+            (
+                "work_queue_item",
+                TaskWaitFor::WorkQueueItem(serde_json::json!(73)),
+            ),
+        ] {
+            let yaml = format!(
+                "version: \"1.0.0\"\ntasks:\n  - name: deploy\n    action: app.deploy\n    wait_for:\n      {key}: {}\n",
+                if key == "execution" {
+                    "\"{{ task.run.id }}\""
+                } else if key == "inquiry" {
+                    "42"
+                } else {
+                    "73"
+                }
+            );
+            let workflow = parse_workflow_yaml(&yaml).unwrap();
+            assert_eq!(workflow.tasks[0].wait_for, Some(expected));
+            let wait_for = &workflow_to_json(&workflow).unwrap()["tasks"][0]["wait_for"];
+            assert_eq!(wait_for.as_object().unwrap().len(), 1);
+            assert!(wait_for.get(key).is_some());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_wait_targets() {
+        for target in ["0", "-1", "1.5", "plain-text", "{{ }}", "{}"] {
+            let yaml = format!(
+                "version: \"1.0.0\"\ntasks:\n  - name: deploy\n    action: app.deploy\n    wait_for:\n      execution: {target}\n"
+            );
+            assert!(
+                parse_workflow_yaml(&yaml).is_err(),
+                "target {target} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_wait_for_with_multiple_targets() {
+        let yaml = r#"
+version: "1.0.0"
+tasks:
+  - name: deploy
+    action: app.deploy
+    wait_for:
+      inquiry: 42
+      execution: 73
+"#;
+
+        assert!(parse_workflow_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_wait_for_without_a_target() {
+        let yaml = r#"
+version: "1.0.0"
+tasks:
+  - name: deploy
+    action: app.deploy
+    wait_for: {}
 "#;
 
         assert!(parse_workflow_yaml(yaml).is_err());

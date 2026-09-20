@@ -326,90 +326,49 @@ curl -X GET "http://localhost:8080/api/v1/executions/456/inquiries" \
 
 ---
 
-### Create Inquiry
+### Create inquiry
 
-Create a new inquiry for an execution.
+Workflow task actions create inquiries with an execution token.
 
 **Endpoint:** `POST /api/v1/inquiries`
 
-**Request Body:**
-
 ```json
 {
-  "execution": 456,
+  "purpose": "production-approval",
   "prompt": "Approve deployment to production?",
   "response_schema": {
-    "type": "object",
-    "properties": {
-      "approved": {"type": "boolean"},
-      "comment": {"type": "string"}
-    },
-    "required": ["approved"]
+    "approved": {"type": "boolean", "required": true},
+    "comment": {"type": "string"}
   },
   "assigned_to": 789,
-  "timeout_at": "2024-01-15T12:00:00Z"
+  "timeout_seconds": 3600
 }
 ```
 
-**Field Validation:**
-
-| Field | Required | Constraints |
-|-------|----------|-------------|
-| `execution` | Yes | Must be a valid execution ID |
-| `prompt` | Yes | 1-10,000 characters |
-| `response_schema` | No | Valid JSON Schema object |
-| `assigned_to` | No | Valid user ID |
-| `timeout_at` | No | ISO 8601 datetime in the future |
-
-**Example Request:**
-
-```bash
-curl -X POST "http://localhost:8080/api/v1/inquiries" \
-  -H "Authorization: Bearer <access_token>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "execution": 456,
-    "prompt": "Approve deployment to production?",
-    "response_schema": {
-      "type": "object",
-      "properties": {
-        "approved": {"type": "boolean"}
-      }
-    },
-    "timeout_at": "2024-01-15T12:00:00Z"
-  }'
-```
-
-**Response:** `201 Created`
+Attune derives the execution and workflow scope from the token. The response contains an internal inquiry ID and a provider-neutral response handle:
 
 ```json
 {
   "data": {
-    "id": 123,
-    "execution": 456,
-    "prompt": "Approve deployment to production?",
-    "response_schema": {
-      "type": "object",
-      "properties": {
-        "approved": {"type": "boolean"}
-      }
+    "inquiry": {
+      "id": 123,
+      "execution": 456,
+      "purpose": "production-approval",
+      "prompt": "Approve deployment to production?",
+      "assigned_to": 789,
+      "status": "pending",
+      "response": null,
+      "timeout_at": "2026-09-19T12:00:00Z"
     },
-    "assigned_to": null,
-    "status": "pending",
-    "response": null,
-    "timeout_at": "2024-01-15T12:00:00Z",
-    "responded_at": null,
-    "created": "2024-01-15T10:00:00Z",
-    "updated": "2024-01-15T10:00:00Z"
+    "response_handle": "attune_irh_REDACTED"
   },
   "message": "Inquiry created successfully"
 }
 ```
 
-**Error Responses:**
+The response includes `Cache-Control: no-store`. Use the numeric ID for workflow waits. Give the opaque handle only to an external adapter. The handle is correlation data and does not replace integration authentication or actor mapping.
 
-- `400 Bad Request`: Validation error
-- `404 Not Found`: Execution not found
+Equivalent retries return the same inquiry and may return a different valid handle. A retry with different immutable fields returns `409 Conflict`.
 
 ---
 
@@ -562,6 +521,35 @@ curl -X POST "http://localhost:8080/api/v1/inquiries/123/respond" \
 - `404 Not Found`: Inquiry not found
 - `400 Bad Request`: Inquiry is not in pending status or has timed out
 - `403 Forbidden`: User is not authorized to respond (inquiry assigned to someone else)
+
+---
+
+### Submit an external response
+
+An integration adapter verifies its provider callback, then submits the normalized actor and response to Attune.
+
+**Endpoint:** `POST /api/v1/inquiry-responses`
+
+```json
+{
+  "response_handle": "attune_irh_REDACTED",
+  "external_actor": {
+    "provider": "chat-provider",
+    "tenant": "workspace-id",
+    "external_subject": "user-id"
+  },
+  "response": {
+    "approved": true,
+    "comment": "Approved in the provider"
+  }
+}
+```
+
+This endpoint accepts only access JWTs minted from integration tokens. Attune rechecks the integration credential and current RBAC grant on every request. It resolves the external actor through the integration's external identity mappings and requires the mapped identity to match `assigned_to`.
+
+The first valid response returns `200 OK`. A response after another response, timeout, cancellation, or terminal workflow returns `409 Conflict`. Invalid or unknown handles return `404 Not Found` without disclosing an inquiry ID.
+
+Provider-specific signature verification, replay checks, payload parsing, and acknowledgment remain in the adapter. Attune does not parse Slack, Discord, or other provider payloads.
 
 ---
 

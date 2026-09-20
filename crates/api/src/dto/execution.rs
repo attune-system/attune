@@ -11,7 +11,7 @@ use attune_common::models::enums::{
     WorkflowCacheIterationState, WorkflowTaskWaitKind, WorkflowTaskWaitState,
 };
 use attune_common::models::execution::WorkflowTaskMetadata;
-use attune_common::models::{WorkflowCacheIteration, WorkflowTaskWait};
+use attune_common::models::{WorkflowCacheIteration, WorkflowTaskWait, WorkflowTaskWaitTarget};
 use attune_common::repositories::execution::ExecutionWithRefs;
 
 const MAX_WORKFLOW_CACHE_ITERATION_ERROR_SUMMARY_CHARS: usize = 1024;
@@ -253,24 +253,49 @@ pub struct WorkflowTaskWaitResponse {
     pub task_name: String,
     pub kind: WorkflowTaskWaitKind,
     pub state: WorkflowTaskWaitState,
-    pub inquiry_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_queue_ref: Option<String>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
 }
 
-impl From<WorkflowTaskWait> for WorkflowTaskWaitResponse {
-    fn from(wait: WorkflowTaskWait) -> Self {
-        Self {
+impl WorkflowTaskWaitResponse {
+    pub fn try_from_wait(
+        wait: WorkflowTaskWait,
+        target_visible: bool,
+        work_queue_ref: Option<String>,
+    ) -> attune_common::Result<Self> {
+        let target = wait.target()?;
+        let state = if wait.state == WorkflowTaskWaitState::Failed
+            && wait
+                .result
+                .as_ref()
+                .and_then(|result| result.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("cancelled")
+        {
+            WorkflowTaskWaitState::Cancelled
+        } else {
+            wait.state
+        };
+        Ok(Self {
             id: wait.id,
             task_name: wait.task_name,
-            kind: wait.kind,
-            state: wait.state,
-            inquiry_id: wait.inquiry,
+            kind: target.kind(),
+            state,
+            target_id: target_visible.then(|| target.id()),
+            work_queue_ref: match target {
+                WorkflowTaskWaitTarget::WorkQueueItem(_) if target_visible => work_queue_ref,
+                WorkflowTaskWaitTarget::Inquiry(_) | WorkflowTaskWaitTarget::Execution(_) => None,
+                WorkflowTaskWaitTarget::WorkQueueItem(_) => None,
+            },
             created: wait.created,
             updated: wait.updated,
             resolved_at: wait.resolved_at,
-        }
+        })
     }
 }
 
@@ -625,42 +650,104 @@ mod tests {
     }
 
     #[test]
-    fn workflow_task_wait_response_contains_only_safe_metadata() {
+    fn workflow_task_wait_response_contains_only_safe_metadata_for_all_targets() {
         let now = Utc::now();
-        let response = WorkflowTaskWaitResponse::from(WorkflowTaskWait {
-            id: 1,
-            workflow_execution: 2,
-            task_name: "approve".to_string(),
-            kind: WorkflowTaskWaitKind::Inquiry,
-            state: WorkflowTaskWaitState::Released,
-            inquiry: 3,
-            result: Some(serde_json::json!({"approved": true})),
-            resolved_at: Some(now),
-            released_at: Some(now),
-            created: now,
-            updated: now,
-        });
+        let cases = [
+            (WorkflowTaskWaitKind::Inquiry, Some(3), None, None, None),
+            (WorkflowTaskWaitKind::Execution, None, Some(4), None, None),
+            (
+                WorkflowTaskWaitKind::WorkQueueItem,
+                None,
+                None,
+                Some(5),
+                Some("core.inbox".to_string()),
+            ),
+        ];
 
-        let json = serde_json::to_value(response).unwrap();
-        let mut fields: Vec<_> = json
-            .as_object()
+        for (kind, inquiry, target_execution, work_queue_item, queue_ref) in cases {
+            let response = WorkflowTaskWaitResponse::try_from_wait(
+                WorkflowTaskWait {
+                    id: 1,
+                    workflow_execution: 2,
+                    task_name: "wait".to_string(),
+                    kind,
+                    state: WorkflowTaskWaitState::Released,
+                    inquiry,
+                    target_execution,
+                    work_queue_item,
+                    result: Some(serde_json::json!({"private": true})),
+                    resolved_at: Some(now),
+                    released_at: Some(now),
+                    created: now,
+                    updated: now,
+                },
+                true,
+                queue_ref.clone(),
+            )
+            .unwrap();
+
+            let json = serde_json::to_value(response).unwrap();
+            assert_eq!(json["kind"], serde_json::to_value(kind).unwrap());
+            assert_eq!(
+                json["target_id"],
+                inquiry.or(target_execution).or(work_queue_item).unwrap()
+            );
+            assert_eq!(
+                json.get("work_queue_ref").and_then(|value| value.as_str()),
+                queue_ref.as_deref()
+            );
+            assert!(json.get("result").is_none());
+            assert!(json.get("released_at").is_none());
+            assert!(json.get("inquiry_id").is_none());
+        }
+
+        let cancelled = WorkflowTaskWaitResponse::try_from_wait(
+            WorkflowTaskWait {
+                id: 2,
+                workflow_execution: 2,
+                task_name: "cancelled_target".to_string(),
+                kind: WorkflowTaskWaitKind::Execution,
+                state: WorkflowTaskWaitState::Failed,
+                inquiry: None,
+                target_execution: Some(98),
+                work_queue_item: None,
+                result: Some(serde_json::json!({"status": "cancelled", "private": true})),
+                resolved_at: Some(now),
+                released_at: None,
+                created: now,
+                updated: now,
+            },
+            true,
+            None,
+        )
+        .unwrap();
+        let cancelled_json = serde_json::to_value(cancelled).unwrap();
+        assert_eq!(cancelled_json["state"], "cancelled");
+        assert!(cancelled_json.get("result").is_none());
+
+        let hidden = WorkflowTaskWaitResponse::try_from_wait(
+            WorkflowTaskWait {
+                id: 2,
+                workflow_execution: 2,
+                task_name: "private_target".to_string(),
+                kind: WorkflowTaskWaitKind::Execution,
+                state: WorkflowTaskWaitState::Waiting,
+                inquiry: None,
+                target_execution: Some(99),
+                work_queue_item: None,
+                result: None,
+                resolved_at: None,
+                released_at: None,
+                created: now,
+                updated: now,
+            },
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(serde_json::to_value(hidden)
             .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        fields.sort_unstable();
-        assert_eq!(
-            fields,
-            [
-                "created",
-                "id",
-                "inquiry_id",
-                "kind",
-                "resolved_at",
-                "state",
-                "task_name",
-                "updated",
-            ]
-        );
+            .get("target_id")
+            .is_none());
     }
 }

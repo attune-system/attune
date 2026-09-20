@@ -320,12 +320,19 @@ async fn test_create_inquiry_allows_dangling_execution_reference() {
 async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
     use attune_common::{
         models::{
-            enums::{ExecutionStatus, WorkflowTaskWaitKind, WorkflowTaskWaitState},
+            enums::{ExecutionStatus, WorkflowTaskWaitState},
             execution::WorkflowTaskMetadata,
+            workflow::WorkflowTaskWaitTarget,
+            ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueItemStatus,
+            WorkQueueUpdateStrategy,
         },
         repositories::{
             execution::{CreateExecutionInput, ExecutionRepository},
             inquiry::CreateWorkflowInquiryInput,
+            work_queue::{
+                CreateWorkQueueInput, CreateWorkQueueItemInput, WorkQueueItemRepository,
+                WorkQueueRepository,
+            },
             workflow::{
                 CreateWorkflowDefinitionInput, CreateWorkflowExecutionInput,
                 WorkflowDefinitionRepository, WorkflowExecutionRepository,
@@ -455,13 +462,31 @@ async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
         CreateWorkflowTaskWaitInput {
             workflow_execution: workflow.id,
             task_name: "deploy".to_string(),
-            kind: WorkflowTaskWaitKind::Inquiry,
-            inquiry: inquiry.id,
+            target: WorkflowTaskWaitTarget::Inquiry(inquiry.id),
         },
     )
     .await
     .unwrap();
     assert_eq!(wait.state, WorkflowTaskWaitState::Waiting);
+    assert_eq!(
+        wait.target().unwrap(),
+        WorkflowTaskWaitTarget::Inquiry(inquiry.id)
+    );
+    assert!(
+        ExecutionRepository::is_in_execution_tree(&pool, parent.id, parent.id, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ExecutionRepository::is_in_execution_tree(&pool, parent.id, parent.id, false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        ExecutionRepository::is_in_execution_tree(&pool, parent.id, creator.id, false)
+            .await
+            .unwrap()
+    );
     let waits = WorkflowTaskWaitRepository::list_by_execution(&pool, parent.id)
         .await
         .unwrap();
@@ -521,13 +546,219 @@ async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
     assert!(released.resolved_at.is_some());
     assert!(released.released_at.is_some());
 
+    ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action_ref: "test.deploy".to_string(),
+            parent: Some(parent.id),
+            status: ExecutionStatus::Requested,
+            workflow_task: Some(WorkflowTaskMetadata {
+                workflow_execution: workflow.id,
+                task_name: "deploy".to_string(),
+                triggered_by: None,
+                task_index: None,
+                task_batch: None,
+                retry_count: 0,
+                max_retries: 0,
+                next_retry_at: None,
+                timeout_seconds: None,
+                timed_out: false,
+                duration_ms: None,
+                started_at: None,
+                completed_at: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(WorkflowTaskWaitRepository::find_resolvable(&pool, 100)
+        .await
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate.id == wait.id));
+
+    let execution_wait = WorkflowTaskWaitRepository::create_or_get(
+        &mut conn,
+        CreateWorkflowTaskWaitInput {
+            workflow_execution: workflow.id,
+            task_name: "after_request".to_string(),
+            target: WorkflowTaskWaitTarget::Execution(creator.id),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        execution_wait.target().unwrap(),
+        WorkflowTaskWaitTarget::Execution(creator.id)
+    );
+    assert!(matches!(
+        WorkflowTaskWaitRepository::create_or_get(
+            &mut conn,
+            CreateWorkflowTaskWaitInput {
+                workflow_execution: workflow.id,
+                task_name: "after_request".to_string(),
+                target: WorkflowTaskWaitTarget::Inquiry(inquiry.id),
+            },
+        )
+        .await,
+        Err(Error::InvalidState(_))
+    ));
+    assert!(WorkflowTaskWaitRepository::find_reconcilable_by_target(
+        &pool,
+        WorkflowTaskWaitTarget::Execution(creator.id),
+    )
+    .await
+    .unwrap()
+    .iter()
+    .any(|candidate| candidate.id == execution_wait.id));
+    assert!(WorkflowTaskWaitRepository::find_resolvable(&pool, 100)
+        .await
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate.id == execution_wait.id));
+    assert!(matches!(
+        ExecutionRepository::delete(&pool, creator.id).await,
+        Err(Error::InvalidState(_))
+    ));
+
+    let disappearing_execution = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action_ref: "test.disappearing".to_string(),
+            parent: Some(parent.id),
+            status: ExecutionStatus::Completed,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let disappearing_wait = WorkflowTaskWaitRepository::create_or_get(
+        &mut conn,
+        CreateWorkflowTaskWaitInput {
+            workflow_execution: workflow.id,
+            task_name: "after_disappearing_execution".to_string(),
+            target: WorkflowTaskWaitTarget::Execution(disappearing_execution.id),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM execution WHERE id = $1")
+        .bind(disappearing_execution.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(WorkflowTaskWaitRepository::find_resolvable(&pool, 100)
+        .await
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate.id == disappearing_wait.id));
+
+    let queue = WorkQueueRepository::create(
+        &pool,
+        CreateWorkQueueInput {
+            r#ref: format!("{}.wait-target", pack.r#ref),
+            pack: Some(pack.id),
+            pack_ref: Some(pack.r#ref.clone()),
+            is_adhoc: false,
+            label: "Wait target".to_string(),
+            description: None,
+            enabled: true,
+            accepting_new_items: true,
+            dispatch_action: None,
+            dispatch_action_ref: "test.dispatch".to_string(),
+            default_priority: 0,
+            allow_pending_update: false,
+            update_strategy: WorkQueueUpdateStrategy::Replace,
+            batch_mode: WorkQueueBatchMode::Single,
+            item_schema: json!({}),
+            action_params: json!({}),
+            trace_tag_template: None,
+            permission_set_refs: None,
+            config: json!({}),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let queue_item = WorkQueueItemRepository::create(
+        &pool,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: queue.r#ref.clone(),
+            item_key: None,
+            priority: 0,
+            status: WorkQueueItemStatus::Skipped,
+            payload: json!({}),
+            metadata: json!({}),
+            trace_tag: None,
+            enqueue_source: "test".to_string(),
+            requested_by_identity: None,
+            requested_by_execution: Some(parent.id),
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+            ack_summary: None,
+        },
+    )
+    .await
+    .unwrap();
+    let queue_wait = WorkflowTaskWaitRepository::create_or_get(
+        &mut conn,
+        CreateWorkflowTaskWaitInput {
+            workflow_execution: workflow.id,
+            task_name: "after_queue".to_string(),
+            target: WorkflowTaskWaitTarget::WorkQueueItem(queue_item.id),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(WorkflowTaskWaitRepository::find_resolvable(&pool, 100)
+        .await
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate.id == queue_wait.id));
+    assert!(matches!(
+        WorkQueueItemRepository::delete(&pool, queue_item.id).await,
+        Err(Error::InvalidState(_))
+    ));
+    assert!(matches!(
+        WorkQueueItemRepository::delete_if_statuses(
+            &pool,
+            queue_item.id,
+            &[WorkQueueItemStatus::Skipped],
+        )
+        .await,
+        Err(Error::InvalidState(_))
+    ));
+    assert!(matches!(
+        WorkQueueRepository::delete(&pool, queue.id).await,
+        Err(Error::InvalidState(_))
+    ));
+    WorkflowTaskWaitRepository::transition_waiting(
+        &pool,
+        queue_wait.id,
+        WorkflowTaskWaitState::Failed,
+        Some(json!({"code": "queue_item_failed"})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(WorkQueueItemRepository::delete(&pool, queue_item.id)
+        .await
+        .unwrap());
+    assert!(WorkQueueRepository::delete(&pool, queue.id).await.unwrap());
+
     let terminal_wait = WorkflowTaskWaitRepository::create_or_get(
         &mut conn,
         CreateWorkflowTaskWaitInput {
             workflow_execution: workflow.id,
             task_name: "verify_timeout_delivery".to_string(),
-            kind: WorkflowTaskWaitKind::Inquiry,
-            inquiry: inquiry.id,
+            target: WorkflowTaskWaitTarget::Inquiry(inquiry.id),
         },
     )
     .await
@@ -573,8 +804,7 @@ async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
         CreateWorkflowTaskWaitInput {
             workflow_execution: workflow.id,
             task_name: "cancelled_task".to_string(),
-            kind: WorkflowTaskWaitKind::Inquiry,
-            inquiry: pending_inquiry.id,
+            target: WorkflowTaskWaitTarget::Inquiry(pending_inquiry.id),
         },
     )
     .await

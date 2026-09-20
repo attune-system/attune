@@ -16,6 +16,15 @@ if TYPE_CHECKING:
     from ..models.update_rule_request_conditions_type_0 import (
         UpdateRuleRequestConditionsType0,
     )
+    from ..models.update_rule_request_sensor_worker_affinity_type_0 import (
+        UpdateRuleRequestSensorWorkerAffinityType0,
+    )
+    from ..models.update_rule_request_sensor_worker_selector_type_0 import (
+        UpdateRuleRequestSensorWorkerSelectorType0,
+    )
+    from ..models.update_rule_request_sensor_worker_tolerations_type_0_item import (
+        UpdateRuleRequestSensorWorkerTolerationsType0Item,
+    )
     from ..models.update_rule_request_trigger_params_type_0 import (
         UpdateRuleRequestTriggerParamsType0,
     )
@@ -32,6 +41,10 @@ class UpdateRuleRequest:
         action_params (None | UpdateRuleRequestActionParamsType0): Parameters to pass to the action when rule is
             triggered
         conditions (None | UpdateRuleRequestConditionsType0): Conditions for rule evaluation
+        sensor_worker_affinity (None | UpdateRuleRequestSensorWorkerAffinityType0): Replacement sensor-worker affinity.
+        sensor_worker_selector (None | UpdateRuleRequestSensorWorkerSelectorType0): Replacement sensor-worker selector.
+        sensor_worker_tolerations (list[UpdateRuleRequestSensorWorkerTolerationsType0Item] | None): Replacement sensor-
+            worker tolerations.
         trigger_params (None | UpdateRuleRequestTriggerParamsType0): Parameters for trigger configuration and event
             filtering
         action_ref (None | str | Unset): Action reference to execute when rule matches Example: slack.post_message.
@@ -49,6 +62,11 @@ class UpdateRuleRequest:
 
     action_params: None | UpdateRuleRequestActionParamsType0
     conditions: None | UpdateRuleRequestConditionsType0
+    sensor_worker_affinity: None | UpdateRuleRequestSensorWorkerAffinityType0
+    sensor_worker_selector: None | UpdateRuleRequestSensorWorkerSelectorType0
+    sensor_worker_tolerations: (
+        list[UpdateRuleRequestSensorWorkerTolerationsType0Item] | None
+    )
     trigger_params: None | UpdateRuleRequestTriggerParamsType0
     action_ref: None | str | Unset = UNSET
     description: None | str | Unset = UNSET
@@ -66,6 +84,12 @@ class UpdateRuleRequest:
         from ..models.update_rule_request_conditions_type_0 import (
             UpdateRuleRequestConditionsType0,
         )
+        from ..models.update_rule_request_sensor_worker_affinity_type_0 import (
+            UpdateRuleRequestSensorWorkerAffinityType0,
+        )
+        from ..models.update_rule_request_sensor_worker_selector_type_0 import (
+            UpdateRuleRequestSensorWorkerSelectorType0,
+        )
         from ..models.update_rule_request_trigger_params_type_0 import (
             UpdateRuleRequestTriggerParamsType0,
         )
@@ -81,6 +105,36 @@ class UpdateRuleRequest:
             conditions = self.conditions.to_dict()
         else:
             conditions = self.conditions
+
+        sensor_worker_affinity: dict[str, Any] | None
+        if isinstance(
+            self.sensor_worker_affinity, UpdateRuleRequestSensorWorkerAffinityType0
+        ):
+            sensor_worker_affinity = self.sensor_worker_affinity.to_dict()
+        else:
+            sensor_worker_affinity = self.sensor_worker_affinity
+
+        sensor_worker_selector: dict[str, Any] | None
+        if isinstance(
+            self.sensor_worker_selector, UpdateRuleRequestSensorWorkerSelectorType0
+        ):
+            sensor_worker_selector = self.sensor_worker_selector.to_dict()
+        else:
+            sensor_worker_selector = self.sensor_worker_selector
+
+        sensor_worker_tolerations: list[dict[str, Any]] | None
+        if isinstance(self.sensor_worker_tolerations, list):
+            sensor_worker_tolerations = []
+            for (
+                sensor_worker_tolerations_type_0_item_data
+            ) in self.sensor_worker_tolerations:
+                sensor_worker_tolerations_type_0_item = (
+                    sensor_worker_tolerations_type_0_item_data.to_dict()
+                )
+                sensor_worker_tolerations.append(sensor_worker_tolerations_type_0_item)
+
+        else:
+            sensor_worker_tolerations = self.sensor_worker_tolerations
 
         trigger_params: dict[str, Any] | None
         if isinstance(self.trigger_params, UpdateRuleRequestTriggerParamsType0):
@@ -139,6 +193,9 @@ class UpdateRuleRequest:
             {
                 "action_params": action_params,
                 "conditions": conditions,
+                "sensor_worker_affinity": sensor_worker_affinity,
+                "sensor_worker_selector": sensor_worker_selector,
+                "sensor_worker_tolerations": sensor_worker_tolerations,
                 "trigger_params": trigger_params,
             }
         )
@@ -166,6 +223,15 @@ class UpdateRuleRequest:
         )
         from ..models.update_rule_request_conditions_type_0 import (
             UpdateRuleRequestConditionsType0,
+        )
+        from ..models.update_rule_request_sensor_worker_affinity_type_0 import (
+            UpdateRuleRequestSensorWorkerAffinityType0,
+        )
+        from ..models.update_rule_request_sensor_worker_selector_type_0 import (
+            UpdateRuleRequestSensorWorkerSelectorType0,
+        )
+        from ..models.update_rule_request_sensor_worker_tolerations_type_0_item import (
+            UpdateRuleRequestSensorWorkerTolerationsType0Item,
         )
         from ..models.update_rule_request_trigger_params_type_0 import (
             UpdateRuleRequestTriggerParamsType0,
@@ -206,6 +272,82 @@ class UpdateRuleRequest:
             return cast(None | UpdateRuleRequestConditionsType0, data)
 
         conditions = _parse_conditions(d.pop("conditions"))
+
+        def _parse_sensor_worker_affinity(
+            data: object,
+        ) -> None | UpdateRuleRequestSensorWorkerAffinityType0:
+            if data is None:
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                sensor_worker_affinity_type_0 = (
+                    UpdateRuleRequestSensorWorkerAffinityType0.from_dict(data)
+                )
+
+                return sensor_worker_affinity_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | UpdateRuleRequestSensorWorkerAffinityType0, data)
+
+        sensor_worker_affinity = _parse_sensor_worker_affinity(
+            d.pop("sensor_worker_affinity")
+        )
+
+        def _parse_sensor_worker_selector(
+            data: object,
+        ) -> None | UpdateRuleRequestSensorWorkerSelectorType0:
+            if data is None:
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                sensor_worker_selector_type_0 = (
+                    UpdateRuleRequestSensorWorkerSelectorType0.from_dict(data)
+                )
+
+                return sensor_worker_selector_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | UpdateRuleRequestSensorWorkerSelectorType0, data)
+
+        sensor_worker_selector = _parse_sensor_worker_selector(
+            d.pop("sensor_worker_selector")
+        )
+
+        def _parse_sensor_worker_tolerations(
+            data: object,
+        ) -> list[UpdateRuleRequestSensorWorkerTolerationsType0Item] | None:
+            if data is None:
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                sensor_worker_tolerations_type_0 = []
+                _sensor_worker_tolerations_type_0 = data
+                for (
+                    sensor_worker_tolerations_type_0_item_data
+                ) in _sensor_worker_tolerations_type_0:
+                    sensor_worker_tolerations_type_0_item = (
+                        UpdateRuleRequestSensorWorkerTolerationsType0Item.from_dict(
+                            sensor_worker_tolerations_type_0_item_data
+                        )
+                    )
+
+                    sensor_worker_tolerations_type_0.append(
+                        sensor_worker_tolerations_type_0_item
+                    )
+
+                return sensor_worker_tolerations_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                list[UpdateRuleRequestSensorWorkerTolerationsType0Item] | None, data
+            )
+
+        sensor_worker_tolerations = _parse_sensor_worker_tolerations(
+            d.pop("sensor_worker_tolerations")
+        )
 
         def _parse_trigger_params(
             data: object,
@@ -304,6 +446,9 @@ class UpdateRuleRequest:
         update_rule_request = cls(
             action_params=action_params,
             conditions=conditions,
+            sensor_worker_affinity=sensor_worker_affinity,
+            sensor_worker_selector=sensor_worker_selector,
+            sensor_worker_tolerations=sensor_worker_tolerations,
             trigger_params=trigger_params,
             action_ref=action_ref,
             description=description,

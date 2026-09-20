@@ -12,8 +12,9 @@
 use anyhow::Result;
 use attune_common::{
     models::{
-        enums::ExecutionStatus, Execution, WorkQueueAck, WorkQueueAckItem, WorkQueueDispatch,
-        WorkQueueDispatchStatus, WorkQueueItem, WorkQueueItemStatus,
+        enums::ExecutionStatus, workflow::WorkflowTaskWaitTarget, Execution, WorkQueueAck,
+        WorkQueueAckItem, WorkQueueDispatch, WorkQueueDispatchStatus, WorkQueueItem,
+        WorkQueueItemStatus,
     },
     mq::{
         Consumer, ExecutionCompletedPayload, ExecutionRequestedPayload, MessageEnvelope,
@@ -216,7 +217,10 @@ impl CompletionListener {
         let mut execution = ExecutionRepository::find_by_id(pool, execution_id).await?;
 
         if let Some(ref exec) = execution.clone() {
-            execution = Some(Self::handle_queue_dispatch_completion(pool, publisher, exec).await?);
+            execution = Some(
+                Self::handle_queue_dispatch_completion(pool, publisher, exec, encryption_key)
+                    .await?,
+            );
         }
 
         if let Some(ref exec) = execution {
@@ -224,6 +228,14 @@ impl CompletionListener {
                 "Execution {} found with status: {:?}",
                 execution_id, exec.status
             );
+
+            ExecutionScheduler::release_target_waits(
+                pool,
+                publisher,
+                WorkflowTaskWaitTarget::Execution(exec.id),
+                encryption_key,
+            )
+            .await?;
 
             // Check if this execution is a workflow child task and advance the
             // workflow orchestration (schedule successor tasks or complete the
@@ -353,6 +365,7 @@ impl CompletionListener {
         pool: &PgPool,
         publisher: &Publisher,
         execution: &Execution,
+        encryption_key: Option<&str>,
     ) -> Result<Execution> {
         let Some(dispatch) =
             WorkQueueDispatchRepository::find_by_execution(pool, execution.id).await?
@@ -505,6 +518,22 @@ impl CompletionListener {
         )
         .await?;
         tx.commit().await?;
+
+        for item in &leased_items {
+            if let Err(error) = ExecutionScheduler::release_target_waits(
+                pool,
+                publisher,
+                WorkflowTaskWaitTarget::WorkQueueItem(item.id),
+                encryption_key,
+            )
+            .await
+            {
+                warn!(
+                    "Failed to reconcile workflow waits for queue item {}: {}",
+                    item.id, error
+                );
+            }
+        }
 
         info!(
             "Finalized queue dispatch {} for execution {} with {} leased item(s)",

@@ -25,6 +25,7 @@ class RuntimeSummary:
         updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
         description (None | str | Unset):  Example: Python runtime with virtualenv support.
         pack_ref (None | str | Unset):  Example: core.
+        retired_at (datetime.datetime | None | Unset):
     """
 
     created: datetime.datetime
@@ -34,6 +35,7 @@ class RuntimeSummary:
     updated: datetime.datetime
     description: None | str | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
+    retired_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,6 +61,14 @@ class RuntimeSummary:
         else:
             pack_ref = self.pack_ref
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -74,6 +84,8 @@ class RuntimeSummary:
             field_dict["description"] = description
         if pack_ref is not UNSET:
             field_dict["pack_ref"] = pack_ref
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
 
         return field_dict
 
@@ -108,6 +120,23 @@ class RuntimeSummary:
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         runtime_summary = cls(
             created=created,
             id=id,
@@ -116,6 +145,7 @@ class RuntimeSummary:
             updated=updated,
             description=description,
             pack_ref=pack_ref,
+            retired_at=retired_at,
         )
 
         runtime_summary.additional_properties = d

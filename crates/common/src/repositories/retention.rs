@@ -15,6 +15,10 @@ use crate::{
 const EXECUTION_RETENTION_PREDICATE: &str =
     "updated < $1 AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned') \
      AND NOT EXISTS ( \
+         SELECT 1 FROM workflow_task_wait wait \
+         WHERE wait.target_execution = execution.id AND wait.state = 'waiting' \
+     ) \
+     AND NOT EXISTS ( \
          SELECT 1 FROM workflow_execution workflow \
          JOIN workflow_log_outbox outbox ON outbox.workflow_execution = workflow.id \
          WHERE workflow.execution = execution.id AND outbox.delivered_at IS NULL \
@@ -476,7 +480,9 @@ impl RetentionRepository {
                 Self::delete_limited(
                     pool,
                     "work_queue_item",
-                    "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled')",
+                    "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled') \
+                     AND NOT EXISTS (SELECT 1 FROM workflow_task_wait wait \
+                         WHERE wait.work_queue_item = work_queue_item.id AND wait.state = 'waiting')",
                     "updated",
                     cutoff,
                     batch_size,
@@ -600,7 +606,9 @@ impl RetentionRepository {
                 Self::count_predicate(
                     pool,
                     "work_queue_item",
-                    "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled')",
+                    "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled') \
+                     AND NOT EXISTS (SELECT 1 FROM workflow_task_wait wait \
+                         WHERE wait.work_queue_item = work_queue_item.id AND wait.state = 'waiting')",
                     cutoff,
                 )
                 .await
@@ -718,9 +726,13 @@ impl RetentionRepository {
         let deleted = sqlx::query_scalar::<_, i64>(
             "WITH doomed AS MATERIALIZED (
                  SELECT execution.id FROM execution
-                 WHERE updated < $1
-                   AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')
-                   AND NOT EXISTS (
+                  WHERE updated < $1
+                    AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM workflow_task_wait wait
+                        WHERE wait.target_execution = execution.id AND wait.state = 'waiting'
+                    )
+                    AND NOT EXISTS (
                        SELECT 1 FROM workflow_execution workflow
                        JOIN workflow_log_outbox outbox
                          ON outbox.workflow_execution = workflow.id
@@ -955,5 +967,24 @@ mod tests {
             sensor_process_index < worker_index,
             "sensor_process retention should run before worker retention",
         );
+    }
+
+    #[test]
+    fn active_waits_are_excluded_from_retention_predicates() {
+        assert!(EXECUTION_RETENTION_PREDICATE.contains("wait.target_execution = execution.id"));
+
+        let queue_item_predicate =
+            "updated < $1 AND NOT EXISTS (SELECT 1 FROM workflow_task_wait wait \
+             WHERE wait.work_queue_item = work_queue_item.id AND wait.state = 'waiting')";
+        assert!(
+            RetentionRepository::count_sql("work_queue_item", queue_item_predicate)
+                .contains("wait.work_queue_item = work_queue_item.id")
+        );
+        assert!(RetentionRepository::delete_sql(
+            "work_queue_item",
+            queue_item_predicate,
+            "updated"
+        )
+        .contains("wait.state = 'waiting'"));
     }
 }

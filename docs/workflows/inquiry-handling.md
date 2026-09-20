@@ -53,12 +53,59 @@ The action creates the inquiry before sending a provider message. It calls `POST
       "required": true
     }
   },
+  "response_options": [
+    {
+      "ref": "approve",
+      "label": "Approve",
+      "style": "positive",
+      "response": {
+        "approved": true
+      }
+    },
+    {
+      "ref": "reject",
+      "label": "Reject",
+      "style": "destructive",
+      "response": {
+        "approved": false
+      }
+    }
+  ],
   "assigned_to": 42,
   "timeout_seconds": 3600
 }
 ```
 
 The API derives the creator execution, the workflow execution, and the workflow task from the token. Callers cannot supply those fields.
+
+The creation response contains the internal inquiry and rendering metadata with one opaque handle per response option:
+
+```json
+{
+  "data": {
+    "inquiry": {
+      "id": 918,
+      "status": "pending"
+    },
+    "response_options": [
+      {
+        "ref": "approve",
+        "label": "Approve",
+        "style": "positive",
+        "response_handle": "attune_irh_REDACTED"
+      },
+      {
+        "ref": "reject",
+        "label": "Reject",
+        "style": "destructive",
+        "response_handle": "attune_irh_REDACTED"
+      }
+    ]
+  }
+}
+```
+
+Use `inquiry.id` for `wait_for.inquiry`. Put each option's handle only in its matching provider control. Attune encrypts the handles, and each equivalent creation retry may return different handles for the same inquiry options. Every issued handle becomes unusable when the inquiry is answered, times out, or is cancelled. Do not log, audit, or return handles as an action output.
 
 The action needs an execution permission set that grants `inquiries:create`. The reserved `standard` permission set does not grant inquiry creation.
 
@@ -68,9 +115,9 @@ Creation is idempotent within this scope:
 workflow execution + workflow task name + action attempt family + purpose
 ```
 
-An equivalent retry returns the existing inquiry. A retry that changes `prompt`, `response_schema`, `assigned_to`, or `timeout_seconds` returns `409 Conflict`.
+An equivalent retry returns the existing inquiry. A retry that changes `prompt`, `response_schema`, `response_options`, `assigned_to`, or `timeout_seconds` returns `409 Conflict`.
 
-The action owns provider delivery and provider idempotency. If delivery definitely fails, cancel the inquiry before the action returns a failure. Attune prevents duplicate inquiry rows, but the provider adapter must prevent duplicate provider messages.
+The action owns provider delivery and provider idempotency. If delivery definitely fails, cancel the inquiry before the action returns a failure. Attune prevents duplicate inquiry rows, but the provider action must prevent duplicate provider messages.
 
 ## Response contract
 
@@ -89,6 +136,14 @@ The API validates the response against the inquiry's flat `response_schema`. Onl
 The response update uses a pending-state compare-and-set. A second response, a late response, or a response after cancellation returns `409 Conflict`.
 
 Provider integrations must map the provider actor to an Attune identity before submitting a response. Do not store provider credentials or raw callback bodies in inquiry metadata.
+
+Provider integrations configure the provider's callback URL to call Attune directly:
+
+```http
+POST /api/v1/inquiry-callbacks/{adapter_key}
+```
+
+The request body and authentication headers use the provider's native protocol. Attune authenticates the exact request bytes, extracts the option-bound handle and external actor through the configured callback adapter, persists the delivery, and invokes the shared inquiry response service. The handle supplies opaque correlation and option integrity, not authorization. Attune also requires an active adapter integration identity, a current `inquiries:respond` grant, an exact external identity mapping, and a mapped identity that matches `assigned_to`. See the [provider-neutral callback ingress](../plans/provider-neutral-inquiry-callback-ingress.md).
 
 ## Runtime behavior
 

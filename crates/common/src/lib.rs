@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod dashboard_spec;
 pub mod db;
 pub mod error;
+pub mod inquiry_response_handle;
 pub mod key_ref;
 pub mod log_stream;
 pub mod metadata_cache;

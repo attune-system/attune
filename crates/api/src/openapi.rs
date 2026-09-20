@@ -37,9 +37,16 @@ use crate::dto::{
     event::{EnforcementResponse, EnforcementSummary, EventResponse, EventSummary},
     execution::{
         ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
-        WorkflowCacheIterationResponse,
+        WorkflowCacheIterationResponse, WorkflowTaskWaitResponse,
     },
-    inquiry::{CreateInquiryRequest, InquiryRespondRequest, InquiryResponse, InquirySummary},
+    external_identity_mapping::{
+        CreateExternalIdentityMappingRequest, ExternalIdentityMappingResponse,
+        UpdateExternalIdentityMappingRequest,
+    },
+    inquiry::{
+        CreateInquiryRequest, CreateInquiryResponse, ExternalActorAssertion,
+        ExternalInquiryRespondRequest, InquiryRespondRequest, InquiryResponse, InquirySummary,
+    },
     key::{CreateKeyRequest, KeyResponse, KeySummary, UpdateKeyRequest},
     pack::{
         CreatePackRequest, InstallPackRequest, PackInstallProvenance, PackInstallResponse,
@@ -205,6 +212,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::work_queues::update_queue,
         crate::routes::work_queues::delete_queue,
         crate::routes::work_queues::list_queue_items,
+        crate::routes::work_queues::get_queue_item,
         crate::routes::work_queues::preview_queue_items_by_selector,
         crate::routes::work_queues::apply_queue_items_by_selector,
         crate::routes::work_queues::enqueue_queue_item,
@@ -281,6 +289,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::inquiries::list_inquiries_by_execution,
         crate::routes::inquiries::create_inquiry,
         crate::routes::inquiries::respond_to_inquiry,
+        crate::routes::inquiries::respond_to_inquiry_from_external_adapter,
         crate::routes::inquiries::cancel_inquiry,
 
         // Keys/Secrets
@@ -328,6 +337,13 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::permissions::create_integration_token,
         crate::routes::permissions::revoke_integration_token,
         crate::routes::permissions::delete_integration_token,
+
+        // External identity mappings
+        crate::routes::external_identity_mappings::create_external_identity_mapping,
+        crate::routes::external_identity_mappings::list_external_identity_mappings,
+        crate::routes::external_identity_mappings::get_external_identity_mapping,
+        crate::routes::external_identity_mappings::update_external_identity_mapping,
+        crate::routes::external_identity_mappings::delete_external_identity_mapping,
 
         // Workflows
         crate::routes::workflows::list_workflows,
@@ -436,6 +452,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<RuleResponse>,
             ApiResponse<ExecutionResponse>,
             ApiResponse<Vec<WorkflowCacheIterationResponse>>,
+            ApiResponse<Vec<WorkflowTaskWaitResponse>>,
             ApiResponse<EventResponse>,
             ApiResponse<EnforcementResponse>,
             ApiResponse<InquiryResponse>,
@@ -629,6 +646,9 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
             // Inquiry DTOs
             CreateInquiryRequest,
+            CreateInquiryResponse,
+            ExternalActorAssertion,
+            ExternalInquiryRespondRequest,
             InquiryRespondRequest,
             InquiryResponse,
             InquirySummary,
@@ -638,6 +658,13 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             UpdateKeyRequest,
             KeyResponse,
             KeySummary,
+
+            // External identity mapping DTOs
+            CreateExternalIdentityMappingRequest,
+            UpdateExternalIdentityMappingRequest,
+            ExternalIdentityMappingResponse,
+            ApiResponse<ExternalIdentityMappingResponse>,
+            PaginatedResponse<ExternalIdentityMappingResponse>,
 
             // Cache DTOs
             CreateCacheNamespaceRequest,
@@ -700,6 +727,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         (name = "rules", description = "Rule management endpoints"),
         (name = "executions", description = "Execution query endpoints"),
         (name = "inquiries", description = "Inquiry (human-in-the-loop) endpoints"),
+        (name = "external identity mappings", description = "Integration-owned external actor mappings"),
         (name = "events", description = "Event query endpoints"),
         (name = "enforcements", description = "Enforcement query endpoints"),
         (name = "secrets", description = "Secret management endpoints"),
@@ -869,12 +897,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 191,
+            path_count, 194,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 248,
+            operation_count, 255,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1388,6 +1416,15 @@ mod tests {
                 path
             );
         }
+
+        assert!(
+            doc.paths
+                .paths
+                .get("/api/v1/queues/{ref}/items/{item_id}")
+                .and_then(|item| item.get.as_ref())
+                .is_some(),
+            "expected queue item detail GET operation in OpenAPI spec"
+        );
 
         let components = doc.components.as_ref().expect("components should exist");
         for schema in [

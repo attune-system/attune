@@ -31,6 +31,7 @@ class PaginatedResponseTriggerSummaryItemsItem:
         pack_ref (None | str | Unset): Pack reference (optional) Example: core.
         reference_allowed_pack_refs (list[str] | Unset): Pack refs allowed to subscribe to this trigger when visibility
             is restricted. Example: ['incident_response', 'deployments'].
+        retired_at (datetime.datetime | None | Unset):
     """
 
     created: datetime.datetime
@@ -44,6 +45,7 @@ class PaginatedResponseTriggerSummaryItemsItem:
     description: None | str | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
     reference_allowed_pack_refs: list[str] | Unset = UNSET
+    retired_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -79,6 +81,14 @@ class PaginatedResponseTriggerSummaryItemsItem:
         if not isinstance(self.reference_allowed_pack_refs, Unset):
             reference_allowed_pack_refs = self.reference_allowed_pack_refs
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -99,6 +109,8 @@ class PaginatedResponseTriggerSummaryItemsItem:
             field_dict["pack_ref"] = pack_ref
         if reference_allowed_pack_refs is not UNSET:
             field_dict["reference_allowed_pack_refs"] = reference_allowed_pack_refs
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
 
         return field_dict
 
@@ -143,6 +155,23 @@ class PaginatedResponseTriggerSummaryItemsItem:
             list[str], d.pop("reference_allowed_pack_refs", UNSET)
         )
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         paginated_response_trigger_summary_items_item = cls(
             created=created,
             enabled=enabled,
@@ -155,6 +184,7 @@ class PaginatedResponseTriggerSummaryItemsItem:
             description=description,
             pack_ref=pack_ref,
             reference_allowed_pack_refs=reference_allowed_pack_refs,
+            retired_at=retired_at,
         )
 
         paginated_response_trigger_summary_items_item.additional_properties = d

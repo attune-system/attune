@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use crate::models::{enums::ExecutionStatus, execution::*, Id, JsonDict};
 use crate::scheduling::{parse_worker_affinity, parse_worker_selector, parse_worker_tolerations};
 use crate::trace_tag::default_execution_trace_tag;
-use crate::Result;
+use crate::{Error, Result};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder, Row};
 use tokio::time::{sleep, Duration};
 
@@ -270,6 +270,41 @@ impl Create for ExecutionRepository {
 }
 
 impl ExecutionRepository {
+    /// Return whether `execution_id` is in the tree rooted at `root_id`.
+    ///
+    /// The visited path prevents malformed parent cycles from recursing forever.
+    pub async fn is_in_execution_tree<'e, E>(
+        executor: E,
+        root_id: Id,
+        execution_id: Id,
+        include_root: bool,
+    ) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar(
+            "WITH RECURSIVE execution_tree AS ( \
+                 SELECT id, ARRAY[id]::BIGINT[] AS path \
+                 FROM execution WHERE id = $1 \
+                 UNION ALL \
+                 SELECT child.id, tree.path || child.id \
+                 FROM execution_tree tree \
+                 JOIN execution child ON child.parent = tree.id \
+                 WHERE NOT child.id = ANY(tree.path) \
+             ) \
+             SELECT EXISTS ( \
+                 SELECT 1 FROM execution_tree \
+                 WHERE id = $2 AND ($3 OR id <> $1) \
+             )",
+        )
+        .bind(root_id)
+        .bind(execution_id)
+        .bind(include_root)
+        .fetch_one(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn create_pinned<'e, E>(
         executor: E,
         input: CreateExecutionInput,
@@ -1200,9 +1235,15 @@ impl Delete for ExecutionRepository {
     {
         let result = sqlx::query(
             r#"
-            WITH deleted_execution AS (
+            WITH target AS (
+                SELECT EXISTS (
+                    SELECT 1 FROM workflow_task_wait
+                    WHERE target_execution = $1 AND state = 'waiting'
+                ) AS blocked
+            ),
+            deleted_execution AS (
                 DELETE FROM execution
-                WHERE id = $1
+                WHERE id = $1 AND NOT (SELECT blocked FROM target)
                 RETURNING id
             ),
             deleted_config_secrets AS (
@@ -1215,18 +1256,39 @@ impl Delete for ExecutionRepository {
                 WHERE entity_type = 'execution_result'
                   AND entity_id IN (SELECT id FROM deleted_execution)
             )
-            SELECT COUNT(*) AS deleted_count FROM deleted_execution
+            SELECT
+                (SELECT blocked FROM target) AS blocked,
+                COUNT(*) AS deleted_count
+            FROM deleted_execution
             "#,
         )
         .bind(id)
         .fetch_one(executor)
         .await?;
+        let blocked: bool = result.get("blocked");
+        if blocked {
+            return Err(Error::invalid_state(format!(
+                "execution {id} is targeted by an active workflow wait"
+            )));
+        }
         let deleted_count: i64 = result.get("deleted_count");
         Ok(deleted_count > 0)
     }
 }
 
 impl ExecutionRepository {
+    pub async fn find_by_id_for_update(
+        conn: &mut PgConnection,
+        id: Id,
+    ) -> Result<Option<Execution>> {
+        let query = format!("SELECT {SELECT_COLUMNS} FROM execution WHERE id = $1 FOR UPDATE");
+        sqlx::query_as::<_, Execution>(&query)
+            .bind(id)
+            .fetch_optional(conn)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Return a current execution load snapshot for the given worker IDs.
     pub async fn current_load_by_worker_ids(
         pool: &PgPool,

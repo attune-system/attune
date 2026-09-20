@@ -2,7 +2,7 @@
 
 use crate::models::{identity::*, Id, JsonDict};
 use crate::Result;
-use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder};
 
 use super::{Create, Delete, FindById, FindByRef, List, Repository, Update};
 
@@ -725,6 +725,49 @@ impl Delete for PermissionSetRepository {
 }
 
 impl PermissionSetRepository {
+    /// Loads direct permission sets and holds their assignments stable for the
+    /// caller's security-sensitive transaction.
+    pub async fn find_by_identity_for_share(
+        conn: &mut PgConnection,
+        identity_id: Id,
+    ) -> Result<Vec<PermissionSet>> {
+        sqlx::query_as::<_, PermissionSet>(
+            "SELECT ps.id, ps.ref, ps.pack, ps.pack_ref, ps.label, ps.description, \
+                    ps.grants, ps.retired_at, ps.created, ps.updated \
+             FROM permission_set ps \
+             INNER JOIN permission_assignment pa ON pa.permset = ps.id \
+             WHERE pa.identity = $1 AND ps.retired_at IS NULL \
+             ORDER BY ps.ref ASC \
+             FOR SHARE OF ps, pa",
+        )
+        .bind(identity_id)
+        .fetch_all(conn)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Loads role-derived permission sets and locks every assignment row that
+    /// supports the authorization decision.
+    pub async fn find_by_identity_roles_for_share(
+        conn: &mut PgConnection,
+        identity_id: Id,
+    ) -> Result<Vec<PermissionSet>> {
+        sqlx::query_as::<_, PermissionSet>(
+            "SELECT ps.id, ps.ref, ps.pack, ps.pack_ref, ps.label, ps.description, \
+                    ps.grants, ps.retired_at, ps.created, ps.updated \
+             FROM identity_role_assignment ira \
+             INNER JOIN permission_set_role_assignment psra ON psra.role = ira.role \
+             INNER JOIN permission_set ps ON ps.id = psra.permset \
+             WHERE ira.identity = $1 AND ps.retired_at IS NULL \
+             ORDER BY ps.ref ASC \
+             FOR SHARE OF ira, psra, ps",
+        )
+        .bind(identity_id)
+        .fetch_all(conn)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn find_by_ref_including_retired<'e, E>(
         executor: E,
         ref_str: &str,

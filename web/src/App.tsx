@@ -45,6 +45,9 @@ const ArtifactDetailPage = lazy(
 const QueuesPage = lazy(() => import("@/pages/queues/QueuesPage"));
 const QueueCreatePage = lazy(() => import("@/pages/queues/QueueCreatePage"));
 const QueueEditPage = lazy(() => import("@/pages/queues/QueueEditPage"));
+const QueueItemDetailPage = lazy(
+  () => import("@/pages/queues/QueueItemDetailPage"),
+);
 const PoliciesPage = lazy(() => import("@/pages/policies/PoliciesPage"));
 const PolicyCreatePage = lazy(
   () => import("@/pages/policies/PolicyCreatePage"),
@@ -169,6 +172,10 @@ function App() {
                   <Route path="queues" element={<QueuesPage />} />
                   <Route path="queues/new" element={<QueueCreatePage />} />
                   <Route path="queues/:ref" element={<QueueDetailPage />} />
+                  <Route
+                    path="queues/:ref/items/:itemId"
+                    element={<QueueItemDetailPage />}
+                  />
                   <Route path="queues/:ref/edit" element={<QueueEditPage />} />
                   <Route path="policies" element={<PoliciesPage />} />
                   <Route path="policies/new" element={<PolicyCreatePage />} />

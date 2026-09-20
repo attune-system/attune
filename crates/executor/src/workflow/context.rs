@@ -13,6 +13,9 @@
 //! | `parameters` | `{{ parameters.url }}` | Immutable workflow input parameters |
 //! | `workflow` | `{{ workflow.counter }}` | Mutable workflow-scoped variables (set via `publish`) |
 //! | `task` | `{{ task.fetch.result.data }}` | Completed task results keyed by task name |
+//! | `inquiry` | `{{ inquiry.approval.response }}` | Awaited inquiry snapshots keyed by guarded task |
+//! | `execution` | `{{ execution.after_job.result }}` | Awaited execution snapshots keyed by guarded task |
+//! | `work_queue_item` | `{{ work_queue_item.after_item.result }}` | Awaited queue item snapshots keyed by guarded task |
 //! | `config` | `{{ config.api_token }}` | Pack configuration values (read-only) |
 //! | `keystore` | `{{ keystore.secret_key }}` | Encrypted secrets from the key store (read-only) |
 //! | `item` | `{{ item }}` or `{{ item.name }}` | Current element in a `with_items` loop |
@@ -78,13 +81,13 @@ pub enum ContextError {
     JsonError(#[from] serde_json::Error),
 }
 
-/// The status of the last completed task, used by `succeeded()` / `failed()` /
-/// `timed_out()` function expressions.
+/// The status of the last completed task, used by workflow outcome functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
     Succeeded,
     Failed,
     TimedOut,
+    Cancelled,
 }
 
 /// Workflow execution context
@@ -106,6 +109,12 @@ pub struct WorkflowContext {
 
     /// Persisted awaited inquiries keyed by guarded task name.
     inquiries: Arc<DashMap<String, JsonValue>>,
+
+    /// Persisted awaited executions keyed by guarded task name.
+    executions: Arc<DashMap<String, JsonValue>>,
+
+    /// Persisted awaited queue items keyed by guarded task name.
+    work_queue_items: Arc<DashMap<String, JsonValue>>,
 
     /// System-provided variables. Canonical namespace: `system`.
     system: Arc<DashMap<String, JsonValue>>,
@@ -155,6 +164,8 @@ impl WorkflowContext {
             parameters: Arc::new(parameters),
             task_results: Arc::new(DashMap::new()),
             inquiries: Arc::new(DashMap::new()),
+            executions: Arc::new(DashMap::new()),
+            work_queue_items: Arc::new(DashMap::new()),
             system: Arc::new(system),
             pack_config: Arc::new(JsonValue::Null),
             keystore: Arc::new(JsonValue::Null),
@@ -198,6 +209,8 @@ impl WorkflowContext {
             parameters: Arc::new(parameters),
             task_results: Arc::new(results),
             inquiries: Arc::new(DashMap::new()),
+            executions: Arc::new(DashMap::new()),
+            work_queue_items: Arc::new(DashMap::new()),
             system: Arc::new(system),
             pack_config: Arc::new(JsonValue::Null),
             keystore: Arc::new(JsonValue::Null),
@@ -229,6 +242,14 @@ impl WorkflowContext {
 
     pub fn set_inquiry(&mut self, task_name: &str, inquiry: JsonValue) {
         self.inquiries.insert(task_name.to_string(), inquiry);
+    }
+
+    pub fn set_execution(&mut self, task_name: &str, execution: JsonValue) {
+        self.executions.insert(task_name.to_string(), execution);
+    }
+
+    pub fn set_work_queue_item(&mut self, task_name: &str, item: JsonValue) {
+        self.work_queue_items.insert(task_name.to_string(), item);
     }
 
     /// Get a task result by task name.
@@ -661,6 +682,18 @@ impl WorkflowContext {
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
 
+        let executions: HashMap<String, JsonValue> = self
+            .executions
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        let work_queue_items: HashMap<String, JsonValue> = self
+            .work_queue_items
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
         let system: HashMap<String, JsonValue> = self
             .system
             .iter()
@@ -672,6 +705,8 @@ impl WorkflowContext {
             "parameters": self.parameters.as_ref(),
             "task_results": task_results,
             "inquiries": inquiries,
+            "executions": executions,
+            "work_queue_items": work_queue_items,
             "system": system,
             "pack_config": self.pack_config.as_ref(),
             "keystore": self.keystore.as_ref(),
@@ -704,6 +739,20 @@ impl WorkflowContext {
             }
         }
 
+        let executions = DashMap::new();
+        if let Some(obj) = data["executions"].as_object() {
+            for (k, v) in obj {
+                executions.insert(k.clone(), v.clone());
+            }
+        }
+
+        let work_queue_items = DashMap::new();
+        if let Some(obj) = data["work_queue_items"].as_object() {
+            for (k, v) in obj {
+                work_queue_items.insert(k.clone(), v.clone());
+            }
+        }
+
         let system = DashMap::new();
         if let Some(obj) = data["system"].as_object() {
             for (k, v) in obj {
@@ -719,6 +768,8 @@ impl WorkflowContext {
             parameters: Arc::new(parameters),
             task_results: Arc::new(task_results),
             inquiries: Arc::new(inquiries),
+            executions: Arc::new(executions),
+            work_queue_items: Arc::new(work_queue_items),
             system: Arc::new(system),
             pack_config: Arc::new(pack_config),
             keystore: Arc::new(keystore),
@@ -906,6 +957,24 @@ impl EvalContext for WorkflowContext {
                 Ok(JsonValue::Object(map))
             }
 
+            "execution" => {
+                let map = self
+                    .executions
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect();
+                Ok(JsonValue::Object(map))
+            }
+
+            "work_queue_item" => {
+                let map = self
+                    .work_queue_items
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect();
+                Ok(JsonValue::Object(map))
+            }
+
             // `config` — pack configuration (read-only).
             "config" => Ok(self.pack_config.as_ref().clone()),
 
@@ -970,6 +1039,13 @@ impl EvalContext for WorkflowContext {
                 let val = self
                     .last_task_outcome
                     .map(|o| o == TaskOutcome::TimedOut)
+                    .unwrap_or(false);
+                Ok(Some(json!(val)))
+            }
+            "cancelled" => {
+                let val = self
+                    .last_task_outcome
+                    .map(|o| o == TaskOutcome::Cancelled)
                     .unwrap_or(false);
                 Ok(Some(json!(val)))
             }
@@ -1411,6 +1487,10 @@ mod tests {
         assert_eq!(ctx.evaluate_expression("succeeded()").unwrap(), json!(true));
         assert_eq!(ctx.evaluate_expression("failed()").unwrap(), json!(false));
         assert_eq!(
+            ctx.evaluate_expression("cancelled()").unwrap(),
+            json!(false)
+        );
+        assert_eq!(
             ctx.evaluate_expression("timed_out()").unwrap(),
             json!(false)
         );
@@ -1424,6 +1504,10 @@ mod tests {
 
         ctx.set_last_task_outcome(json!({}), TaskOutcome::TimedOut);
         assert_eq!(ctx.evaluate_expression("timed_out()").unwrap(), json!(true));
+
+        ctx.set_last_task_outcome(json!({}), TaskOutcome::Cancelled);
+        assert_eq!(ctx.evaluate_expression("cancelled()").unwrap(), json!(true));
+        assert_eq!(ctx.evaluate_expression("failed()").unwrap(), json!(false));
     }
 
     // ---------------------------------------------------------------
@@ -1554,6 +1638,8 @@ mod tests {
         ctx.set_var("test", json!("data"));
         ctx.set_task_result("task1", json!({"result": "ok"}));
         ctx.set_inquiry("deploy", json!({"id": 42, "response": {"approved": true}}));
+        ctx.set_execution("after_job", json!({"id": 43, "status": "completed"}));
+        ctx.set_work_queue_item("after_item", json!({"id": 44, "status": "completed"}));
         ctx.set_pack_config(json!({"setting": "val"}));
         ctx.set_keystore(json!({"secret": "hidden"}));
 
@@ -1578,6 +1664,18 @@ mod tests {
                 .evaluate_expression("inquiry.deploy.response.approved")
                 .unwrap(),
             json!(true)
+        );
+        assert_eq!(
+            imported
+                .evaluate_expression("execution.after_job.status")
+                .unwrap(),
+            json!("completed")
+        );
+        assert_eq!(
+            imported
+                .evaluate_expression("work_queue_item.after_item.id")
+                .unwrap(),
+            json!(44)
         );
     }
 

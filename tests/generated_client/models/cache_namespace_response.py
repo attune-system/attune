@@ -37,6 +37,7 @@ class CacheNamespaceResponse:
         owner_ref (None | str): Owner reference for display, when known.
         owner_type (OwnerType):
         record_count (int | None): Active generation record count, when populated.
+        retired_at (datetime.datetime | None):
         size_bytes (int | None): Active generation size in bytes, when populated.
         source_revision (None | str): Active generation source revision, when populated.
         stale (bool): True when the active generation's age exceeds the freshness target.
@@ -63,6 +64,7 @@ class CacheNamespaceResponse:
     owner_ref: None | str
     owner_type: OwnerType
     record_count: int | None
+    retired_at: datetime.datetime | None
     size_bytes: int | None
     source_revision: None | str
     stale: bool
@@ -118,6 +120,12 @@ class CacheNamespaceResponse:
         record_count: int | None
         record_count = self.record_count
 
+        retired_at: None | str
+        if isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         size_bytes: int | None
         size_bytes = self.size_bytes
 
@@ -153,6 +161,7 @@ class CacheNamespaceResponse:
                 "owner_ref": owner_ref,
                 "owner_type": owner_type,
                 "record_count": record_count,
+                "retired_at": retired_at,
                 "size_bytes": size_bytes,
                 "source_revision": source_revision,
                 "stale": stale,
@@ -243,6 +252,21 @@ class CacheNamespaceResponse:
 
         record_count = _parse_record_count(d.pop("record_count"))
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None:
+            if data is None:
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at"))
+
         def _parse_size_bytes(data: object) -> int | None:
             if data is None:
                 return data
@@ -283,6 +307,7 @@ class CacheNamespaceResponse:
             owner_ref=owner_ref,
             owner_type=owner_type,
             record_count=record_count,
+            retired_at=retired_at,
             size_bytes=size_bytes,
             source_revision=source_revision,
             stale=stale,

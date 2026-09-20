@@ -51,6 +51,7 @@ class SensorResponse:
         log_retention_policy (None | RetentionPolicyType | Unset):
         pack (int | None | Unset): Pack ID (optional) Example: 1.
         pack_ref (None | str | Unset): Pack reference (optional) Example: monitoring.
+        retired_at (datetime.datetime | None | Unset):
     """
 
     created: datetime.datetime
@@ -73,6 +74,7 @@ class SensorResponse:
     log_retention_policy: None | RetentionPolicyType | Unset = UNSET
     pack: int | None | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
+    retired_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -159,6 +161,14 @@ class SensorResponse:
         else:
             pack_ref = self.pack_ref
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -192,6 +202,8 @@ class SensorResponse:
             field_dict["pack"] = pack
         if pack_ref is not UNSET:
             field_dict["pack_ref"] = pack_ref
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
 
         return field_dict
 
@@ -346,6 +358,23 @@ class SensorResponse:
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         sensor_response = cls(
             created=created,
             enabled=enabled,
@@ -367,6 +396,7 @@ class SensorResponse:
             log_retention_policy=log_retention_policy,
             pack=pack,
             pack_ref=pack_ref,
+            retired_at=retired_at,
         )
 
         sensor_response.additional_properties = d

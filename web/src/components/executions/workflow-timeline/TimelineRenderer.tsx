@@ -470,7 +470,7 @@ export default function TimelineRenderer({
               return (
                 <g
                   key={node.id}
-                  className="cursor-pointer"
+                  className={task.destination ? "cursor-pointer" : undefined}
                   opacity={nodeOpacity}
                   style={{ transition: "opacity 0.2s ease" }}
                   onMouseEnter={(e) => handleTaskHover(task, e)}
@@ -479,7 +479,7 @@ export default function TimelineRenderer({
                   onClick={(e) => handleTaskClick(task, e)}
                   onDoubleClick={(e) => {
                     e.stopPropagation();
-                    onTaskClick?.(task);
+                    if (task.destination) onTaskClick?.(task);
                   }}
                 >
                   {/* Selection ring */}
@@ -881,7 +881,7 @@ function TaskTooltip({
 
         {/* Footer hint */}
         <div className="mt-2 pt-1.5 border-t border-gray-700 text-[10px] text-gray-500">
-          {gi
+          {gi || !task.destination
             ? "Click to highlight path"
             : "Click to highlight path · Double-click to view details"}
         </div>

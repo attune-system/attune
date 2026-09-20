@@ -35,9 +35,13 @@ class InquiryResponse:
         status (InquiryStatus):
         updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:45:00Z.
         assigned_to (int | None | Unset):
+        purpose (None | str | Unset):
         responded_at (datetime.datetime | None | Unset): When the inquiry was responded to Example:
             2024-01-13T10:45:00Z.
+        responded_by (int | None | Unset):
         timeout_at (datetime.datetime | None | Unset): When the inquiry expires Example: 2024-01-13T11:30:00Z.
+        workflow_execution (int | None | Unset):
+        workflow_task_name (None | str | Unset):
     """
 
     created: datetime.datetime
@@ -49,8 +53,12 @@ class InquiryResponse:
     status: InquiryStatus
     updated: datetime.datetime
     assigned_to: int | None | Unset = UNSET
+    purpose: None | str | Unset = UNSET
     responded_at: datetime.datetime | None | Unset = UNSET
+    responded_by: int | None | Unset = UNSET
     timeout_at: datetime.datetime | None | Unset = UNSET
+    workflow_execution: int | None | Unset = UNSET
+    workflow_task_name: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -91,6 +99,12 @@ class InquiryResponse:
         else:
             assigned_to = self.assigned_to
 
+        purpose: None | str | Unset
+        if isinstance(self.purpose, Unset):
+            purpose = UNSET
+        else:
+            purpose = self.purpose
+
         responded_at: None | str | Unset
         if isinstance(self.responded_at, Unset):
             responded_at = UNSET
@@ -99,6 +113,12 @@ class InquiryResponse:
         else:
             responded_at = self.responded_at
 
+        responded_by: int | None | Unset
+        if isinstance(self.responded_by, Unset):
+            responded_by = UNSET
+        else:
+            responded_by = self.responded_by
+
         timeout_at: None | str | Unset
         if isinstance(self.timeout_at, Unset):
             timeout_at = UNSET
@@ -106,6 +126,18 @@ class InquiryResponse:
             timeout_at = self.timeout_at.isoformat()
         else:
             timeout_at = self.timeout_at
+
+        workflow_execution: int | None | Unset
+        if isinstance(self.workflow_execution, Unset):
+            workflow_execution = UNSET
+        else:
+            workflow_execution = self.workflow_execution
+
+        workflow_task_name: None | str | Unset
+        if isinstance(self.workflow_task_name, Unset):
+            workflow_task_name = UNSET
+        else:
+            workflow_task_name = self.workflow_task_name
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -123,10 +155,18 @@ class InquiryResponse:
         )
         if assigned_to is not UNSET:
             field_dict["assigned_to"] = assigned_to
+        if purpose is not UNSET:
+            field_dict["purpose"] = purpose
         if responded_at is not UNSET:
             field_dict["responded_at"] = responded_at
+        if responded_by is not UNSET:
+            field_dict["responded_by"] = responded_by
         if timeout_at is not UNSET:
             field_dict["timeout_at"] = timeout_at
+        if workflow_execution is not UNSET:
+            field_dict["workflow_execution"] = workflow_execution
+        if workflow_task_name is not UNSET:
+            field_dict["workflow_task_name"] = workflow_task_name
 
         return field_dict
 
@@ -195,6 +235,15 @@ class InquiryResponse:
 
         assigned_to = _parse_assigned_to(d.pop("assigned_to", UNSET))
 
+        def _parse_purpose(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        purpose = _parse_purpose(d.pop("purpose", UNSET))
+
         def _parse_responded_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
                 return data
@@ -211,6 +260,15 @@ class InquiryResponse:
             return cast(datetime.datetime | None | Unset, data)
 
         responded_at = _parse_responded_at(d.pop("responded_at", UNSET))
+
+        def _parse_responded_by(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        responded_by = _parse_responded_by(d.pop("responded_by", UNSET))
 
         def _parse_timeout_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -229,6 +287,28 @@ class InquiryResponse:
 
         timeout_at = _parse_timeout_at(d.pop("timeout_at", UNSET))
 
+        def _parse_workflow_execution(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        workflow_execution = _parse_workflow_execution(
+            d.pop("workflow_execution", UNSET)
+        )
+
+        def _parse_workflow_task_name(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        workflow_task_name = _parse_workflow_task_name(
+            d.pop("workflow_task_name", UNSET)
+        )
+
         inquiry_response = cls(
             created=created,
             execution=execution,
@@ -239,8 +319,12 @@ class InquiryResponse:
             status=status,
             updated=updated,
             assigned_to=assigned_to,
+            purpose=purpose,
             responded_at=responded_at,
+            responded_by=responded_by,
             timeout_at=timeout_at,
+            workflow_execution=workflow_execution,
+            workflow_task_name=workflow_task_name,
         )
 
         inquiry_response.additional_properties = d

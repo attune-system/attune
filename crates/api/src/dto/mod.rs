@@ -10,6 +10,7 @@ pub mod common;
 pub mod dashboard;
 pub mod event;
 pub mod execution;
+pub mod external_identity_mapping;
 pub mod history;
 pub mod inquiry;
 pub mod key;
@@ -58,9 +59,14 @@ pub use execution::{
     ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
     WorkflowCacheIterationResponse, WorkflowTaskWaitResponse,
 };
+pub use external_identity_mapping::{
+    CreateExternalIdentityMappingRequest, ExternalIdentityMappingResponse,
+    UpdateExternalIdentityMappingRequest,
+};
 pub use history::{HistoryEntityTypePath, HistoryQueryParams, HistoryRecordResponse};
 pub use inquiry::{
-    CreateInquiryRequest, InquiryQueryParams, InquiryRespondRequest, InquiryResponse,
+    CreateInquiryRequest, CreateInquiryResponse, ExternalActorAssertion,
+    ExternalInquiryRespondRequest, InquiryQueryParams, InquiryRespondRequest, InquiryResponse,
     InquirySummary,
 };
 pub use key::{CreateKeyRequest, KeyQueryParams, KeyResponse, KeySummary, UpdateKeyRequest};

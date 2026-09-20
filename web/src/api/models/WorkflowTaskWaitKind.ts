@@ -4,4 +4,6 @@
 /* eslint-disable */
 export enum WorkflowTaskWaitKind {
   INQUIRY = "inquiry",
+  EXECUTION = "execution",
+  WORK_QUEUE_ITEM = "work_queue_item",
 }

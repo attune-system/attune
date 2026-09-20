@@ -377,10 +377,12 @@ pub mod enums {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
-    #[sqlx(type_name = "workflow_task_wait_kind_enum", rename_all = "lowercase")]
-    #[serde(rename_all = "lowercase")]
+    #[sqlx(type_name = "workflow_task_wait_kind_enum", rename_all = "snake_case")]
+    #[serde(rename_all = "snake_case")]
     pub enum WorkflowTaskWaitKind {
         Inquiry,
+        Execution,
+        WorkQueueItem,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
@@ -1887,7 +1889,7 @@ pub mod inquiry {
         pub timeout_at: Option<DateTime<Utc>>,
         pub timeout_seconds: Option<i64>,
         pub responded_by: Option<Id>,
-        pub provider_actor: Option<JsonValue>,
+        pub external_actor: Option<JsonValue>,
         pub responded_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
@@ -1896,7 +1898,7 @@ pub mod inquiry {
     pub const INQUIRY_SELECT_COLUMNS: &str =
         "id, execution, workflow_execution, workflow_task_name, \
         action_attempt_family, purpose, prompt, response_schema, assigned_to, status, response, \
-        timeout_at, timeout_seconds, responded_by, provider_actor, responded_at, created, updated";
+        timeout_at, timeout_seconds, responded_by, external_actor, responded_at, created, updated";
 }
 
 /// Identity and permissions
@@ -1974,6 +1976,19 @@ pub mod identity {
         pub revoked_at: Option<DateTime<Utc>>,
         pub revoked_by: Option<Id>,
         pub revocation_reason: Option<String>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct ExternalIdentityMapping {
+        pub id: Id,
+        pub integration_identity: Id,
+        pub mapped_identity: Id,
+        pub provider: String,
+        pub tenant: String,
+        pub external_subject: String,
+        pub created_by: Option<Id>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -2739,7 +2754,9 @@ pub mod workflow {
         pub task_name: String,
         pub kind: WorkflowTaskWaitKind,
         pub state: WorkflowTaskWaitState,
-        pub inquiry: Id,
+        pub inquiry: Option<Id>,
+        pub target_execution: Option<Id>,
+        pub work_queue_item: Option<Id>,
         pub result: Option<JsonValue>,
         pub resolved_at: Option<DateTime<Utc>>,
         pub released_at: Option<DateTime<Utc>>,
@@ -2747,8 +2764,57 @@ pub mod workflow {
         pub updated: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum WorkflowTaskWaitTarget {
+        Inquiry(Id),
+        Execution(Id),
+        WorkQueueItem(Id),
+    }
+
+    impl WorkflowTaskWaitTarget {
+        pub fn kind(self) -> WorkflowTaskWaitKind {
+            match self {
+                Self::Inquiry(_) => WorkflowTaskWaitKind::Inquiry,
+                Self::Execution(_) => WorkflowTaskWaitKind::Execution,
+                Self::WorkQueueItem(_) => WorkflowTaskWaitKind::WorkQueueItem,
+            }
+        }
+
+        pub fn id(self) -> Id {
+            match self {
+                Self::Inquiry(id) | Self::Execution(id) | Self::WorkQueueItem(id) => id,
+            }
+        }
+    }
+
+    impl WorkflowTaskWait {
+        pub fn target(&self) -> crate::Result<WorkflowTaskWaitTarget> {
+            match (
+                self.kind,
+                self.inquiry,
+                self.target_execution,
+                self.work_queue_item,
+            ) {
+                (WorkflowTaskWaitKind::Inquiry, Some(id), None, None) => {
+                    Ok(WorkflowTaskWaitTarget::Inquiry(id))
+                }
+                (WorkflowTaskWaitKind::Execution, None, Some(id), None) => {
+                    Ok(WorkflowTaskWaitTarget::Execution(id))
+                }
+                (WorkflowTaskWaitKind::WorkQueueItem, None, None, Some(id)) => {
+                    Ok(WorkflowTaskWaitTarget::WorkQueueItem(id))
+                }
+                _ => Err(crate::Error::invalid_state(format!(
+                    "workflow task wait {} has invalid target columns for kind {:?}",
+                    self.id, self.kind
+                ))),
+            }
+        }
+    }
+
     pub const WORKFLOW_TASK_WAIT_SELECT_COLUMNS: &str = "id, workflow_execution, task_name, kind, \
-        state, inquiry, result, resolved_at, released_at, created, updated";
+        state, inquiry, target_execution, work_queue_item, result, resolved_at, released_at, created, updated";
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct WorkflowCacheIteration {

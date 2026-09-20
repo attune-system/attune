@@ -28,6 +28,7 @@ class PaginatedResponseWorkflowSummaryItemsItem:
         version (str): Workflow version Example: 1.0.0.
         description (None | str | Unset): Workflow description Example: Automated incident response workflow with
             notifications and approvals.
+        retired_at (datetime.datetime | None | Unset):
     """
 
     created: datetime.datetime
@@ -39,6 +40,7 @@ class PaginatedResponseWorkflowSummaryItemsItem:
     updated: datetime.datetime
     version: str
     description: None | str | Unset = UNSET
+    retired_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +66,14 @@ class PaginatedResponseWorkflowSummaryItemsItem:
         else:
             description = self.description
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -80,6 +90,8 @@ class PaginatedResponseWorkflowSummaryItemsItem:
         )
         if description is not UNSET:
             field_dict["description"] = description
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
 
         return field_dict
 
@@ -111,6 +123,23 @@ class PaginatedResponseWorkflowSummaryItemsItem:
 
         description = _parse_description(d.pop("description", UNSET))
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         paginated_response_workflow_summary_items_item = cls(
             created=created,
             id=id,
@@ -121,6 +150,7 @@ class PaginatedResponseWorkflowSummaryItemsItem:
             updated=updated,
             version=version,
             description=description,
+            retired_at=retired_at,
         )
 
         paginated_response_workflow_summary_items_item.additional_properties = d

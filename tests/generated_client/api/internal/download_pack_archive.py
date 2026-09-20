@@ -35,6 +35,9 @@ def _parse_response(
     if response.status_code == 404:
         return None
 
+    if response.status_code == 416:
+        return None
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -57,7 +60,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Any]:
-    """Stream a pack directory as a `.tar.gz` archive.
+    """Return the deterministic archive for a pack's active release.
 
      Used by remote workers/sensors to download pack contents when they
     don't share a mounted volume with the API.
@@ -89,7 +92,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Any]:
-    """Stream a pack directory as a `.tar.gz` archive.
+    """Return the deterministic archive for a pack's active release.
 
      Used by remote workers/sensors to download pack contents when they
     don't share a mounted volume with the API.

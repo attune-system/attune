@@ -16,11 +16,10 @@ use attune_common::{
     metadata_cache::MetadataCache,
     models::{
         enums::{
-            ExecutionStatus, InquiryStatus, WorkflowCacheIterationState, WorkflowTaskWaitKind,
-            WorkflowTaskWaitState,
+            ExecutionStatus, InquiryStatus, WorkflowCacheIterationState, WorkflowTaskWaitState,
         },
         execution::WorkflowTaskMetadata,
-        workflow::WorkflowDefinition as WorkflowDefinitionModel,
+        workflow::{WorkflowDefinition as WorkflowDefinitionModel, WorkflowTaskWaitTarget},
         Action, CacheEntry, CacheGenerationState, Execution, ExecutionExecutableSnapshot,
         OwnerType, Runtime, WorkflowCacheIteration,
     },
@@ -42,6 +41,7 @@ use attune_common::{
         pack::PackRepository,
         runtime::{RuntimeRepository, WorkerRepository},
         trigger::SensorRepository,
+        work_queue::WorkQueueItemRepository,
         workflow::{
             CreateWorkflowExecutionInput, WorkflowDefinitionRepository, WorkflowExecutionRepository,
         },
@@ -66,7 +66,7 @@ use attune_common::{
     },
     trace_tag::normalize_trace_tag,
     version_matching::matches_constraint,
-    workflow::{IterateCacheConfig, WorkflowDefinition},
+    workflow::{IterateCacheConfig, TaskWaitFor, WorkflowDefinition},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,9 @@ use crate::policy_enforcer::{PolicyEnforcer, SchedulingPolicyOutcome};
 use crate::workflow::context::{TaskOutcome, WorkflowContext};
 use crate::workflow::graph::{BackoffStrategy, TaskGraph};
 use crate::workflow::log::{LogLevel, WorkflowLogger};
+use crate::workflow::task_wait::{
+    execution_resolution, work_queue_item_resolution, TargetResolution,
+};
 
 #[derive(Debug, Clone)]
 struct EffectiveWorkerPlacement {
@@ -535,18 +538,18 @@ struct WorkflowAdvanceOutcome {
 }
 
 #[derive(Debug, Clone)]
-struct InquiryPrerequisiteError {
+struct TaskWaitPrerequisiteError {
     task_name: String,
     detail: String,
 }
 
-impl std::fmt::Display for InquiryPrerequisiteError {
+impl std::fmt::Display for TaskWaitPrerequisiteError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.detail)
     }
 }
 
-impl std::error::Error for InquiryPrerequisiteError {}
+impl std::error::Error for TaskWaitPrerequisiteError {}
 
 #[derive(Debug, Clone)]
 struct RenderedWorkflowTaskInput {
@@ -1790,10 +1793,10 @@ impl ExecutionScheduler {
         )
         .await;
         if let Err(error) = activation {
-            let Some(prerequisite_error) = error.downcast_ref::<InquiryPrerequisiteError>() else {
+            let Some(prerequisite_error) = error.downcast_ref::<TaskWaitPrerequisiteError>() else {
                 return Err(error);
             };
-            let logical_outcome = Self::inquiry_prerequisite_failure_execution(
+            let logical_outcome = Self::task_wait_prerequisite_failure_execution(
                 parent_execution,
                 *workflow_execution_id,
                 prerequisite_error,
@@ -1811,7 +1814,7 @@ impl ExecutionScheduler {
             pending_completions.extend(outcome.completed_children);
             pending_completions.extend(outcome.completed_execution);
         }
-        let outcome = Self::advance_resolved_inquiry_wait_with_conn(
+        let outcome = Self::advance_resolved_task_wait_with_conn(
             &mut transaction,
             round_robin_counter,
             encryption_key,
@@ -2881,64 +2884,130 @@ impl ExecutionScheduler {
         };
 
         let invalid_prerequisite = |detail: String| {
-            anyhow::Error::new(InquiryPrerequisiteError {
+            anyhow::Error::new(TaskWaitPrerequisiteError {
                 task_name: task_node.name.clone(),
                 detail,
             })
         };
-        let rendered = wf_ctx.render_json(&wait_for.inquiry).map_err(|error| {
+        let (target_name, target_template) = wait_for.target();
+        let rendered = wf_ctx.render_json(target_template).map_err(|error| {
             invalid_prerequisite(format!(
-                "failed to render inquiry prerequisite for task '{}': {error}",
+                "failed to render {target_name} prerequisite for task '{}': {error}",
                 task_node.name
             ))
         })?;
-        let inquiry_id = rendered.as_i64().filter(|id| *id > 0).ok_or_else(|| {
+        let target_id = rendered.as_i64().filter(|id| *id > 0).ok_or_else(|| {
             invalid_prerequisite(format!(
-                "inquiry prerequisite for task '{}' must resolve to a positive integer",
+                "{target_name} prerequisite for task '{}' must resolve to a positive integer",
                 task_node.name
             ))
         })?;
-        let inquiry = InquiryRepository::find_by_id_for_update(conn, inquiry_id)
-            .await?
-            .ok_or_else(|| invalid_prerequisite(format!("inquiry {inquiry_id} does not exist")))?;
-        if inquiry.workflow_execution != Some(*workflow_execution_id) {
-            return Err(invalid_prerequisite(format!(
-                "inquiry {inquiry_id} does not belong to workflow execution {workflow_execution_id}"
-            )));
+        let target = match wait_for {
+            TaskWaitFor::Inquiry(_) => WorkflowTaskWaitTarget::Inquiry(target_id),
+            TaskWaitFor::Execution(_) => WorkflowTaskWaitTarget::Execution(target_id),
+            TaskWaitFor::WorkQueueItem(_) => WorkflowTaskWaitTarget::WorkQueueItem(target_id),
+        };
+
+        if let Some(existing) = WorkflowTaskWaitRepository::find_by_workflow_task(
+            &mut *conn,
+            *workflow_execution_id,
+            &task_node.name,
+        )
+        .await?
+        {
+            if existing.target()? != target {
+                return Err(invalid_prerequisite(format!(
+                    "task '{}' already waits on an unrelated target",
+                    task_node.name
+                )));
+            }
+            match existing.state {
+                WorkflowTaskWaitState::Released => {
+                    let mut target_context = wf_ctx.clone();
+                    if let Some(snapshot) = existing.result {
+                        Self::set_task_wait_context(
+                            &mut target_context,
+                            target,
+                            &task_node.name,
+                            snapshot,
+                        );
+                    }
+                    return Self::dispatch_workflow_task_with_conn(
+                        conn,
+                        round_robin_counter,
+                        parent_execution,
+                        workflow_execution_id,
+                        task_node,
+                        &target_context,
+                        encryption_key,
+                        triggered_by,
+                        pending_messages,
+                        pending_completions,
+                    )
+                    .await;
+                }
+                WorkflowTaskWaitState::Waiting => {}
+                WorkflowTaskWaitState::TimedOut
+                | WorkflowTaskWaitState::Cancelled
+                | WorkflowTaskWaitState::Failed => return Ok(()),
+            }
         }
+
+        let resolution = Self::resolve_task_wait_target(
+            conn,
+            parent_execution.id,
+            *workflow_execution_id,
+            target,
+            &task_node.name,
+        )
+        .await?;
 
         let wait = WorkflowTaskWaitRepository::create_or_get(
             conn,
             CreateWorkflowTaskWaitInput {
                 workflow_execution: *workflow_execution_id,
                 task_name: task_node.name.clone(),
-                kind: WorkflowTaskWaitKind::Inquiry,
-                inquiry: inquiry_id,
+                target,
             },
         )
         .await?;
 
-        if wait.state != WorkflowTaskWaitState::Waiting
-            && wait.state != WorkflowTaskWaitState::Released
-        {
+        if !matches!(
+            wait.state,
+            WorkflowTaskWaitState::Waiting | WorkflowTaskWaitState::Released
+        ) {
             return Ok(());
         }
 
-        match inquiry.status {
-            InquiryStatus::Pending => Ok(()),
-            InquiryStatus::Responded => {
-                let mut inquiry_context = wf_ctx.clone();
-                inquiry_context.set_inquiry(
+        if wait.state == WorkflowTaskWaitState::Released {
+            let mut target_context = wf_ctx.clone();
+            if let Some(snapshot) = wait.result {
+                Self::set_task_wait_context(&mut target_context, target, &task_node.name, snapshot);
+            }
+            return Self::dispatch_workflow_task_with_conn(
+                conn,
+                round_robin_counter,
+                parent_execution,
+                workflow_execution_id,
+                task_node,
+                &target_context,
+                encryption_key,
+                triggered_by,
+                pending_messages,
+                pending_completions,
+            )
+            .await;
+        }
+
+        match resolution {
+            TargetResolution::Waiting => Ok(()),
+            TargetResolution::Released(snapshot) => {
+                let mut target_context = wf_ctx.clone();
+                Self::set_task_wait_context(
+                    &mut target_context,
+                    target,
                     &task_node.name,
-                    serde_json::json!({
-                        "id": inquiry.id,
-                        "status": inquiry.status,
-                        "response": inquiry.response,
-                        "assigned_to": inquiry.assigned_to,
-                        "responded_by": inquiry.responded_by,
-                        "responded_at": inquiry.responded_at,
-                        "timeout_at": inquiry.timeout_at,
-                    }),
+                    snapshot.clone(),
                 );
                 Self::dispatch_workflow_task_with_conn(
                     conn,
@@ -2946,29 +3015,148 @@ impl ExecutionScheduler {
                     parent_execution,
                     workflow_execution_id,
                     task_node,
-                    &inquiry_context,
+                    &target_context,
                     encryption_key,
                     triggered_by,
                     pending_messages,
                     pending_completions,
                 )
                 .await?;
-                if wait.state == WorkflowTaskWaitState::Waiting {
-                    WorkflowTaskWaitRepository::transition_waiting(
-                        conn,
-                        wait.id,
-                        WorkflowTaskWaitState::Released,
-                        None,
-                    )
-                    .await?;
-                }
+                WorkflowTaskWaitRepository::transition_waiting(
+                    conn,
+                    wait.id,
+                    WorkflowTaskWaitState::Released,
+                    Some(snapshot),
+                )
+                .await?;
                 Ok(())
             }
-            InquiryStatus::Timeout | InquiryStatus::Cancelled => Ok(()),
+            TargetResolution::Failed(snapshot) => {
+                WorkflowTaskWaitRepository::transition_waiting(
+                    conn,
+                    wait.id,
+                    WorkflowTaskWaitState::Failed,
+                    Some(snapshot),
+                )
+                .await?;
+                Ok(())
+            }
+            TargetResolution::TimedOut(snapshot) => {
+                WorkflowTaskWaitRepository::transition_waiting(
+                    conn,
+                    wait.id,
+                    WorkflowTaskWaitState::TimedOut,
+                    Some(snapshot),
+                )
+                .await?;
+                Ok(())
+            }
         }
     }
 
-    async fn populate_inquiry_context(
+    async fn resolve_task_wait_target(
+        conn: &mut PgConnection,
+        workflow_root_execution: i64,
+        workflow_execution_id: i64,
+        target: WorkflowTaskWaitTarget,
+        task_name: &str,
+    ) -> Result<TargetResolution> {
+        let invalid = |detail| {
+            anyhow::Error::new(TaskWaitPrerequisiteError {
+                task_name: task_name.to_string(),
+                detail,
+            })
+        };
+        match target {
+            WorkflowTaskWaitTarget::Inquiry(inquiry_id) => {
+                let inquiry = InquiryRepository::find_by_id_for_update(conn, inquiry_id)
+                    .await?
+                    .ok_or_else(|| invalid(format!("inquiry {inquiry_id} does not exist")))?;
+                if inquiry.workflow_execution != Some(workflow_execution_id) {
+                    return Err(invalid(format!(
+                        "inquiry {inquiry_id} does not belong to workflow execution {workflow_execution_id}"
+                    )));
+                }
+                let snapshot = serde_json::json!({
+                    "id": inquiry.id,
+                    "status": inquiry.status,
+                    "response": inquiry.response,
+                    "assigned_to": inquiry.assigned_to,
+                    "responded_by": inquiry.responded_by,
+                    "responded_at": inquiry.responded_at,
+                    "timeout_at": inquiry.timeout_at,
+                });
+                Ok(match inquiry.status {
+                    InquiryStatus::Pending => TargetResolution::Waiting,
+                    InquiryStatus::Responded => TargetResolution::Released(snapshot),
+                    InquiryStatus::Timeout => TargetResolution::TimedOut(serde_json::json!({
+                        "code": "inquiry_timeout", "inquiry_id": inquiry.id, "status": "timeout"
+                    })),
+                    InquiryStatus::Cancelled => TargetResolution::Failed(serde_json::json!({
+                        "code": "inquiry_cancelled", "inquiry_id": inquiry.id, "status": "cancelled"
+                    })),
+                })
+            }
+            WorkflowTaskWaitTarget::Execution(execution_id) => {
+                let execution = ExecutionRepository::find_by_id_for_update(conn, execution_id)
+                    .await?
+                    .ok_or_else(|| invalid(format!("execution {execution_id} does not exist")))?;
+                let owned = ExecutionRepository::is_in_execution_tree(
+                    &mut *conn,
+                    workflow_root_execution,
+                    execution_id,
+                    false,
+                )
+                .await?;
+                if !owned || execution.workflow_task.is_some() {
+                    return Err(invalid(format!(
+                        "execution {execution_id} is not an eligible descendant of workflow root {workflow_root_execution}"
+                    )));
+                }
+                Ok(execution_resolution(&execution))
+            }
+            WorkflowTaskWaitTarget::WorkQueueItem(item_id) => {
+                let item = WorkQueueItemRepository::find_by_id_for_update(conn, item_id)
+                    .await?
+                    .ok_or_else(|| invalid(format!("work queue item {item_id} does not exist")))?;
+                let requester = item.requested_by_execution.ok_or_else(|| {
+                    invalid(format!(
+                        "work queue item {item_id} was not requested by an execution"
+                    ))
+                })?;
+                let owned = ExecutionRepository::is_in_execution_tree(
+                    &mut *conn,
+                    workflow_root_execution,
+                    requester,
+                    true,
+                )
+                .await?;
+                if !owned {
+                    return Err(invalid(format!(
+                        "work queue item {item_id} is unrelated to workflow root {workflow_root_execution}"
+                    )));
+                }
+                Ok(work_queue_item_resolution(&item))
+            }
+        }
+    }
+
+    fn set_task_wait_context(
+        wf_ctx: &mut WorkflowContext,
+        target: WorkflowTaskWaitTarget,
+        task_name: &str,
+        snapshot: JsonValue,
+    ) {
+        match target {
+            WorkflowTaskWaitTarget::Inquiry(_) => wf_ctx.set_inquiry(task_name, snapshot),
+            WorkflowTaskWaitTarget::Execution(_) => wf_ctx.set_execution(task_name, snapshot),
+            WorkflowTaskWaitTarget::WorkQueueItem(_) => {
+                wf_ctx.set_work_queue_item(task_name, snapshot)
+            }
+        }
+    }
+
+    async fn populate_task_wait_context(
         conn: &mut PgConnection,
         workflow_execution_id: i64,
         wf_ctx: &mut WorkflowContext,
@@ -2987,38 +3175,46 @@ impl ExecutionScheduler {
             .map(|inquiry| (inquiry.id, inquiry))
             .collect();
         for wait in waits {
-            let Some(inquiry) = inquiries_by_id.get(&wait.inquiry) else {
-                continue;
-            };
-            wf_ctx.set_inquiry(
-                &wait.task_name,
-                serde_json::json!({
-                    "id": inquiry.id,
-                    "status": inquiry.status,
-                    "response": inquiry.response,
-                    "assigned_to": inquiry.assigned_to,
-                    "responded_by": inquiry.responded_by,
-                    "responded_at": inquiry.responded_at,
-                    "timeout_at": inquiry.timeout_at,
-                }),
-            );
+            let target = wait.target()?;
+            if let WorkflowTaskWaitTarget::Inquiry(inquiry_id) = target {
+                if let Some(inquiry) = inquiries_by_id.get(&inquiry_id) {
+                    wf_ctx.set_inquiry(
+                        &wait.task_name,
+                        serde_json::json!({
+                            "id": inquiry.id,
+                            "status": inquiry.status,
+                            "response": inquiry.response,
+                            "assigned_to": inquiry.assigned_to,
+                            "responded_by": inquiry.responded_by,
+                            "responded_at": inquiry.responded_at,
+                            "timeout_at": inquiry.timeout_at,
+                        }),
+                    );
+                    continue;
+                }
+            }
+            if wait.state != WorkflowTaskWaitState::Waiting {
+                if let Some(snapshot) = wait.result {
+                    Self::set_task_wait_context(wf_ctx, target, &wait.task_name, snapshot);
+                }
+            }
         }
         Ok(())
     }
 
-    fn inquiry_prerequisite_failure_execution(
+    fn task_wait_prerequisite_failure_execution(
         parent_execution: &Execution,
         workflow_execution_id: i64,
-        error: &InquiryPrerequisiteError,
+        error: &TaskWaitPrerequisiteError,
         triggered_by: Option<String>,
     ) -> Execution {
         let mut logical_outcome = parent_execution.clone();
         logical_outcome.id = -workflow_execution_id;
         logical_outcome.action = None;
-        logical_outcome.action_ref = "system.inquiry_wait".to_string();
+        logical_outcome.action_ref = "system.task_wait".to_string();
         logical_outcome.status = ExecutionStatus::Failed;
         logical_outcome.result = Some(serde_json::json!({
-            "code": "inquiry_reference_invalid",
+            "code": "task_wait_reference_invalid",
             "message": error.detail,
         }));
         logical_outcome.workflow_task = Some(WorkflowTaskMetadata {
@@ -3039,7 +3235,7 @@ impl ExecutionScheduler {
         logical_outcome
     }
 
-    async fn advance_resolved_inquiry_wait_with_conn(
+    async fn advance_resolved_task_wait_with_conn(
         conn: &mut PgConnection,
         round_robin_counter: &AtomicUsize,
         encryption_key: Option<&str>,
@@ -3083,12 +3279,22 @@ impl ExecutionScheduler {
             return Ok(WorkflowAdvanceOutcome::default());
         }
 
+        WorkflowTaskWaitRepository::mark_terminal_delivery_complete(&mut *conn, wait.id).await?;
+
         let mut logical_outcome = parent_execution.clone();
         logical_outcome.id = -wait.id;
         logical_outcome.action = None;
-        logical_outcome.action_ref = "system.inquiry_wait".to_string();
+        logical_outcome.action_ref = "system.task_wait".to_string();
         logical_outcome.status = if wait.state == WorkflowTaskWaitState::TimedOut {
             ExecutionStatus::Timeout
+        } else if wait
+            .result
+            .as_ref()
+            .and_then(|result| result.get("status"))
+            .and_then(JsonValue::as_str)
+            == Some("cancelled")
+        {
+            ExecutionStatus::Cancelled
         } else {
             ExecutionStatus::Failed
         };
@@ -4839,8 +5045,22 @@ impl ExecutionScheduler {
         inquiry_id: i64,
         encryption_key: Option<&str>,
     ) -> Result<()> {
-        let waits =
-            WorkflowTaskWaitRepository::find_reconcilable_by_inquiry(pool, inquiry_id).await?;
+        Self::release_target_waits(
+            pool,
+            publisher,
+            WorkflowTaskWaitTarget::Inquiry(inquiry_id),
+            encryption_key,
+        )
+        .await
+    }
+
+    pub(crate) async fn release_target_waits(
+        pool: &PgPool,
+        publisher: &Publisher,
+        target: WorkflowTaskWaitTarget,
+        encryption_key: Option<&str>,
+    ) -> Result<()> {
+        let waits = WorkflowTaskWaitRepository::find_reconcilable_by_target(pool, target).await?;
         for wait in waits {
             let mut transaction = pool.begin().await?;
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -4854,7 +5074,7 @@ impl ExecutionScheduler {
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Workflow execution {} not found for inquiry wait {}",
+                    "Workflow execution {} not found for task wait {}",
                     wait.workflow_execution,
                     wait.id
                 )
@@ -4903,37 +5123,52 @@ impl ExecutionScheduler {
                 continue;
             }
 
-            let inquiry = InquiryRepository::find_by_id_for_update(&mut transaction, wait.inquiry)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Inquiry {} not found", wait.inquiry))?;
-            match inquiry.status {
-                InquiryStatus::Timeout => {
-                    WorkflowTaskWaitRepository::transition_waiting(
-                        &mut *transaction,
-                        wait.id,
-                        WorkflowTaskWaitState::TimedOut,
-                        Some(serde_json::json!({
-                            "code": "inquiry_timeout",
-                            "inquiry_id": inquiry.id,
-                            "status": "timeout"
-                        })),
-                    )
-                    .await?;
+            if wait.state == WorkflowTaskWaitState::Waiting {
+                match Self::resolve_task_wait_target(
+                    &mut transaction,
+                    parent_execution.id,
+                    workflow_execution.id,
+                    target,
+                    &wait.task_name,
+                )
+                .await
+                {
+                    Ok(TargetResolution::Waiting | TargetResolution::Released(_)) => {}
+                    Ok(TargetResolution::TimedOut(snapshot)) => {
+                        WorkflowTaskWaitRepository::transition_waiting(
+                            &mut *transaction,
+                            wait.id,
+                            WorkflowTaskWaitState::TimedOut,
+                            Some(snapshot),
+                        )
+                        .await?;
+                    }
+                    Ok(TargetResolution::Failed(snapshot)) => {
+                        WorkflowTaskWaitRepository::transition_waiting(
+                            &mut *transaction,
+                            wait.id,
+                            WorkflowTaskWaitState::Failed,
+                            Some(snapshot),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        let Some(prerequisite) = error.downcast_ref::<TaskWaitPrerequisiteError>()
+                        else {
+                            return Err(error);
+                        };
+                        WorkflowTaskWaitRepository::transition_waiting(
+                            &mut *transaction,
+                            wait.id,
+                            WorkflowTaskWaitState::Failed,
+                            Some(serde_json::json!({
+                                "code": "task_wait_target_invalid",
+                                "message": prerequisite.detail,
+                            })),
+                        )
+                        .await?;
+                    }
                 }
-                InquiryStatus::Cancelled => {
-                    WorkflowTaskWaitRepository::transition_waiting(
-                        &mut *transaction,
-                        wait.id,
-                        WorkflowTaskWaitState::Failed,
-                        Some(serde_json::json!({
-                            "code": "inquiry_cancelled",
-                            "inquiry_id": inquiry.id,
-                            "status": "cancelled"
-                        })),
-                    )
-                    .await?;
-                }
-                InquiryStatus::Pending | InquiryStatus::Responded => {}
             }
 
             let workflow_def = WorkflowDefinitionRepository::find_by_id_including_retired(
@@ -5007,7 +5242,7 @@ impl ExecutionScheduler {
                 &child_executions,
                 workflow_execution.id,
             );
-            Self::populate_inquiry_context(&mut transaction, workflow_execution.id, &mut wf_ctx)
+            Self::populate_task_wait_context(&mut transaction, workflow_execution.id, &mut wf_ctx)
                 .await?;
 
             let mut pending_messages = Vec::new();
@@ -5026,7 +5261,7 @@ impl ExecutionScheduler {
                 &mut pending_completions,
             )
             .await?;
-            let outcome = Self::advance_resolved_inquiry_wait_with_conn(
+            let outcome = Self::advance_resolved_task_wait_with_conn(
                 &mut transaction,
                 &round_robin_counter,
                 encryption_key,
@@ -5232,6 +5467,8 @@ impl ExecutionScheduler {
             TaskOutcome::Succeeded
         } else if task_timed_out {
             TaskOutcome::TimedOut
+        } else if execution.status == ExecutionStatus::Cancelled {
+            TaskOutcome::Cancelled
         } else {
             TaskOutcome::Failed
         };
@@ -5284,6 +5521,7 @@ impl ExecutionScheduler {
             workflow_execution.status,
             parent_execution.status,
             execution.status,
+            execution.id < 0,
         ) {
             if let Some(iteration) =
                 WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
@@ -5630,7 +5868,7 @@ impl ExecutionScheduler {
             &workflow_execution.variables,
             task_results_map,
         );
-        Self::populate_inquiry_context(&mut *conn, workflow_execution_id, &mut wf_ctx).await?;
+        Self::populate_task_wait_context(&mut *conn, workflow_execution_id, &mut wf_ctx).await?;
         Self::mark_workflow_parameter_secret_sources(&wf_ctx, &parent_execution);
         Self::mark_workflow_task_result_secret_sources(
             &wf_ctx,
@@ -5781,7 +6019,7 @@ impl ExecutionScheduler {
                 let should_fire = match transition.kind() {
                     crate::workflow::graph::TransitionKind::Succeeded => task_succeeded,
                     crate::workflow::graph::TransitionKind::Failed => {
-                        !task_succeeded && !task_timed_out
+                        task_outcome == TaskOutcome::Failed
                     }
                     crate::workflow::graph::TransitionKind::Always => true,
                     crate::workflow::graph::TransitionKind::TimedOut => task_timed_out,
@@ -5890,6 +6128,7 @@ impl ExecutionScheduler {
 
         // Dispatch successor tasks, passing the updated workflow context
         let mut logical_prerequisite_failures = Vec::new();
+        let mut terminal_wait_tasks = Vec::new();
         for next_task_name in &tasks_to_schedule {
             if let Some(task_node) = graph.get_task(next_task_name) {
                 if let Err(e) = Self::activate_workflow_task_with_conn(
@@ -5906,7 +6145,8 @@ impl ExecutionScheduler {
                 )
                 .await
                 {
-                    if let Some(prerequisite_error) = e.downcast_ref::<InquiryPrerequisiteError>() {
+                    if let Some(prerequisite_error) = e.downcast_ref::<TaskWaitPrerequisiteError>()
+                    {
                         logical_prerequisite_failures
                             .push((prerequisite_error.clone(), Some(task_name.clone())));
                         continue;
@@ -5916,6 +6156,22 @@ impl ExecutionScheduler {
                         next_task_name, e
                     );
                     return Err(e);
+                }
+                if WorkflowTaskWaitRepository::find_by_workflow_task(
+                    &mut *conn,
+                    workflow_execution_id,
+                    next_task_name,
+                )
+                .await?
+                .is_some_and(|wait| {
+                    matches!(
+                        wait.state,
+                        WorkflowTaskWaitState::TimedOut
+                            | WorkflowTaskWaitState::Cancelled
+                            | WorkflowTaskWaitState::Failed
+                    )
+                }) {
+                    terminal_wait_tasks.push(next_task_name.clone());
                 }
             }
         }
@@ -5927,6 +6183,7 @@ impl ExecutionScheduler {
                 !logical_prerequisite_failures
                     .iter()
                     .any(|(error, _)| error.task_name == task.as_str())
+                    && !terminal_wait_tasks.contains(task)
             })
             .cloned()
             .collect();
@@ -5951,9 +6208,11 @@ impl ExecutionScheduler {
         )
         .await?;
 
-        if !logical_prerequisite_failures.is_empty() {
+        let has_logical_wait_failures = !logical_prerequisite_failures.is_empty();
+        let has_terminal_waits = !terminal_wait_tasks.is_empty();
+        if has_logical_wait_failures || has_terminal_waits {
             for (prerequisite_error, triggered_by) in logical_prerequisite_failures {
-                let logical_outcome = Self::inquiry_prerequisite_failure_execution(
+                let logical_outcome = Self::task_wait_prerequisite_failure_execution(
                     &parent_execution,
                     workflow_execution_id,
                     &prerequisite_error,
@@ -5965,6 +6224,22 @@ impl ExecutionScheduler {
                     encryption_key,
                     &logical_outcome,
                     metadata_caches,
+                ))
+                .await?;
+                pending_messages.extend(outcome.execution_requests);
+                pending_completed_children.extend(outcome.completed_children);
+                if outcome.completed_execution.is_some() {
+                    pending_completed_execution = outcome.completed_execution;
+                }
+            }
+            for terminal_task in terminal_wait_tasks {
+                let outcome = Box::pin(Self::advance_resolved_task_wait_with_conn(
+                    &mut *conn,
+                    round_robin_counter,
+                    encryption_key,
+                    &parent_execution,
+                    workflow_execution_id,
+                    &terminal_task,
                 ))
                 .await?;
                 pending_messages.extend(outcome.execution_requests);
@@ -5986,6 +6261,12 @@ impl ExecutionScheduler {
             && deferred_join_tasks.is_empty()
             && running_children == 0
             && WorkflowTaskWaitRepository::count_waiting(&mut *conn, workflow_execution_id).await?
+                == 0
+            && WorkflowTaskWaitRepository::count_pending_terminal_delivery(
+                &mut *conn,
+                workflow_execution_id,
+            )
+            .await?
                 == 0;
 
         if all_done {
@@ -6101,6 +6382,7 @@ impl ExecutionScheduler {
         workflow_status: ExecutionStatus,
         parent_status: ExecutionStatus,
         child_status: ExecutionStatus,
+        logical_outcome: bool,
     ) -> bool {
         matches!(
             workflow_status,
@@ -6108,10 +6390,11 @@ impl ExecutionScheduler {
         ) || matches!(
             parent_status,
             ExecutionStatus::Canceling | ExecutionStatus::Cancelled
-        ) || matches!(
-            child_status,
-            ExecutionStatus::Canceling | ExecutionStatus::Cancelled
-        )
+        ) || (!logical_outcome
+            && matches!(
+                child_status,
+                ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+            ))
     }
 
     /// Finalize a cancelled workflow by updating the parent `execution` record
@@ -7348,6 +7631,10 @@ mod tests {
     use attune_common::{
         config::Config,
         models::{
+            enums::{
+                ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueItemStatus,
+                WorkQueueUpdateStrategy,
+            },
             execution::{
                 ActionExecutableSnapshot, PackReleasePin, ReleasedActionExecutableSnapshot,
             },
@@ -7360,6 +7647,10 @@ mod tests {
             inquiry::{CreateWorkflowInquiryInput, InquiryRepository, UpdateInquiryInput},
             pack::{CreatePackInput, PackRepository},
             pack_release::{CreatePackReleaseInput, PackReleaseRepository},
+            work_queue::{
+                CreateWorkQueueInput, CreateWorkQueueItemInput, UpdateWorkQueueItemInput,
+                WorkQueueItemRepository, WorkQueueRepository,
+            },
             workflow::{
                 CreateWorkflowDefinitionInput, CreateWorkflowExecutionInput,
                 WorkflowDefinitionRepository, WorkflowExecutionRepository,
@@ -7375,10 +7666,14 @@ mod tests {
     struct InquirySchedulerFixture {
         database: TestDatabase,
         parent: Execution,
+        request: Execution,
         workflow_execution_id: i64,
         inquiry: Inquiry,
+        graph: TaskGraph,
         guarded_task: TaskNode,
         context: WorkflowContext,
+        queue_id: i64,
+        queue_ref: String,
     }
 
     impl InquirySchedulerFixture {
@@ -7427,8 +7722,66 @@ tasks:
     next:
       - do: [timeout_handler]
         when: "{{ timed_out() }}"
+  - name: execution_completed_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      execution: "{{ task.request.execution_completed }}"
+  - name: execution_failed_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      execution: "{{ task.request.execution_failed }}"
+    next:
+      - do: [failure_handler]
+        when: "{{ failed() }}"
+  - name: execution_timeout_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      execution: "{{ task.request.execution_timeout }}"
+    next:
+      - do: [timeout_handler]
+        when: "{{ timed_out() }}"
+  - name: execution_cancelled_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      execution: "{{ task.request.execution_cancelled }}"
+    next:
+      - do: [failure_handler]
+        when: "{{ cancelled() }}"
+      - do: [timeout_handler]
+        when: "{{ failed() }}"
+  - name: queue_completed_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      work_queue_item: "{{ task.request.queue_completed }}"
+  - name: queue_skipped_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      work_queue_item: "{{ task.request.queue_skipped }}"
+  - name: queue_failed_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      work_queue_item: "{{ task.request.queue_failed }}"
+  - name: queue_cancelled_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      work_queue_item: "{{ task.request.queue_cancelled }}"
+    next:
+      - do: [failure_handler]
+        when: "{{ cancelled() }}"
+      - do: [timeout_handler]
+        when: "{{ failed() }}"
+  - name: unrelated_execution_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      execution: "{{ task.request.unrelated_execution }}"
+  - name: unrelated_queue_guarded
+    action: scheduler_inquiry_it.guarded
+    wait_for:
+      work_queue_item: "{{ task.request.unrelated_queue }}"
   - name: timeout_handler
     action: scheduler_inquiry_it.timeout_handler
+  - name: failure_handler
+    action: scheduler_inquiry_it.failure_handler
 "#;
             let workflow = attune_common::workflow::parse_workflow_yaml(workflow_source)
                 .expect("parse test workflow");
@@ -7490,6 +7843,36 @@ tasks:
             let request_action = create_action(pool, pack.id, "request").await;
             let guarded_action = create_action(pool, pack.id, "guarded").await;
             let timeout_action = create_action(pool, pack.id, "timeout_handler").await;
+            let failure_action = create_action(pool, pack.id, "failure_handler").await;
+
+            let queue = WorkQueueRepository::create(
+                pool,
+                CreateWorkQueueInput {
+                    r#ref: "scheduler_inquiry_it.wait_targets".to_string(),
+                    pack: Some(pack.id),
+                    pack_ref: Some(pack.r#ref.clone()),
+                    is_adhoc: false,
+                    label: "Scheduler wait targets".to_string(),
+                    description: None,
+                    enabled: true,
+                    accepting_new_items: true,
+                    dispatch_action: Some(guarded_action.id),
+                    dispatch_action_ref: guarded_action.r#ref.clone(),
+                    default_priority: 0,
+                    allow_pending_update: false,
+                    update_strategy: WorkQueueUpdateStrategy::Replace,
+                    batch_mode: WorkQueueBatchMode::Single,
+                    item_schema: serde_json::json!({}),
+                    action_params: serde_json::json!({}),
+                    trace_tag_template: None,
+                    permission_set_refs: None,
+                    config: serde_json::json!({}),
+                    reference_visibility: ActionReferenceVisibility::Public,
+                    reference_allowed_pack_refs: Vec::new(),
+                },
+            )
+            .await
+            .expect("create wait target queue");
 
             let mut transaction = pool.begin().await.expect("start release transaction");
             let release = PackReleaseRepository::create_or_get(
@@ -7522,7 +7905,12 @@ tasks:
                 workflow_definition: None,
             };
             let mut pack_executables = BTreeMap::new();
-            for action in [&request_action, &guarded_action, &timeout_action] {
+            for action in [
+                &request_action,
+                &guarded_action,
+                &timeout_action,
+                &failure_action,
+            ] {
                 pack_executables.insert(
                     action.r#ref.clone(),
                     ReleasedActionExecutableSnapshot {
@@ -7637,40 +8025,157 @@ tasks:
             Self {
                 database,
                 parent,
+                request,
                 workflow_execution_id: workflow_execution.id,
                 inquiry,
+                graph,
                 guarded_task,
                 context,
+                queue_id: queue.id,
+                queue_ref: queue.r#ref,
             }
         }
 
-        async fn activate_guarded(&self) -> Vec<PendingExecutionRequested> {
-            let mut transaction = self
-                .database
-                .pool()
-                .begin()
-                .await
-                .expect("begin activation");
+        fn task(&self, name: &str) -> TaskNode {
+            self.graph.get_task(name).expect("test task exists").clone()
+        }
+
+        async fn context_with_request_result(&self, result: JsonValue) -> WorkflowContext {
+            ExecutionRepository::update(
+                self.database.pool(),
+                self.request.id,
+                UpdateExecutionInput {
+                    result: Some(result.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist wait target result");
+            let mut context = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+            context.set_task_result("request", result);
+            context
+        }
+
+        async fn create_execution(&self, status: ExecutionStatus, owned: bool) -> Execution {
+            let snapshot = self
+                .request
+                .executable_snapshot
+                .as_ref()
+                .expect("request has executable snapshot");
+            ExecutionRepository::create_pinned(
+                self.database.pool(),
+                CreateExecutionInput {
+                    action: self.request.action,
+                    action_ref: self.request.action_ref.clone(),
+                    parent: owned.then_some(self.parent.id),
+                    status,
+                    result: Some(serde_json::json!({"target": true})),
+                    ..Default::default()
+                },
+                snapshot,
+            )
+            .await
+            .expect("create wait target execution")
+        }
+
+        async fn create_queue_item(&self, status: WorkQueueItemStatus, requester: i64) -> i64 {
+            WorkQueueItemRepository::create(
+                self.database.pool(),
+                CreateWorkQueueItemInput {
+                    queue: self.queue_id,
+                    queue_ref: self.queue_ref.clone(),
+                    item_key: None,
+                    priority: 0,
+                    status,
+                    payload: serde_json::json!({}),
+                    metadata: serde_json::json!({}),
+                    trace_tag: None,
+                    enqueue_source: "scheduler-test".to_string(),
+                    requested_by_identity: None,
+                    requested_by_execution: Some(requester),
+                    requested_by_enforcement: None,
+                    leased_execution: None,
+                    lease_token: None,
+                    lease_expires_at: None,
+                    attempt_count: 0,
+                    last_error: (status == WorkQueueItemStatus::Failed)
+                        .then(|| serde_json::json!({"message": "failed"})),
+                    ack_summary: (status != WorkQueueItemStatus::Failed)
+                        .then(|| serde_json::json!({"processed": true})),
+                },
+            )
+            .await
+            .expect("create wait target queue item")
+            .id
+        }
+
+        async fn activate_task(
+            &self,
+            task_name: &str,
+            context: &WorkflowContext,
+        ) -> anyhow::Result<Vec<PendingExecutionRequested>> {
+            let task = self.task(task_name);
+            let mut transaction = self.database.pool().begin().await?;
             let mut pending = Vec::new();
             ExecutionScheduler::activate_workflow_task_with_conn(
                 &mut transaction,
                 &AtomicUsize::new(0),
                 &self.parent,
                 &self.workflow_execution_id,
-                &self.guarded_task,
-                &self.context,
+                &task,
+                context,
                 None,
                 Some("request"),
                 &mut pending,
                 &mut Vec::new(),
             )
-            .await
-            .expect("activate guarded task");
-            transaction.commit().await.expect("commit activation");
-            pending
+            .await?;
+            transaction.commit().await?;
+            Ok(pending)
         }
 
-        async fn guarded_children(&self) -> Vec<Execution> {
+        async fn wait(&self, task_name: &str) -> attune_common::models::WorkflowTaskWait {
+            WorkflowTaskWaitRepository::find_by_workflow_task(
+                self.database.pool(),
+                self.workflow_execution_id,
+                task_name,
+            )
+            .await
+            .expect("load task wait")
+            .expect("task wait exists")
+        }
+
+        async fn advance_terminal_wait(&self, task_name: &str) -> WorkflowAdvanceOutcome {
+            let mut transaction = self
+                .database
+                .pool()
+                .begin()
+                .await
+                .expect("begin terminal wait advancement");
+            let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
+                &mut transaction,
+                &AtomicUsize::new(0),
+                None,
+                &self.parent,
+                self.workflow_execution_id,
+                task_name,
+            )
+            .await
+            .expect("advance terminal task wait");
+            transaction
+                .commit()
+                .await
+                .expect("commit terminal wait advancement");
+            outcome
+        }
+
+        async fn activate_guarded(&self) -> Vec<PendingExecutionRequested> {
+            self.activate_task(&self.guarded_task.name, &self.context)
+                .await
+                .expect("activate guarded task")
+        }
+
+        async fn task_children(&self, task_name: &str) -> Vec<Execution> {
             ExecutionRepository::find_by_parent(self.database.pool(), self.parent.id)
                 .await
                 .expect("list workflow children")
@@ -7679,9 +8184,13 @@ tasks:
                     execution
                         .workflow_task
                         .as_ref()
-                        .is_some_and(|task| task.task_name == "guarded")
+                        .is_some_and(|task| task.task_name == task_name)
                 })
                 .collect()
+        }
+
+        async fn guarded_children(&self) -> Vec<Execution> {
+            self.task_children("guarded").await
         }
     }
 
@@ -7805,7 +8314,7 @@ tasks:
             .begin()
             .await
             .expect("begin timeout");
-        let outcome = ExecutionScheduler::advance_resolved_inquiry_wait_with_conn(
+        let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
             &mut transaction,
             &AtomicUsize::new(0),
             None,
@@ -7835,6 +8344,450 @@ tasks:
         .expect("workflow execution exists");
         assert!(workflow.completed_tasks.contains(&"guarded".to_string()));
         assert!(!workflow.failed_tasks.contains(&"guarded".to_string()));
+
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean test database");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn completed_owned_execution_wait_is_idempotent_across_activation_and_reconciliation() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let target = fixture
+            .create_execution(ExecutionStatus::Completed, true)
+            .await;
+        let context = fixture
+            .context_with_request_result(serde_json::json!({
+                "execution_completed": target.id
+            }))
+            .await;
+
+        let first = fixture
+            .activate_task("execution_completed_guarded", &context)
+            .await
+            .expect("activate completed execution wait");
+        let duplicate = fixture
+            .activate_task("execution_completed_guarded", &context)
+            .await
+            .expect("repeat completed execution wait activation");
+        let children = fixture.task_children("execution_completed_guarded").await;
+
+        assert_eq!(
+            fixture.wait("execution_completed_guarded").await.state,
+            WorkflowTaskWaitState::Released
+        );
+        assert_eq!(
+            children.len(),
+            1,
+            "duplicate activation created another child"
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(duplicate.len(), 1);
+        assert_eq!(first[0].execution_id, children[0].id);
+        assert_eq!(duplicate[0].execution_id, children[0].id);
+
+        let reconcilable =
+            WorkflowTaskWaitRepository::find_resolvable(fixture.database.pool(), 100)
+                .await
+                .expect("find restart reconciliation work");
+        assert!(reconcilable.iter().any(|wait| {
+            wait.workflow_execution == fixture.workflow_execution_id
+                && wait.task_name == "execution_completed_guarded"
+        }));
+
+        let mut transaction = fixture
+            .database
+            .pool()
+            .begin()
+            .await
+            .expect("begin request reconciliation");
+        let mut replayed = Vec::new();
+        ExecutionScheduler::collect_reconcilable_workflow_messages_with_conn(
+            &mut transaction,
+            &fixture.parent,
+            fixture.workflow_execution_id,
+            &mut replayed,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("collect requested child after restart");
+        transaction
+            .commit()
+            .await
+            .expect("commit request reconciliation");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].execution_id, children[0].id);
+
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean test database");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn failed_and_timed_out_execution_waits_take_logical_transitions_without_children() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let failed = fixture
+            .create_execution(ExecutionStatus::Failed, true)
+            .await;
+        let timed_out = fixture
+            .create_execution(ExecutionStatus::Timeout, true)
+            .await;
+        let context = fixture
+            .context_with_request_result(serde_json::json!({
+                "execution_failed": failed.id,
+                "execution_timeout": timed_out.id
+            }))
+            .await;
+
+        assert!(fixture
+            .activate_task("execution_failed_guarded", &context)
+            .await
+            .expect("activate failed execution wait")
+            .is_empty());
+        assert!(fixture
+            .activate_task("execution_timeout_guarded", &context)
+            .await
+            .expect("activate timed-out execution wait")
+            .is_empty());
+        assert_eq!(
+            fixture.wait("execution_failed_guarded").await.state,
+            WorkflowTaskWaitState::Failed
+        );
+        assert_eq!(
+            fixture.wait("execution_timeout_guarded").await.state,
+            WorkflowTaskWaitState::TimedOut
+        );
+        assert!(fixture
+            .task_children("execution_failed_guarded")
+            .await
+            .is_empty());
+        assert!(fixture
+            .task_children("execution_timeout_guarded")
+            .await
+            .is_empty());
+
+        let failed_outcome = fixture
+            .advance_terminal_wait("execution_failed_guarded")
+            .await;
+        let timeout_outcome = fixture
+            .advance_terminal_wait("execution_timeout_guarded")
+            .await;
+        assert!(failed_outcome
+            .execution_requests
+            .iter()
+            .any(|request| request.action_ref == "scheduler_inquiry_it.failure_handler"));
+        assert!(timeout_outcome
+            .execution_requests
+            .iter()
+            .any(|request| request.action_ref == "scheduler_inquiry_it.timeout_handler"));
+
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean test database");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn cancelled_targets_take_cancelled_transitions_without_children() {
+        for (task_name, target_key, target_kind) in [
+            (
+                "execution_cancelled_guarded",
+                "execution_cancelled",
+                "execution",
+            ),
+            ("queue_cancelled_guarded", "queue_cancelled", "queue"),
+        ] {
+            let fixture = InquirySchedulerFixture::create().await;
+            let target_id = if target_kind == "execution" {
+                fixture
+                    .create_execution(ExecutionStatus::Cancelled, true)
+                    .await
+                    .id
+            } else {
+                fixture
+                    .create_queue_item(WorkQueueItemStatus::Cancelled, fixture.parent.id)
+                    .await
+            };
+            let context = fixture
+                .context_with_request_result(serde_json::json!({(target_key): target_id}))
+                .await;
+
+            assert!(fixture
+                .activate_task(task_name, &context)
+                .await
+                .expect("activate cancelled target wait")
+                .is_empty());
+            assert!(fixture.task_children(task_name).await.is_empty());
+            let outcome = fixture.advance_terminal_wait(task_name).await;
+            assert!(outcome
+                .execution_requests
+                .iter()
+                .any(|request| request.action_ref == "scheduler_inquiry_it.failure_handler"));
+            assert!(!outcome
+                .execution_requests
+                .iter()
+                .any(|request| request.action_ref == "scheduler_inquiry_it.timeout_handler"));
+
+            fixture
+                .database
+                .cleanup()
+                .await
+                .expect("clean test database");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn terminal_owned_queue_items_release_only_completed_waits() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let completed = fixture
+            .create_queue_item(WorkQueueItemStatus::Completed, fixture.parent.id)
+            .await;
+        let skipped = fixture
+            .create_queue_item(WorkQueueItemStatus::Skipped, fixture.parent.id)
+            .await;
+        let failed = fixture
+            .create_queue_item(WorkQueueItemStatus::Failed, fixture.parent.id)
+            .await;
+        let context = fixture
+            .context_with_request_result(serde_json::json!({
+                "queue_completed": completed,
+                "queue_skipped": skipped,
+                "queue_failed": failed
+            }))
+            .await;
+
+        assert_eq!(
+            fixture
+                .activate_task("queue_completed_guarded", &context)
+                .await
+                .expect("activate completed queue item wait")
+                .len(),
+            1
+        );
+        for task_name in ["queue_skipped_guarded", "queue_failed_guarded"] {
+            assert!(fixture
+                .activate_task(task_name, &context)
+                .await
+                .expect("activate unsuccessful queue item wait")
+                .is_empty());
+            assert_eq!(
+                fixture.wait(task_name).await.state,
+                WorkflowTaskWaitState::Failed
+            );
+            assert!(fixture.task_children(task_name).await.is_empty());
+        }
+        assert_eq!(
+            fixture.wait("queue_completed_guarded").await.state,
+            WorkflowTaskWaitState::Released
+        );
+        assert_eq!(
+            fixture.task_children("queue_completed_guarded").await.len(),
+            1
+        );
+
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean test database");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn parallel_terminal_waits_are_all_applied_before_workflow_finalization() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let skipped = fixture
+            .create_queue_item(WorkQueueItemStatus::Skipped, fixture.parent.id)
+            .await;
+        let failed = fixture
+            .create_queue_item(WorkQueueItemStatus::Failed, fixture.parent.id)
+            .await;
+        let context = fixture
+            .context_with_request_result(serde_json::json!({
+                "queue_skipped": skipped,
+                "queue_failed": failed
+            }))
+            .await;
+
+        fixture
+            .activate_task("queue_skipped_guarded", &context)
+            .await
+            .expect("activate skipped queue wait");
+        fixture
+            .activate_task("queue_failed_guarded", &context)
+            .await
+            .expect("activate failed queue wait");
+
+        fixture.advance_terminal_wait("queue_skipped_guarded").await;
+        let after_first = WorkflowExecutionRepository::find_by_id(
+            fixture.database.pool(),
+            fixture.workflow_execution_id,
+        )
+        .await
+        .expect("load workflow after first terminal wait")
+        .expect("workflow exists");
+        assert!(!matches!(
+            after_first.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed
+        ));
+
+        fixture.advance_terminal_wait("queue_failed_guarded").await;
+        let after_second = WorkflowExecutionRepository::find_by_id(
+            fixture.database.pool(),
+            fixture.workflow_execution_id,
+        )
+        .await
+        .expect("load workflow after second terminal wait")
+        .expect("workflow exists");
+        assert!(after_second
+            .failed_tasks
+            .contains(&"queue_skipped_guarded".to_string()));
+        assert!(after_second
+            .failed_tasks
+            .contains(&"queue_failed_guarded".to_string()));
+
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean test database");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn unrelated_execution_and_queue_requester_become_logical_prerequisite_failures() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let unrelated = fixture
+            .create_execution(ExecutionStatus::Completed, false)
+            .await;
+        let queue_item = fixture
+            .create_queue_item(WorkQueueItemStatus::Completed, unrelated.id)
+            .await;
+        let context = fixture
+            .context_with_request_result(serde_json::json!({
+                "unrelated_execution": unrelated.id,
+                "unrelated_queue": queue_item
+            }))
+            .await;
+
+        for task_name in ["unrelated_execution_guarded", "unrelated_queue_guarded"] {
+            let error = fixture
+                .activate_task(task_name, &context)
+                .await
+                .expect_err("unrelated target must be rejected");
+            let prerequisite = error
+                .downcast_ref::<TaskWaitPrerequisiteError>()
+                .expect("rejection is a logical prerequisite failure");
+            let logical = ExecutionScheduler::task_wait_prerequisite_failure_execution(
+                &fixture.parent,
+                fixture.workflow_execution_id,
+                prerequisite,
+                Some("request".to_string()),
+            );
+            assert_eq!(logical.status, ExecutionStatus::Failed);
+            assert_eq!(
+                logical
+                    .result
+                    .as_ref()
+                    .and_then(|result| result["code"].as_str()),
+                Some("task_wait_reference_invalid")
+            );
+            assert_eq!(
+                logical
+                    .workflow_task
+                    .as_ref()
+                    .map(|task| task.task_name.as_str()),
+                Some(task_name)
+            );
+            assert!(fixture.task_children(task_name).await.is_empty());
+        }
+
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean test database");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn database_reconciliation_finds_and_processes_typed_waits() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let execution = fixture
+            .create_execution(ExecutionStatus::Running, true)
+            .await;
+        let queue_item = fixture
+            .create_queue_item(WorkQueueItemStatus::Queued, fixture.request.id)
+            .await;
+        let context = fixture
+            .context_with_request_result(serde_json::json!({
+                "execution_completed": execution.id,
+                "queue_completed": queue_item
+            }))
+            .await;
+
+        for task_name in ["execution_completed_guarded", "queue_completed_guarded"] {
+            assert!(fixture
+                .activate_task(task_name, &context)
+                .await
+                .expect("persist waiting typed prerequisite")
+                .is_empty());
+            assert_eq!(
+                fixture.wait(task_name).await.state,
+                WorkflowTaskWaitState::Waiting
+            );
+        }
+
+        ExecutionRepository::update(
+            fixture.database.pool(),
+            execution.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("complete execution target");
+        WorkQueueItemRepository::update(
+            fixture.database.pool(),
+            queue_item,
+            UpdateWorkQueueItemInput {
+                status: Some(WorkQueueItemStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("complete queue item target");
+
+        let reconcilable =
+            WorkflowTaskWaitRepository::find_resolvable(fixture.database.pool(), 100)
+                .await
+                .expect("find typed waits after restart");
+        for task_name in ["execution_completed_guarded", "queue_completed_guarded"] {
+            assert!(reconcilable.iter().any(|wait| wait.task_name == task_name));
+            assert_eq!(
+                fixture
+                    .activate_task(task_name, &context)
+                    .await
+                    .expect("process reconcilable typed wait")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                fixture.wait(task_name).await.state,
+                WorkflowTaskWaitState::Released
+            );
+            assert_eq!(fixture.task_children(task_name).await.len(), 1);
+        }
 
         fixture
             .database
@@ -8910,22 +9863,32 @@ tasks:
         assert!(ExecutionScheduler::should_halt_workflow_advancement(
             ExecutionStatus::Running,
             ExecutionStatus::Canceling,
-            ExecutionStatus::Completed
+            ExecutionStatus::Completed,
+            false,
         ));
         assert!(ExecutionScheduler::should_halt_workflow_advancement(
             ExecutionStatus::Cancelled,
             ExecutionStatus::Running,
-            ExecutionStatus::Failed
+            ExecutionStatus::Failed,
+            false,
         ));
         assert!(ExecutionScheduler::should_halt_workflow_advancement(
             ExecutionStatus::Running,
             ExecutionStatus::Running,
-            ExecutionStatus::Cancelled
+            ExecutionStatus::Cancelled,
+            false,
         ));
         assert!(!ExecutionScheduler::should_halt_workflow_advancement(
             ExecutionStatus::Running,
             ExecutionStatus::Running,
-            ExecutionStatus::Failed
+            ExecutionStatus::Failed,
+            false,
+        ));
+        assert!(!ExecutionScheduler::should_halt_workflow_advancement(
+            ExecutionStatus::Running,
+            ExecutionStatus::Running,
+            ExecutionStatus::Cancelled,
+            true,
         ));
     }
 

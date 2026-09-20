@@ -63,7 +63,50 @@ pub enum TokenType {
     Worker,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrationAccessProvenance {
+    /// Identity authenticated by the integration token.
+    pub identity_id: i64,
+    /// Integration token record that authenticated the identity.
+    pub integration_token_id: i64,
+}
+
 impl Claims {
+    /// Parse the integration-token provenance carried by an access token.
+    pub fn integration_access_provenance(&self) -> Result<IntegrationAccessProvenance, JwtError> {
+        if self.token_type != TokenType::Access
+            || self.scope.as_deref() != Some("integration_token")
+        {
+            return Err(JwtError::Invalid);
+        }
+
+        let identity_id = self
+            .sub
+            .parse::<i64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or(JwtError::Invalid)?;
+        let metadata = self.metadata.as_ref().ok_or(JwtError::Invalid)?;
+        if metadata
+            .get("auth_method")
+            .and_then(serde_json::Value::as_str)
+            != Some("integration_token")
+        {
+            return Err(JwtError::Invalid);
+        }
+
+        let integration_token_id = metadata
+            .get("integration_token_id")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|id| *id > 0)
+            .ok_or(JwtError::Invalid)?;
+
+        Ok(IntegrationAccessProvenance {
+            identity_id,
+            integration_token_id,
+        })
+    }
+
     /// Parse the workload fence carried by a sensor token.
     pub fn sensor_workload_fence(&self) -> Result<SensorWorkloadFence, JwtError> {
         if self.token_type != TokenType::Sensor {
@@ -108,6 +151,37 @@ pub fn generate_access_token(
     config: &JwtConfig,
 ) -> Result<String, JwtError> {
     generate_token(identity_id, login, config, TokenType::Access)
+}
+
+/// Generate an access JWT that records its integration-token origin.
+pub fn generate_integration_access_token(
+    identity_id: i64,
+    integration_token_id: i64,
+    login: &str,
+    config: &JwtConfig,
+) -> Result<String, JwtError> {
+    let now = Utc::now();
+    let exp = (now + Duration::seconds(config.access_token_expiration)).timestamp();
+
+    let claims = Claims {
+        sub: identity_id.to_string(),
+        login: login.to_string(),
+        iat: now.timestamp(),
+        exp,
+        token_type: TokenType::Access,
+        scope: Some("integration_token".to_string()),
+        metadata: Some(serde_json::json!({
+            "integration_token_id": integration_token_id,
+            "auth_method": "integration_token",
+        })),
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(config.secret.as_bytes()),
+    )
+    .map_err(|e| JwtError::EncodeError(e.to_string()))
 }
 
 /// Generate a JWT refresh token
@@ -572,6 +646,84 @@ mod tests {
         assert_eq!(claims.sub, "123");
         assert_eq!(claims.login, "testuser");
         assert_eq!(claims.token_type, TokenType::Access);
+        assert!(matches!(
+            claims.integration_access_provenance(),
+            Err(JwtError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn integration_access_token_round_trips_typed_provenance() {
+        let config = test_config();
+        let token = generate_integration_access_token(123, 456, "integration-user", &config)
+            .expect("generate integration access token");
+
+        let claims = validate_token(&token, &config).expect("validate integration access token");
+
+        assert_eq!(claims.sub, "123");
+        assert_eq!(claims.login, "integration-user");
+        assert_eq!(claims.token_type, TokenType::Access);
+        assert_eq!(claims.scope.as_deref(), Some("integration_token"));
+        assert_eq!(
+            claims
+                .integration_access_provenance()
+                .expect("parse integration access provenance"),
+            IntegrationAccessProvenance {
+                identity_id: 123,
+                integration_token_id: 456,
+            }
+        );
+    }
+
+    #[test]
+    fn integration_access_provenance_rejects_invalid_claims() {
+        let valid = Claims {
+            sub: "123".to_string(),
+            login: "integration-user".to_string(),
+            iat: 100,
+            exp: 200,
+            token_type: TokenType::Access,
+            scope: Some("integration_token".to_string()),
+            metadata: Some(serde_json::json!({
+                "integration_token_id": 456,
+                "auth_method": "integration_token",
+            })),
+        };
+
+        let mut invalid = valid.clone();
+        invalid.token_type = TokenType::Refresh;
+        assert!(matches!(
+            invalid.integration_access_provenance(),
+            Err(JwtError::Invalid)
+        ));
+
+        let mut invalid = valid.clone();
+        invalid.scope = None;
+        assert!(matches!(
+            invalid.integration_access_provenance(),
+            Err(JwtError::Invalid)
+        ));
+
+        let mut invalid = valid.clone();
+        invalid.metadata.as_mut().unwrap()["auth_method"] = serde_json::json!("password");
+        assert!(matches!(
+            invalid.integration_access_provenance(),
+            Err(JwtError::Invalid)
+        ));
+
+        let mut invalid = valid.clone();
+        invalid.metadata.as_mut().unwrap()["integration_token_id"] = serde_json::json!(0);
+        assert!(matches!(
+            invalid.integration_access_provenance(),
+            Err(JwtError::Invalid)
+        ));
+
+        let mut invalid = valid;
+        invalid.sub = "0".to_string();
+        assert!(matches!(
+            invalid.integration_access_provenance(),
+            Err(JwtError::Invalid)
+        ));
     }
 
     #[test]

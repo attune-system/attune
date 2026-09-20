@@ -10,24 +10,25 @@ from typing_extensions import Self
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.create_sensor_token_response_200_data import (
-        CreateSensorTokenResponse200Data,
+    from ..models.api_response_create_inquiry_response_data import (
+        ApiResponseCreateInquiryResponseData,
     )
 
 
-T = TypeVar("T", bound="CreateSensorTokenResponse200")
+T = TypeVar("T", bound="ApiResponseCreateInquiryResponse")
 
 
 @_attrs_define
-class CreateSensorTokenResponse200:
+class ApiResponseCreateInquiryResponse:
     """Standard API response wrapper
 
     Attributes:
-        data (CreateSensorTokenResponse200Data): Response for sensor token creation
+        data (ApiResponseCreateInquiryResponseData): Creation result containing the inquiry and its provider-neutral
+            response handle.
         message (None | str | Unset): Optional message
     """
 
-    data: CreateSensorTokenResponse200Data
+    data: ApiResponseCreateInquiryResponseData
     message: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -54,12 +55,12 @@ class CreateSensorTokenResponse200:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
-        from ..models.create_sensor_token_response_200_data import (
-            CreateSensorTokenResponse200Data,
+        from ..models.api_response_create_inquiry_response_data import (
+            ApiResponseCreateInquiryResponseData,
         )
 
         d = dict(src_dict)
-        data = CreateSensorTokenResponse200Data.from_dict(d.pop("data"))
+        data = ApiResponseCreateInquiryResponseData.from_dict(d.pop("data"))
 
         def _parse_message(data: object) -> None | str | Unset:
             if data is None:
@@ -70,13 +71,13 @@ class CreateSensorTokenResponse200:
 
         message = _parse_message(d.pop("message", UNSET))
 
-        create_sensor_token_response_200 = cls(
+        api_response_create_inquiry_response = cls(
             data=data,
             message=message,
         )
 
-        create_sensor_token_response_200.additional_properties = d
-        return create_sensor_token_response_200
+        api_response_create_inquiry_response.additional_properties = d
+        return api_response_create_inquiry_response
 
     @property
     def additional_keys(self) -> list[str]:

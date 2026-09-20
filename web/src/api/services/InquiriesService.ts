@@ -2,8 +2,11 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ApiResponse_CreateInquiryResponse } from "../models/ApiResponse_CreateInquiryResponse";
 import type { ApiResponse_InquiryResponse } from "../models/ApiResponse_InquiryResponse";
+import type { ApiResponse_SuccessResponse } from "../models/ApiResponse_SuccessResponse";
 import type { CreateInquiryRequest } from "../models/CreateInquiryRequest";
+import type { ExternalInquiryRespondRequest } from "../models/ExternalInquiryRespondRequest";
 import type { i64 } from "../models/i64";
 import type { InquiryRespondRequest } from "../models/InquiryRespondRequest";
 import type { InquiryStatus } from "../models/InquiryStatus";
@@ -103,14 +106,14 @@ export class InquiriesService {
   }
   /**
    * Create a new inquiry
-   * @returns ApiResponse_InquiryResponse Inquiry created successfully
+   * @returns ApiResponse_CreateInquiryResponse Inquiry and one-shot response handle created
    * @throws ApiError
    */
   public static createInquiry({
     requestBody,
   }: {
     requestBody: CreateInquiryRequest;
-  }): CancelablePromise<ApiResponse_InquiryResponse> {
+  }): CancelablePromise<ApiResponse_CreateInquiryResponse> {
     return __request(OpenAPI, {
       method: "POST",
       url: "/api/v1/inquiries",
@@ -247,6 +250,30 @@ export class InquiriesService {
         403: `Not authorized to respond to this inquiry`,
         404: `Inquiry not found`,
         500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Accept a one-shot response asserted by an external integration adapter.
+   * @returns ApiResponse_SuccessResponse External response submitted
+   * @throws ApiError
+   */
+  public static respondToInquiryFromExternalAdapter({
+    requestBody,
+  }: {
+    requestBody: ExternalInquiryRespondRequest;
+  }): CancelablePromise<ApiResponse_SuccessResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/inquiry-responses",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        401: `Invalid or inactive integration credential`,
+        403: `External actor is not authorized or assigned`,
+        404: `Response handle not found`,
+        409: `Inquiry or workflow is no longer respondable`,
+        422: `Invalid request or response`,
       },
     });
   }

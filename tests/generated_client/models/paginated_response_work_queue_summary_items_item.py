@@ -31,6 +31,7 @@ class PaginatedResponseWorkQueueSummaryItemsItem:
         updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
         description (None | str | Unset):  Example: Dispatches inbound work items to the core processor.
         pack_ref (None | str | Unset):  Example: core.
+        retired_at (datetime.datetime | None | Unset):
         trace_tag_template (None | str | Unset):  Example: {{ queue.ref }}.{{ queue_item.id }}.
     """
 
@@ -47,6 +48,7 @@ class PaginatedResponseWorkQueueSummaryItemsItem:
     updated: datetime.datetime
     description: None | str | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
+    retired_at: datetime.datetime | None | Unset = UNSET
     trace_tag_template: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -85,6 +87,14 @@ class PaginatedResponseWorkQueueSummaryItemsItem:
         else:
             pack_ref = self.pack_ref
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         trace_tag_template: None | str | Unset
         if isinstance(self.trace_tag_template, Unset):
             trace_tag_template = UNSET
@@ -112,6 +122,8 @@ class PaginatedResponseWorkQueueSummaryItemsItem:
             field_dict["description"] = description
         if pack_ref is not UNSET:
             field_dict["pack_ref"] = pack_ref
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
         if trace_tag_template is not UNSET:
             field_dict["trace_tag_template"] = trace_tag_template
 
@@ -162,6 +174,23 @@ class PaginatedResponseWorkQueueSummaryItemsItem:
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         def _parse_trace_tag_template(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -187,6 +216,7 @@ class PaginatedResponseWorkQueueSummaryItemsItem:
             updated=updated,
             description=description,
             pack_ref=pack_ref,
+            retired_at=retired_at,
             trace_tag_template=trace_tag_template,
         )
 

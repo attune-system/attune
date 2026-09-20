@@ -14,7 +14,11 @@ def _get_kwargs(
     stream: str,
     *,
     offset: int | Unset = UNSET,
+    last_event_id: int | None | Unset = UNSET,
 ) -> dict[str, Any]:
+    headers: dict[str, Any] = {}
+    if not isinstance(last_event_id, Unset):
+        headers["Last-Event-ID"] = last_event_id
 
     params: dict[str, Any] = {}
 
@@ -31,6 +35,7 @@ def _get_kwargs(
         "params": params,
     }
 
+    _kwargs["headers"] = headers
     return _kwargs
 
 
@@ -44,6 +49,9 @@ def _parse_response(
         return None
 
     if response.status_code == 404:
+        return None
+
+    if response.status_code == 429:
         return None
 
     if client.raise_on_unexpected_status:
@@ -69,17 +77,19 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     offset: int | Unset = UNSET,
+    last_event_id: int | None | Unset = UNSET,
 ) -> Response[Any]:
     """Stream stdout/stderr for an execution as SSE.
 
-     This tails the worker's live log files directly from the shared artifacts
-    volume. The file may not exist yet when the worker has not emitted any
-    output, so the stream waits briefly for it to appear.
+     This tails the stream backend selected when the worker allocates its log
+    artifacts. The stream may not exist yet while allocation is pending.
+    An explicit `offset` query parameter takes precedence over `Last-Event-ID`.
 
     Args:
         id (int):
         stream (str):
         offset (int | Unset):
+        last_event_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -93,6 +103,7 @@ def sync_detailed(
         id=id,
         stream=stream,
         offset=offset,
+        last_event_id=last_event_id,
     )
 
     response = client.get_httpx_client().request(
@@ -108,17 +119,19 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     offset: int | Unset = UNSET,
+    last_event_id: int | None | Unset = UNSET,
 ) -> Response[Any]:
     """Stream stdout/stderr for an execution as SSE.
 
-     This tails the worker's live log files directly from the shared artifacts
-    volume. The file may not exist yet when the worker has not emitted any
-    output, so the stream waits briefly for it to appear.
+     This tails the stream backend selected when the worker allocates its log
+    artifacts. The stream may not exist yet while allocation is pending.
+    An explicit `offset` query parameter takes precedence over `Last-Event-ID`.
 
     Args:
         id (int):
         stream (str):
         offset (int | Unset):
+        last_event_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -132,6 +145,7 @@ async def asyncio_detailed(
         id=id,
         stream=stream,
         offset=offset,
+        last_event_id=last_event_id,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)

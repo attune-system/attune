@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
+from ..models.artifact_body_state import ArtifactBodyState
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="UploadVersionResponse201Data")
@@ -22,6 +23,7 @@ class UploadVersionResponse201Data:
         created (datetime.datetime): Creation timestamp
         id (int): Version ID
         version (int): Version number (1-based)
+        body_state (ArtifactBodyState | None | Unset):
         content_json (Any | None | Unset):
         content_type (None | str | Unset): MIME content type
         created_by (None | str | Unset): Who created this version
@@ -31,6 +33,9 @@ class UploadVersionResponse201Data:
         file_path (None | str | Unset): Relative file path for disk-backed versions (from artifacts_dir root).
             When present, the file content lives on the shared volume, not in the DB.
         meta (Any | None | Unset):
+        object_key (None | str | Unset): Immutable object-store locator.
+        provider_version (None | str | Unset): Opaque provider generation, version ID, or ETag pinned for reads.
+        sha256 (None | str | Unset): SHA-256 digest of the ready body.
         size_bytes (int | None | Unset): Size of content in bytes
     """
 
@@ -38,12 +43,16 @@ class UploadVersionResponse201Data:
     created: datetime.datetime
     id: int
     version: int
+    body_state: ArtifactBodyState | None | Unset = UNSET
     content_json: Any | None | Unset = UNSET
     content_type: None | str | Unset = UNSET
     created_by: None | str | Unset = UNSET
     execution: int | None | Unset = UNSET
     file_path: None | str | Unset = UNSET
     meta: Any | None | Unset = UNSET
+    object_key: None | str | Unset = UNSET
+    provider_version: None | str | Unset = UNSET
+    sha256: None | str | Unset = UNSET
     size_bytes: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -55,6 +64,14 @@ class UploadVersionResponse201Data:
         id = self.id
 
         version = self.version
+
+        body_state: None | str | Unset
+        if isinstance(self.body_state, Unset):
+            body_state = UNSET
+        elif isinstance(self.body_state, ArtifactBodyState):
+            body_state = self.body_state.value
+        else:
+            body_state = self.body_state
 
         content_json: Any | None | Unset
         if isinstance(self.content_json, Unset):
@@ -92,6 +109,24 @@ class UploadVersionResponse201Data:
         else:
             meta = self.meta
 
+        object_key: None | str | Unset
+        if isinstance(self.object_key, Unset):
+            object_key = UNSET
+        else:
+            object_key = self.object_key
+
+        provider_version: None | str | Unset
+        if isinstance(self.provider_version, Unset):
+            provider_version = UNSET
+        else:
+            provider_version = self.provider_version
+
+        sha256: None | str | Unset
+        if isinstance(self.sha256, Unset):
+            sha256 = UNSET
+        else:
+            sha256 = self.sha256
+
         size_bytes: int | None | Unset
         if isinstance(self.size_bytes, Unset):
             size_bytes = UNSET
@@ -108,6 +143,8 @@ class UploadVersionResponse201Data:
                 "version": version,
             }
         )
+        if body_state is not UNSET:
+            field_dict["body_state"] = body_state
         if content_json is not UNSET:
             field_dict["content_json"] = content_json
         if content_type is not UNSET:
@@ -120,6 +157,12 @@ class UploadVersionResponse201Data:
             field_dict["file_path"] = file_path
         if meta is not UNSET:
             field_dict["meta"] = meta
+        if object_key is not UNSET:
+            field_dict["object_key"] = object_key
+        if provider_version is not UNSET:
+            field_dict["provider_version"] = provider_version
+        if sha256 is not UNSET:
+            field_dict["sha256"] = sha256
         if size_bytes is not UNSET:
             field_dict["size_bytes"] = size_bytes
 
@@ -135,6 +178,23 @@ class UploadVersionResponse201Data:
         id = d.pop("id")
 
         version = d.pop("version")
+
+        def _parse_body_state(data: object) -> ArtifactBodyState | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                body_state_type_1 = ArtifactBodyState(data)
+
+                return body_state_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(ArtifactBodyState | None | Unset, data)
+
+        body_state = _parse_body_state(d.pop("body_state", UNSET))
 
         def _parse_content_json(data: object) -> Any | None | Unset:
             if data is None:
@@ -190,6 +250,33 @@ class UploadVersionResponse201Data:
 
         meta = _parse_meta(d.pop("meta", UNSET))
 
+        def _parse_object_key(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        object_key = _parse_object_key(d.pop("object_key", UNSET))
+
+        def _parse_provider_version(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        provider_version = _parse_provider_version(d.pop("provider_version", UNSET))
+
+        def _parse_sha256(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        sha256 = _parse_sha256(d.pop("sha256", UNSET))
+
         def _parse_size_bytes(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -204,12 +291,16 @@ class UploadVersionResponse201Data:
             created=created,
             id=id,
             version=version,
+            body_state=body_state,
             content_json=content_json,
             content_type=content_type,
             created_by=created_by,
             execution=execution,
             file_path=file_path,
             meta=meta,
+            object_key=object_key,
+            provider_version=provider_version,
+            sha256=sha256,
             size_bytes=size_bytes,
         )
 

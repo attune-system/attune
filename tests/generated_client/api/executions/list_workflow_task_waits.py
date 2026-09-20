@@ -6,56 +6,45 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.api_response_inquiry_response import ApiResponseInquiryResponse
-from ...models.update_inquiry_request import UpdateInquiryRequest
+from ...models.list_workflow_task_waits_response_200 import (
+    ListWorkflowTaskWaitsResponse200,
+)
 from ...types import Response
 
 
 def _get_kwargs(
     id: int,
-    *,
-    body: UpdateInquiryRequest,
 ) -> dict[str, Any]:
-    headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
-        "method": "put",
-        "url": "/api/v1/inquiries/{id}".format(
+        "method": "get",
+        "url": "/api/v1/executions/{id}/workflow-task-waits".format(
             id=quote(str(id), safe=""),
         ),
     }
 
-    _kwargs["json"] = body.to_dict()
-
-    headers["Content-Type"] = "application/json"
-
-    _kwargs["headers"] = headers
     return _kwargs
 
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | ApiResponseInquiryResponse | None:
+) -> Any | ListWorkflowTaskWaitsResponse200 | None:
     if response.status_code == 200:
-        response_200 = ApiResponseInquiryResponse.from_dict(response.json())
+        response_200 = ListWorkflowTaskWaitsResponse200.from_dict(response.json())
 
         return response_200
-
-    if response.status_code == 400:
-        response_400 = cast(Any, None)
-        return response_400
 
     if response.status_code == 401:
         response_401 = cast(Any, None)
         return response_401
 
+    if response.status_code == 403:
+        response_403 = cast(Any, None)
+        return response_403
+
     if response.status_code == 404:
         response_404 = cast(Any, None)
         return response_404
-
-    if response.status_code == 500:
-        response_500 = cast(Any, None)
-        return response_500
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -65,7 +54,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | ApiResponseInquiryResponse]:
+) -> Response[Any | ListWorkflowTaskWaitsResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -78,25 +67,22 @@ def sync_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
-    body: UpdateInquiryRequest,
-) -> Response[Any | ApiResponseInquiryResponse]:
-    """Update an existing inquiry
+) -> Response[Any | ListWorkflowTaskWaitsResponse200]:
+    """List safe workflow task wait metadata for an execution.
 
     Args:
         id (int):
-        body (UpdateInquiryRequest): Request to update an inquiry
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ApiResponseInquiryResponse]
+        Response[Any | ListWorkflowTaskWaitsResponse200]
     """
 
     kwargs = _get_kwargs(
         id=id,
-        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -110,26 +96,23 @@ def sync(
     id: int,
     *,
     client: AuthenticatedClient,
-    body: UpdateInquiryRequest,
-) -> Any | ApiResponseInquiryResponse | None:
-    """Update an existing inquiry
+) -> Any | ListWorkflowTaskWaitsResponse200 | None:
+    """List safe workflow task wait metadata for an execution.
 
     Args:
         id (int):
-        body (UpdateInquiryRequest): Request to update an inquiry
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ApiResponseInquiryResponse
+        Any | ListWorkflowTaskWaitsResponse200
     """
 
     return sync_detailed(
         id=id,
         client=client,
-        body=body,
     ).parsed
 
 
@@ -137,25 +120,22 @@ async def asyncio_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
-    body: UpdateInquiryRequest,
-) -> Response[Any | ApiResponseInquiryResponse]:
-    """Update an existing inquiry
+) -> Response[Any | ListWorkflowTaskWaitsResponse200]:
+    """List safe workflow task wait metadata for an execution.
 
     Args:
         id (int):
-        body (UpdateInquiryRequest): Request to update an inquiry
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ApiResponseInquiryResponse]
+        Response[Any | ListWorkflowTaskWaitsResponse200]
     """
 
     kwargs = _get_kwargs(
         id=id,
-        body=body,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -167,26 +147,23 @@ async def asyncio(
     id: int,
     *,
     client: AuthenticatedClient,
-    body: UpdateInquiryRequest,
-) -> Any | ApiResponseInquiryResponse | None:
-    """Update an existing inquiry
+) -> Any | ListWorkflowTaskWaitsResponse200 | None:
+    """List safe workflow task wait metadata for an execution.
 
     Args:
         id (int):
-        body (UpdateInquiryRequest): Request to update an inquiry
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ApiResponseInquiryResponse
+        Any | ListWorkflowTaskWaitsResponse200
     """
 
     return (
         await asyncio_detailed(
             id=id,
             client=client,
-            body=body,
         )
     ).parsed

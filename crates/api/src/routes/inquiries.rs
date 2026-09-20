@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -12,15 +12,19 @@ use std::sync::Arc;
 use validator::Validate;
 
 use attune_common::{
+    audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome},
+    inquiry_response_handle::{issue_inquiry_response_handle, resolve_inquiry_response_handle},
     mq::{InquiryRespondedPayload, MessageEnvelope, MessageType},
     rbac::{Action as RbacAction, AuthorizationContext, Grant, Resource},
     repositories::{
         execution::ExecutionRepository,
+        external_identity_mapping::ExternalIdentityMappingRepository,
         identity::IdentityRepository,
         inquiry::{
             CreateWorkflowInquiryInput, InquiryRepository, InquirySearchFilters,
             InquiryVisibilityContext,
         },
+        integration_token::IntegrationTokenRepository,
         workflow::WorkflowExecutionRepository,
         FindById,
     },
@@ -33,10 +37,10 @@ use crate::auth::{
 use crate::{
     authz::{AuthorizationCheck, AuthorizationService},
     dto::{
-        common::{PaginatedResponse, PaginationParams},
+        common::{PaginatedResponse, PaginationParams, SuccessResponse},
         inquiry::{
-            CreateInquiryRequest, InquiryQueryParams, InquiryRespondRequest, InquiryResponse,
-            InquirySummary,
+            CreateInquiryRequest, CreateInquiryResponse, ExternalInquiryRespondRequest,
+            InquiryQueryParams, InquiryRespondRequest, InquiryResponse, InquirySummary,
         },
         ApiResponse,
     },
@@ -250,7 +254,7 @@ pub async fn list_inquiries_by_execution(
     request_body = CreateInquiryRequest,
     security(("bearer_auth" = [])),
     responses(
-        (status = 201, description = "Inquiry created successfully", body = ApiResponse<InquiryResponse>),
+        (status = 201, description = "Inquiry and one-shot response handle created", body = ApiResponse<CreateInquiryResponse>),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Execution not found"),
@@ -288,6 +292,17 @@ pub async fn create_inquiry(
         )
         .await?;
 
+    let encryption_key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError(
+                "Cannot issue inquiry response handles without security.encryption_key".to_string(),
+            )
+        })?;
+
     let inquiry_input = CreateWorkflowInquiryInput {
         execution,
         purpose: request.purpose,
@@ -301,12 +316,21 @@ pub async fn create_inquiry(
     let inquiry =
         InquiryRepository::create_workflow_inquiry_idempotent(&mut conn, inquiry_input).await?;
 
+    let response_handle =
+        issue_inquiry_response_handle(inquiry.id, encryption_key).map_err(ApiError::from)?;
     let response = ApiResponse::with_message(
-        InquiryResponse::from(inquiry),
+        CreateInquiryResponse {
+            inquiry: InquiryResponse::from(inquiry),
+            response_handle,
+        },
         "Inquiry created successfully",
     );
 
-    Ok((StatusCode::CREATED, Json(response)))
+    Ok((
+        StatusCode::CREATED,
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(response),
+    ))
 }
 
 /// Respond to an inquiry (user-facing endpoint)
@@ -443,9 +467,7 @@ pub async fn respond_to_inquiry(
 
     let mut transaction = state.db.begin().await?;
     if let Some(workflow_execution_id) = inquiry.workflow_execution {
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(workflow_execution_id)
-            .execute(&mut *transaction)
+        WorkflowExecutionRepository::acquire_advisory_lock(&mut transaction, workflow_execution_id)
             .await?;
         let workflow = WorkflowExecutionRepository::find_by_id_for_update(
             &mut *transaction,
@@ -480,28 +502,7 @@ pub async fn respond_to_inquiry(
     })?;
     transaction.commit().await?;
 
-    // Publish InquiryResponded message if publisher is available
-    if let Some(publisher) = state.get_publisher().await {
-        let payload = InquiryRespondedPayload {
-            inquiry_id: id,
-            execution_id: inquiry.execution,
-            response: request.response.clone(),
-            responded_by: Some(responded_by),
-            responded_at: chrono::Utc::now(),
-        };
-
-        let envelope =
-            MessageEnvelope::new(MessageType::InquiryResponded, payload).with_source("api");
-
-        if let Err(e) = publisher.publish_envelope(&envelope).await {
-            tracing::error!("Failed to publish InquiryResponded message: {}", e);
-            // Don't fail the request - inquiry is already saved
-        } else {
-            tracing::info!("Published InquiryResponded message for inquiry {}", id);
-        }
-    } else {
-        tracing::warn!("No publisher available to publish InquiryResponded message");
-    }
+    publish_inquiry_responded(&state, &updated_inquiry).await;
 
     let response = ApiResponse::with_message(
         redact_inquiry_response(
@@ -512,6 +513,248 @@ pub async fn respond_to_inquiry(
     );
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// Accept a one-shot response asserted by an external integration adapter.
+#[utoipa::path(
+    post,
+    path = "/api/v1/inquiry-responses",
+    tag = "inquiries",
+    request_body = ExternalInquiryRespondRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "External response submitted", body = ApiResponse<SuccessResponse>),
+        (status = 422, description = "Invalid request or response"),
+        (status = 401, description = "Invalid or inactive integration credential"),
+        (status = 403, description = "External actor is not authorized or assigned"),
+        (status = 404, description = "Response handle not found"),
+        (status = 409, description = "Inquiry or workflow is no longer respondable")
+    )
+)]
+pub async fn respond_to_inquiry_from_external_adapter(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ExternalInquiryRespondRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+    let provenance = user.claims.integration_access_provenance().map_err(|_| {
+        ApiError::Forbidden(
+            "External responses require an integration-token access token".to_string(),
+        )
+    })?;
+
+    let mut transaction = state.db.begin().await?;
+    IntegrationTokenRepository::find_active_for_identity(
+        &mut *transaction,
+        provenance.integration_token_id,
+        provenance.identity_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::Unauthorized("Integration credential is no longer active".to_string())
+    })?;
+
+    let encryption_key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError(
+                "Cannot resolve inquiry response handles without security.encryption_key"
+                    .to_string(),
+            )
+        })?;
+    let id = resolve_inquiry_response_handle(&request.response_handle, encryption_key)
+        .map_err(|_| ApiError::NotFound("Inquiry response handle was not found".to_string()))?;
+
+    state
+        .authorization_service()
+        .authorize_identity_fresh(
+            &mut transaction,
+            &user,
+            provenance.identity_id,
+            AuthorizationCheck {
+                resource: Resource::Inquiries,
+                action: RbacAction::Respond,
+                context: AuthorizationContext {
+                    target_id: Some(id),
+                    ..AuthorizationContext::new(provenance.identity_id)
+                },
+            },
+        )
+        .await?;
+
+    let resolved = ExternalIdentityMappingRepository::resolve_exact_with_mapping_for_share(
+        &mut *transaction,
+        provenance.identity_id,
+        &request.external_actor.provider,
+        &request.external_actor.tenant,
+        &request.external_actor.external_subject,
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::Forbidden("External identity is not mapped to an active identity".to_string())
+    })?;
+
+    let initial = InquiryRepository::find_by_id(&mut *transaction, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Inquiry response handle was not found".to_string()))?;
+    if let Some(workflow_execution_id) = initial.workflow_execution {
+        WorkflowExecutionRepository::acquire_advisory_lock(&mut transaction, workflow_execution_id)
+            .await?;
+        let workflow = WorkflowExecutionRepository::find_by_id_for_update(
+            &mut *transaction,
+            workflow_execution_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::Conflict("Owning workflow no longer exists".to_string()))?;
+        if matches!(
+            workflow.status,
+            attune_common::models::enums::ExecutionStatus::Completed
+                | attune_common::models::enums::ExecutionStatus::Failed
+                | attune_common::models::enums::ExecutionStatus::Canceling
+                | attune_common::models::enums::ExecutionStatus::Cancelled
+                | attune_common::models::enums::ExecutionStatus::Timeout
+                | attune_common::models::enums::ExecutionStatus::Abandoned
+        ) {
+            return Err(ApiError::Conflict(
+                "Owning workflow is cancelling or terminal".to_string(),
+            ));
+        }
+    }
+
+    let inquiry = InquiryRepository::find_by_id_for_update(&mut transaction, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Inquiry response handle was not found".to_string()))?;
+    if inquiry.status != attune_common::models::enums::InquiryStatus::Pending {
+        return Err(ApiError::Conflict(
+            "Inquiry is no longer pending".to_string(),
+        ));
+    }
+    if inquiry
+        .timeout_at
+        .is_some_and(|timeout_at| timeout_at <= chrono::Utc::now())
+    {
+        return Err(ApiError::Conflict(
+            "Inquiry has timed out and can no longer be responded to".to_string(),
+        ));
+    }
+    let assigned_to = inquiry.assigned_to.ok_or_else(|| {
+        ApiError::Forbidden("External responses require an assigned inquiry".to_string())
+    })?;
+    if assigned_to != resolved.identity.id {
+        return Err(ApiError::Forbidden(
+            "Mapped identity is not assigned to this inquiry".to_string(),
+        ));
+    }
+
+    let response = serde_json::Value::Object(request.response);
+    validate_inquiry_response(id, inquiry.response_schema.as_ref(), &response)?;
+    let external_actor = serde_json::json!({
+        "provider": resolved.mapping.provider,
+        "tenant": resolved.mapping.tenant,
+        "external_subject": resolved.mapping.external_subject,
+        "mapping_id": resolved.mapping.id,
+        "integration_identity_id": provenance.identity_id,
+        "integration_token_id": provenance.integration_token_id,
+    });
+    let updated_inquiry = InquiryRepository::respond_pending(
+        &mut *transaction,
+        id,
+        response,
+        resolved.identity.id,
+        Some(external_actor),
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::Conflict("Inquiry is no longer pending or has timed out".to_string())
+    })?;
+    transaction.commit().await?;
+
+    state.audit_emitter.emit(build_external_response_audit(
+        id,
+        resolved.identity.id,
+        resolved.identity.login,
+        &resolved.mapping.provider,
+        resolved.mapping.id,
+        provenance.identity_id,
+        provenance.integration_token_id,
+    ));
+
+    publish_inquiry_responded(&state, &updated_inquiry).await;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::with_message(
+            SuccessResponse::new("Response submitted successfully"),
+            "Response submitted successfully",
+        )),
+    ))
+}
+
+fn build_external_response_audit(
+    inquiry_id: i64,
+    mapped_identity_id: i64,
+    mapped_identity_login: String,
+    provider: &str,
+    mapping_id: i64,
+    integration_identity_id: i64,
+    integration_token_id: i64,
+) -> attune_common::audit::PendingAuditEvent {
+    AuditEventBuilder::new(
+        AuditCategory::Api,
+        event_type::inquiry::EXTERNAL_RESPONSE_ACCEPTED,
+        AuditOutcome::Success,
+    )
+    .actor_identity(mapped_identity_id)
+    .actor_login(mapped_identity_login)
+    .actor_token_type("integration_token")
+    .resource("inquiry")
+    .resource_id(inquiry_id)
+    .with_details(serde_json::json!({
+        "provider": provider,
+        "mapping_id": mapping_id,
+        "integration_identity_id": integration_identity_id,
+        "integration_token_id": integration_token_id,
+    }))
+    .build()
+}
+
+async fn publish_inquiry_responded(
+    state: &Arc<AppState>,
+    inquiry: &attune_common::models::inquiry::Inquiry,
+) {
+    let Some(response) = inquiry.response.clone() else {
+        tracing::error!(
+            inquiry_id = inquiry.id,
+            "Responded inquiry has no response payload"
+        );
+        return;
+    };
+    if let Some(publisher) = state.get_publisher().await {
+        let payload = InquiryRespondedPayload {
+            inquiry_id: inquiry.id,
+            execution_id: inquiry.execution,
+            response,
+            responded_by: inquiry.responded_by,
+            responded_at: inquiry.responded_at.unwrap_or_else(chrono::Utc::now),
+        };
+        let envelope =
+            MessageEnvelope::new(MessageType::InquiryResponded, payload).with_source("api");
+        if let Err(error) = publisher.publish_envelope(&envelope).await {
+            tracing::error!(inquiry_id = inquiry.id, %error, "Failed to publish InquiryResponded message");
+        } else {
+            tracing::info!(
+                inquiry_id = inquiry.id,
+                "Published InquiryResponded message"
+            );
+        }
+    } else {
+        tracing::warn!(
+            inquiry_id = inquiry.id,
+            "No publisher available to publish InquiryResponded message"
+        );
+    }
 }
 
 const REDACTED_INQUIRY_EXECUTION_ID: i64 = 0;
@@ -882,5 +1125,31 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(list_inquiries_by_execution),
         )
         .route("/inquiries/{id}/respond", post(respond_to_inquiry))
+        .route(
+            "/inquiry-responses",
+            post(respond_to_inquiry_from_external_adapter),
+        )
         .route("/inquiries/{id}/cancel", post(cancel_inquiry))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_external_response_audit;
+
+    #[test]
+    fn external_response_audit_contains_only_allowlisted_attribution() {
+        let event =
+            build_external_response_audit(11, 22, "mapped-user".to_string(), "slack", 33, 44, 55);
+        assert_eq!(event.actor_identity, Some(22));
+        assert_eq!(event.resource_id, Some(11));
+        assert_eq!(
+            event.details,
+            Some(serde_json::json!({
+                "provider": "slack",
+                "mapping_id": 33,
+                "integration_identity_id": 44,
+                "integration_token_id": 55,
+            }))
+        );
+    }
 }

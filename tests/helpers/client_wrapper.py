@@ -1804,7 +1804,10 @@ class AttuneClient:
         if response.status_code in (200, 201):
             resp_data = response.json()
             if "data" in resp_data:
-                return resp_data["data"]
+                data = resp_data["data"]
+                if isinstance(data, dict) and isinstance(data.get("inquiry"), dict):
+                    return data["inquiry"]
+                return data
             return resp_data
         raise Exception(
             f"Failed to create inquiry: {response.status_code} {response.text}"

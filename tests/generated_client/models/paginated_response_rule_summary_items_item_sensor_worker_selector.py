@@ -7,13 +7,11 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
-T = TypeVar("T", bound="UpdateInquiryRequestResponseType0")
+T = TypeVar("T", bound="PaginatedResponseRuleSummaryItemsItemSensorWorkerSelector")
 
 
 @_attrs_define
-class UpdateInquiryRequestResponseType0:
-    """Update the response data"""
-
+class PaginatedResponseRuleSummaryItemsItemSensorWorkerSelector:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -26,10 +24,10 @@ class UpdateInquiryRequestResponseType0:
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
-        update_inquiry_request_response_type_0 = cls()
+        paginated_response_rule_summary_items_item_sensor_worker_selector = cls()
 
-        update_inquiry_request_response_type_0.additional_properties = d
-        return update_inquiry_request_response_type_0
+        paginated_response_rule_summary_items_item_sensor_worker_selector.additional_properties = d
+        return paginated_response_rule_summary_items_item_sensor_worker_selector
 
     @property
     def additional_keys(self) -> list[str]:

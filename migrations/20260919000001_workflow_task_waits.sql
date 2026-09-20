@@ -1,7 +1,7 @@
 -- Durable pre-dispatch workflow waits and action-owned inquiry scope.
 
 DO $$ BEGIN
-    CREATE TYPE workflow_task_wait_kind_enum AS ENUM ('inquiry');
+    CREATE TYPE workflow_task_wait_kind_enum AS ENUM ('inquiry', 'execution', 'work_queue_item');
 EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
@@ -28,7 +28,7 @@ ALTER TABLE inquiry
     ADD COLUMN purpose TEXT,
     ADD COLUMN timeout_seconds BIGINT,
     ADD COLUMN responded_by BIGINT REFERENCES identity(id) ON DELETE SET NULL,
-    ADD COLUMN provider_actor JSONB,
+    ADD COLUMN external_actor JSONB,
     ADD CONSTRAINT inquiry_workflow_scope_complete CHECK (
         (workflow_execution IS NULL AND workflow_task_name IS NULL AND action_attempt_family IS NULL AND purpose IS NULL)
         OR
@@ -58,7 +58,7 @@ COMMENT ON COLUMN inquiry.action_attempt_family IS 'Stable original execution ID
 COMMENT ON COLUMN inquiry.purpose IS 'Pack-supplied inquiry purpose unique within the workflow task attempt family';
 COMMENT ON COLUMN inquiry.timeout_seconds IS 'Immutable relative timeout used to compare idempotent create requests';
 COMMENT ON COLUMN inquiry.responded_by IS 'Attune identity that submitted the accepted response';
-COMMENT ON COLUMN inquiry.provider_actor IS 'Non-secret provider actor evidence for an integration response';
+COMMENT ON COLUMN inquiry.external_actor IS 'Non-secret external actor attribution for an integration response';
 
 CREATE TABLE workflow_task_wait (
     id BIGSERIAL PRIMARY KEY,
@@ -66,13 +66,30 @@ CREATE TABLE workflow_task_wait (
     task_name TEXT NOT NULL,
     kind workflow_task_wait_kind_enum NOT NULL,
     state workflow_task_wait_state_enum NOT NULL DEFAULT 'waiting',
-    inquiry BIGINT NOT NULL REFERENCES inquiry(id) ON DELETE RESTRICT,
+    inquiry BIGINT REFERENCES inquiry(id) ON DELETE RESTRICT,
+    target_execution BIGINT,
+    work_queue_item BIGINT,
+    active_work_queue_item BIGINT REFERENCES work_queue_item(id) ON DELETE RESTRICT,
     result JSONB,
     resolved_at TIMESTAMPTZ,
     released_at TIMESTAMPTZ,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_workflow_task_wait_identity UNIQUE (workflow_execution, task_name),
+    CONSTRAINT workflow_task_wait_target_consistent CHECK (
+        (kind = 'inquiry' AND inquiry IS NOT NULL AND target_execution IS NULL AND work_queue_item IS NULL)
+        OR
+        (kind = 'execution' AND inquiry IS NULL AND target_execution IS NOT NULL AND work_queue_item IS NULL)
+        OR
+        (kind = 'work_queue_item' AND inquiry IS NULL AND target_execution IS NULL AND work_queue_item IS NOT NULL)
+    ),
+    CONSTRAINT workflow_task_wait_active_queue_target_consistent CHECK (
+        (kind = 'work_queue_item' AND state = 'waiting'
+            AND active_work_queue_item IS NOT NULL
+            AND active_work_queue_item = work_queue_item)
+        OR
+        (NOT (kind = 'work_queue_item' AND state = 'waiting') AND active_work_queue_item IS NULL)
+    ),
     CONSTRAINT workflow_task_wait_resolution_consistent CHECK (
         (state = 'waiting' AND resolved_at IS NULL AND released_at IS NULL)
         OR
@@ -84,6 +101,10 @@ CREATE TABLE workflow_task_wait (
 
 CREATE INDEX idx_workflow_task_wait_inquiry_state
     ON workflow_task_wait(inquiry, state);
+CREATE INDEX idx_workflow_task_wait_execution_state
+    ON workflow_task_wait(target_execution, state);
+CREATE INDEX idx_workflow_task_wait_work_queue_item_state
+    ON workflow_task_wait(work_queue_item, state);
 CREATE INDEX idx_workflow_task_wait_workflow_state
     ON workflow_task_wait(workflow_execution, state);
 CREATE INDEX idx_workflow_task_wait_waiting
@@ -97,6 +118,9 @@ CREATE TRIGGER update_workflow_task_wait_updated
 
 COMMENT ON TABLE workflow_task_wait IS 'Durable prerequisites resolved before workflow child execution creation';
 COMMENT ON COLUMN workflow_task_wait.inquiry IS 'Inquiry whose terminal state controls release of the guarded task';
+COMMENT ON COLUMN workflow_task_wait.target_execution IS 'Execution whose terminal state controls release of the guarded task; plain BIGINT because execution is a hypertable';
+COMMENT ON COLUMN workflow_task_wait.work_queue_item IS 'Work queue item whose terminal state controls release of the guarded task; plain BIGINT to avoid retention-blocking ownership';
+COMMENT ON COLUMN workflow_task_wait.active_work_queue_item IS 'Foreign-key guard that prevents deletion only while a queue-item wait is active';
 COMMENT ON COLUMN workflow_task_wait.result IS 'Safe logical outcome used when no guarded child execution is created';
 
 DELETE FROM intrinsic_handler WHERE ref = 'attune.inquiry/v1';

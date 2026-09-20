@@ -6,7 +6,7 @@ use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
 use attune_common::models::{enums::InquiryStatus, inquiry::Inquiry, Id, JsonDict, JsonSchema};
-use serde_json::Value as JsonValue;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 /// Full inquiry response with all details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -164,12 +164,54 @@ pub struct CreateInquiryRequest {
     pub timeout_seconds: Option<i64>,
 }
 
+/// Creation result containing the inquiry and its provider-neutral response handle.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CreateInquiryResponse {
+    pub inquiry: InquiryResponse,
+
+    /// Opaque correlation handle for one-shot external responses.
+    #[schema(example = "attune_irh_REDACTED")]
+    pub response_handle: String,
+}
+
 /// Request to respond to an inquiry (user-facing endpoint)
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
 pub struct InquiryRespondRequest {
     /// Response data conforming to the inquiry's response_schema
     #[schema(value_type = Object)]
     pub response: JsonValue,
+}
+
+/// External actor asserted by an authenticated integration adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalActorAssertion {
+    #[validate(length(min = 1, max = 64))]
+    #[schema(min_length = 1, max_length = 64)]
+    pub provider: String,
+
+    #[validate(length(min = 1, max = 255))]
+    #[schema(min_length = 1, max_length = 255)]
+    pub tenant: String,
+
+    #[validate(length(min = 1, max = 255))]
+    #[schema(min_length = 1, max_length = 255)]
+    pub external_subject: String,
+}
+
+/// Provider-neutral one-shot response submitted by an integration adapter.
+#[derive(Clone, Serialize, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalInquiryRespondRequest {
+    #[validate(length(min = 12, max = 1024))]
+    #[schema(min_length = 12, max_length = 1024)]
+    pub response_handle: String,
+
+    #[validate(nested)]
+    pub external_actor: ExternalActorAssertion,
+
+    #[schema(value_type = Object)]
+    pub response: JsonMap<String, JsonValue>,
 }
 
 /// Query parameters for filtering inquiries
@@ -194,6 +236,31 @@ pub struct InquiryQueryParams {
     /// Pagination limit
     #[param(example = 50)]
     pub limit: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExternalInquiryRespondRequest;
+
+    #[test]
+    fn external_response_request_rejects_actor_ids_and_evidence() {
+        for extra_field in ["responded_by", "mapping_id", "credential_id", "evidence"] {
+            let mut value = serde_json::json!({
+                "response_handle": "attune_irh_synthetic",
+                "external_actor": {
+                    "provider": "github",
+                    "tenant": "Acme",
+                    "external_subject": "User-42"
+                },
+                "response": {"approved": true}
+            });
+            value[extra_field] = serde_json::json!(123);
+            assert!(
+                serde_json::from_value::<ExternalInquiryRespondRequest>(value).is_err(),
+                "accepted forbidden request field {extra_field}"
+            );
+        }
+    }
 }
 
 /// Paginated list response

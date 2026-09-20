@@ -1156,7 +1156,7 @@ tasks:
     }
 
     #[test]
-    fn test_inquiry_prerequisite_is_snapshotted() {
+    fn test_typed_prerequisite_is_snapshotted() {
         let yaml = r#"
 version: "1.0.0"
 tasks:
@@ -1170,8 +1170,8 @@ tasks:
         let graph = TaskGraph::from_workflow(&workflow).unwrap();
         let node = graph.get_task("deploy").unwrap();
         assert_eq!(
-            node.wait_for.as_ref().unwrap().inquiry,
-            serde_json::json!("{{ task.request.inquiry_id }}")
+            node.wait_for.as_ref().unwrap(),
+            &TaskWaitFor::Inquiry(serde_json::json!("{{ task.request.inquiry_id }}"))
         );
 
         let stored = serde_json::to_value(&graph).unwrap();
@@ -1179,5 +1179,14 @@ tasks:
             stored["nodes"]["deploy"]["wait_for"]["inquiry"],
             serde_json::json!("{{ task.request.inquiry_id }}")
         );
+
+        for wait_for in [
+            TaskWaitFor::Execution(serde_json::json!(12)),
+            TaskWaitFor::WorkQueueItem(serde_json::json!(13)),
+        ] {
+            let stored = serde_json::to_value(&wait_for).unwrap();
+            let restored: TaskWaitFor = serde_json::from_value(stored).unwrap();
+            assert_eq!(restored, wait_for);
+        }
     }
 }

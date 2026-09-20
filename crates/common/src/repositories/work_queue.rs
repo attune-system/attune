@@ -1,7 +1,7 @@
 //! Work queue repositories for first-class business queues.
 
 use chrono::{DateTime, Utc};
-use sqlx::{Executor, Postgres, QueryBuilder};
+use sqlx::{Executor, PgConnection, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::models::{
@@ -513,11 +513,32 @@ impl Delete for WorkQueueRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query("DELETE FROM work_queue WHERE id = $1")
-            .bind(id)
-            .execute(executor)
-            .await?;
-        Ok(result.rows_affected() > 0)
+        let (exists, blocked, deleted): (bool, bool, bool) = sqlx::query_as(
+            "WITH target AS ( \
+                 SELECT EXISTS (SELECT 1 FROM work_queue WHERE id = $1) AS exists, \
+                        EXISTS ( \
+                            SELECT 1 FROM work_queue_item item \
+                            JOIN workflow_task_wait wait ON wait.work_queue_item = item.id \
+                            WHERE item.queue = $1 AND wait.state = 'waiting' \
+                        ) AS blocked \
+             ), deleted AS ( \
+                 DELETE FROM work_queue \
+                 WHERE id = $1 AND NOT (SELECT blocked FROM target) \
+                 RETURNING 1 \
+             ) \
+             SELECT target.exists, target.blocked, EXISTS (SELECT 1 FROM deleted) AS deleted \
+             FROM target",
+        )
+        .bind(id)
+        .fetch_one(executor)
+        .await
+        .map_err(|error| map_active_wait_delete_error(error, "work queue", id))?;
+        if blocked {
+            return Err(Error::invalid_state(format!(
+                "work queue {id} contains an item targeted by an active workflow wait"
+            )));
+        }
+        Ok(exists && deleted)
     }
 }
 
@@ -683,22 +704,36 @@ impl WorkQueueRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = if keep_refs.is_empty() {
-            sqlx::query("DELETE FROM work_queue WHERE pack = $1 AND is_adhoc = false")
-                .bind(pack_id)
-                .execute(executor)
-                .await?
-        } else {
-            sqlx::query(
-                "DELETE FROM work_queue WHERE pack = $1 AND is_adhoc = false AND ref != ALL($2)",
-            )
-            .bind(pack_id)
-            .bind(keep_refs)
-            .execute(executor)
-            .await?
-        };
-
-        Ok(result.rows_affected())
+        let (blocked, deleted): (bool, i64) = sqlx::query_as(
+            "WITH candidates AS MATERIALIZED ( \
+                 SELECT id FROM work_queue \
+                 WHERE pack = $1 AND is_adhoc = false AND ref != ALL($2) \
+             ), blocked AS ( \
+                 SELECT EXISTS ( \
+                     SELECT 1 FROM work_queue_item item \
+                     JOIN workflow_task_wait wait ON wait.work_queue_item = item.id \
+                     WHERE item.queue IN (SELECT id FROM candidates) AND wait.state = 'waiting' \
+                 ) AS value \
+             ), deleted AS ( \
+                 DELETE FROM work_queue \
+                 WHERE id IN (SELECT id FROM candidates) \
+                   AND NOT (SELECT value FROM blocked) \
+                 RETURNING 1 \
+             ) \
+             SELECT blocked.value, (SELECT COUNT(*)::BIGINT FROM deleted) \
+             FROM blocked",
+        )
+        .bind(pack_id)
+        .bind(keep_refs)
+        .fetch_one(executor)
+        .await
+        .map_err(|error| map_active_wait_delete_error(error, "work queue pack", pack_id))?;
+        if blocked {
+            return Err(Error::invalid_state(format!(
+                "pack {pack_id} contains a work queue item targeted by an active workflow wait"
+            )));
+        }
+        Ok(deleted.max(0) as u64)
     }
 }
 
@@ -950,11 +985,31 @@ impl Delete for WorkQueueItemRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query("DELETE FROM work_queue_item WHERE id = $1")
-            .bind(id)
-            .execute(executor)
-            .await?;
-        Ok(result.rows_affected() > 0)
+        let (exists, blocked, deleted): (bool, bool, bool) = sqlx::query_as(
+            "WITH target AS ( \
+                 SELECT EXISTS (SELECT 1 FROM work_queue_item WHERE id = $1) AS exists, \
+                        EXISTS ( \
+                            SELECT 1 FROM workflow_task_wait \
+                            WHERE work_queue_item = $1 AND state = 'waiting' \
+                        ) AS blocked \
+             ), deleted AS ( \
+                 DELETE FROM work_queue_item \
+                 WHERE id = $1 AND NOT (SELECT blocked FROM target) \
+                 RETURNING 1 \
+             ) \
+             SELECT target.exists, target.blocked, EXISTS (SELECT 1 FROM deleted) AS deleted \
+             FROM target",
+        )
+        .bind(id)
+        .fetch_one(executor)
+        .await
+        .map_err(|error| map_active_wait_delete_error(error, "work queue item", id))?;
+        if blocked {
+            return Err(Error::invalid_state(format!(
+                "work queue item {id} is targeted by an active workflow wait"
+            )));
+        }
+        Ok(exists && deleted)
     }
 }
 
@@ -968,6 +1023,20 @@ impl WorkQueueItemRepository {
 
     pub fn is_mutable_pending_status(status: WorkQueueItemStatus) -> bool {
         Self::MUTABLE_PENDING_STATUSES.contains(&status)
+    }
+
+    pub async fn find_by_id_for_update(
+        conn: &mut PgConnection,
+        id: Id,
+    ) -> Result<Option<WorkQueueItem>> {
+        let query = format!(
+            "SELECT {WORK_QUEUE_ITEM_SELECT_COLUMNS} FROM work_queue_item WHERE id = $1 FOR UPDATE"
+        );
+        sqlx::query_as::<_, WorkQueueItem>(&query)
+            .bind(id)
+            .fetch_optional(conn)
+            .await
+            .map_err(Into::into)
     }
 
     /// Return per-queue backlog snapshot rows for queued/retry/leased item statuses.
@@ -1538,14 +1607,32 @@ impl WorkQueueItemRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query(
-            "DELETE FROM work_queue_item WHERE id = $1 AND status = ANY($2::work_queue_item_status_enum[])",
+        let (blocked, deleted): (bool, bool) = sqlx::query_as(
+            "WITH target AS ( \
+                 SELECT EXISTS ( \
+                     SELECT 1 FROM workflow_task_wait \
+                     WHERE work_queue_item = $1 AND state = 'waiting' \
+                 ) AS blocked \
+             ), deleted AS ( \
+                 DELETE FROM work_queue_item \
+                 WHERE id = $1 \
+                   AND status = ANY($2::work_queue_item_status_enum[]) \
+                   AND NOT (SELECT blocked FROM target) \
+                 RETURNING 1 \
+             ) \
+             SELECT target.blocked, EXISTS (SELECT 1 FROM deleted) AS deleted FROM target",
         )
         .bind(id)
         .bind(statuses)
-        .execute(executor)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        .fetch_one(executor)
+        .await
+        .map_err(|error| map_active_wait_delete_error(error, "work queue item", id))?;
+        if blocked {
+            return Err(Error::invalid_state(format!(
+                "work queue item {id} is targeted by an active workflow wait"
+            )));
+        }
+        Ok(deleted)
     }
 
     pub async fn update_if_statuses<'e, E>(
@@ -1748,6 +1835,19 @@ impl WorkQueueItemRepository {
             .await
             .map_err(Into::into)
     }
+}
+
+fn map_active_wait_delete_error(error: sqlx::Error, entity: &str, id: Id) -> Error {
+    if error
+        .as_database_error()
+        .and_then(|database_error| database_error.constraint())
+        == Some("workflow_task_wait_active_work_queue_item_fkey")
+    {
+        return Error::invalid_state(format!(
+            "{entity} {id} is targeted by an active workflow wait"
+        ));
+    }
+    error.into()
 }
 
 // ============================================================================

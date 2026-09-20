@@ -66,6 +66,7 @@ class CreateActionResponse201Data:
             restricted. Example: ['incident_response', 'deployments'].
         required_worker_runtimes (CreateActionResponse201DataRequiredWorkerRuntimes | Unset): Additional worker runtime
             requirements keyed by runtime name/alias. Use "*" for any available version.
+        retired_at (datetime.datetime | None | Unset):
         runtime (int | None | Unset): Runtime ID Example: 1.
         runtime_ref (None | str | Unset): Runtime reference (stable identifier, e.g., "core.python") Example:
             core.python.
@@ -103,6 +104,7 @@ class CreateActionResponse201Data:
     required_worker_runtimes: (
         CreateActionResponse201DataRequiredWorkerRuntimes | Unset
     ) = UNSET
+    retired_at: datetime.datetime | None | Unset = UNSET
     runtime: int | None | Unset = UNSET
     runtime_ref: None | str | Unset = UNSET
     runtime_version_constraint: None | str | Unset = UNSET
@@ -205,6 +207,14 @@ class CreateActionResponse201Data:
         if not isinstance(self.required_worker_runtimes, Unset):
             required_worker_runtimes = self.required_worker_runtimes.to_dict()
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         runtime: int | None | Unset
         if isinstance(self.runtime, Unset):
             runtime = UNSET
@@ -288,6 +298,8 @@ class CreateActionResponse201Data:
             field_dict["reference_allowed_pack_refs"] = reference_allowed_pack_refs
         if required_worker_runtimes is not UNSET:
             field_dict["required_worker_runtimes"] = required_worker_runtimes
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
         if runtime is not UNSET:
             field_dict["runtime"] = runtime
         if runtime_ref is not UNSET:
@@ -481,6 +493,23 @@ class CreateActionResponse201Data:
                 )
             )
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         def _parse_runtime(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -578,6 +607,7 @@ class CreateActionResponse201Data:
             log_retention_policy=log_retention_policy,
             reference_allowed_pack_refs=reference_allowed_pack_refs,
             required_worker_runtimes=required_worker_runtimes,
+            retired_at=retired_at,
             runtime=runtime,
             runtime_ref=runtime_ref,
             runtime_version_constraint=runtime_version_constraint,

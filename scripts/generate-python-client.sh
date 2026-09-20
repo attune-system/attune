@@ -64,7 +64,8 @@ echo -e "${BLUE}=== Attune Python Client Generator ===${NC}"
 echo ""
 
 # Check if openapi-python-client is installed
-OPENAPI_CLIENT_CMD="tests/venvs/e2e/bin/openapi-python-client"
+E2E_VENV_BIN="$(pwd)/tests/venvs/e2e/bin"
+OPENAPI_CLIENT_CMD="${E2E_VENV_BIN}/openapi-python-client"
 if [ ! -f "${OPENAPI_CLIENT_CMD}" ]; then
     echo -e "${YELLOW}openapi-python-client not found. Installing...${NC}"
     if [ -d "tests/venvs/e2e" ]; then
@@ -75,7 +76,7 @@ if [ ! -f "${OPENAPI_CLIENT_CMD}" ]; then
     fi
     echo ""
 fi
-export PATH="$(dirname "${OPENAPI_CLIENT_CMD}"):${PATH}"
+export PATH="${E2E_VENV_BIN}:${PATH}"
 
 if [ "${USE_RUNNING_API}" = "1" ]; then
     # Check if API is running

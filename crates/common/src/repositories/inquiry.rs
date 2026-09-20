@@ -13,7 +13,7 @@ use super::{Create, Delete, FindById, List, Repository, Update};
 const INQUIRY_SELECT_COLUMNS_QUALIFIED: &str = "i.id, i.execution, i.workflow_execution, \
     i.workflow_task_name, i.action_attempt_family, i.purpose, i.prompt, i.response_schema, \
     i.assigned_to, i.status, i.response, i.timeout_at, i.timeout_seconds, i.responded_by, \
-    i.provider_actor, i.responded_at, i.created, i.updated";
+    i.external_actor, i.responded_at, i.created, i.updated";
 
 /// Filters for [`InquiryRepository::search`].
 ///
@@ -320,14 +320,14 @@ impl InquiryRepository {
         id: Id,
         response: JsonDict,
         responded_by: Id,
-        provider_actor: Option<JsonValue>,
+        external_actor: Option<JsonValue>,
     ) -> Result<Option<Inquiry>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
             "UPDATE inquiry SET status = $2, response = $3, responded_by = $4, \
-             provider_actor = $5, responded_at = NOW(), updated = NOW() \
+             external_actor = $5, responded_at = NOW(), updated = NOW() \
              WHERE id = $1 AND status = $6 \
                AND (timeout_at IS NULL OR timeout_at > NOW()) \
              RETURNING {INQUIRY_SELECT_COLUMNS}"
@@ -337,7 +337,7 @@ impl InquiryRepository {
             .bind(InquiryStatus::Responded)
             .bind(response)
             .bind(responded_by)
-            .bind(provider_actor)
+            .bind(external_actor)
             .bind(InquiryStatus::Pending)
             .fetch_optional(executor)
             .await

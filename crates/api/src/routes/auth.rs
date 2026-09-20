@@ -31,8 +31,8 @@ use crate::{
     auth::{
         hash_password,
         jwt::{
-            generate_access_token, generate_integration_refresh_token, generate_refresh_token,
-            validate_token, TokenType,
+            generate_access_token, generate_integration_access_token,
+            generate_integration_refresh_token, generate_refresh_token, validate_token, TokenType,
         },
         middleware::RequireAuth,
         oidc::{
@@ -655,7 +655,12 @@ fn integration_token_response(
     integration_token_id: i64,
     jwt_config: &crate::auth::jwt::JwtConfig,
 ) -> Result<TokenResponse, ApiError> {
-    let access_token = generate_access_token(identity.id, &identity.login, jwt_config)?;
+    let access_token = generate_integration_access_token(
+        identity.id,
+        integration_token_id,
+        &identity.login,
+        jwt_config,
+    )?;
     let refresh_token = generate_integration_refresh_token(
         integration_token_id,
         identity.id,
@@ -1780,6 +1785,38 @@ mod tests {
             created: Utc::now(),
             updated: Utc::now(),
         }
+    }
+
+    #[test]
+    fn integration_token_response_mints_provenanced_access_token() {
+        attune_common::auth::install_crypto_provider();
+        let identity = sensor_identity("integration-user", serde_json::json!([]));
+        let config = crate::auth::jwt::JwtConfig {
+            secret: "integration-token-response-test-secret".to_string(),
+            access_token_expiration: 3600,
+            refresh_token_expiration: 604800,
+        };
+
+        let response = integration_token_response(&identity, 77, &config)
+            .expect("mint integration token response");
+        let access_claims = validate_token(&response.access_token, &config)
+            .expect("validate integration access token");
+
+        assert_eq!(
+            access_claims
+                .integration_access_provenance()
+                .expect("parse integration access provenance"),
+            crate::auth::jwt::IntegrationAccessProvenance {
+                identity_id: identity.id,
+                integration_token_id: 77,
+            }
+        );
+
+        let refresh_claims = validate_token(&response.refresh_token, &config)
+            .expect("validate integration refresh token");
+        assert_eq!(refresh_claims.token_type, TokenType::Refresh);
+        assert_eq!(refresh_claims.scope.as_deref(), Some("integration_token"));
+        assert_eq!(refresh_claims.sub, "77");
     }
 
     #[test]

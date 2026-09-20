@@ -103,9 +103,10 @@ pub fn validate_workflow_expressions(
         }
 
         if let Some(ref wait_for) = task.wait_for {
+            let (target_name, target) = wait_for.target();
             collect_json_templates(
-                &wait_for.inquiry,
-                &format!("{task_loc} wait_for.inquiry"),
+                target,
+                &format!("{task_loc} wait_for.{target_name}"),
                 &known_names,
                 &mut warnings,
             );
@@ -730,9 +731,9 @@ mod tests {
     #[test]
     fn test_inquiry_prerequisite_and_namespace_are_validated() {
         let mut task = action_task("deploy");
-        task.wait_for = Some(super::super::parser::TaskWaitFor {
-            inquiry: serde_json::json!("{{ task.request.inquiry_id }}"),
-        });
+        task.wait_for = Some(super::super::parser::TaskWaitFor::Inquiry(
+            serde_json::json!("{{ task.request.inquiry_id }}"),
+        ));
         task.input.insert(
             "approval".to_string(),
             serde_json::json!("{{ inquiry['deploy-prod'].response }}"),
@@ -746,14 +747,26 @@ mod tests {
     #[test]
     fn test_inquiry_prerequisite_reports_unknown_reference() {
         let mut task = action_task("deploy");
-        task.wait_for = Some(super::super::parser::TaskWaitFor {
-            inquiry: serde_json::json!("{{ missing.inquiry_id }}"),
-        });
+        task.wait_for = Some(super::super::parser::TaskWaitFor::Inquiry(
+            serde_json::json!("{{ missing.inquiry_id }}"),
+        ));
 
         let wf = minimal_workflow(vec![task]);
         let warnings = validate_workflow_expressions(&wf, None);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].location.contains("wait_for.inquiry"));
         assert!(warnings[0].message.contains("unknown variable 'missing'"));
+    }
+
+    #[test]
+    fn test_execution_prerequisite_reports_target_location() {
+        let mut task = action_task("deploy");
+        task.wait_for = Some(super::super::parser::TaskWaitFor::Execution(
+            serde_json::json!("{{ missing.execution_id }}"),
+        ));
+
+        let warnings = validate_workflow_expressions(&minimal_workflow(vec![task]), None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].location.contains("wait_for.execution"));
     }
 }

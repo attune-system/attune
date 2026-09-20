@@ -156,10 +156,9 @@ The pack action owns:
 - Attune inquiry creation;
 - provider callback correlation;
 - provider-specific idempotency;
-- cleanup when provider delivery definitely fails;
-- the provider listener or webhook that submits a response.
+- cleanup when provider delivery definitely fails.
 
-The coordinator owns none of those provider details.
+The coordinator owns none of those provider details. Attune's API-owned callback adapter authenticates and normalizes the provider response; the pack action does not run a listener.
 
 ### Create the inquiry before sending
 
@@ -208,7 +207,7 @@ The inquiry response schema remains Attune's flat per-field format. The API vali
 
 ## External response path
 
-The pack supplies one shared provider listener for many inquiries. It does not start one process per inquiry.
+The first released external-response contract is the [provider-neutral inquiry callback ingress](provider-neutral-inquiry-callback-ingress.md). Providers call the Attune API directly. Unreleased listener and normalized-response scaffolding is not a compatibility contract and must be removed before release.
 
 Examples include:
 
@@ -217,7 +216,7 @@ Examples include:
 - a Teams bot callback;
 - a Discord interaction endpoint.
 
-The listener verifies the provider request, resolves the inquiry correlation value, maps the external actor to an Attune identity, and calls an integration-specific inquiry response endpoint.
+The callback adapter verifies the provider request, resolves an option-bound inquiry handle, maps the external actor to an Attune identity, and invokes the shared inquiry response service.
 
 The response operation must:
 
@@ -230,7 +229,7 @@ The response operation must:
 - reject a response after timeout, cancellation, or an earlier response;
 - avoid storing provider credentials or raw callback bodies in audit details.
 
-An integration cannot submit an arbitrary `responded_by` value through the human response endpoint. A registered provider integration needs a distinct credential and an explicit on-behalf-of grant. The integration response endpoint accepts provider actor evidence, resolves it through a configured external-identity mapping, and records both the mapped Attune identity and a non-secret provider actor reference. If no trusted mapping exists, the response is rejected.
+An integration cannot submit an arbitrary `responded_by` value through the human response endpoint. Each callback adapter binds a distinct integration identity with an explicit `inquiries:respond` grant. Direct callback ingress extracts provider actor evidence, resolves it through a configured external-identity mapping, and records both the mapped Attune identity and a non-secret provider actor reference. If no trusted mapping exists, the response is rejected.
 
 RabbitMQ publication remains a low-latency wake-up. A database reconciler must release waits when the response is committed but the wake-up message is lost.
 
@@ -293,11 +292,7 @@ The inquiry remains owned by the upstream action execution that created and deli
 
 The API stores workflow scope inferred from the creator execution. A guarded task may wait only for an inquiry created within the same workflow execution. Cross-workflow and arbitrary inquiry waits are outside the first contract.
 
-The current `InquiryHandler` assumes that a response completes `inquiry.execution`. That behavior must be removed for action-created waitable inquiries. A response changes inquiry state; workflow wait resolution controls downstream scheduling.
-
-Remove or replace that consumer before the first action-created inquiry can run. Two consumers on the existing inquiry response queue would compete for messages rather than broadcast them, and the legacy handler would overwrite the completed creator action's original result.
-
-The clean pre-production cutover is to remove synthetic `core.ask` execution completion and the legacy `__inquiry` result marker. Do not add another completion mode unless active persisted runs require a short drain period.
+The unreleased `InquiryHandler` scaffolding assumes that a response completes `inquiry.execution`. Remove it before action-created waitable inquiries are enabled. A response changes inquiry state; workflow wait resolution controls downstream scheduling. Synthetic `core.ask` execution completion and the `__inquiry` result marker must not ship.
 
 ## Coordinator flow
 
@@ -397,7 +392,7 @@ Action-created inquiry prerequisites
 |   +-- deliver provider message
 |   +-- return inquiry_id
 |   +-- idempotent retry
-|   +-- provider listener and callback
+|   +-- option-bound provider controls
 |
 +-- Workflow authoring
 |   +-- templated wait_for.inquiry ID
@@ -435,21 +430,21 @@ Action-created inquiry prerequisites
 |   +-- inquiry link and status
 |   +-- no synthetic child execution
 |
-+-- Migration
-    +-- replace core.ask workflows
++-- Pre-release cleanup
+    +-- update bundled core.ask definitions
     +-- remove execution-resume inquiry handling
     +-- remove legacy __inquiry marker
-    +-- reset or drain active legacy waits
 ```
 
 ## Feature work tree
 
 ```text
-1. Freeze the workflow contract
+1. Freeze the workflow contract and remove conflicting scaffolding
    |
    +-- Add wait_for parser fixtures
    +-- Define inquiry namespace and result shapes
    +-- Reject iteration and cyclic guarded tasks
+   +-- Remove core.ask interception, __inquiry creation, and execution-resume handling
    |
    v
 2. Add safe action-owned inquiry creation
@@ -496,8 +491,6 @@ Action-created inquiry prerequisites
    +-- Prove response-before-wait registration
    +-- Prove restart and duplicate delivery behavior
    +-- Convert core.ask definitions and tests
-   +-- Reset or drain active core.ask workflows
-   +-- Remove core.ask interception, __inquiry creation, and execution-resume handling together
    |
    v
 7. Integrate cancellation and API lifecycle
@@ -514,7 +507,7 @@ Action-created inquiry prerequisites
    +-- Add response, rejection, timeout, and cancellation coverage
    |
    v
-9. Finish migration
+9. Finish documentation
    |
    +-- Update workflow and inquiry documentation
 ```
@@ -531,7 +524,7 @@ The first slice should avoid an external provider and prove the scheduling contr
 6. Persist a task wait without creating the guarded child execution.
 7. Release the wait and create the guarded child exactly once.
 8. Integrate cancellation under the same workflow lock.
-9. Convert bundled `core.ask` definitions, then remove its scheduler interception, generic `__inquiry` creation, and execution-resume response handler in the same cutover.
+9. Convert bundled `core.ask` definitions and remove its scheduler interception, generic `__inquiry` creation, and execution-resume response handler before release.
 10. Prove response-before-registration, timeout, rejection, cancellation, duplicate wake-up, and executor restart.
 11. Count the pending wait during parallel workflow completion.
 

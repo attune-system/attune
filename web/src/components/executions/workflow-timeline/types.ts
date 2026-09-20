@@ -6,6 +6,8 @@
  * on a time axis with curved dependency edges showing the DAG structure.
  */
 
+import type { TaskWaitFor } from "@/types/workflow";
+
 // ---------------------------------------------------------------------------
 // Core data types
 // ---------------------------------------------------------------------------
@@ -23,7 +25,26 @@ export type TaskState =
 
 export type TimelineTaskDestination =
   | { kind: "execution"; executionId: number }
-  | { kind: "inquiry"; inquiryId: number };
+  | { kind: "inquiry"; inquiryId: number }
+  | {
+      kind: "work_queue_item";
+      workQueueRef: string;
+      workQueueItemId: number;
+    };
+
+export function timelineTaskDestinationPath(
+  destination: TimelineTaskDestination | null,
+): string | null {
+  if (!destination) return null;
+  switch (destination.kind) {
+    case "inquiry":
+      return `/inquiries/${destination.inquiryId}`;
+    case "execution":
+      return `/executions/${destination.executionId}`;
+    case "work_queue_item":
+      return `/queues/${encodeURIComponent(destination.workQueueRef)}/items/${destination.workQueueItemId}`;
+  }
+}
 
 /**
  * Metadata for a collapsed with_items group node.
@@ -78,7 +99,7 @@ export interface TimelineTask {
   /** Duration in ms (from metadata or computed) */
   durationMs: number | null;
   /** Detail page opened from the task */
-  destination: TimelineTaskDestination;
+  destination: TimelineTaskDestination | null;
   /**
    * Present only on collapsed with_items group nodes.
    * When set, this task represents multiple item executions merged into one.
@@ -243,7 +264,7 @@ export interface WorkflowDefinitionTask {
   with_items?: string;
   /** Max concurrent items for with_items (default 1 = serial) */
   concurrency?: number;
-  wait_for?: { inquiry: number | string };
+  wait_for?: TaskWaitFor;
   // Legacy fields (auto-converted to next)
   on_success?: string | string[];
   on_failure?: string | string[];

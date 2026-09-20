@@ -112,25 +112,28 @@ impl InquiryHandler {
 
             match WorkflowTaskWaitRepository::find_resolvable(&pool, 100).await {
                 Ok(waits) => {
-                    let inquiry_ids: std::collections::HashSet<_> =
-                        waits.into_iter().map(|wait| wait.inquiry).collect();
-                    for inquiry_id in inquiry_ids {
-                        if let Err(error) = ExecutionScheduler::release_inquiry_waits(
+                    let mut targets = Vec::new();
+                    for wait in waits {
+                        if let Ok(target) = wait.target() {
+                            if !targets.contains(&target) {
+                                targets.push(target);
+                            }
+                        }
+                    }
+                    for target in targets {
+                        if let Err(error) = ExecutionScheduler::release_target_waits(
                             &pool,
                             &publisher,
-                            inquiry_id,
+                            target,
                             encryption_key.as_deref(),
                         )
                         .await
                         {
-                            error!(
-                                "Error reconciling waits for inquiry {}: {}",
-                                inquiry_id, error
-                            );
+                            error!("Error reconciling waits for target {:?}: {}", target, error);
                         }
                     }
                 }
-                Err(error) => error!("Error finding resolvable inquiry waits: {}", error),
+                Err(error) => error!("Error finding resolvable task waits: {}", error),
             }
         }
     }

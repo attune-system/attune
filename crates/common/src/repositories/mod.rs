@@ -41,6 +41,7 @@ pub mod execution;
 pub mod execution_admission;
 pub mod execution_log_stream_lease;
 pub mod execution_secret_value;
+pub mod external_identity_mapping;
 pub mod health;
 pub mod identity;
 pub mod inquiry;
@@ -152,6 +153,7 @@ pub use execution::ExecutionRepository;
 pub use execution_admission::ExecutionAdmissionRepository;
 pub use execution_log_stream_lease::ExecutionLogStreamLeaseRepository;
 pub use execution_secret_value::ExecutionSecretValueRepository;
+pub use external_identity_mapping::ExternalIdentityMappingRepository;
 pub use health::HealthRepository;
 pub use identity::{
     DeleteIdentityOutcome, IdentityRepository, PermissionAssignmentRepository,

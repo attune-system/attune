@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { ExecutionsService, WorkflowTaskWaitState } from "@/api";
+import { ExecutionsService } from "@/api";
 
 type WorkflowTaskWaitsResponse = Awaited<
   ReturnType<typeof ExecutionsService.listWorkflowTaskWaits>
@@ -23,11 +23,7 @@ export function shouldPollWorkflowTaskWaits(
 ): boolean {
   return (
     isExecutionActive(parentStatus) ||
-    waits?.some(
-      (wait) =>
-        wait.state === WorkflowTaskWaitState.WAITING ||
-        wait.state === WorkflowTaskWaitState.RELEASED,
-    ) === true
+    waits?.some((wait) => wait.state === "waiting") === true
   );
 }
 

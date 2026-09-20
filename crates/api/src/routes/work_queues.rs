@@ -649,6 +649,41 @@ pub async fn list_queue_items(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/queues/{ref}/items/{item_id}",
+    tag = "queues",
+    params(
+        ("ref" = String, Path, description = "Queue reference identifier"),
+        ("item_id" = i64, Path, description = "Queue item identifier")
+    ),
+    responses(
+        (status = 200, description = "Queue item detail", body = ApiResponse<WorkQueueItemResponse>),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Queue or queue item not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_queue_item(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path((queue_ref, item_id)): Path<(String, i64)>,
+) -> ApiResult<impl IntoResponse> {
+    let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
+
+    authorize_queue_item_action(&state, &user, RbacAction::Read, &queue).await?;
+    ensure_queue_item_visibility(&state, &user, RbacAction::Read, &queue).await?;
+
+    let item = WorkQueueItemRepository::find_by_queue_and_id(&state.db, queue.id, item_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Queue item '{}' not found", item_id)))?;
+    let response = queue_item_response_with_execution_visibility(&state, &user, item).await?;
+
+    Ok((StatusCode::OK, Json(ApiResponse::new(response))))
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/queues/{ref}/items",
     tag = "queues",
@@ -1087,7 +1122,8 @@ pub async fn delete_queue_item(
         item.id,
         WorkQueueItemRepository::mutable_pending_statuses(),
     )
-    .await?;
+    .await
+    .map_err(map_queue_item_delete_error)?;
     if !deleted {
         return Err(ApiError::Conflict(
             "Queue item is no longer in a mutable pending state".to_string(),
@@ -1129,8 +1165,17 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/queues/{ref}/items/{item_id}",
-            axum::routing::put(update_queue_item).delete(delete_queue_item),
+            get(get_queue_item)
+                .put(update_queue_item)
+                .delete(delete_queue_item),
         )
+}
+
+fn map_queue_item_delete_error(error: attune_common::Error) -> ApiError {
+    match error {
+        attune_common::Error::InvalidState(message) => ApiError::Conflict(message),
+        other => other.into(),
+    }
 }
 
 struct EnqueueQueueItemResult {
@@ -1637,7 +1682,7 @@ async fn authorize_queue_action(
     .await
 }
 
-async fn authorize_queue_item_action(
+pub(crate) async fn authorize_queue_item_action(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     action: RbacAction,
@@ -1715,7 +1760,7 @@ pub(crate) async fn queue_item_visible(
         || has_queue_management_access(state, user, queue).await?)
 }
 
-async fn ensure_queue_item_visibility(
+pub(crate) async fn ensure_queue_item_visibility(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     action: RbacAction,
@@ -2291,8 +2336,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply_merge_patch, paginate_rows, queue_items_bulk_audit_details, routes,
-        validate_bulk_enqueue_limit,
+        apply_merge_patch, map_queue_item_delete_error, paginate_rows,
+        queue_items_bulk_audit_details, routes, validate_bulk_enqueue_limit,
     };
     use crate::dto::work_queue::{
         ApplyWorkQueueItemsRequest, WorkQueueItemBulkOperation, WorkQueueItemJsonPathSelector,
@@ -2301,6 +2346,15 @@ mod tests {
     #[test]
     fn test_work_queue_routes_structure() {
         let _router = routes();
+    }
+
+    #[test]
+    fn active_wait_delete_conflict_maps_to_http_conflict() {
+        let error = map_queue_item_delete_error(attune_common::Error::InvalidState(
+            "work queue item is targeted by an active workflow wait".to_string(),
+        ));
+
+        assert_eq!(error.status_code(), axum::http::StatusCode::CONFLICT);
     }
 
     #[test]

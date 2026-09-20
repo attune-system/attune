@@ -12,6 +12,15 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.create_rule_request_action_params import CreateRuleRequestActionParams
     from ..models.create_rule_request_conditions import CreateRuleRequestConditions
+    from ..models.create_rule_request_sensor_worker_affinity import (
+        CreateRuleRequestSensorWorkerAffinity,
+    )
+    from ..models.create_rule_request_sensor_worker_selector import (
+        CreateRuleRequestSensorWorkerSelector,
+    )
+    from ..models.create_rule_request_sensor_worker_tolerations_item import (
+        CreateRuleRequestSensorWorkerTolerationsItem,
+    )
     from ..models.create_rule_request_trigger_params import (
         CreateRuleRequestTriggerParams,
     )
@@ -37,6 +46,12 @@ class CreateRuleRequest:
         permission_set_refs (list[str] | None | Unset): Permission set refs to apply to executions created by this rule.
             Omit to
             inherit the action default. Provide an empty array to force no API token. Example: ['core.agent_reader'].
+        sensor_worker_affinity (CreateRuleRequestSensorWorkerAffinity | Unset): Required and preferred sensor-worker
+            affinity for this rule.
+        sensor_worker_selector (CreateRuleRequestSensorWorkerSelector | Unset): Required labels for the sensor worker
+            that runs this rule's managed sensor.
+        sensor_worker_tolerations (list[CreateRuleRequestSensorWorkerTolerationsItem] | Unset): Taints tolerated by the
+            sensor worker for this rule.
         trace_tag_template (None | str | Unset): Optional template used to resolve execution trace tags for this rule.
             Example: {{ event.trigger }}.{{ event.id }}.
         trigger_params (CreateRuleRequestTriggerParams | Unset): Parameters for trigger configuration and event
@@ -53,6 +68,11 @@ class CreateRuleRequest:
     description: None | str | Unset = UNSET
     enabled: bool | Unset = UNSET
     permission_set_refs: list[str] | None | Unset = UNSET
+    sensor_worker_affinity: CreateRuleRequestSensorWorkerAffinity | Unset = UNSET
+    sensor_worker_selector: CreateRuleRequestSensorWorkerSelector | Unset = UNSET
+    sensor_worker_tolerations: (
+        list[CreateRuleRequestSensorWorkerTolerationsItem] | Unset
+    ) = UNSET
     trace_tag_template: None | str | Unset = UNSET
     trigger_params: CreateRuleRequestTriggerParams | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -93,6 +113,23 @@ class CreateRuleRequest:
         else:
             permission_set_refs = self.permission_set_refs
 
+        sensor_worker_affinity: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.sensor_worker_affinity, Unset):
+            sensor_worker_affinity = self.sensor_worker_affinity.to_dict()
+
+        sensor_worker_selector: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.sensor_worker_selector, Unset):
+            sensor_worker_selector = self.sensor_worker_selector.to_dict()
+
+        sensor_worker_tolerations: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sensor_worker_tolerations, Unset):
+            sensor_worker_tolerations = []
+            for sensor_worker_tolerations_item_data in self.sensor_worker_tolerations:
+                sensor_worker_tolerations_item = (
+                    sensor_worker_tolerations_item_data.to_dict()
+                )
+                sensor_worker_tolerations.append(sensor_worker_tolerations_item)
+
         trace_tag_template: None | str | Unset
         if isinstance(self.trace_tag_template, Unset):
             trace_tag_template = UNSET
@@ -124,6 +161,12 @@ class CreateRuleRequest:
             field_dict["enabled"] = enabled
         if permission_set_refs is not UNSET:
             field_dict["permission_set_refs"] = permission_set_refs
+        if sensor_worker_affinity is not UNSET:
+            field_dict["sensor_worker_affinity"] = sensor_worker_affinity
+        if sensor_worker_selector is not UNSET:
+            field_dict["sensor_worker_selector"] = sensor_worker_selector
+        if sensor_worker_tolerations is not UNSET:
+            field_dict["sensor_worker_tolerations"] = sensor_worker_tolerations
         if trace_tag_template is not UNSET:
             field_dict["trace_tag_template"] = trace_tag_template
         if trigger_params is not UNSET:
@@ -138,6 +181,15 @@ class CreateRuleRequest:
         )
         from ..models.create_rule_request_conditions import (
             CreateRuleRequestConditions,
+        )
+        from ..models.create_rule_request_sensor_worker_affinity import (
+            CreateRuleRequestSensorWorkerAffinity,
+        )
+        from ..models.create_rule_request_sensor_worker_selector import (
+            CreateRuleRequestSensorWorkerSelector,
+        )
+        from ..models.create_rule_request_sensor_worker_tolerations_item import (
+            CreateRuleRequestSensorWorkerTolerationsItem,
         )
         from ..models.create_rule_request_trigger_params import (
             CreateRuleRequestTriggerParams,
@@ -198,6 +250,39 @@ class CreateRuleRequest:
             d.pop("permission_set_refs", UNSET)
         )
 
+        _sensor_worker_affinity = d.pop("sensor_worker_affinity", UNSET)
+        sensor_worker_affinity: CreateRuleRequestSensorWorkerAffinity | Unset
+        if isinstance(_sensor_worker_affinity, Unset):
+            sensor_worker_affinity = UNSET
+        else:
+            sensor_worker_affinity = CreateRuleRequestSensorWorkerAffinity.from_dict(
+                _sensor_worker_affinity
+            )
+
+        _sensor_worker_selector = d.pop("sensor_worker_selector", UNSET)
+        sensor_worker_selector: CreateRuleRequestSensorWorkerSelector | Unset
+        if isinstance(_sensor_worker_selector, Unset):
+            sensor_worker_selector = UNSET
+        else:
+            sensor_worker_selector = CreateRuleRequestSensorWorkerSelector.from_dict(
+                _sensor_worker_selector
+            )
+
+        _sensor_worker_tolerations = d.pop("sensor_worker_tolerations", UNSET)
+        sensor_worker_tolerations: (
+            list[CreateRuleRequestSensorWorkerTolerationsItem] | Unset
+        ) = UNSET
+        if _sensor_worker_tolerations is not UNSET:
+            sensor_worker_tolerations = []
+            for sensor_worker_tolerations_item_data in _sensor_worker_tolerations:
+                sensor_worker_tolerations_item = (
+                    CreateRuleRequestSensorWorkerTolerationsItem.from_dict(
+                        sensor_worker_tolerations_item_data
+                    )
+                )
+
+                sensor_worker_tolerations.append(sensor_worker_tolerations_item)
+
         def _parse_trace_tag_template(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -227,6 +312,9 @@ class CreateRuleRequest:
             description=description,
             enabled=enabled,
             permission_set_refs=permission_set_refs,
+            sensor_worker_affinity=sensor_worker_affinity,
+            sensor_worker_selector=sensor_worker_selector,
+            sensor_worker_tolerations=sensor_worker_tolerations,
             trace_tag_template=trace_tag_template,
             trigger_params=trigger_params,
         )

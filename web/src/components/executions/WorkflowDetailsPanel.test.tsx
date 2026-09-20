@@ -162,7 +162,7 @@ describe("WorkflowDetailsPanel cache iteration status", () => {
   });
 });
 
-describe("WorkflowDetailsPanel inquiry waits", () => {
+describe("WorkflowDetailsPanel waits", () => {
   beforeEach(() => {
     vi.mocked(useChildExecutions).mockReturnValue({
       data: { items: [] },
@@ -191,7 +191,7 @@ describe("WorkflowDetailsPanel inquiry waits", () => {
         data: [
           {
             id: 7,
-            inquiry_id: 91,
+            target_id: 91,
             kind: WorkflowTaskWaitKind.INQUIRY,
             state: WorkflowTaskWaitState.WAITING,
             task_name: "approve_deploy",
@@ -216,6 +216,61 @@ describe("WorkflowDetailsPanel inquiry waits", () => {
   });
 
   it.each([
+    ["execution", undefined, "/executions/91"],
+    ["work_queue_item", "ops.deployments", "/queues/ops.deployments/items/91"],
+  ] as const)("links a %s wait to its target", (kind, workQueueRef, href) => {
+    vi.mocked(useWorkflowTaskWaits).mockReturnValue({
+      data: {
+        data: [
+          {
+            id: 7,
+            target_id: 91,
+            kind,
+            state: WorkflowTaskWaitState.WAITING,
+            task_name: "approve_deploy",
+            work_queue_ref: workQueueRef,
+            created: "2026-08-05T10:00:00Z",
+            updated: "2026-08-05T10:01:00Z",
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useWorkflowTaskWaits>);
+
+    renderPanel();
+    expect(screen.getByText("waiting").closest("a")).toHaveAttribute(
+      "href",
+      href,
+    );
+  });
+
+  it("disables a queue item wait without a queue ref", () => {
+    vi.mocked(useWorkflowTaskWaits).mockReturnValue({
+      data: {
+        data: [
+          {
+            id: 7,
+            target_id: 91,
+            kind: "work_queue_item",
+            state: WorkflowTaskWaitState.WAITING,
+            task_name: "approve_deploy",
+            created: "2026-08-05T10:00:00Z",
+            updated: "2026-08-05T10:01:00Z",
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useWorkflowTaskWaits>);
+
+    renderPanel();
+    const row = screen.getByText("waiting").closest("[aria-disabled=true]");
+    expect(row).toBeInTheDocument();
+    expect(row?.closest("a")).toBeNull();
+  });
+
+  it.each([
     [WorkflowTaskWaitState.TIMED_OUT, "timeout"],
     [WorkflowTaskWaitState.CANCELLED, "cancelled"],
     [WorkflowTaskWaitState.FAILED, "failed"],
@@ -226,7 +281,7 @@ describe("WorkflowDetailsPanel inquiry waits", () => {
         data: [
           {
             id: 7,
-            inquiry_id: 91,
+            target_id: 91,
             kind: WorkflowTaskWaitKind.INQUIRY,
             state,
             task_name: "approve_deploy",
@@ -250,7 +305,7 @@ describe("WorkflowDetailsPanel inquiry waits", () => {
         data: [
           {
             id: 7,
-            inquiry_id: 91,
+            target_id: 91,
             kind: WorkflowTaskWaitKind.INQUIRY,
             state: WorkflowTaskWaitState.RELEASED,
             task_name: "approve_deploy",

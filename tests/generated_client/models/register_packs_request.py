@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
+from ..models.absent_metadata_policy import AbsentMetadataPolicy
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="RegisterPacksRequest")
@@ -18,6 +19,8 @@ class RegisterPacksRequest:
 
     Attributes:
         pack_paths (list[str]): List of pack directory paths to register Example: ['/tmp/attune-packs/slack'].
+        absent_metadata_policy (AbsentMetadataPolicy | Unset): How an installation handles pack-managed metadata omitted
+            by the new release.
         force (bool | Unset): Force registration (replace if exists) Example: False.
         packs_base_dir (None | str | Unset): Base directory for permanent storage Example: /opt/attune/packs.
         skip_tests (bool | Unset): Skip running pack tests Example: False.
@@ -25,6 +28,7 @@ class RegisterPacksRequest:
     """
 
     pack_paths: list[str]
+    absent_metadata_policy: AbsentMetadataPolicy | Unset = UNSET
     force: bool | Unset = UNSET
     packs_base_dir: None | str | Unset = UNSET
     skip_tests: bool | Unset = UNSET
@@ -33,6 +37,10 @@ class RegisterPacksRequest:
 
     def to_dict(self) -> dict[str, Any]:
         pack_paths = self.pack_paths
+
+        absent_metadata_policy: str | Unset = UNSET
+        if not isinstance(self.absent_metadata_policy, Unset):
+            absent_metadata_policy = self.absent_metadata_policy.value
 
         force = self.force
 
@@ -53,6 +61,8 @@ class RegisterPacksRequest:
                 "pack_paths": pack_paths,
             }
         )
+        if absent_metadata_policy is not UNSET:
+            field_dict["absent_metadata_policy"] = absent_metadata_policy
         if force is not UNSET:
             field_dict["force"] = force
         if packs_base_dir is not UNSET:
@@ -68,6 +78,13 @@ class RegisterPacksRequest:
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         pack_paths = cast(list[str], d.pop("pack_paths"))
+
+        _absent_metadata_policy = d.pop("absent_metadata_policy", UNSET)
+        absent_metadata_policy: AbsentMetadataPolicy | Unset
+        if isinstance(_absent_metadata_policy, Unset):
+            absent_metadata_policy = UNSET
+        else:
+            absent_metadata_policy = AbsentMetadataPolicy(_absent_metadata_policy)
 
         force = d.pop("force", UNSET)
 
@@ -86,6 +103,7 @@ class RegisterPacksRequest:
 
         register_packs_request = cls(
             pack_paths=pack_paths,
+            absent_metadata_policy=absent_metadata_policy,
             force=force,
             packs_base_dir=packs_base_dir,
             skip_tests=skip_tests,

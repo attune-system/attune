@@ -29,6 +29,9 @@ def _parse_response(
     if response.status_code == 200:
         return None
 
+    if response.status_code == 206:
+        return None
+
     if response.status_code == 400:
         return None
 
@@ -36,6 +39,9 @@ def _parse_response(
         return None
 
     if response.status_code == 404:
+        return None
+
+    if response.status_code == 416:
         return None
 
     if client.raise_on_unexpected_status:

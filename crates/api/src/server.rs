@@ -60,6 +60,7 @@ impl Server {
             .merge(routes::key_routes())
             .merge(routes::cache_routes())
             .merge(routes::permission_routes())
+            .merge(routes::external_identity_mapping_routes())
             .merge(routes::worker_routes())
             .merge(routes::retention_routes())
             .merge(routes::work_queue_routes())

@@ -385,6 +385,36 @@ export class QueuesService {
     });
   }
   /**
+   * @returns ApiResponse_WorkQueueItemResponse Queue item detail
+   * @throws ApiError
+   */
+  public static getQueueItem({
+    ref,
+    itemId,
+  }: {
+    /**
+     * Queue reference identifier
+     */
+    ref: string;
+    /**
+     * Queue item identifier
+     */
+    itemId: number;
+  }): CancelablePromise<ApiResponse_WorkQueueItemResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/queues/{ref}/items/{item_id}",
+      path: {
+        ref: ref,
+        item_id: itemId,
+      },
+      errors: {
+        403: `Insufficient permissions`,
+        404: `Queue or queue item not found`,
+      },
+    });
+  }
+  /**
    * @returns ApiResponse_WorkQueueItemResponse Queue item updated
    * @throws ApiError
    */

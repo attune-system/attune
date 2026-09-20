@@ -58,7 +58,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Any | GetKeyResponse200]:
-    """Get a single key by reference (includes decrypted value)
+    """Get a single key by reference
 
     Args:
         ref (str):
@@ -87,7 +87,7 @@ def sync(
     *,
     client: AuthenticatedClient,
 ) -> Any | GetKeyResponse200 | None:
-    """Get a single key by reference (includes decrypted value)
+    """Get a single key by reference
 
     Args:
         ref (str):
@@ -111,7 +111,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Any | GetKeyResponse200]:
-    """Get a single key by reference (includes decrypted value)
+    """Get a single key by reference
 
     Args:
         ref (str):
@@ -138,7 +138,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
 ) -> Any | GetKeyResponse200 | None:
-    """Get a single key by reference (includes decrypted value)
+    """Get a single key by reference
 
     Args:
         ref (str):

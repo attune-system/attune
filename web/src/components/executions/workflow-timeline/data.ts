@@ -298,6 +298,26 @@ function waitStateToTaskState(state: WorkflowTaskWaitState): TaskState {
   }
 }
 
+function waitDestination(wait: WorkflowTaskWait): TimelineTask["destination"] {
+  if (wait.target_id == null) return null;
+  switch (wait.kind) {
+    case "inquiry":
+      return { kind: "inquiry", inquiryId: wait.target_id };
+    case "execution":
+      return { kind: "execution", executionId: wait.target_id };
+    case "work_queue_item":
+      return wait.work_queue_ref
+        ? {
+            kind: "work_queue_item",
+            workQueueRef: wait.work_queue_ref,
+            workQueueItemId: wait.target_id,
+          }
+        : null;
+    default:
+      return null;
+  }
+}
+
 export function buildSyntheticWaitTasks({
   waits,
   childExecutions,
@@ -345,7 +365,7 @@ export function buildSyntheticWaitTasks({
         retryCount: 0,
         maxRetries: 0,
         durationMs: Math.max(0, endMs - startMs),
-        destination: { kind: "inquiry", inquiryId: wait.inquiry_id },
+        destination: waitDestination(wait),
       };
     });
 }
@@ -958,12 +978,12 @@ export function buildEdges(
     // Fill only the definition edges that touch a synthetic wait node.
     if (
       workflowDef?.tasks &&
-      tasks.some((task) => task.destination.kind === "inquiry")
+      tasks.some((task) => task.id.startsWith("__wait_"))
     ) {
       const allTaskIdsByName = timelineTaskIdsByName(tasks);
       const syntheticIds = new Set(
         tasks
-          .filter((task) => task.destination.kind === "inquiry")
+          .filter((task) => task.id.startsWith("__wait_"))
           .map((task) => task.id),
       );
       const taskById = new Map(tasks.map((task) => [task.id, task]));

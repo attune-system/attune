@@ -696,12 +696,13 @@ export class ExecutionsService {
     data: Array<{
       created: string;
       id: number;
-      inquiry_id: number;
       kind: WorkflowTaskWaitKind;
       resolved_at?: string | null;
       state: WorkflowTaskWaitState;
+      target_id?: number | null;
       task_name: string;
       updated: string;
+      work_queue_ref?: string | null;
     }>;
     /**
      * Optional message

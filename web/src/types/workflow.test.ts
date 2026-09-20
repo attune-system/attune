@@ -172,18 +172,16 @@ describe("iterate_cache workflow authoring", () => {
   });
 });
 
-describe("inquiry wait workflow authoring", () => {
-  it("round-trips wait_for.inquiry through the graph model", () => {
-    const workflowState = state(
-      task({
-        wait_for: {
-          inquiry: "{{ task.request_approval.inquiry_id }}",
-        },
-      }),
-    );
+describe("workflow wait authoring", () => {
+  it.each([
+    { inquiry: "{{ task.request_approval.inquiry_id }}" },
+    { execution: "{{ task.start_deploy.execution_id }}" },
+    { work_queue_item: 91 },
+  ])("round-trips $wait_for through the graph model", (waitFor) => {
+    const workflowState = state(task({ wait_for: waitFor }));
 
     const graph = builderStateToGraph(workflowState);
-    expect(graph.tasks[0].wait_for).toEqual(workflowState.tasks[0].wait_for);
+    expect(graph.tasks[0].wait_for).toEqual(waitFor);
 
     const definition: WorkflowYamlDefinition = {
       ref: "core.cache_workflow",
@@ -194,6 +192,27 @@ describe("inquiry wait workflow authoring", () => {
     expect(
       definitionToBuilderState(definition, "core", "cache_workflow").tasks[0]
         .wait_for,
-    ).toEqual(workflowState.tasks[0].wait_for);
+    ).toEqual(waitFor);
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid literal wait target %s",
+    (target) => {
+      expect(
+        validateWorkflow(state(task({ wait_for: { execution: target } }))),
+      ).toContain(
+        'Task "process_cache" execution wait target must be a positive integer',
+      );
+    },
+  );
+
+  it("requires wait target strings to be pure template expressions", () => {
+    expect(
+      validateWorkflow(
+        state(task({ wait_for: { work_queue_item: "item-{{ index }}" } })),
+      ),
+    ).toContain(
+      'Task "process_cache" work_queue_item wait target must be a template expression like {{ parameters.items }}',
+    );
   });
 });

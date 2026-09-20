@@ -53,6 +53,7 @@ class WorkQueueResponse:
         pack_ref (None | str | Unset):  Example: core.
         permission_set_refs (list[str] | None | Unset):  Example: ['core.agent_reader'].
         resolved_dispatch_tuning (None | ResolvedWorkQueueDispatchTuningResponse | Unset):
+        retired_at (datetime.datetime | None | Unset):
         trace_tag_template (None | str | Unset):  Example: {{ queue.ref }}.{{ queue_item.id }}.
     """
 
@@ -82,6 +83,7 @@ class WorkQueueResponse:
     resolved_dispatch_tuning: None | ResolvedWorkQueueDispatchTuningResponse | Unset = (
         UNSET
     )
+    retired_at: datetime.datetime | None | Unset = UNSET
     trace_tag_template: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -169,6 +171,14 @@ class WorkQueueResponse:
         else:
             resolved_dispatch_tuning = self.resolved_dispatch_tuning
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         trace_tag_template: None | str | Unset
         if isinstance(self.trace_tag_template, Unset):
             trace_tag_template = UNSET
@@ -211,6 +221,8 @@ class WorkQueueResponse:
             field_dict["permission_set_refs"] = permission_set_refs
         if resolved_dispatch_tuning is not UNSET:
             field_dict["resolved_dispatch_tuning"] = resolved_dispatch_tuning
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
         if trace_tag_template is not UNSET:
             field_dict["trace_tag_template"] = trace_tag_template
 
@@ -348,6 +360,23 @@ class WorkQueueResponse:
             d.pop("resolved_dispatch_tuning", UNSET)
         )
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         def _parse_trace_tag_template(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -384,6 +413,7 @@ class WorkQueueResponse:
             pack_ref=pack_ref,
             permission_set_refs=permission_set_refs,
             resolved_dispatch_tuning=resolved_dispatch_tuning,
+            retired_at=retired_at,
             trace_tag_template=trace_tag_template,
         )
 

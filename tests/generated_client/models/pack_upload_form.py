@@ -19,17 +19,25 @@ class PackUploadForm:
     """
     Attributes:
         pack (File):
+        absent_metadata_policy (None | str | Unset):
         force (None | str | Unset):
         skip_tests (None | str | Unset):
     """
 
     pack: File
+    absent_metadata_policy: None | str | Unset = UNSET
     force: None | str | Unset = UNSET
     skip_tests: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         pack = self.pack.to_tuple()
+
+        absent_metadata_policy: None | str | Unset
+        if isinstance(self.absent_metadata_policy, Unset):
+            absent_metadata_policy = UNSET
+        else:
+            absent_metadata_policy = self.absent_metadata_policy
 
         force: None | str | Unset
         if isinstance(self.force, Unset):
@@ -50,6 +58,8 @@ class PackUploadForm:
                 "pack": pack,
             }
         )
+        if absent_metadata_policy is not UNSET:
+            field_dict["absent_metadata_policy"] = absent_metadata_policy
         if force is not UNSET:
             field_dict["force"] = force
         if skip_tests is not UNSET:
@@ -61,6 +71,22 @@ class PackUploadForm:
         files: types.RequestFiles = []
 
         files.append(("pack", self.pack.to_tuple()))
+
+        if not isinstance(self.absent_metadata_policy, Unset):
+            if isinstance(self.absent_metadata_policy, str):
+                files.append(
+                    (
+                        "absent_metadata_policy",
+                        (None, str(self.absent_metadata_policy).encode(), "text/plain"),
+                    )
+                )
+            else:
+                files.append(
+                    (
+                        "absent_metadata_policy",
+                        (None, str(self.absent_metadata_policy).encode(), "text/plain"),
+                    )
+                )
 
         if not isinstance(self.force, Unset):
             if isinstance(self.force, str):
@@ -88,6 +114,17 @@ class PackUploadForm:
         d = dict(src_dict)
         pack = File(payload=BytesIO(d.pop("pack")))
 
+        def _parse_absent_metadata_policy(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        absent_metadata_policy = _parse_absent_metadata_policy(
+            d.pop("absent_metadata_policy", UNSET)
+        )
+
         def _parse_force(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -108,6 +145,7 @@ class PackUploadForm:
 
         pack_upload_form = cls(
             pack=pack,
+            absent_metadata_policy=absent_metadata_policy,
             force=force,
             skip_tests=skip_tests,
         )

@@ -17,6 +17,15 @@ if TYPE_CHECKING:
     from ..models.api_response_rule_response_data_conditions import (
         ApiResponseRuleResponseDataConditions,
     )
+    from ..models.api_response_rule_response_data_sensor_worker_affinity import (
+        ApiResponseRuleResponseDataSensorWorkerAffinity,
+    )
+    from ..models.api_response_rule_response_data_sensor_worker_selector import (
+        ApiResponseRuleResponseDataSensorWorkerSelector,
+    )
+    from ..models.api_response_rule_response_data_sensor_worker_tolerations_item import (
+        ApiResponseRuleResponseDataSensorWorkerTolerationsItem,
+    )
     from ..models.api_response_rule_response_data_trigger_params import (
         ApiResponseRuleResponseDataTriggerParams,
     )
@@ -41,6 +50,9 @@ class ApiResponseRuleResponseData:
         pack (int): Pack ID Example: 1.
         pack_ref (str): Pack reference Example: slack.
         ref (str): Unique reference identifier Example: slack.notify_on_error.
+        sensor_worker_affinity (ApiResponseRuleResponseDataSensorWorkerAffinity):
+        sensor_worker_selector (ApiResponseRuleResponseDataSensorWorkerSelector):
+        sensor_worker_tolerations (list[ApiResponseRuleResponseDataSensorWorkerTolerationsItem]):
         trigger_params (ApiResponseRuleResponseDataTriggerParams): Parameters for trigger configuration and event
             filtering
         trigger_ref (str): Trigger reference Example: system.error_event.
@@ -52,6 +64,7 @@ class ApiResponseRuleResponseData:
         permission_set_refs (list[str] | None | Unset): Optional execution permission override. Null means inherit
             action default;
             empty array means force no execution API token. Example: ['core.agent_reader'].
+        retired_at (datetime.datetime | None | Unset):
         trace_tag_template (None | str | Unset): Optional template used to resolve execution trace tags for this rule.
             Example: {{ event.trigger }}.{{ event.id }}.
         trigger (int | None | Unset): Trigger ID (null if the referenced trigger has been deleted) Example: 1.
@@ -68,6 +81,11 @@ class ApiResponseRuleResponseData:
     pack: int
     pack_ref: str
     ref: str
+    sensor_worker_affinity: ApiResponseRuleResponseDataSensorWorkerAffinity
+    sensor_worker_selector: ApiResponseRuleResponseDataSensorWorkerSelector
+    sensor_worker_tolerations: list[
+        ApiResponseRuleResponseDataSensorWorkerTolerationsItem
+    ]
     trigger_params: ApiResponseRuleResponseDataTriggerParams
     trigger_ref: str
     updated: datetime.datetime
@@ -75,6 +93,7 @@ class ApiResponseRuleResponseData:
     description: None | str | Unset = UNSET
     owner_identity: int | None | Unset = UNSET
     permission_set_refs: list[str] | None | Unset = UNSET
+    retired_at: datetime.datetime | None | Unset = UNSET
     trace_tag_template: None | str | Unset = UNSET
     trigger: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -101,6 +120,17 @@ class ApiResponseRuleResponseData:
         pack_ref = self.pack_ref
 
         ref = self.ref
+
+        sensor_worker_affinity = self.sensor_worker_affinity.to_dict()
+
+        sensor_worker_selector = self.sensor_worker_selector.to_dict()
+
+        sensor_worker_tolerations = []
+        for sensor_worker_tolerations_item_data in self.sensor_worker_tolerations:
+            sensor_worker_tolerations_item = (
+                sensor_worker_tolerations_item_data.to_dict()
+            )
+            sensor_worker_tolerations.append(sensor_worker_tolerations_item)
 
         trigger_params = self.trigger_params.to_dict()
 
@@ -135,6 +165,14 @@ class ApiResponseRuleResponseData:
         else:
             permission_set_refs = self.permission_set_refs
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         trace_tag_template: None | str | Unset
         if isinstance(self.trace_tag_template, Unset):
             trace_tag_template = UNSET
@@ -162,6 +200,9 @@ class ApiResponseRuleResponseData:
                 "pack": pack,
                 "pack_ref": pack_ref,
                 "ref": ref,
+                "sensor_worker_affinity": sensor_worker_affinity,
+                "sensor_worker_selector": sensor_worker_selector,
+                "sensor_worker_tolerations": sensor_worker_tolerations,
                 "trigger_params": trigger_params,
                 "trigger_ref": trigger_ref,
                 "updated": updated,
@@ -175,6 +216,8 @@ class ApiResponseRuleResponseData:
             field_dict["owner_identity"] = owner_identity
         if permission_set_refs is not UNSET:
             field_dict["permission_set_refs"] = permission_set_refs
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
         if trace_tag_template is not UNSET:
             field_dict["trace_tag_template"] = trace_tag_template
         if trigger is not UNSET:
@@ -189,6 +232,15 @@ class ApiResponseRuleResponseData:
         )
         from ..models.api_response_rule_response_data_conditions import (
             ApiResponseRuleResponseDataConditions,
+        )
+        from ..models.api_response_rule_response_data_sensor_worker_affinity import (
+            ApiResponseRuleResponseDataSensorWorkerAffinity,
+        )
+        from ..models.api_response_rule_response_data_sensor_worker_selector import (
+            ApiResponseRuleResponseDataSensorWorkerSelector,
+        )
+        from ..models.api_response_rule_response_data_sensor_worker_tolerations_item import (
+            ApiResponseRuleResponseDataSensorWorkerTolerationsItem,
         )
         from ..models.api_response_rule_response_data_trigger_params import (
             ApiResponseRuleResponseDataTriggerParams,
@@ -220,6 +272,29 @@ class ApiResponseRuleResponseData:
         pack_ref = d.pop("pack_ref")
 
         ref = d.pop("ref")
+
+        sensor_worker_affinity = (
+            ApiResponseRuleResponseDataSensorWorkerAffinity.from_dict(
+                d.pop("sensor_worker_affinity")
+            )
+        )
+
+        sensor_worker_selector = (
+            ApiResponseRuleResponseDataSensorWorkerSelector.from_dict(
+                d.pop("sensor_worker_selector")
+            )
+        )
+
+        sensor_worker_tolerations = []
+        _sensor_worker_tolerations = d.pop("sensor_worker_tolerations")
+        for sensor_worker_tolerations_item_data in _sensor_worker_tolerations:
+            sensor_worker_tolerations_item = (
+                ApiResponseRuleResponseDataSensorWorkerTolerationsItem.from_dict(
+                    sensor_worker_tolerations_item_data
+                )
+            )
+
+            sensor_worker_tolerations.append(sensor_worker_tolerations_item)
 
         trigger_params = ApiResponseRuleResponseDataTriggerParams.from_dict(
             d.pop("trigger_params")
@@ -275,6 +350,23 @@ class ApiResponseRuleResponseData:
             d.pop("permission_set_refs", UNSET)
         )
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         def _parse_trace_tag_template(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -307,6 +399,9 @@ class ApiResponseRuleResponseData:
             pack=pack,
             pack_ref=pack_ref,
             ref=ref,
+            sensor_worker_affinity=sensor_worker_affinity,
+            sensor_worker_selector=sensor_worker_selector,
+            sensor_worker_tolerations=sensor_worker_tolerations,
             trigger_params=trigger_params,
             trigger_ref=trigger_ref,
             updated=updated,
@@ -314,6 +409,7 @@ class ApiResponseRuleResponseData:
             description=description,
             owner_identity=owner_identity,
             permission_set_refs=permission_set_refs,
+            retired_at=retired_at,
             trace_tag_template=trace_tag_template,
             trigger=trigger,
         )

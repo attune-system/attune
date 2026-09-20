@@ -6,7 +6,11 @@ import {
 } from "@/api";
 import type { WorkflowTaskWait } from "@/hooks/useWorkflowTaskWaits";
 import { buildEdges, buildSyntheticWaitTasks } from "./data";
-import type { TimelineTask, WorkflowDefinition } from "./types";
+import {
+  timelineTaskDestinationPath,
+  type TimelineTask,
+  type WorkflowDefinition,
+} from "./types";
 
 const definition: WorkflowDefinition = {
   tasks: [
@@ -25,7 +29,7 @@ const definition: WorkflowDefinition = {
 
 const wait: WorkflowTaskWait = {
   id: 8,
-  inquiry_id: 91,
+  target_id: 91,
   kind: WorkflowTaskWaitKind.INQUIRY,
   state: WorkflowTaskWaitState.WAITING,
   task_name: "deploy",
@@ -106,4 +110,38 @@ describe("workflow wait timeline transformation", () => {
       }),
     ).toHaveLength(0);
   });
+
+  it.each([
+    ["inquiry", undefined, { kind: "inquiry", inquiryId: 91 }, "/inquiries/91"],
+    [
+      "execution",
+      undefined,
+      { kind: "execution", executionId: 91 },
+      "/executions/91",
+    ],
+    [
+      "work_queue_item",
+      "ops.deployments",
+      {
+        kind: "work_queue_item",
+        workQueueRef: "ops.deployments",
+        workQueueItemId: 91,
+      },
+      "/queues/ops.deployments/items/91",
+    ],
+    ["work_queue_item", undefined, null, null],
+  ] as const)(
+    "builds the %s destination from typed wait metadata",
+    (kind, workQueueRef, destination, path) => {
+      const [task] = buildSyntheticWaitTasks({
+        waits: [{ ...wait, kind, work_queue_ref: workQueueRef }],
+        childExecutions: [],
+        workflowDef: definition,
+        parentExecutionId: 42,
+      });
+
+      expect(task.destination).toEqual(destination);
+      expect(timelineTaskDestinationPath(task.destination)).toBe(path);
+    },
+  );
 });

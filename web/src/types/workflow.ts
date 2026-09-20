@@ -81,10 +81,24 @@ export interface WorkflowTask {
   position: NodePosition;
 }
 
-export interface TaskWaitFor {
-  /** Inquiry ID or template expression that resolves to one */
-  inquiry: number | string;
-}
+type TaskWaitTarget = number | string;
+
+export type TaskWaitFor =
+  | {
+      inquiry: TaskWaitTarget;
+      execution?: never;
+      work_queue_item?: never;
+    }
+  | {
+      inquiry?: never;
+      execution: TaskWaitTarget;
+      work_queue_item?: never;
+    }
+  | {
+      inquiry?: never;
+      execution?: never;
+      work_queue_item: TaskWaitTarget;
+    };
 
 export type CacheOwnerType =
   "system" | "identity" | "pack" | "action" | "sensor";
@@ -1736,6 +1750,35 @@ export function validateWorkflow(
           errors,
           { requirePureExpression: true },
         );
+      }
+    }
+
+    if (task.wait_for) {
+      const entries = Object.entries(task.wait_for).filter(
+        ([, value]) => value !== undefined,
+      );
+      if (entries.length !== 1) {
+        errors.push(`Task "${task.name}" must define exactly one wait target`);
+      } else {
+        const [kind, target] = entries[0];
+        const label = `Task "${task.name}" ${kind} wait target`;
+        if (typeof target === "number") {
+          if (!Number.isSafeInteger(target) || target <= 0) {
+            errors.push(`${label} must be a positive integer`);
+          }
+        } else if (typeof target === "string") {
+          if (!target.trim()) {
+            errors.push(`${label} must be a template expression`);
+          } else {
+            validateTemplateSyntax(target, label, errors, {
+              requirePureExpression: true,
+            });
+          }
+        } else {
+          errors.push(
+            `${label} must be a positive integer or template expression`,
+          );
+        }
       }
     }
 

@@ -34,7 +34,7 @@ import type {
   WorkflowDefinition,
   LayoutConfig,
 } from "./types";
-import { DEFAULT_LAYOUT } from "./types";
+import { DEFAULT_LAYOUT, timelineTaskDestinationPath } from "./types";
 import {
   buildTimelineTasks,
   buildSyntheticWaitTasks,
@@ -300,11 +300,8 @@ export default function WorkflowTimelineGraph({
 
   const handleTaskClick = useCallback(
     (task: TimelineTask) => {
-      if (task.destination.kind === "inquiry") {
-        navigate(`/inquiries/${task.destination.inquiryId}`);
-      } else {
-        navigate(`/executions/${task.destination.executionId}`);
-      }
+      const path = timelineTaskDestinationPath(task.destination);
+      if (path) navigate(path);
     },
     [navigate],
   );

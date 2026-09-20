@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { QueuesService } from "@/api";
 import {
   WorkQueuesService,
   type ApplyWorkQueueItemsRequest,
@@ -23,6 +24,8 @@ const queueKeys = {
   items: (ref: string) => [...queueKeys.detail(ref), "items"] as const,
   itemList: (ref: string, params?: ListQueueItemsParams) =>
     [...queueKeys.items(ref), params] as const,
+  item: (ref: string, itemId: number) =>
+    [...queueKeys.items(ref), itemId] as const,
 };
 
 export function useQueues(params?: ListQueuesParams) {
@@ -106,6 +109,22 @@ export function useQueueItems(ref: string, params?: ListQueueItemsParams) {
     queryFn: () => WorkQueuesService.listQueueItems({ ref, ...params }),
     enabled: !!ref,
     staleTime: 15000,
+  });
+}
+
+export function useQueueItem(ref: string, itemId: number | null) {
+  return useQuery({
+    queryKey: queueKeys.item(ref, itemId ?? 0),
+    queryFn: () => QueuesService.getQueueItem({ ref, itemId: itemId! }),
+    enabled: !!ref && itemId != null && itemId > 0,
+    staleTime: 3000,
+    refetchInterval: (query) => {
+      const status = query.state.data?.data.status;
+      return status &&
+        ["completed", "failed", "skipped", "cancelled"].includes(status)
+        ? false
+        : 3000;
+    },
   });
 }
 

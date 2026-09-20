@@ -30,6 +30,7 @@ class ApiResponseVecDashboardListItemResponseDataItem:
         updated (datetime.datetime):
         visibility (DashboardVisibility):
         description (None | str | Unset):
+        retired_at (datetime.datetime | None | Unset):
     """
 
     id: int
@@ -43,6 +44,7 @@ class ApiResponseVecDashboardListItemResponseDataItem:
     updated: datetime.datetime
     visibility: DashboardVisibility
     description: None | str | Unset = UNSET
+    retired_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,6 +74,14 @@ class ApiResponseVecDashboardListItemResponseDataItem:
         else:
             description = self.description
 
+        retired_at: None | str | Unset
+        if isinstance(self.retired_at, Unset):
+            retired_at = UNSET
+        elif isinstance(self.retired_at, datetime.datetime):
+            retired_at = self.retired_at.isoformat()
+        else:
+            retired_at = self.retired_at
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -90,6 +100,8 @@ class ApiResponseVecDashboardListItemResponseDataItem:
         )
         if description is not UNSET:
             field_dict["description"] = description
+        if retired_at is not UNSET:
+            field_dict["retired_at"] = retired_at
 
         return field_dict
 
@@ -125,6 +137,23 @@ class ApiResponseVecDashboardListItemResponseDataItem:
 
         description = _parse_description(d.pop("description", UNSET))
 
+        def _parse_retired_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                retired_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return retired_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        retired_at = _parse_retired_at(d.pop("retired_at", UNSET))
+
         api_response_vec_dashboard_list_item_response_data_item = cls(
             id=id,
             is_default_home=is_default_home,
@@ -137,6 +166,7 @@ class ApiResponseVecDashboardListItemResponseDataItem:
             updated=updated,
             visibility=visibility,
             description=description,
+            retired_at=retired_at,
         )
 
         api_response_vec_dashboard_list_item_response_data_item.additional_properties = d

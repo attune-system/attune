@@ -21,7 +21,7 @@ use attune_common::{
         FindById,
     },
 };
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -238,6 +238,45 @@ impl AuthorizationService {
     ) -> Result<(), ApiError> {
         let snapshot = self.load_snapshot(user).await?;
         self.authorize_with_snapshot(user, snapshot.as_ref(), check)
+    }
+
+    /// Authorizes an identity from rows read in the caller's transaction.
+    /// This deliberately bypasses every authorization cache.
+    pub async fn authorize_identity_fresh(
+        &self,
+        conn: &mut PgConnection,
+        user: &AuthenticatedUser,
+        identity_id: i64,
+        mut check: AuthorizationCheck,
+    ) -> Result<(), ApiError> {
+        let identity = IdentityRepository::find_by_id(&mut *conn, identity_id)
+            .await?
+            .filter(|identity| !identity.frozen)
+            .ok_or_else(|| ApiError::Unauthorized("Identity is not active".to_string()))?;
+        let mut permission_sets =
+            PermissionSetRepository::find_by_identity_for_share(&mut *conn, identity.id).await?;
+        permission_sets.extend(
+            PermissionSetRepository::find_by_identity_roles_for_share(&mut *conn, identity.id)
+                .await?,
+        );
+        let mut seen = std::collections::HashSet::new();
+        permission_sets.retain(|permission_set| seen.insert(permission_set.id));
+        let grants = Self::grants_from_permission_sets(permission_sets)?;
+
+        check.context.identity_id = identity.id;
+        check.context.identity_attributes = match identity.attributes {
+            serde_json::Value::Object(attributes) => attributes.clone().into_iter().collect(),
+            _ => HashMap::new(),
+        };
+        if !Self::is_allowed(&grants, check.resource, check.action, &check.context) {
+            self.emit_rbac_denied(user, &check);
+            return Err(ApiError::Forbidden(format!(
+                "Insufficient permissions: {}:{}",
+                resource_name(check.resource),
+                action_name(check.action)
+            )));
+        }
+        Ok(())
     }
 
     /// Loads the requesting identity's attributes and effective grants once so

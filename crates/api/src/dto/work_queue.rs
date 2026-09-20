@@ -700,9 +700,11 @@ where
                 "retry" => WorkQueueItemStatus::Retry,
                 "completed" => WorkQueueItemStatus::Completed,
                 "failed" => WorkQueueItemStatus::Failed,
+                "skipped" => WorkQueueItemStatus::Skipped,
+                "cancelled" => WorkQueueItemStatus::Cancelled,
                 other => {
                     return Err(format!(
-                        "invalid work queue item status '{}' (expected one of queued, leased, retry, completed, failed)",
+                        "invalid work queue item status '{}' (expected one of queued, leased, retry, completed, failed, skipped, cancelled)",
                         other
                     ));
                 }
@@ -814,10 +816,10 @@ mod tests {
 
     #[test]
     fn parse_status_filters_accepts_repeated_values() {
-        let parsed = parse_status_filters(["queued", "retry"]).expect("parse statuses");
+        let parsed = parse_status_filters(["skipped", "cancelled"]).expect("parse statuses");
         assert_eq!(
             parsed,
-            vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry]
+            vec![WorkQueueItemStatus::Skipped, WorkQueueItemStatus::Cancelled]
         );
     }
 }

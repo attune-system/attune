@@ -52,7 +52,7 @@
 //! - `flat(arr)`, `zip(a, b)`, `range(n)` / `range(start, end)`
 //!
 //! ### Workflow-specific
-//! - `result()`, `succeeded()`, `failed()`, `timed_out()`
+//! - `result()`, `succeeded()`, `failed()`, `timed_out()`, `cancelled()`
 
 mod ast;
 mod evaluator;

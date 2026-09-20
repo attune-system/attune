@@ -262,11 +262,7 @@ export function useExecutionStream(options: UseExecutionStreamOptions = {}) {
           exact: true,
         });
         queryClient.invalidateQueries({
-          queryKey: [
-            "artifacts",
-            "execution",
-            executionNotification.entity_id,
-          ],
+          queryKey: ["artifacts", "execution", executionNotification.entity_id],
           exact: true,
         });
       }

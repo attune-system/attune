@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
+from ..models.absent_metadata_policy import AbsentMetadataPolicy
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="PackInstallStatusResponse")
@@ -18,6 +19,8 @@ class PackInstallStatusResponse:
     """Response describing a tracked pack installation attempt.
 
     Attributes:
+        absent_metadata_policy (AbsentMetadataPolicy): How an installation handles pack-managed metadata omitted by the
+            new release.
         install_id (int): Pack install record id
         pack_ref (str): Pack reference this install attempt belongs to
         pack_version (str): Pack version being installed
@@ -30,6 +33,7 @@ class PackInstallStatusResponse:
         test_result (Any | Unset): Snapshot of the PackTestResult, when available
     """
 
+    absent_metadata_policy: AbsentMetadataPolicy
     install_id: int
     pack_ref: str
     pack_version: str
@@ -43,6 +47,8 @@ class PackInstallStatusResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        absent_metadata_policy = self.absent_metadata_policy.value
+
         install_id = self.install_id
 
         pack_ref = self.pack_ref
@@ -81,6 +87,7 @@ class PackInstallStatusResponse:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "absent_metadata_policy": absent_metadata_policy,
                 "install_id": install_id,
                 "pack_ref": pack_ref,
                 "pack_version": pack_version,
@@ -103,6 +110,8 @@ class PackInstallStatusResponse:
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
+        absent_metadata_policy = AbsentMetadataPolicy(d.pop("absent_metadata_policy"))
+
         install_id = d.pop("install_id")
 
         pack_ref = d.pop("pack_ref")
@@ -153,6 +162,7 @@ class PackInstallStatusResponse:
         test_result = d.pop("test_result", UNSET)
 
         pack_install_status_response = cls(
+            absent_metadata_policy=absent_metadata_policy,
             install_id=install_id,
             pack_ref=pack_ref,
             pack_version=pack_version,

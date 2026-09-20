@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::{Executor, Postgres};
+use sqlx::{Executor, PgConnection, Postgres};
 
 use crate::models::{identity::IntegrationToken, Id};
 use crate::Result;
@@ -88,6 +88,32 @@ impl Delete for IntegrationTokenRepository {
 }
 
 impl IntegrationTokenRepository {
+    /// Locks and returns an active credential only when it belongs to the
+    /// expected, unfrozen integration identity.
+    pub async fn find_active_for_identity(
+        conn: &mut PgConnection,
+        id: Id,
+        identity: Id,
+    ) -> Result<Option<IntegrationToken>> {
+        sqlx::query_as::<_, IntegrationToken>(&format!(
+            "SELECT {} FROM integration_token t \
+             JOIN identity i ON i.id = t.identity \
+             WHERE t.id = $1 AND t.identity = $2 AND t.revoked_at IS NULL \
+               AND (t.expires_at IS NULL OR t.expires_at > NOW()) AND NOT i.frozen \
+             FOR SHARE OF t, i",
+            SELECT_COLUMNS
+                .split(", ")
+                .map(|column| format!("t.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .bind(id)
+        .bind(identity)
+        .fetch_optional(conn)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn list_by_identity<'e, E>(executor: E, identity: Id) -> Result<Vec<IntegrationToken>>
     where
         E: Executor<'e, Database = Postgres> + 'e,

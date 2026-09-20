@@ -66,6 +66,12 @@ pub mod event_type {
     }
 
     pub mod admin {
+        pub const EXTERNAL_IDENTITY_MAPPING_CREATED: &str =
+            "admin.external_identity_mapping.created";
+        pub const EXTERNAL_IDENTITY_MAPPING_UPDATED: &str =
+            "admin.external_identity_mapping.updated";
+        pub const EXTERNAL_IDENTITY_MAPPING_DELETED: &str =
+            "admin.external_identity_mapping.deleted";
         pub const IDENTITY_CREATED: &str = "admin.identity.created";
         pub const IDENTITY_UPDATED: &str = "admin.identity.updated";
         pub const IDENTITY_DELETED: &str = "admin.identity.deleted";
@@ -123,6 +129,10 @@ pub mod event_type {
         pub const CANCELLED: &str = "execution.cancelled";
         pub const RETRIED: &str = "execution.retried";
         pub const WORKFLOW_CHILD_DISPATCHED: &str = "execution.workflow_child_dispatched";
+    }
+
+    pub mod inquiry {
+        pub const EXTERNAL_RESPONSE_ACCEPTED: &str = "inquiry.external_response.accepted";
     }
 
     pub mod audit_log {

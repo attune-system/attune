@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.create_sensor_token_internal_response_200_data_workload_fence_type_0 import (
+        CreateSensorTokenInternalResponse200DataWorkloadFenceType0,
+    )
+
 
 T = TypeVar("T", bound="CreateSensorTokenInternalResponse200Data")
 
@@ -24,6 +30,7 @@ class CreateSensorTokenInternalResponse200Data:
         token (str):
         trigger_types (list[str]):
         pack_ref (None | str | Unset):
+        workload_fence (CreateSensorTokenInternalResponse200DataWorkloadFenceType0 | None | Unset):
     """
 
     expires_at: str
@@ -33,9 +40,16 @@ class CreateSensorTokenInternalResponse200Data:
     token: str
     trigger_types: list[str]
     pack_ref: None | str | Unset = UNSET
+    workload_fence: (
+        CreateSensorTokenInternalResponse200DataWorkloadFenceType0 | None | Unset
+    ) = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.create_sensor_token_internal_response_200_data_workload_fence_type_0 import (
+            CreateSensorTokenInternalResponse200DataWorkloadFenceType0,
+        )
+
         expires_at = self.expires_at
 
         identity_id = self.identity_id
@@ -54,6 +68,17 @@ class CreateSensorTokenInternalResponse200Data:
         else:
             pack_ref = self.pack_ref
 
+        workload_fence: dict[str, Any] | None | Unset
+        if isinstance(self.workload_fence, Unset):
+            workload_fence = UNSET
+        elif isinstance(
+            self.workload_fence,
+            CreateSensorTokenInternalResponse200DataWorkloadFenceType0,
+        ):
+            workload_fence = self.workload_fence.to_dict()
+        else:
+            workload_fence = self.workload_fence
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -68,11 +93,17 @@ class CreateSensorTokenInternalResponse200Data:
         )
         if pack_ref is not UNSET:
             field_dict["pack_ref"] = pack_ref
+        if workload_fence is not UNSET:
+            field_dict["workload_fence"] = workload_fence
 
         return field_dict
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.create_sensor_token_internal_response_200_data_workload_fence_type_0 import (
+            CreateSensorTokenInternalResponse200DataWorkloadFenceType0,
+        )
+
         d = dict(src_dict)
         expires_at = d.pop("expires_at")
 
@@ -95,6 +126,32 @@ class CreateSensorTokenInternalResponse200Data:
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
+        def _parse_workload_fence(
+            data: object,
+        ) -> CreateSensorTokenInternalResponse200DataWorkloadFenceType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                workload_fence_type_0 = CreateSensorTokenInternalResponse200DataWorkloadFenceType0.from_dict(
+                    data
+                )
+
+                return workload_fence_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                CreateSensorTokenInternalResponse200DataWorkloadFenceType0
+                | None
+                | Unset,
+                data,
+            )
+
+        workload_fence = _parse_workload_fence(d.pop("workload_fence", UNSET))
+
         create_sensor_token_internal_response_200_data = cls(
             expires_at=expires_at,
             identity_id=identity_id,
@@ -103,6 +160,7 @@ class CreateSensorTokenInternalResponse200Data:
             token=token,
             trigger_types=trigger_types,
             pack_ref=pack_ref,
+            workload_fence=workload_fence,
         )
 
         create_sensor_token_internal_response_200_data.additional_properties = d

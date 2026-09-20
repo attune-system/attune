@@ -2,7 +2,7 @@
 
 use crate::models::{enums::ExecutionStatus, workflow::*, Id, JsonDict, JsonSchema};
 use crate::Result;
-use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder};
 
 use super::{Create, Delete, FindById, FindByRef, List, Repository, Update};
 
@@ -635,6 +635,14 @@ impl Delete for WorkflowExecutionRepository {
 }
 
 impl WorkflowExecutionRepository {
+    pub async fn acquire_advisory_lock(conn: &mut PgConnection, id: Id) -> Result<()> {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(id)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
     pub async fn cancel_with_prerequisites(
         pool: &PgPool,
         id: Id,

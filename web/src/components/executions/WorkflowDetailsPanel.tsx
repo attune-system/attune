@@ -33,6 +33,7 @@ import type {
   TimelineTask,
   WorkflowDefinition,
 } from "@/components/executions/workflow-timeline/types";
+import { timelineTaskDestinationPath } from "@/components/executions/workflow-timeline/types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -576,47 +577,60 @@ function TasksTab({
         </div>
 
         {/* Task rows */}
-        {waitTasks.map((task, idx) => (
-          <Link
-            key={task.id}
-            to={
-              task.destination.kind === "inquiry"
-                ? `/inquiries/${task.destination.inquiryId}`
-                : `/executions/${task.destination.executionId}`
-            }
-            className="grid grid-cols-12 gap-3 px-3 py-3 rounded-lg hover:bg-gray-50 transition-colors items-center group"
-          >
-            <div className="col-span-1 text-sm text-gray-400 font-mono">
-              {idx + 1}
+        {waitTasks.map((task, idx) => {
+          const destination = timelineTaskDestinationPath(task.destination);
+          const row = (
+            <>
+              <div className="col-span-1 text-sm text-gray-400 font-mono">
+                {idx + 1}
+              </div>
+              <div className="col-span-3 flex items-center gap-2 min-w-0">
+                {getStatusIcon(task.state)}
+                <span className="text-sm font-medium text-gray-900 truncate group-hover:text-blue-600">
+                  {task.name}
+                </span>
+              </div>
+              <div className="col-span-3 min-w-0">
+                <span className="text-sm text-gray-600 truncate block">
+                  {task.actionRef}
+                </span>
+              </div>
+              <div className="col-span-2">
+                <span
+                  className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${getStatusBadgeClasses(task.state)}`}
+                >
+                  {task.state === "released"
+                    ? "released (no child)"
+                    : task.state}
+                </span>
+              </div>
+              <div className="col-span-2 text-sm text-gray-500">
+                {task.durationMs != null && task.durationMs > 0 ? (
+                  formatDuration(task.durationMs)
+                ) : (
+                  <span className="text-gray-300">—</span>
+                )}
+              </div>
+              <div className="col-span-1 text-sm text-gray-300">—</div>
+            </>
+          );
+          const className =
+            "grid grid-cols-12 gap-3 px-3 py-3 rounded-lg transition-colors items-center group";
+
+          return destination ? (
+            <Link
+              key={task.id}
+              to={destination}
+              className={`${className} hover:bg-gray-50`}
+            >
+              {row}
+            </Link>
+          ) : (
+            <div key={task.id} className={className} aria-disabled="true">
+              {row}
             </div>
-            <div className="col-span-3 flex items-center gap-2 min-w-0">
-              {getStatusIcon(task.state)}
-              <span className="text-sm font-medium text-gray-900 truncate group-hover:text-blue-600">
-                {task.name}
-              </span>
-            </div>
-            <div className="col-span-3 min-w-0">
-              <span className="text-sm text-gray-600 truncate block">
-                {task.actionRef}
-              </span>
-            </div>
-            <div className="col-span-2">
-              <span
-                className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${getStatusBadgeClasses(task.state)}`}
-              >
-                {task.state === "released" ? "released (no child)" : task.state}
-              </span>
-            </div>
-            <div className="col-span-2 text-sm text-gray-500">
-              {task.durationMs != null && task.durationMs > 0 ? (
-                formatDuration(task.durationMs)
-              ) : (
-                <span className="text-gray-300">—</span>
-              )}
-            </div>
-            <div className="col-span-1 text-sm text-gray-300">—</div>
-          </Link>
-        ))}
+          );
+        })}
         {tasks.map((task, idx) => {
           const wt = task.workflow_task;
           const depth = Math.max(0, (depthById.get(task.id) ?? 1) - 1);

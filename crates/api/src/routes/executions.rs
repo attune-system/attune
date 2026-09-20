@@ -26,6 +26,7 @@ use attune_common::models::enums::ExecutionStatus;
 use attune_common::models::enums::LogStreamBackend;
 use attune_common::models::enums::RetentionPolicyType;
 use attune_common::models::log_stream::{LogSegment, LogStream};
+use attune_common::models::WorkflowTaskWaitTarget;
 use attune_common::mq::{
     ExecutionCancelRequestedPayload, ExecutionRequestedPayload, MessageEnvelope, MessageType,
     Publisher,
@@ -41,6 +42,7 @@ use attune_common::repositories::{
     execution_secret_value::ExecutionSecretValueRepository,
     log_stream::LogStreamRepository,
     maintenance::MaintenanceRepository,
+    work_queue::{WorkQueueItemRepository, WorkQueueRepository},
     workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository},
     FindById, FindByRef, Update, WorkflowCacheIterationRepository, WorkflowTaskWaitRepository,
 };
@@ -1171,12 +1173,79 @@ pub async fn list_workflow_task_waits(
     )
     .await?;
 
-    let waits: Vec<WorkflowTaskWaitResponse> =
-        WorkflowTaskWaitRepository::list_by_execution(&state.db, id)
-            .await?
-            .into_iter()
-            .map(WorkflowTaskWaitResponse::from)
-            .collect();
+    let wait_rows = WorkflowTaskWaitRepository::list_by_execution(&state.db, id).await?;
+    let mut waits = Vec::with_capacity(wait_rows.len());
+    for wait in wait_rows {
+        let target = wait.target()?;
+        let (target_visible, work_queue_ref) = match target {
+            WorkflowTaskWaitTarget::Inquiry(_) => (true, None),
+            WorkflowTaskWaitTarget::Execution(target_id) => {
+                let visible = if let Some(target_execution) =
+                    ExecutionRepository::find_by_id(&state.db, target_id).await?
+                {
+                    match authorize_execution_access(
+                        &state,
+                        &user,
+                        &target_execution,
+                        Action::Read,
+                        authz_snapshot.as_ref(),
+                        &mut ExecutionVisibilityCache::default(),
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(error) if error.status_code() == StatusCode::FORBIDDEN => false,
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    false
+                };
+                (visible, None)
+            }
+            WorkflowTaskWaitTarget::WorkQueueItem(item_id) => {
+                let Some(item) = WorkQueueItemRepository::find_by_id(&state.db, item_id).await?
+                else {
+                    waits.push(WorkflowTaskWaitResponse::try_from_wait(wait, false, None)?);
+                    continue;
+                };
+                let Some(queue) =
+                    WorkQueueRepository::find_by_ref(&state.db, &item.queue_ref).await?
+                else {
+                    waits.push(WorkflowTaskWaitResponse::try_from_wait(wait, false, None)?);
+                    continue;
+                };
+                let visible = match super::work_queues::authorize_queue_item_action(
+                    &state,
+                    &user,
+                    Action::Read,
+                    &queue,
+                )
+                .await
+                {
+                    Ok(()) => match super::work_queues::ensure_queue_item_visibility(
+                        &state,
+                        &user,
+                        Action::Read,
+                        &queue,
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(error) if error.status_code() == StatusCode::FORBIDDEN => false,
+                        Err(error) => return Err(error),
+                    },
+                    Err(error) if error.status_code() == StatusCode::FORBIDDEN => false,
+                    Err(error) => return Err(error),
+                };
+                (visible, visible.then_some(item.queue_ref))
+            }
+        };
+        waits.push(WorkflowTaskWaitResponse::try_from_wait(
+            wait,
+            target_visible,
+            work_queue_ref,
+        )?);
+    }
 
     Ok((StatusCode::OK, Json(ApiResponse::new(waits))))
 }

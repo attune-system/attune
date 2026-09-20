@@ -6,7 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.success_response import SuccessResponse
+from ...models.api_response_inquiry_response import ApiResponseInquiryResponse
 from ...types import Response
 
 
@@ -15,8 +15,8 @@ def _get_kwargs(
 ) -> dict[str, Any]:
 
     _kwargs: dict[str, Any] = {
-        "method": "delete",
-        "url": "/api/v1/inquiries/{id}".format(
+        "method": "post",
+        "url": "/api/v1/inquiries/{id}/cancel".format(
             id=quote(str(id), safe=""),
         ),
     }
@@ -26,9 +26,9 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | SuccessResponse | None:
+) -> Any | ApiResponseInquiryResponse | None:
     if response.status_code == 200:
-        response_200 = SuccessResponse.from_dict(response.json())
+        response_200 = ApiResponseInquiryResponse.from_dict(response.json())
 
         return response_200
 
@@ -36,9 +36,17 @@ def _parse_response(
         response_401 = cast(Any, None)
         return response_401
 
+    if response.status_code == 403:
+        response_403 = cast(Any, None)
+        return response_403
+
     if response.status_code == 404:
         response_404 = cast(Any, None)
         return response_404
+
+    if response.status_code == 409:
+        response_409 = cast(Any, None)
+        return response_409
 
     if response.status_code == 500:
         response_500 = cast(Any, None)
@@ -52,7 +60,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | SuccessResponse]:
+) -> Response[Any | ApiResponseInquiryResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -65,8 +73,8 @@ def sync_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
-) -> Response[Any | SuccessResponse]:
-    """Delete an inquiry
+) -> Response[Any | ApiResponseInquiryResponse]:
+    """Cancel an inquiry from its creator execution.
 
     Args:
         id (int):
@@ -76,7 +84,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | SuccessResponse]
+        Response[Any | ApiResponseInquiryResponse]
     """
 
     kwargs = _get_kwargs(
@@ -94,8 +102,8 @@ def sync(
     id: int,
     *,
     client: AuthenticatedClient,
-) -> Any | SuccessResponse | None:
-    """Delete an inquiry
+) -> Any | ApiResponseInquiryResponse | None:
+    """Cancel an inquiry from its creator execution.
 
     Args:
         id (int):
@@ -105,7 +113,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | SuccessResponse
+        Any | ApiResponseInquiryResponse
     """
 
     return sync_detailed(
@@ -118,8 +126,8 @@ async def asyncio_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
-) -> Response[Any | SuccessResponse]:
-    """Delete an inquiry
+) -> Response[Any | ApiResponseInquiryResponse]:
+    """Cancel an inquiry from its creator execution.
 
     Args:
         id (int):
@@ -129,7 +137,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | SuccessResponse]
+        Response[Any | ApiResponseInquiryResponse]
     """
 
     kwargs = _get_kwargs(
@@ -145,8 +153,8 @@ async def asyncio(
     id: int,
     *,
     client: AuthenticatedClient,
-) -> Any | SuccessResponse | None:
-    """Delete an inquiry
+) -> Any | ApiResponseInquiryResponse | None:
+    """Cancel an inquiry from its creator execution.
 
     Args:
         id (int):
@@ -156,7 +164,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | SuccessResponse
+        Any | ApiResponseInquiryResponse
     """
 
     return (
