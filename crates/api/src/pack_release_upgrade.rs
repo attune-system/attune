@@ -8,6 +8,7 @@ use attune_common::{
     models::Pack,
     pack_registry::PackStorage,
     repositories::{
+        component_lifecycle::ComponentLifecycleRepository,
         object_maintenance::ObjectMaintenanceRepository,
         pack::PackRepository,
         pack_release::{CreatePackReleaseInput, PackReleaseRepository},
@@ -149,7 +150,8 @@ async fn upgrade_pack(
         },
     )
     .await?;
-    PackReleaseRepository::activate(&mut tx, pack.id, release.id).await?;
+    let projections = ComponentLifecycleRepository::active_projection_ids(&mut tx, pack.id).await?;
+    PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, &projections).await?;
     tx.commit().await?;
     Ok(())
 }

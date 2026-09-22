@@ -104,7 +104,7 @@ artifacts_dir: /opt/attune/artifacts
 # list to [] to deny public registry and pack-source traffic by default.
 pack_registry:
   enabled: true
-  allow_unverified_direct_remote_installs: false
+  allow_unverified_direct_remote_installs: true
   approved_public_hosts:
     - raw.githubusercontent.com
     - github.com

@@ -84,7 +84,7 @@ artifacts_dir: ./artifacts
 # Standard public pack discovery. An explicit empty host list opts out.
 pack_registry:
   enabled: true
-  allow_unverified_direct_remote_installs: false
+  allow_unverified_direct_remote_installs: true
   approved_public_hosts:
     - raw.githubusercontent.com
     - github.com

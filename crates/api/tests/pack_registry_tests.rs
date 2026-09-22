@@ -15,14 +15,18 @@ use attune_common::{
         jwt::{generate_token, generate_worker_token, validate_token, JwtConfig, TokenType},
     },
     blob_store::{BlobStore, FilesystemBlobStore, ObjectKey},
-    models::Pack,
+    models::{ManagementOrigin, Pack},
     pack_registry::calculate_directory_checksum,
+    platform_catalog::ManagedComponentKind,
     repositories::{
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
         },
         pack::{CreatePackInput, PackRepository},
+        platform_catalog::PlatformCatalogRepository,
+        runtime::{CreateRuntimeInput, RuntimeRepository},
+        trigger::{CreateSensorInput, SensorRepository},
         Create, FindById, FindByRef, List, PackInstallRepository, PackReleaseRepository,
     },
 };
@@ -2159,7 +2163,7 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
     )?;
     fs::write(source.join("run.sh"), "#!/bin/sh\necho legacy\n")?;
 
-    PackRepository::create(
+    let pack = PackRepository::create(
         &ctx.pool,
         CreatePackInput {
             r#ref: "core".to_string(),
@@ -2174,6 +2178,48 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
             dependencies: Vec::new(),
             is_standard: false,
             installers: json!({}),
+        },
+    )
+    .await?;
+    let runtime = RuntimeRepository::create(
+        &ctx.pool,
+        CreateRuntimeInput {
+            r#ref: "core.legacy_native".to_string(),
+            pack: Some(pack.id),
+            pack_ref: Some(pack.r#ref.clone()),
+            description: None,
+            name: "native".to_string(),
+            aliases: Vec::new(),
+            distributions: json!({}),
+            installation: None,
+            execution_config: json!({}),
+            auto_detected: false,
+            detection_config: json!({}),
+        },
+    )
+    .await?;
+    let sensor = SensorRepository::create(
+        &ctx.pool,
+        CreateSensorInput {
+            r#ref: "core.legacy_timer".to_string(),
+            pack: Some(pack.id),
+            pack_ref: Some(pack.r#ref.clone()),
+            label: "Legacy timer".to_string(),
+            description: None,
+            entrypoint: "run.sh".to_string(),
+            runtime: runtime.id,
+            runtime_ref: runtime.r#ref,
+            runtime_version_constraint: None,
+            enabled: true,
+            param_schema: None,
+            config: None,
+            worker_selector: json!({}),
+            worker_tolerations: json!([]),
+            worker_affinity: json!({}),
+            log_retention_policy: None,
+            log_retention_limit: None,
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
         },
     )
     .await?;
@@ -2200,6 +2246,18 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
         .expect("uploaded immutable archive");
     assert_eq!(object.size as i64, release.archive_size);
     assert_eq!(hex::encode(object.sha256), release.digest);
+    assert_eq!(
+        PlatformCatalogRepository::origin_by_id(
+            &ctx.pool,
+            ManagedComponentKind::Sensor,
+            sensor.id,
+        )
+        .await?,
+        Some(ManagementOrigin::Pack {
+            pack_id: pack.id,
+            release_id: Some(release.id),
+        })
+    );
 
     let ready = ctx.get("/health/ready", None).await?;
     assert_eq!(ready.status(), axum::http::StatusCode::OK);

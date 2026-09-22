@@ -35,6 +35,63 @@ pub struct RetiredPackComponent {
 pub struct ComponentLifecycleRepository;
 
 impl ComponentLifecycleRepository {
+    pub async fn active_projection_ids(
+        connection: &mut PgConnection,
+        pack_id: i64,
+    ) -> Result<PackProjectionIds> {
+        #[derive(sqlx::FromRow)]
+        struct ProjectionRow {
+            runtimes: Vec<i64>,
+            runtime_versions: Vec<i64>,
+            permission_sets: Vec<i64>,
+            triggers: Vec<i64>,
+            actions: Vec<i64>,
+            sensors: Vec<i64>,
+            rules: Vec<i64>,
+            policies: Vec<i64>,
+            work_queues: Vec<i64>,
+            workflows: Vec<i64>,
+            dashboards: Vec<i64>,
+            caches: Vec<i64>,
+        }
+
+        let row: ProjectionRow = sqlx::query_as(
+            r#"
+            SELECT
+                ARRAY(SELECT id FROM runtime WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS runtimes,
+                ARRAY(SELECT rv.id FROM runtime_version rv JOIN runtime r ON r.id = rv.runtime WHERE r.pack = $1 AND r.management_origin = 'pack' AND r.retired_at IS NULL AND rv.retired_at IS NULL ORDER BY rv.id) AS runtime_versions,
+                ARRAY(SELECT id FROM permission_set WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS permission_sets,
+                ARRAY(SELECT id FROM trigger WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS triggers,
+                ARRAY(SELECT id FROM action WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS actions,
+                ARRAY(SELECT id FROM sensor WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS sensors,
+                ARRAY(SELECT id FROM rule WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS rules,
+                ARRAY(SELECT id FROM policy WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS policies,
+                ARRAY(SELECT id FROM work_queue WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS work_queues,
+                ARRAY(SELECT id FROM workflow_definition WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS workflows,
+                ARRAY(SELECT id FROM dashboard WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS dashboards,
+                ARRAY(SELECT id FROM cache_namespace WHERE managing_pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS caches
+            "#,
+        )
+        .bind(pack_id)
+        .fetch_one(connection)
+        .await?;
+
+        Ok(PackProjectionIds {
+            runtimes: row.runtimes,
+            runtime_versions: row.runtime_versions,
+            permission_sets: row.permission_sets,
+            triggers: row.triggers,
+            actions: row.actions,
+            sensors: row.sensors,
+            rules: row.rules,
+            policies: row.policies,
+            work_queues: row.work_queues,
+            workflows: row.workflows,
+            dashboards: row.dashboards,
+            caches: row.caches,
+        })
+    }
+
     pub async fn list_retired_by_pack<'e, E>(
         executor: E,
         pack_id: i64,

@@ -1540,8 +1540,7 @@ impl SensorManager {
         Ok(SensorInstance::new_standalone(
             sensor,
             child,
-            stdout_handle,
-            stderr_handle,
+            (stdout_handle, stderr_handle),
             token_expires_at,
             workload,
             pack_revision,
@@ -3700,14 +3699,14 @@ impl SensorInstance {
     fn new_standalone(
         sensor: Sensor,
         child_process: Child,
-        stdout_handle: JoinHandle<()>,
-        stderr_handle: JoinHandle<()>,
+        output_handles: (JoinHandle<()>, JoinHandle<()>),
         token_expires_at: DateTime<Utc>,
         workload: OwnedSensorWorkload,
         pack_revision: PackRevision,
         definition_updated: DateTime<Utc>,
     ) -> Self {
         let sensor_ref = sensor.r#ref.clone();
+        let (stdout_handle, stderr_handle) = output_handles;
         Self {
             sensor,
             sensor_ref,
@@ -4351,8 +4350,7 @@ mod tests {
         let mut instance = SensorInstance::new_standalone(
             test_sensor,
             child,
-            stdout_handle,
-            stderr_handle,
+            (stdout_handle, stderr_handle),
             Utc::now() + chrono::Duration::hours(1),
             test_owned_workload(),
             PackRevision {
