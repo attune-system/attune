@@ -39,7 +39,6 @@ fn artifact_input(suffix: &str) -> CreateArtifactInput {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn ledger_rechecks_shared_exact_references_and_retries_stale_claims() {
     let pool = create_test_pool().await.expect("test database");
     ObjectMaintenanceRepository::reserve_upload(&pool, "shared/key", "artifact")
@@ -110,7 +109,6 @@ async fn ledger_rechecks_shared_exact_references_and_retries_stale_claims() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn claimed_deletion_cannot_be_revived_by_upload_calls() {
     let pool = create_test_pool().await.expect("test database");
     ObjectMaintenanceRepository::reserve_upload(&pool, "claimed/key", "artifact")
@@ -152,7 +150,6 @@ async fn claimed_deletion_cannot_be_revived_by_upload_calls() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn stale_upload_cleanup_does_not_delete_a_refreshed_reservation() {
     let pool = create_test_pool().await.expect("test database");
     ObjectMaintenanceRepository::reserve_upload(&pool, "refreshed/key", "artifact")
@@ -193,7 +190,6 @@ async fn stale_upload_cleanup_does_not_delete_a_refreshed_reservation() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn upload_reservation_wins_or_claim_rechecks_exact_references() {
     let pool = create_test_pool().await.expect("test database");
     ObjectMaintenanceRepository::reserve_upload(&pool, "republished/key", "artifact")
@@ -261,7 +257,6 @@ async fn upload_reservation_wins_or_claim_rechecks_exact_references() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn ready_object_pages_advance_past_a_healthy_prefix() {
     let pool = create_test_pool().await.expect("test database");
     let artifact = ArtifactRepository::create(&pool, artifact_input("ready_pages"))
@@ -294,7 +289,6 @@ async fn ready_object_pages_advance_past_a_healthy_prefix() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn versions_policy_ignores_pending_uploads_until_they_are_ready() {
     let pool = create_test_pool().await.expect("test database");
     let mut input = artifact_input("versions");
@@ -394,7 +388,6 @@ async fn versions_policy_ignores_pending_uploads_until_they_are_ready() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn concurrent_ready_transitions_obey_the_versions_limit() {
     let pool = create_test_pool().await.expect("test database");
     let mut input = artifact_input("concurrent_versions");
@@ -444,7 +437,6 @@ async fn concurrent_ready_transitions_obey_the_versions_limit() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn object_lifecycle_recovery_is_delayed_and_idempotent() {
     let pool = create_test_pool().await.expect("test database");
     let artifact = ArtifactRepository::create(&pool, artifact_input("pending"))
@@ -525,7 +517,6 @@ async fn object_lifecycle_recovery_is_delayed_and_idempotent() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn abandoned_shared_logs_are_selected_only_after_the_pending_grace() {
     let pool = create_test_pool().await.expect("test database");
     let artifact = ArtifactRepository::create(&pool, artifact_input("shared_pending"))
@@ -635,7 +626,6 @@ async fn abandoned_shared_logs_are_selected_only_after_the_pending_grace() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn active_object_logs_are_not_abandoned_even_when_the_body_timestamp_is_old() {
     let pool = create_test_pool().await.expect("test database");
     let artifact = ArtifactRepository::create(&pool, artifact_input("active_object_log"))
@@ -738,7 +728,6 @@ async fn active_object_logs_are_not_abandoned_even_when_the_body_timestamp_is_ol
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn shared_log_seal_and_cleanup_claim_have_exactly_one_winner() {
     let pool = create_test_pool().await.expect("test database");
     let artifact = ArtifactRepository::create(&pool, artifact_input("seal_cleanup_race"))
@@ -854,7 +843,6 @@ async fn shared_log_seal_and_cleanup_claim_have_exactly_one_winner() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn migration_switch_is_atomic_and_preserves_snapshot_pointer() {
     let pool = create_test_pool().await.expect("test database");
     let mut input = artifact_input("legacy");

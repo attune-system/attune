@@ -9,7 +9,6 @@ mod helpers;
 use helpers::{ActionFixture, PackFixture};
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_upsert_queue_stats() {
     let pool = helpers::create_test_pool().await.unwrap();
 
@@ -67,7 +66,6 @@ async fn test_upsert_queue_stats() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_queue_stats_by_action() {
     let pool = helpers::create_test_pool().await.unwrap();
 
@@ -109,7 +107,6 @@ async fn test_find_queue_stats_by_action() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_active_queue_stats() {
     let pool = helpers::create_test_pool().await.unwrap();
 
@@ -174,7 +171,6 @@ async fn test_list_active_queue_stats() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_queue_stats() {
     let pool = helpers::create_test_pool().await.unwrap();
 
@@ -224,7 +220,6 @@ async fn test_delete_queue_stats() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_batch_upsert_queue_stats() {
     let pool = helpers::create_test_pool().await.unwrap();
 
@@ -267,7 +262,6 @@ async fn test_batch_upsert_queue_stats() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_clear_stale_queue_stats() {
     let pool = helpers::create_test_pool().await.unwrap();
 
@@ -307,7 +301,6 @@ async fn test_clear_stale_queue_stats() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_queue_stats_cascade_delete() {
     let pool = helpers::create_test_pool().await.unwrap();
 

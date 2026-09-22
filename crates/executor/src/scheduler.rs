@@ -1538,7 +1538,7 @@ impl ExecutionScheduler {
                 )
                 .await?;
             Self::complete_workflow_with_conn(
-                &mut *transaction,
+                &mut transaction,
                 execution.id,
                 workflow_execution.id,
                 true,
@@ -1548,7 +1548,7 @@ impl ExecutionScheduler {
             .await?;
             logger
                 .log_with_conn(
-                    &mut *transaction,
+                    &mut transaction,
                     crate::workflow::log::LogLevel::Info,
                     "Workflow completed",
                 )
@@ -5513,6 +5513,37 @@ impl ExecutionScheduler {
                     )
                 })?;
 
+        let child_cancelled = execution.id >= 0
+            && matches!(
+                execution.status,
+                ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+            );
+        if child_cancelled
+            && !matches!(
+                workflow_execution.status,
+                ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+            )
+            && !matches!(
+                parent_execution.status,
+                ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+            )
+        {
+            let reason = format!("Workflow task '{}' was cancelled", task_name);
+            WorkflowExecutionRepository::cancel_with_prerequisites_with_conn(
+                &mut *conn,
+                workflow_execution_id,
+                &reason,
+                Some((
+                    ExecutionStatus::Canceling,
+                    Some(serde_json::json!({
+                        "error": reason,
+                        "succeeded": false,
+                    })),
+                )),
+            )
+            .await?;
+        }
+
         // Cancellation must be a hard stop for workflow orchestration. Once
         // either the workflow record, the parent execution, or the completed
         // child itself is in a cancellation state, do not evaluate transitions,
@@ -5541,7 +5572,7 @@ impl ExecutionScheduler {
                     .await?;
                 }
             }
-            if workflow_execution.status == ExecutionStatus::Cancelled {
+            if workflow_execution.status == ExecutionStatus::Cancelled || child_cancelled {
                 let running = Self::count_running_workflow_children_with_conn(
                     &mut *conn,
                     workflow_execution_id,
@@ -5556,12 +5587,30 @@ impl ExecutionScheduler {
                          finalizing parent execution {} as Cancelled",
                         workflow_execution_id, workflow_execution.execution
                     );
-                    Self::finalize_cancelled_workflow_with_conn(
+                    let completed_execution = Self::finalize_cancelled_workflow_with_conn(
                         &mut *conn,
                         workflow_execution.execution,
                         workflow_execution_id,
                     )
                     .await?;
+                    if let Some(completed_execution) = completed_execution {
+                        if completed_execution.parent.is_some() {
+                            let action_id = completed_execution.action.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Cancelled nested workflow execution {} has no action id",
+                                    completed_execution.id
+                                )
+                            })?;
+                            pending_completed_execution = Some(PendingExecutionCompleted {
+                                execution_id: completed_execution.id,
+                                action_id,
+                                action_ref: completed_execution.action_ref.clone(),
+                                status: completed_execution.status,
+                                result: completed_execution.result.clone(),
+                                completed_at: Utc::now(),
+                            });
+                        }
+                    }
                 } else {
                     debug!(
                         "Workflow_execution {} is cancelling/cancelled with {} running children, \
@@ -5583,7 +5632,7 @@ impl ExecutionScheduler {
             return Ok(WorkflowAdvanceOutcome {
                 execution_requests: pending_messages,
                 completed_children: pending_completed_children,
-                completed_execution: None,
+                completed_execution: pending_completed_execution,
             });
         }
 
@@ -6434,7 +6483,7 @@ impl ExecutionScheduler {
         conn: &mut PgConnection,
         parent_execution_id: i64,
         workflow_execution_id: i64,
-    ) -> Result<()> {
+    ) -> Result<Option<Execution>> {
         info!(
             "Finalizing cancelled workflow: parent execution {} (workflow_execution {})",
             parent_execution_id, workflow_execution_id
@@ -6448,7 +6497,7 @@ impl ExecutionScheduler {
             })),
             ..Default::default()
         };
-        ExecutionRepository::update_if_status(
+        let execution = ExecutionRepository::update_if_status(
             &mut *conn,
             parent_execution_id,
             ExecutionStatus::Canceling,
@@ -6456,7 +6505,7 @@ impl ExecutionScheduler {
         )
         .await?;
 
-        Ok(())
+        Ok(execution)
     }
 
     async fn complete_workflow_with_conn(
@@ -7638,6 +7687,7 @@ mod tests {
             execution::{
                 ActionExecutableSnapshot, PackReleasePin, ReleasedActionExecutableSnapshot,
             },
+            inquiry::{InquiryResponseOption, InquiryResponseOptionStyle},
             Action, Execution, Inquiry, Worker, WorkerRole, WorkerStatus, WorkerType,
         },
         repositories::{
@@ -7993,10 +8043,16 @@ tasks:
             let inquiry = InquiryRepository::create_workflow_inquiry_idempotent(
                 &mut connection,
                 CreateWorkflowInquiryInput {
-                    execution: request.id,
+                    created_by_execution: request.id,
                     purpose: "approval".to_string(),
                     prompt: "Approve?".to_string(),
                     response_schema: None,
+                    response_options: vec![InquiryResponseOption {
+                        r#ref: "approve".to_string(),
+                        label: "Approve".to_string(),
+                        style: InquiryResponseOptionStyle::Positive,
+                        response: serde_json::json!({"approved": true}),
+                    }],
                     assigned_to: None,
                     timeout_seconds: Some(3600),
                 },
@@ -8195,7 +8251,62 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
+    async fn cancelled_workflow_child_cancels_workflow_and_parent() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let child = ExecutionRepository::update(
+            fixture.database.pool(),
+            fixture.request.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Cancelled),
+                result: Some(serde_json::json!({"error": "cancelled by user"})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancel workflow child");
+
+        let mut transaction = fixture
+            .database
+            .pool()
+            .begin()
+            .await
+            .expect("begin workflow advancement");
+        ExecutionScheduler::advance_workflow_serialized(
+            &mut transaction,
+            &AtomicUsize::new(0),
+            None,
+            &child,
+            &SchedulerMetadataCaches::new(),
+        )
+        .await
+        .expect("advance cancelled workflow child");
+        transaction
+            .commit()
+            .await
+            .expect("commit workflow advancement");
+
+        let workflow = WorkflowExecutionRepository::find_by_id(
+            fixture.database.pool(),
+            fixture.workflow_execution_id,
+        )
+        .await
+        .expect("load workflow execution")
+        .expect("workflow execution exists");
+        let parent = ExecutionRepository::find_by_id(fixture.database.pool(), fixture.parent.id)
+            .await
+            .expect("load parent execution")
+            .expect("parent execution exists");
+        assert_eq!(workflow.status, ExecutionStatus::Cancelled);
+        assert_eq!(parent.status, ExecutionStatus::Cancelled);
+
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean test database");
+    }
+
+    #[tokio::test]
     async fn inquiry_wait_release_is_idempotent_and_republishes_requested_child() {
         let fixture = InquirySchedulerFixture::create().await;
 
@@ -8271,7 +8382,6 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn inquiry_timeout_follows_timed_out_transition_without_guarded_child() {
         let fixture = InquirySchedulerFixture::create().await;
         assert!(fixture.activate_guarded().await.is_empty());
@@ -8353,7 +8463,6 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn completed_owned_execution_wait_is_idempotent_across_activation_and_reconciliation() {
         let fixture = InquirySchedulerFixture::create().await;
         let target = fixture
@@ -8429,7 +8538,6 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn failed_and_timed_out_execution_waits_take_logical_transitions_without_children() {
         let fixture = InquirySchedulerFixture::create().await;
         let failed = fixture
@@ -8495,7 +8603,6 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn cancelled_targets_take_cancelled_transitions_without_children() {
         for (task_name, target_key, target_kind) in [
             (
@@ -8545,7 +8652,6 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn terminal_owned_queue_items_release_only_completed_waits() {
         let fixture = InquirySchedulerFixture::create().await;
         let completed = fixture
@@ -8602,7 +8708,6 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn parallel_terminal_waits_are_all_applied_before_workflow_finalization() {
         let fixture = InquirySchedulerFixture::create().await;
         let skipped = fixture
@@ -8663,7 +8768,6 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn unrelated_execution_and_queue_requester_become_logical_prerequisite_failures() {
         let fixture = InquirySchedulerFixture::create().await;
         let unrelated = fixture
@@ -8719,7 +8823,6 @@ tasks:
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn database_reconciliation_finds_and_processes_typed_waits() {
         let fixture = InquirySchedulerFixture::create().await;
         let execution = fixture

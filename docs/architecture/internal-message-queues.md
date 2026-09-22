@@ -293,14 +293,14 @@ The API inquiry response route is the producer.
 ```typescript
 interface InquiryRespondedPayload {
   inquiry_id: number;
-  execution_id: number;
+  created_by_execution_id: number;
   response: unknown;
   responded_by: number | null;
   responded_at: string;
 }
 ```
 
-The envelope uses `message_type: "InquiryResponded"`. The handler reloads the inquiry and requires its persisted status to be `responded`, then reloads the execution. It does not compare `responded_by` or `responded_at` with the database.
+The envelope uses `message_type: "InquiryResponded"`. The handler reloads the inquiry, verifies its workflow scope, and releases waits by inquiry ID. It does not trust the payload response or actor fields as state.
 
 Producer: [inquiry API](../../crates/api/src/routes/inquiries.rs#L485-L509). Consumer: [`InquiryHandler`](../../crates/executor/src/inquiry_handler.rs#L72-L95). Payload: [`InquiryRespondedPayload`](../../crates/common/src/mq/messages.rs#L433-L446).
 

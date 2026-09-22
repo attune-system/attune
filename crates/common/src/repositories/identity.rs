@@ -166,6 +166,19 @@ impl Delete for IdentityRepository {
 }
 
 impl IdentityRepository {
+    /// Loads an identity and prevents authorization-relevant updates until the
+    /// caller's transaction completes.
+    pub async fn find_by_id_for_share(conn: &mut PgConnection, id: Id) -> Result<Option<Identity>> {
+        sqlx::query_as::<_, Identity>(
+            "SELECT id, login, display_name, password_hash, attributes, frozen, created, updated \
+             FROM identity WHERE id = $1 FOR SHARE",
+        )
+        .bind(id)
+        .fetch_optional(conn)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Deletes an identity when no cache namespace still references it.
     ///
     /// Identity-owned namespaces must drain through the cache retention

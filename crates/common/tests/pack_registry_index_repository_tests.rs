@@ -9,7 +9,6 @@ use attune_common::repositories::{
 use helpers::create_test_pool;
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn standard_index_is_managed_and_custom_indices_append() {
     let pool = create_test_pool().await.unwrap();
 
@@ -36,7 +35,6 @@ async fn standard_index_is_managed_and_custom_indices_append() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn deleting_standard_index_does_not_recreate_it() {
     let pool = create_test_pool().await.unwrap();
 
@@ -54,7 +52,6 @@ async fn deleting_standard_index_does_not_recreate_it() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn appending_at_max_position_saturates_and_preserves_id_order() {
     let pool = create_test_pool().await.unwrap();
     sqlx::query("UPDATE pack_registry_index SET position = $1 WHERE is_standard")
@@ -82,7 +79,6 @@ async fn appending_at_max_position_saturates_and_preserves_id_order() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn header_compare_and_set_does_not_overwrite_concurrent_rotation() {
     let pool = create_test_pool().await.unwrap();
     let index = PackRegistryIndexRepository::create(

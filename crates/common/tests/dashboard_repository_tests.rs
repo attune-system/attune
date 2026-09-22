@@ -71,7 +71,6 @@ async fn create_dashboard(
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_dashboard_clears_existing_default_home_in_scope() {
     let pool = create_test_pool().await.expect("pool should be created");
 
@@ -102,7 +101,6 @@ async fn test_create_dashboard_clears_existing_default_home_in_scope() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_with_version_metadata_only_change_does_not_create_spec_revision() {
     let pool = create_test_pool().await.expect("pool should be created");
 
@@ -136,7 +134,6 @@ async fn test_update_with_version_metadata_only_change_does_not_create_spec_revi
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_set_default_home_is_atomic_and_keeps_spec_history_clean() {
     let pool = create_test_pool().await.expect("pool should be created");
 
@@ -173,7 +170,6 @@ async fn test_set_default_home_is_atomic_and_keeps_spec_history_clean() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_with_version_spec_change_creates_new_dashboard_version() {
     let pool = create_test_pool().await.expect("pool should be created");
 

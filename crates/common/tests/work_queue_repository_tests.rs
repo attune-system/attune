@@ -79,7 +79,6 @@ async fn create_queue_fixture() -> (
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn work_queue_repository_crud_and_search_round_trip() {
     let (pool, queue) = create_queue_fixture().await;
 
@@ -145,7 +144,6 @@ async fn work_queue_repository_crud_and_search_round_trip() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
     let (pool, queue) = create_queue_fixture().await;
 
@@ -329,7 +327,6 @@ async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn work_queue_item_repository_coalesces_within_same_priority_band() {
     let (pool, queue) = create_queue_fixture().await;
 
@@ -459,7 +456,6 @@ async fn work_queue_item_repository_coalesces_within_same_priority_band() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn work_queue_item_repository_can_coalesce_across_priorities() {
     let (pool, queue) = create_queue_fixture().await;
 
@@ -590,7 +586,6 @@ async fn work_queue_item_repository_can_coalesce_across_priorities() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn work_queue_item_repository_returns_partial_batch_when_only_partial_group_matches() {
     let (pool, queue) = create_queue_fixture().await;
 
@@ -669,7 +664,6 @@ async fn work_queue_item_repository_returns_partial_batch_when_only_partial_grou
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn work_queue_item_repository_falls_back_to_fifo_when_group_value_is_missing() {
     let (pool, queue) = create_queue_fixture().await;
 
@@ -749,7 +743,6 @@ async fn work_queue_item_repository_falls_back_to_fifo_when_group_value_is_missi
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() {
     let (pool, queue) = create_queue_fixture().await;
 

@@ -3500,7 +3500,7 @@ async fn query_inquiry_backlog_rows(
                             WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
                         )::bigint AS overdue_count
                     FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.execution
+                    LEFT JOIN execution e ON e.id = i.created_by_execution
                     WHERE i.status::text = 'pending'
                       AND i.assigned_to = $1
                       AND {pack_ref_expr} = ANY($2::text[])
@@ -3525,7 +3525,7 @@ async fn query_inquiry_backlog_rows(
                             WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
                         )::bigint AS overdue_count
                     FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.execution
+                    LEFT JOIN execution e ON e.id = i.created_by_execution
                     WHERE i.status::text = 'pending'
                       AND {pack_ref_expr} = ANY($1::text[])
                     GROUP BY 1, 2
@@ -3547,7 +3547,7 @@ async fn query_inquiry_backlog_rows(
                             WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
                         )::bigint AS overdue_count
                     FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.execution
+                    LEFT JOIN execution e ON e.id = i.created_by_execution
                     WHERE i.status::text = 'pending'
                       AND i.assigned_to = $1
                     GROUP BY 1, 2
@@ -3569,7 +3569,7 @@ async fn query_inquiry_backlog_rows(
                             WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
                         )::bigint AS overdue_count
                     FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.execution
+                    LEFT JOIN execution e ON e.id = i.created_by_execution
                     WHERE i.status::text = 'pending'
                     GROUP BY 1, 2
                     ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
@@ -3642,7 +3642,7 @@ async fn query_inquiry_sla_rows(
                         COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
                         COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
                     FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.execution
+                    LEFT JOIN execution e ON e.id = i.created_by_execution
                     WHERE i.created >= $2
                       AND i.created < $3
                       AND i.assigned_to = $4
@@ -3683,7 +3683,7 @@ async fn query_inquiry_sla_rows(
                         COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
                         COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
                     FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.execution
+                    LEFT JOIN execution e ON e.id = i.created_by_execution
                     WHERE i.created >= $2
                       AND i.created < $3
                       AND {pack_ref_expr} = ANY($4::text[])
@@ -3721,7 +3721,7 @@ async fn query_inquiry_sla_rows(
                         COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
                         COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
                     FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.execution
+                    LEFT JOIN execution e ON e.id = i.created_by_execution
                     WHERE i.created >= $2
                       AND i.created < $3
                       AND i.assigned_to = $4
@@ -3759,7 +3759,7 @@ async fn query_inquiry_sla_rows(
                         COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
                         COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
                     FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.execution
+                    LEFT JOIN execution e ON e.id = i.created_by_execution
                     WHERE i.created >= $2
                       AND i.created < $3
                     GROUP BY 1, 2, 3

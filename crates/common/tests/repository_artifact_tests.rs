@@ -92,7 +92,6 @@ async fn setup_db() -> attune_common::test_database::TestDatabase {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_file_path_scope_queries_are_exact() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("file_path_scope_queries");
@@ -186,7 +185,6 @@ async fn test_file_path_scope_queries_are_exact() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_object_body_lifecycle_is_reserved_verified_and_immutable() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("object_body_lifecycle");
@@ -276,7 +274,6 @@ async fn test_object_body_lifecycle_is_reserved_verified_and_immutable() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn test_log_stream_commits_in_order_and_seals_before_ready() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("immutable_log_stream");
@@ -359,7 +356,6 @@ async fn test_log_stream_commits_in_order_and_seals_before_ready() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn log_segment_range_query_returns_only_intersecting_rows() {
     const SEGMENT_BYTES: i64 = 64 * 1024;
     const TEN_MIB_SEGMENTS: i64 = 10 * 1024 * 1024 / SEGMENT_BYTES;
@@ -419,7 +415,6 @@ async fn log_segment_range_query_returns_only_intersecting_rows() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn log_stream_commit_and_seal_emit_compact_transactional_wakeups() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("log_stream_notifications");
@@ -502,7 +497,6 @@ async fn receive_log_stream_change(
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn shared_file_log_stream_persists_backend_without_object_metadata() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("shared_file_log_stream");
@@ -597,7 +591,6 @@ async fn shared_file_log_stream_persists_backend_without_object_metadata() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn test_log_failure_state_is_sanitized_and_cannot_be_overwritten_by_ready() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("degraded_log_state");
@@ -637,7 +630,6 @@ async fn test_log_failure_state_is_sanitized_and_cannot_be_overwritten_by_ready(
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn test_successful_log_seal_state_is_ready() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("ready_log_state");
@@ -670,7 +662,6 @@ async fn test_successful_log_seal_state_is_ready() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_artifact() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("create_artifact");
@@ -690,7 +681,6 @@ async fn test_create_artifact() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_id_exists() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("find_by_id_exists");
@@ -712,7 +702,6 @@ async fn test_find_by_id_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_id_not_exists() {
     let pool = setup_db().await;
     let non_existent_id = 999_999_999_999i64;
@@ -725,7 +714,6 @@ async fn test_find_by_id_not_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_by_id_not_found_error() {
     let pool = setup_db().await;
     let non_existent_id = 999_999_999_998i64;
@@ -742,7 +730,6 @@ async fn test_get_by_id_not_found_error() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ref_exists() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("find_by_ref_exists");
@@ -762,7 +749,6 @@ async fn test_find_by_ref_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ref_not_exists() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("find_by_ref_not_exists");
@@ -775,7 +761,6 @@ async fn test_find_by_ref_not_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_artifacts() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("list");
@@ -802,7 +787,6 @@ async fn test_list_artifacts() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_search_artifacts_by_classification() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("search_by_classification");
@@ -840,7 +824,6 @@ async fn test_search_artifacts_by_classification() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_artifact_ref() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("update_ref");
@@ -867,7 +850,6 @@ async fn test_update_artifact_ref() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_artifact_all_fields() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("update_all");
@@ -912,7 +894,6 @@ async fn test_update_artifact_all_fields() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_artifact_no_changes() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("update_no_changes");
@@ -934,7 +915,6 @@ async fn test_update_artifact_no_changes() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_artifact() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("delete");
@@ -958,7 +938,6 @@ async fn test_delete_artifact() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_artifact_not_exists() {
     let pool = setup_db().await;
     let non_existent_id = 999_999_999_997i64;
@@ -975,7 +954,6 @@ async fn test_delete_artifact_not_exists() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_all_types() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("all_types");
@@ -1003,7 +981,6 @@ async fn test_artifact_all_types() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_all_scopes() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("all_scopes");
@@ -1029,7 +1006,6 @@ async fn test_artifact_all_scopes() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_all_retention_policies() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("all_retention");
@@ -1058,7 +1034,6 @@ async fn test_artifact_all_retention_policies() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_scope() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("find_by_scope");
@@ -1090,7 +1065,6 @@ async fn test_find_by_scope() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_owner() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("find_by_owner");
@@ -1121,7 +1095,6 @@ async fn test_find_by_owner() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_type() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("find_by_type");
@@ -1151,7 +1124,6 @@ async fn test_find_by_type() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_scope_and_owner() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("find_by_scope_and_owner");
@@ -1187,7 +1159,6 @@ async fn test_find_by_scope_and_owner() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_retention_policy() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("find_by_retention");
@@ -1222,7 +1193,6 @@ async fn test_find_by_retention_policy() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_timestamps_auto_set_on_create() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("timestamps_create");
@@ -1238,7 +1208,6 @@ async fn test_timestamps_auto_set_on_create() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_updated_timestamp_changes_on_update() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("timestamps_update");
@@ -1269,7 +1238,6 @@ async fn test_updated_timestamp_changes_on_update() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_with_empty_owner() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("empty_owner");
@@ -1284,7 +1252,6 @@ async fn test_artifact_with_empty_owner() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_ref_rejects_path_separators() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("special_chars");
@@ -1301,7 +1268,6 @@ async fn test_artifact_ref_rejects_path_separators() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_with_zero_retention_limit() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("zero_retention");
@@ -1316,7 +1282,6 @@ async fn test_artifact_with_zero_retention_limit() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_with_negative_retention_limit() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("negative_retention");
@@ -1331,7 +1296,6 @@ async fn test_artifact_with_negative_retention_limit() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_with_large_retention_limit() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("large_retention");
@@ -1346,7 +1310,6 @@ async fn test_artifact_with_large_retention_limit() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_artifact_with_long_ref() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("long_ref");
@@ -1361,7 +1324,6 @@ async fn test_artifact_with_long_ref() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_multiple_artifacts_same_ref_allowed() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("duplicate_ref");
@@ -1390,7 +1352,6 @@ async fn test_multiple_artifacts_same_ref_allowed() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_scope_ordered_by_created() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("scope_ordering");

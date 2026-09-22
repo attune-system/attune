@@ -3,13 +3,11 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { InquiryResponse } from "./InquiryResponse";
+import type { InquiryResponseOptionHandle } from "./InquiryResponseOptionHandle";
 /**
- * Creation result containing the inquiry and its provider-neutral response handle.
+ * Creation result containing the inquiry and one opaque handle per response option.
  */
 export type CreateInquiryResponse = {
   inquiry: InquiryResponse;
-  /**
-   * Opaque correlation handle for one-shot external responses.
-   */
-  response_handle: string;
+  response_options: Array<InquiryResponseOptionHandle>;
 };

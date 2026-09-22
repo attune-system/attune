@@ -86,6 +86,10 @@ def create_test_pack(
     if existing_pack:
         try:
             cache_probe = client.get_action_by_ref(f"{pack_ref}.cache_read")
+            inquiry_creator_probe = client.get_action_by_ref(
+                f"{pack_ref}.create_inquiry"
+            )
+            inquiry_probe = client.get_action_by_ref(f"{pack_ref}.inquiry_workflow")
             permission_sets = client.get(
                 "/api/v1/permissions/sets", params={"pack_ref": pack_ref}
             )
@@ -104,11 +108,32 @@ def create_test_pack(
                 for item in permission_items
                 if isinstance(item, dict)
             )
+            inquiry_creator = any(
+                item.get("ref") == f"{pack_ref}.inquiry_creator"
+                and any(
+                    grant.get("resource") == "inquiries"
+                    and "create" in grant.get("actions", [])
+                    for grant in item.get("grants", [])
+                    if isinstance(grant, dict)
+                )
+                for item in permission_items
+                if isinstance(item, dict)
+            )
         except Exception:
             cache_probe = None
+            inquiry_creator_probe = None
+            inquiry_probe = None
             cache_reader = False
-        if cache_probe and cache_reader and (
-            pack_ref == "test_pack" or client.list_actions(pack_ref=pack_ref)
+            inquiry_creator = False
+        if (
+            cache_probe
+            and inquiry_creator_probe
+            and inquiry_probe
+            and cache_reader
+            and inquiry_creator
+            and (
+                pack_ref == "test_pack" or client.list_actions(pack_ref=pack_ref)
+            )
         ):
             return existing_pack
 

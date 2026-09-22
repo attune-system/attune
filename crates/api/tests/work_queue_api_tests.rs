@@ -9,6 +9,7 @@ use attune_common::{
     },
     repositories::{
         action::{ActionRepository, CreateActionInput},
+        component_lifecycle::PackProjectionIds,
         execution::{CreateExecutionInput, ExecutionRepository},
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
@@ -36,9 +37,6 @@ async fn create_pack_with_action(
     let pack = create_test_pack(&ctx.pool, pack_ref)
         .await
         .expect("create test pack");
-    helpers::activate_test_pack_release(&ctx.pool, &pack)
-        .await
-        .expect("activate test pack release");
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {
@@ -71,6 +69,16 @@ async fn create_pack_with_action(
     )
     .await
     .expect("create test action");
+    helpers::activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            ..PackProjectionIds::default()
+        },
+    )
+    .await
+    .expect("activate test pack release");
 
     (pack, action)
 }
@@ -190,7 +198,6 @@ async fn create_queue_with_visibility(
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn queue_api_bulk_enqueues_items() {
     let ctx = TestContext::new()
         .await
@@ -284,7 +291,6 @@ async fn queue_api_bulk_enqueues_items() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn queue_reference_visibility_filters_discovery_by_referencing_pack() {
     let ctx = TestContext::new()
         .await
@@ -416,7 +422,6 @@ async fn queue_reference_visibility_filters_discovery_by_referencing_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn private_queue_item_submission_requires_constrained_item_grant() {
     let ctx = TestContext::new()
         .await
@@ -504,7 +509,6 @@ async fn private_queue_item_submission_requires_constrained_item_grant() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn api_created_pack_owned_queue_is_api_managed() {
     let ctx = TestContext::new()
         .await
@@ -565,7 +569,6 @@ async fn api_created_pack_owned_queue_is_api_managed() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn queue_api_supports_merge_patch_enqueue_and_pending_item_lifecycle() {
     let ctx = TestContext::new()
         .await
@@ -730,7 +733,6 @@ async fn queue_api_supports_merge_patch_enqueue_and_pending_item_lifecycle() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn queue_api_supports_jsonpath_preview_and_bulk_operations() {
     let ctx = TestContext::new()
         .await
@@ -966,7 +968,6 @@ async fn queue_api_supports_jsonpath_preview_and_bulk_operations() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
     let ctx = TestContext::new()
         .await
@@ -1108,7 +1109,6 @@ fn trace_queue_item_ids(body: &serde_json::Value) -> Vec<i64> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn trace_report_enforces_per_queue_item_visibility() {
     let ctx = TestContext::new()
         .await
@@ -1288,7 +1288,6 @@ fn trace_origins(body: &serde_json::Value) -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn trace_report_enforces_per_queue_dispatch_visibility() {
     let ctx = TestContext::new()
         .await

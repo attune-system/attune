@@ -427,7 +427,7 @@ pub struct InquiryCreatedPayload {
     /// Inquiry ID
     pub inquiry_id: Id,
     /// Execution ID that created this inquiry
-    pub execution_id: Id,
+    pub created_by_execution_id: Id,
     /// Prompt text for the user
     pub prompt: String,
     /// Response schema (optional)
@@ -443,8 +443,8 @@ pub struct InquiryCreatedPayload {
 pub struct InquiryRespondedPayload {
     /// Inquiry ID
     pub inquiry_id: Id,
-    /// Execution ID
-    pub execution_id: Id,
+    /// Execution ID that created this inquiry
+    pub created_by_execution_id: Id,
     /// Response data
     pub response: JsonValue,
     /// User/identity that responded

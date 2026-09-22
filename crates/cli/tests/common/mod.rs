@@ -45,6 +45,7 @@ impl TestFixture {
     }
 
     /// Write a default config with the mock server
+    #[allow(dead_code)]
     pub fn write_default_config(&self) {
         let config = format!(
             r#"

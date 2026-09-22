@@ -1773,32 +1773,54 @@ class AttuneClient:
         if data is not None:
             execution_id = execution_id or data.get("execution_id")
             prompt = data.get("prompt", data.get("message", "Please respond"))
+            purpose = data.get("purpose")
             response_schema = data.get("schema") or data.get("response_schema")
+            response_options = data.get("response_options")
             assigned_to = data.get("assigned_to")
-            timeout_at = data.get("timeout_at") or data.get("ttl")
+            timeout_seconds = data.get("timeout_seconds") or data.get("ttl")
+            timeout_at = data.get("timeout_at")
+            default_response = data.get("default_response")
         else:
             prompt = kwargs.get("prompt", "Please respond")
+            purpose = kwargs.get("purpose")
             response_schema = kwargs.get("schema") or kwargs.get("response_schema")
+            response_options = kwargs.get("response_options")
             assigned_to = kwargs.get("assigned_to")
+            timeout_seconds = kwargs.get("timeout_seconds")
             timeout_at = kwargs.get("timeout_at")
+            default_response = kwargs.get("default_response")
+
+        if timeout_seconds is None and timeout_at:
+            import math
+            from datetime import datetime, timezone
+
+            deadline = datetime.fromisoformat(str(timeout_at).replace("Z", "+00:00"))
+            timeout_seconds = max(
+                1, math.ceil((deadline - datetime.now(timezone.utc)).total_seconds())
+            )
+
+        if response_options is None:
+            option_response = default_response or {"approved": True}
+            response_options = [
+                {
+                    "ref": "continue",
+                    "label": "Continue",
+                    "style": "default",
+                    "response": option_response,
+                }
+            ]
 
         payload: dict = {
-            "execution": execution_id or 0,
+            "purpose": purpose or safe_ref_part(prompt, "response")[:255],
             "prompt": prompt,
+            "response_options": response_options,
         }
         if response_schema:
             payload["response_schema"] = response_schema
         if assigned_to:
             payload["assigned_to"] = assigned_to
-        if timeout_at:
-            # Convert TTL (integer seconds) to ISO timestamp if needed
-            if isinstance(timeout_at, (int, float)):
-                from datetime import datetime, timezone, timedelta
-
-                timeout_at = (
-                    datetime.now(timezone.utc) + timedelta(seconds=timeout_at)
-                ).isoformat()
-            payload["timeout_at"] = timeout_at
+        if timeout_seconds:
+            payload["timeout_seconds"] = timeout_seconds
 
         response = self._request("POST", "/api/v1/inquiries", json=payload)
         if response.status_code in (200, 201):
@@ -1818,6 +1840,7 @@ class AttuneClient:
         response = gen_list_inquiries.sync(
             client=self._get_client(),
             status=params.get("status"),
+            created_by_execution=params.get("created_by_execution"),
             limit=params.get("limit"),
             offset=params.get("offset"),
         )

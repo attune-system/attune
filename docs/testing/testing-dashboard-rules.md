@@ -21,7 +21,7 @@ docker run -d --name attune-postgres \
 # Terminal 2: RabbitMQ (if not running as service)
 docker run -d --name attune-rabbitmq \
   -p 5672:5672 -p 15672:15672 \
-  rabbitmq:3.12-management
+  rabbitmq:4.3.6-management-alpine
 
 # Terminal 3: API Server
 cd crates/api

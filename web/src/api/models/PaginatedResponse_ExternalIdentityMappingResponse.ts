@@ -18,6 +18,7 @@ export type PaginatedResponse_ExternalIdentityMappingResponse = {
     integration_identity: number;
     mapped_identity: number;
     provider: string;
+    subject_kind: string;
     tenant: string;
     updated: string;
   }>;

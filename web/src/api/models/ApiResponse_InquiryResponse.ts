@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { i64 } from "./i64";
+import type { InquiryResponseOption } from "./InquiryResponseOption";
 import type { InquiryStatus } from "./InquiryStatus";
 /**
  * Standard API response wrapper
@@ -13,14 +14,18 @@ export type ApiResponse_InquiryResponse = {
    */
   data: {
     assigned_to?: null | i64;
+    assigned_to_display_name?: string | null;
+    assigned_to_login?: string | null;
     /**
      * Creation timestamp
      */
     created: string;
+    created_by_action_ref?: string | null;
     /**
-     * Execution ID this inquiry belongs to
+     * Execution ID that created this inquiry
      */
-    execution: i64;
+    created_by_execution: i64;
+    created_by_pack_ref?: string | null;
     /**
      * Inquiry ID
      */
@@ -35,12 +40,18 @@ export type ApiResponse_InquiryResponse = {
      */
     responded_at?: string | null;
     responded_by?: null | i64;
+    responded_by_display_name?: string | null;
+    responded_by_login?: string | null;
     /**
      * Response data provided by the user
      */
     response: any | null;
     /**
-     * JSON schema for expected response
+     * Fixed responses that provider controls may select.
+     */
+    response_options: Array<InquiryResponseOption>;
+    /**
+     * Attune flat schema for expected response fields
      */
     response_schema: any | null;
     /**
@@ -55,7 +66,10 @@ export type ApiResponse_InquiryResponse = {
      * Last update timestamp
      */
     updated: string;
+    workflow_action_ref?: string | null;
     workflow_execution?: null | i64;
+    workflow_pack_ref?: string | null;
+    workflow_root_execution?: null | i64;
     workflow_task_name?: string | null;
   };
   /**

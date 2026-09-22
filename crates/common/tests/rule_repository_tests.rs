@@ -23,7 +23,6 @@ use serde_json::json;
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_rule() {
     let pool = create_test_pool().await.unwrap();
 
@@ -111,7 +110,6 @@ async fn test_create_rule() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_rule_disabled() {
     let pool = create_test_pool().await.unwrap();
 
@@ -156,7 +154,6 @@ async fn test_create_rule_disabled() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_rule_with_complex_conditions() {
     let pool = create_test_pool().await.unwrap();
 
@@ -209,7 +206,6 @@ async fn test_create_rule_with_complex_conditions() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_rule_duplicate_ref() {
     let pool = create_test_pool().await.unwrap();
 
@@ -292,7 +288,6 @@ async fn test_create_rule_duplicate_ref() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_rule_invalid_ref_format_uppercase() {
     let pool = create_test_pool().await.unwrap();
 
@@ -337,7 +332,6 @@ async fn test_create_rule_invalid_ref_format_uppercase() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_rule_invalid_ref_format_no_dot() {
     let pool = create_test_pool().await.unwrap();
 
@@ -386,7 +380,6 @@ async fn test_create_rule_invalid_ref_format_no_dot() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_rule_by_id() {
     let pool = create_test_pool().await.unwrap();
 
@@ -438,7 +431,6 @@ async fn test_find_rule_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_rule_by_id_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -448,7 +440,6 @@ async fn test_find_rule_by_id_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_rule_by_ref() {
     let pool = create_test_pool().await.unwrap();
 
@@ -500,7 +491,6 @@ async fn test_find_rule_by_ref() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_rule_by_ref_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -512,7 +502,6 @@ async fn test_find_rule_by_ref_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_rules() {
     let pool = create_test_pool().await.unwrap();
 
@@ -568,7 +557,6 @@ async fn test_list_rules() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_rules_ordered_by_ref() {
     let pool = create_test_pool().await.unwrap();
 
@@ -630,7 +618,6 @@ async fn test_list_rules_ordered_by_ref() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_rule_label() {
     let pool = create_test_pool().await.unwrap();
 
@@ -686,7 +673,6 @@ async fn test_update_rule_label() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_rule_description() {
     let pool = create_test_pool().await.unwrap();
 
@@ -740,7 +726,6 @@ async fn test_update_rule_description() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_rule_conditions() {
     let pool = create_test_pool().await.unwrap();
 
@@ -795,7 +780,6 @@ async fn test_update_rule_conditions() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_rule_enabled() {
     let pool = create_test_pool().await.unwrap();
 
@@ -851,7 +835,6 @@ async fn test_update_rule_enabled() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_rule_multiple_fields() {
     let pool = create_test_pool().await.unwrap();
 
@@ -918,7 +901,6 @@ async fn test_update_rule_multiple_fields() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_rule_action_and_trigger_refs() {
     let pool = create_test_pool().await.unwrap();
 
@@ -988,7 +970,6 @@ async fn test_update_rule_action_and_trigger_refs() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_rule_no_changes() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1044,7 +1025,6 @@ async fn test_update_rule_no_changes() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_rule() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1095,7 +1075,6 @@ async fn test_delete_rule() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_rule_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1109,7 +1088,6 @@ async fn test_delete_rule_not_found() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_rules_by_pack() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1205,7 +1183,6 @@ async fn test_find_rules_by_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_rules_by_action() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1293,7 +1270,6 @@ async fn test_find_rules_by_action() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_rules_by_trigger() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1383,7 +1359,6 @@ async fn test_find_rules_by_trigger() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_enabled_rules() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1469,7 +1444,6 @@ async fn test_find_enabled_rules() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_cascade_delete_pack_deletes_rules() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1528,7 +1502,6 @@ async fn test_cascade_delete_pack_deletes_rules() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_rule_timestamps() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1594,7 +1567,6 @@ async fn test_rule_timestamps() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_rule_with_owner_identity() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1649,7 +1621,6 @@ async fn test_create_rule_with_owner_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_rule_without_owner_identity_defaults_null() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1693,7 +1664,6 @@ async fn test_create_rule_without_owner_identity_defaults_null() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_rule_owner_identity_set_and_clear() {
     let pool = create_test_pool().await.unwrap();
 

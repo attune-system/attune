@@ -879,11 +879,6 @@ class Execution(Base):
         back_populates="execution_obj"
     )
     executor_obj: Mapped["Identity | None"] = relationship(back_populates="executions")
-    inquiries: Mapped[list["Inquiry"]] = relationship(
-        back_populates="execution_obj", cascade="all, delete-orphan"
-    )
-
-
 SCHEMA_FUNCTIONS.extend(
     [
         PGFunction(
@@ -962,11 +957,16 @@ class Inquiry(Base):
     __tablename__: str = "inquiry"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    execution: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("execution.id", ondelete="CASCADE"), nullable=False
+    created_by_execution: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    workflow_execution: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("workflow_execution.id", ondelete="CASCADE")
     )
+    workflow_task_name: Mapped[str | None] = mapped_column(Text)
+    action_attempt_family: Mapped[int | None] = mapped_column(BigInteger)
+    purpose: Mapped[str | None] = mapped_column(Text)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
     response_schema: Mapped[SchemaDict | None] = mapped_column(JSONB)
+    response_options: Mapped[list[JSONDict]] = mapped_column(JSONB, nullable=False)
     assigned_to: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("identity.id", ondelete="SET NULL")
     )
@@ -977,6 +977,11 @@ class Inquiry(Base):
     )
     response: Mapped[JSONDict | None] = mapped_column(JSONB)
     timeout_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timeout_seconds: Mapped[int | None] = mapped_column(BigInteger)
+    responded_by: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("identity.id", ondelete="SET NULL")
+    )
+    external_actor: Mapped[JSONDict | None] = mapped_column(JSONB)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=func.now()
@@ -986,9 +991,8 @@ class Inquiry(Base):
     )
 
     # Relationships
-    execution_obj: Mapped[Execution] = relationship(back_populates="inquiries")
     assigned_to_obj: Mapped["Identity | None"] = relationship(
-        back_populates="inquiries"
+        back_populates="inquiries", foreign_keys=[assigned_to]
     )
 
 

@@ -11,7 +11,10 @@ async fn main() {
 async fn run() -> attune_common::Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next();
-    if command.is_none() || command.as_deref() == Some("--list") {
+    if command
+        .as_deref()
+        .is_none_or(|command| command.starts_with('-'))
+    {
         return Ok(());
     }
 

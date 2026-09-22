@@ -25,9 +25,11 @@ pub struct ApiResponse<T> {
     pub data: T,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct PaginatedResponse<T> {
-    items: Vec<T>,
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct PaginatedResponse<T> {
+    pub items: Vec<T>,
+    #[serde(default)]
+    pub pagination: serde_json::Value,
 }
 
 /// API error response
@@ -461,10 +463,10 @@ impl ApiClient {
         self.handle_cache_response(response).await
     }
 
-    async fn handle_paginated_response<T: DeserializeOwned>(
+    async fn handle_paginated_response_full<T: DeserializeOwned>(
         &self,
         response: reqwest::Response,
-    ) -> Result<Vec<T>> {
+    ) -> Result<PaginatedResponse<T>> {
         let status = response.status();
         let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
         if status.is_success() {
@@ -478,7 +480,7 @@ impl ApiClient {
                 status,
                 request_id.as_deref(),
             )?;
-            Ok(paginated.items)
+            Ok(paginated)
         } else {
             let error_text = response
                 .text()
@@ -523,6 +525,14 @@ impl ApiClient {
     }
 
     pub async fn get_paginated<T: DeserializeOwned>(&mut self, path: &str) -> Result<Vec<T>> {
+        Ok(self.get_paginated_response(path).await?.items)
+    }
+
+    /// GET a paginated endpoint while retaining its pagination metadata.
+    pub async fn get_paginated_response<T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+    ) -> Result<PaginatedResponse<T>> {
         let req = self.build_request(Method::GET, path);
         let response = req.send().await.context("Failed to send request to API")?;
 
@@ -535,10 +545,10 @@ impl ApiClient {
                 .send()
                 .await
                 .context("Failed to send request to API (retry)")?;
-            return self.handle_paginated_response(response).await;
+            return self.handle_paginated_response_full(response).await;
         }
 
-        self.handle_paginated_response(response).await
+        self.handle_paginated_response_full(response).await
     }
 
     /// GET request with query parameters (query string must be in path)

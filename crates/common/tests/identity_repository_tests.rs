@@ -16,7 +16,6 @@ use helpers::*;
 use serde_json::json;
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_identity() {
     let pool = create_test_pool().await.unwrap();
 
@@ -39,7 +38,6 @@ async fn test_create_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_identity_minimal() {
     let pool = create_test_pool().await.unwrap();
 
@@ -58,7 +56,6 @@ async fn test_create_identity_minimal() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_identity_duplicate_login() {
     let pool = create_test_pool().await.unwrap();
 
@@ -95,7 +92,6 @@ async fn test_create_identity_duplicate_login() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_identity_by_id() {
     let pool = create_test_pool().await.unwrap();
 
@@ -120,7 +116,6 @@ async fn test_find_identity_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_identity_by_id_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -130,7 +125,6 @@ async fn test_find_identity_by_id_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_identity_by_login() {
     let pool = create_test_pool().await.unwrap();
 
@@ -154,7 +148,6 @@ async fn test_find_identity_by_login() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_identity_by_login_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -166,7 +159,6 @@ async fn test_find_identity_by_login_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_identities() {
     let pool = create_test_pool().await.unwrap();
 
@@ -198,7 +190,6 @@ async fn test_list_identities() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_identity() {
     let pool = create_test_pool().await.unwrap();
 
@@ -233,7 +224,6 @@ async fn test_update_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_identity_partial() {
     let pool = create_test_pool().await.unwrap();
 
@@ -266,7 +256,6 @@ async fn test_update_identity_partial() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_identity_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -291,7 +280,6 @@ async fn test_update_identity_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_identity() {
     let pool = create_test_pool().await.unwrap();
 
@@ -324,7 +312,6 @@ async fn test_delete_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_identity_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -334,7 +321,6 @@ async fn test_delete_identity_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_identity_timestamps_auto_populated() {
     let pool = create_test_pool().await.unwrap();
 
@@ -359,7 +345,6 @@ async fn test_identity_timestamps_auto_populated() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_identity_updated_changes_on_update() {
     let pool = create_test_pool().await.unwrap();
 
@@ -394,7 +379,6 @@ async fn test_identity_updated_changes_on_update() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_identity_with_complex_attributes() {
     let pool = create_test_pool().await.unwrap();
 
@@ -435,7 +419,6 @@ async fn test_identity_with_complex_attributes() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_identity_login_case_sensitive() {
     let pool = create_test_pool().await.unwrap();
 
@@ -483,7 +466,6 @@ async fn test_identity_login_case_sensitive() {
 // ── LDAP-specific tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ldap_dn_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -519,7 +501,6 @@ async fn test_find_by_ldap_dn_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ldap_dn_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -535,7 +516,6 @@ async fn test_find_by_ldap_dn_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ldap_dn_wrong_server() {
     let pool = create_test_pool().await.unwrap();
 
@@ -565,7 +545,6 @@ async fn test_find_by_ldap_dn_wrong_server() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ldap_dn_multiple_identities_different_servers() {
     let pool = create_test_pool().await.unwrap();
 
@@ -622,7 +601,6 @@ async fn test_find_by_ldap_dn_multiple_identities_different_servers() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ldap_dn_ignores_oidc_attributes() {
     let pool = create_test_pool().await.unwrap();
 
@@ -653,7 +631,6 @@ async fn test_find_by_ldap_dn_ignores_oidc_attributes() {
 // ── OIDC-specific tests ─────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_oidc_subject_strict_three_way_match() {
     let pool = create_test_pool().await.unwrap();
 
@@ -699,7 +676,6 @@ async fn test_find_by_oidc_subject_strict_three_way_match() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_legacy_oidc_subject_matches_rows_without_client_id() {
     let pool = create_test_pool().await.unwrap();
 
@@ -772,7 +748,6 @@ async fn test_find_legacy_oidc_subject_matches_rows_without_client_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "integration test — requires database"]
 async fn test_upsert_oidc_identity_is_race_safe() {
     // Two concurrent OIDC logins for the same (issuer, sub) but with
     // different client_ids must not produce two identity rows. The partial

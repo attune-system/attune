@@ -18,10 +18,10 @@ EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
 
-DROP INDEX IF EXISTS uq_inquiry_execution;
+DROP INDEX IF EXISTS uq_inquiry_created_by_execution;
 
 ALTER TABLE inquiry
-    DROP CONSTRAINT IF EXISTS inquiry_execution_fkey,
+    DROP CONSTRAINT IF EXISTS inquiry_created_by_execution_fkey,
     ADD COLUMN workflow_execution BIGINT REFERENCES workflow_execution(id) ON DELETE CASCADE,
     ADD COLUMN workflow_task_name TEXT,
     ADD COLUMN action_attempt_family BIGINT,
@@ -51,7 +51,7 @@ CREATE INDEX idx_inquiry_workflow_task
     ON inquiry(workflow_execution, workflow_task_name)
     WHERE workflow_execution IS NOT NULL;
 
-COMMENT ON COLUMN inquiry.execution IS 'Execution that created this inquiry; plain BIGINT because execution is a hypertable';
+COMMENT ON COLUMN inquiry.created_by_execution IS 'Execution that created this inquiry; plain BIGINT because execution is a hypertable';
 COMMENT ON COLUMN inquiry.workflow_execution IS 'Workflow scope derived from the creator execution';
 COMMENT ON COLUMN inquiry.workflow_task_name IS 'Creator workflow task name derived from the creator execution';
 COMMENT ON COLUMN inquiry.action_attempt_family IS 'Stable original execution ID used for idempotency across action retries';

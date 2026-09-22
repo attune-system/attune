@@ -10,6 +10,7 @@ use attune_common::{
     models::*,
     repositories::{
         action::{ActionRepository, CreateActionInput},
+        component_lifecycle::PackProjectionIds,
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
@@ -557,6 +558,15 @@ pub async fn create_test_pack(pool: &PgPool, ref_name: &str) -> Result<Pack> {
 /// Adds the immutable release required before a pack's components can execute.
 #[allow(dead_code)]
 pub async fn activate_test_pack_release(pool: &PgPool, pack: &Pack) -> Result<()> {
+    activate_test_pack_release_with_projections(pool, pack, &PackProjectionIds::default()).await
+}
+
+#[allow(dead_code)]
+pub async fn activate_test_pack_release_with_projections(
+    pool: &PgPool,
+    pack: &Pack,
+    projections: &PackProjectionIds,
+) -> Result<()> {
     let mut tx = pool.begin().await?;
     let release = PackReleaseRepository::create_or_get(
         &mut tx,
@@ -573,7 +583,7 @@ pub async fn activate_test_pack_release(pool: &PgPool, pack: &Pack) -> Result<()
         },
     )
     .await?;
-    PackReleaseRepository::activate(&mut tx, pack.id, release.id).await?;
+    PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, projections).await?;
     tx.commit().await?;
     Ok(())
 }

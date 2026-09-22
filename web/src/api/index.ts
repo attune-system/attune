@@ -187,9 +187,7 @@ export type { ExecutionRescheduleResponse } from "./models/ExecutionRescheduleRe
 export type { ExecutionResponse } from "./models/ExecutionResponse";
 export { ExecutionStatus } from "./models/ExecutionStatus";
 export type { ExecutionSummary } from "./models/ExecutionSummary";
-export type { ExternalActorAssertion } from "./models/ExternalActorAssertion";
 export type { ExternalIdentityMappingResponse } from "./models/ExternalIdentityMappingResponse";
-export type { ExternalInquiryRespondRequest } from "./models/ExternalInquiryRespondRequest";
 export type { FailedEnvironment } from "./models/FailedEnvironment";
 export type { FailedPack } from "./models/FailedPack";
 export type { FailedPackRegistration } from "./models/FailedPackRegistration";
@@ -205,6 +203,9 @@ export type { IdentityRoleAssignmentResponse } from "./models/IdentityRoleAssign
 export type { IdentitySummary } from "./models/IdentitySummary";
 export type { InquiryRespondRequest } from "./models/InquiryRespondRequest";
 export type { InquiryResponse } from "./models/InquiryResponse";
+export type { InquiryResponseOption } from "./models/InquiryResponseOption";
+export type { InquiryResponseOptionHandle } from "./models/InquiryResponseOptionHandle";
+export { InquiryResponseOptionStyle } from "./models/InquiryResponseOptionStyle";
 export { InquiryStatus } from "./models/InquiryStatus";
 export type { InquirySummary } from "./models/InquirySummary";
 export type { InstallPackRequest } from "./models/InstallPackRequest";

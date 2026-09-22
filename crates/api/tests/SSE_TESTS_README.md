@@ -52,7 +52,7 @@ They are not run by default in CI/CD.
 cargo run -p attune-api -- -c config.test.yaml
 
 # Terminal 2: Run ignored SSE tests
-cargo test -p attune-api --test sse_execution_stream_tests -- --ignored --nocapture --test-threads=1
+cargo test -p attune-api --test sse_execution_stream_tests -- --ignored --nocapture --test-threads=4
 
 # Or run a specific test
 cargo test -p attune-api test_sse_stream_receives_execution_updates -- --ignored --nocapture
@@ -101,7 +101,7 @@ Tests verify:
 cargo run -p attune-api -- -c config.test.yaml
 
 # Terminal 2: Run all SSE tests
-cargo test -p attune-api --test sse_execution_stream_tests -- --test-threads=1 --nocapture
+cargo test -p attune-api --test sse_execution_stream_tests -- --test-threads=4 --nocapture
 
 # Or run specific test
 cargo test -p attune-api test_sse_stream_receives_execution_updates -- --nocapture
@@ -224,7 +224,7 @@ API_PID=$!
 sleep 3
 
 # Run ALL tests including ignored ones
-cargo test -p attune-api --test sse_execution_stream_tests -- --ignored --test-threads=1
+cargo test -p attune-api --test sse_execution_stream_tests -- --ignored --test-threads=4
 
 # Cleanup
 kill $API_PID

@@ -185,7 +185,6 @@ async fn cleanup_test_data(pool: &PgPool, pack_id: i64) {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_policy_enforcer_creation() {
     let pool = setup_db().await;
     let enforcer = PolicyEnforcer::new(pool.pool().clone());
@@ -199,7 +198,6 @@ async fn test_policy_enforcer_creation() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_global_rate_limit() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -256,7 +254,6 @@ async fn test_global_rate_limit() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_concurrency_limit() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -310,7 +307,6 @@ async fn test_concurrency_limit() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_action_specific_policy() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -360,7 +356,6 @@ async fn test_action_specific_policy() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_pack_specific_policy() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -406,7 +401,6 @@ async fn test_pack_specific_policy() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_policy_priority() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();

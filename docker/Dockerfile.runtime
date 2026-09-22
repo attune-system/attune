@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 1000 attune && \
-    mkdir -p /opt/attune/packs /opt/attune/logs /opt/attune/runtime_envs /opt/attune/config /opt/attune/artifacts /opt/attune/agent && \
+    mkdir -p /opt/attune/packs /opt/attune/logs /opt/attune/runtime_envs /opt/attune/config /opt/attune/artifacts /opt/attune/agent /opt/attune/blobs && \
     chown -R attune:attune /opt/attune
 
 WORKDIR /opt/attune

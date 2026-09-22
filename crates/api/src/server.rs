@@ -56,6 +56,7 @@ impl Server {
             .merge(routes::execution_routes())
             .merge(routes::trigger_routes())
             .merge(routes::inquiry_routes())
+            .merge(routes::inquiry_callback_routes())
             .merge(routes::event_routes())
             .merge(routes::key_routes())
             .merge(routes::cache_routes())
@@ -183,20 +184,5 @@ impl Server {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    #[ignore] // Ignore until we have test database setup
-    async fn test_server_creation() {
-        // This test is ignored because it requires a test database pool
-        // When implemented, create a test pool and verify server creation
-        // let pool = PgPool::connect(&test_db_url).await.unwrap();
-        // let state = AppState::new(pool);
-        // let server = Server::new(state, "127.0.0.1".to_string(), 8080);
-        // assert_eq!(server.host, "127.0.0.1");
-        // assert_eq!(server.port, 8080);
     }
 }

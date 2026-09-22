@@ -18,7 +18,6 @@ use helpers::{create_test_pool, ActionFixture, IdentityFixture, PackFixture};
 use serde_json::json;
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn absence_policies_preserve_overrides_and_gate_omitted_components() {
     let pool = create_test_pool().await.unwrap();
     let pack = PackFixture::new_unique("absence-policy")
@@ -118,7 +117,6 @@ async fn absence_policies_preserve_overrides_and_gate_omitted_components() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn retire_and_reactivate_preserves_ids_assignments_and_refs() {
     let pool = create_test_pool().await.unwrap();
     let pack = PackFixture::new_unique("lifecycle")
@@ -304,7 +302,6 @@ async fn retire_and_reactivate_preserves_ids_assignments_and_refs() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn lists_only_retired_components_owned_by_the_pack() {
     let pool = create_test_pool().await.unwrap();
     let pack = PackFixture::new_unique("retired-list")
@@ -319,7 +316,7 @@ async fn lists_only_retired_components_owned_by_the_pack() {
         .create(&pool)
         .await
         .unwrap();
-    let active = ActionFixture::new_unique(pack.id, &pack.r#ref, "active")
+    let _active = ActionFixture::new_unique(pack.id, &pack.r#ref, "active")
         .create(&pool)
         .await
         .unwrap();
@@ -328,11 +325,6 @@ async fn lists_only_retired_components_owned_by_the_pack() {
         .await
         .unwrap();
 
-    sqlx::query("UPDATE action SET management_origin = 'pack' WHERE id = ANY($1::BIGINT[])")
-        .bind(vec![retired.id, active.id, other.id])
-        .execute(&pool)
-        .await
-        .unwrap();
     sqlx::query("UPDATE action SET retired_at = NOW() WHERE id = ANY($1::BIGINT[])")
         .bind(vec![retired.id, other.id])
         .execute(&pool)
@@ -352,7 +344,6 @@ async fn lists_only_retired_components_owned_by_the_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn loader_retires_omitted_versions_and_rejects_a_retired_runtime_dependency() {
     let pool = create_test_pool().await.unwrap();
     PlatformCatalogRepository::reconcile(&pool).await.unwrap();

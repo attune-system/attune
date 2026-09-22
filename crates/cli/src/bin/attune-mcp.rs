@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use attune_cli::{
     client::{sanitize_url_for_display, ApiClient, ApiError},
     config::CliConfig,
+    inquiry::{self, InquiryListFilters},
 };
 use axum::{
     extract::State,
@@ -345,19 +346,52 @@ impl McpServer {
                     )
                     .await
             }
-            "inquiries_list" => self.list_path("/inquiries", args).await,
+            "inquiries_list" => self.inquiries_list(args).await,
+            "inquiries_get" => {
+                let id = required_i64(args, "id")?;
+                serde_json::to_value(inquiry::get(&mut self.client, id).await?)
+                    .context("Failed to serialize inquiry")
+            }
             "inquiries_respond" => {
                 let id = required_i64(args, "id")?;
-                let response = args
-                    .get("response")
+                let option_ref = optional_string(args, "option_ref");
+                let response = optional_object(args, "response")?;
+                let inquiry = match (option_ref, response) {
+                    (Some(option_ref), None) => {
+                        inquiry::respond_with_option(&mut self.client, id, &option_ref).await?
+                    }
+                    (None, Some(response)) => {
+                        inquiry::respond(&mut self.client, id, response).await?
+                    }
+                    _ => anyhow::bail!("Provide exactly one of 'option_ref' or 'response'"),
+                };
+                serde_json::to_value(inquiry).context("Failed to serialize inquiry")
+            }
+            "execution_inquiries_create" => {
+                let purpose = required_string(args, "purpose")?;
+                let prompt = required_string(args, "prompt")?;
+                let response_options = args
+                    .get("response_options")
+                    .and_then(Value::as_array)
                     .cloned()
-                    .ok_or_else(|| anyhow!("Missing required argument 'response'"))?;
-                self.client
-                    .post::<Value, _>(
-                        &format!("/inquiries/{id}/respond"),
-                        &json!({ "response": response }),
-                    )
-                    .await
+                    .ok_or_else(|| anyhow!("Missing required array argument 'response_options'"))?;
+                inquiry::create(
+                    &mut self.client,
+                    json!({
+                        "purpose": purpose,
+                        "prompt": prompt,
+                        "response_schema": optional_object(args, "response_schema")?,
+                        "response_options": response_options,
+                        "assigned_to": optional_i64(args, "assigned_to")?,
+                        "timeout_seconds": optional_i64(args, "timeout_seconds")?,
+                    }),
+                )
+                .await
+            }
+            "execution_inquiries_cancel" => {
+                let id = required_i64(args, "id")?;
+                serde_json::to_value(inquiry::cancel(&mut self.client, id).await?)
+                    .context("Failed to serialize inquiry")
             }
             "queues_list" => self.list_path("/queues", args).await,
             "queues_get" => {
@@ -566,6 +600,30 @@ impl McpServer {
             .get_paginated::<Value>(&format!("/executions?{qs}"))
             .await
             .map(Value::Array)
+    }
+
+    async fn inquiries_list(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let offset = optional_i64(args, "offset")?.unwrap_or(0);
+        let limit = optional_i64(args, "limit")?.unwrap_or(50);
+        if offset < 0 {
+            anyhow::bail!("Argument 'offset' must be at least 0");
+        }
+        if !(1..=500).contains(&limit) {
+            anyhow::bail!("Argument 'limit' must be between 1 and 500");
+        }
+
+        let page = inquiry::list(
+            &mut self.client,
+            &InquiryListFilters {
+                status: optional_string(args, "status"),
+                created_by_execution: optional_i64(args, "created_by_execution")?,
+                assigned_to: optional_i64(args, "assigned_to")?,
+                offset: offset as usize,
+                limit: limit as usize,
+            },
+        )
+        .await?;
+        serde_json::to_value(page).context("Failed to serialize inquiry page")
     }
 
     async fn cache_namespaces_list(&mut self, args: &Map<String, Value>) -> Result<Value> {
@@ -1020,14 +1078,32 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "inquiries_list",
             title: "List inquiries",
-            description: "List inquiries that require or record human responses.",
-            input_schema: pagination_schema,
+            description: "List visible inquiries with inquiry-specific filters and pagination metadata. Requires an Attune access token or execution token; visibility still follows inquiry and execution permissions.",
+            input_schema: inquiries_list_schema,
+        },
+        ToolDef {
+            name: "inquiries_get",
+            title: "Get inquiry",
+            description: "Fetch one visible inquiry and its stored response options. Requires an Attune access token or execution token; visibility still follows inquiry and execution permissions.",
+            input_schema: id_schema,
         },
         ToolDef {
             name: "inquiries_respond",
             title: "Respond to inquiry",
-            description: "Submit a structured response to a pending inquiry.",
+            description: "Respond to a pending inquiry with either a stored option ref or a response object. Requires an Attune access token or execution token and authorization to answer the inquiry.",
             input_schema: inquiry_respond_schema,
+        },
+        ToolDef {
+            name: "execution_inquiries_create",
+            title: "Create execution inquiry",
+            description: "Create an inquiry for the current execution. Requires an execution token with inquiries:create permission; access tokens are rejected by the API.",
+            input_schema: execution_inquiry_create_schema,
+        },
+        ToolDef {
+            name: "execution_inquiries_cancel",
+            title: "Cancel execution inquiry",
+            description: "Cancel a pending inquiry created by the current execution. Requires that creator execution's execution token; access tokens are rejected by the API.",
+            input_schema: id_schema,
         },
         ToolDef {
             name: "queues_list",
@@ -1284,14 +1360,76 @@ fn queue_enqueue_schema() -> Value {
     })
 }
 
+fn inquiries_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["pending", "responded", "timeout", "cancelled"],
+                "description": "Filter by inquiry status"
+            },
+            "created_by_execution": { "type": "integer", "description": "Filter by creator execution ID" },
+            "assigned_to": { "type": "integer", "description": "Filter by assigned identity ID" },
+            "offset": { "type": "integer", "minimum": 0, "default": 0 },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+        },
+        "additionalProperties": false
+    })
+}
+
 fn inquiry_respond_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "id": { "type": "integer", "description": "Inquiry ID" },
-            "response": { "description": "Structured inquiry response payload" }
+            "option_ref": { "type": "string", "description": "Ref of a stored response option" },
+            "response": {
+                "type": "object",
+                "description": "Structured inquiry response payload",
+                "additionalProperties": true
+            }
         },
-        "required": ["id", "response"],
+        "required": ["id"],
+        "oneOf": [
+            { "required": ["option_ref"], "not": { "required": ["response"] } },
+            { "required": ["response"], "not": { "required": ["option_ref"] } }
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn execution_inquiry_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "purpose": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "prompt": { "type": "string", "minLength": 1, "maxLength": 10000 },
+            "response_schema": {
+                "type": "object",
+                "description": "Attune flat per-field response schema",
+                "additionalProperties": { "type": "object" }
+            },
+            "response_options": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 25,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ref": { "type": "string" },
+                        "label": { "type": "string" },
+                        "style": { "type": "string", "enum": ["default", "positive", "destructive"] },
+                        "response": { "type": "object", "additionalProperties": true }
+                    },
+                    "required": ["ref", "label", "style", "response"],
+                    "additionalProperties": false
+                }
+            },
+            "assigned_to": { "type": "integer", "description": "Optional assigned identity ID" },
+            "timeout_seconds": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["purpose", "prompt", "response_options"],
         "additionalProperties": false
     })
 }
@@ -2257,7 +2395,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_catalog_includes_queue_enqueue_and_execute() {
+    fn tool_catalog_includes_queue_execute_and_inquiry_tools() {
         let names = tool_defs().iter().map(|tool| tool.name).collect::<Vec<_>>();
         assert!(names.contains(&"actions_execute"));
         assert!(names.contains(&"queues_enqueue"));
@@ -2265,6 +2403,9 @@ mod tests {
         assert!(names.contains(&"packs_check"));
         assert!(names.contains(&"rules_update_trace_tag_template"));
         assert!(names.contains(&"queues_update_trace_tag_template"));
+        assert!(names.contains(&"inquiries_get"));
+        assert!(names.contains(&"execution_inquiries_create"));
+        assert!(names.contains(&"execution_inquiries_cancel"));
         for cache_tool in [
             "cache_namespaces_list",
             "cache_namespace_get",
@@ -2284,6 +2425,222 @@ mod tests {
         ] {
             assert!(names.contains(&cache_tool), "missing {cache_tool}");
         }
+    }
+
+    #[test]
+    fn inquiry_schemas_use_api_filters_and_exclusive_response_sources() {
+        let list = inquiries_list_schema();
+        assert!(list["properties"].get("created_by_execution").is_some());
+        assert!(list["properties"].get("assigned_to").is_some());
+        assert!(list["properties"].get("offset").is_some());
+        assert!(list["properties"].get("limit").is_some());
+        assert!(list["properties"].get("page").is_none());
+
+        let respond = inquiry_respond_schema();
+        assert_eq!(respond["oneOf"].as_array().map(Vec::len), Some(2));
+        assert_eq!(respond["properties"]["response"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn inquiries_list_sends_filters_and_preserves_pagination() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/inquiries"))
+            .and(query_param("status", "pending"))
+            .and(query_param("created_by_execution", "77"))
+            .and(query_param("assigned_to", "9"))
+            .and(query_param("offset", "10"))
+            .and(query_param("limit", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [],
+                "pagination": {
+                    "page": 3,
+                    "page_size": 5,
+                    "has_previous": true,
+                    "has_next": false
+                }
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({
+            "status": "pending",
+            "created_by_execution": 77,
+            "assigned_to": 9,
+            "offset": 10,
+            "limit": 5
+        }))
+        .expect("arguments");
+
+        let response = server
+            .call_tool("inquiries_list", &args)
+            .await
+            .expect("inquiry list");
+
+        assert_eq!(response["pagination"]["page"], 3);
+        assert_eq!(response["pagination"]["page_size"], 5);
+    }
+
+    #[tokio::test]
+    async fn inquiries_get_and_option_response_use_stored_response() {
+        let api = MockServer::start().await;
+        let pending = json!({
+            "id": 42,
+            "created_by_execution": 77,
+            "workflow_execution": null,
+            "workflow_task_name": null,
+            "purpose": "approval",
+            "prompt": "Approve?",
+            "response_schema": {"approved": {"type": "boolean", "required": true}},
+            "response_options": [{
+                "ref": "approve",
+                "label": "Approve",
+                "style": "positive",
+                "response": {"approved": true}
+            }],
+            "assigned_to": 9,
+            "status": "pending",
+            "response": null,
+            "timeout_at": null,
+            "responded_by": null,
+            "responded_at": null,
+            "created": "2026-09-21T11:00:00Z",
+            "updated": "2026-09-21T11:00:00Z"
+        });
+        Mock::given(method("GET"))
+            .and(path("/api/v1/inquiries/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": pending})))
+            .expect(2)
+            .mount(&api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/inquiries/42/respond"))
+            .and(body_json(json!({"response": {"approved": true}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": 42,
+                    "created_by_execution": 77,
+                    "workflow_execution": null,
+                    "workflow_task_name": null,
+                    "purpose": "approval",
+                    "prompt": "Approve?",
+                    "response_schema": {"approved": {"type": "boolean", "required": true}},
+                    "response_options": [],
+                    "assigned_to": 9,
+                    "status": "responded",
+                    "response": {"approved": true},
+                    "timeout_at": null,
+                    "responded_by": 9,
+                    "responded_at": "2026-09-21T11:01:00Z",
+                    "created": "2026-09-21T11:00:00Z",
+                    "updated": "2026-09-21T11:01:00Z"
+                }
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server(api.uri());
+        let get_args = serde_json::from_value(json!({"id": 42})).expect("arguments");
+        let fetched = server
+            .call_tool("inquiries_get", &get_args)
+            .await
+            .expect("inquiry get");
+        assert_eq!(fetched["response_options"][0]["ref"], "approve");
+
+        let respond_args = serde_json::from_value(json!({
+            "id": 42,
+            "option_ref": "approve"
+        }))
+        .expect("arguments");
+        let responded = server
+            .call_tool("inquiries_respond", &respond_args)
+            .await
+            .expect("inquiry respond");
+        assert_eq!(responded["status"], "responded");
+    }
+
+    #[tokio::test]
+    async fn execution_inquiry_create_and_cancel_use_authority_scoped_endpoints() {
+        let api = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/inquiries"))
+            .and(body_json(json!({
+                "purpose": "approval",
+                "prompt": "Approve?",
+                "response_schema": {
+                    "approved": {"type": "boolean", "required": true}
+                },
+                "response_options": [{
+                    "ref": "approve",
+                    "label": "Approve",
+                    "style": "positive",
+                    "response": {"approved": true}
+                }],
+                "assigned_to": 9,
+                "timeout_seconds": 3600
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "data": {"inquiry": {"id": 42}, "response_options": []}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/inquiries/42/cancel"))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": 42,
+                    "created_by_execution": 77,
+                    "workflow_execution": null,
+                    "workflow_task_name": null,
+                    "purpose": "approval",
+                    "prompt": "Approve?",
+                    "response_schema": null,
+                    "response_options": [],
+                    "assigned_to": 9,
+                    "status": "cancelled",
+                    "response": null,
+                    "timeout_at": null,
+                    "responded_by": null,
+                    "responded_at": null,
+                    "created": "2026-09-21T11:00:00Z",
+                    "updated": "2026-09-21T11:01:00Z"
+                }
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server(api.uri());
+        let create_args = serde_json::from_value(json!({
+            "purpose": "approval",
+            "prompt": "Approve?",
+            "response_schema": {
+                "approved": {"type": "boolean", "required": true}
+            },
+            "response_options": [{
+                "ref": "approve",
+                "label": "Approve",
+                "style": "positive",
+                "response": {"approved": true}
+            }],
+            "assigned_to": 9,
+            "timeout_seconds": 3600
+        }))
+        .expect("arguments");
+        let created = server
+            .call_tool("execution_inquiries_create", &create_args)
+            .await
+            .expect("create inquiry");
+        assert_eq!(created["inquiry"]["id"], 42);
+
+        let cancel_args = serde_json::from_value(json!({"id": 42})).expect("arguments");
+        let cancelled = server
+            .call_tool("execution_inquiries_cancel", &cancel_args)
+            .await
+            .expect("cancel inquiry");
+        assert_eq!(cancelled["status"], "cancelled");
     }
 
     #[tokio::test]

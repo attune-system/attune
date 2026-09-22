@@ -82,7 +82,7 @@ Migration behavior is still tested separately. `migration_tests` creates fresh d
 
 ## Concurrency
 
-Template creation is serialized once; clone use is independent. The common-crate lane has passed its four-thread timing, session, and leak gates. Other crates remain serial until their representative runs prove the same bounds. Executables still run sequentially because overlapping migration DDL with repository tests caused a large regression.
+Template creation is serialized once; clone use is independent. The common-crate lane has passed its four-thread timing, session, and leak gates. Managed Make, Docker, benchmark, and CI entry points enforce at least four libtest threads; direct Cargo callers must set that concurrency themselves. Executables still run sequentially because overlapping migration DDL with repository tests caused a large regression.
 
 Use unique run IDs for overlapping invocations. Database names, Compose projects, RabbitMQ vhosts, filesystem roots, and external service resources must remain disjoint.
 

@@ -7,7 +7,6 @@ use serde_json::json;
 mod helpers;
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_register_debug() {
     let ctx = TestContext::new()
         .await
@@ -34,7 +33,6 @@ async fn test_register_debug() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_health_check() {
     let ctx = TestContext::new()
         .await
@@ -56,7 +54,6 @@ async fn test_health_check() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_health_detailed() {
     let ctx = TestContext::new()
         .await
@@ -80,7 +77,6 @@ async fn test_health_detailed() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_health_ready() {
     let ctx = TestContext::new()
         .await
@@ -103,7 +99,6 @@ async fn test_health_ready() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_health_content_is_unavailable_without_core_or_hosts() {
     let ctx = TestContext::new()
         .await
@@ -165,7 +160,6 @@ async fn test_health_content_is_unavailable_without_core_or_hosts() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_health_ready_rejects_non_current_catalog_revision() {
     let ctx = TestContext::new()
         .await
@@ -187,7 +181,6 @@ async fn test_health_ready_rejects_non_current_catalog_revision() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_health_live() {
     let ctx = TestContext::new()
         .await
@@ -204,7 +197,6 @@ async fn test_health_live() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_register_user() {
     let ctx = TestContext::new()
         .await
@@ -236,7 +228,6 @@ async fn test_register_user() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_register_duplicate_user() {
     let ctx = TestContext::new()
         .await
@@ -274,7 +265,6 @@ async fn test_register_duplicate_user() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_register_invalid_password() {
     let ctx = TestContext::new()
         .await
@@ -297,7 +287,6 @@ async fn test_register_invalid_password() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_login_success() {
     let ctx = TestContext::new()
         .await
@@ -340,7 +329,6 @@ async fn test_login_success() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_login_success_clears_browser_auth_cookies() {
     let ctx = TestContext::new()
         .await
@@ -389,7 +377,6 @@ async fn test_login_success_clears_browser_auth_cookies() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_login_wrong_password() {
     let ctx = TestContext::new()
         .await
@@ -426,7 +413,6 @@ async fn test_login_wrong_password() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_login_nonexistent_user() {
     let ctx = TestContext::new()
         .await
@@ -450,7 +436,6 @@ async fn test_login_nonexistent_user() {
 // ── LDAP auth tests ──────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_ldap_login_returns_501_when_not_configured() {
     let ctx = TestContext::new()
         .await
@@ -474,7 +459,6 @@ async fn test_ldap_login_returns_501_when_not_configured() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_logout_clears_browser_auth_cookies() {
     let ctx = TestContext::new()
         .await
@@ -510,7 +494,6 @@ async fn test_logout_clears_browser_auth_cookies() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_ldap_login_validates_empty_login() {
     let ctx = TestContext::new()
         .await
@@ -533,7 +516,6 @@ async fn test_ldap_login_validates_empty_login() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_ldap_login_validates_empty_password() {
     let ctx = TestContext::new()
         .await
@@ -555,7 +537,6 @@ async fn test_ldap_login_validates_empty_password() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_ldap_login_validates_missing_fields() {
     let ctx = TestContext::new()
         .await
@@ -573,7 +554,6 @@ async fn test_ldap_login_validates_missing_fields() {
 // ── auth/settings LDAP field tests ──────────────────────────────────
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_auth_settings_includes_ldap_fields_disabled() {
     let ctx = TestContext::new()
         .await
@@ -604,7 +584,6 @@ async fn test_auth_settings_includes_ldap_fields_disabled() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_current_user() {
     let ctx = TestContext::new()
         .await
@@ -628,7 +607,6 @@ async fn test_get_current_user() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_current_user_unauthorized() {
     let ctx = TestContext::new()
         .await
@@ -643,7 +621,6 @@ async fn test_get_current_user_unauthorized() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_current_user_invalid_token() {
     let ctx = TestContext::new()
         .await
@@ -658,7 +635,6 @@ async fn test_get_current_user_invalid_token() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_refresh_token() {
     let ctx = TestContext::new()
         .await
@@ -709,7 +685,6 @@ async fn test_refresh_token() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_refresh_with_invalid_token() {
     let ctx = TestContext::new()
         .await

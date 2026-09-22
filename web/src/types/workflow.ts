@@ -1637,6 +1637,25 @@ function validateActionInputs(
   }
 }
 
+function taskReachesItself(
+  taskName: string,
+  transitionsByTask: Map<string, string[]>,
+): boolean {
+  const pending = [...(transitionsByTask.get(taskName) ?? [])];
+  const visited = new Set<string>();
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) continue;
+    if (current === taskName) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    pending.push(...(transitionsByTask.get(current) ?? []));
+  }
+
+  return false;
+}
+
 /**
  * Validate a workflow builder state and return any errors.
  */
@@ -1716,6 +1735,13 @@ export function validateWorkflow(
     taskNames.add(task.name);
   }
 
+  const transitionsByTask = new Map(
+    state.tasks.map((task) => [
+      task.name,
+      (task.next ?? []).flatMap((transition) => transition.do ?? []),
+    ]),
+  );
+
   // Check that tasks have an action reference
   for (const task of state.tasks) {
     if (!task.action) {
@@ -1761,24 +1787,38 @@ export function validateWorkflow(
         errors.push(`Task "${task.name}" must define exactly one wait target`);
       } else {
         const [kind, target] = entries[0];
-        const label = `Task "${task.name}" ${kind} wait target`;
-        if (typeof target === "number") {
-          if (!Number.isSafeInteger(target) || target <= 0) {
-            errors.push(`${label} must be a positive integer`);
-          }
-        } else if (typeof target === "string") {
-          if (!target.trim()) {
-            errors.push(`${label} must be a template expression`);
-          } else {
-            validateTemplateSyntax(target, label, errors, {
-              requirePureExpression: true,
-            });
-          }
+        if (!["inquiry", "execution", "work_queue_item"].includes(kind)) {
+          errors.push(`Task "${task.name}" has an unsupported wait target`);
         } else {
-          errors.push(
-            `${label} must be a positive integer or template expression`,
-          );
+          const label = `Task "${task.name}" ${kind} wait target`;
+          if (typeof target === "number") {
+            if (!Number.isSafeInteger(target) || target <= 0) {
+              errors.push(`${label} must be a positive integer`);
+            }
+          } else if (typeof target === "string") {
+            if (!target.trim()) {
+              errors.push(`${label} must be a template expression`);
+            } else {
+              validateTemplateSyntax(target, label, errors, {
+                requirePureExpression: true,
+              });
+            }
+          } else {
+            errors.push(
+              `${label} must be a positive integer or template expression`,
+            );
+          }
         }
+      }
+      if (task.with_items?.trim() || task.iterate_cache) {
+        errors.push(
+          `Task "${task.name}" cannot define wait_for together with iteration`,
+        );
+      }
+      if (taskReachesItself(task.name, transitionsByTask)) {
+        errors.push(
+          `Task "${task.name}" cannot define wait_for in a cyclic graph region`,
+        );
       }
     }
 

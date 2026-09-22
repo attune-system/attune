@@ -8,8 +8,8 @@ priority: optional
 maintainer: "Attune <attune@rdrx.app>"
 description: "Attune Notifier — Real-time WebSocket notification service"
 vendor: "Attune"
-homepage: "https://git.rdrx.app/attune/attune"
-license: "Proprietary"
+homepage: "https://git.rdrx.app/attune-system/attune"
+license: "Apache-2.0"
 
 depends:
   - attune-common (= ${VERSION})

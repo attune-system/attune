@@ -2,7 +2,7 @@
 mod helpers;
 
 use attune_common::{
-    config::{CacheAdmissionConfig, Config},
+    config::CacheAdmissionConfig,
     models::ManagementOrigin,
     pack_registry::loader::PackComponentLoader,
     platform_catalog::{ManagedComponentKind as Kind, CATALOG_REVISION},
@@ -22,7 +22,6 @@ use attune_common::{
         trigger::{SensorRepository, TriggerRepository, UpdateTriggerInput},
         Create, Delete, FindById, FindByRef, List, Update,
     },
-    test_database::TestDatabase,
 };
 use helpers::{
     create_test_pool, ActionFixture, IdentityFixture, PackFixture, RuntimeFixture, SensorFixture,
@@ -31,8 +30,6 @@ use helpers::{
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::path::Path;
-
-const MIGRATION: &str = "20260916000001_platform_catalog.sql";
 
 async fn permission(pool: &PgPool, component_ref: &str, pack: Option<i64>) -> i64 {
     PermissionSetRepository::create(
@@ -96,7 +93,6 @@ fn legacy_fixture() -> tempfile::TempDir {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn fresh_catalog_is_complete_idempotent_and_serialized_without_core() {
     let db = create_test_pool().await.unwrap();
     let (first, second) = tokio::join!(Catalog::reconcile(&db), Catalog::reconcile(&db));
@@ -136,19 +132,8 @@ async fn fresh_catalog_is_complete_idempotent_and_serialized_without_core() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
-async fn maintenance_migration_preserves_builtin_ids_assignments_and_external_refs() {
-    let config = Config::load_from_file(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config.test.yaml")
-            .to_str()
-            .unwrap(),
-    )
-    .unwrap();
-    let db = TestDatabase::create_before(&config.database, MIGRATION)
-        .await
-        .unwrap()
-        .with_cleanup_on_drop();
+async fn maintenance_reconciliation_preserves_builtin_ids_assignments_and_external_refs() {
+    let db = create_test_pool().await.unwrap();
     let core = PackFixture::new("core").create(&db).await.unwrap();
     let other = PackFixture::new("external").create(&db).await.unwrap();
     let mut runtime_ids = Vec::new();
@@ -231,18 +216,6 @@ async fn maintenance_migration_preserves_builtin_ids_assignments_and_external_re
     sqlx::query("INSERT INTO rule (ref, pack, pack_ref, label, action, action_ref, trigger, trigger_ref, enabled) VALUES ('external.alert', $1, 'external', 'Alert', $2, 'external.uses_shell', $3, 'core.alert', true)")
         .bind(other.id).bind(action.id).bind(trigger_ids[0].1).execute(&db).await.unwrap();
 
-    sqlx::raw_sql(include_str!(
-        "../../../migrations/20260916000001_platform_catalog.sql"
-    ))
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../../migrations/20260916000002_catalog_bootstrap_and_release_lock.sql"
-    ))
-    .execute(&db)
-    .await
-    .unwrap();
     Catalog::reconcile(&db).await.unwrap();
     for (id, runtime_id, version) in &version_ids {
         let row = RuntimeVersionRepository::get_by_id(&db, *id).await.unwrap();
@@ -342,11 +315,11 @@ async fn maintenance_migration_preserves_builtin_ids_assignments_and_external_re
     )
     .await
     .unwrap();
-    loader
+    let loaded = loader
         .load_all_in_transaction(&mut tx, fixture.path())
         .await
         .unwrap();
-    PackReleaseRepository::activate(&mut tx, core.id, release.id)
+    PackReleaseRepository::activate_projected(&mut tx, core.id, release.id, &loaded.projections)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -398,7 +371,6 @@ async fn maintenance_migration_preserves_builtin_ids_assignments_and_external_re
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn catalog_conflicts_abort_the_entire_reconciliation() {
     for conflict in [
         "ad_hoc",
@@ -489,7 +461,6 @@ async fn catalog_conflicts_abort_the_entire_reconciliation() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn platform_mutations_fail_but_assignments_and_runtime_verification_work() {
     let db = create_test_pool().await.unwrap();
     Catalog::reconcile(&db).await.unwrap();
@@ -576,7 +547,6 @@ async fn platform_mutations_fail_but_assignments_and_runtime_verification_work()
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn legacy_core_cannot_replace_platform_definitions_or_claim_ad_hoc_refs() {
     let db = create_test_pool().await.unwrap();
     Catalog::reconcile(&db).await.unwrap();
@@ -650,7 +620,6 @@ async fn legacy_core_cannot_replace_platform_definitions_or_claim_ad_hoc_refs() 
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn newer_catalog_revision_and_incompatible_epoch_fail_closed() {
     for column in ["revision", "compatibility_epoch"] {
         let db = create_test_pool().await.unwrap();

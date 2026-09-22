@@ -18,6 +18,10 @@ on:
         description: "Run: Tests"
         type: boolean
         default: true
+      run_e2e_smoke:
+        description: "Run: Full-stack smoke tests"
+        type: boolean
+        default: true
       run_rust_audit:
         description: "Run: Cargo Audit & Deny"
         type: boolean
@@ -60,6 +64,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       web: ${{ steps.filter.outputs.web }}
       release: ${{ steps.filter.outputs.release }}
+      smoke: ${{ steps.filter.outputs.smoke }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -71,10 +76,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rust="false"
-          web="false"
-          release="false"
-
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
             head="${{ github.sha }}"
@@ -82,33 +83,16 @@ jobs:
             base="${{ github.event.before }}"
             head="${{ github.sha }}"
             if [ "$base" = "0000000000000000000000000000000000000000" ]; then
-              rust="true"; web="true"
-              release="true"
-              { echo "rust=$rust"; echo "web=$web"; echo "release=$release"; } >> "$GITHUB_OUTPUT"
-              echo "Changed path flags: rust=$rust web=$web release=$release (first push)"
+              printf 'rust=true\nweb=true\nrelease=true\nsmoke=true\n' >> "$GITHUB_OUTPUT"
               exit 0
             fi
           else
             # workflow_dispatch: path detection not applicable; jobs check their own input flags
-            { echo "rust=false"; echo "web=false"; echo "release=false"; } >> "$GITHUB_OUTPUT"
+            printf 'rust=false\nweb=false\nrelease=false\nsmoke=false\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          while IFS= read -r f; do
-            if printf '%s' "$f" | grep -qE '^(crates/|migrations/|Cargo\.toml$|Cargo\.lock$)' \
-               || printf '%s' "$f" | grep -qE '\.rs$'; then
-              rust="true"
-            fi
-            if printf '%s' "$f" | grep -qE '^web/'; then
-              web="true"
-            fi
-            if printf '%s' "$f" | grep -qE '^(\.dockerignore$|\.github/workflows/|docker/|migrations/|packaging/|scripts/|config\.|docker-compose(\.[^/]*)?\.ya?ml$)'; then
-              release="true"
-            fi
-          done < <(git diff --name-only "$base" "$head")
-
-          { echo "rust=$rust"; echo "web=$web"; echo "release=$release"; } >> "$GITHUB_OUTPUT"
-          echo "Changed path flags: rust=$rust web=$web release=$release"
+          git diff --name-only "$base" "$head" | bash scripts/ci-changed-paths.sh | tee -a "$GITHUB_OUTPUT"
 
   rust-fmt:
     name: Rustfmt
@@ -142,7 +126,7 @@ jobs:
 
       - name: Validate release scripts
         run: |
-          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh scripts/run-integration-tests.sh scripts/run-rust-integration-tests.sh scripts/cleanup-test-schemas.sh scripts/ci-test-db-safety.sh scripts/test-test-isolation-guards.sh
+          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh scripts/check-db-test-threads.sh scripts/database-test-ignore-policy.sh scripts/run-ci-rust-tests.sh scripts/run-integration-tests.sh scripts/run-rust-integration-tests.sh scripts/cleanup-test-schemas.sh scripts/ci-test-db-safety.sh scripts/test-test-isolation-guards.sh
           bash scripts/test-test-isolation-guards.sh
           bash scripts/test-arch-package-signatures.sh
           bash scripts/test-upload-release-asset.sh
@@ -220,10 +204,28 @@ jobs:
       (github.event_name != 'workflow_dispatch' && needs.changes.outputs.rust == 'true')
     env:
       ATTUNE_TEST_RUN_ID: ci-${{ github.run_id }}
+      ATTUNE_RUST_TEST_THREADS: 4
+      ATTUNE__ENVIRONMENT: test
+      DATABASE_URL: postgresql://attune:attune@localhost:5432/attune_test
+      ATTUNE__DATABASE__URL: postgresql://attune:attune@localhost:5432/attune_test
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@localhost:5672/ci-${{ github.run_id }}-${{ github.run_attempt }}
       RUNTIME_LOG_HARNESS_OWNER: attune-runtime-log-ci-${{ github.run_id }}-${{ github.run_attempt }}
     services:
+      rabbitmq:
+        image: rabbitmq:4.3.6-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: attune
+          RABBITMQ_DEFAULT_PASS: attune
+          RABBITMQ_DEFAULT_VHOST: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
       postgres:
-        image: timescale/timescaledb:2.17.2-pg16
+        image: timescale/timescaledb:2.30.1-pg18
         env:
           POSTGRES_USER: attune
           POSTGRES_PASSWORD: attune
@@ -315,17 +317,15 @@ jobs:
           AWS_ACCESS_KEY_ID: attune-minio
           AWS_SECRET_ACCESS_KEY: attune-minio-secret
           AWS_REGION: us-east-1
+        run: scripts/run-ci-rust-tests.sh
+
+      - name: Executor broker integration test
         run: >-
-          cargo test --workspace --all-features -- --include-ignored --test-threads=1
-          --skip test_service_creation
-          --skip test_sse_stream_receives_execution_updates
-          --skip test_sse_stream_filters_by_execution_id
-          --skip test_sse_stream_requires_authentication
-          --skip test_sse_stream_all_executions
-          --skip dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets
-          --skip test_action_execute_with_profile
-          --skip test_high_concurrency_stress
-          --skip test_extreme_stress_10k_executions
+          cargo test -p attune-executor --lib service::tests::test_service_creation
+          -- --ignored --exact --nocapture --test-threads=4
+
+      - name: MinIO storage correctness tests
+        run: make test-runtime-log-correctness
 
       - name: Stop runtime-log test storage
         if: always()
@@ -342,6 +342,27 @@ jobs:
           BASELINE_DATABASE_COUNT: ${{ steps.test-db-baseline.outputs.database_count }}
           BASELINE_TEMPLATE_COUNT: ${{ steps.test-db-baseline.outputs.template_count }}
         run: bash scripts/ci-test-db-safety.sh cleanup
+
+  e2e-smoke:
+    name: Full-stack smoke tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    needs: changes
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.run_e2e_smoke) ||
+      (github.event_name != 'workflow_dispatch' && needs.changes.outputs.smoke == 'true')
+    env:
+      ATTUNE_E2E_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      ATTUNE_E2E_CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Run tier 1 and live-API SSE tests
+        run: >-
+          timeout --signal=TERM --kill-after=120s 110m
+          bash scripts/run-integration-tests.sh --tier 1
+          tests/e2e/api/test_sse_execution_stream.py -x
 
   rust-audit:
     name: Cargo Audit & Deny

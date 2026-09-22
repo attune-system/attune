@@ -502,7 +502,9 @@ from .create_identity_role_assignment_response_201_data import (
     CreateIdentityRoleAssignmentResponse201Data,
 )
 from .create_inquiry_request import CreateInquiryRequest
-from .create_inquiry_request_response_schema import CreateInquiryRequestResponseSchema
+from .create_inquiry_request_response_schema_type_0 import (
+    CreateInquiryRequestResponseSchemaType0,
+)
 from .create_inquiry_response import CreateInquiryResponse
 from .create_integration_token_request import CreateIntegrationTokenRequest
 from .create_integration_token_response import CreateIntegrationTokenResponse
@@ -708,12 +710,7 @@ from .execution_response_workflow_task_type_0 import ExecutionResponseWorkflowTa
 from .execution_status import ExecutionStatus
 from .execution_summary import ExecutionSummary
 from .execution_summary_workflow_task_type_0 import ExecutionSummaryWorkflowTaskType0
-from .external_actor_assertion import ExternalActorAssertion
 from .external_identity_mapping_response import ExternalIdentityMappingResponse
-from .external_inquiry_respond_request import ExternalInquiryRespondRequest
-from .external_inquiry_respond_request_response import (
-    ExternalInquiryRespondRequestResponse,
-)
 from .failed_environment import FailedEnvironment
 from .failed_pack import FailedPack
 from .failed_pack_registration import FailedPackRegistration
@@ -858,6 +855,10 @@ from .identity_summary import IdentitySummary
 from .inquiry_respond_request import InquiryRespondRequest
 from .inquiry_respond_request_response import InquiryRespondRequestResponse
 from .inquiry_response import InquiryResponse
+from .inquiry_response_option import InquiryResponseOption
+from .inquiry_response_option_handle import InquiryResponseOptionHandle
+from .inquiry_response_option_response import InquiryResponseOptionResponse
+from .inquiry_response_option_style import InquiryResponseOptionStyle
 from .inquiry_response_response_schema_type_0 import InquiryResponseResponseSchemaType0
 from .inquiry_response_response_type_0 import InquiryResponseResponseType0
 from .inquiry_status import InquiryStatus
@@ -1731,7 +1732,7 @@ __all__ = (
     "CreateIdentityRoleAssignmentResponse201",
     "CreateIdentityRoleAssignmentResponse201Data",
     "CreateInquiryRequest",
-    "CreateInquiryRequestResponseSchema",
+    "CreateInquiryRequestResponseSchemaType0",
     "CreateInquiryResponse",
     "CreateIntegrationTokenRequest",
     "CreateIntegrationTokenResponse",
@@ -1869,10 +1870,7 @@ __all__ = (
     "ExecutionStatus",
     "ExecutionSummary",
     "ExecutionSummaryWorkflowTaskType0",
-    "ExternalActorAssertion",
     "ExternalIdentityMappingResponse",
-    "ExternalInquiryRespondRequest",
-    "ExternalInquiryRespondRequestResponse",
     "FailedEnvironment",
     "FailedPack",
     "FailedPackRegistration",
@@ -1965,6 +1963,10 @@ __all__ = (
     "InquiryRespondRequest",
     "InquiryRespondRequestResponse",
     "InquiryResponse",
+    "InquiryResponseOption",
+    "InquiryResponseOptionHandle",
+    "InquiryResponseOptionResponse",
+    "InquiryResponseOptionStyle",
     "InquiryResponseResponseSchemaType0",
     "InquiryResponseResponseType0",
     "InquiryStatus",

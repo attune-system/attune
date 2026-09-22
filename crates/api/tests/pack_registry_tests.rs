@@ -73,7 +73,6 @@ print("Test action executed")
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn delete_pack_rejects_non_access_tokens_before_pack_lookup() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let jwt_config = JwtConfig {
@@ -116,7 +115,6 @@ async fn delete_pack_rejects_non_access_tokens_before_pack_lookup() -> Result<()
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let pack = PackRepository::create(
@@ -193,7 +191,6 @@ async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn delete_pack_removes_projection_and_runtime_environments() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -358,7 +355,6 @@ async fn register_pack_index_user(ctx: &TestContext, grants: serde_json::Value) 
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn constrained_pack_grants_cannot_read_or_administer_global_pack_indices() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_pack_index_user(
@@ -441,7 +437,6 @@ async fn constrained_pack_grants_cannot_read_or_administer_global_pack_indices()
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn pack_index_update_waits_for_the_mutation_advisory_lock() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let standard_id: i64 =
@@ -482,7 +477,6 @@ async fn pack_index_update_waits_for_the_mutation_advisory_lock() -> Result<()> 
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn standard_index_without_headers_does_not_require_encryption_key() -> Result<()> {
     let ctx = TestContext::new_without_registry_encryption_key()
         .await?
@@ -512,7 +506,6 @@ async fn standard_index_without_headers_does_not_require_encryption_key() -> Res
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let create_secret = "create-registry-secret";
@@ -595,7 +588,6 @@ async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn registry_id_only_loads_the_selected_enabled_managed_row() -> Result<()> {
     let ctx = TestContext::new_without_registry_encryption_key()
         .await?
@@ -675,7 +667,6 @@ async fn registry_id_only_loads_the_selected_enabled_managed_row() -> Result<()>
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn disabled_registry_preserves_outbound_host_denial_for_direct_installs() -> Result<()> {
     let ctx = TestContext::new_with_disabled_pack_registry()
         .await?
@@ -697,7 +688,6 @@ async fn disabled_registry_preserves_outbound_host_denial_for_direct_installs() 
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn direct_remote_install_requires_explicit_deployment_opt_in() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
 
@@ -718,7 +708,6 @@ async fn direct_remote_install_requires_explicit_deployment_opt_in() -> Result<(
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn direct_remote_query_credentials_are_rejected_without_echo() -> Result<()> {
     let ctx = TestContext::new_with_unverified_direct_remote_installs()
         .await?
@@ -740,7 +729,6 @@ async fn direct_remote_query_credentials_are_rejected_without_echo() -> Result<(
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_from_local_directory() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -780,7 +768,6 @@ async fn test_install_pack_from_local_directory() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_with_dependency_validation_success() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -831,7 +818,6 @@ async fn test_install_pack_with_dependency_validation_success() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_with_missing_dependency_fails() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -871,7 +857,6 @@ async fn test_install_pack_with_missing_dependency_fails() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let fixture =
@@ -984,7 +969,6 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn release_activation_failure_preserves_database_and_projection() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let first = create_test_pack_dir("activation_failure", "1.0.0")?;
@@ -1054,7 +1038,6 @@ async fn release_activation_failure_preserves_database_and_projection() -> Resul
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn commit_failure_preserves_database_and_projection() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let first = create_test_pack_dir("commit_failure", "1.0.0")?;
@@ -1126,7 +1109,6 @@ async fn commit_failure_preserves_database_and_projection() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_skip_deps_bypasses_validation() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1162,7 +1144,6 @@ async fn test_install_pack_skip_deps_bypasses_validation() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_with_runtime_validation() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1196,7 +1177,6 @@ async fn test_install_pack_with_runtime_validation() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_metadata_tracking() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1291,7 +1271,6 @@ async fn test_install_pack_metadata_tracking() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_force_reinstall() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1344,7 +1323,6 @@ async fn test_install_pack_force_reinstall() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn force_install_still_attempts_candidate_tests() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let pack_dir = create_test_pack_dir("force-tested", "1.0.0")?;
@@ -1383,12 +1361,18 @@ testing:
     assert!(PackRepository::find_by_ref(&ctx.pool, "force-tested")
         .await?
         .is_some());
-    let install = PackInstallRepository::new(ctx.pool.clone())
-        .find_latest_by_pack_ref("force-tested")
-        .await?
-        .expect("force install should record its candidate test attempt");
-    assert_eq!(install.status, "failed");
-    assert!(install
+    let installs = PackInstallRepository::new(ctx.pool.clone())
+        .list_by_pack_ref("force-tested", 10, 0)
+        .await?;
+    assert_eq!(
+        installs.first().map(|install| install.status.as_str()),
+        Some("succeeded")
+    );
+    let failed_test_attempt = installs
+        .iter()
+        .find(|install| install.status == "failed")
+        .expect("force install should retain its failed candidate test attempt");
+    assert!(failed_test_attempt
         .error_message
         .as_deref()
         .is_some_and(|message| message.contains("publisher unavailable")));
@@ -1397,7 +1381,6 @@ testing:
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn register_candidate_dispatch_failure_leaves_pack_unregistered() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let pack_dir = create_test_pack_dir("register-candidate", "1.0.0")?;
@@ -1441,7 +1424,6 @@ testing:
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn candidate_archive_requires_active_assigned_attempt_credentials() -> Result<()> {
     let ctx = TestContext::new().await?;
     let repo = PackInstallRepository::new(ctx.pool.clone());
@@ -1529,7 +1511,6 @@ async fn candidate_archive_requires_active_assigned_attempt_credentials() -> Res
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn create_placement_write_failure_rolls_back_the_pack_row() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     sqlx::raw_sql(
@@ -1574,7 +1555,6 @@ async fn create_placement_write_failure_rolls_back_the_pack_row() -> Result<()> 
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn update_placement_write_failure_rolls_back_metadata() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     PackRepository::create(
@@ -1634,7 +1614,6 @@ async fn update_placement_write_failure_rolls_back_metadata() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn install_only_permission_cannot_replace_existing_pack() -> Result<()> {
     let ctx = TestContext::new().await?.with_pack_install_auth().await?;
     let pack_dir = create_test_pack_dir("replacement_guard", "2.0.0")?;
@@ -1697,7 +1676,6 @@ testing:
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn register_activates_an_immutable_source_snapshot() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let pack_dir = create_test_pack_dir("register_snapshot", "1.0.0")?;
@@ -1731,7 +1709,6 @@ async fn register_activates_an_immutable_source_snapshot() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn force_reinstall_preserves_ownerless_pack_ownership() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let pack_dir = create_test_pack_dir("ownership_guard", "2.0.0")?;
@@ -1778,7 +1755,6 @@ async fn force_reinstall_preserves_ownerless_pack_ownership() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_storage_path_created() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1829,7 +1805,6 @@ async fn test_install_pack_storage_path_created() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_invalid_source() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1860,7 +1835,6 @@ async fn test_install_pack_invalid_source() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_missing_pack_yaml() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1895,7 +1869,6 @@ async fn test_install_pack_missing_pack_yaml() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_invalid_pack_yaml() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1924,7 +1897,6 @@ async fn test_install_pack_invalid_pack_yaml() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_without_auth_fails() -> Result<()> {
     let ctx = TestContext::new().await?; // No auth
 
@@ -1950,7 +1922,6 @@ async fn test_install_pack_without_auth_fails() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_multiple_pack_installations() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -1998,7 +1969,6 @@ async fn test_multiple_pack_installations() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_install_pack_version_upgrade() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
@@ -2047,7 +2017,6 @@ async fn test_install_pack_version_upgrade() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn pack_releases_reject_conflicting_versions_and_preserve_previous_bytes() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let first = create_test_pack_dir("immutable-version", "1.0.0")?;
@@ -2177,7 +2146,6 @@ async fn pack_releases_reject_conflicting_versions_and_preserve_previous_bytes()
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readiness() -> Result<()>
 {
     let ctx = TestContext::new().await?;
@@ -2263,7 +2231,6 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn missing_legacy_pack_bytes_fail_closed_without_a_fake_release() -> Result<()> {
     let ctx = TestContext::new().await?;
     attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)

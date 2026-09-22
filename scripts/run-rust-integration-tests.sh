@@ -2,8 +2,8 @@
 #
 # Orchestration script for Rust integration tests in Docker.
 #
-# Starts the owned PostgreSQL and RabbitMQ dependencies, builds the Rust test
-# container, runs the #[ignore]'d integration tests, and tears down.
+# Starts owned PostgreSQL and RabbitMQ dependencies, builds the Rust test
+# container, runs the normal precompiled test inventory, and tears down.
 #
 # Usage:
 #   ./scripts/run-rust-integration-tests.sh              # All crates
@@ -24,7 +24,10 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # ── Defaults ──────────────────────────────────────────────────────────────
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ATTUNE_RUST_TEST_THREADS="${ATTUNE_RUST_TEST_THREADS:-4}"
+"$PROJECT_ROOT/scripts/check-db-test-threads.sh" "$ATTUNE_RUST_TEST_THREADS"
+export ATTUNE_RUST_TEST_THREADS
 COMPOSE_FILES=("-f" "$PROJECT_ROOT/docker-compose.yaml" "-f" "$PROJECT_ROOT/docker-compose.e2e.yaml")
 validate_identifier() {
   [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,47}$ ]]
@@ -91,13 +94,13 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $0 [options] [-- cargo-test-args]"
       echo ""
       echo "Options:"
-      echo "  --crate, -c <name>  Run tests for a specific crate (common, api, executor, worker)"
+      echo "  --crate, -c <name>  Run tests for a specific crate (common, api, executor, sensor, worker, notifier, supervisor, cli)"
       echo "  --test <name>       Run one integration-test executable"
       echo "  --filter, -f <expr> Filter test names"
       echo "  --no-teardown       Keep Docker stack running after tests"
       echo "  --no-build          Skip docker compose build step"
       echo "  --no-startup        Use an explicitly named stack without owning teardown"
-      echo "  -- <args>           Extra args passed to cargo test binary"
+      echo "  -- <args>           Extra args passed to each selected libtest executable"
       echo ""
       echo "Examples:"
       echo "  $0                              # All integration tests"
@@ -195,7 +198,7 @@ write_benchmark_record() {
     "${ATTUNE_BENCHMARK_SAMPLE:-unspecified}" \
     "${ATTUNE_BENCHMARK_MODE:-unspecified}" \
     "$ATTUNE_TEST_RUN_ID" \
-    "${ATTUNE_RUST_TEST_THREADS:-1}" \
+    "$ATTUNE_RUST_TEST_THREADS" \
     "$SELECTED_TESTS" "$SELECTED_SHA256" "$INVENTORY_TESTS" "$INVENTORY_SHA256" \
     "$BUILD_MS" "$STARTUP_MS" "$TEST_MS" "$CLEANUP_MS" "$total_ms" \
     "$exit_code" "$PEAK_SESSIONS" "$PRE_CLONES" "$PRE_MIGRATIONS" "$PRE_TEMPLATES" \

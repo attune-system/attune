@@ -161,6 +161,15 @@ async fn main() {
             )
             .await
         }
+        Commands::Inquiry { command } => {
+            commands::inquiry::handle_inquiry_command(
+                &cli.profile,
+                command,
+                &cli.api_url,
+                output_format,
+            )
+            .await
+        }
         Commands::Workflow { command } => {
             commands::workflow::handle_workflow_command(
                 &cli.profile,

@@ -80,7 +80,7 @@ def sync_detailed(
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 ) -> Response[Any | PaginatedResponseInquirySummary]:
-    """List inquiries for a specific execution
+    """List inquiries created by a specific execution
 
     Args:
         execution_id (int):
@@ -115,7 +115,7 @@ def sync(
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 ) -> Any | PaginatedResponseInquirySummary | None:
-    """List inquiries for a specific execution
+    """List inquiries created by a specific execution
 
     Args:
         execution_id (int):
@@ -145,7 +145,7 @@ async def asyncio_detailed(
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 ) -> Response[Any | PaginatedResponseInquirySummary]:
-    """List inquiries for a specific execution
+    """List inquiries created by a specific execution
 
     Args:
         execution_id (int):
@@ -178,7 +178,7 @@ async def asyncio(
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 ) -> Any | PaginatedResponseInquirySummary | None:
-    """List inquiries for a specific execution
+    """List inquiries created by a specific execution
 
     Args:
         execution_id (int):

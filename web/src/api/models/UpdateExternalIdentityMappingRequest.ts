@@ -6,5 +6,6 @@ export type UpdateExternalIdentityMappingRequest = {
   external_subject: string;
   mapped_identity: number;
   provider: string;
+  subject_kind: string;
   tenant: string;
 };

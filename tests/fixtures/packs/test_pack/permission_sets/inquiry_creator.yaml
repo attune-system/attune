@@ -1,0 +1,6 @@
+ref: test_pack.inquiry_creator
+label: Inquiry Creator
+description: Creates inquiries from the inquiry E2E workflow action.
+grants:
+  - resource: inquiries
+    actions: [create]

@@ -15,6 +15,7 @@ use attune_common::{
     repositories::{
         action::{ActionRepository, CreateActionInput},
         artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
+        component_lifecycle::PackProjectionIds,
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
@@ -159,7 +160,6 @@ async fn create_failed_workflow_log_outbox(ctx: &TestContext) -> Result<i64> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn workflow_log_retry_rejects_unauthenticated_requests() {
     let ctx = TestContext::new().await.expect("test context");
     let outbox_id = create_failed_workflow_log_outbox(&ctx)
@@ -178,7 +178,6 @@ async fn workflow_log_retry_rejects_unauthenticated_requests() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn workflow_log_retry_requires_artifact_update_permission() {
     let ctx = TestContext::new().await.expect("test context");
     let token = register_scoped_user(
@@ -211,7 +210,6 @@ async fn workflow_log_retry_requires_artifact_update_permission() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn workflow_log_retry_requeues_for_authorized_access_token() {
     let ctx = TestContext::new().await.expect("test context");
     let token = register_scoped_user(
@@ -254,7 +252,6 @@ async fn create_pack_with_action(
     attune_common::models::action::Action,
 )> {
     let pack = create_test_pack(&ctx.pool, pack_ref).await?;
-    activate_test_pack_release(&ctx.pool, &pack).await?;
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {
@@ -286,12 +283,20 @@ async fn create_pack_with_action(
         },
     )
     .await?;
+    activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            ..PackProjectionIds::default()
+        },
+    )
+    .await?;
 
     Ok((pack, action))
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_pack_scoped_key_permissions_enforce_owner_refs() {
     let ctx = TestContext::new()
         .await
@@ -386,7 +391,6 @@ async fn test_pack_scoped_key_permissions_enforce_owner_refs() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_pack_scoped_artifact_permissions_enforce_owner_refs() {
     let ctx = TestContext::new()
         .await
@@ -501,7 +505,6 @@ async fn test_pack_scoped_artifact_permissions_enforce_owner_refs() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_queue_admin_like_crud_and_pending_item_guards() {
     let ctx = TestContext::new()
         .await
@@ -657,7 +660,6 @@ async fn test_queue_admin_like_crud_and_pending_item_guards() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_pack_scoped_queue_permissions_cover_definitions_and_items() {
     let ctx = TestContext::new()
         .await
@@ -891,7 +893,6 @@ mod artifact_authz_tests {
 
     /// Public artifacts are readable by any authenticated user with `artifacts:read`.
     #[tokio::test]
-    #[ignore = "integration test — requires database"]
     async fn public_artifact_readable_by_any_user_with_artifacts_read() {
         let ctx = TestContext::new().await.expect("test ctx");
         let token = register_scoped_user(
@@ -922,7 +923,6 @@ mod artifact_authz_tests {
 
     /// Private + scope=identity: only the owning identity may read.
     #[tokio::test]
-    #[ignore = "integration test — requires database"]
     async fn private_identity_scoped_artifact_owner_can_read_other_cannot() {
         let ctx = TestContext::new().await.expect("test ctx");
 
@@ -972,7 +972,6 @@ mod artifact_authz_tests {
 
     /// Private + scope=action: derive pack from `<pack>.<action>`, require packs:read.
     #[tokio::test]
-    #[ignore = "integration test — requires database"]
     async fn private_action_scoped_artifact_uses_derived_pack_for_authz() {
         let ctx = TestContext::new().await.expect("test ctx");
 
@@ -1032,7 +1031,6 @@ mod artifact_authz_tests {
 
     /// Private + scope=sensor: same pack-derivation rule as scope=action.
     #[tokio::test]
-    #[ignore = "integration test — requires database"]
     async fn private_sensor_scoped_artifact_uses_derived_pack_for_authz() {
         let ctx = TestContext::new().await.expect("test ctx");
         let token = register_scoped_user(
@@ -1080,7 +1078,6 @@ mod artifact_authz_tests {
 
     /// List endpoint hides private artifacts the user cannot access.
     #[tokio::test]
-    #[ignore = "integration test — requires database"]
     async fn list_endpoint_filters_private_artifacts_user_cannot_read() {
         let ctx = TestContext::new().await.expect("test ctx");
         let token = register_scoped_user(
@@ -1145,7 +1142,6 @@ mod artifact_authz_tests {
 
     /// Execution token from pack X cannot mutate artifact owned by pack Y.
     #[tokio::test]
-    #[ignore = "integration test — requires database"]
     async fn execution_token_cannot_cross_pack_mutate_artifact() {
         let ctx = TestContext::new().await.expect("test ctx");
 
@@ -1237,7 +1233,6 @@ mod artifact_authz_tests {
     /// guard refuses rather than letting an execution token mutate it via a
     /// fake derived pack.
     #[tokio::test]
-    #[ignore = "integration test — requires database"]
     async fn dotless_action_owner_is_treated_as_malformed_and_refused() {
         let ctx = TestContext::new().await.expect("test ctx");
 
@@ -1292,7 +1287,6 @@ mod artifact_authz_tests {
     /// pack; cross-pack writes against pack-derivable artifacts must be
     /// refused with 403, not silently allowed.
     #[tokio::test]
-    #[ignore = "integration test — requires database"]
     async fn execution_token_with_empty_action_ref_is_refused() {
         let ctx = TestContext::new().await.expect("test ctx");
 

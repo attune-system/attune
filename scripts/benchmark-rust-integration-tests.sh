@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 output="${1:-/tmp/attune-rust-integration-benchmark.tsv}"
 cold_samples="${ATTUNE_BENCHMARK_COLD_SAMPLES:-3}"
 warm_samples="${ATTUNE_BENCHMARK_WARM_SAMPLES:-5}"
@@ -18,8 +18,8 @@ for value in "$cold_samples" "$warm_samples" "$threads"; do
     exit 2
   }
 done
-((threads > 0)) || {
-  echo "ERROR: ATTUNE_BENCHMARK_THREADS must be greater than zero" >&2
+((threads >= 4)) || {
+  echo "ERROR: ATTUNE_BENCHMARK_THREADS must be at least four" >&2
   exit 2
 }
 

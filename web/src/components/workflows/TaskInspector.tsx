@@ -106,6 +106,61 @@ function inputToPermissionSetRefs(
     .filter(Boolean);
 }
 
+type WaitKind = "inquiry" | "execution" | "work_queue_item";
+
+function waitKind(waitFor: WorkflowTask["wait_for"]): WaitKind | "none" {
+  if (!waitFor) return "none";
+  if ("inquiry" in waitFor && waitFor.inquiry !== undefined) return "inquiry";
+  if ("execution" in waitFor && waitFor.execution !== undefined)
+    return "execution";
+  if ("work_queue_item" in waitFor && waitFor.work_queue_item !== undefined)
+    return "work_queue_item";
+  return "none";
+}
+
+function waitTarget(waitFor: WorkflowTask["wait_for"]): number | string {
+  if (!waitFor) return "";
+  if ("inquiry" in waitFor && waitFor.inquiry !== undefined)
+    return waitFor.inquiry;
+  if ("execution" in waitFor && waitFor.execution !== undefined)
+    return waitFor.execution;
+  if ("work_queue_item" in waitFor && waitFor.work_queue_item !== undefined)
+    return waitFor.work_queue_item;
+  return "";
+}
+
+function waitForValue(kind: WaitKind, target: number | string) {
+  switch (kind) {
+    case "inquiry":
+      return { inquiry: target };
+    case "execution":
+      return { execution: target };
+    case "work_queue_item":
+      return { work_queue_item: target };
+  }
+}
+
+function normalizedWaitTarget(value: string): number | string {
+  const trimmed = value.trim();
+  if (/^[1-9][0-9]*$/.test(trimmed)) {
+    const numeric = Number(trimmed);
+    if (Number.isSafeInteger(numeric)) return numeric;
+  }
+  return trimmed;
+}
+
+const WAIT_LABELS: Record<WaitKind, string> = {
+  inquiry: "Inquiry ID or expression",
+  execution: "Execution ID or expression",
+  work_queue_item: "Work queue item ID or expression",
+};
+
+const WAIT_PLACEHOLDERS: Record<WaitKind, string> = {
+  inquiry: "{{ task.request_approval.inquiry_id }}",
+  execution: "{{ task.start_job.execution_id }}",
+  work_queue_item: "{{ task.enqueue.item_id }}",
+};
+
 export default function TaskInspector({
   task,
   allTaskNames,
@@ -341,6 +396,8 @@ export default function TaskInspector({
   const hasSchema = Object.keys(schemaProperties).length > 0;
 
   const otherTaskNames = allTaskNames.filter((n) => n !== task.name);
+  const selectedWaitKind = waitKind(task.wait_for);
+  const hasIteration = Boolean(task.with_items?.trim() || task.iterate_cache);
 
   return (
     <div className="w-80 border-l border-gray-200 bg-white flex flex-col h-full overflow-hidden">
@@ -839,6 +896,92 @@ export default function TaskInspector({
           </div>
         </CollapsibleSection>
 
+        <CollapsibleSection
+          title="Wait for prerequisite"
+          sectionKey="wait"
+          expanded={expandedSections.has("wait")}
+          onToggle={toggleSection}
+        >
+          <div className="space-y-3">
+            <p className="text-[10px] text-gray-400">
+              Hold this task until one inquiry, execution, or work queue item
+              reaches a terminal state.
+            </p>
+            <div>
+              <label
+                htmlFor={`wait-kind-${task.id}`}
+                className="block text-xs font-medium text-gray-700 mb-1"
+              >
+                Wait type
+              </label>
+              <select
+                id={`wait-kind-${task.id}`}
+                value={selectedWaitKind}
+                disabled={hasIteration && !task.wait_for}
+                onChange={(event) => {
+                  const kind = event.target.value;
+                  if (kind === "none") {
+                    update({ wait_for: undefined });
+                  } else if (
+                    kind === "inquiry" ||
+                    kind === "execution" ||
+                    kind === "work_queue_item"
+                  ) {
+                    update({ wait_for: waitForValue(kind, "") });
+                  }
+                }}
+                className="w-full px-2.5 py-1.5 border border-gray-300 rounded bg-white text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
+              >
+                <option value="none">None</option>
+                <option value="inquiry">Inquiry</option>
+                <option value="execution">Execution</option>
+                <option value="work_queue_item">Work queue item</option>
+              </select>
+            </div>
+            {selectedWaitKind !== "none" && (
+              <div>
+                <label
+                  htmlFor={`wait-target-${task.id}`}
+                  className="block text-xs font-medium text-gray-700 mb-1"
+                >
+                  {WAIT_LABELS[selectedWaitKind]}
+                </label>
+                <input
+                  id={`wait-target-${task.id}`}
+                  type="text"
+                  value={String(waitTarget(task.wait_for))}
+                  onChange={(event) =>
+                    update({
+                      wait_for: waitForValue(
+                        selectedWaitKind,
+                        event.target.value,
+                      ),
+                    })
+                  }
+                  onBlur={(event) =>
+                    update({
+                      wait_for: waitForValue(
+                        selectedWaitKind,
+                        normalizedWaitTarget(event.target.value),
+                      ),
+                    })
+                  }
+                  className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  placeholder={WAIT_PLACEHOLDERS[selectedWaitKind]}
+                />
+                <p className="text-[10px] text-gray-400 mt-0.5">
+                  Enter a positive ID or a pure template expression.
+                </p>
+              </div>
+            )}
+            {hasIteration && !task.wait_for && (
+              <p className="text-[10px] text-amber-700">
+                Remove iteration before adding a prerequisite wait.
+              </p>
+            )}
+          </div>
+        </CollapsibleSection>
+
         {/* Iteration Section */}
         <CollapsibleSection
           title="Iteration"
@@ -851,6 +994,7 @@ export default function TaskInspector({
               <input
                 type="checkbox"
                 checked={Boolean(task.iterate_cache)}
+                disabled={Boolean(task.wait_for)}
                 onChange={(e) => {
                   if (e.target.checked) {
                     setLocalWithItems("");
@@ -873,7 +1017,7 @@ export default function TaskInspector({
                     });
                   }
                 }}
-                className="mt-0.5 h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                className="mt-0.5 h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
               />
               <span>
                 <span className="block text-xs font-medium text-gray-700">
@@ -1012,7 +1156,7 @@ export default function TaskInspector({
               <input
                 type="text"
                 value={localWithItems}
-                disabled={Boolean(task.iterate_cache)}
+                disabled={Boolean(task.iterate_cache || task.wait_for)}
                 onChange={(e) => setLocalWithItems(e.target.value)}
                 onBlur={() =>
                   update({ with_items: localWithItems.trim() || undefined })
@@ -1023,6 +1167,11 @@ export default function TaskInspector({
               <p className="text-[10px] text-gray-400 mt-0.5">
                 Template expression resolving to a list for iteration.
               </p>
+              {task.wait_for && (
+                <p className="text-[10px] text-amber-700 mt-0.5">
+                  Remove the prerequisite wait before adding iteration.
+                </p>
+              )}
             </div>
 
             <div>

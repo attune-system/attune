@@ -10,9 +10,10 @@ from typing_extensions import Self
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.create_inquiry_request_response_schema import (
-        CreateInquiryRequestResponseSchema,
+    from ..models.create_inquiry_request_response_schema_type_0 import (
+        CreateInquiryRequestResponseSchemaType0,
     )
+    from ..models.inquiry_response_option import InquiryResponseOption
 
 
 T = TypeVar("T", bound="CreateInquiryRequest")
@@ -26,31 +27,48 @@ class CreateInquiryRequest:
         prompt (str): Prompt text to display to the user Example: Approve deployment to production?.
         purpose (str): Stable purpose used to make creation idempotent within this workflow task attempt. Example:
             approval.
-        response_schema (CreateInquiryRequestResponseSchema): Optional schema for the expected response format (flat
-            format with inline required/secret)
+        response_options (list[InquiryResponseOption]): Fixed response choices rendered by provider actions.
         assigned_to (int | None | Unset):
+        response_schema (CreateInquiryRequestResponseSchemaType0 | None | Unset): Optional schema for the expected
+            response format (flat format with inline required/secret)
         timeout_seconds (int | None | Unset): Optional relative timeout in seconds. Example: 3600.
     """
 
     prompt: str
     purpose: str
-    response_schema: CreateInquiryRequestResponseSchema
+    response_options: list[InquiryResponseOption]
     assigned_to: int | None | Unset = UNSET
+    response_schema: CreateInquiryRequestResponseSchemaType0 | None | Unset = UNSET
     timeout_seconds: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.create_inquiry_request_response_schema_type_0 import (
+            CreateInquiryRequestResponseSchemaType0,
+        )
+
         prompt = self.prompt
 
         purpose = self.purpose
 
-        response_schema = self.response_schema.to_dict()
+        response_options = []
+        for response_options_item_data in self.response_options:
+            response_options_item = response_options_item_data.to_dict()
+            response_options.append(response_options_item)
 
         assigned_to: int | None | Unset
         if isinstance(self.assigned_to, Unset):
             assigned_to = UNSET
         else:
             assigned_to = self.assigned_to
+
+        response_schema: dict[str, Any] | None | Unset
+        if isinstance(self.response_schema, Unset):
+            response_schema = UNSET
+        elif isinstance(self.response_schema, CreateInquiryRequestResponseSchemaType0):
+            response_schema = self.response_schema.to_dict()
+        else:
+            response_schema = self.response_schema
 
         timeout_seconds: int | None | Unset
         if isinstance(self.timeout_seconds, Unset):
@@ -64,11 +82,13 @@ class CreateInquiryRequest:
             {
                 "prompt": prompt,
                 "purpose": purpose,
-                "response_schema": response_schema,
+                "response_options": response_options,
             }
         )
         if assigned_to is not UNSET:
             field_dict["assigned_to"] = assigned_to
+        if response_schema is not UNSET:
+            field_dict["response_schema"] = response_schema
         if timeout_seconds is not UNSET:
             field_dict["timeout_seconds"] = timeout_seconds
 
@@ -76,8 +96,11 @@ class CreateInquiryRequest:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
-        from ..models.create_inquiry_request_response_schema import (
-            CreateInquiryRequestResponseSchema,
+        from ..models.create_inquiry_request_response_schema_type_0 import (
+            CreateInquiryRequestResponseSchemaType0,
+        )
+        from ..models.inquiry_response_option import (
+            InquiryResponseOption,
         )
 
         d = dict(src_dict)
@@ -85,9 +108,14 @@ class CreateInquiryRequest:
 
         purpose = d.pop("purpose")
 
-        response_schema = CreateInquiryRequestResponseSchema.from_dict(
-            d.pop("response_schema")
-        )
+        response_options = []
+        _response_options = d.pop("response_options")
+        for response_options_item_data in _response_options:
+            response_options_item = InquiryResponseOption.from_dict(
+                response_options_item_data
+            )
+
+            response_options.append(response_options_item)
 
         def _parse_assigned_to(data: object) -> int | None | Unset:
             if data is None:
@@ -97,6 +125,27 @@ class CreateInquiryRequest:
             return cast(int | None | Unset, data)
 
         assigned_to = _parse_assigned_to(d.pop("assigned_to", UNSET))
+
+        def _parse_response_schema(
+            data: object,
+        ) -> CreateInquiryRequestResponseSchemaType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                response_schema_type_0 = (
+                    CreateInquiryRequestResponseSchemaType0.from_dict(data)
+                )
+
+                return response_schema_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CreateInquiryRequestResponseSchemaType0 | None | Unset, data)
+
+        response_schema = _parse_response_schema(d.pop("response_schema", UNSET))
 
         def _parse_timeout_seconds(data: object) -> int | None | Unset:
             if data is None:
@@ -110,8 +159,9 @@ class CreateInquiryRequest:
         create_inquiry_request = cls(
             prompt=prompt,
             purpose=purpose,
-            response_schema=response_schema,
+            response_options=response_options,
             assigned_to=assigned_to,
+            response_schema=response_schema,
             timeout_seconds=timeout_seconds,
         )
 

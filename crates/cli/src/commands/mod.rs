@@ -5,6 +5,7 @@ pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod execution;
+pub mod inquiry;
 pub mod key;
 pub mod pack;
 pub mod pack_index;

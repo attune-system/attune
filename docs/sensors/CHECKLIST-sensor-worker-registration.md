@@ -156,8 +156,8 @@ kill $SENSOR_PID
 # Run sensor service tests
 cargo test --package attune-sensor
 
-# Run integration tests (if DB available)
-cargo test --package attune-sensor -- --ignored
+# Run integration tests after make db-test-setup
+cargo test --package attune-sensor -- --test-threads=4
 
 # Verify all tests pass
 ```

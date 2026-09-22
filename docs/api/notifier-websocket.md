@@ -219,7 +219,7 @@ interface InquiryCreatedPayload {
   entity_type: "inquiry";
   entity_id: number;
   id: number;
-  execution: number;
+  created_by_execution: number;
   status: string;
   timeout_at: string | null;
   created: string;
@@ -229,7 +229,7 @@ interface InquiryRespondedPayload {
   entity_type: "inquiry";
   entity_id: number;
   id: number;
-  execution: number;
+  created_by_execution: number;
   status: "responded";
   updated: string;
 }
@@ -238,7 +238,7 @@ interface InquiryTimeoutPayload {
   entity_type: "inquiry";
   entity_id: number;
   id: number;
-  execution: number;
+  created_by_execution: number;
   status: "timeout";
   timeout_at: string | null;
   updated: string;

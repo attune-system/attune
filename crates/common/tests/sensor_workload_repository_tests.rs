@@ -8,6 +8,7 @@ use attune_common::{
         Sensor, SensorWorkloadFence, SensorWorkloadLease, Worker,
     },
     repositories::{
+        component_lifecycle::PackProjectionIds,
         pack_release::{CreatePackReleaseInput, PackReleaseRepository},
         rule::{CreateRuleInput, RuleRepository},
         runtime::{CreateWorkerInput, WorkerRepository},
@@ -74,9 +75,18 @@ async fn setup_fixture() -> (
     )
     .await
     .expect("release");
-    PackReleaseRepository::activate(&mut tx, pack.id, release.id)
-        .await
-        .expect("activate release");
+    PackReleaseRepository::activate_projected(
+        &mut tx,
+        pack.id,
+        release.id,
+        &PackProjectionIds {
+            runtimes: vec![runtime.id],
+            sensors: vec![sensor.id],
+            ..PackProjectionIds::default()
+        },
+    )
+    .await
+    .expect("activate release");
     tx.commit().await.expect("commit release transaction");
 
     let worker_a = create_worker(
@@ -208,7 +218,6 @@ fn lease_fence(lease: &SensorWorkloadLease) -> SensorWorkloadFence {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn default_workload_is_idempotent() {
     let (pool, sensor, _, _) = setup_fixture().await;
 
@@ -234,7 +243,6 @@ async fn default_workload_is_idempotent() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn eligibility_aware_acquisition_checks_active_workload_and_starts_generation() {
     let (pool, sensor, worker, _) = setup_fixture().await;
     let worker_instance = Uuid::new_v4();
@@ -311,7 +319,55 @@ async fn eligibility_aware_acquisition_checks_active_workload_and_starts_generat
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
+async fn callback_demand_acquires_and_renews_without_active_rules() {
+    let (pool, sensor, worker, _) = setup_fixture().await;
+    sqlx::query("UPDATE sensor SET config = $1 WHERE id = $2")
+        .bind(json!({
+            "inquiry_callback_adapters": {
+                "test.callback": {
+                    "provider": "test",
+                    "subject_kind": "user",
+                    "request": {
+                        "delivery_id_pointer": "/id",
+                        "tenant_pointer": "/tenant",
+                        "external_subject_pointer": "/user",
+                        "response_handle_pointer": "/handle"
+                    }
+                }
+            }
+        }))
+        .bind(sensor.id)
+        .execute(&*pool)
+        .await
+        .expect("enable callback adapter");
+
+    let acquired = SensorWorkloadAdmissionRepository::acquire(
+        &pool,
+        acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+    )
+    .await
+    .expect("acquire callback workload");
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(acquired) = acquired else {
+        panic!("callback workload was not acquired");
+    };
+
+    let renewed = SensorWorkloadAdmissionRepository::renew(
+        &pool,
+        sensor.id,
+        SensorWorkloadLeaseInput {
+            fence: acquired.fence(),
+            lease_seconds: LEASE_SECONDS * 2,
+        },
+    )
+    .await
+    .expect("renew callback workload");
+    assert!(matches!(
+        renewed,
+        RenewEligibleSensorWorkloadOutcome::Renewed(_)
+    ));
+}
+
+#[tokio::test]
 async fn eligibility_aware_acquisition_enforces_worker_sensor_capacity() {
     let (pool, first_sensor, worker, _) = setup_fixture().await;
     let pack_id = first_sensor.pack.expect("sensor pack");
@@ -361,7 +417,6 @@ async fn eligibility_aware_acquisition_enforces_worker_sensor_capacity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn concurrent_eligibility_aware_acquisition_has_one_owner() {
     let (pool, sensor, worker_a, worker_b) = setup_fixture().await;
     create_active_rule(&pool, &sensor).await;
@@ -397,7 +452,6 @@ async fn concurrent_eligibility_aware_acquisition_has_one_owner() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn eligibility_aware_renewal_stops_on_ineligibility_or_ownership_loss() {
     let (pool, sensor, worker, _) = setup_fixture().await;
     let rule_id = create_active_rule(&pool, &sensor).await;
@@ -440,7 +494,6 @@ async fn eligibility_aware_renewal_stops_on_ineligibility_or_ownership_loss() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn concurrent_acquisition_has_exactly_one_owner() {
     let (pool, sensor, worker_a, worker_b) = setup_fixture().await;
     let instance_a = Uuid::new_v4();
@@ -478,7 +531,6 @@ async fn concurrent_acquisition_has_exactly_one_owner() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn begin_process_increments_generation() {
     let (pool, sensor, worker, _) = setup_fixture().await;
     let acquired = acquire(&pool, sensor.id, worker.id, Uuid::new_v4()).await;
@@ -494,7 +546,6 @@ async fn begin_process_increments_generation() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn renewal_preserves_generation() {
     let (pool, sensor, worker, _) = setup_fixture().await;
     let acquired = acquire(&pool, sensor.id, worker.id, Uuid::new_v4()).await;
@@ -519,7 +570,6 @@ async fn renewal_preserves_generation() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn stale_generation_is_rejected() {
     let (pool, sensor, worker, _) = setup_fixture().await;
     let acquired = acquire(&pool, sensor.id, worker.id, Uuid::new_v4()).await;
@@ -558,7 +608,6 @@ async fn stale_generation_is_rejected() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn pack_release_lookup_requires_the_complete_current_fence() {
     let (pool, sensor, worker, other_worker) = setup_fixture().await;
     let acquired = acquire(&pool, sensor.id, worker.id, Uuid::new_v4()).await;
@@ -622,7 +671,6 @@ async fn pack_release_lookup_requires_the_complete_current_fence() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn released_workload_can_be_reacquired() {
     let (pool, sensor, worker_a, worker_b) = setup_fixture().await;
     let acquired = acquire(&pool, sensor.id, worker_a.id, Uuid::new_v4()).await;
@@ -649,7 +697,6 @@ async fn released_workload_can_be_reacquired() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn expired_lease_can_be_taken_over() {
     let (pool, sensor, worker_a, worker_b) = setup_fixture().await;
     let acquired = acquire(&pool, sensor.id, worker_a.id, Uuid::new_v4()).await;
@@ -684,7 +731,6 @@ async fn expired_lease_can_be_taken_over() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn periodic_reconciliation_converges_when_one_replica_misses_pack_lifecycle_prompt() {
     let (pool, sensor, worker_a, worker_b) = setup_fixture().await;
     create_active_rule(&pool, &sensor).await;
@@ -762,7 +808,6 @@ async fn periodic_reconciliation_converges_when_one_replica_misses_pack_lifecycl
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn default_workload_membership_requires_enabled_owned_targets() {
     let (pool, sensor, _, _) = setup_fixture().await;
     let pack_id = sensor.pack.expect("sensor pack");

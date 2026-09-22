@@ -1151,6 +1151,10 @@ pub async fn delete_pack(
 ///
 /// Preserves the tracking record when dispatch fails after the attempt was
 /// created so forced operations can report the exact failed attempt.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the preflight failure record needs the complete immutable install context"
+)]
 async fn record_pack_test_preflight_failure(
     state: &AppState,
     requested_by: i64,

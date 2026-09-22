@@ -154,7 +154,6 @@ async fn publish_generation(
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn owner_constraints_and_canonical_owner_namespace_uniqueness() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace_name = format!("cache_{}", unique_test_id());
@@ -189,7 +188,6 @@ async fn owner_constraints_and_canonical_owner_namespace_uniqueness() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn cache_retention_config_is_persisted_with_runtime_retention() {
     let pool = helpers::create_test_pool().await.unwrap();
     let mut config = RetentionConfig::default();
@@ -212,7 +210,6 @@ async fn cache_retention_config_is_persisted_with_runtime_retention() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn bytewise_ordering_and_duplicate_ids_are_enforced() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -253,7 +250,6 @@ async fn bytewise_ordering_and_duplicate_ids_are_enforced() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn chunk_replays_and_seal_write_boundary_are_enforced() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -361,7 +357,6 @@ async fn chunk_replays_and_seal_write_boundary_are_enforced() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn promotion_is_optimistic_and_pinned_reads_do_not_mix_generations() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -436,7 +431,6 @@ async fn promotion_is_optimistic_and_pinned_reads_do_not_mix_generations() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn namespace_isolation_and_generation_quota_rejection() {
     let pool = helpers::create_test_pool().await.unwrap();
     let first_namespace = CacheNamespaceRepository::create(
@@ -517,7 +511,6 @@ async fn namespace_isolation_and_generation_quota_rejection() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn expiration_tombstone_and_bounded_cleanup_primitives() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -588,7 +581,6 @@ async fn expiration_tombstone_and_bounded_cleanup_primitives() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn only_nonterminal_workflow_iteration_pins_generation() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -893,7 +885,6 @@ async fn only_nonterminal_workflow_iteration_pins_generation() {
 /// so an unreadable generation is a typed error while a genuine end-of-page is
 /// an empty `Vec`.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn scan_pinned_distinguishes_expired_from_end_of_generation() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1021,7 +1012,6 @@ async fn scan_pinned_distinguishes_expired_from_end_of_generation() {
 /// Multi-id reads preserve request order, omit missing ids, stay bounded, and
 /// never cross namespace boundaries.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn multi_id_lookup_orders_omits_missing_and_isolates_namespaces() {
     let pool = helpers::create_test_pool().await.unwrap();
     let first_namespace = CacheNamespaceRepository::create(
@@ -1106,7 +1096,6 @@ async fn multi_id_lookup_orders_omits_missing_and_isolates_namespaces() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn source_checksum_is_bounded_and_included_in_storage_accounting() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1156,7 +1145,6 @@ async fn source_checksum_is_bounded_and_included_in_storage_accounting() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn namespace_and_generation_metadata_support_keyset_pages() {
     let pool = helpers::create_test_pool().await.unwrap();
     let mut namespaces = Vec::new();
@@ -1229,7 +1217,6 @@ async fn namespace_and_generation_metadata_support_keyset_pages() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn failed_generations_release_slots_but_continue_consuming_byte_quotas() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1280,7 +1267,6 @@ async fn failed_generations_release_slots_but_continue_consuming_byte_quotas() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn refresh_failure_streak_is_idempotent_and_resets_on_promotion() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1338,7 +1324,6 @@ async fn refresh_failure_streak_is_idempotent_and_resets_on_promotion() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn empty_tombstoned_namespace_cleanup_is_independently_bounded() {
     let pool = helpers::create_test_pool().await.unwrap();
     let first = CacheNamespaceRepository::create(
@@ -1392,7 +1377,6 @@ async fn empty_tombstoned_namespace_cleanup_is_independently_bounded() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn large_reads_are_deduplicated_and_byte_bounded() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1460,7 +1444,6 @@ async fn large_reads_are_deduplicated_and_byte_bounded() {
 /// Identical concurrent chunk uploads collapse to one insert plus idempotent
 /// replays; conflicting checksums for the same index yield exactly one error.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn concurrent_chunk_uploads_replay_or_conflict() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1515,7 +1498,6 @@ async fn concurrent_chunk_uploads_replay_or_conflict() {
 /// The unpublished-generation quota bounds staging and sealed-ready refreshes,
 /// while a failed refresh immediately releases its writer slot.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn max_staging_generations_quota_is_enforced() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1553,7 +1535,6 @@ async fn max_staging_generations_quota_is_enforced() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn aggregate_admission_limits_are_atomic_across_racing_writers() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace_policy = CacheNamespacePolicy::default();
@@ -1610,7 +1591,6 @@ async fn aggregate_admission_limits_are_atomic_across_racing_writers() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn managed_namespace_admission_is_atomic_and_updates_remain_idempotent() {
     let pool = helpers::create_test_pool().await.unwrap();
     let first_pack = PackFixture::new_unique("managed_admission_a")
@@ -1707,7 +1687,6 @@ async fn managed_namespace_admission_is_atomic_and_updates_remain_idempotent() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn aggregate_physical_bytes_include_staging_entries_and_roll_back_rejection() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1834,7 +1813,6 @@ async fn aggregate_physical_bytes_include_staging_entries_and_roll_back_rejectio
 /// Promotion is blocked by retained-generation count, while aggregate bytes
 /// are rejected earlier during staging admission.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn retained_generation_and_aggregate_byte_quotas_are_enforced() {
     let pool = helpers::create_test_pool().await.unwrap();
 
@@ -1914,7 +1892,6 @@ async fn retained_generation_and_aggregate_byte_quotas_are_enforced() {
 /// Database triggers reject invalid generation transitions and entry writes to
 /// non-staging generations even when the repository layer is bypassed.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn direct_db_state_transition_and_staging_trigger_are_rejected() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -1963,7 +1940,6 @@ async fn direct_db_state_transition_and_staging_trigger_are_rejected() {
 /// deadlocks, because all three acquire the namespace lock before the
 /// generation lock.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn tombstone_races_upload_and_seal_without_deadlock() {
     let pool = helpers::create_test_pool().await.unwrap();
 
@@ -2034,7 +2010,6 @@ async fn tombstone_races_upload_and_seal_without_deadlock() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn cleanup_waits_for_a_reader_pinned_before_expiry() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -2112,7 +2087,6 @@ async fn cleanup_waits_for_a_reader_pinned_before_expiry() {
 /// Both within-chunk and cross-chunk duplicate external ids surface the typed,
 /// identifier-free ingestion error rather than a raw database error.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn duplicate_external_ids_yield_typed_error() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -2155,7 +2129,6 @@ async fn duplicate_external_ids_yield_typed_error() {
 /// generation state, not record count, so end-of-scan traversals never fail on
 /// their final (empty) page.
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn scan_pinned_returns_empty_page_for_zero_record_snapshot() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
@@ -2255,7 +2228,6 @@ fn write_pack_owner_components(root: &std::path::Path, pack_ref: &str) {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn late_pack_component_failure_rolls_back_metadata_and_components() {
     let pool = helpers::create_test_pool().await.unwrap();
     create_core_native_runtime(&pool).await;
@@ -2329,7 +2301,6 @@ async fn late_pack_component_failure_rolls_back_metadata_and_components() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
     let pool = helpers::create_test_pool().await.unwrap();
     create_core_native_runtime(&pool).await;
@@ -2450,11 +2421,12 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
 
     fs::remove_file(temp.path().join("caches/catalog.yaml")).unwrap();
     loader.load_all(temp.path()).await.unwrap();
-    let removed = CacheNamespaceRepository::find_by_id(&pool, pack_namespace.id)
+    let removed = CacheNamespaceRepository::find_by_id_including_retired(&pool, pack_namespace.id)
         .await
         .unwrap()
         .unwrap();
-    assert!(removed.tombstoned_at.is_some());
+    assert!(removed.retired_at.is_some());
+    assert!(removed.tombstoned_at.is_none());
     assert_eq!(
         CacheNamespaceRepository::resolve(
             &pool,
@@ -2485,21 +2457,8 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
     .await
     .unwrap()
     .unwrap();
-    assert_ne!(reinstalled.id, pack_namespace.id);
-    assert_eq!(
-        CacheEntryRepository::delete_cleanup_batch(&pool, active.id, 100)
-            .await
-            .unwrap(),
-        1
-    );
-    assert!(CacheGenerationRepository::delete_if_empty(&pool, active.id)
-        .await
-        .unwrap());
-    assert!(
-        CacheNamespaceRepository::delete_tombstoned_if_empty(&pool, pack_namespace.id)
-            .await
-            .unwrap()
-    );
+    assert_eq!(reinstalled.id, pack_namespace.id);
+    assert_eq!(reinstalled.active_generation, Some(active.id));
     assert_eq!(
         CacheNamespaceRepository::resolve_managed_definition(
             &pool,
@@ -2547,9 +2506,15 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
         .unwrap()
         .is_none());
 
+    for id in [action_namespace.id, sensor_namespace.id] {
+        let namespace = CacheNamespaceRepository::find_by_id_including_retired(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(namespace.retired_at.is_some());
+        assert!(namespace.tombstoned_at.is_none());
+    }
     for (id, owner_type, expected_ref) in [
-        (action_namespace.id, OwnerType::Action, action_ref.as_str()),
-        (sensor_namespace.id, OwnerType::Sensor, sensor_ref.as_str()),
         (
             api_action_namespace.id,
             OwnerType::Action,
@@ -2565,14 +2530,15 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
             .await
             .unwrap()
             .unwrap();
-        assert!(namespace.tombstoned_at.is_some());
+        assert!(namespace.tombstoned_at.is_none());
+        assert!(namespace.retired_at.is_none());
         match owner_type {
             OwnerType::Action => {
-                assert!(namespace.owner_action.is_none());
+                assert_eq!(namespace.owner_action, Some(action.id));
                 assert_eq!(namespace.owner_action_ref.as_deref(), Some(expected_ref));
             }
             OwnerType::Sensor => {
-                assert!(namespace.owner_sensor.is_none());
+                assert_eq!(namespace.owner_sensor, Some(sensor.id));
                 assert_eq!(namespace.owner_sensor_ref.as_deref(), Some(expected_ref));
             }
             _ => unreachable!(),
@@ -2589,8 +2555,7 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn stale_owner_cleanup_rolls_back_when_cache_tombstoning_fails() {
+async fn component_retirement_rolls_back_when_retirement_fails() {
     let pool = helpers::create_test_pool().await.unwrap();
     create_core_native_runtime(&pool).await;
     let pack = PackFixture::new_unique("atomic_owner_cleanup")
@@ -2637,13 +2602,11 @@ async fn stale_owner_cleanup_rolls_back_when_cache_tombstoning_fails() {
 
     sqlx::query(
         r#"
-        CREATE FUNCTION reject_owner_cache_tombstone()
+        CREATE FUNCTION reject_action_retirement()
         RETURNS TRIGGER AS $$
         BEGIN
-            IF OLD.tombstoned_at IS NULL
-               AND NEW.tombstoned_at IS NOT NULL
-               AND (OLD.owner_action IS NOT NULL OR OLD.owner_sensor IS NOT NULL) THEN
-                RAISE EXCEPTION 'test cache tombstone failure';
+            IF OLD.retired_at IS NULL AND NEW.retired_at IS NOT NULL THEN
+                RAISE EXCEPTION 'test component retirement failure';
             END IF;
             RETURN NEW;
         END;
@@ -2654,9 +2617,9 @@ async fn stale_owner_cleanup_rolls_back_when_cache_tombstoning_fails() {
     .await
     .unwrap();
     sqlx::query(
-        "CREATE TRIGGER reject_owner_cache_tombstone_trigger \
-         BEFORE UPDATE ON cache_namespace FOR EACH ROW \
-         EXECUTE FUNCTION reject_owner_cache_tombstone()",
+        "CREATE TRIGGER reject_action_retirement_trigger \
+         BEFORE UPDATE ON action FOR EACH ROW \
+         EXECUTE FUNCTION reject_action_retirement()",
     )
     .execute(&pool)
     .await
@@ -2664,11 +2627,10 @@ async fn stale_owner_cleanup_rolls_back_when_cache_tombstoning_fails() {
 
     fs::remove_file(temp.path().join("actions/refresh.yaml")).unwrap();
     fs::remove_file(temp.path().join("sensors/watcher.yaml")).unwrap();
-    let failed_cleanup = loader.load_all(temp.path()).await.unwrap();
+    let failed_cleanup = loader.load_all(temp.path()).await.unwrap_err();
     assert!(failed_cleanup
-        .warnings
-        .iter()
-        .any(|warning| warning.contains("Failed to atomically clean up stale cache owners")));
+        .to_string()
+        .contains("test component retirement failure"));
 
     assert!(ActionRepository::find_by_ref(&pool, &action_ref)
         .await
@@ -2686,20 +2648,16 @@ async fn stale_owner_cleanup_rolls_back_when_cache_tombstoning_fails() {
         assert!(namespace.tombstoned_at.is_none());
     }
 
-    sqlx::query("DROP TRIGGER reject_owner_cache_tombstone_trigger ON cache_namespace")
+    sqlx::query("DROP TRIGGER reject_action_retirement_trigger ON action")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DROP FUNCTION reject_owner_cache_tombstone()")
+    sqlx::query("DROP FUNCTION reject_action_retirement()")
         .execute(&pool)
         .await
         .unwrap();
 
-    let successful_cleanup = loader.load_all(temp.path()).await.unwrap();
-    assert!(!successful_cleanup
-        .warnings
-        .iter()
-        .any(|warning| warning.contains("Failed to atomically clean up stale cache owners")));
+    loader.load_all(temp.path()).await.unwrap();
     assert!(ActionRepository::find_by_ref(&pool, &action_ref)
         .await
         .unwrap()
@@ -2713,12 +2671,12 @@ async fn stale_owner_cleanup_rolls_back_when_cache_tombstoning_fails() {
             .await
             .unwrap()
             .unwrap();
-        assert!(namespace.tombstoned_at.is_some());
+        assert!(namespace.tombstoned_at.is_none());
+        assert!(namespace.retired_at.is_none());
     }
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn managed_cache_definition_identity_is_immutable() {
     let pool = helpers::create_test_pool().await.unwrap();
     let pack = PackFixture::new_unique("immutable_cache")
@@ -2770,7 +2728,6 @@ async fn managed_cache_definition_identity_is_immutable() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn api_namespace_create_still_conflicts_while_tombstone_drains() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = format!("api_conflict_{}", unique_test_id());
@@ -2787,7 +2744,6 @@ async fn api_namespace_create_still_conflicts_while_tombstone_drains() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn direct_action_and_sensor_deletion_tombstones_owned_caches() {
     let pool = helpers::create_test_pool().await.unwrap();
     create_core_native_runtime(&pool).await;
@@ -2880,7 +2836,6 @@ async fn direct_action_and_sensor_deletion_tombstones_owned_caches() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn pack_deletion_tombstones_owned_caches_without_synchronous_drain() {
     let pool = helpers::create_test_pool().await.unwrap();
     create_core_native_runtime(&pool).await;

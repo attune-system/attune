@@ -15,7 +15,6 @@ use axum::{body::Bytes, http::StatusCode};
 use helpers::TestContext;
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn api_deletion_enqueues_object_without_deleting_it_on_request_path() {
     let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
     let identity_id: i64 = sqlx::query_scalar("SELECT id FROM identity ORDER BY id DESC LIMIT 1")

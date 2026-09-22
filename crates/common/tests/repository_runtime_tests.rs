@@ -122,7 +122,6 @@ async fn setup_db() -> attune_common::test_database::TestDatabase {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_runtime() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("create_runtime");
@@ -145,7 +144,6 @@ async fn test_create_runtime() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_runtime_minimal() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("create_runtime_minimal");
@@ -164,7 +162,6 @@ async fn test_create_runtime_minimal() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_runtime_by_id() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("find_by_id");
@@ -184,7 +181,6 @@ async fn test_find_runtime_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_runtime_by_id_not_found() {
     let pool = setup_db().await;
 
@@ -196,7 +192,6 @@ async fn test_find_runtime_by_id_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_runtime_by_ref() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("find_by_ref");
@@ -216,7 +211,6 @@ async fn test_find_runtime_by_ref() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_runtime_by_ref_not_found() {
     let pool = setup_db().await;
 
@@ -228,7 +222,6 @@ async fn test_find_runtime_by_ref_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_runtimes() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("list_runtimes");
@@ -253,7 +246,6 @@ async fn test_list_runtimes() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_runtime() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("update_runtime");
@@ -289,7 +281,6 @@ async fn test_update_runtime() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_runtime_partial() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("update_partial");
@@ -322,7 +313,6 @@ async fn test_update_runtime_partial() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_runtime_empty() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("update_empty");
@@ -345,7 +335,6 @@ async fn test_update_runtime_empty() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_runtime() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("delete_runtime");
@@ -369,7 +358,6 @@ async fn test_delete_runtime() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_runtime_not_found() {
     let pool = setup_db().await;
 
@@ -395,7 +383,6 @@ async fn test_delete_runtime_not_found() {
 // }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_pack() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("find_by_pack");
@@ -457,7 +444,6 @@ async fn test_find_by_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_pack_empty() {
     let pool = setup_db().await;
 
@@ -469,7 +455,6 @@ async fn test_find_by_pack_empty() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_runtime_created_successfully() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("created_test");
@@ -492,7 +477,6 @@ async fn test_runtime_created_successfully() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_duplicate_ref_fails() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("duplicate_ref");
@@ -508,7 +492,6 @@ async fn test_duplicate_ref_fails() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_json_fields() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("json_fields");
@@ -527,7 +510,6 @@ async fn test_json_fields() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_empty_json_distributions() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("empty_json");
@@ -544,7 +526,6 @@ async fn test_empty_json_distributions() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_ordering() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("list_ordering");
@@ -587,7 +568,6 @@ async fn test_list_ordering() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_timestamps() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("timestamps");
@@ -607,7 +587,6 @@ async fn test_timestamps() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_changes_timestamp() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("timestamp_update");
@@ -634,7 +613,6 @@ async fn test_update_changes_timestamp() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_pack_ref_without_pack_id() {
     let pool = setup_db().await;
     let fixture = RuntimeFixture::new("pack_ref_only");

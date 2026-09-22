@@ -54,7 +54,6 @@ async fn pending_version(
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn grant_creation_lock_and_completion_are_transactional_and_idempotent() {
     let database = create_test_pool().await.expect("test database");
     let pool = database.pool();
@@ -142,7 +141,6 @@ async fn grant_creation_lock_and_completion_are_transactional_and_idempotent() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn issued_grant_protects_object_and_pending_artifact_cleanup_until_settled() {
     let database = create_test_pool().await.expect("test database");
     let pool = database.pool();
@@ -286,7 +284,6 @@ async fn issued_grant_protects_object_and_pending_artifact_cleanup_until_settled
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn grants_expire_after_the_settlement_window() {
     let database = create_test_pool().await.expect("test database");
     let pool = database.pool();
@@ -329,7 +326,6 @@ async fn grants_expire_after_the_settlement_window() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn settled_grant_can_be_renewed_without_replacing_its_identity() {
     let database = create_test_pool().await.expect("test database");
     let pool = database.pool();
@@ -386,7 +382,6 @@ async fn settled_grant_can_be_renewed_without_replacing_its_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn expired_url_cannot_be_renewed_during_its_settlement_window() {
     let database = create_test_pool().await.expect("test database");
     let pool = database.pool();

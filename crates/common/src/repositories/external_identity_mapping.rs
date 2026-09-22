@@ -4,7 +4,7 @@ use crate::models::identity::ExternalIdentityMapping;
 use crate::models::Id;
 use crate::{Error, Result};
 
-pub const SELECT_COLUMNS: &str = "id, integration_identity, mapped_identity, provider, tenant, external_subject, created_by, created, updated";
+pub const SELECT_COLUMNS: &str = "id, integration_identity, mapped_identity, provider, tenant, subject_kind, external_subject, created_by, created, updated";
 
 pub struct ExternalIdentityMappingRepository;
 
@@ -27,6 +27,7 @@ struct ResolvedExternalIdentityRow {
     mapped_identity: Id,
     provider: String,
     tenant: String,
+    subject_kind: String,
     external_subject: String,
     created_by: Option<Id>,
     mapping_created: chrono::DateTime<chrono::Utc>,
@@ -39,6 +40,7 @@ pub struct CreateExternalIdentityMappingInput {
     pub mapped_identity: Id,
     pub provider: String,
     pub tenant: String,
+    pub subject_kind: String,
     pub external_subject: String,
     pub created_by: Option<Id>,
 }
@@ -48,6 +50,7 @@ pub struct UpdateExternalIdentityMappingInput {
     pub mapped_identity: Id,
     pub provider: String,
     pub tenant: String,
+    pub subject_kind: String,
     pub external_subject: String,
 }
 
@@ -55,6 +58,7 @@ pub struct UpdateExternalIdentityMappingInput {
 struct NormalizedExternalIdentityKey {
     provider: String,
     tenant: String,
+    subject_kind: String,
     external_subject: String,
 }
 
@@ -67,16 +71,22 @@ impl ExternalIdentityMappingRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let key = normalize_key(&input.provider, &input.tenant, &input.external_subject)?;
+        let key = normalize_key(
+            &input.provider,
+            &input.tenant,
+            &input.subject_kind,
+            &input.external_subject,
+        )?;
         sqlx::query_as::<_, ExternalIdentityMapping>(&format!(
             "INSERT INTO external_identity_mapping \
-             (integration_identity, mapped_identity, provider, tenant, external_subject, created_by) \
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING {SELECT_COLUMNS}"
+             (integration_identity, mapped_identity, provider, tenant, subject_kind, external_subject, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {SELECT_COLUMNS}"
         ))
         .bind(integration_identity)
         .bind(input.mapped_identity)
         .bind(key.provider)
         .bind(key.tenant)
+        .bind(key.subject_kind)
         .bind(key.external_subject)
         .bind(input.created_by)
         .fetch_one(executor)
@@ -166,10 +176,15 @@ impl ExternalIdentityMappingRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let key = normalize_key(&input.provider, &input.tenant, &input.external_subject)?;
+        let key = normalize_key(
+            &input.provider,
+            &input.tenant,
+            &input.subject_kind,
+            &input.external_subject,
+        )?;
         sqlx::query_as::<_, ExternalIdentityMapping>(&format!(
             "UPDATE external_identity_mapping SET mapped_identity = $3, provider = $4, \
-             tenant = $5, external_subject = $6, updated = NOW() \
+             tenant = $5, subject_kind = $6, external_subject = $7, updated = NOW() \
              WHERE integration_identity = $1 AND id = $2 RETURNING {SELECT_COLUMNS}"
         ))
         .bind(integration_identity)
@@ -177,6 +192,7 @@ impl ExternalIdentityMappingRepository {
         .bind(input.mapped_identity)
         .bind(key.provider)
         .bind(key.tenant)
+        .bind(key.subject_kind)
         .bind(key.external_subject)
         .fetch_one(executor)
         .await
@@ -212,23 +228,26 @@ impl ExternalIdentityMappingRepository {
         integration_identity: Id,
         provider: &str,
         tenant: &str,
+        subject_kind: &str,
         external_subject: &str,
     ) -> Result<Option<MappedExternalIdentity>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let key = normalize_key(provider, tenant, external_subject)?;
+        let key = normalize_key(provider, tenant, subject_kind, external_subject)?;
         sqlx::query_as::<_, MappedExternalIdentity>(
             "SELECT i.id, i.login \
              FROM external_identity_mapping m \
              JOIN identity i ON i.id = m.mapped_identity \
              WHERE m.integration_identity = $1 AND m.provider = $2 \
-               AND m.tenant = $3 AND m.external_subject = $4 AND NOT i.frozen \
+               AND m.tenant = $3 AND m.subject_kind = $4 \
+               AND m.external_subject = $5 AND NOT i.frozen \
               FOR SHARE OF m, i",
         )
         .bind(integration_identity)
         .bind(key.provider)
         .bind(key.tenant)
+        .bind(key.subject_kind)
         .bind(key.external_subject)
         .fetch_optional(executor)
         .await
@@ -242,23 +261,26 @@ impl ExternalIdentityMappingRepository {
         integration_identity: Id,
         provider: &str,
         tenant: &str,
+        subject_kind: &str,
         external_subject: &str,
     ) -> Result<Option<ResolvedExternalIdentity>> {
-        let key = normalize_key(provider, tenant, external_subject)?;
+        let key = normalize_key(provider, tenant, subject_kind, external_subject)?;
         let row = sqlx::query_as::<_, ResolvedExternalIdentityRow>(
             "SELECT m.id AS mapping_id, m.integration_identity, m.mapped_identity, \
-                    m.provider, m.tenant, m.external_subject, m.created_by, \
+                    m.provider, m.tenant, m.subject_kind, m.external_subject, m.created_by, \
                     m.created AS mapping_created, m.updated AS mapping_updated, \
                      i.login AS identity_login \
              FROM external_identity_mapping m \
              JOIN identity i ON i.id = m.mapped_identity \
              WHERE m.integration_identity = $1 AND m.provider = $2 \
-               AND m.tenant = $3 AND m.external_subject = $4 AND NOT i.frozen \
+               AND m.tenant = $3 AND m.subject_kind = $4 \
+               AND m.external_subject = $5 AND NOT i.frozen \
              FOR SHARE OF m, i",
         )
         .bind(integration_identity)
         .bind(key.provider)
         .bind(key.tenant)
+        .bind(key.subject_kind)
         .bind(key.external_subject)
         .fetch_optional(conn)
         .await?;
@@ -270,6 +292,7 @@ impl ExternalIdentityMappingRepository {
                 mapped_identity: row.mapped_identity,
                 provider: row.provider,
                 tenant: row.tenant,
+                subject_kind: row.subject_kind,
                 external_subject: row.external_subject,
                 created_by: row.created_by,
                 created: row.mapping_created,
@@ -286,27 +309,13 @@ impl ExternalIdentityMappingRepository {
 fn normalize_key(
     provider: &str,
     tenant: &str,
+    subject_kind: &str,
     external_subject: &str,
 ) -> Result<NormalizedExternalIdentityKey> {
-    let provider = provider.trim().to_ascii_lowercase();
+    let provider = normalize_token("provider", provider)?;
     let tenant = tenant.trim().to_string();
+    let subject_kind = normalize_token("subject_kind", subject_kind)?;
     let external_subject = external_subject.trim().to_string();
-
-    let mut provider_chars = provider.chars();
-    if provider.len() > 64
-        || !provider_chars
-            .next()
-            .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
-        || !provider_chars.all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || matches!(character, '.' | '_' | '-')
-        })
-    {
-        return Err(Error::validation(
-            "provider must be a lowercase token of at most 64 characters",
-        ));
-    }
 
     validate_external_component("tenant", &tenant)?;
     validate_external_component("external_subject", &external_subject)?;
@@ -314,8 +323,29 @@ fn normalize_key(
     Ok(NormalizedExternalIdentityKey {
         provider,
         tenant,
+        subject_kind,
         external_subject,
     })
+}
+
+fn normalize_token(name: &str, value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    let mut chars = value.chars();
+    if value.len() > 64
+        || !chars
+            .next()
+            .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+        || !chars.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '.' | '_' | '-')
+        })
+    {
+        return Err(Error::validation(format!(
+            "{name} must be a lowercase token of at most 64 characters"
+        )));
+    }
+    Ok(value)
 }
 
 fn validate_external_component(name: &str, value: &str) -> Result<()> {
@@ -325,4 +355,28 @@ fn validate_external_component(name: &str, value: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_provider_and_subject_kind_tokens() {
+        let key = normalize_key(" GitHub ", " Acme ", " Service_Account ", " User-42 ")
+            .expect("valid external identity key");
+
+        assert_eq!(key.provider, "github");
+        assert_eq!(key.tenant, "Acme");
+        assert_eq!(key.subject_kind, "service_account");
+        assert_eq!(key.external_subject, "User-42");
+    }
+
+    #[test]
+    fn rejects_invalid_subject_kind_token() {
+        let error = normalize_key("github", "Acme", "service account", "User-42")
+            .expect_err("subject kind containing spaces must fail");
+
+        assert!(matches!(error, Error::Validation(_)));
+    }
 }

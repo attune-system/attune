@@ -96,6 +96,7 @@ attune/
   - `packs_data` for packs
   - `runtime_envs` for generated runtime environments
   - `artifacts_data` for file-backed artifacts
+  - `blobs_data` for immutable object bodies and log segments
   - `agent_bin` for injected musl-linked binaries
 - Packs are **mounted/shared**, not copied into service images.
 - Pack updates are typically applied with a **service restart**, not an image rebuild.
@@ -132,7 +133,7 @@ For more detail, use:
 
 ### Hypertables and History (Canonical)
 - `event`, `enforcement`, and `execution` are Timescale hypertables.
-- Because hypertables cannot be FK targets, references such as `execution.parent`, `execution.enforcement`, `workflow_execution.execution`, and `inquiry.execution` are plain `BIGINT` columns.
+- Because hypertables cannot be FK targets, references such as `execution.parent`, `execution.enforcement`, `workflow_execution.execution`, and `inquiry.created_by_execution` are plain `BIGINT` columns.
 - `event` is immutable after insert.
 - `enforcement` has a narrow lifecycle and no separate history table.
 - `execution` is mutable and has an `execution_history` hypertable; `worker` also has history tracking.
@@ -243,9 +244,14 @@ make db-migrate
 ```
 
 ### Testing / Validation
-- Database-backed Rust tests use run-owned, migration-hashed template databases with one physical clone per test; see `docs/testing/schema-per-test.md`.
-- Use `make db-test-setup` before integration tests.
-- Use `cargo test -- --nocapture --test-threads=1` for detailed failures.
+- Read `docs/testing/running-tests.md` before choosing a test runner or provisioning dependencies.
+- Database-only Rust tests run in normal Cargo suites and require PostgreSQL/TimescaleDB. Reserve `--ignored` for tests with explicit external-service or stress-test prerequisites.
+- Prefer `scripts/run-rust-integration-tests.sh` for Docker-owned Rust tests and `scripts/run-integration-tests.sh` for full-stack E2E. These runners own setup and teardown and avoid fixed host ports.
+- For host-run database tests, provision disposable PostgreSQL/TimescaleDB and run `make db-test-setup` with `TEST_DB_ADMIN_URL` and `TEST_DB_URL`. Host setup requires `psql` and `sqlx`; direct Cargo runs use `ATTUNE__DATABASE__URL`.
+- Database fixtures use run-owned, migration-hashed templates and physical clones by default. Approved read-only and rollback-isolated tests share a runner-owned database; see `docs/testing/schema-per-test.md`.
+- Give each direct Cargo invocation a unique `ATTUNE_TEST_RUN_ID`: 1–20 lowercase letters/digits with optional non-leading hyphens. Docker runners generate run identities.
+- Database-backed test runs use at least four threads. Use `cargo test -- --nocapture --test-threads=4` for detailed failures. Docker test executables run sequentially.
+- MinIO log tests require versioned object storage as well as PostgreSQL. Use `make runtime-log-test-storage-up`, `make test-runtime-log-correctness`, and `make runtime-log-test-storage-down`; read `docs/deployment/runtime-log-verification.md` for ownership, credentials, and cleanup. The default Docker database/broker lane excludes external-service tests.
 - Full validation can be slow: allow at least 40 minutes for `cargo test`, up
   to 2 hours for `make test-integration`, and up to 2 hours for `make e2e-test`.
   Set the command timeout before starting so a passing run is not terminated

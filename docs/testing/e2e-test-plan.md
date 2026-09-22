@@ -1568,7 +1568,7 @@ jobs:
           --health-retries 5
       
       rabbitmq:
-        image: rabbitmq:3-management
+        image: rabbitmq:4.3.6-management-alpine
         options: >-
           --health-cmd "rabbitmq-diagnostics -q ping"
           --health-interval 10s

@@ -1676,7 +1676,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn supervisor_reconciles_abandoned_and_missing_objects_with_a_delete_delay() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).unwrap();

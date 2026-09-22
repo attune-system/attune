@@ -29,8 +29,8 @@ fn is_abandoned_pack_staging(file_name: &str, age: Option<std::time::Duration>) 
 }
 
 use attune_api::{
-    inquiry_timeout, pack_release_upgrade::upgrade_legacy_pack_releases, postgres_listener,
-    AppState, Server,
+    inquiry_response::start_inquiry_callback_delivery_monitor, inquiry_timeout,
+    pack_release_upgrade::upgrade_legacy_pack_releases, postgres_listener, AppState, Server,
 };
 
 #[derive(Parser, Debug)]
@@ -533,6 +533,17 @@ async fn main() -> Result<()> {
     });
     info!("Inquiry timeout monitor started");
 
+    let callback_delivery_state = state.clone();
+    let callback_delivery_shutdown = state.execution_log_streams.shutdown_token();
+    let callback_delivery_monitor = tokio::spawn(async move {
+        start_inquiry_callback_delivery_monitor(
+            callback_delivery_state,
+            callback_delivery_shutdown,
+        )
+        .await;
+    });
+    info!("Inquiry callback delivery monitor started");
+
     // Create and start server
     let server = Server::new(state.clone());
 
@@ -545,9 +556,14 @@ async fn main() -> Result<()> {
         shutdown_streams.begin_shutdown();
     });
 
-    if let Err(e) = server.run().await {
-        tracing::error!("Server error: {}", e);
-        return Err(e);
+    let server_result = server.run().await;
+    state.execution_log_streams.begin_shutdown();
+    if let Err(error) = callback_delivery_monitor.await {
+        tracing::error!(%error, "Inquiry callback delivery monitor failed");
+    }
+    if let Err(error) = server_result {
+        tracing::error!(%error, "Server error");
+        return Err(error);
     }
 
     info!("Shutting down Attune API Service");

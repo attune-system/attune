@@ -897,7 +897,6 @@ async fn test_update_status_lifecycle(pool: sqlx::PgPool) {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn worker_crud_and_lookup_scenario() {
     let database = setup_db().await;
     let pool = database.pool().clone();
@@ -916,7 +915,6 @@ async fn worker_crud_and_lookup_scenario() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn worker_queries_and_value_encoding_scenario() {
     let database = setup_db().await;
     let pool = database.pool().clone();
@@ -940,7 +938,6 @@ async fn worker_queries_and_value_encoding_scenario() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn worker_update_scenario() {
     let database = setup_db().await;
     let pool = database.pool().clone();
@@ -952,7 +949,6 @@ async fn worker_update_scenario() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn worker_timestamp_and_heartbeat_scenario() {
     let database = setup_db().await;
     let pool = database.pool().clone();

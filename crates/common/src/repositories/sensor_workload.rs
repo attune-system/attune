@@ -11,6 +11,10 @@ use crate::{
 };
 
 const WORKLOAD_SELECT_COLUMNS: &str = "id, sensor, workload_key, pack_release, pack_release_digest, executable_snapshot, created, updated";
+const WORKLOAD_SELECT_COLUMNS_QUALIFIED: &str =
+    "workload.id, workload.sensor, workload.workload_key, \
+    workload.pack_release, workload.pack_release_digest, workload.executable_snapshot, \
+    workload.created, workload.updated";
 const ASSIGNMENT_SELECT_COLUMNS: &str = "workload, worker, worker_instance, generation, \
      lease_expires_at, assigned_at, renewed_at, created, updated";
 
@@ -280,6 +284,39 @@ impl SensorWorkloadRepository {
         .await?)
     }
 
+    pub async fn is_current_fence_for_sensor_scope(
+        pool: &PgPool,
+        fence: SensorWorkloadFence,
+        sensor_ref: &str,
+        pack_ref: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                 SELECT 1 \
+                 FROM sensor_workload_assignment AS assignment \
+                 JOIN sensor_workload AS workload ON workload.id = assignment.workload \
+                 JOIN sensor ON sensor.id = workload.sensor \
+                 WHERE assignment.workload = $1 \
+                   AND assignment.worker = $2 \
+                   AND assignment.worker_instance = $3 \
+                   AND assignment.generation = $4 \
+                   AND assignment.lease_expires_at > clock_timestamp() \
+                   AND sensor.ref = $5 \
+                   AND sensor.pack_ref = $6 \
+                   AND sensor.effective_enabled \
+                   AND sensor.retired_at IS NULL \
+             )",
+        )
+        .bind(fence.workload_id)
+        .bind(fence.worker_id)
+        .bind(fence.worker_instance)
+        .bind(fence.generation)
+        .bind(sensor_ref)
+        .bind(pack_ref)
+        .fetch_one(pool)
+        .await?)
+    }
+
     pub async fn pack_release_for_current_fence(
         pool: &PgPool,
         fence: SensorWorkloadFence,
@@ -308,8 +345,18 @@ impl SensorWorkloadRepository {
         sensor_id: Id,
         fence: SensorWorkloadFence,
     ) -> Result<bool> {
-        let current = sqlx::query_scalar::<_, bool>(
-            "SELECT TRUE \
+        Ok(Self::lock_current_fence_workload(tx, sensor_id, fence)
+            .await?
+            .is_some())
+    }
+
+    pub async fn lock_current_fence_workload(
+        tx: &mut Transaction<'_, Postgres>,
+        sensor_id: Id,
+        fence: SensorWorkloadFence,
+    ) -> Result<Option<SensorWorkload>> {
+        sqlx::query_as::<_, SensorWorkload>(&format!(
+            "SELECT {WORKLOAD_SELECT_COLUMNS_QUALIFIED} \
              FROM sensor_workload_assignment AS assignment \
              JOIN sensor_workload AS workload ON workload.id = assignment.workload \
              WHERE assignment.workload = $1 \
@@ -318,17 +365,16 @@ impl SensorWorkloadRepository {
                AND assignment.worker_instance = $4 \
                AND assignment.generation = $5 \
                AND assignment.lease_expires_at > clock_timestamp() \
-             FOR NO KEY UPDATE OF assignment",
-        )
+              FOR NO KEY UPDATE OF assignment"
+        ))
         .bind(fence.workload_id)
         .bind(sensor_id)
         .bind(fence.worker_id)
         .bind(fence.worker_instance)
         .bind(fence.generation)
         .fetch_optional(&mut **tx)
-        .await?
-        .unwrap_or(false);
-        Ok(current)
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn rule_is_member(

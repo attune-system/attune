@@ -344,7 +344,7 @@ retention seeding.
 
 ### Docker Compose
 
-`docker-compose.yaml` includes a `supervisor` service using `attune-supervisor`. It mounts the same Docker config and artifact volume as the rest of the stack:
+`docker-compose.yaml` includes a `supervisor` service using `attune-supervisor`. It mounts the same Docker config, artifact volume, and blob volume as the API:
 
 ```bash
 docker compose up -d supervisor

@@ -17,6 +17,25 @@ beforeEach(() => {
 });
 
 describe("KeyCreateModal", () => {
+  it("places scope and owner before the local reference", async () => {
+    const user = userEvent.setup();
+    render(<KeyCreateModal onClose={vi.fn()} />);
+
+    const scope = screen.getByLabelText(/^Scope/);
+    const localReference = screen.getByLabelText(/^Local reference/);
+    expect(
+      scope.compareDocumentPosition(localReference) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    await user.selectOptions(scope, "pack");
+    const owner = screen.getByLabelText("Owner Identifier");
+    expect(
+      owner.compareDocumentPosition(localReference) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("creates a pack-scoped encrypted key with an object value", async () => {
     const user = userEvent.setup();
     render(<KeyCreateModal onClose={vi.fn()} />);

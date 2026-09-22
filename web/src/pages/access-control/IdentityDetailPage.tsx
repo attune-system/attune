@@ -34,6 +34,7 @@ import {
   type IntegrationToken,
 } from "@/hooks/usePermissions";
 import { GrantsView } from "@/components/access-control/GrantsView";
+import { ExternalIdentityMappingsSection } from "@/components/access-control/ExternalIdentityMappingsSection";
 import {
   type ParsedGrant,
   parseGrants,
@@ -1223,6 +1224,8 @@ export default function IdentityDetailPage() {
               </div>
             )}
           </div>
+
+          <ExternalIdentityMappingsSection integrationIdentity={identity.id} />
 
           {/* Attributes Section */}
           <div className="bg-white rounded-lg shadow p-6">

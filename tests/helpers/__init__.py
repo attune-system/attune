@@ -26,6 +26,7 @@ from .fixtures import (
     timestamp_now,
     unique_ref,
 )
+from .inquiries import InquiryRun, start_inquiry_workflow, workflow_task_children
 from .polling import (
     wait_for_condition,
     wait_for_enforcement_count,
@@ -49,6 +50,10 @@ __all__ = [
     "wait_for_execution_status",
     "wait_for_inquiry_count",
     "wait_for_inquiry_status",
+    # Inquiry workflow helpers
+    "InquiryRun",
+    "start_inquiry_workflow",
+    "workflow_task_children",
     # Fixture creators
     "create_test_pack",
     "create_interval_timer",

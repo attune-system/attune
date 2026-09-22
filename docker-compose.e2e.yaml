@@ -24,7 +24,7 @@
 # API service on the attune-network.
 #
 # The rust-int-tests service compiles the workspace test binaries and runs
-# them with --ignored to execute database-dependent integration tests.
+  # them normally against the owned integration database.
 # The runner supplies a unique --project-name. Reset base fixed container names
 # and host ports so two E2E projects cannot claim the same Docker resources.
 services:
@@ -38,6 +38,8 @@ services:
   init-pack-binaries:
     container_name: !reset null
   init-packs:
+    container_name: !reset null
+  pack-release-upgrade:
     container_name: !reset null
   init-agent:
     container_name: !reset null
@@ -145,7 +147,7 @@ services:
       DATABASE_URL: postgresql://attune:attune@postgres:5432/attune_test
       ATTUNE_TEST_RUN_ID: ${ATTUNE_TEST_RUN_ID:?run-rust-integration-tests.sh must set ATTUNE_TEST_RUN_ID}
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
-      TEST_THREADS: ${ATTUNE_RUST_TEST_THREADS:-1}
+      TEST_THREADS: ${ATTUNE_RUST_TEST_THREADS:-4}
       ATTUNE_RUST_INCLUDE_EXTERNAL: ${ATTUNE_RUST_INCLUDE_EXTERNAL:-0}
       ATTUNE_TEST_S3_ENDPOINT: ${ATTUNE_TEST_S3_ENDPOINT:-}
       ATTUNE_TEST_S3_BUCKET: ${ATTUNE_TEST_S3_BUCKET:-}

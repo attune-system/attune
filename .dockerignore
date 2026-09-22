@@ -66,6 +66,7 @@ scripts/
 !scripts/load_core_pack.py
 !scripts/bootstrap_core_pack.py
 !scripts/seed-standard-pack-index.sh
+!scripts/check-db-test-threads.sh
 
 # Cargo lock (workspace handles this)
 # Uncomment if you want deterministic builds:

@@ -15,10 +15,12 @@
         e2e-test-cache-load test-integration-executor runtime-log-test-storage-up \
         runtime-log-test-storage-clean runtime-log-test-storage-down \
         test-runtime-log-correctness test-runtime-log-load test-runtime-log-harness-safety \
-        test-runtime-log-rwx-static
+        test-runtime-log-rwx-static check-db-test-threads
 
 TEST_DB_ADMIN_URL ?= postgresql://attune:attune@localhost:5432/postgres
 TEST_DB_URL ?= postgresql://attune:attune@localhost:5432/attune_test
+TEST_THREADS ?= 4
+DB_TEST_THREADS ?= $(TEST_THREADS)
 RUNTIME_LOG_MINIO_IMAGE ?= quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
 RUNTIME_LOG_MC_IMAGE ?= quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
 RUNTIME_LOG_HARNESS_ID ?= $(shell printf '%s' '$(CURDIR)-$(shell id -u)' | sha256sum | cut -c1-12)
@@ -153,16 +155,34 @@ clean:
 
 # Testing
 test:
-	cargo test
+	cargo test -- --test-threads=$(TEST_THREADS)
 
 test-common:
-	cargo test -p attune-common
+	cargo test -p attune-common -- --test-threads=$(TEST_THREADS)
 
 test-api:
-	cargo test -p attune-api
+	cargo test -p attune-api -- --test-threads=$(TEST_THREADS)
 
 test-verbose:
-	cargo test -- --nocapture --test-threads=1
+	cargo test -- --nocapture --test-threads=$(TEST_THREADS)
+
+DB_TEST_TARGETS := test test-common test-api test-verbose \
+	test-integration test-integration-api test-integration-common \
+	test-integration-executor test-integration-supervisor \
+	test-runtime-log-correctness test-runtime-log-load
+
+$(DB_TEST_TARGETS): export ATTUNE__ENVIRONMENT := test
+$(DB_TEST_TARGETS): export DATABASE_URL := $(TEST_DB_URL)
+$(DB_TEST_TARGETS): export ATTUNE__DATABASE__URL := $(TEST_DB_URL)
+$(DB_TEST_TARGETS): check-db-test-threads
+
+check-db-test-threads:
+	@scripts/check-db-test-threads.sh "$(DB_TEST_THREADS)"
+
+test: db-test-setup
+test-common: db-test-setup
+test-api: db-test-setup
+test-verbose: db-test-setup
 
 test-integration: db-test-setup test-integration-api test-integration-common test-integration-executor test-integration-supervisor
 	@echo "Integration tests complete"
@@ -170,15 +190,15 @@ test-integration: db-test-setup test-integration-api test-integration-common tes
 test-integration-api: export ATTUNE__DATABASE__URL := $(TEST_DB_URL)
 test-integration-api:
 	@echo "Running API integration tests..."
-	cargo test -p attune-api --test cache_api_tests -- --ignored --test-threads=1
-	cargo test -p attune-api --test agent_tests -- --ignored --test-threads=1
-	cargo test -p attune-api --test execution_token_permissions_e2e -- --ignored --test-threads=1
-	cargo test -p attune-api --test inquiry_authz_tests -- --ignored --test-threads=1
-	cargo test -p attune-api --test pack_registry_tests -- --ignored --test-threads=1
-	cargo test -p attune-api --test pack_workflow_tests -- --ignored --test-threads=1
-	cargo test -p attune-api --test permissions_api_tests -- --ignored --test-threads=1
-	cargo test -p attune-api --test rbac_scoped_resources_api_tests -- --ignored --test-threads=1
-	cargo test -p attune-api --test workflow_tests -- --ignored --test-threads=1
+	cargo test -p attune-api --test cache_api_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-api --test agent_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-api --test execution_token_permissions_e2e -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-api --test inquiry_authz_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-api --test pack_registry_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-api --test pack_workflow_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-api --test permissions_api_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-api --test rbac_scoped_resources_api_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-api --test workflow_tests -- --test-threads=$(DB_TEST_THREADS)
 	$(MAKE) test-runtime-log-correctness
 	@echo "API integration tests complete"
 
@@ -193,15 +213,20 @@ runtime-log-test-storage-down:
 
 test-runtime-log-correctness:
 	@set -eu; trap '$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh clean-prefix' EXIT; \
+		$(RUNTIME_LOG_TEST_ENV) cargo test -p attune-common --lib \
+			blob_store::tests::s3_direct_upload_authorization_puts_and_verifies_exact_bytes \
+			-- --ignored --exact --test-threads=$(DB_TEST_THREADS); \
 		$(RUNTIME_LOG_TEST_ENV) cargo test -p attune-api --test runtime_log_replica_tests \
-			-- --ignored --test-threads=1
+			-- --ignored --test-threads=$(DB_TEST_THREADS) \
+			--skip bounded_runtime_log_load_report --skip volume_transport_child_holds_lock
 
 test-runtime-log-load:
 	@set -eu; trap '$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh clean-prefix' EXIT; \
 		$(RUNTIME_LOG_TEST_ENV) ATTUNE_RUN_LOG_STREAM_LOAD=1 \
 			ATTUNE_LOG_LOAD_STREAMS=$(ATTUNE_LOG_LOAD_STREAMS) \
 			cargo test -p attune-api --test runtime_log_replica_tests \
-			bounded_runtime_log_load_report -- --ignored --exact --nocapture
+			bounded_runtime_log_load_report -- --ignored --exact --nocapture \
+			--test-threads=$(DB_TEST_THREADS)
 
 test-runtime-log-rwx-static:
 	bash -n scripts/runtime-log-rwx-conformance.sh
@@ -214,39 +239,39 @@ test-runtime-log-harness-safety:
 
 test-integration-supervisor:
 	@echo "Running supervisor integration tests..."
-	cargo test -p attune-supervisor --bin attune-supervisor -- --ignored --test-threads=1
+	cargo test -p attune-supervisor --bin attune-supervisor -- --test-threads=$(DB_TEST_THREADS)
 	@echo "Supervisor integration tests complete"
 
 test-integration-executor:
 	@echo "Running executor integration tests..."
-	cargo test -p attune-executor --lib workflow::log::tests -- --ignored --test-threads=1
+	cargo test -p attune-executor --lib workflow::log::tests -- --test-threads=$(DB_TEST_THREADS)
 	@echo "Executor integration tests complete"
 
 test-integration-common:
 	@echo "Running common integration tests..."
-	cargo test -p attune-common --test action_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test cache_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test enforcement_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test event_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test execution_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test identity_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test inquiry_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test key_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test maintenance_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test migration_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test notification_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test pack_environment_coordination_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test pack_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test permission_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test queue_stats_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test repository_artifact_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test repository_runtime_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test repository_worker_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test rule_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test sensor_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test trigger_repository_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test webhook_tests -- --ignored --test-threads=1
-	cargo test -p attune-common --test work_queue_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test action_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test cache_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test enforcement_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test event_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test execution_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test identity_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test inquiry_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test key_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test maintenance_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test migration_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test notification_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test pack_environment_coordination_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test pack_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test permission_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test queue_stats_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test repository_artifact_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test repository_runtime_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test repository_worker_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test rule_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test sensor_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test trigger_repository_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test webhook_tests -- --test-threads=$(DB_TEST_THREADS)
+	cargo test -p attune-common --test work_queue_repository_tests -- --test-threads=$(DB_TEST_THREADS)
 	@echo "Common integration tests complete"
 
 test-with-db: test test-integration
@@ -563,10 +588,13 @@ deny:
 	cargo deny --locked check
 	cargo deny --manifest-path crates/core-timer-sensor/Cargo.toml --config deny.toml --locked check
 
-ci-rust:
+ci-rust: db-test-setup
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
-	cargo test --workspace --all-features
+	@set -eu; $(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh up; \
+		trap '$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh down' EXIT; \
+		DATABASE_URL=$(TEST_DB_URL) ATTUNE__DATABASE__URL=$(TEST_DB_URL) \
+			ATTUNE_RUST_TEST_THREADS=$(DB_TEST_THREADS) scripts/run-ci-rust-tests.sh
 	$(MAKE) deny
 
 ci-web-blocking:

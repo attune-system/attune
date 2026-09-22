@@ -324,7 +324,6 @@ async fn release_next_active(
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_fifo_ordering_with_database() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -604,7 +603,6 @@ async fn test_high_concurrency_stress() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_multiple_workers_simulation() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -739,7 +737,6 @@ async fn test_multiple_workers_simulation() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_cross_action_independence() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -916,7 +913,6 @@ async fn test_cross_action_independence() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_cancellation_during_queue() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -1061,7 +1057,6 @@ async fn test_cancellation_during_queue() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_queue_stats_persistence() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -1184,7 +1179,6 @@ async fn test_queue_stats_persistence() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_release_restore_recovers_active_slot_and_next_queue_head() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -1241,7 +1235,6 @@ async fn test_release_restore_recovers_active_slot_and_next_queue_head() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_remove_restore_recovers_queued_execution_position() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();
@@ -1293,7 +1286,6 @@ async fn test_remove_restore_recovers_queued_execution_position() {
 }
 
 #[tokio::test]
-#[ignore] // Requires database
 async fn test_queue_full_rejection() {
     let pool = setup_db().await;
     let timestamp = Utc::now().timestamp();

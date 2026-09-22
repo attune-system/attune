@@ -5,8 +5,13 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
-use attune_common::models::{enums::InquiryStatus, inquiry::Inquiry, Id, JsonDict, JsonSchema};
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use attune_common::models::{
+    enums::InquiryStatus,
+    inquiry::{Inquiry, InquiryResponseOption, InquiryResponseOptionStyle},
+    Id, JsonDict, JsonSchema,
+};
+use attune_common::secret_values::redact_secret_parameters;
+use serde_json::Value as JsonValue;
 
 /// Full inquiry response with all details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -15,11 +20,22 @@ pub struct InquiryResponse {
     #[schema(example = 1)]
     pub id: Id,
 
-    /// Execution ID this inquiry belongs to
+    /// Execution ID that created this inquiry
     #[schema(example = 1)]
-    pub execution: Id,
+    pub created_by_execution: Id,
+
+    pub created_by_action_ref: Option<String>,
+
+    pub created_by_pack_ref: Option<String>,
 
     pub workflow_execution: Option<Id>,
+
+    /// Root execution ID for the containing workflow
+    pub workflow_root_execution: Option<Id>,
+
+    pub workflow_action_ref: Option<String>,
+
+    pub workflow_pack_ref: Option<String>,
 
     pub workflow_task_name: Option<String>,
 
@@ -29,13 +45,20 @@ pub struct InquiryResponse {
     #[schema(example = "Approve deployment to production?")]
     pub prompt: String,
 
-    /// JSON schema for expected response
+    /// Attune flat schema for expected response fields
     #[schema(value_type = Object, nullable = true)]
     pub response_schema: Option<JsonSchema>,
+
+    /// Fixed responses that provider controls may select.
+    pub response_options: Vec<InquiryResponseOption>,
 
     /// Identity ID this inquiry is assigned to
     #[schema(example = 1)]
     pub assigned_to: Option<Id>,
+
+    pub assigned_to_login: Option<String>,
+
+    pub assigned_to_display_name: Option<String>,
 
     /// Current status of the inquiry
     #[schema(example = "pending")]
@@ -50,6 +73,10 @@ pub struct InquiryResponse {
     pub timeout_at: Option<DateTime<Utc>>,
 
     pub responded_by: Option<Id>,
+
+    pub responded_by_login: Option<String>,
+
+    pub responded_by_display_name: Option<String>,
 
     /// When the inquiry was responded to
     #[schema(example = "2024-01-13T10:45:00Z")]
@@ -66,24 +93,42 @@ pub struct InquiryResponse {
 
 impl From<Inquiry> for InquiryResponse {
     fn from(inquiry: Inquiry) -> Self {
+        let response = redact_response(inquiry.response, inquiry.response_schema.as_ref());
         Self {
             id: inquiry.id,
-            execution: inquiry.execution,
+            created_by_execution: inquiry.created_by_execution,
+            created_by_action_ref: None,
+            created_by_pack_ref: None,
             workflow_execution: inquiry.workflow_execution,
+            workflow_root_execution: None,
+            workflow_action_ref: None,
+            workflow_pack_ref: None,
             workflow_task_name: inquiry.workflow_task_name,
             purpose: inquiry.purpose,
             prompt: inquiry.prompt,
             response_schema: inquiry.response_schema,
+            response_options: inquiry.response_options,
             assigned_to: inquiry.assigned_to,
+            assigned_to_login: None,
+            assigned_to_display_name: None,
             status: inquiry.status,
-            response: inquiry.response,
+            response,
             timeout_at: inquiry.timeout_at,
             responded_by: inquiry.responded_by,
+            responded_by_login: None,
+            responded_by_display_name: None,
             responded_at: inquiry.responded_at,
             created: inquiry.created,
             updated: inquiry.updated,
         }
     }
+}
+
+fn redact_response(
+    response: Option<JsonDict>,
+    response_schema: Option<&JsonSchema>,
+) -> Option<JsonDict> {
+    response.map(|value| redact_secret_parameters(value, response_schema).0)
 }
 
 /// Summary inquiry response for list views
@@ -93,9 +138,23 @@ pub struct InquirySummary {
     #[schema(example = 1)]
     pub id: Id,
 
-    /// Execution ID
+    /// Execution ID that created this inquiry
     #[schema(example = 1)]
-    pub execution: Id,
+    pub created_by_execution: Id,
+
+    pub created_by_action_ref: Option<String>,
+
+    pub created_by_pack_ref: Option<String>,
+
+    pub workflow_execution: Option<Id>,
+
+    pub workflow_root_execution: Option<Id>,
+
+    pub workflow_action_ref: Option<String>,
+
+    pub workflow_pack_ref: Option<String>,
+
+    pub workflow_task_name: Option<String>,
 
     /// Prompt text
     #[schema(example = "Approve deployment to production?")]
@@ -104,6 +163,10 @@ pub struct InquirySummary {
     /// Assigned identity ID
     #[schema(example = 1)]
     pub assigned_to: Option<Id>,
+
+    pub assigned_to_login: Option<String>,
+
+    pub assigned_to_display_name: Option<String>,
 
     /// Inquiry status
     #[schema(example = "pending")]
@@ -126,9 +189,18 @@ impl From<Inquiry> for InquirySummary {
     fn from(inquiry: Inquiry) -> Self {
         Self {
             id: inquiry.id,
-            execution: inquiry.execution,
+            created_by_execution: inquiry.created_by_execution,
+            created_by_action_ref: None,
+            created_by_pack_ref: None,
+            workflow_execution: inquiry.workflow_execution,
+            workflow_root_execution: None,
+            workflow_action_ref: None,
+            workflow_pack_ref: None,
+            workflow_task_name: inquiry.workflow_task_name,
             prompt: inquiry.prompt,
             assigned_to: inquiry.assigned_to,
+            assigned_to_login: None,
+            assigned_to_display_name: None,
             status: inquiry.status,
             has_response: inquiry.response.is_some(),
             timeout_at: inquiry.timeout_at,
@@ -151,8 +223,12 @@ pub struct CreateInquiryRequest {
     pub prompt: String,
 
     /// Optional schema for the expected response format (flat format with inline required/secret)
-    #[schema(value_type = Object, example = json!({"approved": {"type": "boolean", "description": "Whether the deployment is approved", "required": true}}))]
+    #[schema(value_type = Option<Object>, example = json!({"approved": {"type": "boolean", "description": "Whether the deployment is approved", "required": true}}))]
     pub response_schema: Option<JsonSchema>,
+
+    /// Fixed response choices rendered by provider actions.
+    #[validate(length(min = 1, max = 25))]
+    pub response_options: Vec<InquiryResponseOption>,
 
     /// Optional identity ID to assign this inquiry to
     #[schema(example = 1)]
@@ -164,14 +240,22 @@ pub struct CreateInquiryRequest {
     pub timeout_seconds: Option<i64>,
 }
 
-/// Creation result containing the inquiry and its provider-neutral response handle.
+/// Provider rendering metadata for one fixed response option.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct InquiryResponseOptionHandle {
+    pub r#ref: String,
+    pub label: String,
+    pub style: InquiryResponseOptionStyle,
+
+    #[schema(example = "attune_irh_REDACTED", min_length = 12, max_length = 96)]
+    pub response_handle: String,
+}
+
+/// Creation result containing the inquiry and one opaque handle per response option.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CreateInquiryResponse {
     pub inquiry: InquiryResponse,
-
-    /// Opaque correlation handle for one-shot external responses.
-    #[schema(example = "attune_irh_REDACTED")]
-    pub response_handle: String,
+    pub response_options: Vec<InquiryResponseOptionHandle>,
 }
 
 /// Request to respond to an inquiry (user-facing endpoint)
@@ -182,38 +266,6 @@ pub struct InquiryRespondRequest {
     pub response: JsonValue,
 }
 
-/// External actor asserted by an authenticated integration adapter.
-#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalActorAssertion {
-    #[validate(length(min = 1, max = 64))]
-    #[schema(min_length = 1, max_length = 64)]
-    pub provider: String,
-
-    #[validate(length(min = 1, max = 255))]
-    #[schema(min_length = 1, max_length = 255)]
-    pub tenant: String,
-
-    #[validate(length(min = 1, max = 255))]
-    #[schema(min_length = 1, max_length = 255)]
-    pub external_subject: String,
-}
-
-/// Provider-neutral one-shot response submitted by an integration adapter.
-#[derive(Clone, Serialize, Deserialize, Validate, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalInquiryRespondRequest {
-    #[validate(length(min = 12, max = 1024))]
-    #[schema(min_length = 12, max_length = 1024)]
-    pub response_handle: String,
-
-    #[validate(nested)]
-    pub external_actor: ExternalActorAssertion,
-
-    #[schema(value_type = Object)]
-    pub response: JsonMap<String, JsonValue>,
-}
-
 /// Query parameters for filtering inquiries
 #[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
 pub struct InquiryQueryParams {
@@ -221,13 +273,21 @@ pub struct InquiryQueryParams {
     #[param(example = "pending")]
     pub status: Option<InquiryStatus>,
 
-    /// Filter by execution ID
+    /// Filter by creator execution ID
     #[param(example = 1)]
-    pub execution: Option<Id>,
+    pub created_by_execution: Option<Id>,
 
     /// Filter by assigned identity
     #[param(example = 1)]
     pub assigned_to: Option<Id>,
+
+    /// Filter by the containing workflow action reference
+    #[param(example = "core.deploy_workflow")]
+    pub workflow_action_ref: Option<String>,
+
+    /// Filter by the containing workflow pack reference
+    #[param(example = "core")]
+    pub workflow_pack_ref: Option<String>,
 
     /// Pagination offset
     #[param(example = 0)]
@@ -236,31 +296,6 @@ pub struct InquiryQueryParams {
     /// Pagination limit
     #[param(example = 50)]
     pub limit: Option<usize>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ExternalInquiryRespondRequest;
-
-    #[test]
-    fn external_response_request_rejects_actor_ids_and_evidence() {
-        for extra_field in ["responded_by", "mapping_id", "credential_id", "evidence"] {
-            let mut value = serde_json::json!({
-                "response_handle": "attune_irh_synthetic",
-                "external_actor": {
-                    "provider": "github",
-                    "tenant": "Acme",
-                    "external_subject": "User-42"
-                },
-                "response": {"approved": true}
-            });
-            value[extra_field] = serde_json::json!(123);
-            assert!(
-                serde_json::from_value::<ExternalInquiryRespondRequest>(value).is_err(),
-                "accepted forbidden request field {extra_field}"
-            );
-        }
-    }
 }
 
 /// Paginated list response
@@ -277,4 +312,48 @@ pub struct ListResponse<T> {
 
     /// Limit used for this page
     pub limit: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InquiryResponse;
+    use attune_common::models::{enums::InquiryStatus, inquiry::Inquiry};
+    use chrono::Utc;
+    use serde_json::json;
+
+    #[test]
+    fn inquiry_response_redacts_secret_schema_fields() {
+        let schema = json!({
+            "decision": {"type": "string"},
+            "note": {"type": "string", "secret": true}
+        });
+
+        let now = Utc::now();
+        let response = InquiryResponse::from(Inquiry {
+            id: 1,
+            created_by_execution: 2,
+            workflow_execution: Some(3),
+            workflow_task_name: Some("approval".to_string()),
+            action_attempt_family: Some(4),
+            purpose: Some("deployment".to_string()),
+            prompt: "Approve deployment?".to_string(),
+            response_schema: Some(schema),
+            response_options: Vec::new(),
+            assigned_to: Some(5),
+            status: InquiryStatus::Responded,
+            response: Some(json!({"decision": "approve", "note": "private reason"})),
+            timeout_at: None,
+            timeout_seconds: None,
+            responded_by: Some(5),
+            external_actor: None,
+            responded_at: Some(now),
+            created: now,
+            updated: now,
+        });
+        let redacted = response.response.unwrap();
+
+        assert_eq!(redacted["decision"], "approve");
+        assert_eq!(redacted["note"]["redacted"], true);
+        assert!(!redacted.to_string().contains("private reason"));
+    }
 }

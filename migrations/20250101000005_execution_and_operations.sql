@@ -156,27 +156,32 @@ COMMENT ON COLUMN execution_secret_value.encryption_key_hash IS 'Hash of the enc
 
 CREATE TABLE inquiry (
     id BIGSERIAL PRIMARY KEY,
-    execution BIGINT NOT NULL,
+    created_by_execution BIGINT NOT NULL,
     prompt TEXT NOT NULL,
     response_schema JSONB,
+    response_options JSONB NOT NULL,
     assigned_to BIGINT REFERENCES identity(id) ON DELETE SET NULL,
     status inquiry_status_enum NOT NULL DEFAULT 'pending',
     response JSONB,
     timeout_at TIMESTAMPTZ,
     responded_at TIMESTAMPTZ,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT inquiry_response_options_array CHECK (
+        jsonb_typeof(response_options) = 'array'
+        AND jsonb_array_length(response_options) BETWEEN 1 AND 25
+    )
 );
 
 -- Indexes
-CREATE UNIQUE INDEX uq_inquiry_execution ON inquiry(execution) WHERE execution IS NOT NULL;
+CREATE UNIQUE INDEX uq_inquiry_created_by_execution ON inquiry(created_by_execution) WHERE created_by_execution IS NOT NULL;
 CREATE INDEX idx_inquiry_assigned_to ON inquiry(assigned_to);
 CREATE INDEX idx_inquiry_status ON inquiry(status);
 CREATE INDEX idx_inquiry_timeout_at ON inquiry(timeout_at) WHERE timeout_at IS NOT NULL;
 CREATE INDEX idx_inquiry_created ON inquiry(created DESC);
 CREATE INDEX idx_inquiry_status_created ON inquiry(status, created DESC);
 CREATE INDEX idx_inquiry_assigned_status ON inquiry(assigned_to, status);
-CREATE INDEX idx_inquiry_execution_status ON inquiry(execution, status);
+CREATE INDEX idx_inquiry_created_by_execution_status ON inquiry(created_by_execution, status);
 CREATE INDEX idx_inquiry_response_gin ON inquiry USING GIN (response);
 
 -- Trigger
@@ -187,7 +192,7 @@ CREATE TRIGGER update_inquiry_updated
 
 -- Comments
 COMMENT ON TABLE inquiry IS 'Inquiries enable human-in-the-loop workflows with async user interactions';
-COMMENT ON COLUMN inquiry.execution IS 'Execution that is waiting on this inquiry';
+COMMENT ON COLUMN inquiry.created_by_execution IS 'Execution that created this inquiry';
 
 ALTER TABLE execution
     ADD CONSTRAINT execution_action_fkey
@@ -210,10 +215,11 @@ ALTER TABLE execution
     FOREIGN KEY (executor) REFERENCES identity(id) ON DELETE SET NULL;
 
 ALTER TABLE inquiry
-    ADD CONSTRAINT inquiry_execution_fkey
-    FOREIGN KEY (execution) REFERENCES execution(id) ON DELETE CASCADE;
+    ADD CONSTRAINT inquiry_created_by_execution_fkey
+    FOREIGN KEY (created_by_execution) REFERENCES execution(id) ON DELETE CASCADE;
 COMMENT ON COLUMN inquiry.prompt IS 'Question or prompt text for the user';
-COMMENT ON COLUMN inquiry.response_schema IS 'JSON schema defining expected response format';
+COMMENT ON COLUMN inquiry.response_schema IS 'Attune flat schema defining expected response fields';
+COMMENT ON COLUMN inquiry.response_options IS 'Immutable provider-neutral response choices';
 COMMENT ON COLUMN inquiry.assigned_to IS 'Identity who should respond to this inquiry';
 COMMENT ON COLUMN inquiry.status IS 'Current inquiry lifecycle status';
 COMMENT ON COLUMN inquiry.response IS 'User response data';
@@ -323,7 +329,7 @@ BEGIN
         'entity_type', 'inquiry',
         'entity_id', NEW.id,
         'id', NEW.id,
-        'execution', NEW.execution,
+        'created_by_execution', NEW.created_by_execution,
         'status', NEW.status,
         'timeout_at', NEW.timeout_at,
         'created', NEW.created
@@ -345,7 +351,7 @@ BEGIN
             'entity_type', 'inquiry',
             'entity_id', NEW.id,
             'id', NEW.id,
-            'execution', NEW.execution,
+            'created_by_execution', NEW.created_by_execution,
             'status', NEW.status,
             'updated', NEW.updated
         );
@@ -367,7 +373,7 @@ BEGIN
             'entity_type', 'inquiry',
             'entity_id', NEW.id,
             'id', NEW.id,
-            'execution', NEW.execution,
+            'created_by_execution', NEW.created_by_execution,
             'status', NEW.status,
             'timeout_at', NEW.timeout_at,
             'updated', NEW.updated

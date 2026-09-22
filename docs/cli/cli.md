@@ -91,7 +91,7 @@ Current MCP tool families:
 - queues: list, get, enqueue
 - artifacts: list, get
 - events: list, get
-- inquiries: list, respond
+- inquiries: list, get, respond, and execution-scoped create and cancel
 - caches: owner-scoped namespace lifecycle, bounded entry lookup/scan, generation inspection, and bounded refresh lifecycle
 
 Notes:
@@ -387,6 +387,27 @@ attune execution result 123 | jq '.data.field'
 # Extract specific field
 attune execution result 123 | jq -r '.status'
 ```
+
+### Inquiry management
+
+Use an access token to browse and answer inquiries:
+
+```bash
+attune inquiry list --status pending
+attune inquiry show 123
+attune inquiry respond 123 --option approve
+attune inquiry respond 123 --response-json '{"approved":true}'
+```
+
+Creation and cancellation require an execution token. Creation also requires an explicit permission set that grants `inquiries:create`:
+
+```bash
+attune inquiry execution create --request-file inquiry.json
+attune inquiry execution create --request-file - < inquiry.json
+attune inquiry execution cancel 123
+```
+
+Use `--offset` and `--limit` to page through list results. JSON and YAML output includes `items` and `pagination`. See the [Inquiry API](../api/api-inquiries.md#client-and-caller-matrix) for visibility and response rules.
 
 ### Trigger Management
 

@@ -148,12 +148,19 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth 
             let fence = claims
                 .sensor_workload_fence()
                 .map_err(|_| AuthError::InvalidToken)?;
-            let current = SensorWorkloadRepository::is_current_fence(&state.db, fence)
-                .await
-                .map_err(|error| {
-                    tracing::error!(%error, "Failed to validate sensor workload fence");
-                    AuthError::Internal
-                })?;
+            let current = match (claims.sensor_ref(), claims.sensor_pack_ref()) {
+                (Ok(sensor_ref), Ok(pack_ref)) => {
+                    SensorWorkloadRepository::is_current_fence_for_sensor_scope(
+                        &state.db, fence, sensor_ref, pack_ref,
+                    )
+                    .await
+                }
+                _ => SensorWorkloadRepository::is_current_fence(&state.db, fence).await,
+            }
+            .map_err(|error| {
+                tracing::error!(%error, "Failed to validate sensor workload fence");
+                AuthError::Internal
+            })?;
             if !current {
                 return Err(AuthError::InvalidToken);
             }

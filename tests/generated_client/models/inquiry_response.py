@@ -12,6 +12,7 @@ from ..models.inquiry_status import InquiryStatus
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inquiry_response_option import InquiryResponseOption
     from ..models.inquiry_response_response_schema_type_0 import (
         InquiryResponseResponseSchemaType0,
     )
@@ -27,11 +28,12 @@ class InquiryResponse:
 
     Attributes:
         created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-        execution (int):
+        created_by_execution (int):
         id (int):
         prompt (str): Prompt text displayed to the user Example: Approve deployment to production?.
         response (InquiryResponseResponseType0 | None): Response data provided by the user
-        response_schema (InquiryResponseResponseSchemaType0 | None): JSON schema for expected response
+        response_options (list[InquiryResponseOption]): Fixed responses that provider controls may select.
+        response_schema (InquiryResponseResponseSchemaType0 | None): Attune flat schema for expected response fields
         status (InquiryStatus):
         updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:45:00Z.
         assigned_to (int | None | Unset):
@@ -45,10 +47,11 @@ class InquiryResponse:
     """
 
     created: datetime.datetime
-    execution: int
+    created_by_execution: int
     id: int
     prompt: str
     response: InquiryResponseResponseType0 | None
+    response_options: list[InquiryResponseOption]
     response_schema: InquiryResponseResponseSchemaType0 | None
     status: InquiryStatus
     updated: datetime.datetime
@@ -71,7 +74,7 @@ class InquiryResponse:
 
         created = self.created.isoformat()
 
-        execution = self.execution
+        created_by_execution = self.created_by_execution
 
         id = self.id
 
@@ -82,6 +85,11 @@ class InquiryResponse:
             response = self.response.to_dict()
         else:
             response = self.response
+
+        response_options = []
+        for response_options_item_data in self.response_options:
+            response_options_item = response_options_item_data.to_dict()
+            response_options.append(response_options_item)
 
         response_schema: dict[str, Any] | None
         if isinstance(self.response_schema, InquiryResponseResponseSchemaType0):
@@ -144,10 +152,11 @@ class InquiryResponse:
         field_dict.update(
             {
                 "created": created,
-                "execution": execution,
+                "created_by_execution": created_by_execution,
                 "id": id,
                 "prompt": prompt,
                 "response": response,
+                "response_options": response_options,
                 "response_schema": response_schema,
                 "status": status,
                 "updated": updated,
@@ -172,6 +181,9 @@ class InquiryResponse:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.inquiry_response_option import (
+            InquiryResponseOption,
+        )
         from ..models.inquiry_response_response_schema_type_0 import (
             InquiryResponseResponseSchemaType0,
         )
@@ -182,7 +194,7 @@ class InquiryResponse:
         d = dict(src_dict)
         created = datetime.datetime.fromisoformat(d.pop("created"))
 
-        execution = d.pop("execution")
+        created_by_execution = d.pop("created_by_execution")
 
         id = d.pop("id")
 
@@ -202,6 +214,15 @@ class InquiryResponse:
             return cast(InquiryResponseResponseType0 | None, data)
 
         response = _parse_response(d.pop("response"))
+
+        response_options = []
+        _response_options = d.pop("response_options")
+        for response_options_item_data in _response_options:
+            response_options_item = InquiryResponseOption.from_dict(
+                response_options_item_data
+            )
+
+            response_options.append(response_options_item)
 
         def _parse_response_schema(
             data: object,
@@ -311,10 +332,11 @@ class InquiryResponse:
 
         inquiry_response = cls(
             created=created,
-            execution=execution,
+            created_by_execution=created_by_execution,
             id=id,
             prompt=prompt,
             response=response,
+            response_options=response_options,
             response_schema=response_schema,
             status=status,
             updated=updated,

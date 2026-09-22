@@ -7,7 +7,7 @@ use crate::models::{
 };
 use crate::{Error, Result};
 use serde_json::Value as JsonValue;
-use sqlx::{Executor, Postgres, QueryBuilder};
+use sqlx::{Executor, PgConnection, Postgres, QueryBuilder};
 
 use super::{
     text_search_patterns, Create, Delete, FindById, FindByRef, List, Patch, Repository, Update,
@@ -1118,6 +1118,9 @@ impl Create for SensorRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(config) = input.config.as_ref() {
+            crate::inquiry_callback_adapter::sensor_inquiry_callback_adapters(Some(config))?;
+        }
         if let Some(limit) = input.log_retention_limit {
             validate_log_retention_limit(limit)?;
         }
@@ -1167,6 +1170,9 @@ impl Update for SensorRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(config) = input.config.as_ref() {
+            crate::inquiry_callback_adapter::sensor_inquiry_callback_adapters(Some(config))?;
+        }
         if let Some(Patch::Set(limit)) = &input.log_retention_limit {
             validate_log_retention_limit(*limit)?;
         }
@@ -1390,6 +1396,16 @@ fn push_sensor_visibility_predicate(
 }
 
 impl SensorRepository {
+    pub async fn find_by_id_for_update(conn: &mut PgConnection, id: Id) -> Result<Option<Sensor>> {
+        sqlx::query_as::<_, Sensor>(&format!(
+            "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(id)
+        .fetch_optional(conn)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn find_by_ref_including_retired<'e, E>(
         executor: E,
         ref_str: &str,

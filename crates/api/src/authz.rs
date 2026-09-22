@@ -245,11 +245,10 @@ impl AuthorizationService {
     pub async fn authorize_identity_fresh(
         &self,
         conn: &mut PgConnection,
-        user: &AuthenticatedUser,
         identity_id: i64,
         mut check: AuthorizationCheck,
     ) -> Result<(), ApiError> {
-        let identity = IdentityRepository::find_by_id(&mut *conn, identity_id)
+        let identity = IdentityRepository::find_by_id_for_share(conn, identity_id)
             .await?
             .filter(|identity| !identity.frozen)
             .ok_or_else(|| ApiError::Unauthorized("Identity is not active".to_string()))?;
@@ -269,7 +268,12 @@ impl AuthorizationService {
             _ => HashMap::new(),
         };
         if !Self::is_allowed(&grants, check.resource, check.action, &check.context) {
-            self.emit_rbac_denied(user, &check);
+            self.audit_emitter.emit(build_identity_rbac_denied_event(
+                identity.id,
+                identity.login,
+                "callback_adapter",
+                &check,
+            ));
             return Err(ApiError::Forbidden(format!(
                 "Insufficient permissions: {}:{}",
                 resource_name(check.resource),
@@ -860,6 +864,47 @@ fn build_rbac_denied_event(
     .actor_identity(ctx.identity_id)
     .actor_login(user.login().to_string())
     .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase())
+    .resource(resource);
+    if let Some(target_id) = ctx.target_id {
+        builder = builder.resource_id(target_id);
+    }
+    if let Some(target_ref) = &ctx.target_ref {
+        builder = builder.resource_ref(target_ref.clone());
+    }
+    builder
+        .with_details(serde_json::json!({
+            "resource": resource,
+            "action": action,
+            "target_id": ctx.target_id,
+            "target_ref": ctx.target_ref,
+            "pack_ref": ctx.pack_ref,
+            "owner_identity_id": ctx.owner_identity_id,
+            "owner_type": ctx.owner_type,
+            "owner_ref": ctx.owner_ref,
+            "visibility": ctx.visibility,
+            "encrypted": ctx.encrypted,
+            "reason": "grant_not_found_or_constraints_not_matched",
+        }))
+        .build()
+}
+
+fn build_identity_rbac_denied_event(
+    identity_id: i64,
+    login: String,
+    actor_type: &str,
+    check: &AuthorizationCheck,
+) -> PendingAuditEvent {
+    let resource = resource_name(check.resource);
+    let action = action_name(check.action);
+    let ctx = &check.context;
+    let mut builder = AuditEventBuilder::new(
+        AuditCategory::Rbac,
+        event_type::rbac::DENIED,
+        AuditOutcome::Denied,
+    )
+    .actor_identity(identity_id)
+    .actor_login(login)
+    .actor_token_type(actor_type)
     .resource(resource);
     if let Some(target_id) = ctx.target_id {
         builder = builder.resource_id(target_id);

@@ -4,9 +4,7 @@
 /* eslint-disable */
 import type { ApiResponse_CreateInquiryResponse } from "../models/ApiResponse_CreateInquiryResponse";
 import type { ApiResponse_InquiryResponse } from "../models/ApiResponse_InquiryResponse";
-import type { ApiResponse_SuccessResponse } from "../models/ApiResponse_SuccessResponse";
 import type { CreateInquiryRequest } from "../models/CreateInquiryRequest";
-import type { ExternalInquiryRespondRequest } from "../models/ExternalInquiryRespondRequest";
 import type { i64 } from "../models/i64";
 import type { InquiryRespondRequest } from "../models/InquiryRespondRequest";
 import type { InquiryStatus } from "../models/InquiryStatus";
@@ -16,8 +14,8 @@ import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class InquiriesService {
   /**
-   * List inquiries for a specific execution
-   * @returns PaginatedResponse_InquirySummary List of inquiries for execution
+   * List inquiries created by a specific execution
+   * @returns PaginatedResponse_InquirySummary List of inquiries created by execution
    * @throws ApiError
    */
   public static listInquiriesByExecution({
@@ -62,8 +60,10 @@ export class InquiriesService {
    */
   public static listInquiries({
     status,
-    execution,
+    createdByExecution,
     assignedTo,
+    workflowActionRef,
+    workflowPackRef,
     offset,
     limit,
   }: {
@@ -72,13 +72,21 @@ export class InquiriesService {
      */
     status?: null | InquiryStatus;
     /**
-     * Filter by execution ID
+     * Filter by creator execution ID
      */
-    execution?: null | i64;
+    createdByExecution?: null | i64;
     /**
      * Filter by assigned identity
      */
     assignedTo?: null | i64;
+    /**
+     * Filter by the containing workflow action reference
+     */
+    workflowActionRef?: string | null;
+    /**
+     * Filter by the containing workflow pack reference
+     */
+    workflowPackRef?: string | null;
     /**
      * Pagination offset
      */
@@ -93,8 +101,10 @@ export class InquiriesService {
       url: "/api/v1/inquiries",
       query: {
         status: status,
-        execution: execution,
+        created_by_execution: createdByExecution,
         assigned_to: assignedTo,
+        workflow_action_ref: workflowActionRef,
+        workflow_pack_ref: workflowPackRef,
         offset: offset,
         limit: limit,
       },
@@ -120,9 +130,12 @@ export class InquiriesService {
       body: requestBody,
       mediaType: "application/json",
       errors: {
-        400: `Invalid request`,
+        400: `Malformed request`,
         401: `Unauthorized`,
+        403: `Execution token or inquiries:create permission required`,
         404: `Execution not found`,
+        409: `Idempotent creation fields differ`,
+        422: `Inquiry request, schema, or options are invalid`,
         500: `Internal server error`,
       },
     });
@@ -138,7 +151,7 @@ export class InquiriesService {
     pageSize,
   }: {
     /**
-     * Inquiry status (pending, responded, timeout, canceled)
+     * Inquiry status (pending, responded, timeout, cancelled)
      */
     status: string;
     /**
@@ -245,35 +258,13 @@ export class InquiriesService {
       body: requestBody,
       mediaType: "application/json",
       errors: {
-        400: `Invalid request or inquiry cannot be responded to`,
+        400: `Malformed request`,
         401: `Unauthorized`,
         403: `Not authorized to respond to this inquiry`,
         404: `Inquiry not found`,
+        409: `Inquiry is no longer pending`,
+        422: `Response does not conform to the inquiry schema`,
         500: `Internal server error`,
-      },
-    });
-  }
-  /**
-   * Accept a one-shot response asserted by an external integration adapter.
-   * @returns ApiResponse_SuccessResponse External response submitted
-   * @throws ApiError
-   */
-  public static respondToInquiryFromExternalAdapter({
-    requestBody,
-  }: {
-    requestBody: ExternalInquiryRespondRequest;
-  }): CancelablePromise<ApiResponse_SuccessResponse> {
-    return __request(OpenAPI, {
-      method: "POST",
-      url: "/api/v1/inquiry-responses",
-      body: requestBody,
-      mediaType: "application/json",
-      errors: {
-        401: `Invalid or inactive integration credential`,
-        403: `External actor is not authorized or assigned`,
-        404: `Response handle not found`,
-        409: `Inquiry or workflow is no longer respondable`,
-        422: `Invalid request or response`,
       },
     });
   }

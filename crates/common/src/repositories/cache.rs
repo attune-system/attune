@@ -395,7 +395,7 @@ impl FindById for CacheNamespaceRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace WHERE id = $1 AND tombstoned_at IS NULL AND retired_at IS NULL"
+            "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace WHERE id = $1 AND retired_at IS NULL"
         );
         sqlx::query_as::<_, CacheNamespace>(&query)
             .bind(id)
@@ -438,6 +438,22 @@ impl Create for CacheNamespaceRepository {
 }
 
 impl CacheNamespaceRepository {
+    pub async fn find_by_id_including_retired<'e, E>(
+        executor: E,
+        id: Id,
+    ) -> Result<Option<CacheNamespace>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query =
+            format!("SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace WHERE id = $1");
+        sqlx::query_as::<_, CacheNamespace>(&query)
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Creates an API-managed namespace while preserving the historical
     /// conflict behavior for owner/name slots still occupied by a tombstoned
     /// namespace. Pack deployment uses the provenance-aware upsert path below.

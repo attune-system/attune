@@ -156,9 +156,9 @@ docker logs attune-postgres
 
 # If you see "exec format error", the image is corrupted
 docker compose down
-docker rmi postgres:16-alpine
-docker volume rm attune_postgres_data
-docker pull postgres:16-alpine
+docker rmi timescale/timescaledb:2.30.1-pg18
+docker volume rm attune_postgres_data_pg18
+docker pull timescale/timescaledb:2.30.1-pg18
 docker compose up -d
 ```
 

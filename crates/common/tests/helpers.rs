@@ -1003,9 +1003,10 @@ impl EnforcementFixture {
 
 /// Fixture builder for Inquiry
 pub struct InquiryFixture {
-    pub execution_id: i64,
+    pub created_by_execution_id: i64,
     pub prompt: String,
     pub response_schema: Option<serde_json::Value>,
+    pub response_options: Vec<inquiry::InquiryResponseOption>,
     pub assigned_to: Option<i64>,
     pub status: enums::InquiryStatus,
     pub response: Option<serde_json::Value>,
@@ -1014,11 +1015,17 @@ pub struct InquiryFixture {
 
 impl InquiryFixture {
     /// Create a new inquiry fixture for the given execution
-    pub fn new(execution_id: i64, prompt: &str) -> Self {
+    pub fn new(created_by_execution_id: i64, prompt: &str) -> Self {
         Self {
-            execution_id,
+            created_by_execution_id,
             prompt: prompt.to_string(),
             response_schema: None,
+            response_options: vec![inquiry::InquiryResponseOption {
+                r#ref: "continue".to_string(),
+                label: "Continue".to_string(),
+                style: inquiry::InquiryResponseOptionStyle::Default,
+                response: json!({}),
+            }],
             assigned_to: None,
             status: enums::InquiryStatus::Pending,
             response: None,
@@ -1027,12 +1034,18 @@ impl InquiryFixture {
     }
 
     /// Create a new inquiry fixture with a unique prompt
-    pub fn new_unique(execution_id: i64, base_prompt: &str) -> Self {
+    pub fn new_unique(created_by_execution_id: i64, base_prompt: &str) -> Self {
         let unique_prompt = format!("{}_{}", base_prompt, unique_test_id());
         Self {
-            execution_id,
+            created_by_execution_id,
             prompt: unique_prompt,
             response_schema: None,
+            response_options: vec![inquiry::InquiryResponseOption {
+                r#ref: "continue".to_string(),
+                label: "Continue".to_string(),
+                style: inquiry::InquiryResponseOptionStyle::Default,
+                response: json!({}),
+            }],
             assigned_to: None,
             status: enums::InquiryStatus::Pending,
             response: None,
@@ -1042,6 +1055,14 @@ impl InquiryFixture {
 
     pub fn with_response_schema(mut self, schema: serde_json::Value) -> Self {
         self.response_schema = Some(schema);
+        self
+    }
+
+    pub fn with_response_options(
+        mut self,
+        response_options: Vec<inquiry::InquiryResponseOption>,
+    ) -> Self {
+        self.response_options = response_options;
         self
     }
 
@@ -1069,9 +1090,10 @@ impl InquiryFixture {
         use attune_common::repositories::inquiry::{CreateInquiryInput, InquiryRepository};
 
         let input = CreateInquiryInput {
-            execution: self.execution_id,
+            created_by_execution: self.created_by_execution_id,
             prompt: self.prompt,
             response_schema: self.response_schema,
+            response_options: self.response_options,
             assigned_to: self.assigned_to,
             status: self.status,
             response: self.response,

@@ -331,7 +331,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn migration_switches_only_after_verification_and_restart_is_a_noop() {
         let database = test_database().await;
         let artifacts = tempfile::tempdir().unwrap();
@@ -376,7 +375,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn failed_verification_leaves_metadata_unswitched() {
         let database = test_database().await;
         let artifacts = tempfile::tempdir().unwrap();

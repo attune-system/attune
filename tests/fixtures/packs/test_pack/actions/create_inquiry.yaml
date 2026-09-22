@@ -1,0 +1,34 @@
+ref: test_pack.create_inquiry
+name: create_inquiry
+label: Create Inquiry
+description: Creates an inquiry through the execution-scoped API for E2E tests.
+enabled: true
+runner_type: python
+entry_point: create_inquiry.py
+parameter_delivery: stdin
+parameter_format: json
+output_format: json
+default_execution_permission_set_refs:
+  - test_pack.inquiry_creator
+parameters:
+  purpose:
+    type: string
+    required: true
+  prompt:
+    type: string
+    required: true
+  response_schema:
+    type: object
+    required: true
+  response_options:
+    type: array
+    required: true
+  timeout_seconds:
+    type: integer
+    required: true
+    minimum: 1
+output:
+  inquiry_id:
+    type: integer
+  status:
+    type: string

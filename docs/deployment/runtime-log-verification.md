@@ -79,6 +79,16 @@ SSE response.
 
 ## Run the correctness suite
 
+Provision a disposable PostgreSQL/TimescaleDB cluster with a role that can create databases. Host setup requires `psql` and `sqlx`. Set `TEST_DB_ADMIN_URL` and `TEST_DB_URL` to that cluster, then run `make db-test-setup`.
+
+Choose a unique owner for the run and an available MinIO host port. Keep these exports for setup, tests, and teardown:
+
+```bash
+export ATTUNE_TEST_RUN_ID="logs-$(date +%s)"
+export RUNTIME_LOG_HARNESS_OWNER="attune-$ATTUNE_TEST_RUN_ID"
+export RUNTIME_LOG_MINIO_PORT=59000
+```
+
 Start disposable versioned MinIO:
 
 ```bash
@@ -100,6 +110,7 @@ replica has its own PostgreSQL pool, S3 client, wakeup registry, and stream
 limiter. The suite checks these behaviors against MinIO:
 
 - Cross-replica upload, live tailing, and `Last-Event-ID` reconnects.
+- Artifact preview `content`, `append`, and `done` events across API replicas without a local artifact file, using a real identity with scoped artifact-read permission.
 - Concurrent duplicate uploads through separate S3 clients.
 - A delayed successful S3 PUT whose caller receives an injected failure, then
   duplicate retries that recover the object and commit one segment row.
@@ -160,7 +171,7 @@ make runtime-log-test-storage-down
 ```
 
 The Make harness derives Docker container and network names from the current
-user and worktree and labels both resources. Startup rejects a same-name
+user and worktree by default, or from `RUNTIME_LOG_HARNESS_OWNER` when set, and labels both resources. Use distinct owners and ports for overlapping runs. Startup rejects a same-name
 resource with a different ownership label. Teardown removes only resources with
 the expected label.
 

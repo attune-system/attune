@@ -23,8 +23,8 @@ class ApiResponseCreateInquiryResponse:
     """Standard API response wrapper
 
     Attributes:
-        data (ApiResponseCreateInquiryResponseData): Creation result containing the inquiry and its provider-neutral
-            response handle.
+        data (ApiResponseCreateInquiryResponseData): Creation result containing the inquiry and one opaque handle per
+            response option.
         message (None | str | Unset): Optional message
     """
 

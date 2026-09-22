@@ -1,14 +1,16 @@
-"""T3.15: Inquiry notification tests."""
+"""T3.15: inquiry notifications from production-path workflow creation."""
 
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta, timezone
 
 import pytest
 import websockets
-from helpers import AttuneClient
-from helpers.fixtures import create_echo_action, unique_ref
+
+from helpers import AttuneClient, start_inquiry_workflow, unique_ref
+
+
+pytestmark = [pytest.mark.tier3, pytest.mark.notifications, pytest.mark.inquiry]
 
 
 def _notifier_ws_url() -> str:
@@ -24,17 +26,25 @@ def _connect_notifier_ws(client: AttuneClient):
     )
 
 
-def _create_execution_for_inquiry(client: AttuneClient, pack_ref: str) -> dict:
-    action = create_echo_action(
-        client=client,
-        pack_ref=pack_ref,
-        action_ref=f"inquiry_notify_anchor_{unique_ref()}",
-        description="Anchor execution for inquiry notification test",
+async def _subscribe_to_inquiries(websocket) -> None:
+    """Wait until the server has processed the inquiry subscription."""
+    await websocket.send(
+        json.dumps({"type": "subscribe", "filter": "entity_type:inquiry"})
     )
-    return client.create_execution(
-        action_ref=action["ref"],
-        parameters={"message": "inquiry notification anchor"},
+    # The protocol has no subscription acknowledgement. Incoming messages are
+    # processed in order, so this error confirms the preceding subscribe ran.
+    await websocket.send(
+        json.dumps({"type": "subscribe", "filter": "invalid-filter"})
     )
+    deadline = asyncio.get_running_loop().time() + 3
+    while asyncio.get_running_loop().time() < deadline:
+        remaining = max(0.1, deadline - asyncio.get_running_loop().time())
+        response = json.loads(
+            await asyncio.wait_for(websocket.recv(), timeout=remaining)
+        )
+        if response.get("type") == "error":
+            return
+    raise AssertionError("Notifier did not confirm subscription processing")
 
 
 async def _wait_for_inquiry_notification(
@@ -48,159 +58,113 @@ async def _wait_for_inquiry_notification(
     while asyncio.get_running_loop().time() < deadline:
         remaining = max(0.1, deadline - asyncio.get_running_loop().time())
         message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=remaining))
-        if message.get("type") != "notification":
-            continue
-        if message.get("notification_type") != notification_type:
-            continue
-        if message.get("entity_type") != "inquiry":
-            continue
-        if message.get("entity_id") != inquiry_id:
-            continue
-        return message
+        if (
+            message.get("type") == "notification"
+            and message.get("notification_type") == notification_type
+            and message.get("entity_type") == "inquiry"
+            and message.get("entity_id") == inquiry_id
+        ):
+            return message
 
     raise AssertionError(
         f"Did not receive {notification_type!r} notification for inquiry {inquiry_id}"
     )
 
 
-@pytest.mark.tier3
-@pytest.mark.notifications
-@pytest.mark.inquiry
-def test_inquiry_creation_notification(client: AttuneClient, test_pack):
-    """Creating an inquiry should persist notification-ready metadata."""
-    execution = _create_execution_for_inquiry(client, test_pack["ref"])
-
-    inquiry = client.create_inquiry(
-        execution_id=execution["id"],
-        prompt="Approve the notification test?",
-        response_schema={
-            "approved": {
-                "type": "boolean",
-                "description": "Whether the request is approved",
-                "required": True,
-            }
-        },
+def test_inquiry_creation_has_workflow_metadata(
+    client: AttuneClient, test_pack: dict
+):
+    run = start_inquiry_workflow(
+        client,
+        test_pack["ref"],
+        purpose=f"notification-metadata-{unique_ref()}",
+        prompt="Approve the notification metadata test?",
     )
 
-    assert inquiry["execution"] == execution["id"]
-    assert inquiry["prompt"] == "Approve the notification test?"
-    assert inquiry["status"] == "pending"
-    assert inquiry["response_schema"]["approved"]["type"] == "boolean"
-    assert inquiry["created"]
-    assert inquiry["updated"]
+    assert run.inquiry["created_by_execution"] == run.creator_execution["id"]
+    assert run.inquiry["workflow_execution"] is not None
+    assert run.inquiry["workflow_task_name"] == "request_inquiry"
+    assert run.inquiry["status"] == "pending"
+    assert run.inquiry["created"]
+    assert run.inquiry["updated"]
 
 
-@pytest.mark.tier3
-@pytest.mark.notifications
-@pytest.mark.inquiry
-def test_inquiry_response_notification(client: AttuneClient, test_pack):
-    """Responding to an inquiry should update it to responded with response data."""
-    execution = _create_execution_for_inquiry(client, test_pack["ref"])
-    inquiry = client.create_inquiry(
-        execution_id=execution["id"],
-        prompt="Approve response notification test?",
-    )
-
-    response = client.respond_to_inquiry(
-        inquiry["id"],
-        response_data={"approved": True, "comment": "Approved by E2E"},
-    )
-
-    assert response["id"] == inquiry["id"]
-    assert response["status"] == "responded"
-    assert response["response"] == {"approved": True, "comment": "Approved by E2E"}
-    assert response["responded_at"] is not None
-
-
-@pytest.mark.tier3
-@pytest.mark.notifications
-@pytest.mark.inquiry
 @pytest.mark.websocket
-def test_inquiry_timeout_notification(client: AttuneClient, test_pack):
-    """Expired pending inquiries should time out, notify subscribers, and reject responses."""
-    pack_ref = test_pack["ref"]
-
+def test_websocket_delivers_inquiry_created_and_responded_notifications(
+    client: AttuneClient, test_pack: dict
+):
     async def run_test() -> tuple[dict, dict, dict]:
         async with _connect_notifier_ws(client) as websocket:
             welcome = json.loads(await asyncio.wait_for(websocket.recv(), timeout=3))
             assert welcome["type"] == "welcome"
-            await websocket.send(
-                json.dumps({"type": "subscribe", "filter": "entity_type:inquiry"})
+            await _subscribe_to_inquiries(websocket)
+
+            run = start_inquiry_workflow(
+                client,
+                test_pack["ref"],
+                purpose=f"websocket-response-{unique_ref()}",
+                prompt="Approve the WebSocket notification test?",
             )
-
-            execution = _create_execution_for_inquiry(client, pack_ref)
-            timeout_at = datetime.now(timezone.utc) + timedelta(seconds=2)
-            inquiry = client.create_inquiry(
-                execution_id=execution["id"],
-                prompt="This inquiry should time out",
-                timeout_at=timeout_at.isoformat(),
-            )
-
-            timeout_notification = await _wait_for_inquiry_notification(
-                websocket,
-                notification_type="inquiry_timeout",
-                inquiry_id=inquiry["id"],
-                timeout=10,
-            )
-            timed_out = client.get_inquiry(inquiry["id"])
-            return inquiry, timed_out, timeout_notification
-
-    inquiry, timed_out, timeout_notification = asyncio.run(run_test())
-
-    assert timed_out["id"] == inquiry["id"]
-    assert timed_out["status"] == "timeout"
-    assert timed_out["timeout_at"] is not None
-    assert timeout_notification["payload"]["status"] == "timeout"
-    assert timeout_notification["payload"]["execution"] == inquiry["execution"]
-    with pytest.raises(Exception, match="(timeout|409|400|responded|terminal)"):
-        client.respond_to_inquiry(
-            inquiry["id"],
-            response_data={"approved": True, "comment": "too late"},
-        )
-
-@pytest.mark.tier3
-@pytest.mark.notifications
-@pytest.mark.inquiry
-@pytest.mark.websocket
-def test_websocket_inquiry_notification_delivery(client: AttuneClient, test_pack):
-    """Authenticated WebSocket subscribers receive inquiry create/respond events."""
-    pack_ref = test_pack["ref"]
-
-    async def run_test() -> tuple[dict, dict, dict]:
-        async with _connect_notifier_ws(client) as websocket:
-            welcome = json.loads(await asyncio.wait_for(websocket.recv(), timeout=3))
-            assert welcome["type"] == "welcome"
-            await websocket.send(
-                json.dumps({"type": "subscribe", "filter": "entity_type:inquiry"})
-            )
-
-            execution = _create_execution_for_inquiry(client, pack_ref)
-            inquiry = client.create_inquiry(
-                execution_id=execution["id"],
-                prompt="Approve WebSocket inquiry notification test?",
-            )
-
-            created_notification = await _wait_for_inquiry_notification(
+            created = await _wait_for_inquiry_notification(
                 websocket,
                 notification_type="inquiry_created",
-                inquiry_id=inquiry["id"],
+                inquiry_id=run.inquiry["id"],
             )
 
             client.respond_to_inquiry(
-                inquiry["id"],
-                response_data={"approved": True, "comment": "WebSocket test"},
+                run.inquiry["id"], response={"approved": True}
             )
-            responded_notification = await _wait_for_inquiry_notification(
+            responded = await _wait_for_inquiry_notification(
                 websocket,
                 notification_type="inquiry_responded",
-                inquiry_id=inquiry["id"],
+                inquiry_id=run.inquiry["id"],
             )
+            return run.inquiry, created, responded
 
-            return inquiry, created_notification, responded_notification
+    inquiry, created, responded = asyncio.run(run_test())
 
-    inquiry, created_notification, responded_notification = asyncio.run(run_test())
+    assert created["payload"]["status"] == "pending"
+    assert created["payload"]["created_by_execution"] == inquiry[
+        "created_by_execution"
+    ]
+    assert responded["payload"]["status"] == "responded"
+    assert responded["payload"]["created_by_execution"] == inquiry[
+        "created_by_execution"
+    ]
 
-    assert created_notification["payload"]["status"] == "pending"
-    assert created_notification["payload"]["execution"] == inquiry["execution"]
-    assert responded_notification["payload"]["status"] == "responded"
-    assert responded_notification["payload"]["execution"] == inquiry["execution"]
+
+@pytest.mark.websocket
+def test_websocket_delivers_inquiry_timeout_notification(
+    client: AttuneClient, test_pack: dict
+):
+    async def run_test() -> tuple[dict, dict]:
+        async with _connect_notifier_ws(client) as websocket:
+            welcome = json.loads(await asyncio.wait_for(websocket.recv(), timeout=3))
+            assert welcome["type"] == "welcome"
+            await _subscribe_to_inquiries(websocket)
+
+            run = start_inquiry_workflow(
+                client,
+                test_pack["ref"],
+                purpose=f"websocket-timeout-{unique_ref()}",
+                prompt="This notification inquiry should time out",
+                timeout_seconds=2,
+            )
+            notification = await _wait_for_inquiry_notification(
+                websocket,
+                notification_type="inquiry_timeout",
+                inquiry_id=run.inquiry["id"],
+                timeout=15,
+            )
+            return run.inquiry, notification
+
+    inquiry, notification = asyncio.run(run_test())
+    timed_out = client.get_inquiry(inquiry["id"])
+
+    assert timed_out["status"] == "timeout"
+    assert notification["payload"]["status"] == "timeout"
+    assert notification["payload"]["created_by_execution"] == inquiry[
+        "created_by_execution"
+    ]
+    with pytest.raises(Exception, match="(timeout|409|400|responded|terminal)"):
+        client.respond_to_inquiry(inquiry["id"], response={"approved": True})

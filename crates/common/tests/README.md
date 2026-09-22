@@ -49,7 +49,7 @@ make db-test-reset
 make test-integration
 
 # Or manually
-cargo test --test '*' -p attune-common -- --test-threads=1
+cargo test --test '*' -p attune-common -- --test-threads=4
 ```
 
 ### Run Specific Test Files
@@ -242,7 +242,7 @@ Each test should be independent:
 Run integration tests single-threaded to avoid race conditions:
 
 ```bash
-cargo test -- --test-threads=1
+cargo test -- --test-threads=4
 ```
 
 ### 5. Descriptive Test Names
@@ -311,7 +311,7 @@ createdb attune_test
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/attune_test sqlx migrate run
 
 # Run tests
-cargo test --test '*' -p attune-common -- --test-threads=1
+cargo test --test '*' -p attune-common -- --test-threads=4
 ```
 
 ## Common Issues
@@ -338,7 +338,7 @@ cargo test --test '*' -p attune-common -- --test-threads=1
 **Issue**: Tests fail intermittently
 
 **Solution**:
-- Run single-threaded: `--test-threads=1`
+- Keep the database-test minimum: `--test-threads=4`
 - Clean database before each test
 - Avoid time-dependent assertions
 

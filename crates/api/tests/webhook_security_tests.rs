@@ -122,7 +122,6 @@ fn generate_hmac_signature(payload: &[u8], secret: &str, algorithm: &str) -> Str
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_sha256_valid() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -183,7 +182,6 @@ async fn test_webhook_hmac_sha256_valid() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_sha512_valid() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -234,7 +232,6 @@ async fn test_webhook_hmac_sha512_valid() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_invalid_signature() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -284,7 +281,6 @@ async fn test_webhook_hmac_invalid_signature() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_missing_signature() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -332,7 +328,6 @@ async fn test_webhook_hmac_missing_signature() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_wrong_secret() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -389,7 +384,6 @@ async fn test_webhook_hmac_wrong_secret() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_rate_limit_enforced() {
     let ctx = setup_test_context().await;
 
@@ -460,7 +454,6 @@ async fn test_webhook_rate_limit_enforced() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_rate_limit_disabled() {
     let ctx = setup_test_context().await;
 
@@ -506,7 +499,6 @@ async fn test_webhook_rate_limit_disabled() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_ip_whitelist_allowed() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -573,7 +565,6 @@ async fn test_webhook_ip_whitelist_allowed() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_ip_whitelist_blocked() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -626,7 +617,6 @@ async fn test_webhook_ip_whitelist_blocked() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_payload_size_limit_enforced() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -678,7 +668,6 @@ async fn test_webhook_payload_size_limit_enforced() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_payload_size_within_limit() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -728,7 +717,6 @@ async fn test_webhook_payload_size_within_limit() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_webhook_event_logging_success() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -793,7 +781,6 @@ async fn test_webhook_event_logging_success() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_webhook_event_logging_failure() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -860,7 +847,6 @@ async fn test_webhook_event_logging_failure() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_webhook_all_security_features_pass() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -935,7 +921,6 @@ async fn test_webhook_all_security_features_pass() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_webhook_multiple_security_failures() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -994,7 +979,6 @@ async fn test_webhook_multiple_security_failures() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_webhook_malformed_json() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -1030,7 +1014,6 @@ async fn test_webhook_malformed_json() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_webhook_empty_payload() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();

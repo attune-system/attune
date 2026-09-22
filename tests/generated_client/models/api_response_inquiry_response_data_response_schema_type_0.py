@@ -12,7 +12,7 @@ T = TypeVar("T", bound="ApiResponseInquiryResponseDataResponseSchemaType0")
 
 @_attrs_define
 class ApiResponseInquiryResponseDataResponseSchemaType0:
-    """JSON schema for expected response"""
+    """Attune flat schema for expected response fields"""
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

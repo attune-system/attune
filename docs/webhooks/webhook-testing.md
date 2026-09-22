@@ -184,14 +184,14 @@ cargo test -p attune-api webhook_api_tests
 cargo test -p attune-api webhook_security_tests
 ```
 
-### Run Ignored Tests (Requires Database)
+### Run Database Tests
 ```bash
-cargo test --workspace -- --ignored
+cargo test --workspace -- --test-threads=4
 ```
 
 ### Run Specific Test
 ```bash
-cargo test -p attune-api test_webhook_hmac_sha256_valid -- --ignored
+cargo test -p attune-api test_webhook_hmac_sha256_valid -- --test-threads=4
 ```
 
 ## Test Environment Setup

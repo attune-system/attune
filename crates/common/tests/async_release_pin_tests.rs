@@ -134,7 +134,6 @@ async fn action_fixture() -> (
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn queued_dispatch_keeps_release_a_after_b_activates() {
     let (pool, pack, action, release_a, snapshot_a) = action_fixture().await;
     let queue = WorkQueueRepository::create(
@@ -220,7 +219,6 @@ async fn queued_dispatch_keeps_release_a_after_b_activates() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn retired_action_keeps_pinned_execution_and_external_queue_reference() {
     let (pool, pack, action, release, snapshot) = action_fixture().await;
     let execution =
@@ -304,7 +302,6 @@ async fn retired_action_keeps_pinned_execution_and_external_queue_reference() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn workflow_transition_keeps_root_release_a_after_b_activates() {
     let (pool, pack, action, release_a, snapshot_a) = action_fixture().await;
     let root =
@@ -327,7 +324,6 @@ async fn workflow_transition_keeps_root_release_a_after_b_activates() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn workflow_snapshot_pins_each_action_to_its_defining_release() {
     let pool = create_test_pool().await.expect("test database");
     let pack = PackFixture::new_unique("mixed_workflow")
@@ -405,7 +401,6 @@ async fn workflow_snapshot_pins_each_action_to_its_defining_release() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn retry_keeps_original_release_a_after_b_activates() {
     let (pool, pack, action, release_a, snapshot_a) = action_fixture().await;
     let original =
@@ -447,7 +442,6 @@ async fn retry_keeps_original_release_a_after_b_activates() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn managed_sensor_replacement_keeps_desired_release_a_after_b_activates() {
     let pool = create_test_pool().await.expect("test database");
     let pack = PackFixture::new_unique("sensor_pin")
@@ -568,7 +562,6 @@ async fn managed_sensor_replacement_keeps_desired_release_a_after_b_activates() 
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn retention_preserves_active_pinned_and_rollback_window_releases() {
     let (pool, pack, action, release_a, snapshot_a) = action_fixture().await;
     ExecutionRepository::create_pinned(&pool, execution_input(&action, None), &snapshot_a)
@@ -614,7 +607,6 @@ async fn retention_preserves_active_pinned_and_rollback_window_releases() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn concurrent_pin_commit_wins_before_retention_can_delete_release() {
     let (pool, pack, action, release_a, snapshot_a) = action_fixture().await;
     let release_b = create_release(&pool, &pack, "2.0.0", 'b').await;
@@ -653,7 +645,6 @@ async fn concurrent_pin_commit_wins_before_retention_can_delete_release() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn retention_removes_local_tree_only_after_last_shared_reference() {
     let pool = create_test_pool().await.expect("test database");
     let first_pack = PackFixture::new_unique("local_release_first")
@@ -743,7 +734,6 @@ async fn retention_removes_local_tree_only_after_last_shared_reference() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn pack_delete_cascade_cleans_release_tree_after_commit() {
     let pool = create_test_pool().await.expect("test database");
     let pack = PackFixture::new_unique("cascade_release_cleanup")
@@ -793,7 +783,6 @@ async fn pack_delete_cascade_cleans_release_tree_after_commit() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn deleting_one_release_does_not_collect_a_shared_exact_object() {
     use attune_common::repositories::object_maintenance::ObjectMaintenanceRepository;
 
@@ -860,7 +849,6 @@ async fn deleting_one_release_does_not_collect_a_shared_exact_object() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn deleting_pack_preserves_historical_release_snapshot() {
     let (pool, pack, action, release, snapshot) = action_fixture().await;
     let mut input = execution_input(&action, None);
@@ -998,7 +986,6 @@ async fn deleting_pack_preserves_historical_release_snapshot() {
 }
 
 #[tokio::test]
-#[ignore = "integration test; requires database"]
 async fn deleting_pack_rejects_nonterminal_pinned_work() {
     let (pool, pack, action, release, snapshot) = action_fixture().await;
     ExecutionRepository::create_pinned(&*pool, execution_input(&action, None), &snapshot)

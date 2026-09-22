@@ -13,7 +13,6 @@ use attune_common::repositories::{
 mod helpers;
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_identity_crud_and_permission_assignment_flow() {
     let ctx = TestContext::new()
         .await
@@ -168,7 +167,6 @@ async fn test_identity_crud_and_permission_assignment_flow() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_identity_delete_tombstones_owned_caches_before_deletion() {
     let ctx = TestContext::new()
         .await
@@ -242,7 +240,6 @@ async fn test_identity_delete_tombstones_owned_caches_before_deletion() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_plain_authenticated_user_cannot_manage_identities() {
     let ctx = TestContext::new()
         .await

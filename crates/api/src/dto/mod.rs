@@ -65,9 +65,8 @@ pub use external_identity_mapping::{
 };
 pub use history::{HistoryEntityTypePath, HistoryQueryParams, HistoryRecordResponse};
 pub use inquiry::{
-    CreateInquiryRequest, CreateInquiryResponse, ExternalActorAssertion,
-    ExternalInquiryRespondRequest, InquiryQueryParams, InquiryRespondRequest, InquiryResponse,
-    InquirySummary,
+    CreateInquiryRequest, CreateInquiryResponse, InquiryQueryParams, InquiryRespondRequest,
+    InquiryResponse, InquiryResponseOptionHandle, InquirySummary,
 };
 pub use key::{CreateKeyRequest, KeyQueryParams, KeyResponse, KeySummary, UpdateKeyRequest};
 pub use pack::{

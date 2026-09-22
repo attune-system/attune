@@ -8,8 +8,8 @@ priority: optional
 maintainer: "Attune <attune@rdrx.app>"
 description: "Shared configuration and lifecycle support for Attune services"
 vendor: "Attune"
-homepage: "https://git.rdrx.app/attune/attune"
-license: "Proprietary"
+homepage: "https://git.rdrx.app/attune-system/attune"
+license: "Apache-2.0"
 
 depends:
   - python3

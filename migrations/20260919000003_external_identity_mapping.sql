@@ -6,6 +6,7 @@ CREATE TABLE external_identity_mapping (
     mapped_identity BIGINT NOT NULL REFERENCES identity(id) ON DELETE CASCADE,
     provider TEXT NOT NULL,
     tenant TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
     external_subject TEXT NOT NULL,
     created_by BIGINT REFERENCES identity(id) ON DELETE SET NULL,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -17,6 +18,9 @@ CREATE TABLE external_identity_mapping (
         tenant = btrim(tenant)
         AND length(tenant) BETWEEN 1 AND 255
     ),
+    CONSTRAINT external_identity_mapping_subject_kind_format CHECK (
+        subject_kind ~ '^[a-z0-9][a-z0-9._-]{0,63}$'
+    ),
     CONSTRAINT external_identity_mapping_subject_format CHECK (
         external_subject = btrim(external_subject)
         AND length(external_subject) BETWEEN 1 AND 255
@@ -25,6 +29,7 @@ CREATE TABLE external_identity_mapping (
         integration_identity,
         provider,
         tenant,
+        subject_kind,
         external_subject
     )
 );
@@ -44,6 +49,7 @@ COMMENT ON COLUMN external_identity_mapping.integration_identity IS 'Integration
 COMMENT ON COLUMN external_identity_mapping.mapped_identity IS 'Attune identity selected for the external subject';
 COMMENT ON COLUMN external_identity_mapping.provider IS 'Canonical lowercase provider token';
 COMMENT ON COLUMN external_identity_mapping.tenant IS 'Case-sensitive provider tenant identifier';
+COMMENT ON COLUMN external_identity_mapping.subject_kind IS 'Canonical lowercase provider subject type token';
 COMMENT ON COLUMN external_identity_mapping.external_subject IS 'Case-sensitive provider subject identifier';
 
 ALTER TABLE inquiry

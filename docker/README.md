@@ -225,9 +225,14 @@ ENVIRONMENT=production
 The following volumes are used:
 
 **Data Volumes:**
-- `postgres_data` - PostgreSQL database files
-- `rabbitmq_data` - RabbitMQ data
+- `postgres_data_pg18` - PostgreSQL 18 database files
+- `rabbitmq_data_v4` - RabbitMQ 4 data
 - `redis_data` - Redis persistence
+
+PostgreSQL 16 data directories cannot be opened by PostgreSQL 18. The
+versioned volume names leave existing PostgreSQL 16 and RabbitMQ 3 volumes
+untouched. Use `pg_dump` and restore for PostgreSQL data. RabbitMQ definitions
+can be exported separately; queued messages in the old volume are not migrated.
 
 **Log Volumes:**
 - `api_logs`, `executor_logs`, `worker_logs`, `sensor_logs`, `notifier_logs`

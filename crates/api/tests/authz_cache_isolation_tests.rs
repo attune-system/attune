@@ -20,7 +20,6 @@ async fn database_exists(database_name: &str) -> Result<bool> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL/TimescaleDB"]
 async fn partial_context_construction_drops_database_owner() -> Result<()> {
     let mut database_name = String::new();
     assert!(fail_after_database_creation_for_test(&mut database_name)
@@ -32,7 +31,6 @@ async fn partial_context_construction_drops_database_owner() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL/TimescaleDB"]
 async fn cache_enabled_equal_identity_ids_remain_app_state_isolated() -> Result<()> {
     // Fresh database clones start their identity sequences at the same value. Give the
     // equal IDs different grants, prime the first app-state cache, then prove

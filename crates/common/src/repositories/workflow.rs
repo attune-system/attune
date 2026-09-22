@@ -654,12 +654,27 @@ impl WorkflowExecutionRepository {
             .bind(id)
             .execute(&mut *transaction)
             .await?;
-        let Some(workflow) = Self::find_by_id_for_update(&mut *transaction, id).await? else {
-            transaction.rollback().await?;
+        let updated = Self::cancel_with_prerequisites_with_conn(
+            &mut transaction,
+            id,
+            error_message,
+            parent_update,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn cancel_with_prerequisites_with_conn(
+        conn: &mut PgConnection,
+        id: Id,
+        error_message: &str,
+        parent_update: Option<(ExecutionStatus, Option<serde_json::Value>)>,
+    ) -> Result<Option<WorkflowExecution>> {
+        let Some(workflow) = Self::find_by_id_for_update(&mut *conn, id).await? else {
             return Ok(None);
         };
         if workflow.status == ExecutionStatus::Cancelled {
-            transaction.commit().await?;
             return Ok(Some(workflow));
         }
         if matches!(
@@ -675,7 +690,6 @@ impl WorkflowExecutionRepository {
                     workflow.id
                 )));
             }
-            transaction.commit().await?;
             return Ok(Some(workflow));
         }
         if let Some((status, result)) = parent_update {
@@ -687,7 +701,7 @@ impl WorkflowExecutionRepository {
             .bind(workflow.execution)
             .bind(status)
             .bind(result)
-            .execute(&mut *transaction)
+            .execute(&mut *conn)
             .await?;
             if updated.rows_affected() == 0 {
                 return Err(crate::Error::InvalidState(format!(
@@ -697,16 +711,15 @@ impl WorkflowExecutionRepository {
             }
         }
 
-        super::inquiry::InquiryRepository::cancel_pending_for_workflow(&mut *transaction, id)
-            .await?;
+        super::inquiry::InquiryRepository::cancel_pending_for_workflow(&mut *conn, id).await?;
         super::workflow_task_wait::WorkflowTaskWaitRepository::cancel_waiting_for_workflow(
-            &mut *transaction,
+            &mut *conn,
             id,
             serde_json::json!({"reason": "workflow cancelled"}),
         )
         .await?;
         let updated = Self::update(
-            &mut *transaction,
+            &mut *conn,
             id,
             UpdateWorkflowExecutionInput {
                 status: Some(ExecutionStatus::Cancelled),
@@ -716,7 +729,6 @@ impl WorkflowExecutionRepository {
             },
         )
         .await?;
-        transaction.commit().await?;
         Ok(Some(updated))
     }
 

@@ -13,6 +13,7 @@ use attune_common::{
     repositories::{
         action::{ActionRepository, CreateActionInput},
         artifact::{ArtifactRepository, CreateArtifactInput},
+        component_lifecycle::PackProjectionIds,
         execution::{CreateExecutionInput, ExecutionRepository},
         identity::{
             CreateIdentityInput, CreatePermissionSetInput, IdentityRepository,
@@ -29,7 +30,7 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 mod helpers;
-use helpers::{activate_test_pack_release, TestContext};
+use helpers::{activate_test_pack_release_with_projections, TestContext};
 
 type TResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -94,8 +95,6 @@ async fn setup_executable_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, 
         },
     )
     .await?;
-    activate_test_pack_release(pool, &pack).await?;
-
     let action = ActionRepository::create(
         pool,
         CreateActionInput {
@@ -114,7 +113,7 @@ async fn setup_executable_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, 
             worker_affinity: json!({}),
             param_schema: None,
             out_schema: None,
-            is_adhoc: true,
+            is_adhoc: false,
             accesses_mcp: true,
             default_execution_permission_set_refs: Vec::new(),
             reference_visibility: Default::default(),
@@ -124,6 +123,15 @@ async fn setup_executable_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, 
             log_retention_policy: None,
             log_retention_limit: None,
             timeout_seconds: None,
+        },
+    )
+    .await?;
+    activate_test_pack_release_with_projections(
+        pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            ..PackProjectionIds::default()
         },
     )
     .await?;
@@ -407,7 +415,6 @@ fn execute_body(action: &Action, permission_set_refs: Option<Vec<String>>) -> Va
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<()> {
     let ctx = TestContext::new().await?;
     let suffix = uuid::Uuid::new_v4().to_string().replace('-', "");
@@ -539,7 +546,13 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
             Some(&execute_only_token),
         )
         .await?;
-    assert_eq!(execute_only_success.status(), StatusCode::CREATED);
+    if execute_only_success.status() != StatusCode::CREATED {
+        panic!(
+            "expected execution creation, got {}: {}",
+            execute_only_success.status(),
+            execute_only_success.text().await?
+        );
+    }
     let no_permission_body: Value = execute_only_success.json().await?;
     assert_eq!(
         no_permission_body["data"]["parent"].as_i64(),
@@ -582,7 +595,6 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> TResult<()> {
     let ctx = TestContext::new().await?;
     let suffix = uuid::Uuid::new_v4().to_string().replace('-', "");
@@ -708,7 +720,6 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResult<()> {
     let ctx = TestContext::new().await?;
     let suffix = uuid::Uuid::new_v4().to_string().replace('-', "");

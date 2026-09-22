@@ -700,7 +700,7 @@ fn rejects_noncanonical_containers_and_corruption() {
     bytes.extend_from_slice(&original);
     gzip(&bad, &bytes);
     assert!(verify(&bad, Limits::default()).is_err());
-    if first_size % 512 != 0 {
+    if !first_size.is_multiple_of(512) {
         let mut bytes = original.clone();
         bytes[512 + first_size as usize] = 1;
         gzip(&bad, &bytes);

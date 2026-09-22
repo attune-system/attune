@@ -157,16 +157,14 @@ tasks:
   - name: ask_for_approval
     action: slack.request_approval
     permission_set_refs:
-      - workflow-inquiry-create
+      - standard
+      - slack.inquiry_creator
     input:
+      purpose: "production-deploy"
       prompt: "Approve production deployment of {{ parameters.app_name }} {{ parameters.version }}?"
+      channel: "{{ parameters.approval_channel }}"
       assigned_to: "{{ parameters.approver_identity_id }}"
-      response_schema:
-        approved:
-          type: boolean
-          required: true
-        note:
-          type: string
+      timeout_seconds: 3600
     next:
       - do:
           - check_approval

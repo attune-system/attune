@@ -13,7 +13,7 @@ from ...types import UNSET, Response, Unset
 def _get_kwargs(
     *,
     status: InquiryStatus | None | Unset = UNSET,
-    execution: int | None | Unset = UNSET,
+    created_by_execution: int | None | Unset = UNSET,
     assigned_to: int | None | Unset = UNSET,
     offset: int | None | Unset = UNSET,
     limit: int | None | Unset = UNSET,
@@ -30,12 +30,12 @@ def _get_kwargs(
         json_status = status
     params["status"] = json_status
 
-    json_execution: int | None | Unset
-    if isinstance(execution, Unset):
-        json_execution = UNSET
+    json_created_by_execution: int | None | Unset
+    if isinstance(created_by_execution, Unset):
+        json_created_by_execution = UNSET
     else:
-        json_execution = execution
-    params["execution"] = json_execution
+        json_created_by_execution = created_by_execution
+    params["created_by_execution"] = json_created_by_execution
 
     json_assigned_to: int | None | Unset
     if isinstance(assigned_to, Unset):
@@ -106,7 +106,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     status: InquiryStatus | None | Unset = UNSET,
-    execution: int | None | Unset = UNSET,
+    created_by_execution: int | None | Unset = UNSET,
     assigned_to: int | None | Unset = UNSET,
     offset: int | None | Unset = UNSET,
     limit: int | None | Unset = UNSET,
@@ -115,7 +115,7 @@ def sync_detailed(
 
     Args:
         status (InquiryStatus | None | Unset):
-        execution (int | None | Unset):
+        created_by_execution (int | None | Unset):
         assigned_to (int | None | Unset):
         offset (int | None | Unset):
         limit (int | None | Unset):
@@ -130,7 +130,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         status=status,
-        execution=execution,
+        created_by_execution=created_by_execution,
         assigned_to=assigned_to,
         offset=offset,
         limit=limit,
@@ -147,7 +147,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     status: InquiryStatus | None | Unset = UNSET,
-    execution: int | None | Unset = UNSET,
+    created_by_execution: int | None | Unset = UNSET,
     assigned_to: int | None | Unset = UNSET,
     offset: int | None | Unset = UNSET,
     limit: int | None | Unset = UNSET,
@@ -156,7 +156,7 @@ def sync(
 
     Args:
         status (InquiryStatus | None | Unset):
-        execution (int | None | Unset):
+        created_by_execution (int | None | Unset):
         assigned_to (int | None | Unset):
         offset (int | None | Unset):
         limit (int | None | Unset):
@@ -172,7 +172,7 @@ def sync(
     return sync_detailed(
         client=client,
         status=status,
-        execution=execution,
+        created_by_execution=created_by_execution,
         assigned_to=assigned_to,
         offset=offset,
         limit=limit,
@@ -183,7 +183,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     status: InquiryStatus | None | Unset = UNSET,
-    execution: int | None | Unset = UNSET,
+    created_by_execution: int | None | Unset = UNSET,
     assigned_to: int | None | Unset = UNSET,
     offset: int | None | Unset = UNSET,
     limit: int | None | Unset = UNSET,
@@ -192,7 +192,7 @@ async def asyncio_detailed(
 
     Args:
         status (InquiryStatus | None | Unset):
-        execution (int | None | Unset):
+        created_by_execution (int | None | Unset):
         assigned_to (int | None | Unset):
         offset (int | None | Unset):
         limit (int | None | Unset):
@@ -207,7 +207,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         status=status,
-        execution=execution,
+        created_by_execution=created_by_execution,
         assigned_to=assigned_to,
         offset=offset,
         limit=limit,
@@ -222,7 +222,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     status: InquiryStatus | None | Unset = UNSET,
-    execution: int | None | Unset = UNSET,
+    created_by_execution: int | None | Unset = UNSET,
     assigned_to: int | None | Unset = UNSET,
     offset: int | None | Unset = UNSET,
     limit: int | None | Unset = UNSET,
@@ -231,7 +231,7 @@ async def asyncio(
 
     Args:
         status (InquiryStatus | None | Unset):
-        execution (int | None | Unset):
+        created_by_execution (int | None | Unset):
         assigned_to (int | None | Unset):
         offset (int | None | Unset):
         limit (int | None | Unset):
@@ -248,7 +248,7 @@ async def asyncio(
         await asyncio_detailed(
             client=client,
             status=status,
-            execution=execution,
+            created_by_execution=created_by_execution,
             assigned_to=assigned_to,
             offset=offset,
             limit=limit,

@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-20
+
+### Added
+
+- Workflows can wait on inquiries, executions, and work queue items without
+  creating placeholder child executions. Durable wait records survive executor
+  restarts and route terminal outcomes through normal workflow transitions.
+- Actions can create fixed-option inquiries with encrypted, option-bound
+  response handles. Inquiry responses support typed flat schemas and workflow
+  context access through `inquiry.<task_name>`.
+- Pack releases include immutable executable snapshots, platform catalog state,
+  absent-metadata policies, and catalog refresh tooling.
+- External identity mappings record provider, subject kind, and exact subject so
+  provider actors can resolve to Attune identities without ambiguous matching.
+
+### Changed
+
+- **Breaking:** Workflow inquiries are action-owned. Packs create them through
+  the authenticated inquiry API and guard later tasks with `wait_for.inquiry`;
+  the old `core.ask` and `__inquiry` result-marker contracts are removed.
+- **Breaking:** Inquiry creator references are named `created_by_execution`
+  across the database, API, generated clients, notifications, and web UI.
+- Pack loading and release installation use explicit component retirement and
+  absent-metadata behavior instead of retaining omitted metadata implicitly.
+- Database-backed tests use run-owned template databases and explicit resource
+  ownership so parallel runs do not clean up one another's state.
+
+### Fixed
+
+- Workflow wait reconciliation releases completed targets after missed queue
+  messages and does not dispatch guarded children after timeout or cancellation.
+- Repository test teardown waits for background work and isolates mutable
+  database, queue, filesystem, and service resources by test run.
+
+### Security
+
+- Inquiry creation requires a workflow-task execution token with delegated
+  `inquiries:create` access. Response processing applies assignment,
+  self-approval, schema, and compare-and-set checks in one transaction.
+- External identity authorization locks the integration identity while checking
+  its current grants, and audit data omits response handles and provider secrets.
+
 ## [0.6.3] - 2026-09-15
 
 ### Added
@@ -4790,7 +4832,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.6.3...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/attune-system/attune/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/attune-system/attune/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/attune-system/attune/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/attune-system/attune/compare/v0.6.0...v0.6.1

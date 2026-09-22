@@ -72,6 +72,29 @@ pub struct IntegrationAccessProvenance {
 }
 
 impl Claims {
+    fn sensor_metadata_str(&self, key: &str) -> Result<&str, JwtError> {
+        if self.token_type != TokenType::Sensor {
+            return Err(JwtError::Invalid);
+        }
+
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(key))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(JwtError::Invalid)
+    }
+
+    /// Return the registered sensor reference carried by a sensor token.
+    pub fn sensor_ref(&self) -> Result<&str, JwtError> {
+        self.sensor_metadata_str("sensor_ref")
+    }
+
+    /// Return the registered pack reference carried by a sensor token.
+    pub fn sensor_pack_ref(&self) -> Result<&str, JwtError> {
+        self.sensor_metadata_str("pack_ref")
+    }
+
     /// Parse the integration-token provenance carried by an access token.
     pub fn integration_access_provenance(&self) -> Result<IntegrationAccessProvenance, JwtError> {
         if self.token_type != TokenType::Access

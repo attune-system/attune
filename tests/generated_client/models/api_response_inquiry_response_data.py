@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..models.api_response_inquiry_response_data_response_type_0 import (
         ApiResponseInquiryResponseDataResponseType0,
     )
+    from ..models.inquiry_response_option import InquiryResponseOption
 
 
 T = TypeVar("T", bound="ApiResponseInquiryResponseData")
@@ -29,11 +30,13 @@ class ApiResponseInquiryResponseData:
 
     Attributes:
         created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-        execution (int):
+        created_by_execution (int):
         id (int):
         prompt (str): Prompt text displayed to the user Example: Approve deployment to production?.
         response (ApiResponseInquiryResponseDataResponseType0 | None): Response data provided by the user
-        response_schema (ApiResponseInquiryResponseDataResponseSchemaType0 | None): JSON schema for expected response
+        response_options (list[InquiryResponseOption]): Fixed responses that provider controls may select.
+        response_schema (ApiResponseInquiryResponseDataResponseSchemaType0 | None): Attune flat schema for expected
+            response fields
         status (InquiryStatus):
         updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:45:00Z.
         assigned_to (int | None | Unset):
@@ -47,10 +50,11 @@ class ApiResponseInquiryResponseData:
     """
 
     created: datetime.datetime
-    execution: int
+    created_by_execution: int
     id: int
     prompt: str
     response: ApiResponseInquiryResponseDataResponseType0 | None
+    response_options: list[InquiryResponseOption]
     response_schema: ApiResponseInquiryResponseDataResponseSchemaType0 | None
     status: InquiryStatus
     updated: datetime.datetime
@@ -73,7 +77,7 @@ class ApiResponseInquiryResponseData:
 
         created = self.created.isoformat()
 
-        execution = self.execution
+        created_by_execution = self.created_by_execution
 
         id = self.id
 
@@ -84,6 +88,11 @@ class ApiResponseInquiryResponseData:
             response = self.response.to_dict()
         else:
             response = self.response
+
+        response_options = []
+        for response_options_item_data in self.response_options:
+            response_options_item = response_options_item_data.to_dict()
+            response_options.append(response_options_item)
 
         response_schema: dict[str, Any] | None
         if isinstance(
@@ -148,10 +157,11 @@ class ApiResponseInquiryResponseData:
         field_dict.update(
             {
                 "created": created,
-                "execution": execution,
+                "created_by_execution": created_by_execution,
                 "id": id,
                 "prompt": prompt,
                 "response": response,
+                "response_options": response_options,
                 "response_schema": response_schema,
                 "status": status,
                 "updated": updated,
@@ -182,11 +192,14 @@ class ApiResponseInquiryResponseData:
         from ..models.api_response_inquiry_response_data_response_type_0 import (
             ApiResponseInquiryResponseDataResponseType0,
         )
+        from ..models.inquiry_response_option import (
+            InquiryResponseOption,
+        )
 
         d = dict(src_dict)
         created = datetime.datetime.fromisoformat(d.pop("created"))
 
-        execution = d.pop("execution")
+        created_by_execution = d.pop("created_by_execution")
 
         id = d.pop("id")
 
@@ -210,6 +223,15 @@ class ApiResponseInquiryResponseData:
             return cast(ApiResponseInquiryResponseDataResponseType0 | None, data)
 
         response = _parse_response(d.pop("response"))
+
+        response_options = []
+        _response_options = d.pop("response_options")
+        for response_options_item_data in _response_options:
+            response_options_item = InquiryResponseOption.from_dict(
+                response_options_item_data
+            )
+
+            response_options.append(response_options_item)
 
         def _parse_response_schema(
             data: object,
@@ -319,10 +341,11 @@ class ApiResponseInquiryResponseData:
 
         api_response_inquiry_response_data = cls(
             created=created,
-            execution=execution,
+            created_by_execution=created_by_execution,
             id=id,
             prompt=prompt,
             response=response,
+            response_options=response_options,
             response_schema=response_schema,
             status=status,
             updated=updated,

@@ -17,7 +17,9 @@ use async_trait::async_trait;
 use attune_api::{postgres_listener, AppState, Server};
 use attune_common::{
     artifact_transport::{ApiTransport, ArtifactFileTransport},
-    auth::jwt::{generate_execution_token, generate_worker_token, JwtConfig},
+    auth::jwt::{
+        generate_access_token, generate_execution_token, generate_worker_token, JwtConfig,
+    },
     blob_store::{
         BlobBody, BlobReader, BlobStore, BlobStoreError, ByteRange, DirectUploadAuthorization,
         DirectUploadSpec, ObjectKey, ProviderVersion, S3BlobStore, StoredObject,
@@ -31,6 +33,10 @@ use attune_common::{
     repositories::{
         artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
         execution::{CreateExecutionInput, ExecutionRepository},
+        identity::{
+            CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository,
+        },
         log_stream::LogStreamRepository,
         Create,
     },
@@ -500,6 +506,26 @@ async fn open_log_stream(
     Ok(response.bytes_stream().eventsource())
 }
 
+async fn open_artifact_stream(
+    client: &reqwest::Client,
+    replica: &Replica,
+    fixture: &LogFixture,
+    token: &str,
+) -> Result<
+    impl Stream<Item = std::result::Result<Event, eventsource_stream::EventStreamError<reqwest::Error>>>,
+> {
+    let response = client
+        .get(format!(
+            "{}/api/v1/artifacts/{}/stream",
+            replica.url, fixture.artifact_id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.bytes_stream().eventsource())
+}
+
 async fn next_event<S, E>(stream: &mut S, name: &str, wait: Duration) -> Result<Event>
 where
     S: Stream<Item = std::result::Result<Event, E>> + Unpin,
@@ -693,6 +719,102 @@ async fn log_segment_upload_goes_from_manager_to_minio_without_api_body_relay() 
         })
         .await?;
     assert_eq!(stored, content);
+
+    harness.stop().await
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires PostgreSQL and versioned MinIO"]
+async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
+    let harness = Harness::start(&[false, false]).await?;
+    let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
+    let identity = IdentityRepository::create(
+        harness.database.pool(),
+        CreateIdentityInput {
+            login: "artifact-preview-reader".into(),
+            display_name: None,
+            password_hash: None,
+            attributes: serde_json::json!({}),
+        },
+    )
+    .await?;
+    let permissions = PermissionSetRepository::create(
+        harness.database.pool(),
+        CreatePermissionSetInput {
+            r#ref: "test.artifact_preview_reader".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: serde_json::json!([{
+                "resource": "artifacts",
+                "actions": ["read"],
+                "constraints": {"ids": [fixture.artifact_id]},
+            }]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        harness.database.pool(),
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: permissions.id,
+        },
+    )
+    .await?;
+    let token = generate_access_token(identity.id, &identity.login, &harness.jwt)?;
+    let client = reqwest::Client::new();
+    let mut reader =
+        Box::pin(open_artifact_stream(&client, &harness.replicas[1], &fixture, &token).await?);
+
+    assert_eq!(
+        put_segment(
+            &client,
+            &harness.replicas[0],
+            &fixture,
+            0,
+            b"workflow log preview",
+            &harness.worker_token,
+        )
+        .await?,
+        reqwest::StatusCode::CREATED
+    );
+    let event = next_data_event(&mut reader, Duration::from_secs(3)).await?;
+    assert_eq!(event.event, "content");
+    assert_eq!(event.data, "workflow log preview");
+
+    assert_eq!(
+        put_segment(
+            &client,
+            &harness.replicas[0],
+            &fixture,
+            1,
+            b" appended",
+            &harness.worker_token,
+        )
+        .await?,
+        reqwest::StatusCode::CREATED
+    );
+    let event = next_data_event(&mut reader, Duration::from_secs(3)).await?;
+    assert_eq!(event.event, "append");
+    assert_eq!(event.data, " appended");
+    assert_eq!(
+        seal(
+            &client,
+            &harness.replicas[0],
+            &fixture,
+            false,
+            &harness.worker_token,
+        )
+        .await?,
+        reqwest::StatusCode::OK
+    );
+    next_event(&mut reader, "done", Duration::from_secs(3)).await?;
+    assert!(harness.counts.gets.load(Ordering::Relaxed) >= 2);
+    assert!(!Path::new(&harness.replicas[1].state.config.artifacts_dir)
+        .join(&fixture.file_path)
+        .exists());
+    drop(reader);
 
     harness.stop().await
 }
@@ -1213,7 +1335,6 @@ async fn shared_volume_cross_process_locking_writer_loss_and_retention() -> Resu
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires PostgreSQL"]
 async fn postgres_listener_retries_initial_failure_and_reports_readiness() -> Result<()> {
     use std::str::FromStr;
 

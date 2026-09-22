@@ -1334,6 +1334,10 @@ pub mod trigger {
     }
 
     impl Sensor {
+        pub fn has_transport_demand(&self) -> bool {
+            crate::inquiry_callback_adapter::sensor_has_callback_demand(self.config.as_ref())
+        }
+
         pub fn worker_selector_labels(&self) -> std::collections::BTreeMap<String, String> {
             crate::scheduling::parse_worker_selector(&self.worker_selector).unwrap_or_default()
         }
@@ -1872,17 +1876,38 @@ pub mod execution {
 /// Inquiry model
 pub mod inquiry {
     use super::*;
+    use utoipa::ToSchema;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum InquiryResponseOptionStyle {
+        Default,
+        Positive,
+        Destructive,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct InquiryResponseOption {
+        pub r#ref: String,
+        pub label: String,
+        pub style: InquiryResponseOptionStyle,
+        #[schema(value_type = Object)]
+        pub response: JsonDict,
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct Inquiry {
         pub id: Id,
-        pub execution: Id,
+        pub created_by_execution: Id,
         pub workflow_execution: Option<Id>,
         pub workflow_task_name: Option<String>,
         pub action_attempt_family: Option<Id>,
         pub purpose: Option<String>,
         pub prompt: String,
         pub response_schema: Option<JsonSchema>,
+        #[sqlx(json)]
+        pub response_options: Vec<InquiryResponseOption>,
         pub assigned_to: Option<Id>,
         pub status: InquiryStatus,
         pub response: Option<JsonDict>,
@@ -1896,8 +1921,8 @@ pub mod inquiry {
     }
 
     pub const INQUIRY_SELECT_COLUMNS: &str =
-        "id, execution, workflow_execution, workflow_task_name, \
-        action_attempt_family, purpose, prompt, response_schema, assigned_to, status, response, \
+        "id, created_by_execution, workflow_execution, workflow_task_name, \
+        action_attempt_family, purpose, prompt, response_schema, response_options, assigned_to, status, response, \
         timeout_at, timeout_seconds, responded_by, external_actor, responded_at, created, updated";
 }
 
@@ -1987,6 +2012,7 @@ pub mod identity {
         pub mapped_identity: Id,
         pub provider: String,
         pub tenant: String,
+        pub subject_kind: String,
         pub external_subject: String,
         pub created_by: Option<Id>,
         pub created: DateTime<Utc>,
@@ -2711,6 +2737,9 @@ pub mod workflow {
 
         pub const DASHBOARD_SELECT_COLUMNS: &str = "id, ref, scope_type, scope_ref, pack, owner_identity, \
              visibility, is_adhoc, label, description, effective_enabled AS enabled, enabled_override, is_default_home, revision, spec_version, \
+             spec, tags, retired_at, created, updated";
+        pub const DASHBOARD_RETURNING_COLUMNS: &str = "id, ref, scope_type, scope_ref, pack, owner_identity, \
+             visibility, is_adhoc, label, description, effective_enabled, enabled_override, is_default_home, revision, spec_version, \
              spec, tags, retired_at, created, updated";
 
         #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

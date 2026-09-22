@@ -688,17 +688,21 @@ class TestSupervisorRetention:
 
                 cur.execute(
                     f"""
-                    INSERT INTO inquiry (execution, prompt, status, response, created, updated)
+                    INSERT INTO inquiry (
+                        created_by_execution, prompt, response_options, status, response, created, updated
+                    )
                     VALUES
-                        (%s, %s, 'responded', %s::jsonb, {old}, {old}),
-                        (%s, %s, 'pending', NULL, {old}, {old})
+                        (%s, %s, %s::jsonb, 'responded', %s::jsonb, {old}, {old}),
+                        (%s, %s, %s::jsonb, 'pending', NULL, {old}, {old})
                     """,
                     (
                         responded_inquiry_execution_id,
                         f"{marker} old responded",
+                        '[{"ref":"continue","label":"Continue","style":"default","response":{}}]',
                         '{"ok": true}',
                         pending_inquiry_execution_id,
                         f"{marker} old pending",
+                        '[{"ref":"continue","label":"Continue","style":"default","response":{}}]',
                     ),
                 )
 

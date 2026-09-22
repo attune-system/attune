@@ -44,8 +44,8 @@ use crate::dto::{
         UpdateExternalIdentityMappingRequest,
     },
     inquiry::{
-        CreateInquiryRequest, CreateInquiryResponse, ExternalActorAssertion,
-        ExternalInquiryRespondRequest, InquiryRespondRequest, InquiryResponse, InquirySummary,
+        CreateInquiryRequest, CreateInquiryResponse, InquiryRespondRequest, InquiryResponse,
+        InquiryResponseOptionHandle, InquirySummary,
     },
     key::{CreateKeyRequest, KeyResponse, KeySummary, UpdateKeyRequest},
     pack::{
@@ -289,7 +289,6 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::inquiries::list_inquiries_by_execution,
         crate::routes::inquiries::create_inquiry,
         crate::routes::inquiries::respond_to_inquiry,
-        crate::routes::inquiries::respond_to_inquiry_from_external_adapter,
         crate::routes::inquiries::cancel_inquiry,
 
         // Keys/Secrets
@@ -647,11 +646,12 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             // Inquiry DTOs
             CreateInquiryRequest,
             CreateInquiryResponse,
-            ExternalActorAssertion,
-            ExternalInquiryRespondRequest,
             InquiryRespondRequest,
             InquiryResponse,
+            InquiryResponseOptionHandle,
             InquirySummary,
+            attune_common::models::inquiry::InquiryResponseOption,
+            attune_common::models::inquiry::InquiryResponseOptionStyle,
 
             // Key/Secret DTOs
             CreateKeyRequest,
@@ -897,12 +897,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 194,
+            path_count, 193,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 255,
+            operation_count, 254,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 

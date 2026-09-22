@@ -27,7 +27,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # ── Defaults ──────────────────────────────────────────────────────────────
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 COMPOSE_FILES=("-f" "$PROJECT_ROOT/docker-compose.yaml" "-f" "$PROJECT_ROOT/docker-compose.e2e.yaml")
 if [[ -n "${ATTUNE_E2E_COMPOSE_OVERRIDE:-}" ]]; then
   COMPOSE_FILES+=("-f" "$ATTUNE_E2E_COMPOSE_OVERRIDE")
@@ -259,6 +259,8 @@ cleanup() {
   exit $exit_code
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ "$DO_STARTUP" == true ]]; then
   # Compose image tags are project-scoped, so fail closed before a build can
@@ -272,7 +274,7 @@ if [[ "$DO_BUILD" == true ]]; then
   compose build --quiet \
     --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" \
     e2e-tests \
-    migrations init-user init-pack-binaries init-packs init-agent \
+    migrations init-user init-pack-binaries init-packs init-agent pack-release-upgrade \
     api executor executor-2 notifier supervisor
   log_success "Build complete"
 fi
@@ -292,7 +294,7 @@ if [[ "$DO_STARTUP" == true ]]; then
   fi
 
   # Start infrastructure + application services (not e2e-tests — that's run separately)
-  compose up -d --no-deps "${SERVICES[@]}"
+  compose up -d "${SERVICES[@]}"
 
   # Read this project's container health directly; no fixed host port or
   # in-image curl/wget dependency is required.

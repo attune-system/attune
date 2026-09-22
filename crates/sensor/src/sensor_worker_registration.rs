@@ -797,7 +797,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_database_driven_detection() {
         let _lock = AGENT_ENV_LOCK.lock().await;
         let (config, pool, _database) = isolated_test_context().await;
@@ -818,7 +817,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_sensor_worker_registration() {
         let _lock = AGENT_ENV_LOCK.lock().await;
         let (config, pool, _database) = isolated_test_context().await;
@@ -837,7 +835,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_sensor_worker_capabilities() {
         let _lock = AGENT_ENV_LOCK.lock().await;
         let (config, pool, _database) = isolated_test_context().await;

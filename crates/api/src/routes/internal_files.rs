@@ -3580,7 +3580,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn concurrent_log_commit_and_seal_work_with_one_database_connection() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).expect("test config");
@@ -3940,7 +3939,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn direct_upload_grant_and_completion_publish_exact_object_version() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).expect("test config");
@@ -4133,7 +4131,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn empty_staged_file_completes_downloads_and_is_not_abandoned() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).expect("test config");
@@ -4243,7 +4240,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn shared_log_seal_stats_hashes_and_reads_the_authoritative_file() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).expect("test config");

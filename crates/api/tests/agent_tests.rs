@@ -20,7 +20,6 @@ use helpers::TestContext;
 // ── /api/v1/agent/info ──────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_agent_info_not_configured() {
     let ctx = TestContext::new()
         .await
@@ -39,7 +38,6 @@ async fn test_agent_info_not_configured() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_agent_info_no_auth_required() {
     // Verify that the endpoint is reachable WITHOUT any JWT token.
     // If RequireAuth middleware were applied, this would return 401.
@@ -67,7 +65,6 @@ async fn test_agent_info_no_auth_required() {
 // ── /api/v1/agent/binary ────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_agent_binary_not_configured() {
     let ctx = TestContext::new()
         .await
@@ -87,7 +84,6 @@ async fn test_agent_binary_not_configured() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_agent_binary_no_auth_required() {
     // Same reasoning as test_agent_info_no_auth_required: the binary
     // download endpoint must be publicly accessible (no RequireAuth).
@@ -113,7 +109,6 @@ async fn test_agent_binary_no_auth_required() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_agent_binary_invalid_arch() {
     // Architecture validation (`validate_arch`) rejects unsupported values
     // with 400 Bad Request. However, in the handler the execution order is:

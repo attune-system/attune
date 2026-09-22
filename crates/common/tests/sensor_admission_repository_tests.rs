@@ -102,7 +102,6 @@ async fn create_rule_for_sensor(
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn worker_eligibility_by_sensor_batches_counts_and_placement() {
     let pool = create_test_pool().await.expect("test database");
     let pack = PackFixture::new_unique("sensor_admission")
@@ -205,5 +204,60 @@ async fn worker_eligibility_by_sensor_batches_counts_and_placement() {
         SensorAdmissionRepository::worker_is_eligible(&mut connection, matching.id, worker.id,)
             .await
             .expect("stale scalar eligibility")
+    );
+}
+
+#[tokio::test]
+async fn callback_sensor_is_eligible_for_active_workload_without_rules() {
+    let pool = create_test_pool().await.expect("test database");
+    let pack = PackFixture::new_unique("sensor_socket_admission")
+        .create(&pool)
+        .await
+        .expect("pack");
+    let runtime =
+        RuntimeFixture::new_unique(Some(pack.id), Some(pack.r#ref.clone()), "sensor_runtime")
+            .create(&pool)
+            .await
+            .expect("runtime");
+    let sensor = SensorFixture::new_unique(
+        Some(pack.id),
+        Some(pack.r#ref.clone()),
+        runtime.id,
+        runtime.r#ref.clone(),
+        "socket_sensor",
+    )
+    .create(&pool)
+    .await
+    .expect("sensor");
+    sqlx::query("UPDATE sensor SET config = $1 WHERE id = $2")
+        .bind(json!({
+            "inquiry_callback_adapters": {
+                "test.callback": {
+                    "provider": "test",
+                    "subject_kind": "user",
+                    "request": {
+                        "delivery_id_pointer": "/id",
+                        "tenant_pointer": "/tenant",
+                        "external_subject_pointer": "/user",
+                        "response_handle_pointer": "/handle"
+                    }
+                }
+            }
+        }))
+        .bind(sensor.id)
+        .execute(&pool)
+        .await
+        .expect("enable callback adapter");
+    let worker = create_sensor_worker(&pool, &runtime.name).await;
+
+    let mut connection = pool.acquire().await.expect("connection");
+    assert!(
+        SensorAdmissionRepository::worker_is_eligible_for_active_workload(
+            &mut connection,
+            sensor.id,
+            worker.id,
+        )
+        .await
+        .expect("workload eligibility")
     );
 }

@@ -21,7 +21,6 @@ use serde_json::json;
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_enforcement_minimal() {
     let pool = create_test_pool().await.unwrap();
 
@@ -97,7 +96,6 @@ async fn test_create_enforcement_minimal() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_enforcement_with_event() {
     let pool = create_test_pool().await.unwrap();
 
@@ -168,7 +166,6 @@ async fn test_create_enforcement_with_event() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_enforcement_with_conditions() {
     let pool = create_test_pool().await.unwrap();
 
@@ -237,7 +234,6 @@ async fn test_create_enforcement_with_conditions() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_enforcement_with_any_condition() {
     let pool = create_test_pool().await.unwrap();
 
@@ -303,7 +299,6 @@ async fn test_create_enforcement_with_any_condition() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_enforcement_without_rule_id() {
     let pool = create_test_pool().await.unwrap();
 
@@ -327,7 +322,6 @@ async fn test_create_enforcement_without_rule_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_enforcement_with_invalid_rule_fails() {
     let pool = create_test_pool().await.unwrap();
 
@@ -351,7 +345,6 @@ async fn test_create_enforcement_with_invalid_rule_fails() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_enforcement_with_nonexistent_event_succeeds() {
     let pool = create_test_pool().await.unwrap();
 
@@ -382,7 +375,6 @@ async fn test_create_enforcement_with_nonexistent_event_succeeds() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_enforcement_by_id() {
     let pool = create_test_pool().await.unwrap();
 
@@ -447,7 +439,6 @@ async fn test_find_enforcement_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_enforcement_by_id_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -459,7 +450,6 @@ async fn test_find_enforcement_by_id_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_enforcement_by_id() {
     let pool = create_test_pool().await.unwrap();
 
@@ -518,7 +508,6 @@ async fn test_get_enforcement_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_enforcement_by_id_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -533,7 +522,6 @@ async fn test_get_enforcement_by_id_not_found() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_enforcements_empty() {
     let pool = create_test_pool().await.unwrap();
 
@@ -543,7 +531,6 @@ async fn test_list_enforcements_empty() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_enforcements() {
     let pool = create_test_pool().await.unwrap();
 
@@ -618,7 +605,6 @@ async fn test_list_enforcements() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_enforcement_status() {
     let pool = create_test_pool().await.unwrap();
 
@@ -689,7 +675,6 @@ async fn test_update_enforcement_status() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_enforcement_status_transitions() {
     let pool = create_test_pool().await.unwrap();
 
@@ -771,7 +756,6 @@ async fn test_update_enforcement_status_transitions() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_enforcement_payload() {
     let pool = create_test_pool().await.unwrap();
 
@@ -837,7 +821,6 @@ async fn test_update_enforcement_payload() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_enforcement_both_fields() {
     let pool = create_test_pool().await.unwrap();
 
@@ -904,7 +887,6 @@ async fn test_update_enforcement_both_fields() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_enforcement_no_changes() {
     let pool = create_test_pool().await.unwrap();
 
@@ -971,7 +953,6 @@ async fn test_update_enforcement_no_changes() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_enforcement_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -992,7 +973,6 @@ async fn test_update_enforcement_not_found() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_enforcement() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1056,7 +1036,6 @@ async fn test_delete_enforcement() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_enforcement_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1070,7 +1049,6 @@ async fn test_delete_enforcement_not_found() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_enforcements_by_rule() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1169,7 +1147,6 @@ async fn test_find_enforcements_by_rule() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_enforcements_by_status() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1262,7 +1239,6 @@ async fn test_find_enforcements_by_status() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_enforcements_by_event() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1354,7 +1330,6 @@ async fn test_find_enforcements_by_event() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_rule_sets_enforcement_rule_to_null() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1423,7 +1398,6 @@ async fn test_delete_rule_sets_enforcement_rule_to_null() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_enforcement_resolved_at_lifecycle() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1497,7 +1471,6 @@ async fn test_enforcement_resolved_at_lifecycle() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_loaded_enforcement_uses_loaded_locator() {
     let pool = create_test_pool().await.unwrap();
 

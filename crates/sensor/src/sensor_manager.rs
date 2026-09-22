@@ -5,8 +5,8 @@
 //!
 //! All sensors are independent processes that communicate with the API
 //! to create events. The sensor manager is responsible for:
-//! - Starting sensor processes when rules become active
-//! - Stopping sensor processes when no rules need them
+//! - Starting sensor processes when rules or configured transports need them
+//! - Stopping sensor processes when they no longer have demand
 //! - Provisioning authentication tokens for sensor processes
 //! - Monitoring sensor health and restarting failed sensors
 
@@ -729,17 +729,16 @@ impl SensorManager {
         // Mark as running
         *self.inner.running.write().await = true;
 
-        // Load and start all enabled sensors with active rules
+        // Load and start enabled sensors with rule or transport demand.
         let sensors = self.load_enabled_sensors().await?;
         info!("Loaded {} enabled sensor(s)", sensors.len());
 
         for sensor in sensors {
-            // Only start sensors that have active rules (across all their triggers)
-            match self.sensor_has_active_rules(sensor.id).await {
+            match self.sensor_should_run(&sensor).await {
                 Ok(true) => {
                     let count = self.sensor_active_rule_count(sensor.id).await.unwrap_or(0);
                     info!(
-                        "Starting sensor {} - has {} active rule(s)",
+                        "Starting sensor {} - has {} active rule(s) or transport demand",
                         sensor.r#ref, count
                     );
                     if let Err(e) = self.start_sensor(sensor, true).await {
@@ -747,13 +746,13 @@ impl SensorManager {
                     }
                 }
                 Ok(false) => {
-                    info!("Skipping sensor {} - no active rules", sensor.r#ref);
+                    info!(
+                        "Skipping sensor {} - no rule or transport demand",
+                        sensor.r#ref
+                    );
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to check active rules for sensor {}: {}",
-                        sensor.r#ref, e
-                    );
+                    error!("Failed to check demand for sensor {}: {}", sensor.r#ref, e);
                 }
             }
         }
@@ -809,7 +808,10 @@ impl SensorManager {
         use attune_common::repositories::SensorRepository;
 
         let all_sensors = SensorRepository::list(&self.inner.db).await?;
-        let enabled_sensors: Vec<Sensor> = all_sensors.into_iter().filter(|s| s.enabled).collect();
+        let enabled_sensors: Vec<Sensor> = all_sensors
+            .into_iter()
+            .filter(|sensor| sensor.enabled && sensor.retired_at.is_none())
+            .collect();
         Ok(enabled_sensors)
     }
 
@@ -842,8 +844,7 @@ impl SensorManager {
         tokio::fs::create_dir_all(parent).await?;
         let temporary = cache_key.temporary_sibling(env_dir)?;
         let result = async {
-            self.ensure_runtime_environment_in_place(exec_config, pack_dir, &temporary)
-                .await?;
+            Self::ensure_runtime_environment_in_place(exec_config, pack_dir, &temporary).await?;
             if let Some(interpreter_template) = exec_config
                 .environment
                 .as_ref()
@@ -871,7 +872,6 @@ impl SensorManager {
     }
 
     async fn ensure_runtime_environment_in_place(
-        &self,
         exec_config: &RuntimeExecutionConfig,
         pack_dir: &std::path::Path,
         env_dir: &std::path::Path,
@@ -931,6 +931,9 @@ impl SensorManager {
                 ));
             }
         }
+
+        // Environment creation makes its interpreter available for dependency templates.
+        let vars = exec_config.build_template_vars_with_env(pack_dir, Some(env_dir));
 
         let dep_cfg = match &exec_config.dependencies {
             Some(cfg) => cfg,
@@ -1033,7 +1036,7 @@ impl SensorManager {
             .cloned()
             .collect();
 
-        if enabled_triggers.is_empty() {
+        if enabled_triggers.is_empty() && !sensor.has_transport_demand() {
             warn!(
                 "Sensor {} has no enabled associated triggers, skipping start",
                 sensor.r#ref
@@ -1070,6 +1073,7 @@ impl SensorManager {
                 return Err(error);
             }
         };
+        let definition_updated = sensor.updated;
         let executable_snapshot = workload
             .executable_snapshot
             .clone()
@@ -1089,6 +1093,7 @@ impl SensorManager {
                 reset_failure_count,
                 workload.clone(),
                 pack_revision,
+                definition_updated,
                 executable_snapshot,
             ),
         )
@@ -1157,6 +1162,7 @@ impl SensorManager {
         reset_failure_count: bool,
         workload: OwnedSensorWorkload,
         pack_revision: PackRevision,
+        definition_updated: DateTime<Utc>,
         executable_snapshot: Option<attune_common::models::SensorExecutableSnapshot>,
     ) -> Result<SensorInstance> {
         info!("Starting standalone sensor: {}", sensor.r#ref);
@@ -1356,6 +1362,11 @@ impl SensorManager {
 
         let trigger_instances_json = serde_json::to_string(&trigger_instances)
             .map_err(|e| anyhow!("Failed to serialize trigger instances: {}", e))?;
+        let sensor_config_json =
+            serde_json::to_string(sensor.config.as_ref().unwrap_or(&serde_json::Value::Null))
+                .map_err(|e| anyhow!("Failed to serialize sensor config: {}", e))?;
+        let trigger_types_json = serde_json::to_string(&token_scope.trigger_types)
+            .map_err(|e| anyhow!("Failed to serialize sensor trigger types: {}", e))?;
         info!(
             sensor_id = sensor.id,
             sensor_ref = %sensor.r#ref,
@@ -1441,6 +1452,8 @@ impl SensorManager {
                 workload.generation.to_string(),
             )
             .env("ATTUNE_SENSOR_TRIGGERS", &trigger_instances_json)
+            .env("ATTUNE_SENSOR_CONFIG_JSON", &sensor_config_json)
+            .env("ATTUNE_SENSOR_TRIGGER_TYPES", &trigger_types_json)
             .env("ATTUNE_MQ_URL", &self.inner.mq_url)
             .env("ATTUNE_MQ_EXCHANGE", "attune.events")
             .env(
@@ -1532,6 +1545,7 @@ impl SensorManager {
             token_expires_at,
             workload,
             pack_revision,
+            definition_updated,
         ))
     }
 
@@ -2147,6 +2161,10 @@ impl SensorManager {
         Ok(count > 0)
     }
 
+    async fn sensor_should_run(&self, sensor: &Sensor) -> Result<bool> {
+        Ok(sensor.has_transport_demand() || self.sensor_has_active_rules(sensor.id).await?)
+    }
+
     /// Get count of active rules across all triggers for a sensor
     async fn sensor_active_rule_count(&self, sensor_id: Id) -> Result<i64> {
         let count = sqlx::query_scalar::<_, i64>(
@@ -2384,7 +2402,7 @@ impl SensorManager {
             };
             let eligibility = async {
                 Ok::<_, anyhow::Error>(
-                    self.sensor_has_active_rules(sensor_id).await?
+                    self.sensor_should_run(&sensor).await?
                         && self.sensor_matches_this_worker(&sensor).await?,
                 )
             }
@@ -2465,7 +2483,7 @@ impl SensorManager {
             return Ok(());
         };
 
-        if !matches!(self.sensor_has_active_rules(sensor_id).await, Ok(true))
+        if !matches!(self.sensor_should_run(&latest).await, Ok(true))
             || !matches!(self.sensor_matches_this_worker(&latest).await, Ok(true))
         {
             debug!(
@@ -2655,9 +2673,9 @@ impl SensorManager {
             }
         };
 
-        if active_rule_count <= 0 {
+        if active_rule_count <= 0 && !exited.sensor.has_transport_demand() {
             info!(
-                "Sensor {} exited but has no active rules; marking stopped and not restarting",
+                "Sensor {} exited without rule or transport demand; marking stopped and not restarting",
                 exited.sensor.r#ref
             );
             self.sync_sensor_file_artifacts(&exited.sensor).await;
@@ -2670,7 +2688,7 @@ impl SensorManager {
         let worker_id = self.inner.worker_id.load(Ordering::SeqCst);
         if worker_id <= 0 {
             warn!(
-                "Sensor {} exited with active rules but worker_id is unset; cannot persist backoff or restart safely",
+                "Sensor {} exited with active demand but worker_id is unset; cannot persist backoff or restart safely",
                 exited.sensor.r#ref
             );
             self.forget_sensor_instance_if_current(exited.sensor.id, &exited.instance_identity)
@@ -2808,11 +2826,11 @@ impl SensorManager {
             }
         };
 
-        match self.sensor_active_rule_count(sensor.id).await {
-            Ok(count) if count > 0 => {}
-            Ok(_) => {
+        match self.sensor_should_run(&sensor).await {
+            Ok(true) => {}
+            Ok(false) => {
                 info!(
-                    "Skipping restart for sensor {} because it has no active rules",
+                    "Skipping restart for sensor {} because it has no rule or transport demand",
                     sensor.r#ref
                 );
                 self.persist_sensor_process_stopped(&sensor).await;
@@ -2822,7 +2840,7 @@ impl SensorManager {
             }
             Err(e) => {
                 warn!(
-                    "Skipping restart for sensor {} because active-rule count failed: {}",
+                    "Skipping restart for sensor {} because demand evaluation failed: {}",
                     sensor.r#ref, e
                 );
                 return;
@@ -2895,7 +2913,7 @@ impl SensorManager {
             }
         };
 
-        if active_rule_count <= 0 {
+        if active_rule_count <= 0 && !sensor.has_transport_demand() {
             self.persist_sensor_process_stopped(&sensor).await;
             self.forget_sensor_instance_if_current(sensor.id, &identity)
                 .await;
@@ -2962,7 +2980,7 @@ impl SensorManager {
         backoff_delay: Duration,
         stderr_excerpt: Option<&str>,
     ) {
-        if process.active_rule_count <= 0
+        if (process.active_rule_count <= 0 && !sensor.has_transport_demand())
             || process.consecutive_failures < SENSOR_ALERT_FAILURE_THRESHOLD
             || process.last_alerted_failure_count >= process.consecutive_failures
         {
@@ -3094,8 +3112,7 @@ impl SensorManager {
             // Check if sensor is actively running
             let is_running = self.sensor_instance_running(sensor.id).await;
 
-            // Check if sensor should be running (has active rules across any trigger)
-            let should_run = self.sensor_has_active_rules(sensor.id).await?;
+            let should_run = self.sensor_should_run(&sensor).await?;
 
             match (is_running, should_run) {
                 (false, true) => {
@@ -3114,7 +3131,10 @@ impl SensorManager {
                 }
                 (true, false) => {
                     // Stop sensor
-                    info!("Stopping sensor {} - no active rules", sensor.r#ref);
+                    info!(
+                        "Stopping sensor {} - no rule or transport demand",
+                        sensor.r#ref
+                    );
                     if let Err(e) = self.stop_sensor(sensor.id).await {
                         error!("Failed to stop sensor: {}", e);
                     }
@@ -3288,13 +3308,13 @@ impl SensorManager {
                     sensor.id
                 )
             })?;
-            let should_run = admission.active_rule_count > 0;
+            let should_run = admission.active_rule_count > 0 || sensor.has_transport_demand();
 
             let definition_changed = if is_running {
                 let instances = self.inner.sensors.read().await;
                 instances
                     .get(&sensor.id)
-                    .is_some_and(|instance| instance.sensor.updated != sensor.updated)
+                    .is_some_and(|instance| instance.definition_updated != sensor.updated)
             } else {
                 false
             };
@@ -3367,7 +3387,7 @@ impl SensorManager {
                 }
                 (true, false) => {
                     info!(
-                        "Stopping sensor {} during lifecycle reconciliation - no active rules",
+                        "Stopping sensor {} during lifecycle reconciliation - no rule or transport demand",
                         sensor.r#ref
                     );
                     if let Err(e) = self.stop_sensor(sensor.id).await {
@@ -3524,7 +3544,7 @@ impl SensorManager {
 
     /// Reconcile the running sensor set against the database.
     ///
-    /// Loads all enabled sensors with active rules and starts any that
+    /// Loads enabled sensors with rule or transport demand and starts any that
     /// are not already running.
     async fn reconcile_sensors(&self) {
         let sensors = match self.load_enabled_sensors().await {
@@ -3541,7 +3561,7 @@ impl SensorManager {
                 continue;
             }
 
-            match self.sensor_has_active_rules(sensor.id).await {
+            match self.sensor_should_run(&sensor).await {
                 Ok(true) => {
                     match self.sensor_matches_this_worker(&sensor).await {
                         Ok(true) => {}
@@ -3568,7 +3588,7 @@ impl SensorManager {
                 Ok(false) => {}
                 Err(e) => {
                     warn!(
-                        "Reconcile: failed to check active rules for sensor {}: {}",
+                        "Reconcile: failed to check demand for sensor {}: {}",
                         sensor.r#ref, e,
                     );
                 }
@@ -3672,6 +3692,7 @@ struct SensorInstance {
     token_rotation: Arc<SensorTokenRotation>,
     workload: OwnedSensorWorkload,
     pack_revision: PackRevision,
+    definition_updated: DateTime<Utc>,
 }
 
 impl SensorInstance {
@@ -3684,6 +3705,7 @@ impl SensorInstance {
         token_expires_at: DateTime<Utc>,
         workload: OwnedSensorWorkload,
         pack_revision: PackRevision,
+        definition_updated: DateTime<Utc>,
     ) -> Self {
         let sensor_ref = sensor.r#ref.clone();
         Self {
@@ -3702,6 +3724,7 @@ impl SensorInstance {
             token_rotation: Arc::new(SensorTokenRotation::default()),
             workload,
             pack_revision,
+            definition_updated,
         }
     }
 
@@ -4068,6 +4091,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_runtime_dependency_install_uses_created_environment_interpreter() {
+        let test_dir = test_workspace_path("runtime-dependency-interpreter");
+        let pack_dir = test_dir.join("pack");
+        let env_dir = test_dir.join("runtime");
+        fs::create_dir_all(&pack_dir).await.unwrap();
+        fs::write(pack_dir.join("requirements.txt"), "test-dependency\n")
+            .await
+            .unwrap();
+
+        let exec_config: RuntimeExecutionConfig = serde_json::from_value(serde_json::json!({
+            "interpreter": {"binary": "/bin/false"},
+            "environment": {
+                "env_type": "test",
+                "dir_name": ".runtime",
+                "create_command": [
+                    "/bin/sh",
+                    "-c",
+                    "mkdir -p \"$1/bin\" && cp /bin/true \"$1/bin/runtime\"",
+                    "sh",
+                    "{env_dir}"
+                ],
+                "interpreter_path": "{env_dir}/bin/runtime"
+            },
+            "dependencies": {
+                "manifest_file": "requirements.txt",
+                "install_command": ["{interpreter}"]
+            }
+        }))
+        .unwrap();
+
+        SensorManager::ensure_runtime_environment_in_place(&exec_config, &pack_dir, &env_dir)
+            .await
+            .unwrap();
+
+        assert!(env_dir.join(".attune_sensor_deps_installed").exists());
+        fs::remove_dir_all(&test_dir).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_read_sensor_stderr_excerpt_returns_none_for_missing_or_empty_logs() {
         let artifacts_dir = test_workspace_path("stderr-empty");
         let sensor_dir = artifacts_dir.join("sensors").join("core.test_sensor");
@@ -4257,6 +4319,8 @@ mod tests {
             while let Ok(Some(_)) = reader.next_line().await {}
         });
 
+        let snapshot_updated = chrono::Utc::now();
+        let definition_updated = snapshot_updated + chrono::Duration::minutes(1);
         let test_sensor = attune_common::models::Sensor {
             id: 0,
             r#ref: "test.sensor".to_string(),
@@ -4281,7 +4345,7 @@ mod tests {
             log_retention_limit: None,
             retired_at: None,
             created: chrono::Utc::now(),
-            updated: chrono::Utc::now(),
+            updated: snapshot_updated,
         };
 
         let mut instance = SensorInstance::new_standalone(
@@ -4296,7 +4360,10 @@ mod tests {
                 digest: "a".repeat(64),
                 path: std::path::PathBuf::from("/tmp/test-pack"),
             },
+            definition_updated,
         );
+        assert_eq!(instance.definition_updated, definition_updated);
+        assert_ne!(instance.sensor.updated, instance.definition_updated);
         instance.stop().await;
 
         assert!(instance.stdout_handle.is_none());

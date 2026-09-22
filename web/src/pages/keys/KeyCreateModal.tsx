@@ -124,6 +124,62 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
 
           <div>
             <label
+              htmlFor="ownerType"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
+              Scope <span className="text-red-500">*</span>
+            </label>
+            <select
+              id="ownerType"
+              value={ownerType}
+              onChange={(e) => {
+                setOwnerType(e.target.value as OwnerType);
+                setOwner("");
+              }}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <option value={OwnerType.SYSTEM}>System (global)</option>
+              <option value={OwnerType.IDENTITY}>User (identity)</option>
+              <option value={OwnerType.PACK}>Pack</option>
+              <option value={OwnerType.ACTION}>Action</option>
+              <option value={OwnerType.SENSOR}>Sensor</option>
+            </select>
+          </div>
+
+          {ownerType !== OwnerType.SYSTEM && (
+            <div>
+              <label
+                htmlFor="owner"
+                className="block text-sm font-medium text-gray-700 mb-1"
+              >
+                Owner Identifier
+              </label>
+              <input
+                id="owner"
+                type="text"
+                value={owner}
+                onChange={(e) => setOwner(e.target.value)}
+                placeholder={
+                  ownerType === OwnerType.PACK
+                    ? "e.g., core"
+                    : ownerType === OwnerType.ACTION
+                      ? "e.g., core.echo"
+                      : ownerType === OwnerType.SENSOR
+                        ? "e.g., core.timer_sensor"
+                        : "e.g., alice@example.com"
+                }
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <p className="mt-1 text-xs text-gray-500">
+                {ownerType === OwnerType.IDENTITY
+                  ? "Required identity login"
+                  : "Required owner reference"}
+              </p>
+            </div>
+          )}
+
+          <div>
+            <label
               htmlFor="localRef"
               className="block text-sm font-medium text-gray-700 mb-1"
             >
@@ -246,62 +302,6 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
               Encrypt value (recommended for secrets)
             </label>
           </div>
-
-          <div>
-            <label
-              htmlFor="ownerType"
-              className="block text-sm font-medium text-gray-700 mb-1"
-            >
-              Scope <span className="text-red-500">*</span>
-            </label>
-            <select
-              id="ownerType"
-              value={ownerType}
-              onChange={(e) => {
-                setOwnerType(e.target.value as OwnerType);
-                setOwner("");
-              }}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
-              <option value={OwnerType.SYSTEM}>System (global)</option>
-              <option value={OwnerType.IDENTITY}>User (identity)</option>
-              <option value={OwnerType.PACK}>Pack</option>
-              <option value={OwnerType.ACTION}>Action</option>
-              <option value={OwnerType.SENSOR}>Sensor</option>
-            </select>
-          </div>
-
-          {ownerType !== OwnerType.SYSTEM && (
-            <div>
-              <label
-                htmlFor="owner"
-                className="block text-sm font-medium text-gray-700 mb-1"
-              >
-                Owner Identifier
-              </label>
-              <input
-                id="owner"
-                type="text"
-                value={owner}
-                onChange={(e) => setOwner(e.target.value)}
-                placeholder={
-                  ownerType === OwnerType.PACK
-                    ? "e.g., core"
-                    : ownerType === OwnerType.ACTION
-                      ? "e.g., core.echo"
-                      : ownerType === OwnerType.SENSOR
-                        ? "e.g., core.timer_sensor"
-                        : "e.g., alice@example.com"
-                }
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-              <p className="mt-1 text-xs text-gray-500">
-                {ownerType === OwnerType.IDENTITY
-                  ? "Required identity login"
-                  : "Required owner reference"}
-              </p>
-            </div>
-          )}
 
           <div className="flex items-center justify-end gap-3 pt-4 border-t border-gray-200">
             <button

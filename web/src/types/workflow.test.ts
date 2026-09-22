@@ -215,4 +215,49 @@ describe("workflow wait authoring", () => {
       'Task "process_cache" work_queue_item wait target must be a template expression like {{ parameters.items }}',
     );
   });
+
+  it("rejects unsupported wait targets loaded from an external definition", () => {
+    const malformedTask = task({
+      wait_for: { inquiry: 42 },
+      with_items: "{{ parameters.items }}",
+    });
+    Reflect.deleteProperty(malformedTask.wait_for ?? {}, "inquiry");
+    Reflect.set(malformedTask.wait_for ?? {}, "unknown", 42);
+
+    const errors = validateWorkflow(state(malformedTask));
+    expect(errors).toContain(
+      'Task "process_cache" has an unsupported wait target',
+    );
+    expect(errors).toContain(
+      'Task "process_cache" cannot define wait_for together with iteration',
+    );
+  });
+
+  it("rejects wait targets combined with iteration", () => {
+    expect(
+      validateWorkflow(
+        state(
+          task({
+            wait_for: { inquiry: "{{ task.request.inquiry_id }}" },
+            with_items: "{{ parameters.items }}",
+          }),
+        ),
+      ),
+    ).toContain(
+      'Task "process_cache" cannot define wait_for together with iteration',
+    );
+  });
+
+  it("rejects wait targets on tasks in cyclic graph regions", () => {
+    const first = task({
+      name: "first",
+      wait_for: { inquiry: "{{ task.request.inquiry_id }}" },
+      next: [{ do: ["second"] }],
+    });
+    const second = task({ name: "second", next: [{ do: ["first"] }] });
+
+    expect(
+      validateWorkflow({ ...state(first), tasks: [first, second] }),
+    ).toContain('Task "first" cannot define wait_for in a cyclic graph region');
+  });
 });

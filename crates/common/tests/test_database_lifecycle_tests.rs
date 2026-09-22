@@ -27,7 +27,6 @@ async fn database_exists(database_url: &str, database_name: &str) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL/TimescaleDB"]
 async fn explicit_cleanup_removes_owned_database() {
     let config = test_config();
     let database = TestDatabase::create(&config.database)
@@ -56,7 +55,6 @@ async fn explicit_cleanup_removes_owned_database() {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL/TimescaleDB"]
 async fn panic_drop_fallback_removes_owned_database() {
     let config = test_config();
     let database = TestDatabase::create(&config.database)
@@ -81,7 +79,6 @@ async fn panic_drop_fallback_removes_owned_database() {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL/TimescaleDB"]
 async fn held_database_lock_is_terminated_and_drop_remains_bounded() {
     let config = test_config();
     let database = TestDatabase::create(&config.database)

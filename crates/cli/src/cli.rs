@@ -2,9 +2,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::commands::{
     action::ActionCommands, artifact::ArtifactCommands, audit::AuditCommands, auth::AuthCommands,
-    cache::CacheCommands, config::ConfigCommands, execution::ExecutionCommands, key::KeyCommands,
-    pack::PackCommands, policy::PolicyCommands, queue::QueueCommands, rule::RuleCommands,
-    sensor::SensorCommands, trigger::TriggerCommands, workflow::WorkflowCommands,
+    cache::CacheCommands, config::ConfigCommands, execution::ExecutionCommands,
+    inquiry::InquiryCommands, key::KeyCommands, pack::PackCommands, policy::PolicyCommands,
+    queue::QueueCommands, rule::RuleCommands, sensor::SensorCommands, trigger::TriggerCommands,
+    workflow::WorkflowCommands,
 };
 
 #[derive(Parser)]
@@ -98,6 +99,11 @@ pub enum Commands {
     Execution {
         #[command(subcommand)]
         command: ExecutionCommands,
+    },
+    /// Human inquiry management
+    Inquiry {
+        #[command(subcommand)]
+        command: InquiryCommands,
     },
     /// Workflow management
     Workflow {

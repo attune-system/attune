@@ -165,8 +165,8 @@ or Nexus publication. It uses the tagged commit timestamp so retries produce
 the same detached signature bytes. Both publication paths verify every package
 against the checked-in public key before upload.
 
-For a stable tag such as `v0.4.1`, container images are published with
-`0.4.1`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
+For a stable tag such as `v0.7.0`, container images are published with
+`0.7.0`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
 Homebrew cask and `attune-bin` Arch package repository only for stable `vX.Y.Z`
 tags. Their destination jobs fail when the required credentials are absent. The
 Arch package installs both `attune` and `attune-mcp` from the checksummed Linux
@@ -219,11 +219,11 @@ See the
 for supported values, existing Secret requirements, external-service profiles,
 and storage configuration.
 
-## Suggested First Release Sequence
+## Release sequence
 
 1. Push the workflow changes.
 2. Create `attune-system/aur-attune-bin`, then configure registry credentials
    and, if desired, the Homebrew and Arch package credentials.
    `ARCH_PACKAGE_TOKEN` must have Contents read/write access to that repository.
-3. Create and push the `v0.4.1` release tag.
-4. Install the chart using the `0.4.1` image tag and chart version.
+3. Create and push a new `vX.Y.Z` release tag matching the workspace version.
+4. Install the chart using the published image tag and a compatible chart version.

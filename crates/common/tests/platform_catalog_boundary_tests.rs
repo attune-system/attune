@@ -183,7 +183,6 @@ async fn repeated_python_bootstrap_preserves_platform_and_rejects_changed_defini
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn component_insert_waits_for_activation_and_does_not_pin_old_release() {
     let db = create_test_pool().await.unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -308,7 +307,6 @@ async fn component_insert_waits_for_activation_and_does_not_pin_old_release() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn adoption_waits_for_version_writer_and_rejects_its_unexpected_child() {
     let db = create_test_pool().await.unwrap();
     let core = PackFixture::new("core").create(&db).await.unwrap();

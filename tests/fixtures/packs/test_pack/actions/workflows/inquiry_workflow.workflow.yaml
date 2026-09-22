@@ -1,0 +1,66 @@
+version: "1.0.0"
+
+vars:
+  outcome: pending
+  response: null
+
+tasks:
+  - name: request_inquiry
+    action: test_pack.create_inquiry
+    permission_set_refs:
+      - test_pack.inquiry_creator
+    input:
+      purpose: "{{ parameters.purpose }}"
+      prompt: "{{ parameters.prompt }}"
+      response_schema: "{{ parameters.response_schema }}"
+      response_options: "{{ parameters.response_options }}"
+      timeout_seconds: "{{ parameters.timeout_seconds }}"
+    next:
+      - when: "{{ succeeded() }}"
+        do:
+          - guarded_task
+
+  - name: guarded_task
+    action: core.echo
+    wait_for:
+      inquiry: "{{ task.request_inquiry.inquiry_id }}"
+    input:
+      message: "Inquiry response released the guarded task"
+    next:
+      - when: "{{ succeeded() and inquiry.guarded_task.response.approved == true }}"
+        publish:
+          - outcome: approved
+          - response: "{{ inquiry.guarded_task.response }}"
+        do:
+          - approved_handler
+      - when: "{{ succeeded() and inquiry.guarded_task.response.approved == false }}"
+        publish:
+          - outcome: denied
+          - response: "{{ inquiry.guarded_task.response }}"
+        do:
+          - denied_handler
+      - when: "{{ timed_out() }}"
+        publish:
+          - outcome: timeout
+        do:
+          - timeout_handler
+
+  - name: approved_handler
+    action: core.echo
+    input:
+      message: "Inquiry was approved"
+
+  - name: denied_handler
+    action: core.echo
+    input:
+      message: "Inquiry was denied"
+
+  - name: timeout_handler
+    action: core.echo
+    input:
+      message: "Inquiry timed out"
+
+output_map:
+  inquiry_id: "{{ task.request_inquiry.inquiry_id }}"
+  outcome: "{{ workflow.outcome }}"
+  response: "{{ workflow.response }}"

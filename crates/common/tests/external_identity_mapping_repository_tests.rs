@@ -28,7 +28,6 @@ async fn create_identity(
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn crud_is_scoped_to_the_integration_identity_and_normalizes_keys() {
     let database = create_test_pool().await.unwrap();
     let integration = create_identity(&database, "mapping_integration").await;
@@ -43,6 +42,7 @@ async fn crud_is_scoped_to_the_integration_identity_and_normalizes_keys() {
             mapped_identity: mapped.id,
             provider: "  GitHub  ".to_string(),
             tenant: "  Acme  ".to_string(),
+            subject_kind: "  User  ".to_string(),
             external_subject: "  User-42  ".to_string(),
             created_by: Some(integration.id),
         },
@@ -52,6 +52,7 @@ async fn crud_is_scoped_to_the_integration_identity_and_normalizes_keys() {
 
     assert_eq!(created.provider, "github");
     assert_eq!(created.tenant, "Acme");
+    assert_eq!(created.subject_kind, "user");
     assert_eq!(created.external_subject, "User-42");
     assert!(ExternalIdentityMappingRepository::find_by_id(
         &database,
@@ -76,6 +77,7 @@ async fn crud_is_scoped_to_the_integration_identity_and_normalizes_keys() {
             mapped_identity: replacement.id,
             provider: " OIDC ".to_string(),
             tenant: " Tenant-A ".to_string(),
+            subject_kind: " Service_Account ".to_string(),
             external_subject: " Subject-A ".to_string(),
         },
     )
@@ -83,6 +85,7 @@ async fn crud_is_scoped_to_the_integration_identity_and_normalizes_keys() {
     .unwrap();
     assert_eq!(updated.mapped_identity, replacement.id);
     assert_eq!(updated.provider, "oidc");
+    assert_eq!(updated.subject_kind, "service_account");
     assert!(!ExternalIdentityMappingRepository::delete(
         &database,
         other_integration.id,
@@ -98,8 +101,7 @@ async fn crud_is_scoped_to_the_integration_identity_and_normalizes_keys() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
-async fn exact_resolution_is_case_sensitive_and_rejects_frozen_identities() {
+async fn exact_resolution_normalizes_tokens_and_rejects_frozen_identities() {
     let database = create_test_pool().await.unwrap();
     let integration = create_identity(&database, "resolve_integration").await;
     let mapped = create_identity(&database, "resolve_target").await;
@@ -111,6 +113,7 @@ async fn exact_resolution_is_case_sensitive_and_rejects_frozen_identities() {
             mapped_identity: mapped.id,
             provider: "GitHub".to_string(),
             tenant: "Acme".to_string(),
+            subject_kind: "User".to_string(),
             external_subject: "User-42".to_string(),
             created_by: None,
         },
@@ -124,6 +127,7 @@ async fn exact_resolution_is_case_sensitive_and_rejects_frozen_identities() {
         integration.id,
         " GITHUB ",
         "Acme",
+        " USER ",
         "User-42",
     )
     .await
@@ -135,6 +139,18 @@ async fn exact_resolution_is_case_sensitive_and_rejects_frozen_identities() {
         integration.id,
         "github",
         "acme",
+        "user",
+        "User-42",
+    )
+    .await
+    .unwrap()
+    .is_none());
+    assert!(ExternalIdentityMappingRepository::resolve_exact_for_share(
+        &mut *transaction,
+        integration.id,
+        "github",
+        "Acme",
+        "group",
         "User-42",
     )
     .await
@@ -158,6 +174,7 @@ async fn exact_resolution_is_case_sensitive_and_rejects_frozen_identities() {
         integration.id,
         "github",
         "Acme",
+        "user",
         "User-42",
     )
     .await
@@ -167,7 +184,6 @@ async fn exact_resolution_is_case_sensitive_and_rejects_frozen_identities() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn duplicate_and_invalid_keys_are_rejected() {
     let database = create_test_pool().await.unwrap();
     let integration = create_identity(&database, "constraint_integration").await;
@@ -177,17 +193,23 @@ async fn duplicate_and_invalid_keys_are_rejected() {
         mapped_identity: mapped.id,
         provider: "github".to_string(),
         tenant: "Acme".to_string(),
+        subject_kind: "user".to_string(),
         external_subject: "User-42".to_string(),
         created_by: None,
     };
     ExternalIdentityMappingRepository::create(&database, integration.id, input())
         .await
         .unwrap();
-    assert!(
-        ExternalIdentityMappingRepository::create(&database, integration.id, input())
-            .await
-            .is_err()
-    );
+    assert!(ExternalIdentityMappingRepository::create(
+        &database,
+        integration.id,
+        CreateExternalIdentityMappingInput {
+            subject_kind: " USER ".to_string(),
+            ..input()
+        },
+    )
+    .await
+    .is_err());
     ExternalIdentityMappingRepository::create(
         &database,
         integration.id,
@@ -198,12 +220,23 @@ async fn duplicate_and_invalid_keys_are_rejected() {
     )
     .await
     .expect("tenant and subject keys must remain case-sensitive");
+    ExternalIdentityMappingRepository::create(
+        &database,
+        integration.id,
+        CreateExternalIdentityMappingInput {
+            subject_kind: "group".to_string(),
+            ..input()
+        },
+    )
+    .await
+    .expect("subject kind must be part of the unique key");
 
     let error = ExternalIdentityMappingRepository::create(
         &database,
         integration.id,
         CreateExternalIdentityMappingInput {
             provider: "bad provider".to_string(),
+            subject_kind: "user".to_string(),
             external_subject: "subject".to_string(),
             tenant: "tenant".to_string(),
             mapped_identity: mapped.id,
@@ -213,25 +246,42 @@ async fn duplicate_and_invalid_keys_are_rejected() {
     .await
     .unwrap_err();
     assert!(matches!(error, Error::Validation(_)));
+
+    let error = ExternalIdentityMappingRepository::create(
+        &database,
+        integration.id,
+        CreateExternalIdentityMappingInput {
+            subject_kind: "bad kind".to_string(),
+            ..input()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Validation(_)));
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn inquiry_external_actor_is_limited_to_4096_bytes() {
     let database = create_test_pool().await.unwrap();
 
-    sqlx::query("INSERT INTO inquiry (execution, prompt, external_actor) VALUES ($1, $2, $3)")
+    sqlx::query(
+        "INSERT INTO inquiry (created_by_execution, prompt, response_options, external_actor) VALUES ($1, $2, $3, $4)",
+    )
         .bind(i64::MAX - 1)
         .bind("bounded actor")
+        .bind(json!([{"ref": "continue", "label": "Continue", "style": "default", "response": {}}]))
         .bind(json!({"actor": "x".repeat(4080)}))
         .execute(&database)
         .await
         .unwrap();
 
     let oversized =
-        sqlx::query("INSERT INTO inquiry (execution, prompt, external_actor) VALUES ($1, $2, $3)")
+        sqlx::query(
+            "INSERT INTO inquiry (created_by_execution, prompt, response_options, external_actor) VALUES ($1, $2, $3, $4)",
+        )
             .bind(i64::MAX)
             .bind("oversized actor")
+            .bind(json!([{"ref": "continue", "label": "Continue", "style": "default", "response": {}}]))
             .bind(json!({"actor": "x".repeat(4096)}))
             .execute(&database)
             .await

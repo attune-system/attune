@@ -573,9 +573,13 @@ BuildKit cache can grow to 5-10GB but dramatically speeds up rebuilds.
 2. **Volume backups**:
    ```bash
    # Backup volumes
-   docker run --rm -v attune_postgres_data:/data -v $(pwd):/backup \
+   docker run --rm -v attune_postgres_data_pg18:/data -v $(pwd):/backup \
      alpine tar czf /backup/postgres_backup.tar.gz /data
    ```
+
+   PostgreSQL 16 data directories are not compatible with PostgreSQL 18.
+   Upgrade with a logical `pg_dump` and restore; do not attach the old volume
+   to the PostgreSQL 18 container.
 
 3. **Automated backups**:
    - Use backup solutions (Velero, Restic)

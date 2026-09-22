@@ -1,0 +1,32 @@
+ref: test_pack.inquiry_workflow
+name: inquiry_workflow
+label: Inquiry Workflow
+description: Creates an inquiry and waits before dispatching the guarded task.
+enabled: true
+workflow_file: workflows/inquiry_workflow.workflow.yaml
+default_execution_permission_set_refs:
+  - test_pack.inquiry_creator
+parameters:
+  purpose:
+    type: string
+    required: true
+  prompt:
+    type: string
+    required: true
+  response_schema:
+    type: object
+    required: true
+  response_options:
+    type: array
+    required: true
+  timeout_seconds:
+    type: integer
+    required: true
+    minimum: 1
+output:
+  inquiry_id:
+    type: integer
+  outcome:
+    type: string
+  response:
+    type: object

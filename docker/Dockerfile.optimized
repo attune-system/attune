@@ -121,7 +121,7 @@ RUN apt-get update && apt-get install -y \
 # Create non-root user and directories
 # /opt/attune/packs is mounted as a volume at runtime, not copied in
 RUN useradd -m -u 1000 attune && \
-    mkdir -p /opt/attune/packs /opt/attune/logs /opt/attune/runtime_envs /opt/attune/config && \
+    mkdir -p /opt/attune/packs /opt/attune/logs /opt/attune/runtime_envs /opt/attune/config /opt/attune/blobs && \
     chown -R attune:attune /opt/attune
 
 WORKDIR /opt/attune

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract only Cargo test executables that contain ignored integration tests."""
+"""Extract Cargo test executables that contain normally runnable tests."""
 
 import json
 import shutil
@@ -34,19 +34,34 @@ for line in messages_path.read_text().splitlines():
         subprocess.run(["strip", "--strip-unneeded", destination], check=True)
         continue
     listing = subprocess.run(
+        [source, "--list"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.splitlines()
+    ignored_listing = subprocess.run(
         [source, "--list", "--ignored"],
         check=True,
         capture_output=True,
         text=True,
         timeout=30,
     ).stdout.splitlines()
-    ignored_tests = [
+    all_tests = [
         entry.rsplit(": ", 1)[0]
         for entry in listing
         if entry.endswith(": test") or entry.endswith(": benchmark")
     ]
-    if not ignored_tests:
+    if not all_tests:
         continue
+    ignored_tests = {
+        entry.rsplit(": ", 1)[0]
+        for entry in ignored_listing
+        if entry.endswith(": test") or entry.endswith(": benchmark")
+    }
+    runnable_tests = [
+        test for test in all_tests if test not in ignored_tests
+    ]
 
     package_dir = output_path / package
     package_dir.mkdir(exist_ok=True)
@@ -54,10 +69,10 @@ for line in messages_path.read_text().splitlines():
     shutil.copy2(source, destination)
     subprocess.run(["strip", "--strip-unneeded", destination], check=True)
     manifest.append((package, str(destination)))
-    inventory.extend((package, source.name, test) for test in ignored_tests)
+    inventory.extend((package, source.name, test) for test in runnable_tests)
 
 if not manifest:
-    raise SystemExit("cargo produced no executables containing ignored tests")
+    raise SystemExit("cargo produced no test executables")
 
 with (output_path / "manifest.tsv").open("w") as handle:
     for package, executable in sorted(manifest):

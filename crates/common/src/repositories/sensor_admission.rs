@@ -336,7 +336,7 @@ impl SensorAdmissionRepository {
         if !snapshot.sensor.enabled
             || snapshot.sensor.retired_at.is_some()
             || snapshot.runtime.retired_at.is_some()
-            || !has_active_rule
+            || !(has_active_rule || snapshot.sensor.has_transport_demand())
         {
             return Ok(false);
         }
@@ -482,7 +482,7 @@ fn assess_snapshot(
     }
 
     if snapshot.sensor.enabled
-        && !active_rules.is_empty()
+        && (!active_rules.is_empty() || snapshot.sensor.has_transport_demand())
         && requirement == SensorAdmissionRequirement::Live
         && failures.is_empty()
     {

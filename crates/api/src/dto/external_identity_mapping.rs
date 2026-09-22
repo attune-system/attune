@@ -13,6 +13,8 @@ pub struct CreateExternalIdentityMappingRequest {
     pub provider: String,
     #[validate(length(min = 1, max = 255))]
     pub tenant: String,
+    #[validate(length(min = 1, max = 64))]
+    pub subject_kind: String,
     #[validate(length(min = 1, max = 255))]
     pub external_subject: String,
 }
@@ -26,6 +28,8 @@ pub struct UpdateExternalIdentityMappingRequest {
     pub provider: String,
     #[validate(length(min = 1, max = 255))]
     pub tenant: String,
+    #[validate(length(min = 1, max = 64))]
+    pub subject_kind: String,
     #[validate(length(min = 1, max = 255))]
     pub external_subject: String,
 }
@@ -37,6 +41,7 @@ pub struct ExternalIdentityMappingResponse {
     pub mapped_identity: i64,
     pub provider: String,
     pub tenant: String,
+    pub subject_kind: String,
     pub external_subject: String,
     pub created_by: Option<i64>,
     pub created: chrono::DateTime<chrono::Utc>,
@@ -51,6 +56,7 @@ impl From<ExternalIdentityMapping> for ExternalIdentityMappingResponse {
             mapped_identity: value.mapped_identity,
             provider: value.provider,
             tenant: value.tenant,
+            subject_kind: value.subject_kind,
             external_subject: value.external_subject,
             created_by: value.created_by,
             created: value.created,
@@ -70,6 +76,7 @@ mod tests {
                 "mapped_identity": 2,
                 "provider": "github",
                 "tenant": "acme",
+                "subject_kind": "user",
                 "external_subject": "user-42"
             });
             value[field] = serde_json::json!("must-not-be-accepted");
@@ -84,6 +91,7 @@ mod tests {
             mapped_identity: 0,
             provider: "x".repeat(65),
             tenant: String::new(),
+            subject_kind: "x".repeat(65),
             external_subject: "x".repeat(256),
         };
 
@@ -91,6 +99,7 @@ mod tests {
         assert!(errors.field_errors().contains_key("mapped_identity"));
         assert!(errors.field_errors().contains_key("provider"));
         assert!(errors.field_errors().contains_key("tenant"));
+        assert!(errors.field_errors().contains_key("subject_kind"));
         assert!(errors.field_errors().contains_key("external_subject"));
     }
 }

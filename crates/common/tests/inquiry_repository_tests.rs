@@ -6,9 +6,14 @@
 mod helpers;
 
 use attune_common::{
-    models::enums::InquiryStatus,
+    models::{
+        enums::InquiryStatus,
+        inquiry::{InquiryResponseOption, InquiryResponseOptionStyle},
+    },
     repositories::{
-        inquiry::{CreateInquiryInput, InquiryRepository, UpdateInquiryInput},
+        inquiry::{
+            CreateInquiryInput, InquiryRepository, InquirySearchFilters, UpdateInquiryInput,
+        },
         Create, Delete, FindById, List, Update,
     },
     Error,
@@ -17,12 +22,20 @@ use chrono::{Duration, Utc};
 use helpers::*;
 use serde_json::json;
 
+fn response_options(response: serde_json::Value) -> Vec<InquiryResponseOption> {
+    vec![InquiryResponseOption {
+        r#ref: "continue".to_string(),
+        label: "Continue".to_string(),
+        style: InquiryResponseOptionStyle::Default,
+        response,
+    }]
+}
+
 // ============================================================================
 // CREATE Tests
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_inquiry_minimal() {
     let pool = create_test_pool().await.unwrap();
 
@@ -68,9 +81,10 @@ async fn test_create_inquiry_minimal() {
 
     // Create inquiry with minimal fields
     let input = CreateInquiryInput {
-        execution: execution.id,
+        created_by_execution: execution.id,
         prompt: "Approve deployment?".to_string(),
         response_schema: None,
+        response_options: response_options(json!({})),
         assigned_to: None,
         status: InquiryStatus::Pending,
         response: None,
@@ -80,7 +94,7 @@ async fn test_create_inquiry_minimal() {
     let inquiry = InquiryRepository::create(&pool, input).await.unwrap();
 
     assert!(inquiry.id > 0);
-    assert_eq!(inquiry.execution, execution.id);
+    assert_eq!(inquiry.created_by_execution, execution.id);
     assert_eq!(inquiry.prompt, "Approve deployment?");
     assert_eq!(inquiry.response_schema, None);
     assert_eq!(inquiry.assigned_to, None);
@@ -93,7 +107,6 @@ async fn test_create_inquiry_minimal() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_inquiry_with_response_schema() {
     let pool = create_test_pool().await.unwrap();
 
@@ -136,18 +149,15 @@ async fn test_create_inquiry_with_response_schema() {
     .unwrap();
 
     let response_schema = json!({
-        "type": "object",
-        "properties": {
-            "approved": {"type": "boolean"},
-            "reason": {"type": "string"}
-        },
-        "required": ["approved"]
+        "approved": {"type": "boolean", "required": true},
+        "reason": {"type": "string"}
     });
 
     let input = CreateInquiryInput {
-        execution: execution.id,
+        created_by_execution: execution.id,
         prompt: "Approve this action?".to_string(),
         response_schema: Some(response_schema.clone()),
+        response_options: response_options(json!({"approved": true})),
         assigned_to: None,
         status: InquiryStatus::Pending,
         response: None,
@@ -160,7 +170,6 @@ async fn test_create_inquiry_with_response_schema() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_inquiry_with_timeout() {
     let pool = create_test_pool().await.unwrap();
 
@@ -205,9 +214,10 @@ async fn test_create_inquiry_with_timeout() {
     let timeout_at = Utc::now() + Duration::hours(1);
 
     let input = CreateInquiryInput {
-        execution: execution.id,
+        created_by_execution: execution.id,
         prompt: "Time-sensitive approval".to_string(),
         response_schema: None,
+        response_options: response_options(json!({})),
         assigned_to: None,
         status: InquiryStatus::Pending,
         response: None,
@@ -223,7 +233,6 @@ async fn test_create_inquiry_with_timeout() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_inquiry_with_assigned_user() {
     let pool = create_test_pool().await.unwrap();
 
@@ -280,9 +289,10 @@ async fn test_create_inquiry_with_assigned_user() {
     .unwrap();
 
     let input = CreateInquiryInput {
-        execution: execution.id,
+        created_by_execution: execution.id,
         prompt: "Review and approve".to_string(),
         response_schema: None,
+        response_options: response_options(json!({})),
         assigned_to: Some(identity.id),
         status: InquiryStatus::Pending,
         response: None,
@@ -295,15 +305,15 @@ async fn test_create_inquiry_with_assigned_user() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_inquiry_allows_dangling_execution_reference() {
     let pool = create_test_pool().await.unwrap();
 
     // Try to create inquiry with non-existent execution ID
     let input = CreateInquiryInput {
-        execution: 99999,
+        created_by_execution: 99999,
         prompt: "Test prompt".to_string(),
         response_schema: None,
+        response_options: response_options(json!({})),
         assigned_to: None,
         status: InquiryStatus::Pending,
         response: None,
@@ -312,11 +322,10 @@ async fn test_create_inquiry_allows_dangling_execution_reference() {
 
     let inquiry = InquiryRepository::create(&pool, input).await.unwrap();
 
-    assert_eq!(inquiry.execution, 99999);
+    assert_eq!(inquiry.created_by_execution, 99999);
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
     use attune_common::{
         models::{
@@ -422,12 +431,30 @@ async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
     .await
     .unwrap();
 
+    let assignee = attune_common::repositories::identity::IdentityRepository::create(
+        &pool,
+        attune_common::repositories::identity::CreateIdentityInput {
+            login: format!("assignee_{}", unique_test_id()),
+            display_name: Some("Approver".to_string()),
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await
+    .unwrap();
+
     let create_input = CreateWorkflowInquiryInput {
-        execution: creator.id,
+        created_by_execution: creator.id,
         purpose: "approval".to_string(),
         prompt: "Approve deployment?".to_string(),
         response_schema: Some(json!({"approved": {"type": "boolean", "required": true}})),
-        assigned_to: None,
+        response_options: vec![InquiryResponseOption {
+            r#ref: "approve".to_string(),
+            label: "Approve".to_string(),
+            style: InquiryResponseOptionStyle::Positive,
+            response: json!({"approved": true}),
+        }],
+        assigned_to: Some(assignee.id),
         timeout_seconds: Some(3600),
     };
     let mut conn = pool.acquire().await.unwrap();
@@ -451,6 +478,21 @@ async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
         &mut conn,
         CreateWorkflowInquiryInput {
             prompt: "Different prompt".to_string(),
+            ..create_input.clone()
+        },
+    )
+    .await;
+    assert!(matches!(conflicting, Err(Error::AlreadyExists { .. })));
+
+    let conflicting = InquiryRepository::create_workflow_inquiry_idempotent(
+        &mut conn,
+        CreateWorkflowInquiryInput {
+            response_options: vec![InquiryResponseOption {
+                r#ref: "reject".to_string(),
+                label: "Reject".to_string(),
+                style: InquiryResponseOptionStyle::Destructive,
+                response: json!({"approved": false}),
+            }],
             ..create_input
         },
     )
@@ -522,6 +564,57 @@ async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
     .unwrap();
     assert_eq!(responded.status, InquiryStatus::Responded);
     assert_eq!(responded.responded_by, Some(identity.id));
+
+    let contexts = InquiryRepository::find_contexts_by_ids(&pool, &[inquiry.id])
+        .await
+        .unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].workflow_root_execution_id, Some(parent.id));
+    assert_eq!(
+        contexts[0].assigned_to_login.as_deref(),
+        Some(assignee.login.as_str())
+    );
+    assert_eq!(
+        contexts[0].assigned_to_display_name.as_deref(),
+        Some("Approver")
+    );
+    assert_eq!(
+        contexts[0].responded_by_login.as_deref(),
+        Some(identity.login.as_str())
+    );
+    assert_eq!(
+        contexts[0].responded_by_display_name.as_deref(),
+        Some("Responder")
+    );
+
+    for filters in [
+        InquirySearchFilters {
+            workflow_action_ref: Some(workflow_action.r#ref.clone()),
+            limit: 10,
+            ..Default::default()
+        },
+        InquirySearchFilters {
+            workflow_pack_ref: Some(pack.r#ref.clone()),
+            limit: 10,
+            ..Default::default()
+        },
+    ] {
+        let result = InquiryRepository::search(&pool, &filters).await.unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.rows[0].id, inquiry.id);
+    }
+    let result = InquiryRepository::search(
+        &pool,
+        &InquirySearchFilters {
+            workflow_action_ref: Some(format!("{}.other", pack.r#ref)),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.total, 0);
+
     assert!(InquiryRepository::respond_pending(
         &pool,
         inquiry.id,
@@ -789,10 +882,11 @@ async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
     let pending_inquiry = InquiryRepository::create_workflow_inquiry_idempotent(
         &mut conn,
         CreateWorkflowInquiryInput {
-            execution: creator.id,
+            created_by_execution: creator.id,
             purpose: "cancellation".to_string(),
             prompt: "Cancel this inquiry".to_string(),
             response_schema: None,
+            response_options: response_options(json!({})),
             assigned_to: None,
             timeout_seconds: None,
         },
@@ -856,7 +950,6 @@ async fn test_workflow_inquiry_idempotency_response_and_wait_release() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_inquiry_by_id() {
     let pool = create_test_pool().await.unwrap();
 
@@ -899,7 +992,8 @@ async fn test_find_inquiry_by_id() {
     .unwrap();
 
     let created_inquiry = InquiryFixture::new_unique(execution.id, "Find me")
-        .with_response_schema(json!({"type": "boolean"}))
+        .with_response_schema(json!({"approved": {"type": "boolean", "required": true}}))
+        .with_response_options(response_options(json!({"approved": true})))
         .create(&pool)
         .await
         .unwrap();
@@ -911,13 +1005,15 @@ async fn test_find_inquiry_by_id() {
     assert!(found.is_some());
     let inquiry = found.unwrap();
     assert_eq!(inquiry.id, created_inquiry.id);
-    assert_eq!(inquiry.execution, created_inquiry.execution);
+    assert_eq!(
+        inquiry.created_by_execution,
+        created_inquiry.created_by_execution
+    );
     assert_eq!(inquiry.prompt, created_inquiry.prompt);
     assert_eq!(inquiry.status, created_inquiry.status);
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_inquiry_by_id_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -927,7 +1023,6 @@ async fn test_find_inquiry_by_id_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_inquiry_by_id() {
     let pool = create_test_pool().await.unwrap();
 
@@ -982,7 +1077,6 @@ async fn test_get_inquiry_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_inquiry_by_id_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -997,7 +1091,6 @@ async fn test_get_inquiry_by_id_not_found() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_inquiries_empty() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1007,7 +1100,6 @@ async fn test_list_inquiries_empty() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_inquiries() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1104,7 +1196,6 @@ async fn test_list_inquiries() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_inquiry_status() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1169,7 +1260,6 @@ async fn test_update_inquiry_status() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_inquiry_status_transitions() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1263,7 +1353,6 @@ async fn test_update_inquiry_status_transitions() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_inquiry_response() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1330,7 +1419,6 @@ async fn test_update_inquiry_response() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_inquiry_with_response_and_status() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1397,7 +1485,6 @@ async fn test_update_inquiry_with_response_and_status() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_inquiry_assignment() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1473,7 +1560,6 @@ async fn test_update_inquiry_assignment() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_inquiry_no_changes() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1537,7 +1623,6 @@ async fn test_update_inquiry_no_changes() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_inquiry_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1559,7 +1644,6 @@ async fn test_update_inquiry_not_found() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_inquiry() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1618,7 +1702,6 @@ async fn test_delete_inquiry() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_inquiry_not_found() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1628,8 +1711,7 @@ async fn test_delete_inquiry_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_delete_execution_cascades_to_inquiries() {
+async fn test_delete_execution_preserves_inquiry_reference() {
     let pool = create_test_pool().await.unwrap();
 
     let pack = PackFixture::new_unique("cascade_pack")
@@ -1709,23 +1791,24 @@ async fn test_delete_execution_cascades_to_inquiries() {
         .await
         .unwrap();
 
-    // Delete the execution - should cascade to inquiries
+    // Execution is a hypertable and cannot be an FK target, so the inquiry
+    // keeps its plain BIGINT reference after execution retention removes it.
     use attune_common::repositories::Delete;
     ExecutionRepository::delete(&pool, execution.id)
         .await
         .unwrap();
 
-    // Verify the deleted execution's inquiry is gone.
+    // The deleted execution's inquiry remains available for audit/history.
     let found1 = InquiryRepository::find_by_id(&pool, inquiry1.id)
         .await
         .unwrap();
-    assert!(found1.is_none());
+    assert_eq!(found1.unwrap().created_by_execution, execution.id);
 
     // Unrelated inquiry should remain.
     let found2 = InquiryRepository::find_by_id(&pool, inquiry2.id)
         .await
         .unwrap();
-    assert_eq!(found2.unwrap().execution, execution2.id);
+    assert_eq!(found2.unwrap().created_by_execution, execution2.id);
 }
 
 // ============================================================================
@@ -1733,7 +1816,6 @@ async fn test_delete_execution_cascades_to_inquiries() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_inquiries_by_status() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1873,8 +1955,7 @@ async fn test_find_inquiries_by_status() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_inquiries_by_execution() {
+async fn test_find_inquiries_by_creator_execution() {
     let pool = create_test_pool().await.unwrap();
 
     let pack = PackFixture::new_unique("exec_query_pack")
@@ -1951,13 +2032,13 @@ async fn test_find_inquiries_by_execution() {
         .await
         .unwrap();
 
-    let inquiries = InquiryRepository::find_by_execution(&pool, execution1.id)
+    let inquiries = InquiryRepository::find_by_created_by_execution(&pool, execution1.id)
         .await
         .unwrap();
 
     assert_eq!(inquiries.len(), 1);
     for inquiry in &inquiries {
-        assert_eq!(inquiry.execution, execution1.id);
+        assert_eq!(inquiry.created_by_execution, execution1.id);
     }
 }
 
@@ -1966,7 +2047,6 @@ async fn test_find_inquiries_by_execution() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_inquiry_timestamps_auto_managed() {
     let pool = create_test_pool().await.unwrap();
 
@@ -2042,7 +2122,6 @@ async fn test_inquiry_timestamps_auto_managed() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_inquiry_complex_response_schema() {
     let pool = create_test_pool().await.unwrap();
 
@@ -2085,29 +2164,30 @@ async fn test_inquiry_complex_response_schema() {
     .unwrap();
 
     let complex_schema = json!({
-        "type": "object",
-        "properties": {
-            "severity": {
-                "type": "string",
-                "enum": ["low", "medium", "high", "critical"]
-            },
-            "impact_analysis": {
-                "type": "object",
-                "properties": {
-                    "affected_systems": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "estimated_downtime": {"type": "number"}
-                }
-            },
-            "approval": {"type": "boolean"}
+        "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"],
+            "required": true
         },
-        "required": ["severity", "approval"]
+        "impact_analysis": {
+            "type": "object",
+            "properties": {
+                "affected_systems": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "estimated_downtime": {"type": "number"}
+            }
+        },
+        "approval": {"type": "boolean", "required": true}
     });
 
     let inquiry = InquiryFixture::new_unique(execution.id, "Complex schema")
         .with_response_schema(complex_schema.clone())
+        .with_response_options(response_options(json!({
+            "severity": "low",
+            "approval": true
+        })))
         .create(&pool)
         .await
         .unwrap();

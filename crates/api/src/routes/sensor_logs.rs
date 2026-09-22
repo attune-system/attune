@@ -50,6 +50,7 @@ pub(crate) struct SensorLogSummary {
 pub(crate) struct SensorLogEntry {
     stream: String,
     artifact_ref: String,
+    artifact_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,9 +90,14 @@ pub(crate) async fn list_sensor_logs(
     let mut logs = Vec::new();
 
     for stream in &["stdout", "stderr"] {
+        let artifact_ref = format!("sensor.{}.{}", sensor_ref, stream);
+        let artifact_id = ArtifactRepository::find_by_ref(&state.db, &artifact_ref)
+            .await?
+            .map(|artifact| artifact.id);
         logs.push(SensorLogEntry {
             stream: stream.to_string(),
-            artifact_ref: format!("sensor.{}.{}", sensor_ref, stream),
+            artifact_ref,
+            artifact_id,
         });
     }
 

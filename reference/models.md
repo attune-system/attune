@@ -266,17 +266,23 @@ Attune is an event-driven automation and orchestration platform with built-in mu
 **Purpose**: Represents an asynchronous user interaction within a workflow execution.
 
 **Key Fields**:
-- `execution`: Execution that is waiting on this inquiry
+- `created_by_execution`: Execution that created this inquiry
+- `workflow_execution`: Workflow instance that contains the creator execution
 - `prompt`: Question or prompt text for the user
-- `response_schema`: JSON schema defining expected response format
+- `response_schema`: Optional Attune flat schema defining expected response fields
+- `response_options`: Immutable provider-neutral response choices
 - `assigned_to`: Identity who should respond to this inquiry
 - `status`: Current state of the inquiry
 - `response`: JSON response data from the user
 - `timeout_at`: When this inquiry expires
+- `timeout_seconds`: Immutable relative timeout used for idempotent creation
+- `responded_by`: Attune identity that submitted the accepted response
+- `external_actor`: Non-secret attribution for an accepted integration response
 - `responded_at`: When the response was received
 
 **Relationships**:
-- Belongs to: execution
+- Created by: execution
+- Scoped to: workflow execution
 - Assigned to: identity
 
 **Purpose**: Enables workflows to pause and wait for human input/approval. When an action needs user interaction (e.g., approval, additional information, decision-making), it creates an Inquiry. The workflow execution pauses until the inquiry is responded to, times out, or is cancelled. This allows for human-in-the-loop automation patterns.

@@ -20,7 +20,6 @@ use serde_json::json;
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_sensor_minimal() {
     let pool = create_test_pool().await.unwrap();
 
@@ -65,7 +64,6 @@ async fn test_create_sensor_minimal() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_sensor_with_param_schema() {
     let pool = create_test_pool().await.unwrap();
 
@@ -115,7 +113,6 @@ async fn test_create_sensor_with_param_schema() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_sensor_without_pack() {
     let pool = create_test_pool().await.unwrap();
 
@@ -145,7 +142,6 @@ async fn test_create_sensor_without_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_sensor_duplicate_ref_fails() {
     let pool = create_test_pool().await.unwrap();
 
@@ -200,7 +196,6 @@ async fn test_create_sensor_duplicate_ref_fails() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_sensor_invalid_ref_format_fails() {
     let pool = create_test_pool().await.unwrap();
 
@@ -259,7 +254,6 @@ async fn test_create_sensor_invalid_ref_format_fails() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_sensor_invalid_pack_fails() {
     let pool = create_test_pool().await.unwrap();
 
@@ -301,7 +295,6 @@ async fn test_create_sensor_invalid_pack_fails() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_sensor_invalid_runtime_fails() {
     let pool = create_test_pool().await.unwrap();
 
@@ -337,7 +330,6 @@ async fn test_create_sensor_invalid_runtime_fails() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_id_exists() {
     let pool = create_test_pool().await.unwrap();
 
@@ -379,7 +371,6 @@ async fn test_find_by_id_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_id_not_exists() {
     let pool = create_test_pool().await.unwrap();
 
@@ -388,7 +379,6 @@ async fn test_find_by_id_not_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_by_id_exists() {
     let pool = create_test_pool().await.unwrap();
 
@@ -425,7 +415,6 @@ async fn test_get_by_id_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_by_id_not_exists_fails() {
     let pool = create_test_pool().await.unwrap();
 
@@ -435,7 +424,6 @@ async fn test_get_by_id_not_exists_fails() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ref_exists() {
     let pool = create_test_pool().await.unwrap();
 
@@ -476,7 +464,6 @@ async fn test_find_by_ref_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_ref_not_exists() {
     let pool = create_test_pool().await.unwrap();
 
@@ -487,7 +474,6 @@ async fn test_find_by_ref_not_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_by_ref_exists() {
     let pool = create_test_pool().await.unwrap();
 
@@ -526,7 +512,6 @@ async fn test_get_by_ref_exists() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_get_by_ref_not_exists_fails() {
     let pool = create_test_pool().await.unwrap();
 
@@ -536,7 +521,6 @@ async fn test_get_by_ref_not_exists_fails() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_all_sensors() {
     let pool = create_test_pool().await.unwrap();
 
@@ -590,7 +574,6 @@ async fn test_list_all_sensors() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_empty() {
     let pool = create_test_pool().await.unwrap();
 
@@ -605,7 +588,6 @@ async fn test_list_empty() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_label() {
     let pool = create_test_pool().await.unwrap();
 
@@ -654,7 +636,6 @@ async fn test_update_label() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_description() {
     let pool = create_test_pool().await.unwrap();
 
@@ -700,7 +681,6 @@ async fn test_update_description() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_entrypoint() {
     let pool = create_test_pool().await.unwrap();
 
@@ -743,7 +723,6 @@ async fn test_update_entrypoint() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_enabled_status() {
     let pool = create_test_pool().await.unwrap();
 
@@ -801,7 +780,6 @@ async fn test_update_enabled_status() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_param_schema() {
     let pool = create_test_pool().await.unwrap();
 
@@ -854,7 +832,6 @@ async fn test_update_param_schema() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_multiple_fields() {
     let pool = create_test_pool().await.unwrap();
 
@@ -908,7 +885,6 @@ async fn test_update_multiple_fields() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_no_changes() {
     let pool = create_test_pool().await.unwrap();
 
@@ -956,7 +932,6 @@ async fn test_update_no_changes() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_nonexistent_sensor_fails() {
     let pool = create_test_pool().await.unwrap();
 
@@ -974,7 +949,6 @@ async fn test_update_nonexistent_sensor_fails() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_existing_sensor() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1015,7 +989,6 @@ async fn test_delete_existing_sensor() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_nonexistent_sensor() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1024,7 +997,6 @@ async fn test_delete_nonexistent_sensor() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_sensor_when_pack_deleted() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1066,7 +1038,6 @@ async fn test_delete_sensor_when_pack_deleted() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_sensor_nullifies_trigger_sensor_ref() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1129,7 +1100,6 @@ async fn test_delete_sensor_nullifies_trigger_sensor_ref() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_sensor_when_runtime_deleted() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1179,7 +1149,6 @@ async fn test_delete_sensor_when_runtime_deleted() {
 // See trigger_repository_tests.rs for those tests.
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_enabled() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1232,7 +1201,6 @@ async fn test_find_enabled() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_enabled_empty() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1270,7 +1238,6 @@ async fn test_find_enabled_empty() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_pack() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1350,7 +1317,6 @@ async fn test_find_by_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_by_pack_no_sensors() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1371,7 +1337,6 @@ async fn test_find_by_pack_no_sensors() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_created_timestamp_set_automatically() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1411,7 +1376,6 @@ async fn test_created_timestamp_set_automatically() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_updated_timestamp_changes_on_update() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1458,7 +1422,6 @@ async fn test_updated_timestamp_changes_on_update() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_updated_timestamp_unchanged_on_read() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1504,7 +1467,6 @@ async fn test_updated_timestamp_unchanged_on_read() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_param_schema_complex_structure() {
     let pool = create_test_pool().await.unwrap();
 
@@ -1577,7 +1539,6 @@ async fn test_param_schema_complex_structure() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_param_schema_can_be_null() {
     let pool = create_test_pool().await.unwrap();
 

@@ -233,7 +233,6 @@ async fn selected_worker_for_execution(pool: &PgPool, action: &Action) -> anyhow
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn schema_isolated_executions_do_not_reuse_cached_actions() -> anyhow::Result<()> {
     let first_pool = create_test_pool().await?;
     let second_pool = create_test_pool().await?;
@@ -291,7 +290,6 @@ async fn schema_isolated_executions_do_not_reuse_cached_actions() -> anyhow::Res
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn schedules_execution_on_worker_matching_selector_label() -> anyhow::Result<()> {
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -321,7 +319,6 @@ async fn schedules_execution_on_worker_matching_selector_label() -> anyhow::Resu
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn preferred_affinity_schedules_execution_on_labelled_worker() -> anyhow::Result<()> {
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -365,7 +362,6 @@ async fn preferred_affinity_schedules_execution_on_labelled_worker() -> anyhow::
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn avoids_no_schedule_tainted_worker_without_toleration() -> anyhow::Result<()> {
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -395,7 +391,6 @@ async fn avoids_no_schedule_tainted_worker_without_toleration() -> anyhow::Resul
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn schedules_execution_on_tainted_worker_when_tolerated() -> anyhow::Result<()> {
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -433,7 +428,6 @@ async fn schedules_execution_on_tainted_worker_when_tolerated() -> anyhow::Resul
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn execution_worker_selector_override_replaces_action_default() -> anyhow::Result<()> {
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -465,7 +459,6 @@ async fn execution_worker_selector_override_replaces_action_default() -> anyhow:
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn execution_empty_selector_override_clears_action_default() -> anyhow::Result<()> {
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -497,7 +490,6 @@ async fn execution_empty_selector_override_clears_action_default() -> anyhow::Re
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn workflow_task_worker_selector_override_controls_child_execution() -> anyhow::Result<()> {
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -535,7 +527,6 @@ async fn workflow_task_worker_selector_override_controls_child_execution() -> an
 }
 
 #[tokio::test]
-#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
 async fn workflow_task_toleration_override_allows_tainted_child_execution() -> anyhow::Result<()> {
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();

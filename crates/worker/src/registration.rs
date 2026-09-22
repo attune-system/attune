@@ -524,7 +524,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_worker_registration() {
         let (config, pool, _database) = isolated_test_context().await;
         let mut registration = WorkerRegistration::new(pool, &config);
@@ -545,7 +544,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_worker_capabilities() {
         let (config, pool, _database) = isolated_test_context().await;
         let mut registration = WorkerRegistration::new(pool, &config);

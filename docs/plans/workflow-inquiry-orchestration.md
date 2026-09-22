@@ -28,18 +28,14 @@ tasks:
   - name: request_approval
     action: slack.request_approval
     permission_set_refs:
-      - workflow-inquiry-create
+      - standard
+      - slack.inquiry_creator
     input:
+      purpose: "production-deploy"
       channel: "#production-approvals"
       prompt: "Approve deployment of {{ parameters.version }} to production?"
       assigned_to: "{{ parameters.approver_identity_id }}"
-      response_schema:
-        approved:
-          type: boolean
-          required: true
-        reason:
-          type: string
-      timeout: 3600
+      timeout_seconds: 3600
     next:
       - when: "{{ succeeded() }}"
         do:
@@ -201,13 +197,13 @@ The action must also use the provider's idempotency mechanism when one exists. A
 
 The action creates the inquiry with its execution token. The API derives the creator execution, workflow execution, and workflow task identity from that token. The action cannot claim an arbitrary execution or workflow.
 
-The reserved `standard` permission does not grant inquiry creation. The action needs an explicit permission set such as `workflow-inquiry-create`.
+The reserved `standard` permission does not grant inquiry creation. The Slack action also uses `slack.inquiry_creator`.
 
 The inquiry response schema remains Attune's flat per-field format. The API validates submitted responses against that schema.
 
 ## External response path
 
-The first released external-response contract is the [provider-neutral inquiry callback ingress](provider-neutral-inquiry-callback-ingress.md). Providers call the Attune API directly. Unreleased listener and normalized-response scaffolding is not a compatibility contract and must be removed before release.
+The first released external-response contract uses metadata-selected adapters on fenced managed sensors and the internal durable callback inbox. Slack Socket Mode is the first configured adapter, not a platform route. The API acknowledges a provider delivery after the inbox commit, then a background monitor applies the response with fresh authorization, mapping, assignment, and inquiry-state checks. The [provider-neutral inquiry callback ingress](provider-neutral-inquiry-callback-ingress.md) defines the public HTTP contract for providers that sign direct callbacks. Unreleased listener and normalized-response scaffolding is not a compatibility contract and must be removed before release.
 
 Examples include:
 
@@ -292,7 +288,7 @@ The inquiry remains owned by the upstream action execution that created and deli
 
 The API stores workflow scope inferred from the creator execution. A guarded task may wait only for an inquiry created within the same workflow execution. Cross-workflow and arbitrary inquiry waits are outside the first contract.
 
-The unreleased `InquiryHandler` scaffolding assumes that a response completes `inquiry.execution`. Remove it before action-created waitable inquiries are enabled. A response changes inquiry state; workflow wait resolution controls downstream scheduling. Synthetic `core.ask` execution completion and the `__inquiry` result marker must not ship.
+The unreleased `InquiryHandler` scaffolding assumes that a response completes `inquiry.created_by_execution`. Remove it before action-created waitable inquiries are enabled. A response changes inquiry state; workflow wait resolution controls downstream scheduling. Synthetic `core.ask` execution completion and the `__inquiry` result marker must not ship.
 
 ## Coordinator flow
 

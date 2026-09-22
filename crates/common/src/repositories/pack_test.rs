@@ -257,7 +257,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_create_test_execution() {
         let (_pool, pack_repo, test_repo) = setup().await;
 
@@ -322,7 +321,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_get_latest_by_pack() {
         let (_pool, pack_repo, test_repo) = setup().await;
 
@@ -364,7 +362,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_get_stats() {
         let (_pool, pack_repo, test_repo) = setup().await;
 

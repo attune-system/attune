@@ -1,4 +1,9 @@
-# Testing Status and Coverage Analysis
+# Historical Testing Status and Coverage Analysis
+
+> This January 2026 snapshot is retained as a historical planning record. It is
+> not the current test inventory. Use [Running Tests](running-tests.md) for the
+> supported test commands and inspect the generated Rust test inventory instead
+> of relying on the fixed counts below.
 
 **Last Updated**: 2026-01-19  
 **Project Phase**: Early Development (Phase 2-3)  
@@ -526,7 +531,7 @@ This document tracks testing coverage across all Attune components, identifying 
 **Running Integration Tests**:
 ```bash
 # All tests (except extreme stress)
-cargo test --test fifo_ordering_integration_test -- --ignored --test-threads=1
+cargo test --test fifo_ordering_integration_test -- --test-threads=4
 
 # Individual test with output
 cargo test --test fifo_ordering_integration_test test_high_concurrency_stress -- --ignored --nocapture

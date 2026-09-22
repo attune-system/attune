@@ -9,6 +9,7 @@ from typing_extensions import Self
 
 if TYPE_CHECKING:
     from ..models.inquiry_response import InquiryResponse
+    from ..models.inquiry_response_option_handle import InquiryResponseOptionHandle
 
 
 T = TypeVar("T", bound="CreateInquiryResponse")
@@ -16,28 +17,31 @@ T = TypeVar("T", bound="CreateInquiryResponse")
 
 @_attrs_define
 class CreateInquiryResponse:
-    """Creation result containing the inquiry and its provider-neutral response handle.
+    """Creation result containing the inquiry and one opaque handle per response option.
 
     Attributes:
         inquiry (InquiryResponse): Full inquiry response with all details
-        response_handle (str): Opaque correlation handle for one-shot external responses. Example: attune_irh_REDACTED.
+        response_options (list[InquiryResponseOptionHandle]):
     """
 
     inquiry: InquiryResponse
-    response_handle: str
+    response_options: list[InquiryResponseOptionHandle]
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         inquiry = self.inquiry.to_dict()
 
-        response_handle = self.response_handle
+        response_options = []
+        for response_options_item_data in self.response_options:
+            response_options_item = response_options_item_data.to_dict()
+            response_options.append(response_options_item)
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
                 "inquiry": inquiry,
-                "response_handle": response_handle,
+                "response_options": response_options,
             }
         )
 
@@ -46,15 +50,25 @@ class CreateInquiryResponse:
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         from ..models.inquiry_response import InquiryResponse
+        from ..models.inquiry_response_option_handle import (
+            InquiryResponseOptionHandle,
+        )
 
         d = dict(src_dict)
         inquiry = InquiryResponse.from_dict(d.pop("inquiry"))
 
-        response_handle = d.pop("response_handle")
+        response_options = []
+        _response_options = d.pop("response_options")
+        for response_options_item_data in _response_options:
+            response_options_item = InquiryResponseOptionHandle.from_dict(
+                response_options_item_data
+            )
+
+            response_options.append(response_options_item)
 
         create_inquiry_response = cls(
             inquiry=inquiry,
-            response_handle=response_handle,
+            response_options=response_options,
         )
 
         create_inquiry_response.additional_properties = d

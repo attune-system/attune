@@ -13,7 +13,6 @@ use helpers::*;
 use serde_json::json;
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_action() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -36,7 +35,6 @@ async fn test_create_action() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_action_with_optional_fields() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -76,7 +74,6 @@ async fn test_create_action_with_optional_fields() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_action_by_id() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -101,7 +98,6 @@ async fn test_find_action_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_action_by_id_not_found() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -111,7 +107,6 @@ async fn test_find_action_by_id_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_action_by_ref() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -135,7 +130,6 @@ async fn test_find_action_by_ref() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_action_by_ref_not_found() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -147,7 +141,6 @@ async fn test_find_action_by_ref_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_actions() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -177,7 +170,6 @@ async fn test_list_actions() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_actions_empty() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -187,7 +179,6 @@ async fn test_list_actions_empty() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_action() {
     let pool = create_test_pool().await.unwrap();
 
@@ -223,7 +214,6 @@ async fn test_update_action() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_action_not_found() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -238,7 +228,6 @@ async fn test_update_action_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_action_partial() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -268,7 +257,6 @@ async fn test_update_action_partial() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_action() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -293,7 +281,6 @@ async fn test_delete_action() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_action_not_found() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -303,7 +290,6 @@ async fn test_delete_action_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_actions_cascade_delete_with_pack() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -327,7 +313,6 @@ async fn test_actions_cascade_delete_with_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_action_foreign_key_constraint() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -366,7 +351,6 @@ async fn test_action_foreign_key_constraint() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_multiple_actions_same_pack() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -391,7 +375,6 @@ async fn test_multiple_actions_same_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_action_unique_ref_constraint() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -416,7 +399,6 @@ async fn test_action_unique_ref_constraint() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_action_with_json_schemas() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -454,7 +436,6 @@ async fn test_action_with_json_schemas() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_action_timestamps_auto_populated() {
     let mut tx = create_test_transaction().await.unwrap();
 
@@ -474,7 +455,6 @@ async fn test_action_timestamps_auto_populated() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_action_updated_changes_on_update() {
     let pool = create_test_pool().await.unwrap();
 

@@ -18,7 +18,6 @@ fn acquired_lease(
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn concurrent_replicas_enforce_cluster_global_limit() {
     let database = create_test_pool().await.expect("test database");
     let first_replica = database.pool().clone();
@@ -48,7 +47,6 @@ async fn concurrent_replicas_enforce_cluster_global_limit() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn concurrent_replicas_scope_limit_to_signed_identity() {
     let database = create_test_pool().await.expect("test database");
     let first_replica = database.pool().clone();
@@ -82,7 +80,6 @@ async fn concurrent_replicas_scope_limit_to_signed_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn expired_lease_is_recovered_after_replica_crash() {
     let database = create_test_pool().await.expect("test database");
     let (abandoned_lease, initial_expires_at) = acquired_lease(
@@ -122,7 +119,6 @@ async fn expired_lease_is_recovered_after_replica_crash() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn release_and_renewal_control_lease_lifetime() {
     let database = create_test_pool().await.expect("test database");
     let (lease, initial_expires_at) = acquired_lease(

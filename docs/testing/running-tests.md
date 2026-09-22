@@ -23,12 +23,12 @@ make test-sensor
 make test-cli
 ```
 
-Some Rust tests marked `#[ignore]` require PostgreSQL/TimescaleDB or other services:
+Database-backed Rust tests run normally and require PostgreSQL/TimescaleDB:
 
 ```bash
 ATTUNE_TEST_RUN_ID=local1 \
   cargo test -p attune-common --test test_database_lifecycle_tests -- \
-  --ignored --test-threads=1
+  --test-threads=4
 ```
 
 `ATTUNE_TEST_RUN_ID` must be 1–20 lowercase ASCII letters/digits, optionally with non-leading `-`. It makes database clones and the migration template attributable to one invocation, for example `attune_db_local1_<uuid>` and `attune_tpl_local1_<migration-hash>`.
@@ -38,7 +38,7 @@ ATTUNE_TEST_RUN_ID=local1 \
 Use the runner scripts rather than raw Compose. They generate or require explicit run identities, refuse existing project resources before startup/build, remove only stacks they started, and do not publish fixed host ports.
 
 ```bash
-# Rust ignored/integration tests against an owned PostgreSQL project
+# Rust integration tests against an owned PostgreSQL project
 bash scripts/run-rust-integration-tests.sh --crate common
 bash scripts/run-rust-integration-tests.sh --crate api --filter test_name
 bash scripts/run-rust-integration-tests.sh --test action_repository_tests
@@ -59,8 +59,8 @@ ATTUNE_E2E_RUN_ID=debug1 ATTUNE_E2E_PROJECT_NAME=attune-debug1 \
 ATTUNE_E2E_RUN_ID=debug-attach ATTUNE_E2E_PROJECT_NAME=attune-debug1 \
   bash scripts/run-integration-tests.sh --no-startup --no-build --tier 1
 
-# Optional bounded concurrency; certify the selected class before adopting it
-ATTUNE_RUST_TEST_THREADS=2 \
+# Database-backed tests require at least four libtest threads
+ATTUNE_RUST_TEST_THREADS=4 \
   bash scripts/run-rust-integration-tests.sh --crate common
 
 # Target one executable at a larger candidate budget
@@ -72,9 +72,9 @@ bash scripts/benchmark-rust-integration-tests.sh \
   /tmp/attune-rust-integration-benchmark.tsv
 ```
 
-The Rust image uses a small runtime stage and stores only stripped executables containing ignored tests, not the Rust toolchain or Cargo's incremental directory. Its `inventory.tsv` is the exact artifact fingerprint. A normal runtime invocation executes those binaries directly and does not compile. Changes limited to the entrypoint or other runtime Docker fixtures do not invalidate the workspace compile layer.
+The Rust image uses a small runtime stage and stores stripped test executables, not the Rust toolchain or Cargo's incremental directory. Its `inventory.tsv` is the exact runnable-test fingerprint. A normal runtime invocation executes those binaries directly and does not compile. Changes limited to the entrypoint or other runtime Docker fixtures do not invalidate the workspace compile layer.
 
-The Docker lane intentionally uses libtest rather than cargo-nextest. A 0.9.145 prototype matched all 904 ignored-test identities but was 7.2% slower by median test time across three equal 591-test common-crate samples. The stock nextest archive was also larger than the complete current runtime image. See [Test concurrency reliability](../plans/test-concurrency-reliability.md#cargo-nextest-scheduler-investigation) for the coverage map and measurements.
+The Docker lane intentionally uses libtest rather than cargo-nextest. An earlier 0.9.145 prototype matched the then-ignored database-test identities but was 7.2% slower by median test time across three equal 591-test common-crate samples. The stock nextest archive was also larger than the complete runtime image. See [Test concurrency reliability](../plans/test-concurrency-reliability.md#cargo-nextest-scheduler-investigation) for the coverage map and measurements.
 
 The database/broker lane excludes tests that declare additional API, MinIO, installed-CLI, or high-load prerequisites. Those identities remain in the image and in their owning CI/E2E lanes; they are not silently discovered or conditionally skipped. To run them after provisioning every prerequisite:
 
@@ -85,16 +85,18 @@ ATTUNE_RUST_INCLUDE_EXTERNAL=1 \
 
 External mode includes SSE tests requiring a live API, runtime-log/S3 tests requiring the owned MinIO harness and `ATTUNE_TEST_S3_*` credentials, the installed-CLI profile test, and explicit high-concurrency stress tests.
 
+For the versioned MinIO correctness suite, including artifact preview across API replicas, follow [Runtime log verification](../deployment/runtime-log-verification.md#run-the-correctness-suite). Host database setup uses `make db-test-setup` and requires `psql` and `sqlx`. Set both `TEST_DB_ADMIN_URL` and `TEST_DB_URL` to your disposable PostgreSQL cluster. Direct Cargo runs use `ATTUNE__DATABASE__URL` for the test database connection.
+
 Docker Desktop must share the checkout path with its VM. If a checkout is on an unshared external mount, bind-mounted migration/pack files may appear empty; add that path to Docker Desktop file sharing before running E2E tests.
 
 ## Concurrency policy
 
-- Default database/service integration concurrency is **1**.
-- The full template-cloned common lane is certified at **4** threads. After the migration fixture optimization, three warm samples had a 335.865-second median and passed the predeclared 393-second adoption target. The global default remains serial because other crates have not passed the same gate. Representative action, execution, and cache repository binaries have passed at **8** threads.
+- Default database/service integration concurrency is **4**. The Make, Docker, benchmark, and CI entry points reject lower values.
+- The full template-cloned common lane is certified at **4** threads. After the migration fixture optimization, three warm samples had a 335.865-second median and passed the predeclared 393-second adoption target. Representative action, execution, and cache repository binaries have passed at **8** threads.
 - `action_repository_tests` is the first explicit hybrid rollback-isolated binary. The Docker runner gives it one migrated database per executable, 18 tests create runtime-local pools and transactions, and the two timestamp-update tests retain physical clones. Its 20 tests passed in 4.24 seconds serially, 3.25 seconds at four threads, and 2.68 seconds at eight threads while preserving individual test identities.
 - `migration_tests` uses one runner-owned migrated database for 19 read-only tests and 11 rollback-isolated tests. Five DDL, committed-state, or cross-connection tests retain physical clones, and six migration-history tests retain fresh databases. Its 41 selected identities passed with medians of 24.714 seconds at one thread and 27.325 seconds at four threads, compared with the previous 104.09-second four-thread median.
 - Pure Rust and Vitest suites may use their native defaults.
-- Notification, retention, service-restart, broker topology, and load tests remain serial/exclusive unless their owning fixture documents a stronger gate. The migration executable may use four libtest threads but remains exclusive from other executables because concurrent database DDL caused a measured regression.
+- Test executables still run sequentially. Notification, retention, service-restart, broker topology, and load tests keep exclusive external resources while libtest runs eligible tests with at least four threads. The migration executable uses four libtest threads but remains exclusive from other executables because concurrent database DDL caused a measured regression.
 - Use unique run IDs for overlapping invocations. Never share a mutable Compose project, schema prefix, RabbitMQ vhost, filesystem root, or host port.
 
 The migration-per-schema runner was retired after the full serial suite exceeded 3.5 hours. On the measured 4-vCPU/16-GiB Rancher Desktop host, a fully migrated template took 10.26 seconds once and physical clones took 172–261 ms (178 ms median). Two warm lifecycle tests fell from 16.12 seconds to 0.72 seconds. The common crate's 626 selected tests took 341 seconds serially and 208 seconds at four threads, with zero clone leaks; both runs exposed the same independently owned S3 prerequisite failure rather than hiding it.
@@ -131,7 +133,7 @@ Before completing changes to test infrastructure:
 
 1. Run focused tests that can fail for the changed behavior.
 2. Repeat race-sensitive tests in varied order.
-3. Check concurrency 1/2/4 before adopting a parallel setting.
+3. Check the required four-thread baseline and any higher candidate setting before adopting it.
 4. Exercise normal teardown, partial setup failure, panic, cancellation, and held-resource paths.
 5. Run two overlapping unique projects and preserve a dirty-neighbor sentinel.
 6. Compare identical test inventories; do not credit skipped tests, hidden retries, or omitted setup.

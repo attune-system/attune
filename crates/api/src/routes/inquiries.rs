@@ -12,20 +12,17 @@ use std::sync::Arc;
 use validator::Validate;
 
 use attune_common::{
-    audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome},
-    inquiry_response_handle::{issue_inquiry_response_handle, resolve_inquiry_response_handle},
-    mq::{InquiryRespondedPayload, MessageEnvelope, MessageType},
+    inquiry_options::validate_response_options,
+    inquiry_response_handle::issue_inquiry_response_handle,
+    models::{execution::Execution, inquiry::Inquiry},
     rbac::{Action as RbacAction, AuthorizationContext, Grant, Resource},
     repositories::{
         execution::ExecutionRepository,
-        external_identity_mapping::ExternalIdentityMappingRepository,
         identity::IdentityRepository,
         inquiry::{
-            CreateWorkflowInquiryInput, InquiryRepository, InquirySearchFilters,
+            CreateWorkflowInquiryInput, InquiryContext, InquiryRepository, InquirySearchFilters,
             InquiryVisibilityContext,
         },
-        integration_token::IntegrationTokenRepository,
-        workflow::WorkflowExecutionRepository,
         FindById,
     },
 };
@@ -37,16 +34,15 @@ use crate::auth::{
 use crate::{
     authz::{AuthorizationCheck, AuthorizationService},
     dto::{
-        common::{PaginatedResponse, PaginationParams, SuccessResponse},
+        common::{PaginatedResponse, PaginationParams},
         inquiry::{
-            CreateInquiryRequest, CreateInquiryResponse, ExternalInquiryRespondRequest,
-            InquiryQueryParams, InquiryRespondRequest, InquiryResponse, InquirySummary,
+            CreateInquiryRequest, CreateInquiryResponse, InquiryQueryParams, InquiryRespondRequest,
+            InquiryResponse, InquiryResponseOptionHandle, InquirySummary,
         },
         ApiResponse,
     },
     middleware::{ApiError, ApiResult},
     state::AppState,
-    validation::validate_inquiry_response,
 };
 
 /// List all inquiries with pagination and optional filters
@@ -72,8 +68,10 @@ pub async fn list_inquiries(
 
     let base_filters = InquirySearchFilters {
         status: query.status,
-        execution: query.execution,
+        created_by_execution: query.created_by_execution,
         assigned_to: query.assigned_to,
+        workflow_action_ref: query.workflow_action_ref,
+        workflow_pack_ref: query.workflow_pack_ref,
         limit: 0,
         offset: 0,
     };
@@ -129,10 +127,18 @@ pub async fn get_inquiry(
         )));
     }
 
-    let response = ApiResponse::new(redact_inquiry_response(
-        InquiryResponse::from(inquiry),
-        decision.execution_visible,
-    ));
+    let vis_ctx = visibility.as_visibility_context();
+    let mut enrichment =
+        load_inquiry_enrichment(&state, &vis_ctx, std::slice::from_ref(&inquiry)).await?;
+    let mut response = InquiryResponse::from(inquiry);
+    let response_id = response.id;
+    apply_response_enrichment(&mut response, enrichment.remove(&response_id));
+    if !decision.execution_visible {
+        response.created_by_execution = REDACTED_CREATED_BY_EXECUTION_ID;
+        response.created_by_action_ref = None;
+        response.created_by_pack_ref = None;
+    }
+    let response = ApiResponse::new(response);
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -143,7 +149,7 @@ pub async fn get_inquiry(
     path = "/api/v1/inquiries/status/{status}",
     tag = "inquiries",
     params(
-        ("status" = String, Path, description = "Inquiry status (pending, responded, timeout, canceled)"),
+        ("status" = String, Path, description = "Inquiry status (pending, responded, timeout, cancelled)"),
         PaginationParams
     ),
     security(("bearer_auth" = [])),
@@ -165,10 +171,10 @@ pub async fn list_inquiries_by_status(
         "pending" => attune_common::models::enums::InquiryStatus::Pending,
         "responded" => attune_common::models::enums::InquiryStatus::Responded,
         "timeout" => attune_common::models::enums::InquiryStatus::Timeout,
-        "canceled" => attune_common::models::enums::InquiryStatus::Cancelled,
+        "cancelled" => attune_common::models::enums::InquiryStatus::Cancelled,
         _ => {
             return Err(ApiError::BadRequest(format!(
-            "Invalid inquiry status: '{}'. Valid values are: pending, responded, timeout, canceled",
+            "Invalid inquiry status: '{}'. Valid values are: pending, responded, timeout, cancelled",
             status_str
         )))
         }
@@ -176,8 +182,10 @@ pub async fn list_inquiries_by_status(
 
     let base_filters = InquirySearchFilters {
         status: Some(status),
-        execution: None,
+        created_by_execution: None,
         assigned_to: None,
+        workflow_action_ref: None,
+        workflow_pack_ref: None,
         limit: 0,
         offset: 0,
     };
@@ -195,7 +203,7 @@ pub async fn list_inquiries_by_status(
     Ok((StatusCode::OK, Json(response)))
 }
 
-/// List inquiries for a specific execution
+/// List inquiries created by a specific execution
 #[utoipa::path(
     get,
     path = "/api/v1/executions/{execution_id}/inquiries",
@@ -206,7 +214,7 @@ pub async fn list_inquiries_by_status(
     ),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "List of inquiries for execution", body = PaginatedResponse<InquirySummary>),
+        (status = 200, description = "List of inquiries created by execution", body = PaginatedResponse<InquirySummary>),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Execution not found"),
         (status = 500, description = "Internal server error")
@@ -227,8 +235,10 @@ pub async fn list_inquiries_by_execution(
 
     let base_filters = InquirySearchFilters {
         status: None,
-        execution: Some(execution_id),
+        created_by_execution: Some(execution_id),
         assigned_to: None,
+        workflow_action_ref: None,
+        workflow_pack_ref: None,
         limit: 0,
         offset: 0,
     };
@@ -255,9 +265,12 @@ pub async fn list_inquiries_by_execution(
     security(("bearer_auth" = [])),
     responses(
         (status = 201, description = "Inquiry and one-shot response handle created", body = ApiResponse<CreateInquiryResponse>),
-        (status = 400, description = "Invalid request"),
+        (status = 400, description = "Malformed request"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Execution token or inquiries:create permission required"),
         (status = 404, description = "Execution not found"),
+        (status = 409, description = "Idempotent creation fields differ"),
+        (status = 422, description = "Inquiry request, schema, or options are invalid"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -268,6 +281,7 @@ pub async fn create_inquiry(
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
     request.validate()?;
+    validate_response_options(request.response_schema.as_ref(), &request.response_options)?;
 
     if user.claims.token_type != TokenType::Execution {
         return Err(ApiError::Forbidden(
@@ -304,10 +318,11 @@ pub async fn create_inquiry(
         })?;
 
     let inquiry_input = CreateWorkflowInquiryInput {
-        execution,
+        created_by_execution: execution,
         purpose: request.purpose,
         prompt: request.prompt,
         response_schema: request.response_schema,
+        response_options: request.response_options,
         assigned_to: request.assigned_to,
         timeout_seconds: request.timeout_seconds,
     };
@@ -316,12 +331,31 @@ pub async fn create_inquiry(
     let inquiry =
         InquiryRepository::create_workflow_inquiry_idempotent(&mut conn, inquiry_input).await?;
 
-    let response_handle =
-        issue_inquiry_response_handle(inquiry.id, encryption_key).map_err(ApiError::from)?;
+    let response_options = inquiry
+        .response_options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let option_index = u16::try_from(index).map_err(|_| {
+                ApiError::InternalServerError("Too many inquiry response options".to_string())
+            })?;
+            Ok(InquiryResponseOptionHandle {
+                r#ref: option.r#ref.clone(),
+                label: option.label.clone(),
+                style: option.style,
+                response_handle: issue_inquiry_response_handle(
+                    inquiry.id,
+                    option_index,
+                    encryption_key,
+                )
+                .map_err(ApiError::from)?,
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
     let response = ApiResponse::with_message(
         CreateInquiryResponse {
             inquiry: InquiryResponse::from(inquiry),
-            response_handle,
+            response_options,
         },
         "Inquiry created successfully",
     );
@@ -345,10 +379,12 @@ pub async fn create_inquiry(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Response submitted successfully", body = ApiResponse<InquiryResponse>),
-        (status = 400, description = "Invalid request or inquiry cannot be responded to"),
+        (status = 400, description = "Malformed request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not authorized to respond to this inquiry"),
         (status = 404, description = "Inquiry not found"),
+        (status = 409, description = "Inquiry is no longer pending"),
+        (status = 422, description = "Response does not conform to the inquiry schema"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -380,129 +416,19 @@ pub async fn respond_to_inquiry(
     let mut visibility = InquiryVisibilityEvaluator::new(&state, &user.0).await?;
     let visibility_decision = visibility.evaluate(&inquiry).await?;
 
-    // Check if inquiry is still pending
-    if inquiry.status != attune_common::models::enums::InquiryStatus::Pending {
-        return Err(ApiError::BadRequest(format!(
-            "Cannot respond to inquiry with status '{:?}'. Only pending inquiries can be responded to.",
-            inquiry.status
-        )));
-    }
-
-    // Privilege-loop guard: an execution that created an inquiry (e.g., via
-    // an action-owned inquiry) must not be allowed to respond to it using its own
-    // execution-scoped token. The triggering identity may still respond from
-    // a separate session (their normal access token), but a callback bearing
-    // the *same* execution scope as the one that created the inquiry would
-    // create a self-approval loop.
-    //
-    // This guard also blocks any *descendant* execution of the creating
-    // execution: a child action spawned by the inquiry-creating workflow
-    // cannot respond to its ancestor's inquiry, since that would still
-    // amount to a self-approval loop. We walk the `execution.parent` chain
-    // from the token's execution upward, capped at depth 100 to bound work
-    // and tolerate any corrupted chain (cycles).
-    if let Some(token_exec_id) = user.0.execution_id() {
-        let creating_exec_id = inquiry.execution;
-        if token_exec_id == creating_exec_id {
-            return Err(ApiError::Forbidden(
-                "An execution cannot respond to an inquiry it created (privilege loop)".to_string(),
-            ));
-        }
-
-        let mut current: Option<i64> = Some(token_exec_id);
-        let mut depth = 0u32;
-        let mut is_descendant = false;
-        while let Some(cur) = current {
-            if depth >= 100 {
-                break;
-            }
-            if cur == creating_exec_id {
-                is_descendant = true;
-                break;
-            }
-            let parent: Option<Option<i64>> =
-                sqlx::query_scalar("SELECT parent FROM execution WHERE id = $1")
-                    .bind(cur)
-                    .fetch_optional(&state.db)
-                    .await
-                    .map_err(|e| ApiError::InternalServerError(format!("ancestry check: {e}")))?;
-            current = parent.flatten();
-            depth += 1;
-        }
-        if is_descendant {
-            return Err(ApiError::Forbidden(
-                "A descendant execution cannot respond to an ancestor's inquiry (privilege loop)"
-                    .to_string(),
-            ));
-        }
-    }
-
-    // Resolve the responding identity strictly. Tokens without a parseable
-    // identity in `sub` cannot produce a usable audit record, so reject up
-    // front rather than silently writing `responded_by = NULL` later.
     let responded_by = user.0.identity_id().map_err(|_| {
         ApiError::Forbidden("Cannot record response: caller has no resolvable identity".to_string())
     })?;
-
-    // Enforce assigned_to: only the assignee may respond.
-    if let Some(assigned_to) = inquiry.assigned_to {
-        if assigned_to != responded_by {
-            return Err(ApiError::Forbidden(format!(
-                "Inquiry {} is assigned to identity {} and can only be answered by them",
-                id, assigned_to
-            )));
-        }
-    }
-
-    // Check if inquiry has timed out
-    if let Some(timeout_at) = inquiry.timeout_at {
-        if timeout_at < chrono::Utc::now() {
-            return Err(ApiError::BadRequest(
-                "Inquiry has timed out and can no longer be responded to".to_string(),
-            ));
-        }
-    }
-
-    validate_inquiry_response(id, inquiry.response_schema.as_ref(), &request.response)?;
-
-    let mut transaction = state.db.begin().await?;
-    if let Some(workflow_execution_id) = inquiry.workflow_execution {
-        WorkflowExecutionRepository::acquire_advisory_lock(&mut transaction, workflow_execution_id)
-            .await?;
-        let workflow = WorkflowExecutionRepository::find_by_id_for_update(
-            &mut *transaction,
-            workflow_execution_id,
-        )
-        .await?
-        .ok_or_else(|| ApiError::Conflict("Owning workflow no longer exists".to_string()))?;
-        if matches!(
-            workflow.status,
-            attune_common::models::enums::ExecutionStatus::Completed
-                | attune_common::models::enums::ExecutionStatus::Failed
-                | attune_common::models::enums::ExecutionStatus::Canceling
-                | attune_common::models::enums::ExecutionStatus::Cancelled
-                | attune_common::models::enums::ExecutionStatus::Timeout
-                | attune_common::models::enums::ExecutionStatus::Abandoned
-        ) {
-            return Err(ApiError::Conflict(
-                "Owning workflow is cancelling or terminal".to_string(),
-            ));
-        }
-    }
-    let updated_inquiry = InquiryRepository::respond_pending(
-        &mut *transaction,
-        id,
-        request.response.clone(),
-        responded_by,
-        None,
+    let updated_inquiry = crate::inquiry_response::submit_inquiry_response(
+        &state,
+        crate::inquiry_response::InquiryResponseSubmission::Human {
+            inquiry_id: id,
+            response: request.response,
+            identity_id: responded_by,
+            execution_id: user.0.execution_id(),
+        },
     )
-    .await?
-    .ok_or_else(|| {
-        ApiError::Conflict("Inquiry is no longer pending or has timed out".to_string())
-    })?;
-    transaction.commit().await?;
-
-    publish_inquiry_responded(&state, &updated_inquiry).await;
+    .await?;
 
     let response = ApiResponse::with_message(
         redact_inquiry_response(
@@ -515,249 +441,7 @@ pub async fn respond_to_inquiry(
     Ok((StatusCode::OK, Json(response)))
 }
 
-/// Accept a one-shot response asserted by an external integration adapter.
-#[utoipa::path(
-    post,
-    path = "/api/v1/inquiry-responses",
-    tag = "inquiries",
-    request_body = ExternalInquiryRespondRequest,
-    security(("bearer_auth" = [])),
-    responses(
-        (status = 200, description = "External response submitted", body = ApiResponse<SuccessResponse>),
-        (status = 422, description = "Invalid request or response"),
-        (status = 401, description = "Invalid or inactive integration credential"),
-        (status = 403, description = "External actor is not authorized or assigned"),
-        (status = 404, description = "Response handle not found"),
-        (status = 409, description = "Inquiry or workflow is no longer respondable")
-    )
-)]
-pub async fn respond_to_inquiry_from_external_adapter(
-    RequireAuth(user): RequireAuth,
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<ExternalInquiryRespondRequest>,
-) -> ApiResult<impl IntoResponse> {
-    request.validate()?;
-    let provenance = user.claims.integration_access_provenance().map_err(|_| {
-        ApiError::Forbidden(
-            "External responses require an integration-token access token".to_string(),
-        )
-    })?;
-
-    let mut transaction = state.db.begin().await?;
-    IntegrationTokenRepository::find_active_for_identity(
-        &mut *transaction,
-        provenance.integration_token_id,
-        provenance.identity_id,
-    )
-    .await?
-    .ok_or_else(|| {
-        ApiError::Unauthorized("Integration credential is no longer active".to_string())
-    })?;
-
-    let encryption_key = state
-        .config
-        .security
-        .encryption_key
-        .as_deref()
-        .ok_or_else(|| {
-            ApiError::InternalServerError(
-                "Cannot resolve inquiry response handles without security.encryption_key"
-                    .to_string(),
-            )
-        })?;
-    let id = resolve_inquiry_response_handle(&request.response_handle, encryption_key)
-        .map_err(|_| ApiError::NotFound("Inquiry response handle was not found".to_string()))?;
-
-    state
-        .authorization_service()
-        .authorize_identity_fresh(
-            &mut transaction,
-            &user,
-            provenance.identity_id,
-            AuthorizationCheck {
-                resource: Resource::Inquiries,
-                action: RbacAction::Respond,
-                context: AuthorizationContext {
-                    target_id: Some(id),
-                    ..AuthorizationContext::new(provenance.identity_id)
-                },
-            },
-        )
-        .await?;
-
-    let resolved = ExternalIdentityMappingRepository::resolve_exact_with_mapping_for_share(
-        &mut *transaction,
-        provenance.identity_id,
-        &request.external_actor.provider,
-        &request.external_actor.tenant,
-        &request.external_actor.external_subject,
-    )
-    .await?
-    .ok_or_else(|| {
-        ApiError::Forbidden("External identity is not mapped to an active identity".to_string())
-    })?;
-
-    let initial = InquiryRepository::find_by_id(&mut *transaction, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("Inquiry response handle was not found".to_string()))?;
-    if let Some(workflow_execution_id) = initial.workflow_execution {
-        WorkflowExecutionRepository::acquire_advisory_lock(&mut transaction, workflow_execution_id)
-            .await?;
-        let workflow = WorkflowExecutionRepository::find_by_id_for_update(
-            &mut *transaction,
-            workflow_execution_id,
-        )
-        .await?
-        .ok_or_else(|| ApiError::Conflict("Owning workflow no longer exists".to_string()))?;
-        if matches!(
-            workflow.status,
-            attune_common::models::enums::ExecutionStatus::Completed
-                | attune_common::models::enums::ExecutionStatus::Failed
-                | attune_common::models::enums::ExecutionStatus::Canceling
-                | attune_common::models::enums::ExecutionStatus::Cancelled
-                | attune_common::models::enums::ExecutionStatus::Timeout
-                | attune_common::models::enums::ExecutionStatus::Abandoned
-        ) {
-            return Err(ApiError::Conflict(
-                "Owning workflow is cancelling or terminal".to_string(),
-            ));
-        }
-    }
-
-    let inquiry = InquiryRepository::find_by_id_for_update(&mut transaction, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("Inquiry response handle was not found".to_string()))?;
-    if inquiry.status != attune_common::models::enums::InquiryStatus::Pending {
-        return Err(ApiError::Conflict(
-            "Inquiry is no longer pending".to_string(),
-        ));
-    }
-    if inquiry
-        .timeout_at
-        .is_some_and(|timeout_at| timeout_at <= chrono::Utc::now())
-    {
-        return Err(ApiError::Conflict(
-            "Inquiry has timed out and can no longer be responded to".to_string(),
-        ));
-    }
-    let assigned_to = inquiry.assigned_to.ok_or_else(|| {
-        ApiError::Forbidden("External responses require an assigned inquiry".to_string())
-    })?;
-    if assigned_to != resolved.identity.id {
-        return Err(ApiError::Forbidden(
-            "Mapped identity is not assigned to this inquiry".to_string(),
-        ));
-    }
-
-    let response = serde_json::Value::Object(request.response);
-    validate_inquiry_response(id, inquiry.response_schema.as_ref(), &response)?;
-    let external_actor = serde_json::json!({
-        "provider": resolved.mapping.provider,
-        "tenant": resolved.mapping.tenant,
-        "external_subject": resolved.mapping.external_subject,
-        "mapping_id": resolved.mapping.id,
-        "integration_identity_id": provenance.identity_id,
-        "integration_token_id": provenance.integration_token_id,
-    });
-    let updated_inquiry = InquiryRepository::respond_pending(
-        &mut *transaction,
-        id,
-        response,
-        resolved.identity.id,
-        Some(external_actor),
-    )
-    .await?
-    .ok_or_else(|| {
-        ApiError::Conflict("Inquiry is no longer pending or has timed out".to_string())
-    })?;
-    transaction.commit().await?;
-
-    state.audit_emitter.emit(build_external_response_audit(
-        id,
-        resolved.identity.id,
-        resolved.identity.login,
-        &resolved.mapping.provider,
-        resolved.mapping.id,
-        provenance.identity_id,
-        provenance.integration_token_id,
-    ));
-
-    publish_inquiry_responded(&state, &updated_inquiry).await;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::with_message(
-            SuccessResponse::new("Response submitted successfully"),
-            "Response submitted successfully",
-        )),
-    ))
-}
-
-fn build_external_response_audit(
-    inquiry_id: i64,
-    mapped_identity_id: i64,
-    mapped_identity_login: String,
-    provider: &str,
-    mapping_id: i64,
-    integration_identity_id: i64,
-    integration_token_id: i64,
-) -> attune_common::audit::PendingAuditEvent {
-    AuditEventBuilder::new(
-        AuditCategory::Api,
-        event_type::inquiry::EXTERNAL_RESPONSE_ACCEPTED,
-        AuditOutcome::Success,
-    )
-    .actor_identity(mapped_identity_id)
-    .actor_login(mapped_identity_login)
-    .actor_token_type("integration_token")
-    .resource("inquiry")
-    .resource_id(inquiry_id)
-    .with_details(serde_json::json!({
-        "provider": provider,
-        "mapping_id": mapping_id,
-        "integration_identity_id": integration_identity_id,
-        "integration_token_id": integration_token_id,
-    }))
-    .build()
-}
-
-async fn publish_inquiry_responded(
-    state: &Arc<AppState>,
-    inquiry: &attune_common::models::inquiry::Inquiry,
-) {
-    let Some(response) = inquiry.response.clone() else {
-        tracing::error!(
-            inquiry_id = inquiry.id,
-            "Responded inquiry has no response payload"
-        );
-        return;
-    };
-    if let Some(publisher) = state.get_publisher().await {
-        let payload = InquiryRespondedPayload {
-            inquiry_id: inquiry.id,
-            execution_id: inquiry.execution,
-            response,
-            responded_by: inquiry.responded_by,
-            responded_at: inquiry.responded_at.unwrap_or_else(chrono::Utc::now),
-        };
-        let envelope =
-            MessageEnvelope::new(MessageType::InquiryResponded, payload).with_source("api");
-        if let Err(error) = publisher.publish_envelope(&envelope).await {
-            tracing::error!(inquiry_id = inquiry.id, %error, "Failed to publish InquiryResponded message");
-        } else {
-            tracing::info!(
-                inquiry_id = inquiry.id,
-                "Published InquiryResponded message"
-            );
-        }
-    } else {
-        tracing::warn!(
-            inquiry_id = inquiry.id,
-            "No publisher available to publish InquiryResponded message"
-        );
-    }
-}
-
-const REDACTED_INQUIRY_EXECUTION_ID: i64 = 0;
+const REDACTED_CREATED_BY_EXECUTION_ID: i64 = 0;
 
 #[derive(Debug, Clone, Copy)]
 struct InquiryAccessDecision {
@@ -829,11 +513,30 @@ impl InquiryVisibilityEvaluator {
         }
     }
 
+    fn can_filter_workflow(&self, filters: &InquirySearchFilters) -> bool {
+        if filters.workflow_action_ref.is_none() && filters.workflow_pack_ref.is_none() {
+            return true;
+        }
+
+        let mut ctx = AuthorizationContext::new(self.identity_id);
+        ctx.identity_attributes = self.identity_attributes.clone();
+        ctx.target_ref = filters.workflow_action_ref.clone();
+        ctx.pack_ref = filters.workflow_pack_ref.clone().or_else(|| {
+            filters
+                .workflow_action_ref
+                .as_deref()
+                .and_then(|action_ref| action_ref.split_once('.'))
+                .map(|(pack_ref, _)| pack_ref.to_string())
+        });
+
+        AuthorizationService::is_allowed(&self.grants, Resource::Executions, RbacAction::Read, &ctx)
+    }
+
     async fn evaluate(
         &mut self,
         inquiry: &attune_common::models::inquiry::Inquiry,
     ) -> ApiResult<InquiryAccessDecision> {
-        let execution = self.linked_execution(inquiry.execution).await?;
+        let execution = self.linked_execution(inquiry.created_by_execution).await?;
 
         let participant = inquiry.assigned_to == Some(self.identity_id)
             || execution
@@ -952,19 +655,12 @@ fn execution_readable_from(
     AuthorizationService::is_allowed(grants, Resource::Executions, RbacAction::Read, &ctx)
 }
 
-fn redact_inquiry_summary(mut summary: InquirySummary, execution_visible: bool) -> InquirySummary {
-    if !execution_visible {
-        summary.execution = REDACTED_INQUIRY_EXECUTION_ID;
-    }
-    summary
-}
-
 fn redact_inquiry_response(
     mut response: InquiryResponse,
     execution_visible: bool,
 ) -> InquiryResponse {
     if !execution_visible {
-        response.execution = REDACTED_INQUIRY_EXECUTION_ID;
+        response.created_by_execution = REDACTED_CREATED_BY_EXECUTION_ID;
     }
     response
 }
@@ -990,6 +686,12 @@ async fn list_visible_inquiry_summaries(
 ) -> ApiResult<(Vec<InquirySummary>, bool)> {
     let page_size = page_size.max(1);
     let evaluator = InquiryVisibilityEvaluator::new(state, user).await?;
+    if !evaluator.can_filter_workflow(&base_filters) {
+        return Err(ApiError::Forbidden(
+            "Workflow inquiry filters require permission to read the matching executions"
+                .to_string(),
+        ));
+    }
     let vis_ctx = evaluator.as_visibility_context();
 
     // Fetch one extra row past the page to detect `has_next` without a
@@ -1006,25 +708,54 @@ async fn list_visible_inquiry_summaries(
         rows.truncate(page_size);
     }
 
-    let items = redact_page_execution_visibility(state, &vis_ctx, rows).await?;
+    let enrichment = load_inquiry_enrichment(state, &vis_ctx, &rows).await?;
+    let items = rows
+        .into_iter()
+        .map(|inquiry| {
+            let mut summary = InquirySummary::from(inquiry);
+            let summary_id = summary.id;
+            apply_summary_enrichment(&mut summary, enrichment.get(&summary_id));
+            summary
+        })
+        .collect();
 
     Ok((items, has_next))
 }
 
-/// Resolves `execution_visible` (used only to decide whether to redact the
-/// `execution` field) for an already visibility-filtered page of inquiries,
-/// using two bulk queries — one for the linked executions, one for their
-/// ancestor executor identities — instead of one round trip per row.
-async fn redact_page_execution_visibility(
+#[derive(Debug, Default)]
+struct InquiryEnrichment {
+    context: Option<InquiryContext>,
+    creator_execution: Option<Execution>,
+    creator_execution_visible: bool,
+    workflow_execution: Option<Execution>,
+    workflow_execution_visible: bool,
+}
+
+async fn load_inquiry_enrichment(
     state: &Arc<AppState>,
     ctx: &InquiryVisibilityContext,
-    inquiries: Vec<attune_common::models::inquiry::Inquiry>,
-) -> ApiResult<Vec<InquirySummary>> {
+    inquiries: &[Inquiry],
+) -> ApiResult<HashMap<i64, InquiryEnrichment>> {
     if inquiries.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HashMap::new());
     }
 
-    let mut execution_ids: Vec<i64> = inquiries.iter().map(|inquiry| inquiry.execution).collect();
+    let inquiry_ids: Vec<i64> = inquiries.iter().map(|inquiry| inquiry.id).collect();
+    let contexts = InquiryRepository::find_contexts_by_ids(&state.db, &inquiry_ids).await?;
+    let contexts_by_id: HashMap<i64, InquiryContext> = contexts
+        .into_iter()
+        .map(|context| (context.inquiry_id, context))
+        .collect();
+
+    let mut execution_ids: Vec<i64> = inquiries
+        .iter()
+        .map(|inquiry| inquiry.created_by_execution)
+        .collect();
+    execution_ids.extend(
+        contexts_by_id
+            .values()
+            .filter_map(|context| context.workflow_root_execution_id),
+    );
     execution_ids.sort_unstable();
     execution_ids.dedup();
 
@@ -1037,30 +768,134 @@ async fn redact_page_execution_visibility(
     let ancestor_ids_by_execution =
         ExecutionRepository::ancestor_executor_ids_by_ids(&state.db, &execution_ids).await?;
 
-    let items = inquiries
-        .into_iter()
+    let enrichment = inquiries
+        .iter()
         .map(|inquiry| {
-            let execution_visible =
-                executions_by_id
-                    .get(&inquiry.execution)
-                    .is_some_and(|execution| {
-                        let ancestors = ancestor_ids_by_execution
-                            .get(&execution.id)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]);
-                        execution_readable_from(
-                            &ctx.grants,
-                            ctx.identity_id,
-                            &ctx.identity_attributes,
-                            execution,
-                            ancestors,
-                        )
-                    });
-            redact_inquiry_summary(InquirySummary::from(inquiry), execution_visible)
+            let context = contexts_by_id.get(&inquiry.id).cloned();
+            let creator_execution = executions_by_id.get(&inquiry.created_by_execution).cloned();
+            let creator_execution_visible = creator_execution.as_ref().is_some_and(|execution| {
+                execution_is_visible(ctx, execution, &ancestor_ids_by_execution)
+            });
+            let workflow_execution = context
+                .as_ref()
+                .and_then(|context| context.workflow_root_execution_id)
+                .and_then(|execution_id| executions_by_id.get(&execution_id))
+                .cloned();
+            let workflow_execution_visible = workflow_execution.as_ref().is_some_and(|execution| {
+                execution_is_visible(ctx, execution, &ancestor_ids_by_execution)
+            });
+
+            (
+                inquiry.id,
+                InquiryEnrichment {
+                    context,
+                    creator_execution,
+                    creator_execution_visible,
+                    workflow_execution,
+                    workflow_execution_visible,
+                },
+            )
         })
         .collect();
 
-    Ok(items)
+    Ok(enrichment)
+}
+
+fn execution_is_visible(
+    ctx: &InquiryVisibilityContext,
+    execution: &Execution,
+    ancestor_ids_by_execution: &HashMap<i64, Vec<i64>>,
+) -> bool {
+    let ancestors = ancestor_ids_by_execution
+        .get(&execution.id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    execution_readable_from(
+        &ctx.grants,
+        ctx.identity_id,
+        &ctx.identity_attributes,
+        execution,
+        ancestors,
+    )
+}
+
+fn action_pack_ref(action_ref: &str) -> Option<String> {
+    action_ref
+        .split_once('.')
+        .map(|(pack_ref, _)| pack_ref.to_string())
+}
+
+fn apply_summary_enrichment(summary: &mut InquirySummary, enrichment: Option<&InquiryEnrichment>) {
+    let Some(enrichment) = enrichment else {
+        summary.created_by_execution = REDACTED_CREATED_BY_EXECUTION_ID;
+        summary.workflow_execution = None;
+        summary.workflow_task_name = None;
+        return;
+    };
+
+    if enrichment.creator_execution_visible {
+        if let Some(execution) = &enrichment.creator_execution {
+            summary.created_by_action_ref = Some(execution.action_ref.clone());
+            summary.created_by_pack_ref = action_pack_ref(&execution.action_ref);
+        }
+    } else {
+        summary.created_by_execution = REDACTED_CREATED_BY_EXECUTION_ID;
+    }
+
+    if enrichment.workflow_execution_visible {
+        if let Some(execution) = &enrichment.workflow_execution {
+            summary.workflow_root_execution = Some(execution.id);
+            summary.workflow_action_ref = Some(execution.action_ref.clone());
+            summary.workflow_pack_ref = action_pack_ref(&execution.action_ref);
+        }
+    } else {
+        summary.workflow_execution = None;
+        summary.workflow_task_name = None;
+    }
+
+    if let Some(context) = &enrichment.context {
+        summary.assigned_to_login = context.assigned_to_login.clone();
+        summary.assigned_to_display_name = context.assigned_to_display_name.clone();
+    }
+}
+
+fn apply_response_enrichment(
+    response: &mut InquiryResponse,
+    enrichment: Option<InquiryEnrichment>,
+) {
+    let Some(enrichment) = enrichment else {
+        response.created_by_execution = REDACTED_CREATED_BY_EXECUTION_ID;
+        response.workflow_execution = None;
+        response.workflow_task_name = None;
+        return;
+    };
+
+    if enrichment.creator_execution_visible {
+        if let Some(execution) = &enrichment.creator_execution {
+            response.created_by_action_ref = Some(execution.action_ref.clone());
+            response.created_by_pack_ref = action_pack_ref(&execution.action_ref);
+        }
+    } else {
+        response.created_by_execution = REDACTED_CREATED_BY_EXECUTION_ID;
+    }
+
+    if enrichment.workflow_execution_visible {
+        if let Some(execution) = &enrichment.workflow_execution {
+            response.workflow_root_execution = Some(execution.id);
+            response.workflow_action_ref = Some(execution.action_ref.clone());
+            response.workflow_pack_ref = action_pack_ref(&execution.action_ref);
+        }
+    } else {
+        response.workflow_execution = None;
+        response.workflow_task_name = None;
+    }
+
+    if let Some(context) = enrichment.context {
+        response.assigned_to_login = context.assigned_to_login;
+        response.assigned_to_display_name = context.assigned_to_display_name;
+        response.responded_by_login = context.responded_by_login;
+        response.responded_by_display_name = context.responded_by_display_name;
+    }
 }
 
 /// Cancel an inquiry from its creator execution.
@@ -1097,7 +932,7 @@ pub async fn cancel_inquiry(
     let inquiry = InquiryRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {} not found", id)))?;
-    if inquiry.execution != creator_execution {
+    if inquiry.created_by_execution != creator_execution {
         return Err(ApiError::Forbidden(
             "Only the creator execution can cancel this inquiry".to_string(),
         ));
@@ -1125,31 +960,5 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(list_inquiries_by_execution),
         )
         .route("/inquiries/{id}/respond", post(respond_to_inquiry))
-        .route(
-            "/inquiry-responses",
-            post(respond_to_inquiry_from_external_adapter),
-        )
         .route("/inquiries/{id}/cancel", post(cancel_inquiry))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::build_external_response_audit;
-
-    #[test]
-    fn external_response_audit_contains_only_allowlisted_attribution() {
-        let event =
-            build_external_response_audit(11, 22, "mapped-user".to_string(), "slack", 33, 44, 55);
-        assert_eq!(event.actor_identity, Some(22));
-        assert_eq!(event.resource_id, Some(11));
-        assert_eq!(
-            event.details,
-            Some(serde_json::json!({
-                "provider": "slack",
-                "mapping_id": 33,
-                "integration_identity_id": 44,
-                "integration_token_id": 55,
-            }))
-        );
-    }
 }

@@ -30,7 +30,6 @@ async fn create_identity(ctx: &TestContext, prefix: &str) -> i64 {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn admin_can_manage_external_identity_mappings() {
     let ctx = TestContext::new()
         .await
@@ -48,6 +47,7 @@ async fn admin_can_manage_external_identity_mappings() {
         "mapped_identity": mapped_identity,
         "provider": " GitHub ",
         "tenant": " Acme ",
+        "subject_kind": " User ",
         "external_subject": " User-42 "
     });
     let created = ctx
@@ -61,14 +61,23 @@ async fn admin_can_manage_external_identity_mappings() {
     assert_eq!(mapping["integration_identity"], integration_identity);
     assert_eq!(mapping["provider"], "github");
     assert_eq!(mapping["tenant"], "Acme");
+    assert_eq!(mapping["subject_kind"], "user");
     assert_eq!(mapping["external_subject"], "User-42");
     assert!(mapping["created_by"].as_i64().is_some_and(|id| id > 0));
 
     let duplicate = ctx
-        .post(&path, request, ctx.token())
+        .post(&path, request.clone(), ctx.token())
         .await
         .expect("create duplicate mapping");
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    let mut other_kind_request = request;
+    other_kind_request["subject_kind"] = json!("group");
+    let other_kind = ctx
+        .post(&path, other_kind_request, ctx.token())
+        .await
+        .expect("create mapping for another subject kind");
+    assert_eq!(other_kind.status(), StatusCode::CREATED);
 
     let wrong_parent = ctx
         .get(
@@ -89,6 +98,7 @@ async fn admin_can_manage_external_identity_mappings() {
                 "mapped_identity": replacement_identity,
                 "provider": "OIDC",
                 "tenant": "Tenant-A",
+                "subject_kind": "Service_Account",
                 "external_subject": "Subject-A"
             }),
             ctx.token(),
@@ -102,13 +112,14 @@ async fn admin_can_manage_external_identity_mappings() {
         replacement_identity
     );
     assert_eq!(updated_body["data"]["provider"], "oidc");
+    assert_eq!(updated_body["data"]["subject_kind"], "service_account");
 
     let listed = ctx.get(&path, ctx.token()).await.expect("list mappings");
     assert_eq!(listed.status(), StatusCode::OK);
     let listed_body: serde_json::Value = listed.json().await.expect("mapping list response");
     assert_eq!(
         listed_body["items"].as_array().expect("mapping list").len(),
-        1
+        2
     );
 
     let deleted = ctx
@@ -124,7 +135,6 @@ async fn admin_can_manage_external_identity_mappings() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn scoped_admin_cannot_map_an_identity_outside_their_scope() {
     let ctx = TestContext::new()
         .await
@@ -171,6 +181,7 @@ async fn scoped_admin_cannot_map_an_identity_outside_their_scope() {
                 "mapped_identity": mapped_identity,
                 "provider": "slack",
                 "tenant": "team-1",
+                "subject_kind": "user",
                 "external_subject": "user-1"
             }),
             ctx.token(),
@@ -182,7 +193,6 @@ async fn scoped_admin_cannot_map_an_identity_outside_their_scope() {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn mapping_api_rejects_non_admins_and_credential_fields() {
     let ctx = TestContext::new()
         .await
@@ -214,6 +224,7 @@ async fn mapping_api_rejects_non_admins_and_credential_fields() {
                 "mapped_identity": admin_mapped_identity,
                 "provider": "github",
                 "tenant": "acme",
+                "subject_kind": "user",
                 "external_subject": "user-42",
                 "token": "must-not-be-accepted"
             }),

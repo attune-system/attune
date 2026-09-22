@@ -25,7 +25,9 @@ use attune_common::{
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome, PendingAuditEvent},
     key_ref::canonical_key_ref,
     models::{key::Key, OwnerType},
-    rbac::{Action, AuthorizationContext, ExecutionScopeConstraint, Grant, Resource},
+    rbac::{
+        Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints, Resource,
+    },
 };
 
 use crate::auth::{jwt::TokenType, RequireAuth};
@@ -39,6 +41,52 @@ use crate::{
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
+
+async fn key_read_grants(state: &AppState, user: &RequireAuth) -> ApiResult<(i64, Vec<Grant>)> {
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+
+    match user.0.claims.token_type {
+        TokenType::Access | TokenType::Execution => {
+            let grants = state
+                .authorization_service()
+                .effective_grants(&user.0)
+                .await?;
+            Ok((identity_id, grants))
+        }
+        TokenType::Sensor => {
+            let pack_ref = user.0.claims.sensor_pack_ref().map_err(|_| {
+                ApiError::Unauthorized("Sensor token is missing its pack scope".to_string())
+            })?;
+            Ok((
+                identity_id,
+                vec![Grant {
+                    resource: Resource::Keys,
+                    actions: vec![Action::Read, Action::Decrypt],
+                    constraints: Some(GrantConstraints {
+                        owner_types: Some(vec![OwnerType::Pack]),
+                        owner_refs: Some(vec![pack_ref.to_string()]),
+                        ..GrantConstraints::default()
+                    }),
+                }],
+            ))
+        }
+        TokenType::Worker | TokenType::Refresh => Err(ApiError::Forbidden(
+            "This token type cannot access keys".to_string(),
+        )),
+    }
+}
+
+fn require_key_mutation_token(user: &RequireAuth) -> ApiResult<()> {
+    match user.0.claims.token_type {
+        TokenType::Access | TokenType::Execution => Ok(()),
+        TokenType::Sensor | TokenType::Worker | TokenType::Refresh => Err(ApiError::Forbidden(
+            "This token type cannot modify keys".to_string(),
+        )),
+    }
+}
 
 /// List all keys with pagination and optional filters (values redacted)
 #[utoipa::path(
@@ -56,38 +104,19 @@ pub async fn list_keys(
     State(state): State<Arc<AppState>>,
     Query(query): Query<KeyQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    // Row-level RBAC visibility is only enforced for access/execution tokens,
-    // matching the previous in-memory behavior: sensor/worker tokens see all
-    // keys matching the owner filters (they have no effective-grants
-    // identity to scope against).
-    let visibility = if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user.0).await?;
-
-        // Ensure the principal can read at least some key records.
-        let can_read_any_key = grants
-            .iter()
-            .any(|g| g.resource == Resource::Keys && g.actions.contains(&Action::Read));
-        if !can_read_any_key {
-            return Err(ApiError::Forbidden(
-                "Insufficient permissions: keys:read".to_string(),
-            ));
-        }
-
-        Some(KeyVisibility {
-            identity_id,
-            grants: compile_key_read_grant_filters(&grants),
-        })
-    } else {
-        None
-    };
+    let (identity_id, grants) = key_read_grants(&state, &user).await?;
+    if !grants
+        .iter()
+        .any(|grant| grant.resource == Resource::Keys && grant.actions.contains(&Action::Read))
+    {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: keys:read".to_string(),
+        ));
+    }
+    let visibility = Some(KeyVisibility {
+        identity_id,
+        grants: compile_key_read_grant_filters(&grants),
+    });
 
     // Owner filters, RBAC visibility, and pagination are all pushed into a
     // single filtered SQL query (see `KeyRepository::search`), so totals and
@@ -201,36 +230,19 @@ pub async fn get_key(
     State(state): State<Arc<AppState>>,
     Path(key_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let (identity_id, grants) = key_read_grants(&state, &user).await?;
     let mut key = KeyRepository::find_by_ref(&state.db, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
 
-    // For encrypted keys, track whether this caller is permitted to see the value.
-    let can_decrypt = if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user.0).await?;
+    if !key_action_allowed(&grants, Action::Read, identity_id, &key) {
+        return Err(ApiError::NotFound(format!("Key '{}' not found", key_ref)));
+    }
 
-        if !key_action_allowed(&grants, Action::Read, identity_id, &key) {
-            return Err(ApiError::NotFound(format!("Key '{}' not found", key_ref)));
-        }
-
-        // For encrypted keys, separately check keys:decrypt.
-        // Failing this is not an error — we just return the value as null.
-        if key.encrypted {
-            key_action_allowed(&grants, Action::Decrypt, identity_id, &key)
-        } else {
-            true
-        }
-    } else {
-        true
-    };
+    // For encrypted keys, separately check keys:decrypt. Failing this returns
+    // a null value rather than ciphertext.
+    let can_decrypt =
+        !key.encrypted || key_action_allowed(&grants, Action::Decrypt, identity_id, &key);
 
     // Decrypt value if encrypted and caller has permission.
     // If they lack Keys::Decrypt, return null rather than the ciphertext.
@@ -307,6 +319,7 @@ pub async fn create_key(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateKeyRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_key_mutation_token(&user)?;
     // Validate request
     request.validate()?;
     let authorization = if matches!(
@@ -484,6 +497,7 @@ pub async fn update_key(
     Path(key_ref): Path<String>,
     Json(request): Json<UpdateKeyRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_key_mutation_token(&user)?;
     // Validate request
     request.validate()?;
 
@@ -617,6 +631,7 @@ pub async fn delete_key(
     State(state): State<Arc<AppState>>,
     Path(key_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    require_key_mutation_token(&user)?;
     // Verify key exists
     let key = KeyRepository::find_by_ref(&state.db, &key_ref)
         .await?

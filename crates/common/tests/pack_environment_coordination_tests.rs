@@ -134,7 +134,6 @@ async fn setup_runtime_fixture() -> (
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn coordinated_environment_claims_single_owner_and_retrys_after_failure() {
     let (pool, temp_dir, pack, runtime, runtime_version, worker_a, worker_b) =
         setup_runtime_fixture().await;
@@ -187,7 +186,6 @@ async fn coordinated_environment_claims_single_owner_and_retrys_after_failure() 
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn coordinated_environment_becomes_outdated_when_manifest_checksum_changes() {
     let (pool, temp_dir, pack, runtime, runtime_version, worker_a, _worker_b) =
         setup_runtime_fixture().await;

@@ -37,31 +37,31 @@ ON CONFLICT (username) DO NOTHING;
 
 ## Running Tests
 
-All tests are marked with `#[ignore]` because they require a database connection.
+Database-backed tests run normally after `make db-test-setup`. Tests that need additional services remain ignored.
 
 ### Run all API integration tests
 ```bash
-cargo test -p attune-api --test '*' -- --ignored
+cargo test -p attune-api --test '*' -- --test-threads=4
 ```
 
 ### Run webhook API tests only
 ```bash
-cargo test -p attune-api --test webhook_api_tests -- --ignored
+cargo test -p attune-api --test webhook_api_tests -- --test-threads=4
 ```
 
 ### Run webhook security tests only
 ```bash
-cargo test -p attune-api --test webhook_security_tests -- --ignored
+cargo test -p attune-api --test webhook_security_tests -- --test-threads=4
 ```
 
 ### Run a specific test
 ```bash
-cargo test -p attune-api --test webhook_security_tests test_webhook_hmac_sha256_valid -- --ignored --nocapture
+cargo test -p attune-api --test webhook_security_tests test_webhook_hmac_sha256_valid -- --nocapture --test-threads=4
 ```
 
 ### Run tests with output
 ```bash
-cargo test -p attune-api --test webhook_security_tests -- --ignored --nocapture
+cargo test -p attune-api --test webhook_security_tests -- --nocapture --test-threads=4
 ```
 
 ## Test Categories
@@ -121,13 +121,13 @@ cargo test -p attune-api --test webhook_security_tests -- --ignored --nocapture
 - Check `JWT_SECRET` environment variable is set
 
 ### Tests timeout
-- Increase timeout with: `cargo test -- --ignored --test-threads=1`
+- Increase timeout while keeping the required concurrency: `cargo test -- --test-threads=4`
 - Check database performance
 - Reduce concurrent test execution
 
 ### Rate limit tests fail
 - Clear webhook event logs between runs
-- Ensure tests run in isolation: `cargo test -- --ignored --test-threads=1`
+- Database fixtures provide per-test isolation; run with `cargo test -- --test-threads=4`
 
 ## Documentation
 

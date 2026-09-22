@@ -5,6 +5,7 @@
 //! fail-closed token handling, cursor integrity, conflict/precondition, and
 //! quota behavior.
 
+use anyhow::Context;
 use axum::http::StatusCode;
 use helpers::*;
 use serde_json::{json, Value};
@@ -12,20 +13,25 @@ use serde_json::{json, Value};
 use attune_common::{
     audit::{AuditCategory, AuditEventFilters, AuditOutcome, AuditRepository},
     auth::jwt::{
-        generate_sensor_token, generate_token, generate_worker_token_with_instance, JwtConfig,
-        TokenType,
+        generate_sensor_token, generate_sensor_token_with_cache_authority_and_workload_fence,
+        generate_token, generate_worker_token_with_instance, validate_token, JwtConfig, TokenType,
     },
     config::CacheAdmissionConfig,
-    models::{enums::WorkerStatus, enums::WorkerType, ActionReferenceVisibility},
+    models::{
+        enums::WorkerStatus, enums::WorkerType, ActionReferenceVisibility, OwnerType,
+        SensorWorkloadFence,
+    },
     repositories::{
         cache::{
             CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope,
             CreateCacheNamespaceInput, ManagedCacheNamespaceDefinition,
         },
+        component_lifecycle::PackProjectionIds,
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository, UpdateIdentityInput,
         },
+        key::{CreateKeyInput, KeyRepository},
         runtime::{CreateRuntimeInput, CreateWorkerInput, RuntimeRepository, WorkerRepository},
         sensor_workload::{
             AcquireSensorWorkloadInput, AcquireSensorWorkloadOutcome, SensorWorkloadRepository,
@@ -216,7 +222,6 @@ async fn create_namespace(
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_full_refresh_and_read_lifecycle() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -382,7 +387,6 @@ async fn cache_full_refresh_and_read_lifecycle() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_point_and_multi_lookup_honor_readable_generation_pins() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -497,7 +501,6 @@ async fn cache_point_and_multi_lookup_honor_readable_generation_pins() -> Result
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_reports_not_populated_before_promotion() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -524,7 +527,6 @@ async fn cache_reports_not_populated_before_promotion() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn tombstoned_namespace_rejects_refresh_writes_with_specific_code() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -568,7 +570,6 @@ async fn tombstoned_namespace_rejects_refresh_writes_with_specific_code() -> Res
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_policy_and_page_limits_are_rejected_at_the_api_boundary() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -627,7 +628,6 @@ async fn cache_policy_and_page_limits_are_rejected_at_the_api_boundary() -> Resu
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn pack_managed_namespace_metadata_is_read_only_through_the_api() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -687,7 +687,6 @@ async fn pack_managed_namespace_metadata_is_read_only_through_the_api() -> Resul
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_namespaces_isolate_external_ids() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -742,7 +741,6 @@ async fn cache_namespaces_isolate_external_ids() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_rbac_list_and_read_share_visibility() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -811,7 +809,6 @@ async fn cache_rbac_list_and_read_share_visibility() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_list_without_owner_returns_every_accessible_scope() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -890,7 +887,6 @@ async fn cache_list_without_owner_returns_every_accessible_scope() -> Result<()>
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_hidden_namespace_is_not_leaked() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -934,7 +930,6 @@ async fn cache_hidden_namespace_is_not_leaked() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_rejects_worker_refresh_and_unsigned_sensor_tokens() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -981,14 +976,18 @@ async fn cache_rejects_worker_refresh_and_unsigned_sensor_tokens() -> Result<()>
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
-async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -> Result<()> {
+async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Result<()> {
     init_test_env();
-    let ctx = TestContext::new().await?;
-    let pack = create_test_pack(&ctx.pool, "sensor_cache_scope").await?;
-    let other_pack = create_test_pack(&ctx.pool, "sensor_cache_other").await?;
-    activate_test_pack_release(&ctx.pool, &pack).await?;
-    let (writer, _) = register_user(
+    let ctx = TestContext::new()
+        .await
+        .map_err(|error| std::io::Error::other(format!("create test context: {error}")))?;
+    let pack = create_test_pack(&ctx.pool, "sensor_cache_scope")
+        .await
+        .map_err(|error| std::io::Error::other(format!("create sensor pack: {error}")))?;
+    let other_pack = create_test_pack(&ctx.pool, "sensor_cache_other")
+        .await
+        .map_err(|error| std::io::Error::other(format!("create other pack: {error}")))?;
+    let (writer, writer_identity_id) = register_user(
         &ctx,
         "sensor_cache_writer",
         json!([{
@@ -1000,7 +999,8 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
             }
         }]),
     )
-    .await?;
+    .await
+    .map_err(|error| std::io::Error::other(format!("register cache writer: {error}")))?;
     create_namespace(&ctx, &writer, &pack.r#ref, "users", json!({}))
         .await?
         .assert_status(StatusCode::CREATED);
@@ -1024,7 +1024,8 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
             detection_config: json!({}),
         },
     )
-    .await?;
+    .await
+    .context("create sensor runtime")?;
     let sensor_ref = format!("{}.cache_reader", pack.r#ref);
     let sensor = SensorRepository::create(
         &ctx.pool,
@@ -1050,9 +1051,10 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
             artifact_retention_limit: None,
         },
     )
-    .await?;
+    .await
+    .context("create cache reader sensor")?;
     let trigger_ref = format!("{}.cache_probe", pack.r#ref);
-    TriggerRepository::create(
+    let trigger = TriggerRepository::create(
         &ctx.pool,
         CreateTriggerInput {
             r#ref: trigger_ref.clone(),
@@ -1070,7 +1072,22 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
             reference_allowed_pack_refs: Vec::new(),
         },
     )
-    .await?;
+    .await
+    .context("create cache probe trigger")?;
+    activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            runtimes: vec![runtime.id],
+            triggers: vec![trigger.id],
+            sensors: vec![sensor.id],
+            ..PackProjectionIds::default()
+        },
+    )
+    .await
+    .map_err(|error| {
+        std::io::Error::other(format!("activate projected sensor pack release: {error}"))
+    })?;
 
     let worker = WorkerRepository::create(
         &ctx.pool,
@@ -1085,7 +1102,8 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
             meta: None,
         },
     )
-    .await?;
+    .await
+    .context("create sensor worker")?;
     let worker_instance = uuid::Uuid::new_v4();
     let workload = match SensorWorkloadRepository::acquire_or_renew(
         &ctx.pool,
@@ -1096,7 +1114,8 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
             lease_seconds: 300,
         },
     )
-    .await?
+    .await
+    .context("acquire sensor workload")?
     {
         AcquireSensorWorkloadOutcome::Acquired(workload) => workload,
         AcquireSensorWorkloadOutcome::HeldByOther(_) => panic!("test workload is already held"),
@@ -1129,6 +1148,223 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
     assert_eq!(body["data"]["pack_ref"], pack.r#ref);
     assert_eq!(body["data"]["permission_set_refs"], json!(["standard"]));
     let sensor_token = body["data"]["token"].as_str().unwrap();
+
+    let encryption_key = ctx
+        .state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .expect("test encryption key");
+    let own_key = KeyRepository::create(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "sensor_credentials".to_string(),
+            owner_type: OwnerType::Pack,
+            owner_identity: None,
+            owner_pack: Some(pack.id),
+            owner_pack_ref: Some(pack.r#ref.clone()),
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Sensor credentials".to_string(),
+            encrypted: true,
+            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption_key)),
+            value: attune_common::crypto::encrypt_json(
+                &json!({"token": "sensor-secret"}),
+                encryption_key,
+            )?,
+        },
+    )
+    .await?;
+    let other_key = KeyRepository::create(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "other_credentials".to_string(),
+            owner_type: OwnerType::Pack,
+            owner_identity: None,
+            owner_pack: Some(other_pack.id),
+            owner_pack_ref: Some(other_pack.r#ref.clone()),
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Other credentials".to_string(),
+            encrypted: false,
+            encryption_key_hash: None,
+            value: json!({"token": "other-secret"}),
+        },
+    )
+    .await?;
+    let system_key = KeyRepository::create(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "system_credentials".to_string(),
+            owner_type: OwnerType::System,
+            owner_identity: None,
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "System credentials".to_string(),
+            encrypted: false,
+            encryption_key_hash: None,
+            value: json!({"token": "system-secret"}),
+        },
+    )
+    .await?;
+    let identity_key = KeyRepository::create(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "identity_credentials".to_string(),
+            owner_type: OwnerType::Identity,
+            owner_identity: Some(writer_identity_id),
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Identity credentials".to_string(),
+            encrypted: false,
+            encryption_key_hash: None,
+            value: json!({"token": "identity-secret"}),
+        },
+    )
+    .await?;
+    let sensor_key = KeyRepository::create(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "owned_sensor_credentials".to_string(),
+            owner_type: OwnerType::Sensor,
+            owner_identity: None,
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: Some(sensor.id),
+            owner_sensor_ref: Some(sensor.r#ref.clone()),
+            name: "Sensor credentials".to_string(),
+            encrypted: false,
+            encryption_key_hash: None,
+            value: json!({"token": "sensor-owner-secret"}),
+        },
+    )
+    .await?;
+
+    let response = ctx
+        .get("/api/v1/keys?per_page=100", Some(sensor_token))
+        .await?
+        .assert_status(StatusCode::OK);
+    let key_list: Value = response.json().await?;
+    let listed_keys = key_list["items"].as_array().expect("key list items");
+    assert_eq!(listed_keys.len(), 1);
+    assert_eq!(listed_keys[0]["ref"], own_key.r#ref);
+
+    let response = ctx
+        .get(
+            &format!("/api/v1/keys/{}", own_key.r#ref),
+            Some(sensor_token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    let own_key_body: Value = response.json().await?;
+    assert_eq!(
+        own_key_body["data"]["value"],
+        json!({"token": "sensor-secret"})
+    );
+    for hidden_ref in [
+        &other_key.r#ref,
+        &system_key.r#ref,
+        &identity_key.r#ref,
+        &sensor_key.r#ref,
+    ] {
+        ctx.get(&format!("/api/v1/keys/{hidden_ref}"), Some(sensor_token))
+            .await?
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    ctx.get("/api/v1/keys", Some(&worker_token))
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    ctx.get(
+        &format!("/api/v1/keys/{}", own_key.r#ref),
+        Some(&worker_token),
+    )
+    .await?
+    .assert_status(StatusCode::FORBIDDEN);
+    ctx.post(
+        "/api/v1/keys",
+        json!({
+            "local_ref": "sensor_write",
+            "owner_type": "pack",
+            "owner_pack_ref": pack.r#ref,
+            "name": "Sensor write",
+            "value": "blocked",
+            "encrypted": true
+        }),
+        Some(sensor_token),
+    )
+    .await?
+    .assert_status(StatusCode::FORBIDDEN);
+    ctx.put(
+        &format!("/api/v1/keys/{}", own_key.r#ref),
+        json!({"name": "Blocked update"}),
+        Some(sensor_token),
+    )
+    .await?
+    .assert_status(StatusCode::FORBIDDEN);
+    ctx.delete(
+        &format!("/api/v1/keys/{}", own_key.r#ref),
+        Some(sensor_token),
+    )
+    .await?
+    .assert_status(StatusCode::FORBIDDEN);
+
+    let sensor_identity_id = validate_token(sensor_token, &test_jwt_config())?
+        .sub
+        .parse::<i64>()?;
+    let wrong_pack_token = generate_sensor_token_with_cache_authority_and_workload_fence(
+        sensor_identity_id,
+        &sensor_ref,
+        vec![trigger_ref.clone()],
+        Some(&other_pack.r#ref),
+        &[],
+        &[],
+        SensorWorkloadFence {
+            workload_id: workload.workload_id,
+            worker_id: worker.id,
+            worker_instance,
+            generation: workload.generation,
+        },
+        &test_jwt_config(),
+        Some(300),
+    )?;
+    ctx.get("/api/v1/keys", Some(&wrong_pack_token))
+        .await?
+        .assert_status(StatusCode::UNAUTHORIZED);
+    let stale_token = generate_sensor_token_with_cache_authority_and_workload_fence(
+        sensor_identity_id,
+        &sensor_ref,
+        vec![trigger_ref.clone()],
+        Some(&pack.r#ref),
+        &[],
+        &[],
+        SensorWorkloadFence {
+            workload_id: workload.workload_id,
+            worker_id: worker.id,
+            worker_instance,
+            generation: workload.generation + 1,
+        },
+        &test_jwt_config(),
+        Some(300),
+    )?;
+    ctx.get("/api/v1/keys", Some(&stale_token))
+        .await?
+        .assert_status(StatusCode::UNAUTHORIZED);
 
     ctx.get(
         &format!(
@@ -1182,7 +1418,6 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_chunk_replay_is_idempotent_and_conflicts_on_divergence() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1238,7 +1473,6 @@ async fn cache_chunk_replay_is_idempotent_and_conflicts_on_divergence() -> Resul
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_chunk_route_accepts_bounded_payloads_above_axum_default_limit() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1279,7 +1513,6 @@ async fn cache_chunk_route_accepts_bounded_payloads_above_axum_default_limit() -
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_duplicate_external_id_across_chunks_is_rejected() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1328,7 +1561,6 @@ async fn cache_duplicate_external_id_across_chunks_is_rejected() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_promotion_optimistic_conflict() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1432,7 +1664,6 @@ async fn cache_promotion_optimistic_conflict() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_cursor_rejected_across_namespaces() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1520,7 +1751,6 @@ async fn cache_cursor_rejected_across_namespaces() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_quota_rejected_before_promotion() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1592,7 +1822,6 @@ async fn cache_quota_rejected_before_promotion() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn successful_chunk_insert_and_replay_emit_redacted_audits() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1670,7 +1899,6 @@ async fn successful_chunk_insert_and_replay_emit_redacted_audits() -> Result<()>
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn aggregate_namespace_quota_returns_stable_api_code() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new_with_cache_admission(CacheAdmissionConfig {
@@ -1699,7 +1927,6 @@ async fn aggregate_namespace_quota_returns_stable_api_code() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn api_namespace_recreate_still_conflicts_while_tombstone_drains() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1731,7 +1958,6 @@ async fn api_namespace_recreate_still_conflicts_while_tombstone_drains() -> Resu
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_zero_record_snapshot_is_an_empty_dataset_not_unpopulated() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1812,7 +2038,6 @@ async fn cache_zero_record_snapshot_is_an_empty_dataset_not_unpopulated() -> Res
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_metadata_lists_support_filters_and_keyset_cursors() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1963,7 +2188,6 @@ async fn cache_metadata_lists_support_filters_and_keyset_cursors() -> Result<()>
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn cache_rbac_honors_identity_attributes_and_audits_denials() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;

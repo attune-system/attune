@@ -75,7 +75,6 @@ async fn wait_for_no_leases(ctx: &TestContext) -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn route_returns_429_and_dropping_sse_body_releases_lease() -> Result<()> {
     let ctx = TestContext::new_with_stream_limits(2, 1)
         .await?
@@ -112,7 +111,6 @@ async fn route_returns_429_and_dropping_sse_body_releases_lease() -> Result<()> 
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database"]
 async fn server_shutdown_waits_for_reconnect_and_lease_release() -> Result<()> {
     let ctx = TestContext::new_with_stream_limits(1, 1)
         .await?

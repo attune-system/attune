@@ -45,6 +45,7 @@ pub mod external_identity_mapping;
 pub mod health;
 pub mod identity;
 pub mod inquiry;
+pub mod inquiry_callback_delivery;
 pub mod integration_token;
 pub mod key;
 pub mod log_stream;
@@ -160,6 +161,7 @@ pub use identity::{
     PermissionSetRepository,
 };
 pub use inquiry::InquiryRepository;
+pub use inquiry_callback_delivery::InquiryCallbackDeliveryRepository;
 pub use integration_token::IntegrationTokenRepository;
 pub use key::KeyRepository;
 pub use maintenance::MaintenanceRepository;

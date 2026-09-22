@@ -5,7 +5,8 @@ use sqlx::{Executor, Postgres, QueryBuilder};
 use crate::dashboard_spec::validate_dashboard_spec;
 use crate::models::{
     dashboard::{
-        Dashboard, DashboardVersion, DASHBOARD_SELECT_COLUMNS, DASHBOARD_VERSION_SELECT_COLUMNS,
+        Dashboard, DashboardVersion, DASHBOARD_RETURNING_COLUMNS, DASHBOARD_SELECT_COLUMNS,
+        DASHBOARD_VERSION_SELECT_COLUMNS,
     },
     DashboardScopeType, DashboardVisibility, Id, JsonDict,
 };
@@ -159,7 +160,7 @@ impl Create for DashboardRepository {
                 SELECT id, revision, spec_version, spec, $15 FROM inserted \
              ) \
              SELECT {} FROM inserted",
-            DASHBOARD_SELECT_COLUMNS, DASHBOARD_SELECT_COLUMNS
+            DASHBOARD_RETURNING_COLUMNS, DASHBOARD_SELECT_COLUMNS
         );
 
         sqlx::query_as::<_, Dashboard>(&query)
@@ -499,7 +500,7 @@ impl DashboardRepository {
                 WHERE $17 = TRUE \
              ) \
              SELECT {} FROM updated",
-            DASHBOARD_SELECT_COLUMNS, DASHBOARD_SELECT_COLUMNS
+            DASHBOARD_RETURNING_COLUMNS, DASHBOARD_SELECT_COLUMNS
         );
 
         let updated = sqlx::query_as::<_, Dashboard>(&query)

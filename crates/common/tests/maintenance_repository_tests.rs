@@ -27,7 +27,6 @@ async fn insert_execution(pool: &PgPool, status: &str, age_seconds: i64) -> i64 
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn requested_execution_is_marked_before_reschedule() {
     let pool = setup_db().await;
     let execution_id = insert_execution(&pool, "requested", 600).await;
@@ -64,7 +63,6 @@ async fn requested_execution_is_marked_before_reschedule() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn reschedule_respects_max_attempts() {
     let pool = setup_db().await;
     let execution_id = insert_execution(&pool, "requested", 600).await;
@@ -101,7 +99,6 @@ async fn reschedule_respects_max_attempts() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn terminal_execution_cannot_be_marked_for_reschedule() {
     let pool = setup_db().await;
     let execution_id = insert_execution(&pool, "completed", 600).await;

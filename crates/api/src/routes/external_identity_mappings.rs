@@ -70,6 +70,7 @@ pub async fn create_external_identity_mapping(
             mapped_identity: request.mapped_identity,
             provider: request.provider,
             tenant: request.tenant,
+            subject_kind: request.subject_kind,
             external_subject: request.external_subject,
             created_by: Some(created_by),
         },
@@ -85,6 +86,7 @@ pub async fn create_external_identity_mapping(
             "integration_identity": mapping.integration_identity,
             "mapped_identity": mapping.mapped_identity,
             "provider": mapping.provider,
+            "subject_kind": mapping.subject_kind,
         }),
     );
 
@@ -224,6 +226,7 @@ pub async fn update_external_identity_mapping(
             mapped_identity: request.mapped_identity,
             provider: request.provider,
             tenant: request.tenant,
+            subject_kind: request.subject_kind,
             external_subject: request.external_subject,
         },
     )
@@ -243,6 +246,7 @@ pub async fn update_external_identity_mapping(
                 "mapped_identity": existing.mapped_identity != mapping.mapped_identity,
                 "provider": existing.provider != mapping.provider,
                 "tenant": existing.tenant != mapping.tenant,
+                "subject_kind": existing.subject_kind != mapping.subject_kind,
                 "external_subject": existing.external_subject != mapping.external_subject,
             },
         }),
@@ -309,6 +313,7 @@ pub async fn delete_external_identity_mapping(
             "integration_identity": mapping.integration_identity,
             "mapped_identity": mapping.mapped_identity,
             "provider": mapping.provider,
+            "subject_kind": mapping.subject_kind,
         }),
     );
 

@@ -10,6 +10,8 @@ echo "============================================="
 echo ""
 
 DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/attune_test}"
+TEST_THREADS="${ATTUNE_RUST_TEST_THREADS:-4}"
+"$(dirname "$0")/check-db-test-threads.sh" "$TEST_THREADS"
 
 sanitize_database_url() {
     local at_signs=${1//[^@]/}
@@ -48,7 +50,15 @@ echo ""
 
 # Run a single test (health check is fast and simple)
 cd "$(dirname "$0")/.."
-cargo test --package attune-api --test health_and_auth_tests test_health_check -- --test-threads=1 2>&1 | grep -E "(running|test result)" || true
+TEST_OUTPUT=$(mktemp)
+trap 'rm -f "$TEST_OUTPUT"' EXIT
+if ! DATABASE_URL="$DATABASE_URL" ATTUNE__DATABASE__URL="$DATABASE_URL" \
+    cargo test --package attune-api --test health_and_auth_tests test_health_check \
+      -- --test-threads="$TEST_THREADS" >"$TEST_OUTPUT" 2>&1; then
+    cat "$TEST_OUTPUT" >&2
+    exit 1
+fi
+grep -E "(running|test result)" "$TEST_OUTPUT"
 
 echo ""
 echo "Test completed. Checking cleanup..."

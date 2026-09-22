@@ -2156,7 +2156,6 @@ mod tests {
     use chrono::Utc;
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn finalization_preserves_zero_byte_file_version() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let config = Config::load_from_file(&config_path).expect("test config");

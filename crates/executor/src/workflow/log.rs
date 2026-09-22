@@ -879,7 +879,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn replicas_serialize_append_against_append() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -898,7 +897,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn replicas_never_append_after_a_racing_seal() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -927,7 +925,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn expired_replica_claim_is_recovered_after_restart() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -948,7 +945,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn transient_store_failure_retains_head_and_blocks_seal() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -995,7 +991,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn upgrade_stream_sequence_is_assigned_before_delivery() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1033,7 +1028,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn configured_size_increase_keeps_existing_stream_limit() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1066,7 +1060,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn permanent_failure_blocks_tail_until_explicit_retry() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1115,7 +1108,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn retention_preserves_undelivered_workflow_logs() {
         use attune_common::repositories::retention::{RetentionRepository, RetentionTarget};
 
@@ -1172,7 +1164,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn append_success_before_lease_expiry_replays_same_sequence() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1219,7 +1210,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn direct_writer_conflict_rebases_dispatcher_append() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1278,7 +1268,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn transient_failures_do_not_exhaust_sequence_rebase_attempts() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1329,7 +1318,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn lost_seal_response_is_replayed_safely() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1358,7 +1346,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn shutdown_waits_for_in_flight_delivery() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1381,7 +1368,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn advisory_lock_namespaces_do_not_collide_with_scheduler_ids() {
         let (database, _) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1417,7 +1403,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn backed_off_head_blocks_tail_without_claiming_it() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();
@@ -1450,7 +1435,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn last_delivery_racing_enqueue_preserves_one_head() {
         let (database, workflow_execution) = test_workflow().await;
         let pool = database.pool().clone();

@@ -171,7 +171,6 @@ async fn list_rule_refs(ctx: &TestContext, path: &str, token: &str) -> Result<Ve
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_rules_hidden_without_read_grant() {
     let ctx = TestContext::new().await.unwrap();
     let rule = seed_rule(&ctx, "packa", "rule_one").await.unwrap();
@@ -206,7 +205,6 @@ async fn test_rules_hidden_without_read_grant() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_global_rules_read_returns_all() {
     let ctx = TestContext::new().await.unwrap();
     seed_rule(&ctx, "packa", "rule_one").await.unwrap();
@@ -232,7 +230,6 @@ async fn test_global_rules_read_returns_all() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_pack_scoped_rules_read_filters_rows() {
     let ctx = TestContext::new().await.unwrap();
     seed_rule(&ctx, "packa", "rule_one").await.unwrap();
@@ -271,7 +268,6 @@ async fn test_pack_scoped_rules_read_filters_rows() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_specific_rule_read_filters_rows() {
     let ctx = TestContext::new().await.unwrap();
     seed_rule(&ctx, "packa", "rule_one").await.unwrap();
@@ -301,7 +297,6 @@ async fn test_specific_rule_read_filters_rows() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_enforcements_require_readable_rule() {
     let ctx = TestContext::new().await.unwrap();
     let rule_a = seed_rule(&ctx, "packa", "rule_one").await.unwrap();
@@ -353,7 +348,6 @@ async fn test_enforcements_require_readable_rule() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_global_enforcement_read_returns_all() {
     let ctx = TestContext::new().await.unwrap();
     let rule_a = seed_rule(&ctx, "packa", "rule_one").await.unwrap();

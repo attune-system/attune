@@ -168,7 +168,6 @@ impl PermissionSetFixture {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_permission_set_minimal() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -197,7 +196,6 @@ async fn test_create_permission_set_minimal() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_permission_set_with_pack() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -228,7 +226,6 @@ async fn test_create_permission_set_with_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_permission_set_with_complex_grants() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -253,7 +250,6 @@ async fn test_create_permission_set_with_complex_grants() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_set_ref_format_validation() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -286,7 +282,6 @@ async fn test_permission_set_ref_format_validation() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_set_ref_lowercase() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -306,7 +301,6 @@ async fn test_permission_set_ref_lowercase() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_set_duplicate_ref() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -331,7 +325,6 @@ async fn test_permission_set_duplicate_ref() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_permission_set_by_id() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -349,7 +342,6 @@ async fn test_find_permission_set_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_permission_set_by_id_not_found() {
     let pool = create_test_pool().await.expect("Failed to create pool");
 
@@ -361,7 +353,6 @@ async fn test_find_permission_set_by_id_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_permission_sets() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -381,7 +372,6 @@ async fn test_list_permission_sets() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_permission_set_label() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -403,7 +393,6 @@ async fn test_update_permission_set_label() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_permission_set_grants() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -429,7 +418,6 @@ async fn test_update_permission_set_grants() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_permission_set_all_fields() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -453,7 +441,6 @@ async fn test_update_permission_set_all_fields() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_permission_set_no_changes() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -475,7 +462,6 @@ async fn test_update_permission_set_no_changes() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_update_permission_set_timestamps() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -500,7 +486,6 @@ async fn test_update_permission_set_timestamps() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_permission_set() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -521,7 +506,6 @@ async fn test_delete_permission_set() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_permission_set_not_found() {
     let pool = create_test_pool().await.expect("Failed to create pool");
 
@@ -533,7 +517,6 @@ async fn test_delete_permission_set_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_set_cascade_from_pack() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -554,7 +537,6 @@ async fn test_permission_set_cascade_from_pack() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_set_timestamps_auto_set() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -574,7 +556,6 @@ async fn test_permission_set_timestamps_auto_set() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_permission_assignment() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -590,7 +571,6 @@ async fn test_create_permission_assignment() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_permission_assignment_duplicate() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -612,7 +592,6 @@ async fn test_create_permission_assignment_duplicate() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_permission_assignment_invalid_identity() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -629,7 +608,6 @@ async fn test_create_permission_assignment_invalid_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_create_permission_assignment_invalid_permset() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -646,7 +624,6 @@ async fn test_create_permission_assignment_invalid_permset() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_permission_assignment_by_id() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -666,7 +643,6 @@ async fn test_find_permission_assignment_by_id() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_permission_assignment_by_id_not_found() {
     let pool = create_test_pool().await.expect("Failed to create pool");
 
@@ -678,7 +654,6 @@ async fn test_find_permission_assignment_by_id_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_list_permission_assignments() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -700,7 +675,6 @@ async fn test_list_permission_assignments() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_assignments_by_identity() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -725,7 +699,6 @@ async fn test_find_assignments_by_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_find_assignments_by_identity_empty() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -740,7 +713,6 @@ async fn test_find_assignments_by_identity_empty() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_permission_assignment() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -763,7 +735,6 @@ async fn test_delete_permission_assignment() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_delete_permission_assignment_not_found() {
     let pool = create_test_pool().await.expect("Failed to create pool");
 
@@ -775,7 +746,6 @@ async fn test_delete_permission_assignment_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_assignment_cascade_from_identity() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -798,7 +768,6 @@ async fn test_permission_assignment_cascade_from_identity() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_assignment_cascade_from_permset() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -821,7 +790,6 @@ async fn test_permission_assignment_cascade_from_permset() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_assignment_timestamp_auto_set() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -838,7 +806,6 @@ async fn test_permission_assignment_timestamp_auto_set() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_multiple_identities_same_permset() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -864,7 +831,6 @@ async fn test_multiple_identities_same_permset() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_one_identity_multiple_permsets() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -897,7 +863,6 @@ async fn test_one_identity_multiple_permsets() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_set_ordering() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
@@ -938,7 +903,6 @@ async fn test_permission_set_ordering() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_permission_assignment_ordering() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());

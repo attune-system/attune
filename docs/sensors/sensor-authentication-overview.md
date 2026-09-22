@@ -1,7 +1,7 @@
 # Sensor Authentication Overview
 
 **Version:** 1.0  
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-09-21
 
 ## Quick Summary
 
@@ -97,6 +97,20 @@ response ends the traversal; callers must never continue with a newer
 generation implicitly.
 Runtime definitions cannot override managed `ATTUNE_*` variables, including
 the signed sensor token and exact pack/sensor refs.
+
+## Managed Sensor Key Access
+
+A managed sensor token can list, read, and decrypt Keys owned by its registered
+pack. The API derives this access from the signed sensor `pack_ref`; it does not
+use ordinary identity roles or caller-supplied owner filters. For example, a
+sensor registered to the `slack` pack can read `pack.slack.credentials` but
+cannot read system, identity, action, sensor, or another pack's Keys.
+
+Sensor Key access is read-only. Sensor and worker tokens cannot create, update,
+or delete Keys. Every request also checks that the token's sensor ref and pack
+ref match its current workload assignment. A stale assignment or mismatched
+scope returns `401 Unauthorized`; a direct read outside the pack returns `404
+Not Found`.
 
 ## Security Best Practices
 
@@ -230,7 +244,7 @@ export ATTUNE_API_TOKEN="eyJhbGci..."
 
 | Scope | Create Events | Read Rules | Read Triggers | Read Keys | Update Execution |
 |-------|---------------|------------|---------------|-----------|------------------|
-| `sensor` | ✅ (restricted)* | ✅ | ✅ | ❌ | ❌ |
+| `sensor` | ✅ (restricted)* | ✅ | ✅ | ✅ (own pack, read/decrypt) | ❌ |
 | `action_execution` | ❌ | ❌ | ❌ | ✅ | ✅ |
 | `webhook` | ✅ | ❌ | ❌ | ❌ | ❌ |
 | `user` | ✅ | ✅ | ✅ | ✅ | ✅ |

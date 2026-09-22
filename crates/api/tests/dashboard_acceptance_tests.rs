@@ -391,7 +391,6 @@ fn fixtures_enforce_source_meta_and_order_contract_shape() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn analytics_dashboard_is_deterministic_for_identical_explicit_ranges() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -439,7 +438,6 @@ async fn analytics_dashboard_is_deterministic_for_identical_explicit_ranges() ->
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn analytics_dashboard_requires_authentication() -> Result<()> {
     let ctx = TestContext::new().await?;
     let response = ctx.get("/api/v1/analytics/dashboard", None).await?;
@@ -448,7 +446,6 @@ async fn analytics_dashboard_requires_authentication() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_ref_resolution_precedence_identity_pack_global() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -561,7 +558,6 @@ async fn dashboard_ref_resolution_precedence_identity_pack_global() -> Result<()
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_partial_failure_contract_mixed_source_statuses() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -636,7 +632,6 @@ async fn dashboard_partial_failure_contract_mixed_source_statuses() -> Result<()
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_scope_rbac_isolation_and_cache_context_partitioning() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -742,7 +737,6 @@ async fn dashboard_scope_rbac_isolation_and_cache_context_partitioning() -> Resu
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_source_params_enforce_effective_scope_intersection() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -874,7 +868,6 @@ async fn dashboard_source_params_enforce_effective_scope_intersection() -> Resul
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_queue_sources_execute_with_expected_shapes() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -1114,7 +1107,6 @@ async fn dashboard_queue_sources_execute_with_expected_shapes() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_source_order_contract_is_deterministic() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -1275,7 +1267,6 @@ async fn dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets() -> Resu
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_optimistic_concurrency_rejects_stale_updates() -> Result<()> {
     let ctx = TestContext::new().await?;
     let dashboard_ref = format!("core.concurrent_{}", uuid::Uuid::new_v4().simple());
@@ -1335,7 +1326,6 @@ async fn dashboard_optimistic_concurrency_rejects_stale_updates() -> Result<()> 
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_authoring_endpoints_support_create_preview_update_clone_and_delete() -> Result<()>
 {
     let ctx = TestContext::new().await?;
@@ -1507,7 +1497,6 @@ async fn dashboard_authoring_endpoints_support_create_preview_update_clone_and_d
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_update_endpoint_returns_explicit_revision_conflict() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -1581,7 +1570,6 @@ async fn dashboard_update_endpoint_returns_explicit_revision_conflict() -> Resul
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn dashboard_default_home_assignment_clears_previous_default_in_scope() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(

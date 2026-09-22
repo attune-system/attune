@@ -2,7 +2,7 @@
 #
 # Entrypoint for the Rust integration test container.
 #
-# Runs all #[ignore]'d integration tests that require a live database.
+# Runs the normal Rust test set against a live database.
 # The DATABASE_URL environment variable must point to a reachable PostgreSQL instance.
 #
 # Usage:
@@ -48,14 +48,14 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: entrypoint.sh [options] [-- cargo-test-args]"
       echo ""
       echo "Options:"
-      echo "  --crate, -c <name>   Run tests for a specific crate (common, api, executor, worker)"
+      echo "  --crate, -c <name>   Run tests for a specific crate (common, api, executor, sensor, worker, notifier, supervisor, cli)"
       echo "  --test <name>        Run one integration-test executable"
-      echo "  --filter, -f <expr>  Filter test names (passed to cargo test as filter)"
-      echo "  -- <args>            Extra args passed to the test binary (e.g. --nocapture)"
+      echo "  --filter, -f <expr>  Filter test names in selected libtest executables"
+      echo "  -- <args>            Extra args passed to each selected libtest executable"
       echo ""
       echo "Environment:"
       echo "  DATABASE_URL         PostgreSQL connection string (required)"
-      echo "  TEST_THREADS         Number of parallel test threads (default: 1)"
+      echo "  TEST_THREADS         Number of parallel test threads (minimum/default: 4)"
       echo "  ATTUNE_RUST_INCLUDE_EXTERNAL=1  Include tests requiring API, MinIO, CLI, or stress resources"
       exit 0 ;;
     *)
@@ -69,6 +69,17 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
   echo -e "${RED}ERROR: DATABASE_URL environment variable is required${NC}" >&2
   exit 1
 fi
+
+TEST_THREADS="${TEST_THREADS:-4}"
+/app/check-db-test-threads.sh "$TEST_THREADS"
+for extra_arg in "${EXTRA_ARGS[@]}"; do
+  case "$extra_arg" in
+    --test-threads|--test-threads=*)
+      echo -e "${RED}ERROR: set TEST_THREADS instead of passing ${extra_arg}${NC}" >&2
+      exit 2
+      ;;
+  esac
+done
 
 sanitize_database_url() {
   local at_signs=${1//[^@]/}
@@ -98,17 +109,13 @@ while ! bash -c "echo >/dev/tcp/$DB_HOST/$DB_PORT" 2>/dev/null; do
 done
 echo -e "${GREEN}Database is reachable (${WAITED}s)${NC}"
 
-# ── Create test database if it doesn't exist ─────────────────────────────
-# The tests expect attune_test database; create it if only the main DB exists
+# ── Use the provisioned base database ────────────────────────────────────
+# The orchestration runner provisions the base database before this entrypoint runs.
 DB_NAME=$(echo "$DATABASE_URL" | sed -E 's|.*/([^?]+).*|\1|')
-BASE_URL=$(echo "$DATABASE_URL" | sed -E "s|/[^?]+|/postgres|")
 
-echo -e "${CYAN}Ensuring database '${DB_NAME}' exists...${NC}"
+echo -e "${CYAN}Using database '${DB_NAME}'...${NC}"
 
-# Use psql-like approach via a simple Rust binary isn't available, so we'll
-# use the sqlx-based test helpers which create schemas per-test.
-# The test database must exist — if it doesn't, we create it.
-# We need the postgres client for this, or we can skip if tests create their own schemas.
+# Test fixtures create physical clones from the run-owned migrated template.
 
 # ── Override config for Docker environment ───────────────────────────────
 # The test helpers read config.test.yaml via CARGO_MANIFEST_DIR/../../config.test.yaml
@@ -179,7 +186,6 @@ EOF
 chmod 600 /build/config.test.yaml
 
 # ── Select precompiled test executables ──────────────────────────────────
-TEST_THREADS="${TEST_THREADS:-1}"
 MANIFEST=/build/test-artifacts/manifest.tsv
 PACKAGE=""
 
@@ -197,14 +203,12 @@ TEST_ARGS=()
 if [[ -n "$FILTER" ]]; then
   TEST_ARGS+=("$FILTER")
 fi
-TEST_ARGS+=(--ignored --test-threads="$TEST_THREADS")
+TEST_ARGS+=(--test-threads="$TEST_THREADS")
 DEFAULT_SKIPS=()
-if [[ "${ATTUNE_RUST_INCLUDE_EXTERNAL:-0}" != "1" ]]; then
+if [[ "${ATTUNE_RUST_INCLUDE_EXTERNAL:-0}" == "1" ]]; then
+  TEST_ARGS+=(--include-ignored)
+else
   DEFAULT_SKIPS=(
-    test_sse_stream_receives_execution_updates
-    test_sse_stream_filters_by_execution_id
-    test_sse_stream_requires_authentication
-    test_sse_stream_all_executions
     dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets
     test_action_execute_with_profile
     test_high_concurrency_stress
@@ -224,6 +228,21 @@ fi
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   TEST_ARGS+=("${EXTRA_ARGS[@]}")
 fi
+
+list_selected_tests() {
+  local test_binary="$1" listed_tests ignored_tests listed_test
+  listed_tests="$("$test_binary" "${TEST_ARGS[@]}" --list)"
+  if [[ "${ATTUNE_RUST_INCLUDE_EXTERNAL:-0}" == "1" ]]; then
+    printf '%s\n' "$listed_tests"
+    return
+  fi
+  ignored_tests="$("$test_binary" --list --ignored)"
+  while IFS= read -r listed_test; do
+    if ! grep -Fqx "$listed_test" <<< "$ignored_tests"; then
+      printf '%s\n' "$listed_test"
+    fi
+  done <<< "$listed_tests"
+}
 
 if [[ ! -s "$MANIFEST" ]]; then
   echo -e "${RED}ERROR: precompiled test artifact manifest is missing${NC}" >&2
@@ -261,13 +280,13 @@ if [[ -n "$FILTER" ]]; then
   MATCHING_ENTRIES=()
   for test_entry in "${TEST_ENTRIES[@]}"; do
     IFS=$'\t' read -r _ test_binary <<< "$test_entry"
-    if "$test_binary" "$FILTER" --list --ignored | grep -E ': (test|benchmark)$' >/dev/null; then
+    if list_selected_tests "$test_binary" | grep -E ': (test|benchmark)$' >/dev/null; then
       MATCHING_ENTRIES+=("$test_entry")
     fi
   done
   TEST_ENTRIES=("${MATCHING_ENTRIES[@]}")
   if [[ ${#TEST_ENTRIES[@]} -eq 0 ]]; then
-    echo -e "${RED}ERROR: no ignored tests matched filter '${FILTER}' in '${PACKAGE:-workspace}'${NC}" >&2
+    echo -e "${RED}ERROR: no tests matched filter '${FILTER}' in '${PACKAGE:-workspace}'${NC}" >&2
     exit 1
   fi
 fi
@@ -283,7 +302,7 @@ for test_entry in "${TEST_ENTRIES[@]}"; do
   else
     test_target="$test_name"
   fi
-  if ! listed_tests="$("$test_binary" "${TEST_ARGS[@]}" --list)"; then
+  if ! listed_tests="$(list_selected_tests "$test_binary")"; then
     echo -e "${RED}ERROR: could not list selected tests in '${test_binary##*/}'${NC}" >&2
     rm -f "$SELECTED_INVENTORY"
     exit 1

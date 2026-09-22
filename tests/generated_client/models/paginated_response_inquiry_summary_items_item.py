@@ -20,7 +20,7 @@ class PaginatedResponseInquirySummaryItemsItem:
 
     Attributes:
         created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-        execution (int):
+        created_by_execution (int):
         has_response (bool): Whether a response has been provided Example: False.
         id (int):
         prompt (str): Prompt text Example: Approve deployment to production?.
@@ -30,7 +30,7 @@ class PaginatedResponseInquirySummaryItemsItem:
     """
 
     created: datetime.datetime
-    execution: int
+    created_by_execution: int
     has_response: bool
     id: int
     prompt: str
@@ -42,7 +42,7 @@ class PaginatedResponseInquirySummaryItemsItem:
     def to_dict(self) -> dict[str, Any]:
         created = self.created.isoformat()
 
-        execution = self.execution
+        created_by_execution = self.created_by_execution
 
         has_response = self.has_response
 
@@ -71,7 +71,7 @@ class PaginatedResponseInquirySummaryItemsItem:
         field_dict.update(
             {
                 "created": created,
-                "execution": execution,
+                "created_by_execution": created_by_execution,
                 "has_response": has_response,
                 "id": id,
                 "prompt": prompt,
@@ -90,7 +90,7 @@ class PaginatedResponseInquirySummaryItemsItem:
         d = dict(src_dict)
         created = datetime.datetime.fromisoformat(d.pop("created"))
 
-        execution = d.pop("execution")
+        created_by_execution = d.pop("created_by_execution")
 
         has_response = d.pop("has_response")
 
@@ -128,7 +128,7 @@ class PaginatedResponseInquirySummaryItemsItem:
 
         paginated_response_inquiry_summary_items_item = cls(
             created=created,
-            execution=execution,
+            created_by_execution=created_by_execution,
             has_response=has_response,
             id=id,
             prompt=prompt,

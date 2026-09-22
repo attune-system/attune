@@ -11,7 +11,10 @@ tasks:
   request_approval:
     action: slack.request_approval
     input:
+      purpose: "production-deploy"
       prompt: "Approve production deployment?"
+      channel: "C123"
+      assigned_to: "{{ parameters.approver_identity_id }}"
     next:
       - do: deploy
 
@@ -133,17 +136,46 @@ Submit a human response with `POST /api/v1/inquiries/{id}/respond`:
 
 The API validates the response against the inquiry's flat `response_schema`. Only the assigned identity can answer an assigned inquiry. The API rejects self-approval by the creator execution and its descendants.
 
+Fields marked `secret: true` are redacted from inquiry API responses after submission. Workflow context uses the stored value. Fixed response option payloads are visible to inquiry readers, so options must not contain secrets.
+
 The response update uses a pending-state compare-and-set. A second response, a late response, or a response after cancellation returns `409 Conflict`.
 
 Provider integrations must map the provider actor to an Attune identity before submitting a response. Do not store provider credentials or raw callback bodies in inquiry metadata.
 
-Provider integrations configure the provider's callback URL to call Attune directly:
+Managed sensors submit provider envelopes through one metadata-selected endpoint:
 
 ```http
-POST /api/v1/inquiry-callbacks/{adapter_key}
+POST /api/v1/internal/inquiry-callbacks/{adapter_ref}
 ```
 
-The request body and authentication headers use the provider's native protocol. Attune authenticates the exact request bytes, extracts the option-bound handle and external actor through the configured callback adapter, persists the delivery, and invokes the shared inquiry response service. The handle supplies opaque correlation and option integrity, not authorization. Attune also requires an active adapter integration identity, a current `inquiries:respond` grant, an exact external identity mapping, and a mapped identity that matches `assigned_to`. See the [provider-neutral callback ingress](../plans/provider-neutral-inquiry-callback-ingress.md).
+The sensor calls this endpoint with its fenced sensor token and the provider's native envelope. Its release-pinned `config.inquiry_callback_adapters` entry defines the provider, subject kind, JSON Pointer extraction rules, and bounded request constraints. Attune stores the normalized selection as encrypted JSON before acknowledging it. The handle supplies opaque correlation and option integrity, not authorization. Ingress requires the caller's current workload fence and an enabled adapter with the same ref in both live and pinned sensor metadata. The background processor rechecks current sensor availability, the `inquiries:respond` grant for the sensor identity, the exact provider identity mapping, and that the mapped identity matches `assigned_to`.
+
+For example, a Slack Socket Mode sensor can declare `slack.socket_mode` and map `/envelope_id`, `/payload/team/id`, `/payload/user/id`, and `/payload/actions/0/value`. Slack's field names and action IDs remain pack metadata rather than API route code.
+
+```yaml
+config:
+  inquiry_callback_adapters:
+    slack.socket_mode:
+      enabled: true
+      provider: slack
+      subject_kind: user
+      request:
+        delivery_id_pointer: /envelope_id
+        tenant_pointer: /payload/team/id
+        external_subject_pointer: /payload/user/id
+        response_handle_pointer: /payload/actions/0/value
+        required_values:
+          /type: interactive
+          /payload/type: block_actions
+        allowed_values:
+          /payload/actions/0/action_id:
+            - attune.inquiry.response.v1.approve
+            - attune.inquiry.response.v1.reject
+        required_array_lengths:
+          /payload/actions: 1
+```
+
+Attune returns `{"acknowledge":true}` after the encrypted delivery commits, so the sensor can acknowledge its provider within the provider's deadline. Failures before that commit return a non-2xx response and remain unacknowledged. After the commit, the API owns the delivery independently of the sensor process lease. A background monitor retries deliveries left `pending` by API crashes. Terminal authorization, mapping, handle, assignment, and inquiry-state failures mark the delivery `rejected`; successful responses mark it `accepted` in the same transaction as the inquiry response.
 
 ## Runtime behavior
 

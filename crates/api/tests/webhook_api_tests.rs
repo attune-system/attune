@@ -149,7 +149,6 @@ async fn get_auth_token(app: &axum::Router, pool: &PgPool) -> String {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_enable_webhook() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -191,7 +190,6 @@ async fn test_enable_webhook() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_disable_webhook() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -241,7 +239,6 @@ async fn test_disable_webhook() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_regenerate_webhook_key() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -292,7 +289,6 @@ async fn test_regenerate_webhook_key() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_regenerate_webhook_key_not_enabled() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -328,7 +324,6 @@ async fn test_regenerate_webhook_key_not_enabled() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_receive_webhook() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -398,7 +393,6 @@ async fn test_receive_webhook() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_receive_webhook_invalid_key() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -427,7 +421,6 @@ async fn test_receive_webhook_invalid_key() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_receive_webhook_disabled() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -476,7 +469,6 @@ async fn test_receive_webhook_disabled() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_webhook_requires_auth_for_management() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();
@@ -508,7 +500,6 @@ async fn test_webhook_requires_auth_for_management() {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_receive_webhook_minimal_payload() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();

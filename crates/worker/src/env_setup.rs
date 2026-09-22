@@ -1447,7 +1447,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL/TimescaleDB"]
     async fn equal_pack_refs_in_separate_databases_do_not_share_metadata() {
         use attune_common::config::Config;
         use attune_common::repositories::pack::CreatePackInput;

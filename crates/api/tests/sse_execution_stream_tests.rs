@@ -161,7 +161,7 @@ async fn receive_execution_notification(
 /// Run with: cargo test test_sse_stream_receives_execution_updates -- --ignored --nocapture
 /// After starting: cargo run -p attune-api -- -c config.test.yaml
 #[tokio::test]
-#[ignore = "integration test — requires database"]
+#[ignore = "requires a live API server and database"]
 async fn test_sse_stream_receives_execution_updates() -> Result<()> {
     // Set up test context with auth
     let ctx = TestContext::new().await?.with_auth().await?;
@@ -288,7 +288,7 @@ async fn test_sse_stream_receives_execution_updates() -> Result<()> {
 
 /// Test that SSE stream correctly filters by execution_id
 #[tokio::test]
-#[ignore = "integration test — requires database"]
+#[ignore = "requires a live API server and database"]
 async fn test_sse_stream_filters_by_execution_id() -> Result<()> {
     // Set up test context with auth
     let ctx = TestContext::new().await?.with_auth().await?;
@@ -385,7 +385,7 @@ async fn test_sse_stream_filters_by_execution_id() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test — requires database"]
+#[ignore = "requires a live API server"]
 async fn test_sse_stream_requires_authentication() -> Result<()> {
     let sse_url = "http://localhost:8080/api/v1/executions/stream";
     let response = reqwest::Client::new().get(sse_url).send().await?;
@@ -399,7 +399,7 @@ async fn test_sse_stream_requires_authentication() -> Result<()> {
 
 /// Test streaming all executions (no filter)
 #[tokio::test]
-#[ignore = "integration test — requires database"]
+#[ignore = "requires a live API server and database"]
 async fn test_sse_stream_all_executions() -> Result<()> {
     // Set up test context with auth
     let ctx = TestContext::new().await?.with_auth().await?;

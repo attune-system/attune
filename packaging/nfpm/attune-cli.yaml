@@ -9,8 +9,8 @@ priority: optional
 maintainer: "Attune <attune@rdrx.app>"
 description: "Attune CLI — Command-line interface and MCP server for the Attune platform"
 vendor: "Attune"
-homepage: "https://git.rdrx.app/attune/attune"
-license: "Proprietary"
+homepage: "https://git.rdrx.app/attune-system/attune"
+license: "Apache-2.0"
 
 # No dependencies — statically linked
 

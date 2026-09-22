@@ -137,7 +137,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database
     async fn test_heartbeat_manager() {
         let mut config = test_config();
         if let Some(worker) = config.worker.as_mut() {

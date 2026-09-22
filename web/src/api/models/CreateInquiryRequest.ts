@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { i64 } from "./i64";
+import type { InquiryResponseOption } from "./InquiryResponseOption";
 /**
  * Request to create a new inquiry
  */
@@ -17,9 +18,13 @@ export type CreateInquiryRequest = {
    */
   purpose: string;
   /**
+   * Fixed response choices rendered by provider actions.
+   */
+  response_options: Array<InquiryResponseOption>;
+  /**
    * Optional schema for the expected response format (flat format with inline required/secret)
    */
-  response_schema: Record<string, any>;
+  response_schema?: any | null;
   /**
    * Optional relative timeout in seconds.
    */

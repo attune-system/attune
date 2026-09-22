@@ -2,13 +2,13 @@
 
 ## Status
 
-Proposed implementation specification for the first released inquiry callback contract. No running Attune deployment depends on the external provider listener or `POST /api/v1/inquiry-responses`; those pieces are unreleased scaffolding and must not shape the public design.
+Proposed specification for public HTTP callback providers. Managed sensors already have a metadata-selected trusted-transport ingress for localhost and private deployments. No running Attune deployment depends on the external provider listener or `POST /api/v1/inquiry-responses`; those pieces are unreleased scaffolding and must not shape either contract.
 
 Implement callback ingress directly in the Attune API, update the canonical pre-production contract in place, and remove the scaffolding before release. Do not add compatibility formats, dual readers, data conversion, or a staged runtime cutover.
 
 ## Decision
 
-Attune will receive provider callbacks directly through a public API route:
+Providers that deliver signed HTTP callbacks will call this public API route:
 
 ```text
 POST /api/v1/inquiry-callbacks/{adapter_key}
@@ -17,6 +17,8 @@ POST /api/v1/inquiry-callbacks/{adapter_key}
 The route will use a configured callback adapter to authenticate the request, decode the body, identify the external actor, extract an opaque response-option handle, and produce the provider's required acknowledgment. The adapter will then pass a provider-neutral selection to the inquiry response service.
 
 The inquiry service will not contain branches for Slack, Discord, Microsoft Teams, or another provider. It will continue to own identity mapping, assignment checks, RBAC, response validation, state changes, audit records, and workflow notification.
+
+Persistent provider transports use the managed-sensor path. A fenced sensor owns the authenticated provider connection and forwards the native envelope to `POST /api/v1/internal/inquiry-callbacks/{adapter_ref}`. The sensor's release-pinned `config.inquiry_callback_adapters` metadata selects bounded JSON Pointer extraction and request constraints. The API rechecks the current workload fence and persists an encrypted delivery before acknowledgment. The API then owns that delivery independently of the sensor process lease. Its background monitor invokes the same inquiry response service and retries deliveries left pending by API crashes. Callers cannot choose the provider, integration identity, actor kind, or response body because those values come from authenticated sensor state and pinned metadata.
 
 Provider protocols differ enough that one Slack-shaped HMAC configuration cannot represent them safely:
 
@@ -28,8 +30,8 @@ The callback adapter interface must therefore separate authentication, decoding,
 
 ## Goals
 
-- Do not ship the standalone Slack inquiry callback listener.
-- Let Slack, Discord, and Microsoft Teams call the Attune API directly.
+- Do not ship the standalone Slack inquiry callback listener or normalized bearer endpoint.
+- Let providers with signed HTTP callbacks call the Attune API directly.
 - Keep provider authentication and wire formats outside inquiry domain logic.
 - Define fixed response options on an inquiry and validate each option against the inquiry's flat `response_schema`.
 - Bind each provider control to one compact, opaque response-option handle.

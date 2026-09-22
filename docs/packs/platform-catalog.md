@@ -184,8 +184,8 @@ database instead of the default local `attune_test`.
 ```sh
 make db-test-setup
 cargo test -p attune-common --lib platform_catalog::tests
-cargo test -p attune-common --test platform_catalog_tests -- --ignored --test-threads=1
-cargo test -p attune-common --test platform_catalog_boundary_tests -- --ignored --test-threads=1
+cargo test -p attune-common --test platform_catalog_tests -- --test-threads=4
+cargo test -p attune-common --test platform_catalog_boundary_tests -- --test-threads=4
 ```
 
 The integration tests cover fresh and concurrent reconciliation, repeat

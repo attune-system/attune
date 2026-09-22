@@ -149,6 +149,12 @@ const navSections: NavSection[] = [
         permissions: [{ resource: "executions" }],
       },
       {
+        to: "/inquiries",
+        label: "Inquiries",
+        icon: navIcons.inquiries,
+        color: "fuchsia",
+      },
+      {
         to: "/enforcements",
         label: "Enforcement History",
         icon: navIcons.enforcements,

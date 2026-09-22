@@ -4,6 +4,7 @@ pub mod commands;
 pub mod completion;
 pub mod completion_tree;
 pub mod config;
+pub mod inquiry;
 pub mod output;
 pub mod wait;
 

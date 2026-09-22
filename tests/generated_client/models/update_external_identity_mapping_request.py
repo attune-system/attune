@@ -16,12 +16,14 @@ class UpdateExternalIdentityMappingRequest:
         external_subject (str):
         mapped_identity (int):
         provider (str):
+        subject_kind (str):
         tenant (str):
     """
 
     external_subject: str
     mapped_identity: int
     provider: str
+    subject_kind: str
     tenant: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -30,6 +32,8 @@ class UpdateExternalIdentityMappingRequest:
         mapped_identity = self.mapped_identity
 
         provider = self.provider
+
+        subject_kind = self.subject_kind
 
         tenant = self.tenant
 
@@ -40,6 +44,7 @@ class UpdateExternalIdentityMappingRequest:
                 "external_subject": external_subject,
                 "mapped_identity": mapped_identity,
                 "provider": provider,
+                "subject_kind": subject_kind,
                 "tenant": tenant,
             }
         )
@@ -55,12 +60,15 @@ class UpdateExternalIdentityMappingRequest:
 
         provider = d.pop("provider")
 
+        subject_kind = d.pop("subject_kind")
+
         tenant = d.pop("tenant")
 
         update_external_identity_mapping_request = cls(
             external_subject=external_subject,
             mapped_identity=mapped_identity,
             provider=provider,
+            subject_kind=subject_kind,
             tenant=tenant,
         )
 

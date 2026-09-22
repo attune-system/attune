@@ -1,15 +1,15 @@
 # Dockerfile for running Rust integration tests against a live database
 #
-# Compiles the workspace in test mode and runs all #[ignore]'d tests.
-# These tests exercise repository layer, API endpoints, and execution logic
-# directly in Rust — they need a database but not the full service stack.
+# Compiles the workspace in test mode and runs the normal test set.
+# Database tests exercise repositories, API endpoints, and execution logic
+# directly in Rust. Explicitly ignored external and load tests remain opt-in.
 #
 # The image keeps the source tree layout intact so CARGO_MANIFEST_DIR-relative
 # path lookups (../../config.test.yaml, ../../migrations) work correctly.
 #
 # Usage:
 #   docker compose -f docker-compose.yaml -f docker-compose.e2e.yaml \
-#     run --rm rust-integration-tests [-- <cargo test args>]
+#     run --rm rust-int-tests [filter]
 
 ARG RUST_VERSION=1.98.1
 ARG DEBIAN_VERSION=bookworm
@@ -72,7 +72,7 @@ COPY config.test.yaml ./config.test.yaml
 
 ARG ATTUNE_FORCE_COMPILE_FAILURE=0
 
-# Compile in a reusable BuildKit target cache, then copy only runnable test
+# Compile in a reusable BuildKit target cache, then copy test
 # executables into the image. This avoids exporting Cargo's multi-gigabyte
 # incremental directory while still ensuring runtime invocations never rebuild.
 # The cargo command writes directly to a file (no masking pipeline), so any
@@ -84,7 +84,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
       printf '\nthis_is_an_intentional_compile_error!();\n' >> crates/common/src/lib.rs; \
     fi && \
     cargo metadata --format-version=1 --no-deps > /tmp/cargo-metadata.json && \
-    cargo test --workspace --no-run --message-format=json-render-diagnostics > /tmp/cargo-artifacts.jsonl && \
+    cargo test --workspace --all-features --no-run --message-format=json-render-diagnostics > /tmp/cargo-artifacts.jsonl && \
     python3 docker/extract-rust-test-artifacts.py \
       /tmp/cargo-metadata.json /tmp/cargo-artifacts.jsonl /build/test-artifacts
 
@@ -114,6 +114,7 @@ COPY --from=builder /build/docker-compose.yaml ./docker-compose.yaml
 COPY --from=builder /build/config.test.yaml ./config.test.yaml
 
 COPY docker/rust-tests-entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY scripts/check-db-test-threads.sh /app/check-db-test-threads.sh
+RUN chmod +x /app/entrypoint.sh /app/check-db-test-threads.sh
 
 ENTRYPOINT ["/app/entrypoint.sh"]

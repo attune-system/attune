@@ -164,7 +164,6 @@ mod tests {
     use bytes::Bytes;
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn interrupted_exact_delete_completes_idempotently_on_retry() {
         let path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let config = Config::load_from_file(&path).unwrap();
@@ -222,7 +221,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires database"]
     async fn cycle_preserves_active_object_logs_and_removes_abandoned_pending_versions() {
         let path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let config = Config::load_from_file(&path).unwrap();

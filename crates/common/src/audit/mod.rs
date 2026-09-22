@@ -132,7 +132,8 @@ pub mod event_type {
     }
 
     pub mod inquiry {
-        pub const EXTERNAL_RESPONSE_ACCEPTED: &str = "inquiry.external_response.accepted";
+        pub const HUMAN_RESPONSE_ACCEPTED: &str = "inquiry.human_response.accepted";
+        pub const CALLBACK_RESPONSE_ACCEPTED: &str = "inquiry.callback_response.accepted";
     }
 
     pub mod audit_log {

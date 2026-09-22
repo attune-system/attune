@@ -7,12 +7,12 @@ This directory contains integration tests for the Attune executor service.
 ### Policy Enforcer Tests (`policy_enforcer_tests.rs`)
 Tests for policy enforcement including rate limiting, concurrency control, and quota management.
 
-**Run**: `cargo test --test policy_enforcer_tests -- --ignored`
+**Run**: `cargo test --test policy_enforcer_tests -- --test-threads=4`
 
 ### FIFO Ordering Integration Tests (`fifo_ordering_integration_test.rs`)
 Comprehensive integration and stress tests for FIFO policy execution ordering.
 
-**Run**: `cargo test --test fifo_ordering_integration_test -- --ignored --test-threads=1`
+**Run**: `cargo test --test fifo_ordering_integration_test -- --test-threads=4`
 
 ## Prerequisites
 
@@ -38,16 +38,16 @@ Comprehensive integration and stress tests for FIFO policy execution ordering.
 ### All Integration Tests
 ```bash
 # Run all executor integration tests (except extreme stress)
-cargo test -- --ignored --test-threads=1
+cargo test -- --test-threads=4
 ```
 
 ### Individual Test Suites
 ```bash
 # Policy enforcer tests
-cargo test --test policy_enforcer_tests -- --ignored
+cargo test --test policy_enforcer_tests -- --test-threads=4
 
 # FIFO ordering tests
-cargo test --test fifo_ordering_integration_test -- --ignored --test-threads=1
+cargo test --test fifo_ordering_integration_test -- --test-threads=4
 ```
 
 ### Individual Test with Output
@@ -62,7 +62,7 @@ cargo test --test fifo_ordering_integration_test test_multiple_workers_simulatio
 ### Extreme Stress Test (10k executions)
 ```bash
 # This test takes 5-10 minutes - run separately
-cargo test --test fifo_ordering_integration_test test_extreme_stress_10k_executions -- --ignored --nocapture --test-threads=1
+cargo test --test fifo_ordering_integration_test test_extreme_stress_10k_executions -- --ignored --nocapture --test-threads=4
 ```
 
 ## Test Organization
@@ -73,7 +73,7 @@ cargo test --test fifo_ordering_integration_test test_extreme_stress_10k_executi
 
 ## Important Notes
 
-- Use `--test-threads=1` for integration tests to avoid database contention
+- Use at least `--test-threads=4`; fixtures own their database state and CI enforces this minimum
 - Tests create unique data using timestamps to avoid conflicts
 - All tests clean up their test data automatically
 - Stress tests output progress messages and performance metrics

@@ -23,7 +23,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::stream::Stream;
+use futures::{stream::Stream, TryStreamExt};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::{
@@ -69,8 +69,8 @@ use attune_common::artifact_transport::{
 };
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::models::enums::{
-    ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
-    RetentionPolicyType,
+    ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, LogStreamBackend,
+    OwnerType, RetentionPolicyType,
 };
 use attune_common::repositories::{
     action::ActionRepository,
@@ -82,6 +82,7 @@ use attune_common::repositories::{
     },
     execution::ExecutionRepository,
     identity::IdentityRepository,
+    log_stream::LogStreamRepository,
     trigger::SensorRepository,
     workflow_log_outbox::WorkflowLogOutboxRepository,
     Create, Delete, FindById, FindByRef, Patch, Update,
@@ -2560,6 +2561,14 @@ fn serve_bytes(
 /// We use `futures::stream::unfold` instead of `async_stream::stream!` to avoid
 /// adding an external dependency.
 enum TailState {
+    /// Reading immutable segments committed through the API.
+    Segmented {
+        state: Arc<AppState>,
+        stream_id: i64,
+        execution_id: Option<i64>,
+        next_sequence: i64,
+        idle_count: u32,
+    },
     /// Waiting for the file to appear on disk.
     WaitingForFile {
         file_path: String,
@@ -2660,11 +2669,9 @@ async fn checked_tail_path(
 /// Stream the latest file-backed artifact version as Server-Sent Events.
 ///
 /// The endpoint:
-/// 1. Waits (up to ~30 s) for the file to appear on disk if it has been
-///    allocated but not yet written by the worker.
-/// 2. Once the file exists it sends the current content as an initial `content`
-///    event, then tails the file every 500 ms, sending `append` events with new
-///    bytes.
+/// 1. Streams committed immutable log segments when the version has an
+///    object-segment log stream.
+/// 2. Otherwise, waits for the allocated file and tails appended bytes.
 /// 3. When no new bytes have appeared for several consecutive checks **and** the
 ///    linked execution (if any) has reached a terminal status, it sends a `done`
 ///    event and the stream ends.
@@ -2752,26 +2759,38 @@ pub async fn stream_artifact(
         }
     };
 
-    let file_path = ver.file_path.ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "Latest version of artifact '{}' has no file_path allocated",
-            artifact.r#ref,
-        ))
-    })?;
-
     let artifacts_dir = std::path::PathBuf::from(&state.config.artifacts_dir);
-    checked_tail_path(&artifacts_dir, &file_path)
-        .await
-        .map_err(ApiError::Forbidden)?;
     let execution_id = ver.execution;
-    let db = state.db.clone();
+    let log_stream = LogStreamRepository::find_by_artifact_version(&state.db, ver.id).await?;
 
     // --- build the SSE stream via unfold -----------------------------------
-    let initial_state = TailState::WaitingForFile {
-        file_path,
-        execution_id,
-        db,
-        started: tokio::time::Instant::now(),
+    let initial_state = match log_stream {
+        Some(log_stream) if log_stream.backend == LogStreamBackend::ObjectSegments => {
+            TailState::Segmented {
+                state: state.clone(),
+                stream_id: log_stream.id,
+                execution_id,
+                next_sequence: 0,
+                idle_count: 0,
+            }
+        }
+        _ => {
+            let file_path = ver.file_path.ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "Latest version of artifact '{}' has no file_path allocated",
+                    artifact.r#ref,
+                ))
+            })?;
+            checked_tail_path(&artifacts_dir, &file_path)
+                .await
+                .map_err(ApiError::Forbidden)?;
+            TailState::WaitingForFile {
+                file_path,
+                execution_id,
+                db: state.db.clone(),
+                started: tokio::time::Instant::now(),
+            }
+        }
     };
 
     let stream_artifacts_dir = artifacts_dir.clone();
@@ -2780,6 +2799,122 @@ pub async fn stream_artifact(
         async move {
             match state {
                 TailState::Finished => None,
+
+                TailState::Segmented {
+                    state,
+                    stream_id,
+                    execution_id,
+                    next_sequence,
+                    mut idle_count,
+                } => {
+                    if idle_count > 0 {
+                        tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+                    }
+                    match LogStreamRepository::find_segment_by_sequence(
+                        &state.db,
+                        stream_id,
+                        next_sequence,
+                    )
+                    .await
+                    {
+                        Ok(Some(segment)) => {
+                            let reader = match super::internal_files::stream_log_segments(
+                                &state,
+                                vec![segment],
+                                None,
+                                false,
+                            ) {
+                                Ok(reader) => reader,
+                                Err(_) => {
+                                    return Some((
+                                        Ok(artifact_stream_error_event(
+                                            "artifact_stream_read_failed",
+                                            "The artifact log segment could not be read",
+                                            true,
+                                        )),
+                                        TailState::Finished,
+                                    ));
+                                }
+                            };
+                            let bytes = match reader
+                                .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                                    bytes.extend_from_slice(&chunk);
+                                    Ok(bytes)
+                                })
+                                .await
+                            {
+                                Ok(bytes) => bytes,
+                                Err(_) => {
+                                    return Some((
+                                        Ok(artifact_stream_error_event(
+                                            "artifact_stream_read_failed",
+                                            "The artifact log segment could not be read",
+                                            true,
+                                        )),
+                                        TailState::Finished,
+                                    ));
+                                }
+                            };
+                            let event = if next_sequence == 0 {
+                                "content"
+                            } else {
+                                "append"
+                            };
+                            Some((
+                                Ok(Event::default()
+                                    .event(event)
+                                    .data(String::from_utf8_lossy(&bytes))),
+                                TailState::Segmented {
+                                    state,
+                                    stream_id,
+                                    execution_id,
+                                    next_sequence: next_sequence + 1,
+                                    idle_count: 0,
+                                },
+                            ))
+                        }
+                        Ok(None) => {
+                            idle_count += 1;
+                            let stream =
+                                LogStreamRepository::find_by_id_in_pool(&state.db, stream_id).await;
+                            let done = match stream {
+                                Ok(stream) => {
+                                    stream.sealed
+                                        || (idle_count >= STREAM_IDLE_CHECKS_BEFORE_DONE
+                                            && is_execution_terminal(&state.db, execution_id).await)
+                                }
+                                Err(_) => false,
+                            };
+                            if done {
+                                Some((
+                                    Ok(Event::default()
+                                        .event("done")
+                                        .data("Execution complete - stream closed")),
+                                    TailState::Finished,
+                                ))
+                            } else {
+                                Some((
+                                    Ok(Event::default().comment("no-change")),
+                                    TailState::Segmented {
+                                        state,
+                                        stream_id,
+                                        execution_id,
+                                        next_sequence,
+                                        idle_count,
+                                    },
+                                ))
+                            }
+                        }
+                        Err(_) => Some((
+                            Ok(artifact_stream_error_event(
+                                "artifact_stream_read_failed",
+                                "The artifact log stream could not be read",
+                                true,
+                            )),
+                            TailState::Finished,
+                        )),
+                    }
+                }
 
                 // ---- Phase 1: wait for the file to appear ----
                 TailState::WaitingForFile {

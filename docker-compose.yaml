@@ -34,18 +34,18 @@ services:
   # ============================================================================
 
   postgres:
-    image: timescale/timescaledb:2.17.2-pg16
+    image: timescale/timescaledb:2.30.1-pg18
     container_name: attune-postgres
     shm_size: 256mb
     environment:
       POSTGRES_USER: attune
       POSTGRES_PASSWORD: attune
       POSTGRES_DB: attune
-      PGDATA: /var/lib/postgresql/data/pgdata
+      PGDATA: /var/lib/postgresql/18/docker
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data_pg18:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U attune"]
       interval: 10s
@@ -58,7 +58,7 @@ services:
   # Database migrations service
   # Runs migrations before services start
   migrations:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: attune-migrations
     volumes:
       - ./migrations:/migrations:ro
@@ -84,7 +84,7 @@ services:
   # Initialize default test user
   # Creates test@attune.local / TestPass123! if it doesn't exist
   init-user:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: attune-init-user
     volumes:
       - ./docker/init-user.sh:/init-user.sh:ro
@@ -195,6 +195,7 @@ services:
       - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
       - packs_data:/opt/attune/packs
       - artifacts_data:/opt/attune/artifacts
+      - blobs_data:/opt/attune/blobs
     depends_on:
       init-packs:
         condition: service_completed_successfully
@@ -231,7 +232,7 @@ services:
       - attune-network
 
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
+    image: rabbitmq:4.3.6-management-alpine
     container_name: attune-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: attune
@@ -241,7 +242,7 @@ services:
       - "5672:5672" # AMQP
       - "15672:15672" # Management UI
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - rabbitmq_data_v4:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -273,6 +274,7 @@ services:
     volumes:
       - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
       - artifacts_data:/opt/attune/artifacts
+      - blobs_data:/opt/attune/blobs
       - supervisor_logs:/opt/attune/logs
     depends_on:
       migrations:
@@ -328,6 +330,7 @@ services:
       - ./packs.dev:/opt/attune/packs.dev:rw
       - runtime_envs:/opt/attune/runtime_envs
       - artifacts_data:/opt/attune/artifacts
+      - blobs_data:/opt/attune/blobs
       - api_logs:/opt/attune/logs
       - agent_bin:/opt/attune/agent:ro
     depends_on:
@@ -949,9 +952,9 @@ services:
 # Volumes
 # ============================================================================
 volumes:
-  postgres_data:
+  postgres_data_pg18:
     driver: local
-  rabbitmq_data:
+  rabbitmq_data_v4:
     driver: local
   # Retained for local inspection / compatibility only. The supported forwarding
   # contract for service logs is container stdout/stderr via Docker logging.
@@ -980,6 +983,8 @@ volumes:
   runtime_envs:
     driver: local
   artifacts_data:
+    driver: local
+  blobs_data:
     driver: local
   agent_bin:
     driver: local

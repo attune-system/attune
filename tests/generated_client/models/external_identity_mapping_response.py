@@ -23,6 +23,7 @@ class ExternalIdentityMappingResponse:
         integration_identity (int):
         mapped_identity (int):
         provider (str):
+        subject_kind (str):
         tenant (str):
         updated (datetime.datetime):
         created_by (int | None | Unset):
@@ -34,6 +35,7 @@ class ExternalIdentityMappingResponse:
     integration_identity: int
     mapped_identity: int
     provider: str
+    subject_kind: str
     tenant: str
     updated: datetime.datetime
     created_by: int | None | Unset = UNSET
@@ -51,6 +53,8 @@ class ExternalIdentityMappingResponse:
         mapped_identity = self.mapped_identity
 
         provider = self.provider
+
+        subject_kind = self.subject_kind
 
         tenant = self.tenant
 
@@ -72,6 +76,7 @@ class ExternalIdentityMappingResponse:
                 "integration_identity": integration_identity,
                 "mapped_identity": mapped_identity,
                 "provider": provider,
+                "subject_kind": subject_kind,
                 "tenant": tenant,
                 "updated": updated,
             }
@@ -96,6 +101,8 @@ class ExternalIdentityMappingResponse:
 
         provider = d.pop("provider")
 
+        subject_kind = d.pop("subject_kind")
+
         tenant = d.pop("tenant")
 
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
@@ -116,6 +123,7 @@ class ExternalIdentityMappingResponse:
             integration_identity=integration_identity,
             mapped_identity=mapped_identity,
             provider=provider,
+            subject_kind=subject_kind,
             tenant=tenant,
             updated=updated,
             created_by=created_by,
