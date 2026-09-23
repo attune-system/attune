@@ -11,7 +11,7 @@ use attune_common::{
         WorkQueueItemStatus, WorkQueueUpdateStrategy,
     },
     repositories::{
-        action::ActionRepository,
+        action::{ActionRepository, CreateActionInput, UpdateActionInput},
         component_lifecycle::{ComponentLifecycleRepository, PackProjectionIds},
         event::{CreateEnforcementInput, EnforcementRepository},
         executable_snapshot::ExecutableSnapshotRepository,
@@ -28,7 +28,7 @@ use attune_common::{
             WorkQueueItemRepository, WorkQueueRepository,
         },
         workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
-        Create, Delete, FindById,
+        Create, Delete, FindById, Update,
     },
 };
 use chrono::{Duration, Utc};
@@ -131,6 +131,72 @@ async fn action_fixture() -> (
         .await
         .expect("release A snapshot");
     (pool, pack, action, release_a, snapshot)
+}
+
+#[tokio::test]
+async fn ad_hoc_action_snapshots_current_definition_against_active_release() {
+    let pool = create_test_pool().await.expect("test database");
+    let pack = PackFixture::new_unique("adhoc_pin")
+        .create(&pool)
+        .await
+        .expect("pack");
+    let release = create_release(&pool, &pack, "1.0.0", 'a').await;
+    activate(&pool, pack.id, release.id).await;
+    let action_ref = format!("{}.adhoc", pack.r#ref);
+    let action = ActionRepository::create(
+        &pool,
+        CreateActionInput {
+            r#ref: action_ref,
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            label: "Ad hoc".to_string(),
+            description: None,
+            entrypoint: "printf first".to_string(),
+            runtime: None,
+            enabled: true,
+            runtime_version_constraint: None,
+            required_worker_runtimes: json!({}),
+            worker_selector: json!({}),
+            worker_tolerations: json!([]),
+            worker_affinity: json!({}),
+            param_schema: None,
+            out_schema: None,
+            is_adhoc: true,
+            accesses_mcp: false,
+            default_execution_permission_set_refs: Vec::new(),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            log_retention_policy: None,
+            log_retention_limit: None,
+            timeout_seconds: None,
+        },
+    )
+    .await
+    .expect("ad hoc action");
+
+    let first = ExecutableSnapshotRepository::resolve_for_action(&pool, action.id)
+        .await
+        .expect("first ad hoc snapshot");
+    ActionRepository::update(
+        &pool,
+        action.id,
+        UpdateActionInput {
+            entrypoint: Some("printf second".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update ad hoc action");
+    let second = ExecutableSnapshotRepository::resolve_for_action(&pool, action.id)
+        .await
+        .expect("second ad hoc snapshot");
+
+    assert_eq!(first.release.id, release.id);
+    assert_eq!(first.executable.action.entrypoint, "printf first");
+    assert_eq!(second.release.id, release.id);
+    assert_eq!(second.executable.action.entrypoint, "printf second");
 }
 
 #[tokio::test]

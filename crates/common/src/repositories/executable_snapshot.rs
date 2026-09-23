@@ -137,6 +137,34 @@ impl ExecutableSnapshotRepository {
                 WHERE a.retired_at IS NULL
                   AND a.effective_enabled
                   AND (a.runtime IS NULL OR r.id IS NOT NULL)
+                UNION ALL
+                SELECT
+                    a.id,
+                    a.ref,
+                    jsonb_build_object(
+                        'action', to_jsonb(a),
+                        'runtime', to_jsonb(r),
+                        'runtime_versions', COALESCE((
+                            SELECT jsonb_agg(to_jsonb(rv) ORDER BY rv.version, rv.id)
+                            FROM runtime_version rv
+                            WHERE rv.runtime = r.id AND rv.retired_at IS NULL
+                        ), '[]'::jsonb),
+                        'workflow_definition', to_jsonb(wd)
+                    ) AS snapshot,
+                    pr.id AS release_id,
+                    pr.digest AS release_digest,
+                    pr.content_path
+                FROM selected s
+                JOIN action a ON a.pack = s.pack
+                JOIN pack p ON p.id = a.pack
+                JOIN pack_release pr ON pr.id = p.active_release
+                LEFT JOIN runtime r ON r.id = a.runtime AND r.retired_at IS NULL
+                LEFT JOIN workflow_definition wd ON wd.id = a.workflow_def AND wd.retired_at IS NULL
+                WHERE a.is_adhoc
+                  AND a.retired_at IS NULL
+                  AND a.effective_enabled
+                  AND (a.runtime IS NULL OR r.id IS NOT NULL)
+                  AND (a.workflow_def IS NULL OR wd.id IS NOT NULL)
             )
             SELECT
                 current.release_id,
