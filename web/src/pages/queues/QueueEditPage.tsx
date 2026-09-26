@@ -1,12 +1,15 @@
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
 import QueueForm from "@/components/queues/QueueForm";
+import { useAuth } from "@/contexts/AuthContext";
 import { useQueue } from "@/hooks/useQueues";
+import { hasPermission } from "@/lib/permissions";
 
 export default function QueueEditPage() {
   const { ref } = useParams<{ ref: string }>();
   const queueRef = ref ?? "";
   const { data, isLoading, error } = useQueue(queueRef);
+  const { user } = useAuth();
   const queue = data?.data;
 
   if (isLoading) {
@@ -35,6 +38,17 @@ export default function QueueEditPage() {
         <div className="rounded-lg border border-yellow-200 bg-yellow-50 px-4 py-3 text-yellow-800">
           This queue is pack-managed and cannot be edited in the UI. Update the
           pack queue definition files instead.
+        </div>
+      </div>
+    );
+  }
+
+  if (!hasPermission(user, "queues", "update")) {
+    return (
+      <div className="mx-auto max-w-4xl p-6">
+        <div className="rounded-lg border border-yellow-200 bg-yellow-50 px-4 py-3 text-yellow-800">
+          Editing this queue requires the{" "}
+          <span className="font-mono">queues:update</span> permission.
         </div>
       </div>
     );

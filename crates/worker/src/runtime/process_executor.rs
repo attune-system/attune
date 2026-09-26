@@ -16,6 +16,7 @@ use super::{
     parameter_passing, BoundedLogFileWriter, BoundedLogWriter, ExecutionResult, OutputFormat,
     RuntimeError, RuntimeResult,
 };
+use attune_common::runtime_log_mirror::{RuntimeLogMirror, RuntimeLogStream};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -93,11 +94,17 @@ async fn capture_output<R>(
     mut writer: BoundedLogWriter,
     mut file: Option<BoundedLogFileWriter>,
     cancel: CancellationToken,
+    stream: RuntimeLogStream,
 ) -> CapturedOutput
 where
     R: AsyncBufRead + Unpin,
 {
     let mut buffer = vec![0_u8; 64 * 1024];
+    let mut mirror = file.as_ref().and_then(|log| {
+        log.mirror_source()
+            .cloned()
+            .map(|source| RuntimeLogMirror::new(source, stream, Some(log.max_bytes() as u64)))
+    });
     let mut logs_incomplete = false;
     loop {
         let read = tokio::select! {
@@ -113,7 +120,14 @@ where
             Ok(read) => {
                 let bytes = &buffer[..read];
                 if writer.write_all(bytes).await.is_err() {
+                    logs_incomplete = true;
                     break;
+                }
+                if let Some(active_mirror) = mirror.as_mut() {
+                    if let Err(error) = active_mirror.push(bytes) {
+                        warn!(%error, stream = stream.as_str(), "Failed to mirror runtime log output");
+                        mirror = None;
+                    }
                 }
                 if let Some(log) = file.as_mut() {
                     let write = tokio::select! {
@@ -122,7 +136,11 @@ where
                     };
                     match write {
                         Some(Ok(())) => {}
-                        Some(Err(_)) => break,
+                        Some(Err(_)) => {
+                            logs_incomplete = true;
+                            file = None;
+                            break;
+                        }
                         None => {
                             logs_incomplete = true;
                             file = None;
@@ -131,7 +149,16 @@ where
                     }
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                logs_incomplete = true;
+                break;
+            }
+        }
+    }
+
+    if let Some(mirror) = mirror.as_mut() {
+        if let Err(error) = mirror.finish() {
+            warn!(%error, stream = stream.as_str(), "Failed to finish mirrored runtime log output");
         }
     }
 
@@ -382,12 +409,14 @@ pub async fn execute_streaming_cancellable(
         stdout_writer,
         stdout_log_writer,
         stdout_cancel,
+        RuntimeLogStream::Stdout,
     ));
     let stderr_task = tokio::spawn(capture_output(
         stderr_reader,
         stderr_writer,
         stderr_log_writer,
         stderr_cancel,
+        RuntimeLogStream::Stderr,
     ));
 
     // Stdin delivery is part of the action's execution budget. Output capture

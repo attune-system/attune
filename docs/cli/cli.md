@@ -449,10 +449,37 @@ attune sensor disable core.file_watcher
 
 ### Queue Management
 
+#### List Queues
+```bash
+attune queue list
+attune queue list --pack core --enabled true
+attune queue list --search inbox --is-adhoc false
+attune queue list --referencing-pack-ref incident_response --page 1 --per-page 25
+attune --output json queue list
+```
+
+Queue discovery supports the API's enabled, queue type, text search, referencing
+pack, and pagination filters. `--pack` uses the pack-scoped queue endpoint.
+
 #### Show Queue Details
 ```bash
 attune queue show core.inbox
 ```
+
+#### Enqueue an Item
+```bash
+# Inline request JSON
+attune queue enqueue core.inbox \
+  --request-json '{"item_key":"order-123","priority":5,"payload":{"order_id":123},"metadata":{"source":"cli"}}'
+
+# Read the same request shape from a file or stdin
+attune queue enqueue core.inbox --request-file item.json
+cat item.json | attune --output json queue enqueue core.inbox --request-file -
+```
+
+The request requires `payload` and may contain `item_key`, `priority`,
+`metadata`, and `trace_tag`. The CLI rejects other fields instead of silently
+sending misspelled or unsupported data.
 
 #### Enable/Disable Queue Processing
 ```bash
@@ -464,6 +491,13 @@ attune queue disable core.inbox
 Queue item selector commands use PostgreSQL SQL/JSONPath and only operate on pending mutable items (`queued` and `retry`).
 
 ```bash
+# Inspect items in any lifecycle state
+attune queue items core.inbox list
+attune queue items core.inbox list --status queued --status retry
+attune queue items core.inbox list --item-key order-123 --enqueue-source api
+attune queue items core.inbox list --page 2 --per-page 50 --output json
+attune queue items core.inbox show 42
+
 # Preview up to 100 matching pending items
 attune queue items core.inbox preview \
   --selector '$.payload.customer_id ? (@ == $customer_id)' \
@@ -485,6 +519,13 @@ attune queue items core.inbox delete \
   --selector '$.payload.customer_id ? (@ == $customer_id)' \
   --vars-json '{"customer_id":123}'
 ```
+
+Item list status values are `queued`, `leased`, `retry`, `completed`, `failed`,
+`skipped`, and `cancelled`. Table output includes status, priority, attempt
+count, payload, and creation time. Item detail also shows lease state, trace
+information, errors, acknowledgement data, and request lineage when the API
+permits it. JSON and YAML output contain the response object without headings
+or success messages; list output retains pagination metadata.
 
 ### Policy Management
 

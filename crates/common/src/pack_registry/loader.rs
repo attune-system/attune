@@ -3754,9 +3754,8 @@ fn parse_dashboard_scope_type(raw: &str) -> std::result::Result<DashboardScopeTy
         "global" => Ok(DashboardScopeType::Global),
         "pack" => Ok(DashboardScopeType::Pack),
         "identity" => Ok(DashboardScopeType::Identity),
-        "tenant" => Ok(DashboardScopeType::Tenant),
         other => Err(format!(
-            "invalid dashboard scope_type '{}'; expected global, pack, identity, or tenant",
+            "invalid dashboard scope_type '{}'; expected global, pack, or identity",
             other
         )),
     }
@@ -3911,6 +3910,23 @@ mod tests {
         assert_eq!(generate_label("http_request"), "Http Request");
         assert_eq!(generate_label("datetime_timer"), "Datetime Timer");
         assert_eq!(generate_label("a_b_c"), "A B C");
+    }
+
+    #[test]
+    fn dashboard_scope_parser_rejects_removed_tenant_scope() {
+        assert_eq!(
+            parse_dashboard_scope_type("global").unwrap(),
+            DashboardScopeType::Global
+        );
+        assert_eq!(
+            parse_dashboard_scope_type("pack").unwrap(),
+            DashboardScopeType::Pack
+        );
+        assert_eq!(
+            parse_dashboard_scope_type("identity").unwrap(),
+            DashboardScopeType::Identity
+        );
+        assert!(parse_dashboard_scope_type("tenant").is_err());
     }
 
     #[test]

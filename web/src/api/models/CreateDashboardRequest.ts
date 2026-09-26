@@ -15,5 +15,5 @@ export type CreateDashboardRequest = {
   spec: Record<string, any>;
   spec_version?: number | null;
   tags?: Array<string>;
-  visibility: DashboardVisibility;
+  visibility?: null | DashboardVisibility;
 };

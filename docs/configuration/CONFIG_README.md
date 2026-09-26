@@ -109,12 +109,17 @@ export ATTUNE__SECURITY__ENCRYPTION_KEY=$(openssl rand -base64 32)
 # Logging
 export ATTUNE__LOG__LEVEL=debug
 export ATTUNE__LOG__FORMAT=pretty
+# Opt in only when cluster log access and retention are suitable for runtime output.
+export ATTUNE__LOG__MIRROR_RUNTIME_LOGS_TO_STDIO=true
 ```
 
 `config.docker.yaml` and other distributable Docker configs intentionally use
 `log.format: json` for structured container stdout. `config.development.yaml`
 uses `pretty` for local readability. The `log.console` and `log.file` fields
 are currently placeholders only; services log to stdout today.
+`log.mirror_runtime_logs_to_stdio` is disabled by default. When enabled, worker
+and sensor services add structured runtime output to their container streams
+without replacing Attune's private runtime-log artifacts.
 
 **Syntax:** `ATTUNE__<section>__<key>=value`
 - Use double underscores (`__`) to separate nested keys

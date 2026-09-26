@@ -73,6 +73,12 @@ log:
   # Reserved for a future file sink. File logging is not currently implemented.
   # file: /var/log/attune/attune.log
 
+  # Opt in to NDJSON copies of action and managed sensor stdout/stderr on the
+  # worker or sensor process streams. Runtime-log artifacts remain authoritative.
+  # Mirrored output may contain secrets and is governed by cluster log access
+  # and retention after it leaves Attune.
+  mirror_runtime_logs_to_stdio: false
+
 # Security configuration
 security:
   # JWT secret key - CHANGE THIS!

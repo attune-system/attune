@@ -165,18 +165,24 @@ log:
   
   # Reserved for a future file sink; not currently implemented
   # file: /var/log/attune/attune.log
+
+  # Optional structured copies of action and managed sensor output for
+  # container log collectors. Disabled because runtime output may be sensitive.
+  mirror_runtime_logs_to_stdio: false
 ```
 
 **Environment variable override:**
 ```bash
 export ATTUNE__LOG__LEVEL=debug
 export ATTUNE__LOG__FORMAT=pretty
+export ATTUNE__LOG__MIRROR_RUNTIME_LOGS_TO_STDIO=true
 ```
 
 Current runtime behavior:
 - Docker/distributable configs intentionally default to `format: json`
 - `config.development.yaml` intentionally uses `format: pretty`
 - `log.console` and `log.file` are retained in schema/config examples, but do not currently switch sinks; services log to stdout today
+- `log.mirror_runtime_logs_to_stdio` emits NDJSON envelopes for runtime log lines from worker and sensor services. Lines over 128 KiB use multiple bounded records. The mirror does not replace private artifact-backed logs.
 
 ### Redis Configuration (Optional)
 

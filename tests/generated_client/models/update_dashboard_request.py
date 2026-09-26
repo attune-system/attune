@@ -26,26 +26,26 @@ class UpdateDashboardRequest:
     """
     Attributes:
         expected_revision (int):  Example: 3.
-        spec (None | UpdateDashboardRequestSpecType0):
         description (None | NullableStringPatchType1 | SetString | str | Unset):
         enabled (bool | None | Unset):  Example: True.
         is_default_home (bool | None | Unset):  Example: False.
         label (None | str | Unset):  Example: Operations Home (Updated).
         scope_ref (None | str | Unset):  Example: core.
         scope_type (DashboardScopeType | None | Unset):
+        spec (None | Unset | UpdateDashboardRequestSpecType0):
         spec_version (int | None | Unset):  Example: 2.
         tags (list[str] | None | Unset):  Example: ['operations', 'home'].
         visibility (DashboardVisibility | None | Unset):
     """
 
     expected_revision: int
-    spec: None | UpdateDashboardRequestSpecType0
     description: None | NullableStringPatchType1 | SetString | str | Unset = UNSET
     enabled: bool | None | Unset = UNSET
     is_default_home: bool | None | Unset = UNSET
     label: None | str | Unset = UNSET
     scope_ref: None | str | Unset = UNSET
     scope_type: DashboardScopeType | None | Unset = UNSET
+    spec: None | Unset | UpdateDashboardRequestSpecType0 = UNSET
     spec_version: int | None | Unset = UNSET
     tags: list[str] | None | Unset = UNSET
     visibility: DashboardVisibility | None | Unset = UNSET
@@ -60,12 +60,6 @@ class UpdateDashboardRequest:
         )
 
         expected_revision = self.expected_revision
-
-        spec: dict[str, Any] | None
-        if isinstance(self.spec, UpdateDashboardRequestSpecType0):
-            spec = self.spec.to_dict()
-        else:
-            spec = self.spec
 
         description: dict[str, Any] | None | str | Unset
         if isinstance(self.description, Unset):
@@ -109,6 +103,14 @@ class UpdateDashboardRequest:
         else:
             scope_type = self.scope_type
 
+        spec: dict[str, Any] | None | Unset
+        if isinstance(self.spec, Unset):
+            spec = UNSET
+        elif isinstance(self.spec, UpdateDashboardRequestSpecType0):
+            spec = self.spec.to_dict()
+        else:
+            spec = self.spec
+
         spec_version: int | None | Unset
         if isinstance(self.spec_version, Unset):
             spec_version = UNSET
@@ -137,7 +139,6 @@ class UpdateDashboardRequest:
         field_dict.update(
             {
                 "expected_revision": expected_revision,
-                "spec": spec,
             }
         )
         if description is not UNSET:
@@ -152,6 +153,8 @@ class UpdateDashboardRequest:
             field_dict["scope_ref"] = scope_ref
         if scope_type is not UNSET:
             field_dict["scope_type"] = scope_type
+        if spec is not UNSET:
+            field_dict["spec"] = spec
         if spec_version is not UNSET:
             field_dict["spec_version"] = spec_version
         if tags is not UNSET:
@@ -173,21 +176,6 @@ class UpdateDashboardRequest:
 
         d = dict(src_dict)
         expected_revision = d.pop("expected_revision")
-
-        def _parse_spec(data: object) -> None | UpdateDashboardRequestSpecType0:
-            if data is None:
-                return data
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                spec_type_0 = UpdateDashboardRequestSpecType0.from_dict(data)
-
-                return spec_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(None | UpdateDashboardRequestSpecType0, data)
-
-        spec = _parse_spec(d.pop("spec"))
 
         def _parse_description(
             data: object,
@@ -273,6 +261,23 @@ class UpdateDashboardRequest:
 
         scope_type = _parse_scope_type(d.pop("scope_type", UNSET))
 
+        def _parse_spec(data: object) -> None | Unset | UpdateDashboardRequestSpecType0:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                spec_type_0 = UpdateDashboardRequestSpecType0.from_dict(data)
+
+                return spec_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | Unset | UpdateDashboardRequestSpecType0, data)
+
+        spec = _parse_spec(d.pop("spec", UNSET))
+
         def _parse_spec_version(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -318,13 +323,13 @@ class UpdateDashboardRequest:
 
         update_dashboard_request = cls(
             expected_revision=expected_revision,
-            spec=spec,
             description=description,
             enabled=enabled,
             is_default_home=is_default_home,
             label=label,
             scope_ref=scope_ref,
             scope_type=scope_type,
+            spec=spec,
             spec_version=spec_version,
             tags=tags,
             visibility=visibility,

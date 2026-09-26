@@ -152,8 +152,8 @@ pub struct CreateDashboardRequest {
     #[schema(example = "global", nullable = true)]
     pub scope_ref: Option<String>,
 
-    #[schema(example = "public")]
-    pub visibility: DashboardVisibility,
+    #[schema(example = "public", nullable = true)]
+    pub visibility: Option<DashboardVisibility>,
 
     #[schema(example = true, default = true, nullable = true)]
     pub enabled: Option<bool>,
@@ -204,7 +204,7 @@ pub struct UpdateDashboardRequest {
     #[schema(example = 2, nullable = true)]
     pub spec_version: Option<i32>,
 
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, required = false, nullable = true)]
     pub spec: Option<JsonValue>,
 
     #[validate(custom(function = "validate_dashboard_tags"))]

@@ -51,6 +51,7 @@ use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -67,6 +68,10 @@ pub struct ActionExecutor {
     secret_manager: SecretManager,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
+    mirror_runtime_logs_to_stdio: bool,
+    worker_id: AtomicI64,
+    worker_name: String,
+    worker_instance: uuid::Uuid,
     log_segment_config: attune_common::log_stream::SegmentedLogConfig,
     execution_log_retention_policy: RetentionPolicyType,
     execution_log_retention_limit: i32,
@@ -269,6 +274,9 @@ impl ActionExecutor {
         secret_manager: SecretManager,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
+        mirror_runtime_logs_to_stdio: bool,
+        worker_name: String,
+        worker_instance: uuid::Uuid,
         log_segment_config: attune_common::log_stream::SegmentedLogConfig,
         execution_log_retention_policy: Option<RetentionPolicyType>,
         execution_log_retention_limit: Option<i32>,
@@ -287,6 +295,10 @@ impl ActionExecutor {
             secret_manager,
             max_stdout_bytes,
             max_stderr_bytes,
+            mirror_runtime_logs_to_stdio,
+            worker_id: AtomicI64::new(0),
+            worker_name,
+            worker_instance,
             log_segment_config,
             execution_log_retention_policy: execution_log_retention_policy
                 .unwrap_or(DEFAULT_LOG_ARTIFACT_RETENTION_POLICY),
@@ -319,6 +331,10 @@ impl ActionExecutor {
                 RUNTIME_VERSIONS_CACHE_MAX_ENTRIES,
             )),
         }
+    }
+
+    pub fn set_worker_id(&self, worker_id: i64) {
+        self.worker_id.store(worker_id, Ordering::Release);
     }
 
     pub async fn invalidate_action_cache(&self, action_id: Option<i64>, action_ref: Option<&str>) {
@@ -1359,6 +1375,18 @@ impl ActionExecutor {
         execution: &Execution,
         action: &Action,
     ) -> Result<ExecutionLogArtifacts> {
+        let mirror_source = self.mirror_runtime_logs_to_stdio.then(|| {
+            attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
+                execution_id: execution.id,
+                parent_execution_id: execution.parent,
+                action_ref: execution.action_ref.clone(),
+                pack_ref: action.pack_ref.clone(),
+                trace_tag: execution.trace_tag.clone(),
+                worker_id: self.worker_id.load(Ordering::Acquire),
+                worker_name: self.worker_name.clone(),
+                worker_instance: self.worker_instance,
+            }
+        });
         let retention = self.effective_action_log_retention(action);
         let backend = if self.transport.transport_mode() == "volume" {
             LogStreamBackend::SharedFile
@@ -1414,7 +1442,8 @@ impl ActionExecutor {
                     self.max_stdout_bytes,
                     true,
                     self.log_segment_config.finalization_timeout_ms,
-                ),
+                )
+                .with_mirror_source(mirror_source.clone()),
                 stderr_writer: BoundedLogFileWriter::from_shared_file_writer(
                     attune_common::log_stream::SharedFileLogWriter::new(
                         self.transport.clone(),
@@ -1424,7 +1453,8 @@ impl ActionExecutor {
                     self.max_stderr_bytes,
                     false,
                     self.log_segment_config.finalization_timeout_ms,
-                ),
+                )
+                .with_mirror_source(mirror_source),
             })
         } else {
             let stdout_writer = attune_common::log_stream::SegmentedLogWriter::new(
@@ -1442,12 +1472,14 @@ impl ActionExecutor {
                     stdout_writer,
                     self.max_stdout_bytes,
                     true,
-                ),
+                )
+                .with_mirror_source(mirror_source.clone()),
                 stderr_writer: BoundedLogFileWriter::from_segmented_writer(
                     stderr_writer,
                     self.max_stderr_bytes,
                     false,
-                ),
+                )
+                .with_mirror_source(mirror_source),
             })
         }
     }
@@ -2175,6 +2207,9 @@ mod tests {
             SecretManager::new(database.pool().clone(), None).expect("secret manager"),
             1024,
             1024,
+            false,
+            "test-worker".to_string(),
+            uuid::Uuid::nil(),
             attune_common::log_stream::SegmentedLogConfig {
                 initial_segment_bytes: 1024,
                 max_segment_bytes: 1024,

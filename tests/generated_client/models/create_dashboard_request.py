@@ -25,19 +25,18 @@ class CreateDashboardRequest:
         ref (str):  Example: core.operations_home.
         scope_type (DashboardScopeType):  Default: DashboardScopeType.GLOBAL.
         spec (CreateDashboardRequestSpec):
-        visibility (DashboardVisibility):
         description (None | str | Unset):  Example: Operational overview for the platform.
         enabled (bool | None | Unset):  Default: True. Example: True.
         is_default_home (bool | None | Unset):  Default: False. Example: False.
         scope_ref (None | str | Unset):  Example: global.
         spec_version (int | None | Unset):  Default: 1. Example: 1.
         tags (list[str] | Unset):  Example: ['operations', 'overview'].
+        visibility (DashboardVisibility | None | Unset):
     """
 
     label: str
     ref: str
     spec: CreateDashboardRequestSpec
-    visibility: DashboardVisibility
     scope_type: DashboardScopeType = DashboardScopeType.GLOBAL
     description: None | str | Unset = UNSET
     enabled: bool | None | Unset = True
@@ -45,6 +44,7 @@ class CreateDashboardRequest:
     scope_ref: None | str | Unset = UNSET
     spec_version: int | None | Unset = 1
     tags: list[str] | Unset = UNSET
+    visibility: DashboardVisibility | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         label = self.label
@@ -54,8 +54,6 @@ class CreateDashboardRequest:
         scope_type = self.scope_type.value
 
         spec = self.spec.to_dict()
-
-        visibility = self.visibility.value
 
         description: None | str | Unset
         if isinstance(self.description, Unset):
@@ -91,6 +89,14 @@ class CreateDashboardRequest:
         if not isinstance(self.tags, Unset):
             tags = self.tags
 
+        visibility: None | str | Unset
+        if isinstance(self.visibility, Unset):
+            visibility = UNSET
+        elif isinstance(self.visibility, DashboardVisibility):
+            visibility = self.visibility.value
+        else:
+            visibility = self.visibility
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -99,7 +105,6 @@ class CreateDashboardRequest:
                 "ref": ref,
                 "scope_type": scope_type,
                 "spec": spec,
-                "visibility": visibility,
             }
         )
         if description is not UNSET:
@@ -114,6 +119,8 @@ class CreateDashboardRequest:
             field_dict["spec_version"] = spec_version
         if tags is not UNSET:
             field_dict["tags"] = tags
+        if visibility is not UNSET:
+            field_dict["visibility"] = visibility
 
         return field_dict
 
@@ -131,8 +138,6 @@ class CreateDashboardRequest:
         scope_type = DashboardScopeType(d.pop("scope_type"))
 
         spec = CreateDashboardRequestSpec.from_dict(d.pop("spec"))
-
-        visibility = DashboardVisibility(d.pop("visibility"))
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -181,18 +186,35 @@ class CreateDashboardRequest:
 
         tags = cast(list[str], d.pop("tags", UNSET))
 
+        def _parse_visibility(data: object) -> DashboardVisibility | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                visibility_type_1 = DashboardVisibility(data)
+
+                return visibility_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(DashboardVisibility | None | Unset, data)
+
+        visibility = _parse_visibility(d.pop("visibility", UNSET))
+
         create_dashboard_request = cls(
             label=label,
             ref=ref,
             scope_type=scope_type,
             spec=spec,
-            visibility=visibility,
             description=description,
             enabled=enabled,
             is_default_home=is_default_home,
             scope_ref=scope_ref,
             spec_version=spec_version,
             tags=tags,
+            visibility=visibility,
         )
 
         return create_dashboard_request

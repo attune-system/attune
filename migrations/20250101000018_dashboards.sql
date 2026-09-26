@@ -14,7 +14,7 @@ BEGIN
         WHERE t.typname = 'dashboard_scope_type_enum'
           AND n.nspname = current_schema()
     ) THEN
-        CREATE TYPE dashboard_scope_type_enum AS ENUM ('global', 'pack', 'identity', 'tenant');
+        CREATE TYPE dashboard_scope_type_enum AS ENUM ('global', 'pack', 'identity');
     END IF;
 END $$;
 
@@ -126,7 +126,7 @@ CREATE TRIGGER update_dashboard_updated
 
 COMMENT ON TABLE dashboard IS 'Dashboard metadata and current declarative spec';
 COMMENT ON COLUMN dashboard.scope_type IS 'Scope dimension for uniqueness/visibility resolution';
-COMMENT ON COLUMN dashboard.scope_ref IS 'Scope instance identifier (e.g. global, pack ref, identity id, tenant id)';
+COMMENT ON COLUMN dashboard.scope_ref IS 'Scope instance identifier (global, pack ref, or identity id)';
 COMMENT ON COLUMN dashboard.revision IS 'Optimistic concurrency revision; increments on each metadata/spec update';
 COMMENT ON COLUMN dashboard.spec_version IS 'Dashboard spec schema version from declarative document';
 COMMENT ON COLUMN dashboard.spec IS 'Full dashboard declarative spec JSONB';

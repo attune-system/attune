@@ -5385,7 +5385,6 @@ fn dashboard_scope_label(scope_type: DashboardScopeType) -> &'static str {
         DashboardScopeType::Global => "global",
         DashboardScopeType::Pack => "pack",
         DashboardScopeType::Identity => "identity",
-        DashboardScopeType::Tenant => "tenant",
     }
 }
 
@@ -5418,12 +5417,19 @@ fn normalize_create_dashboard_request(
     let is_default_home = request.is_default_home.unwrap_or(false);
     let spec_version = request.spec_version.unwrap_or(1);
     let tags = normalize_tags(&request.tags);
+    let visibility = request.visibility.unwrap_or_else(|| {
+        if request.scope_type == DashboardScopeType::Identity {
+            DashboardVisibility::Private
+        } else {
+            DashboardVisibility::Public
+        }
+    });
     let (scope_type, scope_ref, owner_identity, visibility) = normalize_dashboard_scope(
         user,
         &request.r#ref,
         request.scope_type,
         request.scope_ref.as_deref(),
-        request.visibility,
+        visibility,
         None,
     )?;
 
@@ -5597,25 +5603,12 @@ fn normalize_dashboard_scope(
             Ok((scope_type, pack_ref, owner_identity, visibility))
         }
         DashboardScopeType::Identity => {
-            if visibility != DashboardVisibility::Private {
-                return Err(ApiError::BadRequest(
-                    "Identity-scoped dashboards must use private visibility".to_string(),
-                ));
-            }
             let identity_id = actor_identity_id(user)?.ok_or_else(|| {
                 ApiError::Forbidden(
                     "Identity-scoped dashboards require an access token".to_string(),
                 )
             })?;
             let expected_scope_ref = identity_id.to_string();
-            if let Some(scope_ref) = scope_ref.map(str::trim) {
-                if !scope_ref.is_empty() && scope_ref != expected_scope_ref {
-                    return Err(ApiError::BadRequest(format!(
-                        "Identity-scoped dashboards must use scope_ref matching the authenticated identity '{}'",
-                        expected_scope_ref
-                    )));
-                }
-            }
             Ok((
                 scope_type,
                 expected_scope_ref,
@@ -5623,9 +5616,6 @@ fn normalize_dashboard_scope(
                 DashboardVisibility::Private,
             ))
         }
-        DashboardScopeType::Tenant => Err(ApiError::BadRequest(
-            "Tenant-scoped dashboards are not supported by this API".to_string(),
-        )),
     }
 }
 
@@ -7754,7 +7744,7 @@ mod tests {
             description: Some("Dashboard".to_string()),
             scope_type: DashboardScopeType::Pack,
             scope_ref: None,
-            visibility: DashboardVisibility::Pack,
+            visibility: Some(DashboardVisibility::Pack),
             enabled: Some(true),
             is_default_home: Some(false),
             spec_version: Some(2),
@@ -7784,7 +7774,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_update_dashboard_request_defaults_identity_scope_and_private_visibility() {
+    fn normalize_update_dashboard_request_forces_identity_scope_and_private_visibility() {
         let dashboard = Dashboard {
             id: 7,
             r#ref: "core.authoring".to_string(),
@@ -7812,8 +7802,8 @@ mod tests {
             label: None,
             description: None,
             scope_type: Some(DashboardScopeType::Identity),
-            scope_ref: None,
-            visibility: None,
+            scope_ref: Some("999".to_string()),
+            visibility: Some(DashboardVisibility::Public),
             enabled: None,
             is_default_home: None,
             spec_version: None,
@@ -7831,6 +7821,49 @@ mod tests {
         assert_eq!(normalized.owner_identity, Some(42));
         assert_eq!(normalized.spec["scope_type"], "identity");
         assert_eq!(normalized.spec["visibility"], "private");
+    }
+
+    #[test]
+    fn normalize_create_dashboard_request_forces_identity_scope_to_current_user() {
+        let request = CreateDashboardRequest {
+            r#ref: "core.personal".to_string(),
+            label: "Personal".to_string(),
+            description: None,
+            scope_type: DashboardScopeType::Identity,
+            scope_ref: Some("999".to_string()),
+            visibility: Some(DashboardVisibility::Public),
+            enabled: None,
+            is_default_home: None,
+            spec_version: None,
+            spec: valid_spec(),
+            tags: vec![],
+        };
+
+        let normalized = normalize_create_dashboard_request(&access_user(42), request)
+            .expect("identity scope should replace client-provided fields");
+        assert_eq!(normalized.scope_ref, "42");
+        assert_eq!(normalized.owner_identity, Some(42));
+        assert_eq!(normalized.visibility, DashboardVisibility::Private);
+
+        let request = CreateDashboardRequest {
+            r#ref: "core.personal".to_string(),
+            label: "Personal".to_string(),
+            description: None,
+            scope_type: DashboardScopeType::Identity,
+            scope_ref: None,
+            visibility: Some(DashboardVisibility::Public),
+            enabled: None,
+            is_default_home: None,
+            spec_version: None,
+            spec: valid_spec(),
+            tags: vec![],
+        };
+        let normalized = normalize_create_dashboard_request(&access_user(42), request)
+            .expect("identity scope should derive hidden fields");
+
+        assert_eq!(normalized.scope_ref, "42");
+        assert_eq!(normalized.owner_identity, Some(42));
+        assert_eq!(normalized.visibility, DashboardVisibility::Private);
     }
 
     #[test]

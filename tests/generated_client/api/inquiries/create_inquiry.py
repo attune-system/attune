@@ -47,9 +47,21 @@ def _parse_response(
         response_401 = cast(Any, None)
         return response_401
 
+    if response.status_code == 403:
+        response_403 = cast(Any, None)
+        return response_403
+
     if response.status_code == 404:
         response_404 = cast(Any, None)
         return response_404
+
+    if response.status_code == 409:
+        response_409 = cast(Any, None)
+        return response_409
+
+    if response.status_code == 422:
+        response_422 = cast(Any, None)
+        return response_422
 
     if response.status_code == 500:
         response_500 = cast(Any, None)

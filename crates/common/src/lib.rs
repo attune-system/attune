@@ -40,6 +40,7 @@ pub mod rbac;
 pub mod repositories;
 pub mod runtime_cache;
 pub mod runtime_detection;
+pub mod runtime_log_mirror;
 pub mod scheduling;
 pub mod schema;
 pub mod secret_values;

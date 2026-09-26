@@ -220,6 +220,8 @@ impl SensorService {
             .as_ref()
             .map(|sensor| sensor.allow_insecure_notifier_ws)
             .unwrap_or(false);
+        let sensor_worker_registration = SensorWorkerRegistration::new(db.clone(), &config);
+        let worker_name = sensor_worker_registration.worker_name().to_string();
 
         let sensor_manager = Arc::new(SensorManager::new(
             db.clone(),
@@ -236,6 +238,8 @@ impl SensorService {
                 pack_transport: pack_transport.clone(),
                 artifact_transport,
                 sensor_log_config,
+                mirror_runtime_logs_to_stdio: config.log.mirror_runtime_logs_to_stdio,
+                worker_name,
             },
         ));
 
@@ -245,8 +249,6 @@ impl SensorService {
             sensor_manager.clone(),
         ));
 
-        // Create sensor worker registration
-        let sensor_worker_registration = SensorWorkerRegistration::new(db.clone(), &config);
         let heartbeat_interval = config
             .sensor
             .as_ref()

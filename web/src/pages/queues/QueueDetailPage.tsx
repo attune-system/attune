@@ -297,6 +297,7 @@ export function QueueDetailPage() {
   const itemTotal = itemPagination?.total_items ?? 0;
   const sourceBadge = queue ? getQueueSourceBadge(queue.is_adhoc) : null;
   const canUpdateQueues = hasPermission(user, "queues", "update");
+  const canEditQueue = queue?.is_adhoc === true && canUpdateQueues;
   const canReadQueueItems = hasPermission(user, "queue_items", "read");
   const canUpdateQueueItems = hasPermission(user, "queue_items", "update");
   const canDeleteQueueItems = hasPermission(user, "queue_items", "delete");
@@ -537,6 +538,40 @@ export function QueueDetailPage() {
           <p className="mt-2 max-w-3xl text-gray-600">
             {queue.description || "No description provided."}
           </p>
+          <div className="mt-4 max-w-3xl rounded-lg border border-gray-200 bg-white px-4 py-3 shadow-sm">
+            <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+              Dispatch action
+            </div>
+            {actionData?.data ? (
+              <>
+                <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                  <Link
+                    to={`/actions/${encodeURIComponent(queue.dispatch_action_ref)}`}
+                    className="font-medium text-blue-600 hover:underline"
+                  >
+                    {actionData.data.label}
+                  </Link>
+                  <span className="font-mono text-sm text-gray-500">
+                    {queue.dispatch_action_ref}
+                  </span>
+                </div>
+                {actionData.data.description && (
+                  <p className="mt-1 text-sm text-gray-600">
+                    {actionData.data.description}
+                  </p>
+                )}
+              </>
+            ) : (
+              <div className="mt-1">
+                <span className="font-mono text-sm text-gray-800">
+                  {queue.dispatch_action_ref}
+                </span>
+                <p className="mt-1 text-xs text-gray-500">
+                  Action details are not available.
+                </p>
+              </div>
+            )}
+          </div>
           <p className="mt-2 text-sm text-gray-600">
             Trace tag template:{" "}
             <span className="font-mono text-gray-800">
@@ -591,7 +626,7 @@ export function QueueDetailPage() {
         </div>
 
         <div className="flex items-center gap-2">
-          {queue.is_adhoc && (
+          {canEditQueue && (
             <Link
               to={`/queues/${encodeURIComponent(queue.ref)}/edit`}
               className="inline-flex items-center gap-2 rounded-lg bg-white px-4 py-2 text-gray-700 shadow hover:bg-gray-50"

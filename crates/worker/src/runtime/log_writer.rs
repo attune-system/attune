@@ -83,6 +83,7 @@ pub struct BoundedLogWriter {
 /// When constructed with a pre-opened `BoxAsyncWriter`, it uses that writer (transport mode).
 pub struct BoundedLogFileWriter {
     writer: RuntimeLogWriter,
+    mirror_source: Option<attune_common::runtime_log_mirror::RuntimeLogSource>,
     finalization_timeout_ms: u64,
     max_bytes: usize,
     truncated: bool,
@@ -210,6 +211,7 @@ impl BoundedLogFileWriter {
         let finalization_timeout_ms = writer.finalization_timeout_ms();
         Self {
             writer: RuntimeLogWriter::Segmented(writer),
+            mirror_source: None,
             finalization_timeout_ms,
             max_bytes,
             truncated: false,
@@ -230,6 +232,7 @@ impl BoundedLogFileWriter {
     ) -> Self {
         Self {
             writer: RuntimeLogWriter::SharedFile(writer),
+            mirror_source: None,
             finalization_timeout_ms,
             max_bytes,
             truncated: false,
@@ -266,6 +269,22 @@ impl BoundedLogFileWriter {
         }
 
         Ok(())
+    }
+
+    pub fn with_mirror_source(
+        mut self,
+        source: Option<attune_common::runtime_log_mirror::RuntimeLogSource>,
+    ) -> Self {
+        self.mirror_source = source;
+        self
+    }
+
+    pub fn mirror_source(&self) -> Option<&attune_common::runtime_log_mirror::RuntimeLogSource> {
+        self.mirror_source.as_ref()
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     async fn add_truncation_notice(&mut self) -> std::io::Result<()> {

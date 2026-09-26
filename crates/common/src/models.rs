@@ -524,7 +524,6 @@ pub mod enums {
         Global,
         Pack,
         Identity,
-        Tenant,
     }
 
     #[derive(

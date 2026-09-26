@@ -487,7 +487,10 @@ function QueueList({ requestedPack }: { requestedPack: string }) {
                 : "Failed to load queue details"}
             </div>
           ) : (
-            <QueueInspectionPreview queue={selectedQueue} />
+            <QueueInspectionPreview
+              queue={selectedQueue}
+              canEdit={selectedQueue.is_adhoc && canUpdateQueues}
+            />
           )}
 
           {selectedQueue && <QueueUpNextList queueRef={selectedQueue.ref} />}

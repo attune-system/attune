@@ -5,7 +5,7 @@ It closes the loop on the current logging work: JSON `stdout` defaults, shared
 tracing initialization, service-log forwarding via Docker/container streams, and
 private artifact-backed runtime logs.
 
-## Two log planes: keep them separate
+## Two log planes
 
 | Plane | Transport / storage | Primary content | Audience | Canonical source of truth |
 | --- | --- | --- | --- | --- |
@@ -14,12 +14,68 @@ private artifact-backed runtime logs.
 
 Rules:
 
-1. **Service logs are for platform behavior and metadata**, not raw task output.
+1. **Service logs are for platform behavior and metadata** by default.
 2. **Runtime logs are the authoritative raw stdout/stderr record** and remain
    private source-of-truth artifacts with `classification=runtime_log`.
-3. Forwarders such as Datadog and Splunk should ingest **service logs** from the
-   container stream. They may ingest runtime-log *metadata* if needed, but they
-   should not rely on mirrored raw stdout/stderr content from service logs.
+3. Forwarders such as an OpenTelemetry Collector, Datadog, or Splunk should
+   ingest service logs from the container stream.
+4. Deployments may set `log.mirror_runtime_logs_to_stdio: true` to add structured
+   copies of action and managed sensor output to worker and sensor container
+   streams. This broadens access to private runtime content and is disabled by
+   default.
+
+## Optional runtime-log mirror
+
+The runtime-log mirror emits NDJSON directly to the matching worker or sensor
+process stream. It remains structured even when normal service logs use the
+`pretty` formatter. Action and sensor stdout maps to process stdout; stderr maps
+to process stderr.
+
+Each record has this shape:
+
+```json
+{
+  "event": "attune.runtime_log",
+  "observed_at": "2026-09-25T12:30:00Z",
+  "source_kind": "execution",
+  "execution_id": 4821,
+  "parent_execution_id": 4790,
+  "action_ref": "core.echo",
+  "pack_ref": "core",
+  "trace_tag": "deploy.production.4821",
+  "worker_id": 8,
+  "worker_name": "rdrx-python-workers",
+  "worker_instance": "9a357ac0-1f99-42d4-ae3c-228df729c236",
+  "source_stream": "stdout",
+  "byte_start": 0,
+  "byte_end": 52,
+  "fragment_index": 0,
+  "continued": false,
+  "body_type": "json",
+  "body": {
+    "level": "info",
+    "operation": "deploy"
+  }
+}
+```
+
+If a complete source line is a JSON object, `body` contains that object. Plain
+text remains a JSON string. Invalid UTF-8 is base64 encoded with
+`body_type: "bytes"` and `body_encoding: "base64"`. Attune never merges child
+fields into the outer envelope, so child output cannot replace correlation
+fields. Lines larger than 128 KiB are emitted as bounded text or byte fragments.
+Worker mirrors stop at the configured stdout or stderr byte limit and emit a
+record with `truncated: true`. Sensor mirrors continue across artifact rotation.
+Both execution and sensor records include `worker_id`, `worker_name`, and
+`worker_instance`. The name identifies the logical registered worker, while the
+instance UUID distinguishes process or pod restarts that reuse that name.
+
+The artifact stream remains authoritative and preserves source bytes up to its
+configured retention and size limits.
+Mirroring is best-effort and has no replay or delivery guarantee. Cluster log
+retention, deletion, and authorization apply independently to mirrored copies.
+Treat the feature as a deliberate security decision because actions and sensors
+can print credentials or customer data.
 
 ## Canonical service-log schema
 
@@ -183,8 +239,8 @@ Recommended mapping with the current Compose contract:
    - `com.attune.log.contract`, `com.attune.log.transport` → informational tags
 4. Promote only low-cardinality Attune fields to facets by default.
 5. Keep high-cardinality fields as searchable attributes.
-6. Do not expect raw execution/sensor stdout in service-log events; retrieve raw
-   runtime output from `runtime_log` artifacts.
+6. Unless the runtime-log mirror is enabled, retrieve raw execution and sensor
+   output from `runtime_log` artifacts.
 
 ### Splunk
 
@@ -203,8 +259,8 @@ Recommended mapping with the current Compose contract:
 4. Make low-cardinality fields searchable/indexed first; keep `message`, ids,
    trace tags, paths, and stack traces as search-time fields unless you have a
    specific operational reason to index them.
-5. Use Attune APIs / UI for private raw runtime logs instead of expecting them in
-   service-log forwarding.
+5. Use Attune APIs or UI for authoritative private runtime logs. Enable the
+   runtime-log mirror only when Splunk should receive a separate copy.
 
 ## Compose contract summary
 
@@ -239,6 +295,7 @@ inspection, but they are **not** the forwarding contract for operators.
       metadata.
 - [ ] Only low-cardinality fields are promoted to always-on tags/facets by
       default.
-- [ ] Raw action/sensor stdout/stderr is **not** expected in service logs.
+- [ ] Raw action/sensor stdout/stderr appears only when
+      `log.mirror_runtime_logs_to_stdio` is deliberately enabled.
 - [ ] Runtime log artifacts remain private and are discoverable as
       `classification=runtime_log` through Attune APIs/UI.

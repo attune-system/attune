@@ -53,6 +53,8 @@ import type {
   DashboardSourceContract,
   DashboardSourceResult,
   DashboardSpecRecord,
+  DashboardScopeType,
+  DashboardVisibility,
 } from "@/types/dashboard";
 import {
   cloneDashboardDocument,
@@ -516,6 +518,28 @@ function slugify(value: string): string {
     .replace(/^_+|_+$/g, "");
 }
 
+function parseDashboardVisibility(value: string): DashboardVisibility {
+  switch (value) {
+    case "public":
+    case "pack":
+    case "private":
+      return value;
+    default:
+      throw new Error(`Unknown dashboard visibility: ${value}`);
+  }
+}
+
+function parseDashboardScopeType(value: string): DashboardScopeType {
+  switch (value) {
+    case "global":
+    case "pack":
+    case "identity":
+      return value;
+    default:
+      throw new Error(`Unknown dashboard scope type: ${value}`);
+  }
+}
+
 function refPrefixFromDashboard(document: DashboardAuthoringDocument): string {
   if (document.scope_type === "pack" && document.scope_ref.trim()) {
     return slugify(document.scope_ref) || "core";
@@ -724,7 +748,7 @@ function validateDocument(
   if (!document.label.trim()) {
     errors.push("Dashboard label is required.");
   }
-  if (!document.scope_ref.trim()) {
+  if (document.scope_type === "pack" && !document.scope_ref.trim()) {
     errors.push("Dashboard scope ref is required.");
   }
 
@@ -1311,6 +1335,14 @@ export default function DashboardEditorPage() {
             : nextScopeRefRaw;
       } else {
         current.scope_type = value as DashboardAuthoringDocument["scope_type"];
+        if (current.scope_type === "global") {
+          current.scope_ref = "";
+        } else if (current.scope_type === "identity") {
+          current.scope_ref = "";
+          current.visibility = "private";
+        } else if (!current.scope_ref.trim()) {
+          current.scope_ref = previousPrefix;
+        }
       }
 
       if (!isEditing && currentLocalRef.trim()) {
@@ -1875,26 +1907,31 @@ export default function DashboardEditorPage() {
                   <select
                     value={draft.scope_type}
                     onChange={(event) =>
-                      updateScopeField("scope_type", event.target.value)
+                      updateScopeField(
+                        "scope_type",
+                        parseDashboardScopeType(event.target.value),
+                      )
                     }
                     className="w-full rounded border border-gray-300 px-3 py-2"
                   >
                     <option value="global">global</option>
                     <option value="pack">pack</option>
                     <option value="identity">identity</option>
-                    <option value="tenant">tenant</option>
                   </select>
                 </label>
-                <label className="text-sm text-gray-700">
-                  <span className="mb-1 block">Scope ref</span>
-                  <input
-                    value={draft.scope_ref}
-                    onChange={(event) =>
-                      updateScopeField("scope_ref", event.target.value)
-                    }
-                    className="w-full rounded border border-gray-300 px-3 py-2"
-                  />
-                </label>
+                {draft.scope_type === "pack" && (
+                  <label className="text-sm text-gray-700">
+                    <span className="mb-1 block">Pack ref</span>
+                    <input
+                      required
+                      value={draft.scope_ref}
+                      onChange={(event) =>
+                        updateScopeField("scope_ref", event.target.value)
+                      }
+                      className="w-full rounded border border-gray-300 px-3 py-2"
+                    />
+                  </label>
+                )}
                 <label className="text-sm text-gray-700">
                   <span className="mb-1 block">Label</span>
                   <input
@@ -1947,20 +1984,25 @@ export default function DashboardEditorPage() {
                     className="w-full rounded border border-gray-300 px-3 py-2"
                   />
                 </label>
-                <label className="text-sm text-gray-700">
-                  <span className="mb-1 block">Visibility</span>
-                  <select
-                    value={draft.visibility}
-                    onChange={(event) =>
-                      updateMetadata("visibility", event.target.value)
-                    }
-                    className="w-full rounded border border-gray-300 px-3 py-2"
-                  >
-                    <option value="public">public</option>
-                    <option value="pack">pack</option>
-                    <option value="private">private</option>
-                  </select>
-                </label>
+                {draft.scope_type !== "identity" && (
+                  <label className="text-sm text-gray-700">
+                    <span className="mb-1 block">Visibility</span>
+                    <select
+                      value={draft.visibility}
+                      onChange={(event) =>
+                        updateMetadata(
+                          "visibility",
+                          parseDashboardVisibility(event.target.value),
+                        )
+                      }
+                      className="w-full rounded border border-gray-300 px-3 py-2"
+                    >
+                      <option value="public">public</option>
+                      <option value="pack">pack</option>
+                      <option value="private">private</option>
+                    </select>
+                  </label>
+                )}
                 <label className="text-sm text-gray-700">
                   <span className="mb-1 block">Tags</span>
                   <input

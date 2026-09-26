@@ -1,9 +1,8 @@
 export type DashboardPrimitive = string | number | boolean | null;
 
-export type DashboardScopeType =
-  "global" | "pack" | "identity" | "tenant" | string;
+export type DashboardScopeType = "global" | "pack" | "identity";
 
-export type DashboardVisibility = "public" | "pack" | "private" | string;
+export type DashboardVisibility = "public" | "pack" | "private";
 
 export type DashboardFilterValue = DashboardPrimitive | string[] | number[];
 
@@ -126,15 +125,16 @@ export interface DashboardMetadataResponse {
   pack?: number | null;
   owner_identity?: number | null;
   visibility: DashboardVisibility;
-  is_adhoc?: boolean;
+  is_adhoc: boolean;
   label: string;
-  description?: string;
-  enabled?: boolean;
-  is_default_home?: boolean;
+  description?: string | null;
+  enabled: boolean;
+  is_default_home: boolean;
   revision: number;
   spec_version: number;
   spec: DashboardSpecRecord;
   tags: string[];
+  retired_at?: string | null;
   created: string;
   updated: string;
 }
@@ -143,13 +143,14 @@ export interface DashboardListItem {
   id: number;
   ref: string;
   label: string;
-  description?: string;
+  description?: string | null;
   scope_type: DashboardScopeType;
   scope_ref: string;
   visibility: DashboardVisibility;
   is_default_home: boolean;
   revision: number;
   tags: string[];
+  retired_at?: string | null;
   updated: string;
 }
 
@@ -237,15 +238,15 @@ export interface DashboardAuthoringDocument {
 export interface DashboardCreateRequest {
   ref: string;
   label: string;
-  description?: string;
+  description?: string | null;
   scope_type: DashboardScopeType;
-  scope_ref: string;
-  visibility: DashboardVisibility;
-  enabled: boolean;
-  is_default_home: boolean;
-  spec_version: number;
+  scope_ref?: string;
+  visibility?: DashboardVisibility;
+  enabled?: boolean;
+  is_default_home?: boolean;
+  spec_version?: number;
   spec: DashboardSpecRecord;
-  tags: string[];
+  tags?: string[];
 }
 
 export interface DashboardUpdateRequest {
@@ -259,20 +260,11 @@ export interface DashboardUpdateRequest {
   spec_version?: number;
   spec?: DashboardSpecRecord;
   tags?: string[];
-  expected_revision?: number;
+  expected_revision: number;
 }
 
 export interface DashboardCloneRequest {
   ref: string;
-  label?: string;
-  description?: string;
-  scope_type?: DashboardScopeType;
-  scope_ref?: string;
-  visibility?: DashboardVisibility;
-  enabled?: boolean;
-  is_default_home?: boolean;
-  spec_version?: number;
-  tags?: string[];
 }
 
 export interface DashboardSourceParamDefinition {
@@ -324,6 +316,12 @@ const KNOWN_SPEC_KEYS = new Set<string>([
   "data_sources",
   "cards",
   "revision",
+  "scope_type",
+  "scope_ref",
+  "visibility",
+  "enabled",
+  "is_default_home",
+  "spec_version",
 ]);
 
 function cloneJson<T>(value: T): T {
@@ -340,14 +338,8 @@ function sortObjectKeys<T>(value: Record<string, T>): Record<string, T> {
   ) as Record<string, T>;
 }
 
-function normalizeScopeRefForRequest(
-  scopeType: DashboardScopeType,
-  scopeRef: string,
-): string {
+function normalizePackScopeRef(scopeRef: string): string {
   const trimmed = scopeRef.trim();
-  if (scopeType !== "pack") {
-    return trimmed;
-  }
   return trimmed
     .toLowerCase()
     .replace(/[^a-z0-9_.-]+/g, "_")
@@ -389,7 +381,7 @@ export function dashboardMetadataToDocument(
     revision: cloneFromExisting ? undefined : metadata.revision,
     ref: cloneFromExisting ? "" : metadata.ref,
     label: cloneFromExisting ? `${metadata.label} Copy` : metadata.label,
-    description: metadata.description,
+    description: metadata.description ?? undefined,
     scope_type: metadata.scope_type,
     scope_ref: metadata.scope_ref,
     visibility: metadata.visibility,
@@ -483,41 +475,39 @@ export function dashboardDocumentToSpec(
 export function dashboardDocumentToCreateRequest(
   document: DashboardAuthoringDocument,
 ): DashboardCreateRequest {
-  const normalizedScopeRef = normalizeScopeRefForRequest(
-    document.scope_type,
-    document.scope_ref,
-  );
-  return {
+  const request: DashboardCreateRequest = {
     ref: document.ref,
     label: document.label,
     description: document.description || undefined,
     scope_type: document.scope_type,
-    scope_ref: normalizedScopeRef,
-    visibility: document.visibility,
     enabled: document.enabled,
     is_default_home: document.is_default_home,
     spec_version: document.spec_version,
     spec: dashboardDocumentToSpec(document),
     tags: sortStrings(document.tags),
   };
+  if (document.scope_type === "pack") {
+    request.scope_ref = normalizePackScopeRef(document.scope_ref);
+  }
+  if (document.scope_type !== "identity") {
+    request.visibility = document.visibility;
+  }
+  return request;
 }
 
 export function dashboardDocumentToUpdateRequest(
   document: DashboardAuthoringDocument,
 ): DashboardUpdateRequest {
-  const normalizedScopeRef = normalizeScopeRefForRequest(
-    document.scope_type,
-    document.scope_ref,
-  );
+  if (document.revision === undefined) {
+    throw new Error("Dashboard revision is required for updates");
+  }
   const trimmedDescription = (document.description ?? "").trim();
-  return {
+  const request: DashboardUpdateRequest = {
     label: document.label,
     description: trimmedDescription
       ? { op: "set", value: trimmedDescription }
       : { op: "clear" },
     scope_type: document.scope_type,
-    scope_ref: normalizedScopeRef,
-    visibility: document.visibility,
     enabled: document.enabled,
     is_default_home: document.is_default_home,
     spec_version: document.spec_version,
@@ -525,26 +515,20 @@ export function dashboardDocumentToUpdateRequest(
     tags: sortStrings(document.tags),
     expected_revision: document.revision,
   };
+  if (document.scope_type === "pack") {
+    request.scope_ref = normalizePackScopeRef(document.scope_ref);
+  }
+  if (document.scope_type !== "identity") {
+    request.visibility = document.visibility;
+  }
+  return request;
 }
 
 export function dashboardDocumentToCloneRequest(
   document: DashboardAuthoringDocument,
 ): DashboardCloneRequest {
-  const normalizedScopeRef = normalizeScopeRefForRequest(
-    document.scope_type,
-    document.scope_ref,
-  );
   return {
     ref: document.ref,
-    label: document.label,
-    description: document.description || undefined,
-    scope_type: document.scope_type,
-    scope_ref: normalizedScopeRef,
-    visibility: document.visibility,
-    enabled: document.enabled,
-    is_default_home: false,
-    spec_version: document.spec_version,
-    tags: sortStrings(document.tags),
   };
 }
 
@@ -559,8 +543,6 @@ export function dashboardDocumentToYamlObject(
     label: document.label,
     description: document.description || undefined,
     scope_type: document.scope_type,
-    scope_ref: document.scope_ref,
-    visibility: document.visibility,
     is_default_home: document.is_default_home,
     enabled: document.enabled,
     spec_version: document.spec_version,
@@ -571,6 +553,13 @@ export function dashboardDocumentToYamlObject(
     cards: spec.cards,
     tags: sortStrings(document.tags),
   };
+
+  if (document.scope_type === "pack") {
+    yamlObject.scope_ref = normalizePackScopeRef(document.scope_ref);
+  }
+  if (document.scope_type !== "identity") {
+    yamlObject.visibility = document.visibility;
+  }
 
   for (const [key, value] of Object.entries(document.extra_spec_fields ?? {})) {
     if (!(key in yamlObject)) {

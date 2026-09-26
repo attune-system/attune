@@ -8,15 +8,15 @@ import type { WorkQueueBatchMode } from "./WorkQueueBatchMode";
 import type { WorkQueueUpdateStrategy } from "./WorkQueueUpdateStrategy";
 export type UpdateWorkQueueRequest = {
   accepting_new_items?: boolean | null;
-  action_params: any | null;
+  action_params?: any | null;
   allow_pending_update?: boolean | null;
   batch_mode?: null | WorkQueueBatchMode;
-  config: any | null;
+  config?: any | null;
   default_priority?: number | null;
   description?: null | NullableStringPatch;
   dispatch_action_ref?: string | null;
   enabled?: boolean | null;
-  item_schema: any | null;
+  item_schema?: any | null;
   label?: string | null;
   pack_ref?: null | NullableStringPatch;
   /**

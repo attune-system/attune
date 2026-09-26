@@ -346,6 +346,11 @@ pub struct LogConfig {
 
     /// Reserved file sink path. File logging is not currently implemented.
     pub file: Option<PathBuf>,
+
+    /// Mirror action and managed sensor output to structured process stdout/stderr.
+    /// Artifact-backed runtime logs remain authoritative.
+    #[serde(default)]
+    pub mirror_runtime_logs_to_stdio: bool,
 }
 
 fn default_log_level() -> String {
@@ -1909,6 +1914,7 @@ impl Default for LogConfig {
             format: default_log_format(),
             console: true,
             file: None,
+            mirror_runtime_logs_to_stdio: false,
         }
     }
 }

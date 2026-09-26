@@ -50,10 +50,16 @@ Sensor stdout and stderr are written to per-sensor rotating log files under the 
 {artifacts_dir}/sensors/{sensor_ref}/stderr.log
 ```
 
-Artifact-backed sensor logs are the authoritative record. Per-line stdout/stderr
-mirroring into tracing is disabled by default to avoid duplicate log ingestion,
-but lifecycle events such as stream closure and log-write failures still appear
-in service logs.
+Artifact-backed sensor logs are the authoritative record. Structured stdout and
+stderr mirroring is disabled by default to avoid duplicate log ingestion, but
+lifecycle events such as stream closure and log-write failures still appear in
+service logs.
+
+Set `log.mirror_runtime_logs_to_stdio: true`, or the environment variable
+`ATTUNE__LOG__MIRROR_RUNTIME_LOGS_TO_STDIO=true`, to emit structured NDJSON
+copies from action workers and sensor workers for container log collectors. The
+mirror preserves JSON-object bodies without stringifying them. It is best-effort
+and may expose sensitive runtime output to broader cluster logging access.
 
 Those sensor log artifacts are explicitly classified as `runtime_log` and remain
 private. The same policy now applies to worker-created execution stdout/stderr
@@ -61,10 +67,9 @@ artifacts. Operators and downstream observability can filter artifact metadata b
 classification to discover log artifacts, while the raw stdout/stderr payload
 stays in the artifact store as the source of truth.
 
-The worker and sensor services emit metadata-only lifecycle tracing around log
+By default, the worker and sensor services emit metadata-only lifecycle tracing around log
 version allocation, promotion/finalization, truncation, and stream closure. The
-events include identifiers, stream names, paths, and sizes only; they do not
-mirror raw stdout/stderr content into service logs. See
+events include identifiers, stream names, paths, and sizes only. See
 [`structured-logging.md`](structured-logging.md) for the canonical separation
 between forwarded service logs and private artifact-backed runtime logs.
 Use [runtime-log verification](runtime-log-verification.md) to run the

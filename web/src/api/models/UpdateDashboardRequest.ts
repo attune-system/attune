@@ -13,7 +13,7 @@ export type UpdateDashboardRequest = {
   label?: string | null;
   scope_ref?: string | null;
   scope_type?: null | DashboardScopeType;
-  spec: any | null;
+  spec?: any | null;
   spec_version?: number | null;
   tags?: any[] | null;
   visibility?: null | DashboardVisibility;

@@ -10,10 +10,12 @@ import {
 
 interface QueueInspectionPreviewProps {
   queue: WorkQueueResponse;
+  canEdit: boolean;
 }
 
 export default function QueueInspectionPreview({
   queue,
+  canEdit,
 }: QueueInspectionPreviewProps) {
   const sourceBadge = getQueueSourceBadge(queue.is_adhoc);
   const config = parseQueueConfig(queue.config);
@@ -85,7 +87,7 @@ export default function QueueInspectionPreview({
           Open queue details
           <ChevronRight className="h-4 w-4" />
         </Link>
-        {queue.is_adhoc && (
+        {canEdit && (
           <Link
             to={`/queues/${encodeURIComponent(queue.ref)}/edit`}
             className="inline-flex items-center gap-2 rounded-lg bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-200"

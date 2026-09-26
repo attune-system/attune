@@ -1444,6 +1444,75 @@ mod tests {
                 schema
             );
         }
+
+        let spec = serde_json::to_value(&doc).expect("OpenAPI spec should serialize");
+        let update_queue = spec
+            .pointer("/components/schemas/UpdateWorkQueueRequest")
+            .expect("UpdateWorkQueueRequest schema should be present");
+        let required = update_queue
+            .get("required")
+            .and_then(|value| value.as_array());
+        for field in ["item_schema", "action_params", "config"] {
+            assert!(
+                update_queue
+                    .pointer(&format!("/properties/{field}"))
+                    .is_some(),
+                "{field} should be present in UpdateWorkQueueRequest"
+            );
+            assert!(
+                required.is_none_or(|fields| {
+                    !fields
+                        .iter()
+                        .any(|required_field| required_field.as_str() == Some(field))
+                }),
+                "{field} should be optional in UpdateWorkQueueRequest"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_scope_and_request_optionality_contract() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec should serialize");
+
+        let scopes = spec
+            .pointer("/components/schemas/DashboardScopeType/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("DashboardScopeType should declare enum values");
+        assert_eq!(
+            scopes,
+            &[
+                serde_json::Value::String("global".to_string()),
+                serde_json::Value::String("pack".to_string()),
+                serde_json::Value::String("identity".to_string()),
+            ]
+        );
+
+        for (schema_name, optional_fields) in [
+            ("CreateDashboardRequest", &["scope_ref", "visibility"][..]),
+            (
+                "UpdateDashboardRequest",
+                &["scope_ref", "scope_type", "spec", "visibility"][..],
+            ),
+        ] {
+            let schema = spec
+                .pointer(&format!("/components/schemas/{schema_name}"))
+                .unwrap_or_else(|| panic!("{schema_name} schema should be present"));
+            let required = schema.get("required").and_then(serde_json::Value::as_array);
+            for field in optional_fields {
+                assert!(
+                    schema.pointer(&format!("/properties/{field}")).is_some(),
+                    "{field} should be present in {schema_name}"
+                );
+                assert!(
+                    required.is_none_or(|fields| {
+                        !fields
+                            .iter()
+                            .any(|required_field| required_field.as_str() == Some(field))
+                    }),
+                    "{field} should be optional in {schema_name}"
+                );
+            }
+        }
     }
 
     #[test]

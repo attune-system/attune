@@ -6,5 +6,4 @@ export enum DashboardScopeType {
   GLOBAL = "global",
   PACK = "pack",
   IDENTITY = "identity",
-  TENANT = "tenant",
 }

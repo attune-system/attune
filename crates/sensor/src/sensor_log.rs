@@ -2,14 +2,13 @@
 //!
 //! Each sensor instance gets its own stdout and stderr streams with
 //! size-based artifact version rotation. Artifact-backed sensor logs are the authoritative
-//! record; per-line stdout/stderr mirroring into tracing is intentionally
-//! disabled to avoid duplicate ingestion.
+//! record. Deployments may also opt into structured stdout/stderr mirroring.
 //!
 //! Sensor logs use file-backed artifact metadata, with one version per rotation
 //! window and immutable segments within each version.
 
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::ChildStdout;
 use tracing::{info, warn};
 
@@ -17,6 +16,7 @@ use attune_common::artifact_transport::ArtifactFileTransport;
 use attune_common::models::enums::{ArtifactClassification, RetentionPolicyType};
 use attune_common::repositories::artifact::{classify_artifact, ArtifactVersionRepository};
 use attune_common::repositories::log_stream::LogStreamRepository;
+use attune_common::runtime_log_mirror::{RuntimeLogMirror, RuntimeLogSource, RuntimeLogStream};
 
 /// Configuration for sensor log rotation.
 #[derive(Debug, Clone)]
@@ -125,32 +125,34 @@ impl RotatingLogWriter {
         Ok(())
     }
 
-    /// Write a line to the log file, rotating if needed.
-    pub async fn write_line(&mut self, line: &[u8]) -> anyhow::Result<()> {
-        self.ensure_writer().await?;
+    /// Write bytes to the log stream, rotating without buffering whole lines.
+    pub async fn write_bytes(&mut self, mut bytes: &[u8]) -> anyhow::Result<()> {
+        while !bytes.is_empty() {
+            self.ensure_writer().await?;
+            if self.config.max_files > 0 && self.current_size >= self.config.max_bytes.max(1) {
+                self.rotate().await?;
+            }
 
-        let newline_len = if line.ends_with(b"\n") { 0 } else { 1 };
-        let bytes_to_write = line.len() as u64 + newline_len;
-
-        if self.current_size > 0
-            && self.current_size + bytes_to_write > self.config.max_bytes
-            && self.config.max_files > 0
-        {
-            self.rotate().await?;
+            let take = if self.config.max_files > 0 {
+                let available = self
+                    .config
+                    .max_bytes
+                    .max(1)
+                    .saturating_sub(self.current_size);
+                usize::try_from(available)
+                    .unwrap_or(usize::MAX)
+                    .min(bytes.len())
+            } else {
+                bytes.len()
+            };
+            self.writer
+                .as_ref()
+                .expect("writer allocated")
+                .write_all(&bytes[..take])
+                .await?;
+            self.current_size = self.current_size.saturating_add(take as u64);
+            bytes = &bytes[take..];
         }
-
-        let mut bytes = Vec::with_capacity(line.len() + newline_len as usize);
-        bytes.extend_from_slice(line);
-        if newline_len == 1 {
-            bytes.push(b'\n');
-        }
-        self.writer
-            .as_ref()
-            .expect("writer allocated")
-            .write_all(&bytes)
-            .await?;
-
-        self.current_size += bytes_to_write;
         Ok(())
     }
 
@@ -222,14 +224,17 @@ impl RotatingLogWriter {
 
 /// Spawn a task that reads a sensor's stdout and writes to a rotating log file.
 pub fn spawn_stdout_log_task(
-    stdout: ChildStdout,
+    mut stdout: ChildStdout,
     sensor_ref: String,
     transport: Arc<dyn ArtifactFileTransport>,
     log_config: SensorLogConfig,
     pool: sqlx::PgPool,
     artifact_target: SensorLogArtifactTarget,
+    mirror_source: Option<RuntimeLogSource>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut mirror = mirror_source
+            .map(|source| RuntimeLogMirror::new(source, RuntimeLogStream::Stdout, None));
         let mut writer = RotatingLogWriter::new_versioned(
             transport,
             &sensor_ref,
@@ -238,11 +243,32 @@ pub fn spawn_stdout_log_task(
             pool,
             artifact_target,
         );
-        let mut reader = BufReader::new(stdout).lines();
+        let mut buffer = vec![0_u8; 64 * 1024];
 
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Err(e) = writer.write_line(line.as_bytes()).await {
+        loop {
+            let read = match stdout.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    warn!(%error, sensor_ref = %sensor_ref, "Failed to read sensor stdout");
+                    break;
+                }
+            };
+            let bytes = &buffer[..read];
+            if let Err(e) = writer.write_bytes(bytes).await {
                 warn!("Failed to write sensor {} stdout log: {}", sensor_ref, e);
+            }
+            if let Some(active_mirror) = mirror.as_mut() {
+                if let Err(error) = active_mirror.push(bytes) {
+                    warn!(%error, sensor_ref = %sensor_ref, "Failed to mirror sensor stdout");
+                    mirror = None;
+                }
+            }
+        }
+
+        if let Some(mirror) = mirror.as_mut() {
+            if let Err(error) = mirror.finish() {
+                warn!(%error, sensor_ref = %sensor_ref, "Failed to finish mirrored sensor stdout");
             }
         }
 
@@ -255,14 +281,17 @@ pub fn spawn_stdout_log_task(
 
 /// Spawn a task that reads a sensor's stderr and writes to a rotating log file.
 pub fn spawn_stderr_log_task(
-    stderr: tokio::process::ChildStderr,
+    mut stderr: tokio::process::ChildStderr,
     sensor_ref: String,
     transport: Arc<dyn ArtifactFileTransport>,
     log_config: SensorLogConfig,
     pool: sqlx::PgPool,
     artifact_target: SensorLogArtifactTarget,
+    mirror_source: Option<RuntimeLogSource>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut mirror = mirror_source
+            .map(|source| RuntimeLogMirror::new(source, RuntimeLogStream::Stderr, None));
         let mut writer = RotatingLogWriter::new_versioned(
             transport,
             &sensor_ref,
@@ -271,11 +300,32 @@ pub fn spawn_stderr_log_task(
             pool,
             artifact_target,
         );
-        let mut reader = BufReader::new(stderr).lines();
+        let mut buffer = vec![0_u8; 64 * 1024];
 
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Err(e) = writer.write_line(line.as_bytes()).await {
+        loop {
+            let read = match stderr.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    warn!(%error, sensor_ref = %sensor_ref, "Failed to read sensor stderr");
+                    break;
+                }
+            };
+            let bytes = &buffer[..read];
+            if let Err(e) = writer.write_bytes(bytes).await {
                 warn!("Failed to write sensor {} stderr log: {}", sensor_ref, e);
+            }
+            if let Some(active_mirror) = mirror.as_mut() {
+                if let Err(error) = active_mirror.push(bytes) {
+                    warn!(%error, sensor_ref = %sensor_ref, "Failed to mirror sensor stderr");
+                    mirror = None;
+                }
+            }
+        }
+
+        if let Some(mirror) = mirror.as_mut() {
+            if let Err(error) = mirror.finish() {
+                warn!(%error, sensor_ref = %sensor_ref, "Failed to finish mirrored sensor stderr");
             }
         }
 

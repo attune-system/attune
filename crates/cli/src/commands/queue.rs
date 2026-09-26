@@ -1,14 +1,18 @@
+use std::io::{self, Read};
+
 use anyhow::{Context, Result};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::client::ApiClient;
+use crate::client::{ApiClient, PaginatedResponse};
 use crate::config::CliConfig;
 use crate::output::{self, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum QueueCommands {
+    /// List visible work queues
+    List(QueueListArgs),
     /// Show details of a work queue
     Show {
         /// Queue reference
@@ -24,6 +28,8 @@ pub enum QueueCommands {
         /// Queue reference
         queue_ref: String,
     },
+    /// Enqueue one work item from a JSON request
+    Enqueue(QueueEnqueueArgs),
     /// Update queue metadata
     Update {
         /// Queue reference
@@ -48,6 +54,13 @@ pub enum QueueCommands {
 
 #[derive(Subcommand)]
 pub enum QueueItemCommands {
+    /// List queue items for operational inspection
+    List(QueueItemListArgs),
+    /// Show one queue item
+    Show {
+        /// Queue item ID
+        item_id: i64,
+    },
     /// Preview pending items matched by a SQL/JSONPath selector
     Preview(QueueItemPreviewArgs),
     /// Merge-patch payloads for pending items matched by a SQL/JSONPath selector
@@ -57,6 +70,95 @@ pub enum QueueItemCommands {
     /// Delete pending items matched by a SQL/JSONPath selector by marking them cancelled
     #[command(visible_alias = "cancel")]
     Delete(QueueItemDeleteArgs),
+}
+
+#[derive(Args)]
+pub struct QueueListArgs {
+    /// Limit results to queues owned by this pack
+    #[arg(long)]
+    pack: Option<String>,
+    /// Filter by enabled state
+    #[arg(long)]
+    enabled: Option<bool>,
+    /// Filter by ad hoc or pack-managed queue type
+    #[arg(long)]
+    is_adhoc: Option<bool>,
+    /// Search queue refs, labels, and descriptions
+    #[arg(long)]
+    search: Option<String>,
+    /// Pack that intends to submit items, used for restricted queue discovery
+    #[arg(long)]
+    referencing_pack_ref: Option<String>,
+    /// Result page, starting at 1
+    #[arg(long, default_value_t = 1, value_parser = parse_page)]
+    page: u32,
+    /// Results per page
+    #[arg(long, default_value_t = 50, value_parser = parse_per_page)]
+    per_page: u32,
+}
+
+#[derive(Args)]
+pub struct QueueEnqueueArgs {
+    /// Queue reference
+    queue_ref: String,
+    /// Complete enqueue request as JSON
+    #[arg(
+        long,
+        required_unless_present = "request_file",
+        conflicts_with = "request_file"
+    )]
+    request_json: Option<String>,
+    /// JSON request file, or '-' to read from stdin
+    #[arg(
+        long,
+        required_unless_present = "request_json",
+        conflicts_with = "request_json"
+    )]
+    request_file: Option<String>,
+}
+
+#[derive(Args)]
+pub struct QueueItemListArgs {
+    /// Filter by exact item key
+    #[arg(long)]
+    item_key: Option<String>,
+    /// Filter by enqueue source
+    #[arg(long)]
+    enqueue_source: Option<String>,
+    /// Filter by status; may be repeated
+    #[arg(long, value_enum)]
+    status: Vec<QueueItemStatus>,
+    /// Result page, starting at 1
+    #[arg(long, default_value_t = 1, value_parser = parse_page)]
+    page: u32,
+    /// Results per page
+    #[arg(long, default_value_t = 50, value_parser = parse_per_page)]
+    per_page: u32,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum QueueItemStatus {
+    Queued,
+    Leased,
+    Retry,
+    Completed,
+    Failed,
+    Skipped,
+    Cancelled,
+}
+
+impl QueueItemStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Leased => "leased",
+            Self::Retry => "retry",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Args)]
@@ -145,6 +247,49 @@ fn default_true() -> bool {
     true
 }
 
+fn default_json_object() -> JsonValue {
+    serde_json::json!({})
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QueueSummary {
+    id: i64,
+    #[serde(rename = "ref")]
+    queue_ref: String,
+    #[serde(default)]
+    pack_ref: Option<String>,
+    is_adhoc: bool,
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+    enabled: bool,
+    accepting_new_items: bool,
+    dispatch_action_ref: String,
+    #[serde(default)]
+    trace_tag_template: Option<String>,
+    reference_visibility: String,
+    #[serde(default)]
+    reference_allowed_pack_refs: Vec<String>,
+    #[serde(default)]
+    retired_at: Option<String>,
+    created: String,
+    updated: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EnqueueQueueItemRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    item_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    priority: Option<i32>,
+    payload: JsonValue,
+    #[serde(default = "default_json_object")]
+    metadata: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trace_tag: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct UpdateQueueOperationalFlags {
     enabled: bool,
@@ -182,6 +327,8 @@ struct ApplyQueueItemsRequest {
 #[derive(Debug, Serialize, Deserialize)]
 struct QueueItemSummary {
     id: i64,
+    queue: i64,
+    queue_ref: String,
     #[serde(default)]
     item_key: Option<String>,
     status: String,
@@ -189,9 +336,26 @@ struct QueueItemSummary {
     payload: JsonValue,
     #[serde(default)]
     metadata: JsonValue,
+    enqueue_source: String,
     #[serde(default)]
-    enqueue_source: Option<String>,
+    trace_tag: Option<String>,
+    #[serde(default)]
+    requested_by_identity: Option<i64>,
+    #[serde(default)]
+    requested_by_execution: Option<i64>,
+    #[serde(default)]
+    requested_by_enforcement: Option<i64>,
+    #[serde(default)]
+    leased_execution: Option<i64>,
+    #[serde(default)]
+    lease_token: Option<String>,
+    #[serde(default)]
+    lease_expires_at: Option<String>,
     attempt_count: i32,
+    #[serde(default)]
+    last_error: Option<JsonValue>,
+    #[serde(default)]
+    ack_summary: Option<JsonValue>,
     created: String,
     updated: String,
 }
@@ -220,6 +384,7 @@ pub async fn handle_queue_command(
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
+        QueueCommands::List(args) => handle_list(args, profile, api_url, output_format).await,
         QueueCommands::Show { queue_ref } => {
             handle_show(queue_ref, profile, api_url, output_format).await
         }
@@ -229,6 +394,7 @@ pub async fn handle_queue_command(
         QueueCommands::Disable { queue_ref } => {
             handle_toggle(queue_ref, false, profile, api_url, output_format).await
         }
+        QueueCommands::Enqueue(args) => handle_enqueue(args, profile, api_url, output_format).await,
         QueueCommands::Update {
             queue_ref,
             trace_tag_template,
@@ -250,6 +416,52 @@ pub async fn handle_queue_command(
     }
 }
 
+async fn handle_list(
+    args: QueueListArgs,
+    profile: &Option<String>,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
+    let base_path = match args.pack.as_deref() {
+        Some(pack_ref) => format!("/packs/{}/queues", encode_path_segment(pack_ref)),
+        None => "/queues".to_string(),
+    };
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(enabled) = args.enabled {
+        query.append_pair("enabled", &enabled.to_string());
+    }
+    if let Some(is_adhoc) = args.is_adhoc {
+        query.append_pair("is_adhoc", &is_adhoc.to_string());
+    }
+    if let Some(search) = args.search.as_deref() {
+        query.append_pair("search", search);
+    }
+    if let Some(pack_ref) = args.referencing_pack_ref.as_deref() {
+        query.append_pair("referencing_pack_ref", pack_ref);
+    }
+    query.append_pair("page", &args.page.to_string());
+    query.append_pair("per_page", &args.per_page.to_string());
+    let path = format!("{base_path}?{}", query.finish());
+    let response: PaginatedResponse<QueueSummary> = client.get_paginated_response(&path).await?;
+    print_queue_list(&response, output_format)
+}
+
+async fn handle_enqueue(
+    args: QueueEnqueueArgs,
+    profile: &Option<String>,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let request = read_enqueue_request(args.request_json, args.request_file)?;
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
+    let path = format!("/queues/{}/items", encode_path_segment(&args.queue_ref));
+    let item: QueueItemSummary = client.post(&path, &request).await?;
+    print_queue_item(&item, output_format)
+}
+
 async fn handle_show(
     queue_ref: String,
     profile: &Option<String>,
@@ -259,7 +471,7 @@ async fn handle_show(
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 
-    let path = format!("/queues/{}", queue_ref);
+    let path = format!("/queues/{}", encode_path_segment(&queue_ref));
     let queue: QueueDetail = client.get(&path).await?;
     print_queue(queue, output_format, None)
 }
@@ -274,7 +486,7 @@ async fn handle_toggle(
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 
-    let path = format!("/queues/{}", queue_ref);
+    let path = format!("/queues/{}", encode_path_segment(&queue_ref));
     let queue: QueueDetail = client
         .put(&path, &UpdateQueueOperationalFlags { enabled })
         .await?;
@@ -299,7 +511,7 @@ async fn handle_update(
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
-    let path = format!("/queues/{}", queue_ref);
+    let path = format!("/queues/{}", encode_path_segment(&queue_ref));
     let request = UpdateQueueRequest {
         trace_tag_template: if clear_trace_tag_template {
             Some(None)
@@ -309,6 +521,48 @@ async fn handle_update(
     };
     let queue: QueueDetail = client.put(&path, &request).await?;
     print_queue(queue, output_format, Some("updated"))
+}
+
+fn print_queue_list(
+    response: &PaginatedResponse<QueueSummary>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    if output_format != OutputFormat::Table {
+        return output::print_output(response, output_format);
+    }
+    if response.items.is_empty() {
+        output::print_info("No work queues found.");
+        return Ok(());
+    }
+
+    let mut table = output::create_table();
+    output::add_header(
+        &mut table,
+        vec![
+            "ID",
+            "Ref",
+            "Pack",
+            "Label",
+            "Enabled",
+            "Accepting",
+            "Dispatch action",
+            "Created",
+        ],
+    );
+    for queue in &response.items {
+        table.add_row(vec![
+            queue.id.to_string(),
+            queue.queue_ref.clone(),
+            queue.pack_ref.as_deref().unwrap_or("-").to_string(),
+            queue.label.clone(),
+            output::format_bool(queue.enabled),
+            output::format_bool(queue.accepting_new_items),
+            queue.dispatch_action_ref.clone(),
+            output::format_timestamp(&queue.created),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
 }
 
 fn print_queue(
@@ -382,12 +636,45 @@ async fn handle_items(
     let mut client = ApiClient::from_config(&config, api_url);
 
     match command {
+        QueueItemCommands::List(args) => {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            if let Some(item_key) = args.item_key.as_deref() {
+                query.append_pair("item_key", item_key);
+            }
+            if let Some(enqueue_source) = args.enqueue_source.as_deref() {
+                query.append_pair("enqueue_source", enqueue_source);
+            }
+            for status in args.status {
+                query.append_pair("statuses", status.as_str());
+            }
+            query.append_pair("page", &args.page.to_string());
+            query.append_pair("per_page", &args.per_page.to_string());
+            let path = format!(
+                "/queues/{}/items?{}",
+                encode_path_segment(&queue_ref),
+                query.finish()
+            );
+            let response: PaginatedResponse<QueueItemSummary> =
+                client.get_paginated_response(&path).await?;
+            print_queue_item_list(&response, output_format)
+        }
+        QueueItemCommands::Show { item_id } => {
+            let path = format!(
+                "/queues/{}/items/{item_id}",
+                encode_path_segment(&queue_ref)
+            );
+            let item: QueueItemSummary = client.get(&path).await?;
+            print_queue_item(&item, output_format)
+        }
         QueueItemCommands::Preview(args) => {
             let request = PreviewQueueItemsRequest {
                 selector: parse_selector(args.selector, args.vars_json)?,
                 limit: validate_preview_limit(args.limit)?,
             };
-            let path = format!("/queues/{}/items/query/preview", queue_ref);
+            let path = format!(
+                "/queues/{}/items/query/preview",
+                encode_path_segment(&queue_ref)
+            );
             let response: PreviewQueueItemsResponse = client.post(&path, &request).await?;
             print_preview_response(response, output_format)
         }
@@ -430,7 +717,10 @@ async fn apply_items(
     request: ApplyQueueItemsRequest,
     output_format: OutputFormat,
 ) -> Result<()> {
-    let path = format!("/queues/{}/items/query/apply", queue_ref);
+    let path = format!(
+        "/queues/{}/items/query/apply",
+        encode_path_segment(queue_ref)
+    );
     let response: ApplyQueueItemsResponse = client.post(&path, &request).await?;
     print_apply_response(response, output_format)
 }
@@ -449,6 +739,56 @@ fn parse_json_object(input: &str, flag_name: &str) -> Result<JsonValue> {
         anyhow::bail!("{flag_name} must be a JSON object");
     }
     Ok(value)
+}
+
+fn read_enqueue_request(
+    request_json: Option<String>,
+    request_file: Option<String>,
+) -> Result<EnqueueQueueItemRequest> {
+    let content = match (request_json, request_file) {
+        (Some(content), None) => content,
+        (None, Some(path)) if path == "-" => {
+            let mut content = String::new();
+            io::stdin()
+                .read_to_string(&mut content)
+                .context("Failed to read enqueue request from stdin")?;
+            content
+        }
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read enqueue request file '{path}'"))?,
+        _ => unreachable!("clap requires exactly one enqueue request source"),
+    };
+    serde_json::from_str(&content).map_err(|error| {
+        anyhow::anyhow!(
+            "Enqueue request must be valid JSON with payload and optional item_key, priority, metadata, and trace_tag fields: {error}"
+        )
+    })
+}
+
+fn encode_path_segment(value: &str) -> String {
+    urlencoding::encode(value).into_owned()
+}
+
+fn parse_page(value: &str) -> std::result::Result<u32, String> {
+    let page = value
+        .parse::<u32>()
+        .map_err(|_| "page must be an integer".to_string())?;
+    if page == 0 {
+        Err("page must be at least 1".to_string())
+    } else {
+        Ok(page)
+    }
+}
+
+fn parse_per_page(value: &str) -> std::result::Result<u32, String> {
+    let per_page = value
+        .parse::<u32>()
+        .map_err(|_| "per-page must be an integer".to_string())?;
+    if (1..=100).contains(&per_page) {
+        Ok(per_page)
+    } else {
+        Err("per-page must be between 1 and 100".to_string())
+    }
 }
 
 fn validate_preview_limit(limit: u32) -> Result<u32> {
@@ -470,7 +810,7 @@ fn print_preview_response(
                 ("Matched", response.matched_count.to_string()),
                 ("Previewed", response.preview_count.to_string()),
             ]);
-            print_items_table(&response.items)
+            print_items_table(&response.items, "No matching pending queue items.")
         }
     }
 }
@@ -497,14 +837,101 @@ fn print_apply_response(
                 ("Skipped", response.skipped_count.to_string()),
                 ("Previewed", response.preview_count.to_string()),
             ]);
-            print_items_table(&response.items)
+            print_items_table(&response.items, "No matching pending queue items.")
         }
     }
 }
 
-fn print_items_table(items: &[QueueItemSummary]) -> Result<()> {
+fn print_queue_item_list(
+    response: &PaginatedResponse<QueueItemSummary>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    if output_format != OutputFormat::Table {
+        return output::print_output(response, output_format);
+    }
+    print_items_table(&response.items, "No queue items found.")
+}
+
+fn print_queue_item(item: &QueueItemSummary, output_format: OutputFormat) -> Result<()> {
+    if output_format != OutputFormat::Table {
+        return output::print_output(item, output_format);
+    }
+
+    output::print_key_value_table(vec![
+        ("ID", item.id.to_string()),
+        ("Queue", item.queue_ref.clone()),
+        (
+            "Item key",
+            item.item_key.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+        ("Status", item.status.clone()),
+        ("Priority", item.priority.to_string()),
+        ("Attempts", item.attempt_count.to_string()),
+        ("Enqueue source", item.enqueue_source.clone()),
+        (
+            "Trace tag",
+            item.trace_tag.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "Requested by identity",
+            item.requested_by_identity
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "Requested by execution",
+            item.requested_by_execution
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "Requested by enforcement",
+            item.requested_by_enforcement
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "Leased execution",
+            item.leased_execution
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "Lease token",
+            item.lease_token.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "Lease expires",
+            item.lease_expires_at
+                .as_deref()
+                .map(output::format_timestamp)
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        ("Payload", compact_json(&item.payload)),
+        ("Metadata", compact_json(&item.metadata)),
+        (
+            "Last error",
+            item.last_error
+                .as_ref()
+                .map(compact_json)
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "Acknowledgement",
+            item.ack_summary
+                .as_ref()
+                .map(compact_json)
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        ("Created", output::format_timestamp(&item.created)),
+        ("Updated", output::format_timestamp(&item.updated)),
+    ]);
+    Ok(())
+}
+
+fn print_items_table(items: &[QueueItemSummary], empty_message: &str) -> Result<()> {
     if items.is_empty() {
-        output::print_info("No matching pending queue items.");
+        output::print_info(empty_message);
         return Ok(());
     }
 
@@ -543,4 +970,50 @@ fn operation_label(operation: &str) -> &str {
 
 fn compact_json(value: &JsonValue) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use crate::cli::Cli;
+
+    #[test]
+    fn queue_command_tree_contains_expected_verbs() {
+        let command = Cli::command();
+        let queue = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "queue")
+            .expect("queue command");
+        let mut queue_verbs = queue
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<Vec<_>>();
+        queue_verbs.sort_unstable();
+        assert_eq!(
+            queue_verbs,
+            ["disable", "enable", "enqueue", "items", "list", "show", "update"]
+        );
+
+        let items = queue
+            .get_subcommands()
+            .find(|command| command.get_name() == "items")
+            .expect("queue items command");
+        let mut item_verbs = items
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<Vec<_>>();
+        item_verbs.sort_unstable();
+        assert_eq!(
+            item_verbs,
+            [
+                "delete",
+                "list",
+                "preview",
+                "reprioritize",
+                "show",
+                "update"
+            ]
+        );
+    }
 }

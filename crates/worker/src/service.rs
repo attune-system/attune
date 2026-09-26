@@ -246,7 +246,9 @@ impl WorkerService {
         info!("Message queue publisher initialized");
 
         // Initialize worker registration
-        let registration = Arc::new(RwLock::new(WorkerRegistration::new(pool.clone(), &config)));
+        let registration_state = WorkerRegistration::new(pool.clone(), &config);
+        let worker_name = registration_state.worker_name().to_string();
+        let registration = Arc::new(RwLock::new(registration_state));
 
         // Initialize artifact manager for execution stdout/stderr/result storage.
         // This must use the shared artifacts_dir so the API log streaming endpoints
@@ -429,6 +431,7 @@ impl WorkerService {
             .as_ref()
             .map(|w| w.max_stderr_bytes)
             .unwrap_or(10 * 1024 * 1024);
+        let mirror_runtime_logs_to_stdio = config.log.mirror_runtime_logs_to_stdio;
         let execution_log_retention_policy = config
             .worker
             .as_ref()
@@ -502,6 +505,9 @@ impl WorkerService {
             secret_manager,
             max_stdout_bytes,
             max_stderr_bytes,
+            mirror_runtime_logs_to_stdio,
+            worker_name,
+            worker_token_provider.instance_id(),
             config.artifacts.log_segment_writer_config(),
             execution_log_retention_policy,
             execution_log_retention_limit,
@@ -614,6 +620,7 @@ impl WorkerService {
         self.worker_id = Some(worker_id);
         self.worker_token_provider
             .set_worker_id(worker_id.to_string());
+        self.executor.set_worker_id(worker_id);
 
         info!("Worker registered with ID: {}", worker_id);
 

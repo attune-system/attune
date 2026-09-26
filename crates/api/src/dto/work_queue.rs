@@ -139,11 +139,11 @@ pub struct UpdateWorkQueueRequest {
     pub batch_mode: Option<WorkQueueBatchMode>,
 
     #[validate(custom(function = "validate_item_schema_field"))]
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, required = false, nullable = true)]
     pub item_schema: Option<JsonValue>,
 
     #[validate(custom(function = "validate_action_params_field"))]
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, required = false, nullable = true)]
     pub action_params: Option<JsonValue>,
 
     /// Optional template used to resolve execution trace tags for queue dispatches.
@@ -168,7 +168,7 @@ pub struct UpdateWorkQueueRequest {
     pub permission_set_refs: Option<Option<Vec<String>>>,
 
     #[validate(custom(function = "validate_queue_config_field"))]
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, required = false, nullable = true)]
     pub config: Option<JsonValue>,
 
     /// Pack-level visibility for queue item submission/targeting.

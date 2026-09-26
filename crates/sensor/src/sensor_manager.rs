@@ -582,6 +582,8 @@ pub struct SensorManagerConfig {
     pub pack_transport: Arc<dyn PackFileTransport>,
     pub artifact_transport: Arc<dyn ArtifactFileTransport>,
     pub sensor_log_config: crate::sensor_log::SensorLogConfig,
+    pub mirror_runtime_logs_to_stdio: bool,
+    pub worker_name: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -647,6 +649,8 @@ struct SensorManagerInner {
     pack_sync_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     artifact_transport: Arc<dyn ArtifactFileTransport>,
     sensor_log_config: crate::sensor_log::SensorLogConfig,
+    mirror_runtime_logs_to_stdio: bool,
+    worker_name: String,
     api_client: ApiClient,
     api_url: String,
     notifier_ws_url: String,
@@ -694,6 +698,8 @@ impl SensorManager {
                 pack_sync_locks: Mutex::new(HashMap::new()),
                 artifact_transport: config.artifact_transport,
                 sensor_log_config: config.sensor_log_config,
+                mirror_runtime_logs_to_stdio: config.mirror_runtime_logs_to_stdio,
+                worker_name: config.worker_name,
                 api_client,
                 api_url: config.api_url,
                 notifier_ws_url: config.notifier_ws_url,
@@ -1500,8 +1506,8 @@ impl SensorManager {
             .take()
             .ok_or_else(|| anyhow!("Failed to capture sensor stderr"))?;
 
-        // Spawn tasks that write to rotating artifact-backed log files. Per-line
-        // stdout/stderr mirroring stays disabled to avoid duplicate ingestion.
+        // Artifact-backed logs remain authoritative. Optional structured mirroring
+        // makes the same output available to container log collectors.
         let log_config = self
             .inner
             .sensor_log_config
@@ -1515,6 +1521,19 @@ impl SensorManager {
             &log_config,
         )
         .await?;
+        let mirror_source = self.inner.mirror_runtime_logs_to_stdio.then(|| {
+            attune_common::runtime_log_mirror::RuntimeLogSource::Sensor {
+                sensor_id: sensor.id,
+                sensor_ref: sensor.r#ref.clone(),
+                pack_ref: pack_ref.clone(),
+                worker_id: workload.worker_id,
+                worker_name: self.inner.worker_name.clone(),
+                worker_instance: workload.worker_instance,
+                workload_id: workload.workload_id,
+                assignment_generation: workload.generation,
+                process_id: child.id(),
+            }
+        });
 
         let stdout_handle = crate::sensor_log::spawn_stdout_log_task(
             stdout,
@@ -1523,6 +1542,7 @@ impl SensorManager {
             log_config.clone(),
             self.inner.db.clone(),
             log_artifacts.stdout,
+            mirror_source.clone(),
         );
         let stderr_handle = crate::sensor_log::spawn_stderr_log_task(
             stderr,
@@ -1531,6 +1551,7 @@ impl SensorManager {
             log_config.clone(),
             self.inner.db.clone(),
             log_artifacts.stderr,
+            mirror_source,
         );
 
         self.persist_sensor_process_started(&sensor, child.id(), reset_failure_count)
