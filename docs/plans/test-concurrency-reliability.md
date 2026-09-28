@@ -414,7 +414,7 @@ The default Docker lane intentionally excludes the same 15 externally provisione
 |---|---|---|
 | `attune-api::sse_execution_stream_tests` | `test_sse_stream_receives_execution_updates`; `test_sse_stream_filters_by_execution_id`; `test_sse_stream_requires_authentication`; `test_sse_stream_all_executions` | Live API and SSE service |
 | `attune-api::dashboard_acceptance_tests` | `dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets` | Separately provisioned acceptance fixture |
-| `attune-api::runtime_log_replica_tests` | `log_segment_upload_goes_from_manager_to_minio_without_api_body_relay`; `object_minio_duplicate_ambiguous_and_finalize_orderings`; `object_minio_reader_recovers_missed_notifications_and_terminal`; `object_minio_upload_reconnect_and_pinned_reads`; `ordinary_artifact_upload_goes_from_manager_to_minio_without_api_body_relay`; `shared_volume_cross_process_locking_writer_loss_and_retention` | MinIO credentials and cross-process storage harness |
+| `attune-api::runtime_log_replica_tests` | `log_segment_upload_goes_from_manager_to_s3_without_api_body_relay`; `object_s3_duplicate_ambiguous_and_finalize_orderings`; `object_s3_reader_recovers_missed_notifications_and_terminal`; `object_s3_upload_reconnect_and_pinned_reads`; `ordinary_artifact_upload_goes_from_manager_to_s3_without_api_body_relay`; `shared_volume_cross_process_locking_writer_loss_and_retention` | S3 credentials and cross-process storage harness |
 | `attune-cli::test_actions` | `test_action_execute_with_profile` | Installed CLI profile |
 | `attune-common` library | `blob_store::tests::s3_direct_upload_authorization_puts_and_verifies_exact_bytes` | S3 credentials and endpoint |
 | `attune-executor::fifo_ordering_integration_test` | `test_high_concurrency_stress`; `test_extreme_stress_10k_executions` | Explicit load tests |
@@ -447,7 +447,7 @@ Measured on the same 4-vCPU Rancher host:
 | Common crate, 626 selected tests, serial | projected hours at late-run rates | 341 s |
 | Common crate, same selection, 4 threads | not adopted | 208 s |
 
-The serial and four-thread common runs left zero owned clones. Both reported the same S3 test prerequisite failure because the Docker Rust lane does not yet provision the independently owned MinIO harness; the optimization did not skip or hide it. General runner concurrency remains one until repeated whole-workspace gates pass.
+The serial and four-thread common runs left zero owned clones. Both reported the same S3 test prerequisite failure because the Docker Rust lane did not yet provision the independently owned S3 harness; the optimization did not skip or hide it. General runner concurrency remains one until repeated whole-workspace gates pass.
 
 CI safety now records exact run-owned clone and template counts in addition to legacy schemas/jobs. Per-test clone leaks fail even after successful janitor recovery; the one run template is an expected run-level artifact and is removed last.
 

@@ -251,7 +251,7 @@ make db-migrate
 - Database fixtures use run-owned, migration-hashed templates and physical clones by default. Approved read-only and rollback-isolated tests share a runner-owned database; see `docs/testing/schema-per-test.md`.
 - Give each direct Cargo invocation a unique `ATTUNE_TEST_RUN_ID`: 1–20 lowercase letters/digits with optional non-leading hyphens. Docker runners generate run identities.
 - Database-backed test runs use at least four threads. Use `cargo test -- --nocapture --test-threads=4` for detailed failures. Docker test executables run sequentially.
-- MinIO log tests require versioned object storage as well as PostgreSQL. Use `make runtime-log-test-storage-up`, `make test-runtime-log-correctness`, and `make runtime-log-test-storage-down`; read `docs/deployment/runtime-log-verification.md` for ownership, credentials, and cleanup. The default Docker database/broker lane excludes external-service tests.
+- S3 log tests require versioned object storage as well as PostgreSQL. The local harness uses RustFS. Use `make runtime-log-test-storage-up`, `make test-runtime-log-correctness`, and `make runtime-log-test-storage-down`; read `docs/deployment/runtime-log-verification.md` for ownership, credentials, and cleanup. The default Docker database/broker lane excludes external-service tests.
 - Full validation can be slow: allow at least 40 minutes for `cargo test`, up
   to 2 hours for `make test-integration`, and up to 2 hours for `make e2e-test`.
   Set the command timeout before starting so a passing run is not terminated

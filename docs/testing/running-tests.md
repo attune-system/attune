@@ -76,16 +76,16 @@ The Rust image uses a small runtime stage and stores stripped test executables, 
 
 The Docker lane intentionally uses libtest rather than cargo-nextest. An earlier 0.9.145 prototype matched the then-ignored database-test identities but was 7.2% slower by median test time across three equal 591-test common-crate samples. The stock nextest archive was also larger than the complete runtime image. See [Test concurrency reliability](../plans/test-concurrency-reliability.md#cargo-nextest-scheduler-investigation) for the coverage map and measurements.
 
-The database/broker lane excludes tests that declare additional API, MinIO, installed-CLI, or high-load prerequisites. Those identities remain in the image and in their owning CI/E2E lanes; they are not silently discovered or conditionally skipped. To run them after provisioning every prerequisite:
+The database/broker lane excludes tests that declare additional API, S3, installed-CLI, or high-load prerequisites. Those identities remain in the image and in their owning CI/E2E lanes; they are not silently discovered or conditionally skipped. To run them after provisioning every prerequisite:
 
 ```bash
 ATTUNE_RUST_INCLUDE_EXTERNAL=1 \
   bash scripts/run-rust-integration-tests.sh --no-build
 ```
 
-External mode includes SSE tests requiring a live API, runtime-log/S3 tests requiring the owned MinIO harness and `ATTUNE_TEST_S3_*` credentials, the installed-CLI profile test, and explicit high-concurrency stress tests.
+External mode includes SSE tests requiring a live API, runtime-log/S3 tests requiring the owned RustFS harness and `ATTUNE_TEST_S3_*` credentials, the installed-CLI profile test, and explicit high-concurrency stress tests.
 
-For the versioned MinIO correctness suite, including artifact preview across API replicas, follow [Runtime log verification](../deployment/runtime-log-verification.md#run-the-correctness-suite). Host database setup uses `make db-test-setup` and requires `psql` and `sqlx`. Set both `TEST_DB_ADMIN_URL` and `TEST_DB_URL` to your disposable PostgreSQL cluster. Direct Cargo runs use `ATTUNE__DATABASE__URL` for the test database connection.
+For the versioned S3 correctness suite, including artifact preview across API replicas, follow [Runtime log verification](../deployment/runtime-log-verification.md#run-the-correctness-suite). Host database setup uses `make db-test-setup` and requires `psql` and `sqlx`. Set both `TEST_DB_ADMIN_URL` and `TEST_DB_URL` to your disposable PostgreSQL cluster. Direct Cargo runs use `ATTUNE__DATABASE__URL` for the test database connection.
 
 Docker Desktop must share the checkout path with its VM. If a checkout is on an unshared external mount, bind-mounted migration/pack files may appear empty; add that path to Docker Desktop file sharing before running E2E tests.
 

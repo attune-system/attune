@@ -81,15 +81,15 @@ SSE response.
 
 Provision a disposable PostgreSQL/TimescaleDB cluster with a role that can create databases. Host setup requires `psql` and `sqlx`. Set `TEST_DB_ADMIN_URL` and `TEST_DB_URL` to that cluster, then run `make db-test-setup`.
 
-Choose a unique owner for the run and an available MinIO host port. Keep these exports for setup, tests, and teardown:
+Choose a unique owner for the run and an available S3 host port. Keep these exports for setup, tests, and teardown:
 
 ```bash
 export ATTUNE_TEST_RUN_ID="logs-$(date +%s)"
 export RUNTIME_LOG_HARNESS_OWNER="attune-$ATTUNE_TEST_RUN_ID"
-export RUNTIME_LOG_MINIO_PORT=59000
+export RUNTIME_LOG_S3_PORT=59000
 ```
 
-Start disposable versioned MinIO:
+Start disposable versioned RustFS:
 
 ```bash
 make runtime-log-test-storage-up
@@ -107,14 +107,14 @@ make test-runtime-log-correctness \
 
 `make test-integration-api` includes `runtime_log_replica_tests`. Each API
 replica has its own PostgreSQL pool, S3 client, wakeup registry, and stream
-limiter. The suite checks these behaviors against MinIO:
+limiter. The suite checks these behaviors against RustFS:
 
 - Cross-replica upload, live tailing, and `Last-Event-ID` reconnects.
 - Artifact preview `content`, `append`, and `done` events across API replicas without a local artifact file, using a real identity with scoped artifact-read permission.
 - Concurrent duplicate uploads through separate S3 clients.
 - A delayed successful S3 PUT whose caller receives an injected failure, then
   duplicate retries that recover the object and commit one segment row.
-- MinIO version IDs and exact pinned reads.
+- S3 version IDs and exact pinned reads.
 - The 15-second reconciliation path after one replica misses log and terminal
   notifications.
 - Append-before-seal and seal-before-append orderings through production HTTP
@@ -164,7 +164,7 @@ result and deletes only the namespace it created, including the PVC and pods,
 on success or failure. Do not point it at a production context. Static CI runs
 `make test-runtime-log-rwx-static`; it does not create Kubernetes resources.
 
-Remove disposable MinIO after the run:
+Remove disposable RustFS after the run:
 
 ```bash
 make runtime-log-test-storage-down
@@ -176,15 +176,15 @@ resource with a different ownership label. Teardown removes only resources with
 the expected label.
 
 Both runtime-log test targets delete all object versions under their unique
-`ATTUNE_TEST_S3_PREFIX` when they exit. When tests use persistent external
-MinIO, pass its endpoint and credentials to the Make target. Run the same scoped
+`ATTUNE_TEST_S3_PREFIX` when they exit. When tests use persistent external S3
+storage, pass its endpoint and credentials to the Make target. Run the same scoped
 cleanup explicitly if the test process was interrupted before its exit trap:
 
 ```bash
 make runtime-log-test-storage-clean \
-  ATTUNE_TEST_S3_ENDPOINT=https://minio.test.example \
-  RUNTIME_LOG_MINIO_USER=attune-test \
-  RUNTIME_LOG_MINIO_PASSWORD="$MINIO_TEST_PASSWORD"
+  ATTUNE_TEST_S3_ENDPOINT=https://s3.test.example \
+  RUNTIME_LOG_S3_ACCESS_KEY=attune-test \
+  RUNTIME_LOG_S3_SECRET_KEY="$S3_TEST_SECRET_KEY"
 ```
 
 The cleanup script refuses prefixes outside
@@ -214,7 +214,7 @@ make test-runtime-log-load \
 ```
 
 The test prints one JSON object. Save it with the commit, build profile, host,
-PostgreSQL settings, MinIO version, and stream count. Compare runs only when
+PostgreSQL settings, S3 implementation and version, and stream count. Compare runs only when
 those inputs match.
 
 | Field | Meaning |
@@ -226,13 +226,13 @@ those inputs match.
 | `reconnect_latency_ms_p50`, `reconnect_latency_ms_p95` | Time from reconnect through the final SSE event. |
 | `postgres_statement_calls_delta` | Calls added to `pg_stat_statements` during the concurrent phase. |
 | `postgres_statement_calls_per_second` | Statement-call delta divided by elapsed time. |
-| `s3_puts`, `s3_gets`, `s3_heads` | `BlobStore` operations sent through real MinIO-backed clients. |
+| `s3_puts`, `s3_gets`, `s3_heads` | `BlobStore` operations sent through real S3-backed clients. |
 | `peak_aggregate_pool_connections` | Highest sum of opened connections in both API pools. |
 | `peak_aggregate_active_pool_connections` | Highest sampled sum of non-idle connections in both API pools. |
 | `peak_active_streams` | Highest sampled sum of active SSE readers on both replicas. |
 | `leaked_active_streams` | Readers left after all scenarios finish. This must be zero. |
 
-The S3 counters are Attune `BlobStore` calls, not MinIO's internal HTTP request
+The S3 counters are Attune `BlobStore` calls, not the storage server's internal HTTP request
 count. Multipart implementation details can produce more wire requests. Pool and
 stream peaks use 5 ms sampling, so a shorter spike can fall between samples.
 This is a bounded regression measurement, not a production capacity test.

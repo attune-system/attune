@@ -2081,7 +2081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration test - requires versioned MinIO"]
+    #[ignore = "integration test - requires versioned S3 storage"]
     async fn s3_direct_upload_authorization_puts_and_verifies_exact_bytes() {
         let endpoint = std::env::var("ATTUNE_TEST_S3_ENDPOINT").unwrap();
         let bucket = std::env::var("ATTUNE_TEST_S3_BUCKET").unwrap();
@@ -2093,7 +2093,7 @@ mod tests {
         );
         let store = S3BlobStore::new(&bucket, &region, &prefix, Some(&endpoint), None).unwrap();
         let key = ObjectKey::new("artifact/body").unwrap();
-        let content = Bytes::from_static(b"direct upload through MinIO");
+        let content = Bytes::from_static(b"direct upload through S3");
         let digest = sha256(&content);
         let authorization = store
             .authorize_direct_upload(

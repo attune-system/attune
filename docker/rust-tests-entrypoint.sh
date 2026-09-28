@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  DATABASE_URL         PostgreSQL connection string (required)"
       echo "  TEST_THREADS         Number of parallel test threads (minimum/default: 4)"
-      echo "  ATTUNE_RUST_INCLUDE_EXTERNAL=1  Include tests requiring API, MinIO, CLI, or stress resources"
+      echo "  ATTUNE_RUST_INCLUDE_EXTERNAL=1  Include tests requiring API, S3, CLI, or stress resources"
       exit 0 ;;
     *)
       # Treat as filter if no flag prefix
@@ -222,11 +222,11 @@ else
     test_high_concurrency_stress
     test_extreme_stress_10k_executions
     s3_direct_upload_authorization_puts_and_verifies_exact_bytes
-    log_segment_upload_goes_from_manager_to_minio_without_api_body_relay
-    object_minio_duplicate_ambiguous_and_finalize_orderings
-    object_minio_reader_recovers_missed_notifications_and_terminal
-    object_minio_upload_reconnect_and_pinned_reads
-    ordinary_artifact_upload_goes_from_manager_to_minio_without_api_body_relay
+    log_segment_upload_goes_from_manager_to_s3_without_api_body_relay
+    object_s3_duplicate_ambiguous_and_finalize_orderings
+    object_s3_reader_recovers_missed_notifications_and_terminal
+    object_s3_upload_reconnect_and_pinned_reads
+    ordinary_artifact_upload_goes_from_manager_to_s3_without_api_body_relay
     shared_volume_cross_process_locking_writer_loss_and_retention
   )
   for skipped_test in "${DEFAULT_SKIPS[@]}"; do

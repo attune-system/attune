@@ -73,7 +73,7 @@ grep -Fq 'TEST_THREADS: ${ATTUNE_RUST_TEST_THREADS:-4}' "$ROOT/docker-compose.e2
 grep -Fq 'cargo test --workspace --all-features --no-run' "$ROOT/docker/Dockerfile.rust-tests"
 
 # Infrastructure-only changes must exercise the Rust runner and full-stack lane.
-for path in Makefile scripts/run-ci-rust-tests.sh scripts/runtime-log-minio.sh \
+for path in Makefile scripts/run-ci-rust-tests.sh scripts/runtime-log-s3.sh \
   config.test.yaml docker-compose.yaml docker-compose.e2e.yaml \
   docker/Dockerfile.rust-tests .github/workflows/ci.yml; do
   flags=$(printf '%s\n' "$path" | bash "$ROOT/scripts/ci-changed-paths.sh")
@@ -98,6 +98,9 @@ fi
 cat > "$TMP_ROOT/ci-bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CAPTURE_DIR/docker-args"
+if [[ $* == *list-object-versions* ]]; then
+  printf '%s\n' None
+fi
 EOF
 chmod +x "$TMP_ROOT/ci-bin/docker"
 : > "$TMP_ROOT/cargo-args"
@@ -106,6 +109,7 @@ CAPTURE_DIR="$TMP_ROOT" PATH="$TMP_ROOT/ci-bin:$PATH" \
 [[ $(wc -l < "$TMP_ROOT/cargo-args") -eq 2 ]]
 grep -Fq -- '-p attune-common --lib blob_store::tests::s3_direct_upload_authorization_puts_and_verifies_exact_bytes -- --ignored --exact --test-threads=4' "$TMP_ROOT/cargo-args"
 grep -Fq -- '-p attune-api --test runtime_log_replica_tests -- --ignored --test-threads=4 --skip bounded_runtime_log_load_report --skip volume_transport_child_holds_lock' "$TMP_ROOT/cargo-args"
-grep -Fq -- 'mc rm --recursive --force --versions' "$TMP_ROOT/docker-args"
+grep -Fq -- 's3api list-object-versions' "$TMP_ROOT/docker-args"
+grep -Fq -- 's3api delete-objects' "$ROOT/scripts/runtime-log-s3.sh"
 
 echo "test isolation guard checks passed"

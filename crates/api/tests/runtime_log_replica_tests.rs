@@ -605,9 +605,8 @@ fn metric(metrics: &str, name: &str) -> u64 {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires PostgreSQL and versioned MinIO"]
-async fn ordinary_artifact_upload_goes_from_manager_to_minio_without_api_body_relay() -> Result<()>
-{
+#[ignore = "integration test - requires PostgreSQL and versioned S3 storage"]
+async fn ordinary_artifact_upload_goes_from_manager_to_s3_without_api_body_relay() -> Result<()> {
     let harness = Harness::start(&[false]).await?;
     let artifact_ref = format!("direct_upload_{}", uuid::Uuid::new_v4().simple());
     let artifact = ArtifactRepository::create(
@@ -640,7 +639,7 @@ async fn ordinary_artifact_upload_goes_from_manager_to_minio_without_api_body_re
     .await?;
     let file_path = version.file_path.clone().unwrap();
     let source = harness._root.path().join("direct-artifact.bin");
-    let content = b"manager to MinIO, not through API";
+    let content = b"manager to S3, not through API";
     tokio::fs::write(&source, content).await?;
     let transport = ApiTransport::new(
         &harness.replicas[0].url,
@@ -679,8 +678,8 @@ async fn ordinary_artifact_upload_goes_from_manager_to_minio_without_api_body_re
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires PostgreSQL and versioned MinIO"]
-async fn log_segment_upload_goes_from_manager_to_minio_without_api_body_relay() -> Result<()> {
+#[ignore = "integration test - requires PostgreSQL and versioned S3 storage"]
+async fn log_segment_upload_goes_from_manager_to_s3_without_api_body_relay() -> Result<()> {
     let harness = Harness::start(&[false]).await?;
     let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
     let transport = ApiTransport::new(
@@ -688,7 +687,7 @@ async fn log_segment_upload_goes_from_manager_to_minio_without_api_body_relay() 
         &harness.worker_token,
         harness._root.path().to_str().unwrap(),
     );
-    let content = b"manager to MinIO log segment";
+    let content = b"manager to S3 log segment";
 
     transport
         .commit_log_segment(fixture.version_id, 0, content)
@@ -724,7 +723,7 @@ async fn log_segment_upload_goes_from_manager_to_minio_without_api_body_relay() 
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires PostgreSQL and versioned MinIO"]
+#[ignore = "integration test - requires PostgreSQL and versioned S3 storage"]
 async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
     let harness = Harness::start(&[false, false]).await?;
     let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
@@ -820,8 +819,8 @@ async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires PostgreSQL and versioned MinIO"]
-async fn object_minio_upload_reconnect_and_pinned_reads() -> Result<()> {
+#[ignore = "integration test - requires PostgreSQL and versioned S3 storage"]
+async fn object_s3_upload_reconnect_and_pinned_reads() -> Result<()> {
     let harness = Harness::start(&[true, true]).await?;
     let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
     let client = reqwest::Client::new();
@@ -906,7 +905,7 @@ async fn object_minio_upload_reconnect_and_pinned_reads() -> Result<()> {
         .await?
         .concat();
     assert_eq!(bytes, b"first");
-    let wrong_version = ProviderVersion::from_stored("v:not-the-recorded-minio-version")?;
+    let wrong_version = ProviderVersion::from_stored("v:not-the-recorded-s3-version")?;
     let wrong = harness.replicas[1]
         .state
         .blob_store
@@ -926,8 +925,8 @@ async fn object_minio_upload_reconnect_and_pinned_reads() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires PostgreSQL and versioned MinIO"]
-async fn object_minio_duplicate_ambiguous_and_finalize_orderings() -> Result<()> {
+#[ignore = "integration test - requires PostgreSQL and versioned S3 storage"]
+async fn object_s3_duplicate_ambiguous_and_finalize_orderings() -> Result<()> {
     let harness = Harness::start(&[true, true]).await?;
     let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
     let client = reqwest::Client::new();
@@ -1047,8 +1046,8 @@ async fn object_minio_duplicate_ambiguous_and_finalize_orderings() -> Result<()>
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires PostgreSQL and versioned MinIO; waits for reconciliation"]
-async fn object_minio_reader_recovers_missed_notifications_and_terminal() -> Result<()> {
+#[ignore = "integration test - requires PostgreSQL and versioned S3 storage; waits for reconciliation"]
+async fn object_s3_reader_recovers_missed_notifications_and_terminal() -> Result<()> {
     let harness = Harness::start(&[true, false]).await?;
     let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
     let client = reqwest::Client::new();
@@ -1182,7 +1181,7 @@ fn volume_transport_child_holds_lock() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "integration test - requires PostgreSQL, versioned MinIO, and Unix flock"]
+#[ignore = "integration test - requires PostgreSQL, versioned S3 storage, and Unix flock"]
 async fn shared_volume_cross_process_locking_writer_loss_and_retention() -> Result<()> {
     use attune_common::artifact_transport::{ArtifactFileTransport, VolumeTransport};
 

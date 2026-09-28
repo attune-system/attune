@@ -29,34 +29,34 @@ touch "$MUTATION_LOG" "$KUBECTL_LOG"
 
 if PATH="$root:$PATH" \
     RUNTIME_LOG_HARNESS_OWNER=expected-owner \
-    RUNTIME_LOG_MINIO_CONTAINER=collision \
-    RUNTIME_LOG_MINIO_NETWORK=collision \
-    RUNTIME_LOG_MINIO_IMAGE=minio \
-    RUNTIME_LOG_MC_IMAGE=mc \
-    RUNTIME_LOG_MINIO_PORT=59000 \
-    RUNTIME_LOG_MINIO_USER=user \
-    RUNTIME_LOG_MINIO_PASSWORD=password \
-    RUNTIME_LOG_MINIO_BUCKET=bucket \
+    RUNTIME_LOG_S3_CONTAINER=collision \
+    RUNTIME_LOG_S3_NETWORK=collision \
+    RUNTIME_LOG_S3_IMAGE=s3 \
+    RUNTIME_LOG_AWS_CLI_IMAGE=aws-cli \
+    RUNTIME_LOG_S3_PORT=59000 \
+    RUNTIME_LOG_S3_ACCESS_KEY=user \
+    RUNTIME_LOG_S3_SECRET_KEY=password \
+    RUNTIME_LOG_S3_BUCKET=bucket \
     RUNTIME_LOG_S3_PREFIX=runtime-log-tests/expected-owner \
-    scripts/runtime-log-minio.sh up >/dev/null 2>&1; then
-    printf '%s\n' 'MinIO harness accepted a foreign container collision' >&2
+    scripts/runtime-log-s3.sh up >/dev/null 2>&1; then
+    printf '%s\n' 'S3 harness accepted a foreign container collision' >&2
     exit 1
 fi
 [[ ! -s $MUTATION_LOG ]]
 
 if PATH="$root:$PATH" \
     RUNTIME_LOG_HARNESS_OWNER=expected-owner \
-    RUNTIME_LOG_MINIO_CONTAINER=owned \
-    RUNTIME_LOG_MINIO_NETWORK=owned \
-    RUNTIME_LOG_MINIO_IMAGE=minio \
-    RUNTIME_LOG_MC_IMAGE=mc \
-    RUNTIME_LOG_MINIO_PORT=59000 \
-    RUNTIME_LOG_MINIO_USER=user \
-    RUNTIME_LOG_MINIO_PASSWORD=password \
-    RUNTIME_LOG_MINIO_BUCKET=bucket \
+    RUNTIME_LOG_S3_CONTAINER=owned \
+    RUNTIME_LOG_S3_NETWORK=owned \
+    RUNTIME_LOG_S3_IMAGE=s3 \
+    RUNTIME_LOG_AWS_CLI_IMAGE=aws-cli \
+    RUNTIME_LOG_S3_PORT=59000 \
+    RUNTIME_LOG_S3_ACCESS_KEY=user \
+    RUNTIME_LOG_S3_SECRET_KEY=password \
+    RUNTIME_LOG_S3_BUCKET=bucket \
     RUNTIME_LOG_S3_PREFIX=runtime-log-tests \
-    scripts/runtime-log-minio.sh clean-prefix >/dev/null 2>&1; then
-    printf '%s\n' 'MinIO harness accepted an unscoped cleanup prefix' >&2
+    scripts/runtime-log-s3.sh clean-prefix >/dev/null 2>&1; then
+    printf '%s\n' 'S3 harness accepted an unscoped cleanup prefix' >&2
     exit 1
 fi
 [[ ! -s $MUTATION_LOG ]]

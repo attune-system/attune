@@ -21,33 +21,33 @@ TEST_DB_ADMIN_URL ?= postgresql://attune:attune@localhost:5432/postgres
 TEST_DB_URL ?= postgresql://attune:attune@localhost:5432/attune_test
 TEST_THREADS ?= 4
 DB_TEST_THREADS ?= $(TEST_THREADS)
-RUNTIME_LOG_MINIO_IMAGE ?= quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
-RUNTIME_LOG_MC_IMAGE ?= quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+RUNTIME_LOG_S3_IMAGE ?= docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+RUNTIME_LOG_AWS_CLI_IMAGE ?= docker.io/amazon/aws-cli:2.31.26@sha256:cf1851fa3162c35009b2dc6d2df2797e5b0e9723fe546f545c9fa34a3dc03477
 RUNTIME_LOG_HARNESS_ID ?= $(shell printf '%s' '$(CURDIR)-$(shell id -u)' | sha256sum | cut -c1-12)
 RUNTIME_LOG_HARNESS_OWNER ?= attune-runtime-log-$(shell id -u)-$(RUNTIME_LOG_HARNESS_ID)
-RUNTIME_LOG_MINIO_CONTAINER ?= $(RUNTIME_LOG_HARNESS_OWNER)-minio
-RUNTIME_LOG_MINIO_NETWORK ?= $(RUNTIME_LOG_HARNESS_OWNER)
-RUNTIME_LOG_MINIO_PORT ?= 59000
-RUNTIME_LOG_MINIO_USER ?= attune-minio
-RUNTIME_LOG_MINIO_PASSWORD ?= attune-minio-secret
-RUNTIME_LOG_MINIO_BUCKET ?= attune-runtime-log-tests
+RUNTIME_LOG_S3_CONTAINER ?= $(RUNTIME_LOG_HARNESS_OWNER)-s3
+RUNTIME_LOG_S3_NETWORK ?= $(RUNTIME_LOG_HARNESS_OWNER)
+RUNTIME_LOG_S3_PORT ?= 59000
+RUNTIME_LOG_S3_ACCESS_KEY ?= attune-s3
+RUNTIME_LOG_S3_SECRET_KEY ?= attune-s3-secret
+RUNTIME_LOG_S3_BUCKET ?= attune-runtime-log-tests
 RUNTIME_LOG_S3_PREFIX ?= runtime-log-tests/$(RUNTIME_LOG_HARNESS_OWNER)
-ATTUNE_TEST_S3_ENDPOINT ?= http://127.0.0.1:$(RUNTIME_LOG_MINIO_PORT)
+ATTUNE_TEST_S3_ENDPOINT ?= http://127.0.0.1:$(RUNTIME_LOG_S3_PORT)
 ATTUNE_LOG_LOAD_STREAMS ?= 20
-RUNTIME_LOG_MINIO_ENV = RUNTIME_LOG_HARNESS_OWNER=$(RUNTIME_LOG_HARNESS_OWNER) \
-	RUNTIME_LOG_MINIO_CONTAINER=$(RUNTIME_LOG_MINIO_CONTAINER) \
-	RUNTIME_LOG_MINIO_NETWORK=$(RUNTIME_LOG_MINIO_NETWORK) \
-	RUNTIME_LOG_MINIO_IMAGE=$(RUNTIME_LOG_MINIO_IMAGE) RUNTIME_LOG_MC_IMAGE=$(RUNTIME_LOG_MC_IMAGE) \
-	RUNTIME_LOG_MINIO_PORT=$(RUNTIME_LOG_MINIO_PORT) RUNTIME_LOG_MINIO_USER=$(RUNTIME_LOG_MINIO_USER) \
-	RUNTIME_LOG_MINIO_PASSWORD=$(RUNTIME_LOG_MINIO_PASSWORD) \
-	RUNTIME_LOG_MINIO_BUCKET=$(RUNTIME_LOG_MINIO_BUCKET) RUNTIME_LOG_S3_PREFIX=$(RUNTIME_LOG_S3_PREFIX) \
+RUNTIME_LOG_S3_ENV = RUNTIME_LOG_HARNESS_OWNER=$(RUNTIME_LOG_HARNESS_OWNER) \
+	RUNTIME_LOG_S3_CONTAINER=$(RUNTIME_LOG_S3_CONTAINER) \
+	RUNTIME_LOG_S3_NETWORK=$(RUNTIME_LOG_S3_NETWORK) \
+	RUNTIME_LOG_S3_IMAGE=$(RUNTIME_LOG_S3_IMAGE) RUNTIME_LOG_AWS_CLI_IMAGE=$(RUNTIME_LOG_AWS_CLI_IMAGE) \
+	RUNTIME_LOG_S3_PORT=$(RUNTIME_LOG_S3_PORT) RUNTIME_LOG_S3_ACCESS_KEY=$(RUNTIME_LOG_S3_ACCESS_KEY) \
+	RUNTIME_LOG_S3_SECRET_KEY=$(RUNTIME_LOG_S3_SECRET_KEY) \
+	RUNTIME_LOG_S3_BUCKET=$(RUNTIME_LOG_S3_BUCKET) RUNTIME_LOG_S3_PREFIX=$(RUNTIME_LOG_S3_PREFIX) \
 	ATTUNE_TEST_S3_ENDPOINT=$(ATTUNE_TEST_S3_ENDPOINT)
 RUNTIME_LOG_TEST_ENV = ATTUNE__DATABASE__URL=$(TEST_DB_URL) \
 	ATTUNE_TEST_S3_ENDPOINT=$(ATTUNE_TEST_S3_ENDPOINT) \
-	ATTUNE_TEST_S3_BUCKET=$(RUNTIME_LOG_MINIO_BUCKET) \
+	ATTUNE_TEST_S3_BUCKET=$(RUNTIME_LOG_S3_BUCKET) \
 	ATTUNE_TEST_S3_PREFIX=$(RUNTIME_LOG_S3_PREFIX) \
-	AWS_ACCESS_KEY_ID=$(RUNTIME_LOG_MINIO_USER) \
-	AWS_SECRET_ACCESS_KEY=$(RUNTIME_LOG_MINIO_PASSWORD) AWS_REGION=us-east-1
+	AWS_ACCESS_KEY_ID=$(RUNTIME_LOG_S3_ACCESS_KEY) \
+	AWS_SECRET_ACCESS_KEY=$(RUNTIME_LOG_S3_SECRET_KEY) AWS_REGION=us-east-1
 
 # Default target
 help:
@@ -65,7 +65,7 @@ help:
 	@echo "  make test-api       - Run tests for API service"
 	@echo "  make test-integration     - Run integration tests"
 	@echo "  make test-integration-api - Run API integration tests (requires DB)"
-	@echo "  make runtime-log-test-storage-up - Start disposable versioned MinIO"
+	@echo "  make runtime-log-test-storage-up - Start disposable versioned S3 storage"
 	@echo "  make runtime-log-test-storage-clean - Remove this harness's MinIO prefix"
 	@echo "  make runtime-log-test-storage-down - Remove disposable MinIO"
 	@echo "  make test-runtime-log-correctness - Run cross-replica runtime-log checks"
@@ -203,16 +203,16 @@ test-integration-api:
 	@echo "API integration tests complete"
 
 runtime-log-test-storage-up:
-	@$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh up
+	@$(RUNTIME_LOG_S3_ENV) scripts/runtime-log-s3.sh up
 
 runtime-log-test-storage-clean:
-	@$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh clean-prefix
+	@$(RUNTIME_LOG_S3_ENV) scripts/runtime-log-s3.sh clean-prefix
 
 runtime-log-test-storage-down:
-	@$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh down
+	@$(RUNTIME_LOG_S3_ENV) scripts/runtime-log-s3.sh down
 
 test-runtime-log-correctness:
-	@set -eu; trap '$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh clean-prefix' EXIT; \
+	@set -eu; trap '$(RUNTIME_LOG_S3_ENV) scripts/runtime-log-s3.sh clean-prefix' EXIT; \
 		$(RUNTIME_LOG_TEST_ENV) cargo test -p attune-common --lib \
 			blob_store::tests::s3_direct_upload_authorization_puts_and_verifies_exact_bytes \
 			-- --ignored --exact --test-threads=$(DB_TEST_THREADS); \
@@ -221,7 +221,7 @@ test-runtime-log-correctness:
 			--skip bounded_runtime_log_load_report --skip volume_transport_child_holds_lock
 
 test-runtime-log-load:
-	@set -eu; trap '$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh clean-prefix' EXIT; \
+	@set -eu; trap '$(RUNTIME_LOG_S3_ENV) scripts/runtime-log-s3.sh clean-prefix' EXIT; \
 		$(RUNTIME_LOG_TEST_ENV) ATTUNE_RUN_LOG_STREAM_LOAD=1 \
 			ATTUNE_LOG_LOAD_STREAMS=$(ATTUNE_LOG_LOAD_STREAMS) \
 			cargo test -p attune-api --test runtime_log_replica_tests \
@@ -234,7 +234,7 @@ test-runtime-log-rwx-static:
 	$(MAKE) test-runtime-log-harness-safety
 
 test-runtime-log-harness-safety:
-	bash -n scripts/runtime-log-minio.sh scripts/test-runtime-log-harness-safety.sh
+	bash -n scripts/runtime-log-s3.sh scripts/test-runtime-log-harness-safety.sh
 	scripts/test-runtime-log-harness-safety.sh
 
 test-integration-supervisor:
@@ -591,8 +591,8 @@ deny:
 ci-rust: db-test-setup
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
-	@set -eu; $(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh up; \
-		trap '$(RUNTIME_LOG_MINIO_ENV) scripts/runtime-log-minio.sh down' EXIT; \
+	@set -eu; $(RUNTIME_LOG_S3_ENV) scripts/runtime-log-s3.sh up; \
+		trap '$(RUNTIME_LOG_S3_ENV) scripts/runtime-log-s3.sh down' EXIT; \
 		DATABASE_URL=$(TEST_DB_URL) ATTUNE__DATABASE__URL=$(TEST_DB_URL) \
 			ATTUNE_RUST_TEST_THREADS=$(DB_TEST_THREADS) scripts/run-ci-rust-tests.sh
 	$(MAKE) deny

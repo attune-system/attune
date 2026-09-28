@@ -295,7 +295,7 @@ jobs:
           docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;"
           cargo run -p attune-api --bin attune-api -- --config config.test.yaml --migrate
 
-      - name: Start versioned MinIO for runtime-log tests
+      - name: Start versioned S3 storage for runtime-log tests
         run: make runtime-log-test-storage-up
 
       - name: Validate runtime-log storage harnesses
@@ -314,8 +314,8 @@ jobs:
           ATTUNE_TEST_S3_ENDPOINT: http://127.0.0.1:59000
           ATTUNE_TEST_S3_BUCKET: attune-runtime-log-tests
           ATTUNE_TEST_S3_PREFIX: runtime-log-tests/attune-runtime-log-ci-${{ github.run_id }}-${{ github.run_attempt }}
-          AWS_ACCESS_KEY_ID: attune-minio
-          AWS_SECRET_ACCESS_KEY: attune-minio-secret
+          AWS_ACCESS_KEY_ID: attune-s3
+          AWS_SECRET_ACCESS_KEY: attune-s3-secret
           AWS_REGION: us-east-1
         run: scripts/run-ci-rust-tests.sh
 
@@ -324,7 +324,7 @@ jobs:
           cargo test -p attune-executor --lib service::tests::test_service_creation
           -- --ignored --exact --nocapture --test-threads=4
 
-      - name: MinIO storage correctness tests
+      - name: S3 storage correctness tests
         run: make test-runtime-log-correctness
 
       - name: Stop runtime-log test storage
@@ -332,7 +332,7 @@ jobs:
         run: make runtime-log-test-storage-down
 
       - name: Report and clean temporary test database objects
-        if: always()
+        if: always() && steps.test-db-baseline.outcome == 'success'
         env:
           POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
           POSTGRES_DB: attune_test
