@@ -110,16 +110,24 @@ export ATTUNE__SECURITY__ENCRYPTION_KEY=$(openssl rand -base64 32)
 export ATTUNE__LOG__LEVEL=debug
 export ATTUNE__LOG__FORMAT=pretty
 # Opt in only when cluster log access and retention are suitable for runtime output.
-export ATTUNE__LOG__MIRROR_RUNTIME_LOGS_TO_STDIO=true
+export ATTUNE__LOG__MIRROR_RUNTIME_STDOUT_TO_STDIO=true
+export ATTUNE__LOG__MIRROR_RUNTIME_STDERR_TO_STDIO=true
 ```
 
 `config.docker.yaml` and other distributable Docker configs intentionally use
 `log.format: json` for structured container stdout. `config.development.yaml`
 uses `pretty` for local readability. The `log.console` and `log.file` fields
 are currently placeholders only; services log to stdout today.
-`log.mirror_runtime_logs_to_stdio` is disabled by default. When enabled, worker
-and sensor services add structured runtime output to their container streams
-without replacing Attune's private runtime-log artifacts.
+`log.mirror_runtime_stdout_to_stdio` and `log.mirror_runtime_stderr_to_stdio`
+are disabled by default. Enable either stream independently to add structured
+runtime output to worker and sensor container logs without replacing Attune's
+private runtime-log artifacts. Action output schemas with `secret: true` delay
+both enabled action streams until capture and masking complete. Parsed JSON,
+YAML, and JSONL results are structurally redacted and reserialized. Non-empty
+stderr and JSON final-line prefixes are mirrored only as `[REDACTED]`; their
+free-form content is never preserved. If the worker cannot parse or safely mask
+the result, it mirrors neither action stream. Private runtime-log artifacts keep
+the raw output.
 
 **Syntax:** `ATTUNE__<section>__<key>=value`
 - Use double underscores (`__`) to separate nested keys

@@ -121,6 +121,7 @@ fn make_context(action_ref: &str, entry_point: &str, runtime_name: &str) -> Exec
         parameter_delivery: ParameterDelivery::default(),
         parameter_format: ParameterFormat::default(),
         output_format: OutputFormat::default(),
+        out_schema: None,
         cancel_token: None,
     }
 }

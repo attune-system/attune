@@ -55,6 +55,8 @@ log:
   level: info
   format: json # Structured JSON on stdout for container environments
   console: true # Reserved/no-op today; services currently always log to stdout
+  mirror_runtime_stdout_to_stdio: false
+  mirror_runtime_stderr_to_stdio: false
 
 # Security settings
 # jwt_secret and encryption_key are intentional placeholders — they MUST be

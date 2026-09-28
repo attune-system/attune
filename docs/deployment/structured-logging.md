@@ -19,10 +19,11 @@ Rules:
    private source-of-truth artifacts with `classification=runtime_log`.
 3. Forwarders such as an OpenTelemetry Collector, Datadog, or Splunk should
    ingest service logs from the container stream.
-4. Deployments may set `log.mirror_runtime_logs_to_stdio: true` to add structured
-   copies of action and managed sensor output to worker and sensor container
-   streams. This broadens access to private runtime content and is disabled by
-   default.
+4. Deployments may independently set `log.mirror_runtime_stdout_to_stdio: true`
+   or `log.mirror_runtime_stderr_to_stdio: true` to add structured copies of
+   action and managed sensor output to matching worker and sensor container
+   streams. This broadens access to private runtime content. Both settings are
+   disabled by default.
 
 ## Optional runtime-log mirror
 
@@ -72,6 +73,23 @@ instance UUID distinguishes process or pod restarts that reuse that name.
 
 The artifact stream remains authoritative and preserves source bytes up to its
 configured retention and size limits.
+Actions whose output schema declares no secret paths are mirrored live. If an
+action declares a secret output path, the worker waits for both bounded streams
+to finish. It parses JSON, YAML, or JSONL stdout, structurally redacts the
+schema-declared paths, and serializes the parsed value again. For JSON actions
+that use a final result line, any non-empty stdout prefix becomes one
+`[REDACTED]` marker. Any non-empty enabled stderr stream also becomes one
+`[REDACTED]` marker. A final newline may be retained, but no diagnostic content
+is preserved, even when it does not contain a known secret spelling. Empty
+diagnostics remain empty.
+
+The worker suppresses both enabled action streams when output is text, parsing
+fails, a declared secret field is unavailable, capture is truncated or
+incomplete, or execution times out or is cancelled. It emits a metadata-only
+warning in that case. Private runtime-log artifacts keep the raw captured bytes
+and remain authoritative. These delay and fail-closed rules apply only to action
+output; managed sensor mirroring keeps its live behavior.
+
 Mirroring is best-effort and has no replay or delivery guarantee. Cluster log
 retention, deletion, and authorization apply independently to mirrored copies.
 Treat the feature as a deliberate security decision because actions and sensors
@@ -295,7 +313,8 @@ inspection, but they are **not** the forwarding contract for operators.
       metadata.
 - [ ] Only low-cardinality fields are promoted to always-on tags/facets by
       default.
-- [ ] Raw action/sensor stdout/stderr appears only when
-      `log.mirror_runtime_logs_to_stdio` is deliberately enabled.
+- [ ] Raw action/sensor stdout appears only when
+      `log.mirror_runtime_stdout_to_stdio` is deliberately enabled, and stderr
+      appears only when `log.mirror_runtime_stderr_to_stdio` is enabled.
 - [ ] Runtime log artifacts remain private and are discoverable as
       `classification=runtime_log` through Attune APIs/UI.

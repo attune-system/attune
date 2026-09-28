@@ -166,23 +166,25 @@ log:
   # Reserved for a future file sink; not currently implemented
   # file: /var/log/attune/attune.log
 
-  # Optional structured copies of action and managed sensor output for
-  # container log collectors. Disabled because runtime output may be sensitive.
-  mirror_runtime_logs_to_stdio: false
+  # Optional structured copies of action and managed sensor output for container
+  # log collectors. Each stream is disabled because runtime output may be sensitive.
+  mirror_runtime_stdout_to_stdio: false
+  mirror_runtime_stderr_to_stdio: false
 ```
 
 **Environment variable override:**
 ```bash
 export ATTUNE__LOG__LEVEL=debug
 export ATTUNE__LOG__FORMAT=pretty
-export ATTUNE__LOG__MIRROR_RUNTIME_LOGS_TO_STDIO=true
+export ATTUNE__LOG__MIRROR_RUNTIME_STDOUT_TO_STDIO=true
+export ATTUNE__LOG__MIRROR_RUNTIME_STDERR_TO_STDIO=true
 ```
 
 Current runtime behavior:
 - Docker/distributable configs intentionally default to `format: json`
 - `config.development.yaml` intentionally uses `format: pretty`
 - `log.console` and `log.file` are retained in schema/config examples, but do not currently switch sinks; services log to stdout today
-- `log.mirror_runtime_logs_to_stdio` emits NDJSON envelopes for runtime log lines from worker and sensor services. Lines over 128 KiB use multiple bounded records. The mirror does not replace private artifact-backed logs.
+- `log.mirror_runtime_stdout_to_stdio` and `log.mirror_runtime_stderr_to_stdio` independently emit NDJSON envelopes for matching runtime log lines from worker and sensor services. Lines over 128 KiB use multiple bounded records. Actions with schema-declared secret outputs are delayed until structured stdout can be parsed, redacted, and reserialized. Any non-empty stderr or JSON final-line prefix is replaced wholesale with `[REDACTED]`; no free-form diagnostic content is retained. Unsafe or incomplete captures are not mirrored. The mirror does not replace raw private artifact-backed logs, which remain authoritative.
 
 ### Redis Configuration (Optional)
 

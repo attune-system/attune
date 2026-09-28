@@ -744,6 +744,8 @@ pub async fn update_pack(
     Path(pack_ref): Path<String>,
     Json(request): Json<UpdatePackRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_pack_configure_token(&user.claims.token_type)?;
+
     // Validate request
     request.validate()?;
 
@@ -752,29 +754,27 @@ pub async fn update_pack(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user).await?;
-        if !pack_action_allowed(&grants, Action::Configure, identity_id, &existing_pack) {
-            return Err(ApiError::Forbidden(
-                "Not authorized to configure pack".to_string(),
-            ));
-        }
-        if existing_pack.installed_by == Some(identity_id) || existing_pack.installed_by.is_none() {
-            authz
-                .authorize(
-                    &user,
-                    AuthorizationCheck {
-                        resource: Resource::Packs,
-                        action: Action::Configure,
-                        context: pack_authorization_context(identity_id, &existing_pack),
-                    },
-                )
-                .await?;
-        }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let grants = authz.effective_grants(&user).await?;
+    if !pack_action_allowed(&grants, Action::Configure, identity_id, &existing_pack) {
+        return Err(ApiError::Forbidden(
+            "Not authorized to configure pack".to_string(),
+        ));
+    }
+    if existing_pack.installed_by == Some(identity_id) || existing_pack.installed_by.is_none() {
+        authz
+            .authorize(
+                &user,
+                AuthorizationCheck {
+                    resource: Resource::Packs,
+                    action: Action::Configure,
+                    context: pack_authorization_context(identity_id, &existing_pack),
+                },
+            )
+            .await?;
     }
 
     let authorized_pack_id = existing_pack.id;
@@ -2631,6 +2631,18 @@ fn require_pack_access_token(token_type: &crate::auth::jwt::TokenType) -> ApiRes
     if token_type != &crate::auth::jwt::TokenType::Access {
         return Err(ApiError::Forbidden(
             "This pack operation requires an access token".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_pack_configure_token(token_type: &crate::auth::jwt::TokenType) -> ApiResult<()> {
+    if !matches!(
+        token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This pack operation requires an access or execution token".to_string(),
         ));
     }
     Ok(())
@@ -5251,7 +5263,7 @@ fn pack_authorization_context(identity_id: i64, pack: &Pack) -> AuthorizationCon
 }
 
 fn pack_action_allowed(grants: &[Grant], action: Action, identity_id: i64, pack: &Pack) -> bool {
-    if pack.is_standard {
+    if pack.is_standard && action == Action::Read {
         return true;
     }
 
@@ -5438,6 +5450,17 @@ mod tests {
         assert!(require_pack_read_token(&TokenType::Execution).is_ok());
         for token_type in [TokenType::Sensor, TokenType::Worker, TokenType::Refresh] {
             assert!(require_pack_read_token(&token_type).is_err());
+        }
+    }
+
+    #[test]
+    fn pack_configuration_only_allows_rbac_capable_tokens() {
+        use crate::auth::jwt::TokenType;
+
+        assert!(require_pack_configure_token(&TokenType::Access).is_ok());
+        assert!(require_pack_configure_token(&TokenType::Execution).is_ok());
+        for token_type in [TokenType::Sensor, TokenType::Worker, TokenType::Refresh] {
+            assert!(require_pack_configure_token(&token_type).is_err());
         }
     }
 

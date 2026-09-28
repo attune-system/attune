@@ -13,10 +13,14 @@
 //! 2. After a 10-second grace period, SIGKILL is sent as a last resort
 
 use super::{
+    action_output_mirror::{
+        action_output_requires_delayed_mirror, safe_action_output_mirror,
+        ActionOutputMirrorDecision, ActionOutputMirrorInput,
+    },
     parameter_passing, BoundedLogFileWriter, BoundedLogWriter, ExecutionResult, OutputFormat,
     RuntimeError, RuntimeResult,
 };
-use attune_common::runtime_log_mirror::{RuntimeLogMirror, RuntimeLogStream};
+use attune_common::runtime_log_mirror::{RuntimeLogMirror, RuntimeLogSource, RuntimeLogStream};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -35,6 +39,7 @@ struct CapturedOutput {
     writer: BoundedLogWriter,
     logs_incomplete: bool,
     seal_error: Option<attune_common::Error>,
+    mirror_source: Option<RuntimeLogSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -95,16 +100,21 @@ async fn capture_output<R>(
     mut file: Option<BoundedLogFileWriter>,
     cancel: CancellationToken,
     stream: RuntimeLogStream,
+    live_mirror: bool,
 ) -> CapturedOutput
 where
     R: AsyncBufRead + Unpin,
 {
     let mut buffer = vec![0_u8; 64 * 1024];
-    let mut mirror = file.as_ref().and_then(|log| {
-        log.mirror_source()
-            .cloned()
-            .map(|source| RuntimeLogMirror::new(source, stream, Some(log.max_bytes() as u64)))
-    });
+    let mirror_source = file.as_ref().and_then(|log| log.mirror_source().cloned());
+    let mut mirror = live_mirror
+        .then(|| ())
+        .and_then(|()| file.as_ref())
+        .and_then(|log| {
+            log.mirror_source()
+                .cloned()
+                .map(|source| RuntimeLogMirror::new(source, stream, Some(log.max_bytes() as u64)))
+        });
     let mut logs_incomplete = false;
     loop {
         let read = tokio::select! {
@@ -177,6 +187,7 @@ where
         writer,
         logs_incomplete,
         seal_error,
+        mirror_source,
     }
 }
 
@@ -302,6 +313,7 @@ pub async fn execute_streaming(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -335,6 +347,7 @@ pub async fn execute_streaming_cancellable(
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
     output_format: OutputFormat,
+    out_schema: Option<&serde_json::Value>,
     cancel_token: Option<CancellationToken>,
     _stdout_log_path: Option<&Path>,
     _stderr_log_path: Option<&Path>,
@@ -342,6 +355,7 @@ pub async fn execute_streaming_cancellable(
     stderr_log_writer: Option<BoundedLogFileWriter>,
 ) -> RuntimeResult<ExecutionResult> {
     let start = Instant::now();
+    let delay_action_mirror = action_output_requires_delayed_mirror(out_schema);
     let execution_deadline = timeout_secs
         .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)));
     let log_finalization_timeout_ms = stdout_log_writer
@@ -410,6 +424,7 @@ pub async fn execute_streaming_cancellable(
         stdout_log_writer,
         stdout_cancel,
         RuntimeLogStream::Stdout,
+        !delay_action_mirror,
     ));
     let stderr_task = tokio::spawn(capture_output(
         stderr_reader,
@@ -417,6 +432,7 @@ pub async fn execute_streaming_cancellable(
         stderr_log_writer,
         stderr_cancel,
         RuntimeLogStream::Stderr,
+        !delay_action_mirror,
     ));
 
     // Stdin delivery is part of the action's execution budget. Output capture
@@ -557,6 +573,38 @@ pub async fn execute_streaming_cancellable(
     let stdout_result = stdout_output.writer.into_result();
     let stderr_result = stderr_output.writer.into_result();
 
+    if delay_action_mirror {
+        match safe_action_output_mirror(ActionOutputMirrorInput {
+            stdout: &stdout_result.content,
+            stderr: &stderr_result.content,
+            output_format,
+            out_schema,
+            stdout_truncated: stdout_result.truncated,
+            stderr_truncated: stderr_result.truncated,
+            logs_incomplete,
+            mirror_stdout: stdout_output.mirror_source.is_some(),
+            mirror_stderr: stderr_output.mirror_source.is_some(),
+        }) {
+            ActionOutputMirrorDecision::Delayed(content) => {
+                if let (Some(source), Some(stdout)) =
+                    (stdout_output.mirror_source, content.stdout)
+                {
+                    mirror_delayed_action_output(source, RuntimeLogStream::Stdout, &stdout);
+                }
+                if let (Some(source), Some(stderr)) =
+                    (stderr_output.mirror_source, content.stderr)
+                {
+                    mirror_delayed_action_output(source, RuntimeLogStream::Stderr, &stderr);
+                }
+            }
+            ActionOutputMirrorDecision::Suppressed(reason) => warn!(
+                reason = reason.as_str(),
+                "Suppressed action runtime log mirroring because secret output could not be masked safely"
+            ),
+            ActionOutputMirrorDecision::Live => {}
+        }
+    }
+
     // Handle process wait result
     let (exit_code, process_error) = match wait_result {
         Ok(status) => (status.code().unwrap_or(-1), None),
@@ -674,6 +722,16 @@ pub async fn execute_streaming_cancellable(
         timed_out: false,
         logs_incomplete,
     })
+}
+
+fn mirror_delayed_action_output(source: RuntimeLogSource, stream: RuntimeLogStream, content: &str) {
+    let mut mirror = RuntimeLogMirror::new(source, stream, None);
+    if let Err(error) = mirror
+        .push(content.as_bytes())
+        .and_then(|()| mirror.finish())
+    {
+        warn!(%error, stream = stream.as_str(), "Failed to mirror masked action runtime log output");
+    }
 }
 
 /// Parse stdout content according to the specified output format.
@@ -1184,6 +1242,7 @@ mod tests {
             1024 * 1024,
             1024 * 1024,
             OutputFormat::Text,
+            None,
             Some(cancel_token),
             None,
             None,
@@ -1296,6 +1355,7 @@ mod tests {
             1024,
             1024,
             OutputFormat::Text,
+            None,
             Some(cancel_token),
             None,
             None,
@@ -1353,6 +1413,7 @@ mod tests {
             1024,
             1024,
             OutputFormat::Text,
+            None,
             Some(cancel_token),
             None,
             None,
@@ -1405,6 +1466,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(stdout_writer),
             None,
         )
@@ -1432,6 +1494,7 @@ mod tests {
             1024,
             1024,
             OutputFormat::Text,
+            None,
             None,
             None,
             None,

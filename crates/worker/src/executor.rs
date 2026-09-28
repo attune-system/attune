@@ -68,7 +68,8 @@ pub struct ActionExecutor {
     secret_manager: SecretManager,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
-    mirror_runtime_logs_to_stdio: bool,
+    mirror_runtime_stdout_to_stdio: bool,
+    mirror_runtime_stderr_to_stdio: bool,
     worker_id: AtomicI64,
     worker_name: String,
     worker_instance: uuid::Uuid,
@@ -274,7 +275,8 @@ impl ActionExecutor {
         secret_manager: SecretManager,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
-        mirror_runtime_logs_to_stdio: bool,
+        mirror_runtime_stdout_to_stdio: bool,
+        mirror_runtime_stderr_to_stdio: bool,
         worker_name: String,
         worker_instance: uuid::Uuid,
         log_segment_config: attune_common::log_stream::SegmentedLogConfig,
@@ -295,7 +297,8 @@ impl ActionExecutor {
             secret_manager,
             max_stdout_bytes,
             max_stderr_bytes,
-            mirror_runtime_logs_to_stdio,
+            mirror_runtime_stdout_to_stdio,
+            mirror_runtime_stderr_to_stdio,
             worker_id: AtomicI64::new(0),
             worker_name,
             worker_instance,
@@ -1072,6 +1075,7 @@ impl ActionExecutor {
             parameter_delivery: action.parameter_delivery,
             parameter_format: action.parameter_format,
             output_format: action.output_format,
+            out_schema: action.out_schema.clone(),
             cancel_token: None,
         };
 
@@ -1375,18 +1379,21 @@ impl ActionExecutor {
         execution: &Execution,
         action: &Action,
     ) -> Result<ExecutionLogArtifacts> {
-        let mirror_source = self.mirror_runtime_logs_to_stdio.then(|| {
-            attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
-                execution_id: execution.id,
-                parent_execution_id: execution.parent,
-                action_ref: execution.action_ref.clone(),
-                pack_ref: action.pack_ref.clone(),
-                trace_tag: execution.trace_tag.clone(),
-                worker_id: self.worker_id.load(Ordering::Acquire),
-                worker_name: self.worker_name.clone(),
-                worker_instance: self.worker_instance,
-            }
-        });
+        let (stdout_mirror_source, stderr_mirror_source) =
+            attune_common::runtime_log_mirror::select_mirror_sources(
+                attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
+                    execution_id: execution.id,
+                    parent_execution_id: execution.parent,
+                    action_ref: execution.action_ref.clone(),
+                    pack_ref: action.pack_ref.clone(),
+                    trace_tag: execution.trace_tag.clone(),
+                    worker_id: self.worker_id.load(Ordering::Acquire),
+                    worker_name: self.worker_name.clone(),
+                    worker_instance: self.worker_instance,
+                },
+                self.mirror_runtime_stdout_to_stdio,
+                self.mirror_runtime_stderr_to_stdio,
+            );
         let retention = self.effective_action_log_retention(action);
         let backend = if self.transport.transport_mode() == "volume" {
             LogStreamBackend::SharedFile
@@ -1443,7 +1450,7 @@ impl ActionExecutor {
                     true,
                     self.log_segment_config.finalization_timeout_ms,
                 )
-                .with_mirror_source(mirror_source.clone()),
+                .with_mirror_source(stdout_mirror_source),
                 stderr_writer: BoundedLogFileWriter::from_shared_file_writer(
                     attune_common::log_stream::SharedFileLogWriter::new(
                         self.transport.clone(),
@@ -1454,7 +1461,7 @@ impl ActionExecutor {
                     false,
                     self.log_segment_config.finalization_timeout_ms,
                 )
-                .with_mirror_source(mirror_source),
+                .with_mirror_source(stderr_mirror_source),
             })
         } else {
             let stdout_writer = attune_common::log_stream::SegmentedLogWriter::new(
@@ -1473,13 +1480,13 @@ impl ActionExecutor {
                     self.max_stdout_bytes,
                     true,
                 )
-                .with_mirror_source(mirror_source.clone()),
+                .with_mirror_source(stdout_mirror_source),
                 stderr_writer: BoundedLogFileWriter::from_segmented_writer(
                     stderr_writer,
                     self.max_stderr_bytes,
                     false,
                 )
-                .with_mirror_source(mirror_source),
+                .with_mirror_source(stderr_mirror_source),
             })
         }
     }
@@ -2207,6 +2214,7 @@ mod tests {
             SecretManager::new(database.pool().clone(), None).expect("secret manager"),
             1024,
             1024,
+            false,
             false,
             "test-worker".to_string(),
             uuid::Uuid::nil(),

@@ -54,6 +54,17 @@ pub enum RuntimeLogSource {
     },
 }
 
+/// Select a live mirror source independently for stdout and stderr.
+pub fn select_mirror_sources(
+    source: RuntimeLogSource,
+    mirror_stdout: bool,
+    mirror_stderr: bool,
+) -> (Option<RuntimeLogSource>, Option<RuntimeLogSource>) {
+    let stdout_source = mirror_stdout.then(|| source.clone());
+    let stderr_source = mirror_stderr.then_some(source);
+    (stdout_source, stderr_source)
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeLogBodyType {
@@ -337,6 +348,15 @@ mod tests {
 
     fn encoded(bytes: &[u8]) -> Value {
         encoded_for_source(&source(), bytes)
+    }
+
+    #[test]
+    fn selects_runtime_log_mirror_sources_per_stream() {
+        for (stdout, stderr) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (stdout_source, stderr_source) = select_mirror_sources(source(), stdout, stderr);
+            assert_eq!(stdout_source.is_some(), stdout);
+            assert_eq!(stderr_source.is_some(), stderr);
+        }
     }
 
     fn encoded_for_source(source: &RuntimeLogSource, bytes: &[u8]) -> Value {

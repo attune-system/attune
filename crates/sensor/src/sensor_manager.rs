@@ -582,7 +582,8 @@ pub struct SensorManagerConfig {
     pub pack_transport: Arc<dyn PackFileTransport>,
     pub artifact_transport: Arc<dyn ArtifactFileTransport>,
     pub sensor_log_config: crate::sensor_log::SensorLogConfig,
-    pub mirror_runtime_logs_to_stdio: bool,
+    pub mirror_runtime_stdout_to_stdio: bool,
+    pub mirror_runtime_stderr_to_stdio: bool,
     pub worker_name: String,
 }
 
@@ -649,7 +650,8 @@ struct SensorManagerInner {
     pack_sync_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     artifact_transport: Arc<dyn ArtifactFileTransport>,
     sensor_log_config: crate::sensor_log::SensorLogConfig,
-    mirror_runtime_logs_to_stdio: bool,
+    mirror_runtime_stdout_to_stdio: bool,
+    mirror_runtime_stderr_to_stdio: bool,
     worker_name: String,
     api_client: ApiClient,
     api_url: String,
@@ -698,7 +700,8 @@ impl SensorManager {
                 pack_sync_locks: Mutex::new(HashMap::new()),
                 artifact_transport: config.artifact_transport,
                 sensor_log_config: config.sensor_log_config,
-                mirror_runtime_logs_to_stdio: config.mirror_runtime_logs_to_stdio,
+                mirror_runtime_stdout_to_stdio: config.mirror_runtime_stdout_to_stdio,
+                mirror_runtime_stderr_to_stdio: config.mirror_runtime_stderr_to_stdio,
                 worker_name: config.worker_name,
                 api_client,
                 api_url: config.api_url,
@@ -1521,19 +1524,22 @@ impl SensorManager {
             &log_config,
         )
         .await?;
-        let mirror_source = self.inner.mirror_runtime_logs_to_stdio.then(|| {
-            attune_common::runtime_log_mirror::RuntimeLogSource::Sensor {
-                sensor_id: sensor.id,
-                sensor_ref: sensor.r#ref.clone(),
-                pack_ref: pack_ref.clone(),
-                worker_id: workload.worker_id,
-                worker_name: self.inner.worker_name.clone(),
-                worker_instance: workload.worker_instance,
-                workload_id: workload.workload_id,
-                assignment_generation: workload.generation,
-                process_id: child.id(),
-            }
-        });
+        let (stdout_mirror_source, stderr_mirror_source) =
+            attune_common::runtime_log_mirror::select_mirror_sources(
+                attune_common::runtime_log_mirror::RuntimeLogSource::Sensor {
+                    sensor_id: sensor.id,
+                    sensor_ref: sensor.r#ref.clone(),
+                    pack_ref: pack_ref.clone(),
+                    worker_id: workload.worker_id,
+                    worker_name: self.inner.worker_name.clone(),
+                    worker_instance: workload.worker_instance,
+                    workload_id: workload.workload_id,
+                    assignment_generation: workload.generation,
+                    process_id: child.id(),
+                },
+                self.inner.mirror_runtime_stdout_to_stdio,
+                self.inner.mirror_runtime_stderr_to_stdio,
+            );
 
         let stdout_handle = crate::sensor_log::spawn_stdout_log_task(
             stdout,
@@ -1542,7 +1548,7 @@ impl SensorManager {
             log_config.clone(),
             self.inner.db.clone(),
             log_artifacts.stdout,
-            mirror_source.clone(),
+            stdout_mirror_source,
         );
         let stderr_handle = crate::sensor_log::spawn_stderr_log_task(
             stderr,
@@ -1551,7 +1557,7 @@ impl SensorManager {
             log_config.clone(),
             self.inner.db.clone(),
             log_artifacts.stderr,
-            mirror_source,
+            stderr_mirror_source,
         );
 
         self.persist_sensor_process_started(&sensor, child.id(), reset_failure_count)

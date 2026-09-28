@@ -22,7 +22,7 @@ use attune_common::{
         key::{CreateKeyInput, KeyRepository},
         pack::{CreatePackInput, PackRepository},
         workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
-        Create,
+        Create, FindByRef,
     },
 };
 use axum::http::StatusCode;
@@ -412,6 +412,72 @@ fn execute_body(action: &Action, permission_set_refs: Option<Vec<String>>) -> Va
     }
 
     body
+}
+
+#[tokio::test]
+async fn pack_updates_require_execution_token_configure_permission() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let suffix = &suffix[..8];
+    let identity = create_execution_identity(&ctx.pool, suffix).await?;
+    let (_execution_pack, action) = setup_executable_action(&ctx.pool, suffix).await?;
+    let parent_execution = create_parent_execution(&ctx.pool, &action, &identity).await?;
+    let target_pack_ref = format!("exec_config_target_{suffix}");
+    create_pack(&ctx.pool, &target_pack_ref, "Original label").await?;
+
+    let configure_ref = format!("test.exec_pack_configure_{suffix}");
+    create_permission_set(
+        &ctx.pool,
+        &configure_ref,
+        json!([{
+            "resource": "packs",
+            "actions": ["configure"],
+            "constraints": {"pack_refs": [target_pack_ref]}
+        }]),
+    )
+    .await?;
+
+    let denied_token = execution_token(&identity, &parent_execution, &action, &[])?;
+    let denied = ctx
+        .put(
+            &format!("/api/v1/packs/{target_pack_ref}"),
+            json!({"config": {"value": "denied"}}),
+            Some(&denied_token),
+        )
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let unchanged = PackRepository::find_by_ref(&ctx.pool, &target_pack_ref)
+        .await?
+        .expect("target pack should exist");
+    assert_eq!(unchanged.config, json!({}));
+    assert_eq!(unchanged.label, "Original label");
+
+    let authorized_token = execution_token(
+        &identity,
+        &parent_execution,
+        &action,
+        std::slice::from_ref(&configure_ref),
+    )?;
+    let authorized = ctx
+        .put(
+            &format!("/api/v1/packs/{target_pack_ref}"),
+            json!({
+                "config": {"value": "authorized"},
+                "label": "Updated label"
+            }),
+            Some(&authorized_token),
+        )
+        .await?;
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    let updated = PackRepository::find_by_ref(&ctx.pool, &target_pack_ref)
+        .await?
+        .expect("target pack should exist");
+    assert_eq!(updated.config, json!({"value": "authorized"}));
+    assert_eq!(updated.label, "Updated label");
+
+    Ok(())
 }
 
 #[tokio::test]

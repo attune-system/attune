@@ -431,7 +431,8 @@ impl WorkerService {
             .as_ref()
             .map(|w| w.max_stderr_bytes)
             .unwrap_or(10 * 1024 * 1024);
-        let mirror_runtime_logs_to_stdio = config.log.mirror_runtime_logs_to_stdio;
+        let mirror_runtime_stdout_to_stdio = config.log.mirror_runtime_stdout_to_stdio;
+        let mirror_runtime_stderr_to_stdio = config.log.mirror_runtime_stderr_to_stdio;
         let execution_log_retention_policy = config
             .worker
             .as_ref()
@@ -505,7 +506,8 @@ impl WorkerService {
             secret_manager,
             max_stdout_bytes,
             max_stderr_bytes,
-            mirror_runtime_logs_to_stdio,
+            mirror_runtime_stdout_to_stdio,
+            mirror_runtime_stderr_to_stdio,
             worker_name,
             worker_token_provider.instance_id(),
             config.artifacts.log_segment_writer_config(),

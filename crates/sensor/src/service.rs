@@ -238,7 +238,8 @@ impl SensorService {
                 pack_transport: pack_transport.clone(),
                 artifact_transport,
                 sensor_log_config,
-                mirror_runtime_logs_to_stdio: config.log.mirror_runtime_logs_to_stdio,
+                mirror_runtime_stdout_to_stdio: config.log.mirror_runtime_stdout_to_stdio,
+                mirror_runtime_stderr_to_stdio: config.log.mirror_runtime_stderr_to_stdio,
                 worker_name,
             },
         ));

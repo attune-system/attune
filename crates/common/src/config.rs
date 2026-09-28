@@ -347,10 +347,15 @@ pub struct LogConfig {
     /// Reserved file sink path. File logging is not currently implemented.
     pub file: Option<PathBuf>,
 
-    /// Mirror action and managed sensor output to structured process stdout/stderr.
+    /// Mirror action and managed sensor stdout to structured process stdout.
     /// Artifact-backed runtime logs remain authoritative.
     #[serde(default)]
-    pub mirror_runtime_logs_to_stdio: bool,
+    pub mirror_runtime_stdout_to_stdio: bool,
+
+    /// Mirror action and managed sensor stderr to structured process stderr.
+    /// Artifact-backed runtime logs remain authoritative.
+    #[serde(default)]
+    pub mirror_runtime_stderr_to_stdio: bool,
 }
 
 fn default_log_level() -> String {
@@ -1914,7 +1919,8 @@ impl Default for LogConfig {
             format: default_log_format(),
             console: true,
             file: None,
-            mirror_runtime_logs_to_stdio: false,
+            mirror_runtime_stdout_to_stdio: false,
+            mirror_runtime_stderr_to_stdio: false,
         }
     }
 }
@@ -2482,6 +2488,27 @@ mod tests {
         assert_eq!(config.environment, "development");
         assert!(config.is_development());
         assert!(!config.is_production());
+    }
+
+    #[test]
+    fn runtime_log_mirror_streams_default_off_and_configure_independently() {
+        let defaults: LogConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!defaults.mirror_runtime_stdout_to_stdio);
+        assert!(!defaults.mirror_runtime_stderr_to_stdio);
+
+        let stdout_only: LogConfig = serde_json::from_value(serde_json::json!({
+            "mirror_runtime_stdout_to_stdio": true
+        }))
+        .unwrap();
+        assert!(stdout_only.mirror_runtime_stdout_to_stdio);
+        assert!(!stdout_only.mirror_runtime_stderr_to_stdio);
+
+        let stderr_only: LogConfig = serde_json::from_value(serde_json::json!({
+            "mirror_runtime_stderr_to_stdio": true
+        }))
+        .unwrap();
+        assert!(!stderr_only.mirror_runtime_stdout_to_stdio);
+        assert!(stderr_only.mirror_runtime_stderr_to_stdio);
     }
 
     #[test]

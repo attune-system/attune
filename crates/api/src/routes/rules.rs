@@ -699,6 +699,15 @@ pub async fn update_rule(
     Path(rule_ref): Path<String>,
     Json(request): Json<UpdateRuleRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot update rules".to_string(),
+        ));
+    }
+
     // Validate request
     request.validate()?;
 
@@ -707,26 +716,24 @@ pub async fn update_rule(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.target_id = Some(existing_rule.id);
-        ctx.target_ref = Some(existing_rule.r#ref.clone());
-        ctx.pack_ref = Some(existing_rule.pack_ref.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Rules,
-                    action: Action::Update,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(existing_rule.id);
+    ctx.target_ref = Some(existing_rule.r#ref.clone());
+    ctx.pack_ref = Some(existing_rule.pack_ref.clone());
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Rules,
+                action: Action::Update,
+                context: ctx,
+            },
+        )
+        .await?;
 
     let action_ref = request
         .action_ref

@@ -159,7 +159,8 @@ mod tests {
             format: format.to_string(),
             console: true,
             file: None,
-            mirror_runtime_logs_to_stdio: false,
+            mirror_runtime_stdout_to_stdio: false,
+            mirror_runtime_stderr_to_stdio: false,
         }
     }
 

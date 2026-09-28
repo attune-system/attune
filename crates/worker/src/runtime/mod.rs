@@ -22,6 +22,7 @@
 //! (e.g., `python-3.12` instead of `python`) so that different versions
 //! maintain isolated environments.
 
+mod action_output_mirror;
 pub mod dependency;
 pub mod local;
 pub mod log_writer;
@@ -167,6 +168,9 @@ pub struct ExecutionContext {
     /// Format for output parsing
     pub output_format: OutputFormat,
 
+    /// Action output schema used to protect mirrored container output.
+    pub out_schema: Option<serde_json::Value>,
+
     /// Optional cancellation token for process termination.
     /// When triggered, the executor sends SIGTERM → SIGKILL
     /// with a short grace period.
@@ -223,6 +227,7 @@ impl ExecutionContext {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            out_schema: None,
             cancel_token: None,
         }
     }

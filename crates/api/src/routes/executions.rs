@@ -1464,6 +1464,7 @@ pub async fn get_execution_stats(
     ),
     responses(
         (status = 200, description = "Cancellation requested", body = inline(ApiResponse<ExecutionResponse>)),
+        (status = 403, description = "Caller is not authorized to cancel the execution"),
         (status = 404, description = "Execution not found"),
         (status = 409, description = "Execution is not in a cancellable state"),
     ),
@@ -1471,13 +1472,34 @@ pub async fn get_execution_stats(
 )]
 pub async fn cancel_execution(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "Only access and execution tokens can cancel executions".to_string(),
+        ));
+    }
+
     // Load the execution
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
+
+    authorize_execution_access(
+        &state,
+        &user,
+        &execution,
+        Action::Cancel,
+        authz_snapshot.as_ref(),
+        &mut ExecutionVisibilityCache::default(),
+    )
+    .await?;
+
     let workflow_execution = WorkflowExecutionRepository::find_by_execution(&state.db, id).await?;
 
     if matches!(

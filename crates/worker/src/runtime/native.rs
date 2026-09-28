@@ -43,6 +43,8 @@ impl NativeRuntime {
         timeout: Option<u64>,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
+        output_format: OutputFormat,
+        out_schema: Option<&serde_json::Value>,
         _stdout_log_path: Option<&Path>,
         _stderr_log_path: Option<&Path>,
         stdout_log_writer: Option<BoundedLogFileWriter>,
@@ -91,7 +93,8 @@ impl NativeRuntime {
             timeout,
             max_stdout_bytes,
             max_stderr_bytes,
-            OutputFormat::Json,
+            output_format,
+            out_schema,
             cancel_token,
             None,
             None,
@@ -177,6 +180,8 @@ impl Runtime for NativeRuntime {
             context.timeout,
             context.max_stdout_bytes,
             context.max_stderr_bytes,
+            context.output_format,
+            context.out_schema.as_ref(),
             context.stdout_log_path.as_deref(),
             context.stderr_log_path.as_deref(),
             context.stdout_log_writer,
@@ -285,6 +290,9 @@ mod tests {
 
         async fn delete_file(&self, _: &str) -> attune_common::Result<()> {
             unreachable!()
+        }
+        async fn append_log_file(&self, _: &str, _: &[u8]) -> attune_common::Result<()> {
+            Ok(())
         }
 
         async fn commit_log_segment(&self, _: i64, _: i64, _: &[u8]) -> attune_common::Result<()> {
@@ -448,6 +456,48 @@ mod tests {
         let exec_result = result.unwrap();
         assert_eq!(exec_result.exit_code, 0);
         assert!(exec_result.stdout.contains("Hello from native runtime"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_text_output_with_secret_schema_uses_suppressed_mirror_path() {
+        use attune_common::runtime_log_mirror::RuntimeLogSource;
+        use serde_json::json;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = write_executable(&temp_dir, r#"printf '{"token":"secret"}\n'"#);
+        let transport = Arc::new(HangingLogTransport::default());
+        let writer = attune_common::log_stream::SharedFileLogWriter::new(
+            transport,
+            1,
+            "native-text.log".to_string(),
+        );
+        let source = RuntimeLogSource::Execution {
+            execution_id: 1,
+            parent_execution_id: None,
+            action_ref: "test.native".to_string(),
+            pack_ref: "test".to_string(),
+            trace_tag: None,
+            worker_id: 1,
+            worker_name: "test-worker".to_string(),
+            worker_instance: uuid::Uuid::nil(),
+        };
+        let mut context = ExecutionContext::test_context("test.native".to_string(), None);
+        context.code_path = Some(path);
+        context.runtime_name = Some("native".to_string());
+        context.output_format = OutputFormat::Text;
+        context.out_schema = Some(json!({
+            "token": {"type": "string", "secret": true}
+        }));
+        context.stdout_log_writer = Some(
+            BoundedLogFileWriter::from_shared_file_writer(writer, 1024, true, 1_000)
+                .with_mirror_source(Some(source)),
+        );
+
+        let result = NativeRuntime::new().execute(context).await.unwrap();
+
+        assert!(result.result.is_none());
+        assert_eq!(result.stdout, "{\"token\":\"secret\"}\n");
     }
 
     #[cfg(unix)]

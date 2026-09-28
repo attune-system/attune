@@ -276,7 +276,7 @@ impl McpServer {
 
     async fn call_tool(&mut self, tool_name: &str, args: &Map<String, Value>) -> Result<Value> {
         match tool_name {
-            "actions_list" => self.list_path("/actions", args).await,
+            "actions_list" => self.list_catalog_path("/actions", args).await,
             "actions_search" => self.actions_search(args).await,
             "actions_get" => {
                 let action_ref = required_string(args, "ref")?;
@@ -433,14 +433,14 @@ impl McpServer {
                     )
                     .await
             }
-            "workflows_list" => self.list_path("/workflows", args).await,
+            "workflows_list" => self.list_catalog_path("/workflows", args).await,
             "workflows_get" => {
                 let workflow_ref = required_string(args, "ref")?;
                 self.client
                     .get::<Value>(&format!("/workflows/{}", encode_path(workflow_ref)))
                     .await
             }
-            "packs_list" => self.list_path("/packs", args).await,
+            "packs_list" => self.list_catalog_path("/packs", args).await,
             "packs_get" => {
                 let pack_ref = required_string(args, "ref")?;
                 self.client
@@ -462,10 +462,12 @@ impl McpServer {
             }
             "packs_get_actions" => {
                 let pack_ref = required_string(args, "ref")?;
+                let page = optional_i64(args, "page")?.unwrap_or(1);
+                let per_page = optional_i64(args, "per_page")?.unwrap_or(100).clamp(1, 100);
                 self.client
                     .get_paginated::<Value>(&format!(
-                        "/actions/search?packs={}&page=1&page_size=100",
-                        urlencoding::encode(pack_ref)
+                        "/actions/search?packs={}&page={page}&page_size={per_page}",
+                        urlencoding::encode(pack_ref),
                     ))
                     .await
                     .map(Value::Array)
@@ -531,6 +533,15 @@ impl McpServer {
         let per_page = optional_i64(args, "per_page")?.unwrap_or(100);
         self.client
             .get_paginated::<Value>(&format!("{path}?page={page}&per_page={per_page}"))
+            .await
+            .map(Value::Array)
+    }
+
+    async fn list_catalog_path(&mut self, path: &str, args: &Map<String, Value>) -> Result<Value> {
+        let page = optional_i64(args, "page")?.unwrap_or(1);
+        let per_page = optional_i64(args, "per_page")?.unwrap_or(100).clamp(1, 100);
+        self.client
+            .get_paginated::<Value>(&format!("{path}?page={page}&page_size={per_page}"))
             .await
             .map(Value::Array)
     }
@@ -1164,8 +1175,8 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "packs_get_actions",
             title: "List pack actions",
-            description: "List all actions belonging to a specific pack by ref.",
-            input_schema: ref_schema,
+            description: "List one bounded page of actions belonging to a specific pack by ref.",
+            input_schema: pack_actions_schema,
         },
         ToolDef {
             name: "packs_check",
@@ -1282,6 +1293,19 @@ fn ref_schema() -> Value {
         "type": "object",
         "properties": {
             "ref": { "type": "string", "description": "Attune reference identifier" }
+        },
+        "required": ["ref"],
+        "additionalProperties": false
+    })
+}
+
+fn pack_actions_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ref": { "type": "string", "description": "Attune pack reference identifier" },
+            "page": { "type": "integer", "minimum": 1, "description": "1-based page number" },
+            "per_page": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Page size" }
         },
         "required": ["ref"],
         "additionalProperties": false
@@ -2439,6 +2463,116 @@ mod tests {
         let respond = inquiry_respond_schema();
         assert_eq!(respond["oneOf"].as_array().map(Vec::len), Some(2));
         assert_eq!(respond["properties"]["response"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn catalog_lists_translate_per_page_to_page_size() {
+        let api = MockServer::start().await;
+        for endpoint in ["actions", "packs", "workflows"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/{endpoint}")))
+                .and(query_param("page", "3"))
+                .and(query_param("page_size", "7"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "items": [],
+                    "pagination": {}
+                })))
+                .expect(1)
+                .mount(&api)
+                .await;
+        }
+
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({"page": 3, "per_page": 7})).expect("arguments");
+        for tool in ["actions_list", "packs_list", "workflows_list"] {
+            server
+                .call_tool(tool, &args)
+                .await
+                .expect("catalog list should succeed");
+        }
+
+        let requests = api
+            .received_requests()
+            .await
+            .expect("request recording should be enabled");
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert!(
+                request.url.query_pairs().all(|(key, _)| key != "per_page"),
+                "catalog request used the ignored per_page API key: {}",
+                request.url
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_lists_clamp_per_page_to_api_maximum() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/actions"))
+            .and(query_param("page", "2"))
+            .and(query_param("page_size", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [],
+                "pagination": {}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({"page": 2, "per_page": 200})).expect("arguments");
+        server
+            .call_tool("actions_list", &args)
+            .await
+            .expect("catalog list should succeed");
+    }
+
+    #[tokio::test]
+    async fn pack_actions_exposes_and_requests_a_bounded_page() {
+        let schema = pack_actions_schema();
+        assert!(schema["properties"].get("page").is_some());
+        assert_eq!(schema["properties"]["per_page"]["maximum"], 100);
+        let description = tool_defs()
+            .iter()
+            .find(|tool| tool.name == "packs_get_actions")
+            .expect("pack actions tool")
+            .description;
+        assert!(description.contains("one bounded page"));
+
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/actions/search"))
+            .and(query_param("packs", "core"))
+            .and(query_param("page", "2"))
+            .and(query_param("page_size", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"ref": "core.third"}, {"ref": "core.fourth"}],
+                "pagination": {"has_next": true}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({
+            "ref": "core",
+            "page": 2,
+            "per_page": 200
+        }))
+        .expect("arguments");
+        let response = server
+            .call_tool("packs_get_actions", &args)
+            .await
+            .expect("pack actions page should succeed");
+
+        assert_eq!(
+            response,
+            json!([
+                {"ref": "core.third"},
+                {"ref": "core.fourth"}
+            ])
+        );
     }
 
     #[tokio::test]

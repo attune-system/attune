@@ -120,6 +120,7 @@ print(json.dumps(result))
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::Json,
+        out_schema: None,
         cancel_token: None,
     };
 
@@ -219,6 +220,7 @@ echo "SECURITY_PASS: Secrets not in inherited environment and accessible via mer
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::default(),
+        out_schema: None,
         cancel_token: None,
     };
 
@@ -288,6 +290,7 @@ print(json.dumps({'secret_a': secrets.get('secret_a')}))
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::Json,
+        out_schema: None,
         cancel_token: None,
     };
 
@@ -338,6 +341,7 @@ print(json.dumps({
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::Json,
+        out_schema: None,
         cancel_token: None,
     };
 
@@ -397,6 +401,7 @@ print("ok")
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::default(),
+        out_schema: None,
         cancel_token: None,
     };
 
@@ -453,6 +458,7 @@ fi
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::default(),
+        out_schema: None,
         cancel_token: None,
     };
 
@@ -539,6 +545,7 @@ echo "PASS: No secrets in environment"
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::default(),
+        out_schema: None,
         cancel_token: None,
     };
 
@@ -624,6 +631,7 @@ print(json.dumps({"leaked": leaked}))
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::Json,
+        out_schema: None,
         cancel_token: None,
     };
 

@@ -55,11 +55,13 @@ stderr mirroring is disabled by default to avoid duplicate log ingestion, but
 lifecycle events such as stream closure and log-write failures still appear in
 service logs.
 
-Set `log.mirror_runtime_logs_to_stdio: true`, or the environment variable
-`ATTUNE__LOG__MIRROR_RUNTIME_LOGS_TO_STDIO=true`, to emit structured NDJSON
-copies from action workers and sensor workers for container log collectors. The
-mirror preserves JSON-object bodies without stringifying them. It is best-effort
-and may expose sensitive runtime output to broader cluster logging access.
+Set `log.mirror_runtime_stdout_to_stdio: true` or
+`log.mirror_runtime_stderr_to_stdio: true` to emit structured NDJSON copies of
+the selected streams from action and sensor workers. The equivalent environment
+variables are `ATTUNE__LOG__MIRROR_RUNTIME_STDOUT_TO_STDIO` and
+`ATTUNE__LOG__MIRROR_RUNTIME_STDERR_TO_STDIO`. The mirror preserves JSON-object
+bodies without stringifying them. It is best-effort and may expose sensitive
+runtime output to broader cluster logging access.
 
 Those sensor log artifacts are explicitly classified as `runtime_log` and remain
 private. The same policy now applies to worker-created execution stdout/stderr
