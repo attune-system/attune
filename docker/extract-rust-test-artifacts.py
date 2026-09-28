@@ -12,23 +12,39 @@ metadata = json.loads(metadata_path.read_text())
 package_names = {package["id"]: package["name"] for package in metadata["packages"]}
 output_path.mkdir(parents=True, exist_ok=True)
 manifest = []
+binary_manifest = []
 inventory = []
 seen = set()
+seen_binaries = set()
 
 for line in messages_path.read_text().splitlines():
     try:
         message = json.loads(line)
     except json.JSONDecodeError:
         continue
-    if message.get("reason") != "compiler-artifact" or not message.get("profile", {}).get("test"):
+    if message.get("reason") != "compiler-artifact":
         continue
     executable = message.get("executable")
     package = package_names.get(message.get("package_id"))
-    if not executable or not package or (package, executable) in seen:
+    if not executable or not package:
+        continue
+    target = message.get("target", {})
+    if "bin" in target.get("kind", []) and not message.get("profile", {}).get("test"):
+        binary_name = target.get("name")
+        if binary_name and binary_name not in seen_binaries:
+            seen_binaries.add(binary_name)
+            binary_dir = output_path / "bin"
+            binary_dir.mkdir(exist_ok=True)
+            destination = binary_dir / binary_name
+            shutil.copy2(Path(executable), destination)
+            subprocess.run(["strip", "--strip-unneeded", destination], check=True)
+            binary_manifest.append((binary_name, str(destination)))
+        continue
+    if not message.get("profile", {}).get("test") or (package, executable) in seen:
         continue
     seen.add((package, executable))
     source = Path(executable)
-    if message.get("target", {}).get("name") == "test_database_lifecycle_helper":
+    if target.get("name") == "test_database_lifecycle_helper":
         destination = output_path / "test_database_lifecycle"
         shutil.copy2(source, destination)
         subprocess.run(["strip", "--strip-unneeded", destination], check=True)
@@ -77,6 +93,10 @@ if not manifest:
 with (output_path / "manifest.tsv").open("w") as handle:
     for package, executable in sorted(manifest):
         handle.write(f"{package}\t{executable}\n")
+
+with (output_path / "binaries.tsv").open("w") as handle:
+    for name, executable in sorted(binary_manifest):
+        handle.write(f"{name}\t{executable}\n")
 
 with (output_path / "inventory.tsv").open("w") as handle:
     for package, executable, test in sorted(inventory):

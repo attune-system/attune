@@ -39,8 +39,8 @@ async fn main() {
         return;
     }
 
-    // Completion is deliberately read-only. In particular, avoid the normal
-    // configuration/output initialization because it creates a default config.
+    // Avoid normal output initialization so completion never creates a default
+    // config. API-backed completion may refresh credentials in an existing one.
     match &cli.command {
         Commands::Completion { command } => {
             handle_completion(*command).unwrap_or_else(|error| {

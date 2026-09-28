@@ -92,14 +92,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
 # rebuild unless they were copied explicitly above.
 COPY docker/ ./docker/
 COPY packaging/ ./packaging/
+COPY packs/ ./packs/
 
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    git \
     libssl3 \
     python3 \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -110,6 +113,7 @@ COPY --from=builder /build/crates ./crates
 COPY --from=builder /build/migrations ./migrations
 COPY --from=builder /build/docker ./docker
 COPY --from=builder /build/packaging ./packaging
+COPY --from=builder /build/packs ./packs
 COPY --from=builder /build/docker-compose.yaml ./docker-compose.yaml
 COPY --from=builder /build/config.test.yaml ./config.test.yaml
 

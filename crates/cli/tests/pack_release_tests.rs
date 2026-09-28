@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::{fs, path::Path, process::Command};
 
 fn offline(home: &Path) -> Command {
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("attune"));
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin("attune"));
     command
         .env_clear()
         .env("HOME", home)

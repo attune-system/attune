@@ -143,9 +143,6 @@ impl ApiClient {
     ) -> Self {
         let mut client = Self::from_config(config, api_url_override);
         client.client = build_http_client(timeout);
-        // A completion request must not refresh or persist credentials.
-        client.refresh_token = None;
-        client.config_path = None;
         client
     }
 

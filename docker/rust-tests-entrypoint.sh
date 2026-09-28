@@ -187,7 +187,15 @@ chmod 600 /build/config.test.yaml
 
 # ── Select precompiled test executables ──────────────────────────────────
 MANIFEST=/build/test-artifacts/manifest.tsv
+BINARY_MANIFEST=/build/test-artifacts/binaries.tsv
 PACKAGE=""
+BINARY_ENV=()
+
+if [[ -f "$BINARY_MANIFEST" ]]; then
+  while IFS=$'\t' read -r binary_name binary_path; do
+    BINARY_ENV+=("CARGO_BIN_EXE_${binary_name}=${binary_path}")
+  done < "$BINARY_MANIFEST"
+fi
 
 if [[ -n "$CRATE" ]]; then
   case "$CRATE" in
@@ -366,14 +374,16 @@ for test_entry in "${TEST_ENTRIES[@]}"; do
 
   test_status=0
   if [[ -n "$test_database_url" ]]; then
-    CARGO_MANIFEST_DIR="/build/crates/${test_package#attune-}" \
+    env "${BINARY_ENV[@]}" \
+      CARGO_MANIFEST_DIR="/build/crates/${test_package#attune-}" \
       DATABASE_URL="$test_database_url" \
       ATTUNE__DATABASE__URL="$test_database_url" \
       ATTUNE_TEST_DATABASE_URL="$test_database_url" \
       ATTUNE_TEST_EXEC_DATABASE_NAME="$CURRENT_TEST_DATABASE" \
       "$test_binary" "${TEST_ARGS[@]}" || test_status=$?
   else
-    CARGO_MANIFEST_DIR="/build/crates/${test_package#attune-}" \
+    env "${BINARY_ENV[@]}" \
+      CARGO_MANIFEST_DIR="/build/crates/${test_package#attune-}" \
       "$test_binary" "${TEST_ARGS[@]}" || test_status=$?
   fi
 
