@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-28
+
+### Added
+
+- The CLI can list queues, enqueue JSON payloads, and inspect queue items with
+  state, provenance, and pagination details.
+- Workers and managed sensors can mirror stdout and stderr as structured NDJSON
+  for cluster log collection. Action output declared as secret is redacted or
+  suppressed when it cannot be parsed safely.
+
+### Changed
+
+- **Breaking:** Removed the unsupported `tenant` dashboard scope. Identity
+  dashboards derive their owner from the authenticated user and remain private.
+- Queue editing now follows `queues:update` permissions, with full metadata
+  changes limited to API-managed queues.
+- The runtime-log test harness uses versioned RustFS storage and AWS-compatible
+  tooling in place of MinIO-specific scripts and environment variables.
+
+### Fixed
+
+- Dynamic shell completion refreshes expired access tokens and persists rotated
+  access and refresh tokens.
+- Managed sensor logs preserve raw bytes, invalid UTF-8, and long lines without
+  inserting newlines or delaying rotation.
+- Dashboard requests omit stale and API-owned scope fields, and generated API
+  contracts correctly mark optional dashboard and work queue fields.
+- MCP list operations map pagination fields correctly and cap page sizes at the
+  API limit.
+
+### Security
+
+- Execution cancellation and pack and rule updates reject service tokens and
+  require the corresponding scoped permission, including owner constraints.
+
 ## [0.7.0] - 2026-09-20
 
 ### Added
@@ -4832,7 +4867,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/attune-system/attune/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/attune-system/attune/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/attune-system/attune/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/attune-system/attune/compare/v0.6.1...v0.6.2

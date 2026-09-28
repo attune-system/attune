@@ -107,14 +107,15 @@ where
 {
     let mut buffer = vec![0_u8; 64 * 1024];
     let mirror_source = file.as_ref().and_then(|log| log.mirror_source().cloned());
-    let mut mirror = live_mirror
-        .then(|| ())
-        .and_then(|()| file.as_ref())
-        .and_then(|log| {
+    let mut mirror = if live_mirror {
+        file.as_ref().and_then(|log| {
             log.mirror_source()
                 .cloned()
                 .map(|source| RuntimeLogMirror::new(source, stream, Some(log.max_bytes() as u64)))
-        });
+        })
+    } else {
+        None
+    };
     let mut logs_incomplete = false;
     loop {
         let read = tokio::select! {
