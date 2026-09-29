@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-29
+
+### Fixed
+
+- OIDC login reads the `groups` claim from the userinfo endpoint when the ID
+  token omits it, so identity providers that issue thin ID tokens (such as the
+  Okta org authorization server) assign managed roles. Login also fills in
+  `email_verified` from userinfo, checks that the userinfo subject matches the
+  ID token, and logs userinfo failures instead of ignoring them.
+
 ## [0.7.1] - 2026-09-28
 
 ### Added
@@ -4867,7 +4877,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/attune-system/attune/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/attune-system/attune/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/attune-system/attune/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/attune-system/attune/compare/v0.6.2...v0.6.3
