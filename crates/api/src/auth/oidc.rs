@@ -18,10 +18,10 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation,
 };
 use openidconnect::{
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata, CoreUserInfoClaims},
-    AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, HttpRequest, HttpResponse,
-    LocalizedClaim, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
-    Scope, TokenResponse as OidcTokenResponse,
+    core::{CoreAuthenticationFlow, CoreClient, CoreGenderClaim, CoreProviderMetadata},
+    AdditionalClaims, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, HttpRequest,
+    HttpResponse, LocalizedClaim, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, SubjectIdentifier, TokenResponse as OidcTokenResponse, UserInfoClaims,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -112,6 +112,23 @@ struct VerifiedIdTokenClaims {
     #[serde(default)]
     groups: Vec<String>,
 }
+
+/// Non-standard claims Attune reads from the userinfo endpoint.
+///
+/// Some providers (for example the Okta org authorization server) issue a thin ID
+/// token without `groups` when an access token is also returned, and only expose
+/// `groups` through userinfo. `CoreUserInfoClaims` discards non-standard claims,
+/// so `groups` must be declared explicitly. It is kept as raw JSON because
+/// providers send either a string or an array.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OidcUserInfoAdditionalClaims {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    groups: Option<JsonValue>,
+}
+
+impl AdditionalClaims for OidcUserInfoAdditionalClaims {}
+
+type OidcUserInfoClaims = UserInfoClaims<OidcUserInfoAdditionalClaims, CoreGenderClaim>;
 
 #[derive(Debug, Clone)]
 pub struct OidcAuthenticatedIdentity {
@@ -327,13 +344,27 @@ pub async fn handle_callback(
         groups: claims.groups,
     };
 
-    if let Ok(userinfo_request) = client.user_info(token_response.access_token().to_owned(), None) {
-        if let Ok(userinfo) = userinfo_request
-            .request_async(&oidc_async_http_client)
+    let expected_subject = SubjectIdentifier::new(oidc_claims.sub.clone());
+    match client.user_info(
+        token_response.access_token().to_owned(),
+        Some(expected_subject),
+    ) {
+        Ok(userinfo_request) => match userinfo_request
+            .request_async::<OidcUserInfoAdditionalClaims, _, CoreGenderClaim>(
+                &oidc_async_http_client,
+            )
             .await
         {
-            merge_userinfo_claims(&mut oidc_claims, &userinfo);
-        }
+            Ok(userinfo) => merge_userinfo_claims(&mut oidc_claims, &userinfo),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "OIDC userinfo request failed; continuing with ID token claims only"
+            ),
+        },
+        Err(err) => tracing::debug!(
+            error = %err,
+            "OIDC userinfo endpoint is not available; using ID token claims only"
+        ),
     }
 
     let identity = upsert_identity(state, &oidc_claims).await?;
@@ -799,9 +830,12 @@ where
     }
 }
 
-fn merge_userinfo_claims(oidc_claims: &mut OidcIdentityClaims, userinfo: &CoreUserInfoClaims) {
+fn merge_userinfo_claims(oidc_claims: &mut OidcIdentityClaims, userinfo: &OidcUserInfoClaims) {
     if oidc_claims.email.is_none() {
         oidc_claims.email = userinfo.email().map(|email| email.as_str().to_string());
+    }
+    if oidc_claims.email_verified.is_none() {
+        oidc_claims.email_verified = userinfo.email_verified();
     }
     if oidc_claims.name.is_none() {
         oidc_claims.name = userinfo.name().and_then(first_localized_claim);
@@ -933,6 +967,98 @@ mod tests {
             extract_groups_from_claims(&string_claims),
             vec!["admins".to_string()]
         );
+    }
+
+    fn userinfo_from_json(body: serde_json::Value) -> OidcUserInfoClaims {
+        OidcUserInfoClaims::from_json::<std::io::Error>(body.to_string().as_bytes(), None)
+            .expect("userinfo JSON should parse")
+    }
+
+    fn thin_id_token_claims() -> OidcIdentityClaims {
+        OidcIdentityClaims {
+            issuer: "https://idp.example.com".to_string(),
+            sub: "00u123".to_string(),
+            client_id: "attune".to_string(),
+            email: None,
+            email_verified: None,
+            name: None,
+            preferred_username: None,
+            groups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_userinfo_claims_backfills_groups_and_profile_from_thin_id_token() {
+        let userinfo = userinfo_from_json(serde_json::json!({
+            "sub": "00u123",
+            "email": "user@example.com",
+            "email_verified": true,
+            "name": "Example User",
+            "preferred_username": "user@example.com",
+            "groups": ["AppAccess:Example", "role-example-admins"]
+        }));
+        let mut claims = thin_id_token_claims();
+
+        merge_userinfo_claims(&mut claims, &userinfo);
+
+        assert_eq!(
+            claims.groups,
+            vec![
+                "AppAccess:Example".to_string(),
+                "role-example-admins".to_string()
+            ]
+        );
+        assert_eq!(claims.email.as_deref(), Some("user@example.com"));
+        assert_eq!(claims.email_verified, Some(true));
+        assert_eq!(claims.name.as_deref(), Some("Example User"));
+        assert_eq!(
+            claims.preferred_username.as_deref(),
+            Some("user@example.com")
+        );
+    }
+
+    #[test]
+    fn merge_userinfo_claims_accepts_string_groups() {
+        let userinfo = userinfo_from_json(serde_json::json!({
+            "sub": "00u123",
+            "groups": "single-group"
+        }));
+        let mut claims = thin_id_token_claims();
+
+        merge_userinfo_claims(&mut claims, &userinfo);
+
+        assert_eq!(claims.groups, vec!["single-group".to_string()]);
+    }
+
+    #[test]
+    fn merge_userinfo_claims_keeps_id_token_values() {
+        let userinfo = userinfo_from_json(serde_json::json!({
+            "sub": "00u123",
+            "email": "userinfo@example.com",
+            "email_verified": false,
+            "groups": ["from-userinfo"]
+        }));
+        let mut claims = thin_id_token_claims();
+        claims.email = Some("id-token@example.com".to_string());
+        claims.email_verified = Some(true);
+        claims.groups = vec!["from-id-token".to_string()];
+
+        merge_userinfo_claims(&mut claims, &userinfo);
+
+        assert_eq!(claims.email.as_deref(), Some("id-token@example.com"));
+        assert_eq!(claims.email_verified, Some(true));
+        assert_eq!(claims.groups, vec!["from-id-token".to_string()]);
+    }
+
+    #[test]
+    fn merge_userinfo_claims_without_groups_leaves_groups_empty() {
+        let userinfo = userinfo_from_json(serde_json::json!({ "sub": "00u123" }));
+        let mut claims = thin_id_token_claims();
+
+        merge_userinfo_claims(&mut claims, &userinfo);
+
+        assert!(claims.groups.is_empty());
+        assert_eq!(claims.email_verified, None);
     }
 
     #[test]

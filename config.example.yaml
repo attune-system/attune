@@ -117,6 +117,10 @@ security:
     client_secret: your-confidential-client-secret
     redirect_uri: http://localhost:3000/auth/callback
     post_logout_redirect_uri: http://localhost:3000/login
+    # `openid email profile` are always requested. Group names from the `groups`
+    # claim become managed roles at each login. Attune reads `groups` from the ID
+    # token, falling back to the userinfo endpoint for providers that issue thin
+    # ID tokens (for example the Okta org authorization server).
     scopes:
       - groups
 
