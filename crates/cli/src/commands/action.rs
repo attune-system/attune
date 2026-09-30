@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::client::ApiClient;
 use crate::config::CliConfig;
+use crate::manual_execution::{ManualExecutionOptions, ManualExecutionRequest};
 use crate::output::{self, OutputFormat};
 use crate::wait::{
     extract_stdout, spawn_execution_output_watch, wait_for_execution, WaitOptions,
@@ -108,21 +109,8 @@ pub enum ActionCommands {
         #[arg(long, conflicts_with = "param")]
         params_json: Option<String>,
 
-        /// Worker label selector as JSON (e.g. '{"pool":"gpu"}')
-        #[arg(long)]
-        worker_selector: Option<String>,
-
-        /// Worker tolerations as JSON array
-        #[arg(long)]
-        worker_tolerations: Option<String>,
-
-        /// Worker affinity as JSON object
-        #[arg(long)]
-        worker_affinity: Option<String>,
-
-        /// Execution timeout override in seconds (snapshotted onto the execution).
-        #[arg(long)]
-        execution_timeout: Option<i32>,
+        #[command(flatten)]
+        execution_options: ManualExecutionOptions,
 
         /// Watch execution until it completes
         #[arg(short, long)]
@@ -222,20 +210,6 @@ struct UpdateActionRequest {
     timeout_seconds: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
-struct ExecuteActionRequest {
-    action_ref: String,
-    parameters: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    worker_selector: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    worker_tolerations: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    worker_affinity: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeout_seconds: Option<i32>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct Execution {
     id: i64,
@@ -307,10 +281,7 @@ pub async fn handle_action_command(
             action_ref,
             param,
             params_json,
-            worker_selector,
-            worker_tolerations,
-            worker_affinity,
-            execution_timeout,
+            execution_options,
             watch,
             timeout,
             notifier_url,
@@ -319,10 +290,7 @@ pub async fn handle_action_command(
                 action_ref,
                 param,
                 params_json,
-                worker_selector,
-                worker_tolerations,
-                worker_affinity,
-                execution_timeout,
+                execution_options,
                 profile,
                 api_url,
                 watch,
@@ -680,10 +648,7 @@ async fn handle_execute(
     action_ref: String,
     params: Vec<String>,
     params_json: Option<String>,
-    worker_selector: Option<String>,
-    worker_tolerations: Option<String>,
-    worker_affinity: Option<String>,
-    execution_timeout: Option<i32>,
+    execution_options: ManualExecutionOptions,
     profile: &Option<String>,
     api_url: &Option<String>,
     watch: bool,
@@ -714,27 +679,9 @@ async fn handle_execute(
         serde_json::json!({})
     };
 
-    let selector = worker_selector
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .context("Invalid --worker-selector JSON")?;
-    let tolerations = worker_tolerations
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .context("Invalid --worker-tolerations JSON")?;
-    let affinity = worker_affinity
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .context("Invalid --worker-affinity JSON")?;
-
-    let request = ExecuteActionRequest {
-        action_ref: action_ref.clone(),
-        parameters,
-        worker_selector: selector,
-        worker_tolerations: tolerations,
-        worker_affinity: affinity,
-        timeout_seconds: execution_timeout,
-    };
+    let request =
+        ManualExecutionRequest::new(action_ref.clone(), parameters, execution_options.parse()?);
+    request.validate()?;
 
     if output_format == OutputFormat::Table {
         output::print_info(&format!("Executing action: {}", action_ref));

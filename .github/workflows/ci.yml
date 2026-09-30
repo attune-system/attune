@@ -135,12 +135,15 @@ jobs:
           sh scripts/test-seed-standard-pack-index.sh
           sh docker/test-prune-removed-pack-rules.sh
           python3 scripts/test_load_core_pack.py
+          python3 scripts/test_bootstrap_core_pack.py
+          python3 scripts/test_check_core_component_versions.py
 
       - name: Validate init-packs package image
         run: |
           set -euo pipefail
-          mkdir -p dist
-          install -m 0755 /bin/true dist/attune-core-timer-sensor
+          mkdir -p dist/core-timer-sensor/linux-amd64 dist/core-timer-sensor/linux-arm64
+          install -m 0755 /bin/true dist/core-timer-sensor/linux-amd64/attune-core-timer-sensor
+          install -m 0755 /bin/true dist/core-timer-sensor/linux-arm64/attune-core-timer-sensor
           docker build \
             --file docker/Dockerfile.init-packs-package \
             --tag attune-init-packs-package-test \
@@ -148,7 +151,7 @@ jobs:
           docker run --rm \
             --entrypoint /bin/sh \
             attune-init-packs-package-test \
-            -ec 'test -x /source/packs/core/sensors/attune-core-timer-sensor'
+            -ec 'test -x /source/packs/core/sensors/timer-sensor-launcher && test -x /source/packs/core/sensors/bin/linux-amd64/attune-core-timer-sensor && test -x /source/packs/core/sensors/bin/linux-arm64/attune-core-timer-sensor'
 
       - name: Validate GitHub Actions workflows
         run: >-

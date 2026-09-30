@@ -19,7 +19,21 @@ pub const ATTUNE_API_TOKEN_ENV: &str = "ATTUNE_API_TOKEN";
 
 /// Runtime definitions cannot replace worker-owned Attune execution context.
 pub fn is_reserved_runtime_env_var(name: &str) -> bool {
-    name.starts_with("ATTUNE_")
+    attune_common::execution_env::is_reserved_execution_env_var(name)
+}
+
+/// Explicit execution values override runtime defaults, but never internal context.
+pub fn merge_execution_environment(
+    env: &mut HashMap<String, String>,
+    execution_env: &HashMap<String, String>,
+) {
+    for (key, value) in execution_env {
+        if is_reserved_runtime_env_var(key) {
+            tracing::warn!("Ignoring execution environment variable {key}: ATTUNE_ is reserved");
+            continue;
+        }
+        env.insert(key.clone(), value.clone());
+    }
 }
 
 /// Apply the explicit execution environment while preventing an API token
@@ -411,6 +425,25 @@ mod tests {
         assert!(is_reserved_runtime_env_var("ATTUNE_API_TOKEN"));
         assert!(is_reserved_runtime_env_var("ATTUNE_PACK_REF"));
         assert!(!is_reserved_runtime_env_var("PYTHONPATH"));
+    }
+
+    #[test]
+    fn execution_environment_overrides_runtime_values_but_not_reserved_values() {
+        let mut env = HashMap::from([
+            ("LOG_LEVEL".to_string(), "info".to_string()),
+            ("ATTUNE_API_URL".to_string(), "http://internal".to_string()),
+        ]);
+        let execution_env = HashMap::from([
+            ("LOG_LEVEL".to_string(), "debug".to_string()),
+            ("REGION".to_string(), "eu-west-1".to_string()),
+            ("ATTUNE_API_URL".to_string(), "http://untrusted".to_string()),
+        ]);
+
+        merge_execution_environment(&mut env, &execution_env);
+
+        assert_eq!(env["LOG_LEVEL"], "debug");
+        assert_eq!(env["REGION"], "eu-west-1");
+        assert_eq!(env["ATTUNE_API_URL"], "http://internal");
     }
 
     #[test]

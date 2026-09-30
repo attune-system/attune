@@ -22,7 +22,7 @@ use attune_common::{
         key::{CreateKeyInput, KeyRepository},
         pack::{CreatePackInput, PackRepository},
         workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
-        Create, FindByRef,
+        Create, FindById, FindByRef,
     },
 };
 use axum::http::StatusCode;
@@ -605,10 +605,33 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         .await?;
     assert_eq!(execute_only_delegation.status(), StatusCode::FORBIDDEN);
 
+    let mut illegal_environment = execute_body(&action, Some(Vec::new()));
+    illegal_environment["env_vars"] = json!({"ATTUNE_API_TOKEN":"hidden-value"});
+    let rejected = ctx
+        .post(
+            "/api/v1/executions/execute",
+            illegal_environment,
+            Some(&execute_only_token),
+        )
+        .await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body: Value = rejected.json().await?;
+    assert!(rejected_body["error"]
+        .as_str()
+        .unwrap()
+        .contains("ATTUNE_API_TOKEN"));
+    assert!(rejected_body["error"]
+        .as_str()
+        .unwrap()
+        .contains("reserved ATTUNE_ prefix"));
+    assert!(!rejected_body.to_string().contains("hidden-value"));
+
+    let mut execution_body = execute_body(&action, Some(Vec::new()));
+    execution_body["env_vars"] = json!({"LOG_LEVEL":"debug", "EMPTY":""});
     let execute_only_success = ctx
         .post(
             "/api/v1/executions/execute",
-            execute_body(&action, Some(Vec::new())),
+            execution_body,
             Some(&execute_only_token),
         )
         .await?;
@@ -620,6 +643,16 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         );
     }
     let no_permission_body: Value = execute_only_success.json().await?;
+    let stored = ExecutionRepository::find_by_id(
+        &ctx.pool,
+        no_permission_body["data"]["id"].as_i64().unwrap(),
+    )
+    .await?
+    .unwrap();
+    assert_eq!(
+        stored.env_vars,
+        Some(json!({"LOG_LEVEL":"debug", "EMPTY":""}))
+    );
     assert_eq!(
         no_permission_body["data"]["parent"].as_i64(),
         Some(parent_execution.id)

@@ -140,6 +140,7 @@ impl Create for RuntimeRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        crate::execution_env::validate_runtime_environment(&input.execution_config)?;
         let query = format!(
             "INSERT INTO runtime (ref, pack, pack_ref, description, name, aliases, \
              distributions, installation, installers, execution_config, \
@@ -176,6 +177,9 @@ impl Update for RuntimeRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(config) = &input.execution_config {
+            crate::execution_env::validate_runtime_environment(config)?;
+        }
         // Build update query
 
         let mut query = QueryBuilder::new("UPDATE runtime SET ");

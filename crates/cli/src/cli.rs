@@ -1,3 +1,4 @@
+use crate::manual_execution::ManualExecutionOptions;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::commands::{
@@ -43,6 +44,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Show this CLI build and the server build for the selected profile.
+    Info {
+        /// Show only the local binary, without contacting the server.
+        #[arg(long)]
+        local: bool,
+    },
     /// Emit shell completion setup.
     Completion {
         #[command(subcommand)]
@@ -148,21 +155,8 @@ pub enum Commands {
         #[arg(long, conflicts_with = "param")]
         params_json: Option<String>,
 
-        /// Worker label selector as JSON (e.g. '{"pool":"gpu"}')
-        #[arg(long)]
-        worker_selector: Option<String>,
-
-        /// Worker tolerations as JSON array
-        #[arg(long)]
-        worker_tolerations: Option<String>,
-
-        /// Worker affinity as JSON object
-        #[arg(long)]
-        worker_affinity: Option<String>,
-
-        /// Execution timeout override in seconds (snapshotted onto the execution).
-        #[arg(long)]
-        execution_timeout: Option<i32>,
+        #[command(flatten)]
+        execution_options: ManualExecutionOptions,
 
         /// Watch execution until it completes
         #[arg(short, long)]

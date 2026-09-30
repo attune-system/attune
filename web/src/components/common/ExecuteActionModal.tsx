@@ -80,6 +80,9 @@ export default function ExecuteActionModal({
   const [envVars, setEnvVars] = useState<Array<{ key: string; value: string }>>(
     [{ key: "", value: "" }],
   );
+  const reservedEnvNames = envVars
+    .filter(({ key }) => key.startsWith("ATTUNE_"))
+    .map(({ key }) => key);
   const assignedPermissionSetRefs = user?.assigned_permission_set_refs ?? [];
   const isCoreAdmin = assignedPermissionSetRefs.includes("core.admin");
   const defaultPermissionSetRefs =
@@ -210,8 +213,15 @@ export default function ExecuteActionModal({
       );
 
       if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.message || "Failed to execute action");
+        const error: unknown = await response.json();
+        const message =
+          typeof error === "object" &&
+          error !== null &&
+          "error" in error &&
+          typeof error.error === "string"
+            ? error.error
+            : "Failed to execute action";
+        throw new Error(message);
       }
 
       return response.json();
@@ -232,7 +242,7 @@ export default function ExecuteActionModal({
   };
 
   const handleExecute = async () => {
-    if (!validateForm()) {
+    if (!validateForm() || reservedEnvNames.length > 0) {
       return;
     }
 
@@ -338,8 +348,12 @@ export default function ExecuteActionModal({
         </div>
 
         {executeAction.error && (
-          <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">
-            {(executeAction.error as Error).message}
+          <div
+            role="alert"
+            className="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm"
+          >
+            <p className="font-semibold">Execution was not created</p>
+            <p>{executeAction.error.message}</p>
           </div>
         )}
 
@@ -360,9 +374,23 @@ export default function ExecuteActionModal({
             Environment Variables
           </h4>
           <p className="text-xs text-gray-500 mb-3">
-            Optional environment variables for this execution (e.g., DEBUG,
-            LOG_LEVEL)
+            These values override runtime environment variables. Names beginning
+            with ATTUNE_ are reserved for internal use.
           </p>
+          {reservedEnvNames.length > 0 && (
+            <div
+              role="alert"
+              className="mb-3 p-3 bg-red-50 border border-red-300 text-red-800 rounded-lg text-sm"
+            >
+              <p className="font-semibold">
+                Reserved environment variable names
+              </p>
+              <p>
+                Remove {reservedEnvNames.join(", ")} to execute this action.
+                ATTUNE_ variables are for internal use.
+              </p>
+            </div>
+          )}
           <div className="space-y-2">
             {envVars.map((envVar, index) => (
               <div key={index} className="flex gap-2 items-start">
@@ -609,7 +637,7 @@ export default function ExecuteActionModal({
           </button>
           <button
             onClick={handleExecute}
-            disabled={executeAction.isPending}
+            disabled={executeAction.isPending || reservedEnvNames.length > 0}
             className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 flex items-center gap-2"
           >
             {executeAction.isPending ? (

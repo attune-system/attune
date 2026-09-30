@@ -85,6 +85,7 @@ COPY migrations/ ./migrations/
 # service to build compiles the shared service binaries; subsequent services get
 # a cache hit here and skip straight to the cp below.
 ARG CARGO_BUILD_JOBS=4
+ARG ATTUNE_BUILD_GIT_SHA
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \

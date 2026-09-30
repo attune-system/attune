@@ -3,6 +3,7 @@ use attune_cli::{
     client::{sanitize_url_for_display, ApiClient, ApiError},
     config::CliConfig,
     inquiry::{self, InquiryListFilters},
+    manual_execution::ManualExecutionRequest,
 };
 use axum::{
     extract::State,
@@ -28,6 +29,13 @@ use tokio::sync::Mutex;
     about = "MCP server exposing curated Attune platform tools over stdio or HTTP"
 )]
 struct Cli {
+    /// Print local MCP and selected-profile server build information as JSON, then exit.
+    #[arg(long)]
+    info: bool,
+
+    /// Show only local build information. Requires --info.
+    #[arg(long, requires = "info")]
+    local: bool,
     /// Profile to use (overrides config)
     #[arg(short = 'p', long, env = "ATTUNE_PROFILE")]
     profile: Option<String>,
@@ -100,6 +108,7 @@ struct LoginCredentials {
 
 struct McpServer {
     client: ApiClient,
+    profile: String,
     /// Stored credentials for automatic re-login (None for execution token mode).
     credentials: Option<LoginCredentials>,
     cache_refreshes: HashMap<String, CacheRefreshMetadata>,
@@ -126,11 +135,13 @@ struct CacheRefreshMetadata {
 impl McpServer {
     fn new(
         client: ApiClient,
+        profile: String,
         credentials: Option<LoginCredentials>,
         packs_check_access: PacksCheckAccess,
     ) -> Self {
         Self {
             client,
+            profile,
             credentials,
             cache_refreshes: HashMap::new(),
             cache_refresh_order: VecDeque::new(),
@@ -276,6 +287,10 @@ impl McpServer {
 
     async fn call_tool(&mut self, tool_name: &str, args: &Map<String, Value>) -> Result<Value> {
         match tool_name {
+            "info_get" => serde_json::to_value(
+                attune_cli::info::get_info("attune-mcp", &self.profile, &mut self.client).await,
+            )
+            .context("Failed to serialize build information"),
             "actions_list" => self.list_catalog_path("/actions", args).await,
             "actions_search" => self.actions_search(args).await,
             "actions_get" => {
@@ -285,18 +300,12 @@ impl McpServer {
                     .await
             }
             "actions_execute" => {
-                let action_ref = required_string(args, "action_ref")?;
-                let parameters = optional_object(args, "parameters")?;
-                let env_vars = optional_object(args, "env_vars")?;
+                let request: ManualExecutionRequest =
+                    serde_json::from_value(Value::Object(args.clone()))
+                        .context("Invalid actions_execute arguments")?;
+                request.validate()?;
                 self.client
-                    .post::<Value, _>(
-                        "/executions/execute",
-                        &json!({
-                            "action_ref": action_ref,
-                            "parameters": parameters,
-                            "env_vars": env_vars
-                        }),
-                    )
+                    .post::<Value, _>("/executions/execute", &request)
                     .await
             }
             "artifacts_list" => self.list_path("/artifacts", args).await,
@@ -998,6 +1007,12 @@ impl McpServer {
 fn tool_defs() -> &'static [ToolDef] {
     &[
         ToolDef {
+            name: "info_get",
+            title: "Get local and server build information",
+            description: "Identify the local MCP binary and the API server for its selected profile. Reports semantic versions and full compiled Git SHAs separately. Server errors are reported without hiding local build information.",
+            input_schema: info_schema,
+        },
+        ToolDef {
             name: "actions_list",
             title: "List actions",
             description: "List Attune actions visible to the authenticated user.",
@@ -1277,6 +1292,10 @@ fn tool_defs() -> &'static [ToolDef] {
     ]
 }
 
+fn info_schema() -> Value {
+    json!({"type":"object", "properties":{}, "additionalProperties":false})
+}
+
 fn pagination_schema() -> Value {
     json!({
         "type": "object",
@@ -1339,12 +1358,68 @@ fn id_schema() -> Value {
 }
 
 fn action_execute_schema() -> Value {
+    let selector_term = json!({
+        "type": "object",
+        "properties": {
+            "match_labels": { "type": "object", "additionalProperties": { "type": "string" } },
+            "match_expressions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string", "minLength": 1 },
+                        "operator": { "type": "string", "enum": ["in", "not_in", "exists", "does_not_exist"] },
+                        "values": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["key", "operator"]
+                }
+            }
+        }
+    });
     json!({
         "type": "object",
         "properties": {
-            "action_ref": { "type": "string", "description": "Action ref, for example core.echo" },
+            "action_ref": { "type": "string", "minLength": 1, "description": "Action ref, for example core.echo" },
             "parameters": { "type": "object", "description": "Structured action parameters", "additionalProperties": true },
-            "env_vars": { "type": "object", "description": "Optional execution environment variables", "additionalProperties": { "type": "string" } }
+            "env_vars": { "type": "object", "description": "Execution environment overrides. ATTUNE_ names are reserved and rejected.", "propertyNames": { "not": { "pattern": "^ATTUNE_" } }, "additionalProperties": { "type": "string" } },
+            "permission_set_refs": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Omit to inherit action defaults; [] disables the execution API token." },
+            "artifact_retention_policy": { "type": "string", "enum": ["versions", "days", "hours", "minutes"], "description": "Retention override for non-log artifacts; omit to inherit action defaults." },
+            "artifact_retention_limit": { "type": "integer", "minimum": 1 },
+            "worker_selector": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Worker label selector. Omit to inherit; {} clears action selector requirements. Pack constraints still apply." },
+            "worker_tolerations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string", "minLength": 1 },
+                        "operator": { "type": "string", "enum": ["equal", "exists"], "description": "Defaults to equal." },
+                        "value": { "type": "string" },
+                        "effect": { "type": "string", "enum": ["no_schedule", "prefer_no_schedule"] }
+                    },
+                    "required": ["key"]
+                },
+                "description": "Worker taint tolerations. Omit to inherit; [] clears action tolerations."
+            },
+            "worker_affinity": {
+                "type": "object",
+                "properties": {
+                    "required": { "type": "array", "items": selector_term },
+                    "preferred": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "weight": { "type": "integer", "minimum": 1, "maximum": 100 },
+                                "preference": selector_term
+                            },
+                            "required": ["preference"]
+                        }
+                    },
+                    "anti_affinity": { "type": "array", "items": selector_term }
+                },
+                "description": "Worker affinity terms. Omit to inherit; {} clears action affinity."
+            },
+            "timeout_seconds": { "type": "integer", "minimum": 1, "description": "Execution timeout override. Omit to inherit action or application defaults." }
         },
         "required": ["action_ref"],
         "additionalProperties": false
@@ -2244,6 +2319,7 @@ async fn build_server(cli: &Cli) -> Result<McpServer> {
 
     Ok(McpServer::new(
         ApiClient::from_config(&config, &cli.api_url),
+        config.current_profile.clone(),
         credentials,
         packs_check_access,
     ))
@@ -2315,6 +2391,28 @@ async fn main() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let cli = Cli::parse();
+    if cli.info {
+        if cli.local {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&attune_cli::info::LocalInfo::current("attune-mcp"))?
+            );
+            return Ok(());
+        }
+        let config = build_config(&cli)?;
+        let mut client = ApiClient::from_config_with_timeout(
+            &config,
+            &cli.api_url,
+            std::time::Duration::from_secs(10),
+        );
+        let report =
+            attune_cli::info::get_info("attune-mcp", &config.current_profile, &mut client).await;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.server_available() {
+            anyhow::bail!("Could not fetch server build information");
+        }
+        return Ok(());
+    }
     if cli.verbose {
         tracing_subscriber::fmt()
             .with_writer(io::stderr)
@@ -2342,6 +2440,116 @@ mod tests {
         test_server_with_access(api_url, PacksCheckAccess::Unrestricted)
     }
 
+    #[tokio::test]
+    async fn info_get_reports_the_local_mcp_build_and_the_responding_api_build() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/info"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"version":"9.8.7", "git_sha":"a".repeat(40)}})),
+            )
+            .expect(1)
+            .mount(&api)
+            .await;
+        let report = test_server(api.uri())
+            .call_tool("info_get", &Map::new())
+            .await
+            .unwrap();
+        assert_eq!(report["local"]["binary"], "attune-mcp");
+        assert_eq!(report["local"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(report["server"]["version"], "9.8.7");
+        assert_eq!(report["server"]["status"], "connected");
+        assert_eq!(report["server"]["api_url"], api.uri());
+        assert!(tool_defs().iter().any(|tool| tool.name == "info_get"));
+    }
+
+    #[tokio::test]
+    async fn actions_execute_forwards_all_configuration_and_preserves_empty_overrides() {
+        let api = MockServer::start().await;
+        let args = json!({
+            "action_ref":"core.echo", "parameters":{"message":"hello"},
+            "env_vars":{"LOG_LEVEL":"debug"}, "permission_set_refs":[],
+            "artifact_retention_policy":"minutes", "artifact_retention_limit":30,
+            "worker_selector":{}, "worker_tolerations":[], "worker_affinity":{},
+            "timeout_seconds":600
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/v1/executions/execute"))
+            .and(body_json(args.clone()))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data":{"id":42}})))
+            .expect(1)
+            .mount(&api)
+            .await;
+        let result = test_server(api.uri())
+            .call_tool("actions_execute", args.as_object().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result["id"], 42);
+    }
+
+    #[tokio::test]
+    async fn actions_execute_omits_unspecified_fields() {
+        let api = MockServer::start().await;
+        let args = json!({"action_ref":"core.echo"});
+        Mock::given(method("POST"))
+            .and(path("/api/v1/executions/execute"))
+            .and(body_json(args.clone()))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data":{"id":42}})))
+            .expect(1)
+            .mount(&api)
+            .await;
+        test_server(api.uri())
+            .call_tool("actions_execute", args.as_object().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actions_execute_rejects_reserved_names_and_invalid_values_without_a_request() {
+        let api = MockServer::start().await;
+        let mut server = test_server(api.uri());
+        for extra in [
+            json!({"env_vars":{"ATTUNE_API_TOKEN":"hidden"}}),
+            json!({"env_vars":{"COUNT":3}}),
+            json!({"timeout_seconds":0}),
+            json!({"artifact_retention_limit":-1}),
+            json!({"unexpected":true}),
+        ] {
+            let mut args = extra.as_object().unwrap().clone();
+            args.insert("action_ref".into(), json!("core.echo"));
+            let error = server
+                .call_tool("actions_execute", &args)
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("hidden"));
+        }
+        assert!(api.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn actions_execute_advertises_the_complete_request_contract() {
+        let schema = action_execute_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 10);
+        for field in [
+            "permission_set_refs",
+            "artifact_retention_policy",
+            "artifact_retention_limit",
+            "worker_selector",
+            "worker_tolerations",
+            "worker_affinity",
+            "timeout_seconds",
+        ] {
+            assert!(properties.contains_key(field), "missing {field}");
+        }
+        assert_eq!(
+            schema["properties"]["env_vars"]["additionalProperties"]["type"],
+            "string"
+        );
+        assert_eq!(schema["properties"]["timeout_seconds"]["minimum"], 1);
+    }
+
     fn test_server_with_access(api_url: String, packs_check_access: PacksCheckAccess) -> McpServer {
         let mut config = CliConfig::default();
         config
@@ -2350,6 +2558,7 @@ mod tests {
             .api_url = api_url;
         McpServer::new(
             ApiClient::from_config(&config, &None),
+            config.current_profile.clone(),
             None,
             packs_check_access,
         )
@@ -2391,6 +2600,7 @@ mod tests {
         let config = CliConfig::default();
         let mut server = McpServer::new(
             ApiClient::from_config(&config, &None),
+            config.current_profile.clone(),
             None,
             PacksCheckAccess::Unrestricted,
         );
@@ -3340,6 +3550,8 @@ mod tests {
     #[test]
     fn build_config_applies_token_overrides() {
         let cli = Cli {
+            info: false,
+            local: false,
             profile: None,
             api_url: None,
             transport: Transport::Stdio,
@@ -3362,6 +3574,8 @@ mod tests {
     #[test]
     fn build_config_prefers_execution_token_and_clears_refresh_token() {
         let cli = Cli {
+            info: false,
+            local: false,
             profile: None,
             api_url: None,
             transport: Transport::Stdio,
@@ -3384,6 +3598,8 @@ mod tests {
     #[test]
     fn selected_auth_mode_prefers_execution_token() {
         let cli = Cli {
+            info: false,
+            local: false,
             profile: None,
             api_url: None,
             transport: Transport::Stdio,

@@ -958,6 +958,11 @@ async fn validate_workflow_action_references(
     workflow_ref: &str,
     definition: &serde_json::Value,
 ) -> Result<(), ApiError> {
+    let errors =
+        attune_common::execution_env::component_environment_errors("workflows", definition);
+    if !errors.is_empty() {
+        return Err(ApiError::BadRequest(errors.join("; ")));
+    }
     let workflow: ParsedWorkflowDefinition =
         serde_json::from_value(definition.clone()).map_err(|e| {
             ApiError::BadRequest(format!(

@@ -163,6 +163,7 @@ impl Runtime for NativeRuntime {
 
         let prepared_params =
             parameter_passing::prepare_parameters(&merged_parameters, &mut env, config)?;
+        parameter_passing::merge_execution_environment(&mut env, &context.execution_env);
 
         // Get stdin content if parameters are delivered via stdin
         let parameters_stdin = prepared_params.stdin_content();
@@ -383,6 +384,35 @@ mod tests {
     async fn test_native_runtime_name() {
         let runtime = NativeRuntime::new();
         assert_eq!(runtime.name(), "native");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execution_env_reaches_native_processes_and_preserves_internal_context() {
+        let mut context = ExecutionContext::test_context("test.env".into(), None);
+        context.code_path = Some(PathBuf::from("/usr/bin/env"));
+        context.env.insert("ATTUNE_EXEC_ID".into(), "42".into());
+        context
+            .env
+            .insert("ATTUNE_TEST_OVERRIDE".into(), "internal".into());
+        context.execution_env = std::collections::HashMap::from([
+            ("EXECUTION_ENV_TEST".into(), "visible".into()),
+            ("ATTUNE_EXEC_ID".into(), "bad".into()),
+        ]);
+        let result = NativeRuntime::new().execute(context).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result
+            .stdout
+            .lines()
+            .any(|line| line == "EXECUTION_ENV_TEST=visible"));
+        assert!(result
+            .stdout
+            .lines()
+            .any(|line| line == "ATTUNE_EXEC_ID=42"));
+        assert!(!result
+            .stdout
+            .lines()
+            .any(|line| line == "ATTUNE_EXEC_ID=bad"));
     }
 
     #[tokio::test]

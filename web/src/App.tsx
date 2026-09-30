@@ -16,6 +16,7 @@ const DashboardEditorPage = lazy(
   () => import("@/pages/dashboard/DashboardEditorPage"),
 );
 const UserProfilePage = lazy(() => import("@/pages/profile/UserProfilePage"));
+const InfoPage = lazy(() => import("@/pages/info/InfoPage"));
 const PacksPage = lazy(() => import("@/pages/packs/PacksPage"));
 const PackCreatePage = lazy(() => import("@/pages/packs/PackCreatePage"));
 const PackInstallPage = lazy(() => import("@/pages/packs/PackInstallPage"));
@@ -133,6 +134,7 @@ function App() {
                     element={<DashboardEditorPage />}
                   />
                   <Route path="profile" element={<UserProfilePage />} />
+                  <Route path="info" element={<InfoPage />} />
                   <Route path="packs" element={<PacksPage />} />
                   <Route path="packs/new" element={<PackCreatePage />} />
                   <Route path="packs/install" element={<PackInstallPage />} />

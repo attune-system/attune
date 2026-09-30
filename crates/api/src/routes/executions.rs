@@ -222,6 +222,7 @@ pub async fn create_execution(
         parse_worker_affinity(worker_affinity)
             .map_err(|e| ApiError::BadRequest(format!("Invalid worker_affinity: {e}")))?;
     }
+    request.validate_environment()?;
     if let Some(limit) = request.artifact_retention_limit {
         if limit <= 0 {
             return Err(ApiError::BadRequest(
@@ -310,10 +311,9 @@ pub async fn create_execution(
         action: Some(action.id),
         action_ref: action.r#ref.clone(),
         config: config_for_storage,
-        env_vars: request
-            .env_vars
-            .as_ref()
-            .and_then(|e| serde_json::from_value(e.clone()).ok()),
+        env_vars: request.env_vars.as_ref().map(|env_vars| {
+            serde_json::to_value(env_vars).expect("string environment map must serialize")
+        }),
         parent: parent_from_token,
         enforcement: None,
         executor: executor_identity,

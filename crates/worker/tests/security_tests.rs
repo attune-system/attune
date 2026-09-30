@@ -93,6 +93,7 @@ print(json.dumps(result))
         action_ref: "security.test_environ".to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: {
             let mut s = HashMap::new();
             s.insert(
@@ -158,6 +159,7 @@ async fn test_shell_secrets_not_in_environ() {
         action_ref: "security.test_shell_environ".to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: {
             let mut s = HashMap::new();
             s.insert(
@@ -267,6 +269,7 @@ print(json.dumps({'secret_a': secrets.get('secret_a')}))
         action_ref: "security.action1".to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: {
             let mut s = HashMap::new();
             s.insert("secret_a".to_string(), serde_json::json!("value_a"));
@@ -318,6 +321,7 @@ print(json.dumps({
         action_ref: "security.action2".to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: {
             let mut s = HashMap::new();
             s.insert("secret_b".to_string(), serde_json::json!("value_b"));
@@ -382,6 +386,7 @@ print("ok")
         action_ref: "security.no_secrets".to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: HashMap::new(),
         timeout: Some(10),
         working_dir: None,
@@ -428,6 +433,7 @@ async fn test_shell_empty_secrets() {
         action_ref: "security.no_secrets".to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: HashMap::new(),
         timeout: Some(10),
         working_dir: None,
@@ -519,6 +525,7 @@ echo "PASS: No secrets in environment"
         action_ref: "testpack.check_env".to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: {
             let mut s = HashMap::new();
             s.insert(
@@ -605,6 +612,7 @@ print(json.dumps({"leaked": leaked}))
         action_ref: "testpack.check_env".to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: {
             let mut s = HashMap::new();
             s.insert(

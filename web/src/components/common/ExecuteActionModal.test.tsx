@@ -42,6 +42,63 @@ afterEach(() => {
 });
 
 describe("ExecuteActionModal", () => {
+  it("shows a visible warning and blocks reserved environment names", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <ExecuteActionModal action={action} onClose={vi.fn()} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText("Key"),
+      "ATTUNE_API_TOKEN",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("ATTUNE_API_TOKEN");
+    expect(screen.getByRole("alert")).toHaveTextContent("internal use");
+    expect(screen.getByRole("button", { name: "Execute" })).toBeDisabled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    await userEvent.clear(screen.getByPlaceholderText("Key"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Execute" })).toBeEnabled();
+  });
+
+  it("displays the API rejection and keeps the dialog open", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error:
+              "Environment variable 'ATTUNE_API_URL' uses the reserved ATTUNE_ prefix",
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    const onClose = vi.fn();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <ExecuteActionModal action={action} onClose={onClose} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Execute" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Execution was not created");
+    expect(alert).toHaveTextContent("ATTUNE_API_URL");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("navigates without reloading the application", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ data: { id: 42 } }), {

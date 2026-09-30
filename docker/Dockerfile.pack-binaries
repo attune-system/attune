@@ -29,6 +29,8 @@
 ARG RUST_VERSION=1.98.1
 ARG DEBIAN_VERSION=bookworm
 ARG RUST_TARGET=
+ARG ZIG_VERSION=0.16.0
+ARG CARGO_ZIGBUILD_VERSION=0.23.4
 
 # ============================================================================
 # Stage 1: Builder - Cross-compile statically-linked pack binaries with musl
@@ -37,6 +39,8 @@ FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 
 ARG RUST_TARGET
 ARG TARGETARCH
+ARG ZIG_VERSION
+ARG CARGO_ZIGBUILD_VERSION
 
 # Install build dependencies.
 # - musl-tools: provides the musl libc headers needed for musl target builds
@@ -60,8 +64,8 @@ RUN apt-get update && apt-get install -y \
 # This replaces native musl-gcc and avoids the -m64 flag mismatch that occurs
 # when the host arch doesn't match the target arch (e.g., building x86_64 musl
 # binaries on an arm64 host).
-RUN pip3 install --break-system-packages --no-cache-dir ziglang && \
-    cargo install --locked cargo-zigbuild
+RUN pip3 install --break-system-packages --no-cache-dir "ziglang==${ZIG_VERSION}" && \
+    cargo install --locked --version "${CARGO_ZIGBUILD_VERSION}" cargo-zigbuild
 
 # Resolve the effective musl target from an explicit override or the native
 # container/build architecture so local docker compose on arm64 hosts doesn't

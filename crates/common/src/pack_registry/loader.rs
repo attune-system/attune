@@ -297,6 +297,7 @@ struct TransactionalPackComponentLoader<'a> {
 
 impl TransactionalPackComponentLoader<'_> {
     async fn load_all(&mut self, pack_dir: &Path) -> Result<PackLoadResult> {
+        crate::pack_check::validate_pack_environment(pack_dir)?;
         PlatformCatalogRepository::check_compatibility(&mut *self.connection).await?;
         // Cache definitions load after every other component because their
         // owners must already exist. Validate their deterministic file/schema

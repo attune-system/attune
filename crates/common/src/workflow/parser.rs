@@ -701,8 +701,15 @@ pub struct DecisionBranch {
 
 /// Parse workflow YAML string into WorkflowDefinition
 pub fn parse_workflow_yaml(yaml: &str) -> ParseResult<WorkflowDefinition> {
+    let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
+    let value = serde_json::to_value(&raw)
+        .map_err(|error| ParseError::ValidationError(error.to_string()))?;
+    let errors = crate::execution_env::component_environment_errors("workflows", &value);
+    if !errors.is_empty() {
+        return Err(ParseError::ValidationError(errors.join("; ")));
+    }
     // Parse YAML
-    let mut workflow: WorkflowDefinition = serde_yaml_ng::from_str(yaml)?;
+    let mut workflow: WorkflowDefinition = serde_yaml_ng::from_value(raw)?;
 
     // Normalize legacy transitions into `next` arrays
     normalize_all_transitions(&mut workflow);

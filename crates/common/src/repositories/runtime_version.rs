@@ -101,6 +101,7 @@ impl Create for RuntimeVersionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        crate::execution_env::validate_runtime_environment(&input.execution_config)?;
         let row = sqlx::query_as::<_, RuntimeVersion>(&format!(
             r#"
             INSERT INTO runtime_version (
@@ -140,6 +141,9 @@ impl Update for RuntimeVersionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(config) = &input.execution_config {
+            crate::execution_env::validate_runtime_environment(config)?;
+        }
         let mut query: QueryBuilder<Postgres> = QueryBuilder::new("UPDATE runtime_version SET ");
         let mut has_updates = false;
 

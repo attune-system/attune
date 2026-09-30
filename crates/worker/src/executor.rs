@@ -896,6 +896,16 @@ impl ActionExecutor {
             }
         }
 
+        let execution_env = if let Some(env_vars) = &execution.env_vars {
+            serde_json::from_value::<HashMap<String, String>>(env_vars.clone()).map_err(|_| {
+                Error::Validation(
+                    "Execution env_vars must be an object with string values".to_string(),
+                )
+            })?
+        } else {
+            HashMap::new()
+        };
+
         // Pack/action/system keys are still delivered through the dedicated
         // stdin secret channel. Execution-specific redacted parameters are
         // restored into `parameters` above and remain separate from these
@@ -1056,6 +1066,7 @@ impl ActionExecutor {
             action_ref: execution.action_ref.clone(),
             parameters,
             env,
+            execution_env,
             secrets, // Passed securely via stdin
             timeout,
             working_dir,

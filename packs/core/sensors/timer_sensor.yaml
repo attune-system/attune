@@ -10,7 +10,7 @@ enabled: true
 runner_type: native
 
 # Entry point for sensor execution
-entry_point: attune-core-timer-sensor
+entry_point: timer-sensor-launcher
 
 # All trigger types this sensor monitors
 trigger_types:

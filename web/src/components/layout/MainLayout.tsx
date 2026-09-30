@@ -9,6 +9,7 @@ import {
   ChevronUp,
   User,
   LogOut,
+  Info,
 } from "lucide-react";
 import {
   hasAnyPermission,
@@ -234,6 +235,12 @@ const navSections: NavSection[] = [
         icon: navIcons.runtimes,
         color: "gray",
         permissions: [{ resource: "runtimes" }, { resource: "workers" }],
+      },
+      {
+        to: "/info",
+        label: "System info",
+        icon: Info,
+        color: "gray",
       },
     ],
   },

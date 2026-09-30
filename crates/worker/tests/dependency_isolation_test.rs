@@ -102,6 +102,7 @@ fn make_context(action_ref: &str, entry_point: &str, runtime_name: &str) -> Exec
         action_ref: action_ref.to_string(),
         parameters: HashMap::new(),
         env: HashMap::new(),
+        execution_env: HashMap::new(),
         secrets: HashMap::new(),
         timeout: Some(30),
         working_dir: None,

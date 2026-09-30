@@ -1102,6 +1102,7 @@ impl Runtime for ProcessRuntime {
         };
         let prepared_params =
             parameter_passing::prepare_parameters(&merged_parameters, &mut env, param_config)?;
+        parameter_passing::merge_execution_environment(&mut env, &context.execution_env);
         let mut parameters_stdin = prepared_params.stdin_content();
 
         // Determine working directory: use context override, or pack dir
@@ -1340,6 +1341,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn execution_env_reaches_the_process_and_overrides_runtime_values() {
+        let root = TempDir::new().unwrap();
+        let mut config = make_shell_config();
+        config.env_vars.insert(
+            "LOG_LEVEL".into(),
+            RuntimeEnvVarConfig::Value("info".into()),
+        );
+        let runtime = ProcessRuntime::new(
+            "shell".into(),
+            config,
+            root.path().into(),
+            root.path().join("envs"),
+        );
+        let mut context = ExecutionContext::test_context(
+            "test.env".into(),
+            Some("printf '%s|%s|%s' \"$LOG_LEVEL\" \"$REGION\" \"$ATTUNE_EXEC_ID\"".into()),
+        );
+        context.env.insert("ATTUNE_EXEC_ID".into(), "42".into());
+        context.execution_env = HashMap::from([
+            ("LOG_LEVEL".into(), "debug".into()),
+            ("REGION".into(), "eu-west-1".into()),
+            ("ATTUNE_EXEC_ID".into(), "bad".into()),
+        ]);
+        let result = runtime.execute(context).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "debug|eu-west-1|42");
+    }
+
     fn make_python_config() -> RuntimeExecutionConfig {
         RuntimeExecutionConfig {
             interpreter: InterpreterConfig {
@@ -1560,6 +1590,7 @@ mod tests {
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -1600,6 +1631,7 @@ mod tests {
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -1640,6 +1672,7 @@ mod tests {
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -1736,6 +1769,7 @@ mod tests {
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -1800,6 +1834,7 @@ mod tests {
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -1885,6 +1920,7 @@ mod tests {
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -1969,6 +2005,7 @@ mod tests {
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
             env,
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -2016,6 +2053,7 @@ mod tests {
             action_ref: "adhoc.test".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -2068,6 +2106,7 @@ mod tests {
                 map
             },
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: {
                 let mut map = HashMap::new();
                 map.insert("api_key".to_string(), serde_json::json!("secret-123"));
@@ -2133,6 +2172,7 @@ mod tests {
             action_ref: "testpack.greet".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -2347,6 +2387,7 @@ mod tests {
             action_ref: "adhoc.equal_id".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,
@@ -2404,6 +2445,7 @@ mod tests {
             action_ref: "testpack.pwd".to_string(),
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,

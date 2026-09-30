@@ -9,7 +9,6 @@ import io
 import json
 import os
 import secrets
-import subprocess
 import tarfile
 import time
 import urllib.error
@@ -47,6 +46,30 @@ def token_login(base_url, token):
         method="POST",
     ) as response:
         return json.load(response)["data"]["access_token"]
+
+
+def bundled_pack_version(pack_dir):
+    import yaml
+
+    with (pack_dir / "pack.yaml").open(encoding="utf-8") as source:
+        metadata = yaml.safe_load(source)
+    if metadata.get("ref") != "core" or not metadata.get("version"):
+        raise RuntimeError("bundled core pack metadata is invalid")
+    return str(metadata["version"])
+
+
+def get_active_release(base_url, token):
+    try:
+        with request(
+            f"{base_url}/api/v1/packs/core/releases",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as response:
+            releases = json.load(response)["data"]
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+    return next((release for release in releases if release["is_active"]), None)
 
 
 def deterministic_archive(pack_dir):
@@ -109,31 +132,43 @@ def upload(base_url, token, pack_dir):
             raise RuntimeError(f"core pack upload returned HTTP {response.status}")
 
 
-def create_bootstrap_token(pack_dir):
+def reconcile(base_url, token, pack_dir, expected_version, expected_digest):
+    actual_version = bundled_pack_version(pack_dir)
+    if actual_version != expected_version:
+        raise RuntimeError(
+            f"expected core pack version {expected_version}, bundled version is {actual_version}"
+        )
+
+    active = get_active_release(base_url, token)
+    if active and active["version"] == expected_version:
+        if expected_digest and active["digest"] != expected_digest:
+            raise RuntimeError(
+                f"active core pack {expected_version} has digest {active['digest']}, "
+                f"expected {expected_digest}"
+            )
+        print(f"core pack {expected_version} is already active; skipping upload")
+        return False
+
+    upload(base_url, token, pack_dir)
+    active = get_active_release(base_url, token)
+    if not active or active["version"] != expected_version:
+        actual = active["version"] if active else "none"
+        raise RuntimeError(
+            f"core pack upload activated version {actual}, expected {expected_version}"
+        )
+    if expected_digest and active["digest"] != expected_digest:
+        raise RuntimeError(
+            f"core pack upload produced digest {active['digest']}, expected {expected_digest}"
+        )
+    return True
+
+
+def create_bootstrap_token():
     database_url = (
         f"postgresql://{urllib.parse.quote(os.environ['DB_USER'], safe='')}:"
         f"{urllib.parse.quote(os.environ['DB_PASSWORD'], safe='')}@"
         f"{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}"
     )
-    environment = os.environ.copy()
-    environment["PGOPTIONS"] = f"-c search_path={os.environ['DB_SCHEMA']},public"
-    subprocess.run(
-        [
-            "python3",
-            os.environ.get("LOADER_SCRIPT", "/scripts/load_core_pack.py"),
-            "--database-url",
-            database_url,
-            "--pack-dir",
-            str(pack_dir.parent),
-            "--pack-name",
-            pack_dir.name,
-            "--schema",
-            os.environ["DB_SCHEMA"],
-        ],
-        env=environment,
-        check=True,
-    )
-
     import psycopg2
     from psycopg2 import sql
 
@@ -220,9 +255,19 @@ def main():
     wait_for_api(base_url, deadline)
     if args.command == "publish":
         pack_dir = Path(os.environ.get("SOURCE_PACKS_DIR", "/source/packs")) / "core"
-        database_url, identity_id, integration_token = create_bootstrap_token(pack_dir)
+        expected_version = os.environ.get(
+            "ATTUNE_CORE_PACK_VERSION", bundled_pack_version(pack_dir)
+        )
+        expected_digest = os.environ.get("ATTUNE_CORE_PACK_DIGEST") or None
+        database_url, identity_id, integration_token = create_bootstrap_token()
         try:
-            upload(base_url, token_login(base_url, integration_token), pack_dir)
+            reconcile(
+                base_url,
+                token_login(base_url, integration_token),
+                pack_dir,
+                expected_version,
+                expected_digest,
+            )
         finally:
             delete_bootstrap_identity(database_url, identity_id)
     wait_for_core(base_url, deadline)

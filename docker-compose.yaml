@@ -181,6 +181,7 @@ services:
       dockerfile: docker/Dockerfile.optimized
       args:
         SERVICE: api
+        ATTUNE_BUILD_GIT_SHA: ${ATTUNE_BUILD_GIT_SHA:-}
         BUILDKIT_INLINE_CACHE: 1
     container_name: attune-pack-release-upgrade
     command: ["/usr/local/bin/attune-service", "--upgrade-pack-releases"]
@@ -216,6 +217,7 @@ services:
       dockerfile: docker/Dockerfile.agent
       target: agent-init
       args:
+        ATTUNE_BUILD_GIT_SHA: ${ATTUNE_BUILD_GIT_SHA:-}
         BUILDKIT_INLINE_CACHE: 1
         RUST_TARGET: ${AGENT_RUST_TARGET:-}
     container_name: attune-init-agent
@@ -263,6 +265,7 @@ services:
       dockerfile: docker/Dockerfile.optimized
       args:
         SERVICE: supervisor
+        ATTUNE_BUILD_GIT_SHA: ${ATTUNE_BUILD_GIT_SHA:-}
         BUILDKIT_INLINE_CACHE: 1
     container_name: attune-supervisor
     environment:
@@ -303,6 +306,7 @@ services:
       dockerfile: docker/Dockerfile.optimized
       args:
         SERVICE: api
+        ATTUNE_BUILD_GIT_SHA: ${ATTUNE_BUILD_GIT_SHA:-}
         BUILDKIT_INLINE_CACHE: 1
     container_name: attune-api
     environment:
@@ -364,6 +368,7 @@ services:
       dockerfile: docker/Dockerfile.optimized
       args:
         SERVICE: executor
+        ATTUNE_BUILD_GIT_SHA: ${ATTUNE_BUILD_GIT_SHA:-}
         BUILDKIT_INLINE_CACHE: 1
     container_name: attune-executor-1
     environment:
@@ -415,6 +420,7 @@ services:
       dockerfile: docker/Dockerfile.optimized
       args:
         SERVICE: executor
+        ATTUNE_BUILD_GIT_SHA: ${ATTUNE_BUILD_GIT_SHA:-}
         BUILDKIT_INLINE_CACHE: 1
     container_name: attune-executor-2
     environment:
@@ -840,6 +846,7 @@ services:
       dockerfile: docker/Dockerfile.optimized
       args:
         SERVICE: notifier
+        ATTUNE_BUILD_GIT_SHA: ${ATTUNE_BUILD_GIT_SHA:-}
         BUILDKIT_INLINE_CACHE: 1
     container_name: attune-notifier
     environment:
@@ -882,6 +889,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.mcp
+      args:
+        ATTUNE_BUILD_GIT_SHA: ${ATTUNE_BUILD_GIT_SHA:-}
     container_name: attune-mcp
     profiles:
       - mcp

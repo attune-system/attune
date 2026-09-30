@@ -524,6 +524,7 @@ export class ExecutionsService {
         id: id,
       },
       errors: {
+        403: `Caller is not authorized to cancel the execution`,
         404: `Execution not found`,
         409: `Execution is not in a cancellable state`,
       },

@@ -63,6 +63,7 @@ impl RuleListParams {
 
 /// Request DTO for creating a new rule
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRuleRequest {
     /// Unique reference identifier (e.g., "mypack.notify_on_error")
     #[validate(length(min = 1, max = 255))]
@@ -142,6 +143,7 @@ pub struct CreateRuleRequest {
 
 /// Request DTO for updating a rule
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRuleRequest {
     /// Human-readable label
     #[validate(length(min = 1, max = 255))]

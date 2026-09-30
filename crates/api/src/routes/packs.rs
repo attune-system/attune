@@ -1993,6 +1993,14 @@ async fn register_pack_internal(
         ));
     }
 
+    attune_common::pack_check::validate_pack_environment(
+        replacement
+            .as_ref()
+            .expect("registration source was staged")
+            .staged_path(),
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
     // Test a private copy before changing active files or database rows.
     let mut test_install = None;
     let mut tests_skipped = skip_tests;

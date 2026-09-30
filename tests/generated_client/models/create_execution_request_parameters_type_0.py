@@ -7,12 +7,12 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
-T = TypeVar("T", bound="CreateExecutionRequestEnvVars")
+T = TypeVar("T", bound="CreateExecutionRequestParametersType0")
 
 
 @_attrs_define
-class CreateExecutionRequestEnvVars:
-    """Environment variables for this execution"""
+class CreateExecutionRequestParametersType0:
+    """Execution parameters/configuration"""
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -26,10 +26,10 @@ class CreateExecutionRequestEnvVars:
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
-        create_execution_request_env_vars = cls()
+        create_execution_request_parameters_type_0 = cls()
 
-        create_execution_request_env_vars.additional_properties = d
-        return create_execution_request_env_vars
+        create_execution_request_parameters_type_0.additional_properties = d
+        return create_execution_request_parameters_type_0
 
     @property
     def additional_keys(self) -> list[str]:

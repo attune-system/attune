@@ -12,6 +12,7 @@ pub mod event;
 pub mod execution;
 pub mod external_identity_mapping;
 pub mod history;
+pub mod info;
 pub mod inquiry;
 pub mod key;
 pub mod pack;

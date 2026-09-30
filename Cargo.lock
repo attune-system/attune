@@ -443,7 +443,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "attune-api"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "attune-cli"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "attune-common"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "attune-executor"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "attune-notifier"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "attune-sensor"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "attune-common",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "attune-supervisor"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "attune-common",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "attune-worker"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",

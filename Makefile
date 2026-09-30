@@ -18,6 +18,8 @@
         test-runtime-log-rwx-static check-db-test-threads
 
 TEST_DB_ADMIN_URL ?= postgresql://attune:attune@localhost:5432/postgres
+ATTUNE_BUILD_GIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
+export ATTUNE_BUILD_GIT_SHA
 TEST_DB_URL ?= postgresql://attune:attune@localhost:5432/attune_test
 TEST_THREADS ?= 4
 DB_TEST_THREADS ?= $(TEST_THREADS)
@@ -449,12 +451,12 @@ build-agent:
 
 docker-build-agent:
 	@echo "Building agent Docker image ($(AGENT_RUST_TARGET))..."
-	DOCKER_BUILDKIT=1 docker buildx build --build-arg RUST_TARGET=$(AGENT_RUST_TARGET) --target agent-init -f docker/Dockerfile.agent -t attune-agent:latest .
+	DOCKER_BUILDKIT=1 docker buildx build --build-arg ATTUNE_BUILD_GIT_SHA=$(ATTUNE_BUILD_GIT_SHA) --build-arg RUST_TARGET=$(AGENT_RUST_TARGET) --target agent-init -f docker/Dockerfile.agent -t attune-agent:latest .
 	@echo "✅ Agent image built: attune-agent:latest ($(AGENT_RUST_TARGET))"
 
 docker-build-agent-arm64:
 	@echo "Building arm64 agent Docker image..."
-	DOCKER_BUILDKIT=1 docker buildx build --build-arg RUST_TARGET=aarch64-unknown-linux-musl --target agent-init -f docker/Dockerfile.agent -t attune-agent:arm64 .
+	DOCKER_BUILDKIT=1 docker buildx build --build-arg ATTUNE_BUILD_GIT_SHA=$(ATTUNE_BUILD_GIT_SHA) --build-arg RUST_TARGET=aarch64-unknown-linux-musl --target agent-init -f docker/Dockerfile.agent -t attune-agent:arm64 .
 	@echo "✅ Agent image built: attune-agent:arm64"
 
 docker-build-agent-all:

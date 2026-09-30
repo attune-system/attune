@@ -58,6 +58,8 @@ from .api_response_auth_settings_response import ApiResponseAuthSettingsResponse
 from .api_response_auth_settings_response_data import (
     ApiResponseAuthSettingsResponseData,
 )
+from .api_response_build_info import ApiResponseBuildInfo
+from .api_response_build_info_data import ApiResponseBuildInfoData
 from .api_response_build_pack_envs_response import ApiResponseBuildPackEnvsResponse
 from .api_response_build_pack_envs_response_data import (
     ApiResponseBuildPackEnvsResponseData,
@@ -377,6 +379,7 @@ from .browse_indexed_packs_response_200 import BrowseIndexedPacksResponse200
 from .browse_indexed_packs_response_200_data_item import (
     BrowseIndexedPacksResponse200DataItem,
 )
+from .build_info import BuildInfo
 from .build_pack_envs_request import BuildPackEnvsRequest
 from .build_pack_envs_response import BuildPackEnvsResponse
 from .build_summary import BuildSummary
@@ -475,8 +478,10 @@ from .create_event_request import CreateEventRequest
 from .create_event_request_config import CreateEventRequestConfig
 from .create_event_request_payload import CreateEventRequestPayload
 from .create_execution_request import CreateExecutionRequest
-from .create_execution_request_env_vars import CreateExecutionRequestEnvVars
-from .create_execution_request_parameters import CreateExecutionRequestParameters
+from .create_execution_request_env_vars_type_0 import CreateExecutionRequestEnvVarsType0
+from .create_execution_request_parameters_type_0 import (
+    CreateExecutionRequestParametersType0,
+)
 from .create_execution_request_worker_affinity_type_0 import (
     CreateExecutionRequestWorkerAffinityType0,
 )
@@ -1480,6 +1485,8 @@ __all__ = (
     "ApiResponseAuditEventResponseDataDetailsType0",
     "ApiResponseAuthSettingsResponse",
     "ApiResponseAuthSettingsResponseData",
+    "ApiResponseBuildInfo",
+    "ApiResponseBuildInfoData",
     "ApiResponseBuildPackEnvsResponse",
     "ApiResponseBuildPackEnvsResponseData",
     "ApiResponseBulkEnqueueWorkQueueItemsResponse",
@@ -1643,6 +1650,7 @@ __all__ = (
     "AuthorizationBasis",
     "BrowseIndexedPacksResponse200",
     "BrowseIndexedPacksResponse200DataItem",
+    "BuildInfo",
     "BuildPackEnvsRequest",
     "BuildPackEnvsResponse",
     "BuildSummary",
@@ -1717,8 +1725,8 @@ __all__ = (
     "CreateEventRequestConfig",
     "CreateEventRequestPayload",
     "CreateExecutionRequest",
-    "CreateExecutionRequestEnvVars",
-    "CreateExecutionRequestParameters",
+    "CreateExecutionRequestEnvVarsType0",
+    "CreateExecutionRequestParametersType0",
     "CreateExecutionRequestWorkerAffinityType0",
     "CreateExecutionRequestWorkerSelectorType0",
     "CreateExecutionRequestWorkerTolerationsType0Item",

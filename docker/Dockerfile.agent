@@ -172,6 +172,7 @@ COPY migrations/ ./migrations/
 # Uses cargo-zigbuild so that cross-compilation works regardless of host arch.
 # Uses a dedicated cache ID (agent-target) so the musl target directory
 # doesn't collide with the glibc target cache used by other Dockerfiles.
+ARG ATTUNE_BUILD_GIT_SHA
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,id=agent-target,target=/build/target,sharing=locked \

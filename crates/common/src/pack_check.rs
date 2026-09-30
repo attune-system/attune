@@ -119,6 +119,30 @@ pub fn check_pack(path: impl AsRef<Path>) -> PackCheckReport {
     checker.finish()
 }
 
+/// Enforce environment metadata checks without changing other registration policies.
+pub fn validate_pack_environment(path: impl AsRef<Path>) -> crate::Result<()> {
+    let report = check_pack(path);
+    let errors = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code == "environment.invalid" || diagnostic.code.contains("limit")
+        })
+        .map(|diagnostic| {
+            format!(
+                "{}: {}",
+                diagnostic.path.as_deref().unwrap_or("pack"),
+                diagnostic.message
+            )
+        })
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::Error::Validation(errors.join("\n")))
+    }
+}
+
 impl PackChecker {
     fn run(&mut self) {
         if !self.root.exists() {
@@ -230,6 +254,21 @@ impl PackChecker {
         );
     }
 
+    fn check_environment_metadata(&mut self, component: &str, value: &YamlValue, rel: &str) {
+        match serde_json::to_value(value) {
+            Ok(value) => {
+                for error in crate::execution_env::component_environment_errors(component, &value) {
+                    self.error(Some(rel), "environment.invalid", error);
+                }
+            }
+            Err(error) => self.error(
+                Some(rel),
+                "environment.invalid",
+                format!("Cannot inspect environment metadata: {error}"),
+            ),
+        }
+    }
+
     fn check_worker_placement<T>(
         &mut self,
         map: &Mapping,
@@ -283,6 +322,7 @@ impl PackChecker {
             return;
         };
 
+        self.check_environment_metadata(component, &value, &rel);
         match component {
             "queues" => self.check_queue(path, &rel),
             "dashboards" => self.check_dashboard(&value, &rel),
@@ -590,6 +630,9 @@ impl PackChecker {
             let Some(content) = self.read_text(&path, &rel) else {
                 continue;
             };
+            if let Ok(value) = serde_yaml_ng::from_str::<YamlValue>(&content) {
+                self.check_environment_metadata("workflows", &value, &rel);
+            }
             match parse_workflow_yaml(&content) {
                 Ok(workflow) => {
                     if !workflow.r#ref.is_empty() {
@@ -641,6 +684,9 @@ impl PackChecker {
         let Some(content) = self.read_text(&path, source) else {
             return;
         };
+        if let Ok(value) = serde_yaml_ng::from_str::<YamlValue>(&content) {
+            self.check_environment_metadata("workflows", &value, &self.relative(&path));
+        }
         match parse_workflow_yaml(&content) {
             Ok(workflow) => {
                 if !workflow.r#ref.is_empty() {
@@ -1183,6 +1229,54 @@ mod tests {
         assert!(report.valid, "{:?}", report.diagnostics);
         assert_eq!(report.files_checked, 5);
         assert_eq!(report.pack_ref.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn reserved_environment_metadata_is_reported_and_blocks_registration_preflight() {
+        let root = TempDir::new().unwrap();
+        write(root.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
+        write(root.path(), "actions/run.yaml", "ref: demo.run\nrunner_type: shell\nentry_point: run.sh\nenv_vars:\n  ATTUNE_API_TOKEN: hidden\n");
+        write(root.path(), "actions/run.sh", "#!/bin/sh\n");
+        write(root.path(), "rules/run.yaml", "ref: demo.rule\ntrigger_ref: demo.event\naction_ref: demo.run\nenv_vars:\n  ATTUNE_RULE: hidden\n");
+        write(
+            root.path(),
+            "queues/jobs.yaml",
+            "ref: demo.jobs\naction_ref: demo.run\nenv_vars:\n  ATTUNE_EXEC_ID: hidden\n",
+        );
+        write(root.path(), "runtimes/custom.yaml", "ref: demo.custom\nname: Custom\nexecution_config:\n  env_vars:\n    ATTUNE_API_URL: hidden\nversions:\n  - version: '1.0.0'\n    execution_config:\n      env_vars:\n        ATTUNE_API_TOKEN:\n          value: hidden\n");
+        write(root.path(), "actions/workflows/deploy.workflow.yaml", "version: '1.0'\ntasks:\n  - name: nested\n    tasks:\n      - name: step\n        action: demo.run\n        env_vars:\n          ATTUNE_PACK_REF: hidden\n");
+        let report = check_pack(root.path());
+        assert!(!report.valid);
+        let errors = report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "environment.invalid")
+            .collect::<Vec<_>>();
+        for path in [
+            "actions/run.yaml",
+            "rules/run.yaml",
+            "queues/jobs.yaml",
+            "runtimes/custom.yaml",
+            "actions/workflows/deploy.workflow.yaml",
+        ] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.path.as_deref() == Some(path)),
+                "missing {path}: {errors:?}"
+            );
+        }
+        assert!(errors.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("versions[0].execution_config.env_vars")));
+        assert!(errors
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("hidden")));
+        let error = validate_pack_environment(root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ATTUNE_API_TOKEN"));
+        assert!(error.contains("actions/run.yaml"));
     }
 
     #[test]

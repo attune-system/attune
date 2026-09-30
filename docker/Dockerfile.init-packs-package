@@ -1,14 +1,17 @@
 FROM python:3.11-slim
 
 COPY packs/ /source/packs/
-# publish.yml stages the architecture-matched static binary before this build.
-COPY dist/attune-core-timer-sensor /source/packs/core/sensors/attune-core-timer-sensor
+# Every image carries the same pack bytes so core versions have one digest.
+COPY dist/core-timer-sensor/ /source/packs/core/sensors/bin/
 COPY scripts/load_core_pack.py /scripts/load_core_pack.py
 COPY scripts/bootstrap_core_pack.py /scripts/bootstrap_core_pack.py
 COPY docker/prune-removed-pack-rules.sh /scripts/prune-removed-pack-rules.sh
 COPY docker/init-packs.sh /init-packs.sh
 
 RUN pip install --no-cache-dir psycopg2-binary pyyaml \
-    && chmod +x /init-packs.sh /scripts/bootstrap_core_pack.py /scripts/prune-removed-pack-rules.sh /source/packs/core/sensors/attune-core-timer-sensor
+    && chmod +x /init-packs.sh /scripts/bootstrap_core_pack.py /scripts/prune-removed-pack-rules.sh \
+        /source/packs/core/sensors/timer-sensor-launcher \
+        /source/packs/core/sensors/bin/linux-amd64/attune-core-timer-sensor \
+        /source/packs/core/sensors/bin/linux-arm64/attune-core-timer-sensor
 
 CMD ["/bin/sh", "/init-packs.sh"]

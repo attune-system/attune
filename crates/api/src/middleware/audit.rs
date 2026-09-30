@@ -33,6 +33,7 @@ pub struct RequestId(pub Uuid);
 /// time the UI polls).
 fn is_skipped_path(path: &str) -> bool {
     path == "/health"
+        || path == "/api/v1/info"
         || path == "/healthz"
         || path == "/ready"
         || path.starts_with("/docs")

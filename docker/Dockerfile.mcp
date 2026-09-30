@@ -44,11 +44,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
 
 COPY crates/common/ ./crates/common/
 COPY crates/cli/ ./crates/cli/
+COPY migrations/ ./migrations/
 
+ARG ATTUNE_BUILD_GIT_SHA
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --bin attune-mcp -j 4
+    cargo build --release --bin attune-mcp -j 4 && \
+    cp /build/target/release/attune-mcp /build/attune-mcp
 
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 
@@ -65,7 +68,7 @@ RUN useradd -m -u 1000 attune && \
 
 WORKDIR /opt/attune
 
-COPY --from=builder /build/target/release/attune-mcp /usr/local/bin/attune-mcp
+COPY --from=builder /build/attune-mcp /usr/local/bin/attune-mcp
 
 USER attune
 

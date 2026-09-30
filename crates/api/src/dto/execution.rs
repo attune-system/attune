@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
 use attune_common::models::enums::ExecutionStatus;
@@ -24,12 +25,14 @@ pub struct CreateExecutionRequest {
     pub action_ref: String,
 
     /// Execution parameters/configuration
-    #[schema(value_type = Object, example = json!({"channel": "#alerts", "message": "Manual test"}))]
+    #[serde(default)]
+    #[schema(value_type = Option<Object>, example = json!({"channel": "#alerts", "message": "Manual test"}))]
     pub parameters: Option<JsonValue>,
 
-    /// Environment variables for this execution
-    #[schema(value_type = Object, example = json!({"DEBUG": "true", "LOG_LEVEL": "info"}))]
-    pub env_vars: Option<JsonValue>,
+    /// Environment overrides for this execution. ATTUNE_ names are reserved for internal use.
+    #[serde(default)]
+    #[schema(example = json!({"DEBUG": "true", "LOG_LEVEL": "info"}))]
+    pub env_vars: Option<HashMap<String, String>>,
 
     /// Permission set refs to apply to this execution's API token. Omit to use
     /// the action default. Provide an empty array to force no API token.
@@ -73,6 +76,19 @@ pub struct CreateExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = 300, nullable = true)]
     pub timeout_seconds: Option<i32>,
+}
+
+impl CreateExecutionRequest {
+    pub fn validate_environment(&self) -> attune_common::Result<()> {
+        if let Some(vars) = &self.env_vars {
+            let mut entries = vars.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            for (key, value) in entries {
+                attune_common::execution_env::validate_execution_env_var(key, value)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Response DTO for execution information
@@ -546,6 +562,43 @@ fn default_per_page() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_environment_validation_is_explicit_and_does_not_echo_values() {
+        let request: CreateExecutionRequest = serde_json::from_value(serde_json::json!({
+            "action_ref":"core.echo", "env_vars":{"ATTUNE_API_TOKEN":"hidden"}
+        }))
+        .unwrap();
+        let error = request.validate_environment().unwrap_err().to_string();
+        assert!(error.contains("ATTUNE_API_TOKEN"));
+        assert!(error.contains("reserved ATTUNE_ prefix"));
+        assert!(!error.contains("hidden"));
+        let invalid = serde_json::from_value::<CreateExecutionRequest>(serde_json::json!({
+            "action_ref":"core.echo", "env_vars":{"COUNT":3}
+        }));
+        assert!(invalid.is_err());
+        let valid: CreateExecutionRequest = serde_json::from_value(serde_json::json!({
+            "action_ref":"core.echo", "env_vars":{"LOG_LEVEL":"debug", "EMPTY":""}
+        }))
+        .unwrap();
+        valid.validate_environment().unwrap();
+    }
+
+    #[test]
+    fn unsupported_component_environment_fields_are_not_silently_discarded() {
+        fn assert_rejected<T: serde::de::DeserializeOwned>() {
+            let body = serde_json::json!({"env_vars":{"ATTUNE_API_TOKEN":"hidden"}});
+            let error = match serde_json::from_value::<T>(body) {
+                Ok(_) => panic!("unsupported env_vars field was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("unknown field `env_vars`"), "{error}");
+            assert!(!error.contains("hidden"));
+        }
+        assert_rejected::<crate::dto::action::UpdateActionRequest>();
+        assert_rejected::<crate::dto::rule::UpdateRuleRequest>();
+        assert_rejected::<crate::dto::work_queue::UpdateWorkQueueRequest>();
+    }
 
     #[test]
     fn test_query_params_defaults() {

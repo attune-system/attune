@@ -103,6 +103,9 @@ pub struct ExecutionContext {
     /// Environment variables
     pub env: HashMap<String, String>,
 
+    /// Caller-supplied execution overrides, applied after runtime environment configuration.
+    pub execution_env: HashMap<String, String>,
+
     /// Secrets (passed securely via stdin, not environment variables).
     /// Values are JSON — strings, objects, arrays, numbers, or booleans.
     pub secrets: HashMap<String, serde_json::Value>,
@@ -208,6 +211,7 @@ impl ExecutionContext {
             action_ref,
             parameters: HashMap::new(),
             env: HashMap::new(),
+            execution_env: HashMap::new(),
             secrets: HashMap::new(),
             timeout: Some(10),
             working_dir: None,

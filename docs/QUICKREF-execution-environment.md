@@ -7,6 +7,18 @@
 
 The worker automatically provides standard environment variables to all action executions. These variables provide context about the execution and enable actions to interact with the Attune API.
 
+## Execution environment overrides
+
+Manual execution requests accept `env_vars` as a string-valued object. The CLI exposes `--env KEY=VALUE` and `--env-json JSON`; MCP exposes `actions_execute.env_vars`.
+
+Execution values override runtime-configured and inherited process values. The worker applies execution overrides after runtime configuration, including prepend and append operations. An explicit empty string also overrides the runtime value. Workflow task children inherit their parent execution's environment overrides.
+
+Names beginning with `ATTUNE_` are reserved for internal use. The API rejects an execution request with those names and reports the offending key without its value. The web execution dialog displays a warning and disables submission. CLI and MCP calls also fail with an explicit error. The worker ignores reserved overrides in previously stored rows and logs the rejected key.
+
+Pack check reports reserved environment keys with the component file and field path. Registration rejects these errors before pack tests or component installation, including when tests are skipped. Runtime checks cover `execution_config.env_vars` and each `versions[].execution_config.env_vars` map.
+
+Actions, rules, queues, and workflow tasks do not define execution-environment defaults. Pack check rejects `env_vars` declarations in those metadata locations rather than discarding them. An action parameter named `env_vars` remains ordinary parameter data and does not set the execution environment.
+
 ## Standard Environment Variables
 
 All actions receive the following environment variables:

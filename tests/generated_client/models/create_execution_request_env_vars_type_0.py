@@ -7,14 +7,19 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
-T = TypeVar("T", bound="CreateExecutionRequestParameters")
+T = TypeVar("T", bound="CreateExecutionRequestEnvVarsType0")
 
 
 @_attrs_define
-class CreateExecutionRequestParameters:
-    """Execution parameters/configuration"""
+class CreateExecutionRequestEnvVarsType0:
+    """Environment overrides for this execution. ATTUNE_ names are reserved for internal use.
 
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+    Example:
+        {'DEBUG': 'true', 'LOG_LEVEL': 'info'}
+
+    """
+
+    additional_properties: dict[str, str] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -26,19 +31,19 @@ class CreateExecutionRequestParameters:
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
-        create_execution_request_parameters = cls()
+        create_execution_request_env_vars_type_0 = cls()
 
-        create_execution_request_parameters.additional_properties = d
-        return create_execution_request_parameters
+        create_execution_request_env_vars_type_0.additional_properties = d
+        return create_execution_request_env_vars_type_0
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> Any:
+    def __getitem__(self, key: str) -> str:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: Any) -> None:
+    def __setitem__(self, key: str, value: str) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

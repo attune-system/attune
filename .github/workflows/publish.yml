@@ -20,11 +20,15 @@ env:
   REGISTRY_NAMESPACE: ${{ vars.CONTAINER_REGISTRY_NAMESPACE }}
   GNU_GLIBC_VERSION: "2.28"
   CARGO_TERM_COLOR: always
+  ATTUNE_BUILD_GIT_SHA: ${{ github.sha }}
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
   RUST_MIN_STACK: 67108864
   SQLX_OFFLINE: true
+  RUST_TOOLCHAIN: "1.98.1"
+  ZIG_VERSION: "0.16.0"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
 
 jobs:
   metadata:
@@ -35,6 +39,7 @@ jobs:
       namespace: ${{ steps.meta.outputs.namespace }}
       image_tag: ${{ steps.meta.outputs.image_tag }}
       image_tags: ${{ steps.meta.outputs.image_tags }}
+      core_pack_version: ${{ steps.meta.outputs.core_pack_version }}
       rust_bundle_matrix: ${{ steps.meta.outputs.rust_bundle_matrix }}
       linux_package_matrix: ${{ steps.meta.outputs.linux_package_matrix }}
       rust_image_matrix: ${{ steps.meta.outputs.rust_image_matrix }}
@@ -42,6 +47,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       - name: Resolve tags and registry paths
         id: meta
@@ -91,6 +98,7 @@ jobs:
             echo "namespace=$namespace"
             echo "image_tag=$version"
             echo "image_tags=$image_tags"
+            echo "core_pack_version=$(awk -F '"' '/^version: / { print $2; exit }' packs/core/pack.yaml)"
           } >> "$GITHUB_OUTPUT"
 
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -181,19 +189,23 @@ jobs:
               exit
             }
           ' Cargo.toml)"
-          timer_sensor_version="$(awk -F '"' '/^version = / { print $2; exit }' crates/core-timer-sensor/Cargo.toml)"
-          for manifest in \
-            "workspace package:${workspace_version}" \
-            "core timer sensor:${timer_sensor_version}"; do
-            name="${manifest%%:*}"
-            actual="${manifest#*:}"
-            if [ "$actual" != "$EXPECTED_VERSION" ]; then
-              echo "${name} version '${actual}' does not match release '${EXPECTED_VERSION}'"
-              exit 1
-            fi
-          done
+          if [ "$workspace_version" != "$EXPECTED_VERSION" ]; then
+            echo "workspace package version '${workspace_version}' does not match release '${EXPECTED_VERSION}'"
+            exit 1
+          fi
 
           echo "Release manifests match ${EXPECTED_VERSION}"
+
+      - name: Verify core component versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          if [ -n "$previous_tag" ]; then
+            python3 scripts/check_core_component_versions.py "$previous_tag"
+          else
+            echo "No previous release tag; skipping core component comparison"
+          fi
 
   changes:
     name: Enable Release Publishers
@@ -274,6 +286,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: |
             ${{ matrix.service_rust_target }}
             ${{ matrix.musl_target }}
@@ -312,7 +325,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --user --break-system-packages --no-cache-dir ziglang
+          python3 -m pip install --user --break-system-packages --no-cache-dir "ziglang==${ZIG_VERSION}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install cargo-zigbuild
@@ -320,7 +333,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-            cargo install --locked cargo-zigbuild
+            cargo install --locked --version "${CARGO_ZIGBUILD_VERSION}" cargo-zigbuild
           fi
 
       - name: Build release binaries
@@ -1558,6 +1571,20 @@ jobs:
           name: attune-binaries-${{ matrix.arch }}
           path: dist/artifact
 
+      - name: Download amd64 timer sensor artifact
+        if: matrix.image.name == 'init-packs'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-binaries-amd64
+          path: dist/core-artifacts/amd64
+
+      - name: Download arm64 timer sensor artifact
+        if: matrix.image.name == 'init-packs'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-binaries-arm64
+          path: dist/core-artifacts/arm64
+
       - name: Extract binary bundle
         shell: bash
         run: |
@@ -1588,9 +1615,14 @@ jobs:
               cp dist/artifact/agent/attune dist/attune
               ;;
             init-packs)
-              install -m 0755 \
-                "dist/artifact/${{ matrix.image.source_path }}" \
-                dist/attune-core-timer-sensor
+              for arch in amd64 arm64; do
+                mkdir -p "dist/core-artifacts/${arch}/extracted" "dist/core-timer-sensor/linux-${arch}"
+                tar -xzf "dist/core-artifacts/${arch}/attune-binaries-${arch}.tar.gz" \
+                  -C "dist/core-artifacts/${arch}/extracted"
+                install -m 0755 \
+                  "dist/core-artifacts/${arch}/extracted/pack-binaries/attune-core-timer-sensor" \
+                  "dist/core-timer-sensor/linux-${arch}/attune-core-timer-sensor"
+              done
               ;;
             migrations|init-user)
               ;;
@@ -1656,7 +1688,7 @@ jobs:
               --platform "${{ matrix.platform }}" \
               --entrypoint /bin/sh \
               "$image_ref" \
-              -ec 'test -x /source/packs/core/sensors/attune-core-timer-sensor'
+              -ec 'test -x /source/packs/core/sensors/timer-sensor-launcher && test -x /source/packs/core/sensors/bin/linux-amd64/attune-core-timer-sensor && test -x /source/packs/core/sensors/bin/linux-arm64/attune-core-timer-sensor'
           fi
 
   publish-web-images:
@@ -1854,6 +1886,9 @@ jobs:
           image_base="${{ needs.metadata.outputs.registry }}/${{ needs.metadata.outputs.namespace }}/${{ matrix.repository }}"
 
           IFS=',' read -ra tags <<< "${{ needs.metadata.outputs.image_tags }}"
+          if [ "${{ matrix.repository }}" = "attune/init-packs" ]; then
+            tags+=("core-${{ needs.metadata.outputs.core_pack_version }}")
+          fi
           for tag in "${tags[@]}"; do
             manifest_ref="${image_base}:${tag}"
             amd64_ref="${image_base}:${{ needs.metadata.outputs.image_tag }}-amd64"

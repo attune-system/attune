@@ -77,6 +77,7 @@ pub struct CreateRuntimeRequest {
 
     /// Runtime execution configuration
     #[serde(default)]
+    #[validate(custom(function = "validate_runtime_environment"))]
     #[schema(value_type = Object, example = json!({"interpreter": {"command": "python3"}}))]
     pub execution_config: JsonValue,
 }
@@ -100,8 +101,43 @@ pub struct UpdateRuntimeRequest {
     pub installation: Option<NullableJsonPatch>,
 
     /// Runtime execution configuration
+    #[validate(custom(function = "validate_runtime_environment"))]
     #[schema(value_type = Object, nullable = true)]
     pub execution_config: Option<JsonValue>,
+}
+
+fn validate_runtime_environment(value: &JsonValue) -> Result<(), validator::ValidationError> {
+    let errors = attune_common::execution_env::runtime_environment_errors(value);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        let mut error = validator::ValidationError::new("reserved_environment");
+        error.message = Some(errors.join("; ").into());
+        Err(error)
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_mutations_reject_reserved_environment_keys_with_a_visible_diagnostic() {
+        let config = serde_json::json!({"env_vars":{"ATTUNE_API_TOKEN":"hidden"}});
+        let create: CreateRuntimeRequest = serde_json::from_value(serde_json::json!({
+            "ref":"test.custom", "name":"Custom", "execution_config":config
+        }))
+        .unwrap();
+        let error = create.validate().unwrap_err().to_string();
+        assert!(error.contains("ATTUNE_API_TOKEN"));
+        assert!(error.contains("reserved ATTUNE_ prefix"));
+        assert!(!error.contains("hidden"));
+        let update: UpdateRuntimeRequest = serde_json::from_value(serde_json::json!({
+            "execution_config":config
+        }))
+        .unwrap();
+        assert!(update.validate().is_err());
+    }
 }
 
 /// Explicit patch operation for nullable string fields.

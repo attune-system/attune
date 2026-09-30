@@ -24,6 +24,7 @@ use crate::dto::common::deserialize_double_option;
 use crate::dto::runtime::NullableStringPatch;
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateWorkQueueRequest {
     #[validate(custom(function = "validate_queue_ref_field"))]
     #[schema(example = "core.inbox")]
@@ -108,6 +109,7 @@ pub struct CreateWorkQueueRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateWorkQueueRequest {
     #[validate(custom(function = "validate_pack_ref_patch"))]
     pub pack_ref: Option<NullableStringPatch>,

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-30
+
+### Added
+
+- The System info page and public `/api/v1/info` endpoint report the responding API's semantic version and compiled Git SHA.
+- `attune info`, `attune-mcp --info`, and the MCP `info_get` tool distinguish local client builds from the selected-profile server build. Local-only commands work without configuration or network access.
+- CLI execution commands support environment, permission-set, and artifact-retention overrides. MCP action execution exposes the full backend execution request, including placement and timeout overrides.
+
+### Fixed
+
+- Workers apply execution environment overrides after runtime configuration. Reserved `ATTUNE_` names produce explicit errors in execution requests and component metadata, including during pack check and registration with tests skipped.
+- The web execution dialog displays API rejection messages and warns about reserved environment names before submission.
+
 ## [0.7.2] - 2026-09-29
 
 ### Fixed

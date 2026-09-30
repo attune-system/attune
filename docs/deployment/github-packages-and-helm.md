@@ -28,8 +28,22 @@ packages and signatures to a raw Nexus repository.
 Binary bundles are uploaded as per-architecture workflow artifacts named
 `attune-binaries-amd64` and `attune-binaries-arm64`. Tag builds attach those
 `attune-binaries-{arch}.tar.gz` files directly to the GitHub Release. Each
-bundle includes the static core timer sensor. The matching architecture's
-`init-packs` image includes that binary with the built-in core pack.
+bundle includes the static core timer sensor. Every `init-packs` image contains
+both timer sensor binaries, so all architectures publish the same core pack
+bytes. The workflow also publishes `attune/init-packs:core-<pack-version>` so
+the chart can pin the core artifact independently from the platform image tag.
+
+## Core component versions
+
+The platform, the core pack, and the timer sensor have independent versions.
+`scripts/update-version.sh` updates only the platform workspace version. Change
+`crates/core-timer-sensor/Cargo.toml` only when the timer sensor changes. Change
+`packs/core/pack.yaml` whenever the assembled core pack changes.
+
+The publish workflow compares each core component with the preceding release
+tag. It rejects changed inputs without a version bump. It also rejects a version
+bump when the inputs did not change. The core pack comparison includes the timer
+sensor version, so a timer sensor release requires a core pack release.
 
 ## Required GitHub Repository Configuration
 

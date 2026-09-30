@@ -11,9 +11,11 @@ from ..models.retention_policy_type import RetentionPolicyType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.create_execution_request_env_vars import CreateExecutionRequestEnvVars
-    from ..models.create_execution_request_parameters import (
-        CreateExecutionRequestParameters,
+    from ..models.create_execution_request_env_vars_type_0 import (
+        CreateExecutionRequestEnvVarsType0,
+    )
+    from ..models.create_execution_request_parameters_type_0 import (
+        CreateExecutionRequestParametersType0,
     )
     from ..models.create_execution_request_worker_affinity_type_0 import (
         CreateExecutionRequestWorkerAffinityType0,
@@ -35,12 +37,13 @@ class CreateExecutionRequest:
 
     Attributes:
         action_ref (str): Action reference to execute Example: slack.post_message.
-        env_vars (CreateExecutionRequestEnvVars): Environment variables for this execution
-        parameters (CreateExecutionRequestParameters): Execution parameters/configuration
         artifact_retention_limit (int | None | Unset): Retention limit override for non-log artifacts created by this
             execution.
             Omit to inherit the action default. Example: 10.
         artifact_retention_policy (None | RetentionPolicyType | Unset):
+        env_vars (CreateExecutionRequestEnvVarsType0 | None | Unset): Environment overrides for this execution. ATTUNE_
+            names are reserved for internal use. Example: {'DEBUG': 'true', 'LOG_LEVEL': 'info'}.
+        parameters (CreateExecutionRequestParametersType0 | None | Unset): Execution parameters/configuration
         permission_set_refs (list[str] | None | Unset): Permission set refs to apply to this execution's API token. Omit
             to use
             the action default. Provide an empty array to force no API token. Example: ['core.agent_reader'].
@@ -60,10 +63,10 @@ class CreateExecutionRequest:
     """
 
     action_ref: str
-    env_vars: CreateExecutionRequestEnvVars
-    parameters: CreateExecutionRequestParameters
     artifact_retention_limit: int | None | Unset = UNSET
     artifact_retention_policy: None | RetentionPolicyType | Unset = UNSET
+    env_vars: CreateExecutionRequestEnvVarsType0 | None | Unset = UNSET
+    parameters: CreateExecutionRequestParametersType0 | None | Unset = UNSET
     permission_set_refs: list[str] | None | Unset = UNSET
     timeout_seconds: int | None | Unset = UNSET
     worker_affinity: CreateExecutionRequestWorkerAffinityType0 | None | Unset = UNSET
@@ -74,6 +77,12 @@ class CreateExecutionRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.create_execution_request_env_vars_type_0 import (
+            CreateExecutionRequestEnvVarsType0,
+        )
+        from ..models.create_execution_request_parameters_type_0 import (
+            CreateExecutionRequestParametersType0,
+        )
         from ..models.create_execution_request_worker_affinity_type_0 import (
             CreateExecutionRequestWorkerAffinityType0,
         )
@@ -82,10 +91,6 @@ class CreateExecutionRequest:
         )
 
         action_ref = self.action_ref
-
-        env_vars = self.env_vars.to_dict()
-
-        parameters = self.parameters.to_dict()
 
         artifact_retention_limit: int | None | Unset
         if isinstance(self.artifact_retention_limit, Unset):
@@ -100,6 +105,22 @@ class CreateExecutionRequest:
             artifact_retention_policy = self.artifact_retention_policy.value
         else:
             artifact_retention_policy = self.artifact_retention_policy
+
+        env_vars: dict[str, Any] | None | Unset
+        if isinstance(self.env_vars, Unset):
+            env_vars = UNSET
+        elif isinstance(self.env_vars, CreateExecutionRequestEnvVarsType0):
+            env_vars = self.env_vars.to_dict()
+        else:
+            env_vars = self.env_vars
+
+        parameters: dict[str, Any] | None | Unset
+        if isinstance(self.parameters, Unset):
+            parameters = UNSET
+        elif isinstance(self.parameters, CreateExecutionRequestParametersType0):
+            parameters = self.parameters.to_dict()
+        else:
+            parameters = self.parameters
 
         permission_set_refs: list[str] | None | Unset
         if isinstance(self.permission_set_refs, Unset):
@@ -155,14 +176,16 @@ class CreateExecutionRequest:
         field_dict.update(
             {
                 "action_ref": action_ref,
-                "env_vars": env_vars,
-                "parameters": parameters,
             }
         )
         if artifact_retention_limit is not UNSET:
             field_dict["artifact_retention_limit"] = artifact_retention_limit
         if artifact_retention_policy is not UNSET:
             field_dict["artifact_retention_policy"] = artifact_retention_policy
+        if env_vars is not UNSET:
+            field_dict["env_vars"] = env_vars
+        if parameters is not UNSET:
+            field_dict["parameters"] = parameters
         if permission_set_refs is not UNSET:
             field_dict["permission_set_refs"] = permission_set_refs
         if timeout_seconds is not UNSET:
@@ -178,11 +201,11 @@ class CreateExecutionRequest:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
-        from ..models.create_execution_request_env_vars import (
-            CreateExecutionRequestEnvVars,
+        from ..models.create_execution_request_env_vars_type_0 import (
+            CreateExecutionRequestEnvVarsType0,
         )
-        from ..models.create_execution_request_parameters import (
-            CreateExecutionRequestParameters,
+        from ..models.create_execution_request_parameters_type_0 import (
+            CreateExecutionRequestParametersType0,
         )
         from ..models.create_execution_request_worker_affinity_type_0 import (
             CreateExecutionRequestWorkerAffinityType0,
@@ -196,10 +219,6 @@ class CreateExecutionRequest:
 
         d = dict(src_dict)
         action_ref = d.pop("action_ref")
-
-        env_vars = CreateExecutionRequestEnvVars.from_dict(d.pop("env_vars"))
-
-        parameters = CreateExecutionRequestParameters.from_dict(d.pop("parameters"))
 
         def _parse_artifact_retention_limit(data: object) -> int | None | Unset:
             if data is None:
@@ -232,6 +251,46 @@ class CreateExecutionRequest:
         artifact_retention_policy = _parse_artifact_retention_policy(
             d.pop("artifact_retention_policy", UNSET)
         )
+
+        def _parse_env_vars(
+            data: object,
+        ) -> CreateExecutionRequestEnvVarsType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                env_vars_type_0 = CreateExecutionRequestEnvVarsType0.from_dict(data)
+
+                return env_vars_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CreateExecutionRequestEnvVarsType0 | None | Unset, data)
+
+        env_vars = _parse_env_vars(d.pop("env_vars", UNSET))
+
+        def _parse_parameters(
+            data: object,
+        ) -> CreateExecutionRequestParametersType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                parameters_type_0 = CreateExecutionRequestParametersType0.from_dict(
+                    data
+                )
+
+                return parameters_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CreateExecutionRequestParametersType0 | None | Unset, data)
+
+        parameters = _parse_parameters(d.pop("parameters", UNSET))
 
         def _parse_permission_set_refs(data: object) -> list[str] | None | Unset:
             if data is None:
@@ -338,10 +397,10 @@ class CreateExecutionRequest:
 
         create_execution_request = cls(
             action_ref=action_ref,
-            env_vars=env_vars,
-            parameters=parameters,
             artifact_retention_limit=artifact_retention_limit,
             artifact_retention_policy=artifact_retention_policy,
+            env_vars=env_vars,
+            parameters=parameters,
             permission_set_refs=permission_set_refs,
             timeout_seconds=timeout_seconds,
             worker_affinity=worker_affinity,

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::client::ApiClient;
 use crate::config::CliConfig;
+use crate::manual_execution::{ManualExecutionOptions, ManualExecutionRequest};
 use crate::output::{self, OutputFormat};
 use crate::wait::{
     extract_stdout, spawn_execution_output_watch, wait_for_execution, WaitOptions,
@@ -161,21 +162,8 @@ pub enum ExecutionCommands {
         #[arg(long, conflicts_with_all = ["param", "interactive"])]
         params_json: Option<String>,
 
-        /// Worker label selector as JSON (e.g. '{"pool":"gpu"}')
-        #[arg(long)]
-        worker_selector: Option<String>,
-
-        /// Worker tolerations as JSON array
-        #[arg(long)]
-        worker_tolerations: Option<String>,
-
-        /// Worker affinity as JSON object
-        #[arg(long)]
-        worker_affinity: Option<String>,
-
-        /// Execution timeout override in seconds (snapshotted onto the execution).
-        #[arg(long)]
-        execution_timeout: Option<i32>,
+        #[command(flatten)]
+        execution_options: ManualExecutionOptions,
 
         /// Watch the new execution until it completes
         #[arg(short, long)]
@@ -426,10 +414,7 @@ pub async fn handle_execution_command(
             interactive,
             param,
             params_json,
-            worker_selector,
-            worker_tolerations,
-            worker_affinity,
-            execution_timeout,
+            execution_options,
             watch,
             timeout,
             notifier_url,
@@ -440,10 +425,7 @@ pub async fn handle_execution_command(
                 interactive,
                 param,
                 params_json,
-                worker_selector,
-                worker_tolerations,
-                worker_affinity,
-                execution_timeout,
+                execution_options,
                 watch,
                 timeout,
                 notifier_url,
@@ -618,20 +600,6 @@ async fn handle_watch_execution(
     render_watched_execution_summary(summary, output_format, suppress_final_stdout)
 }
 
-#[derive(Debug, Serialize)]
-struct ExecuteActionRequest {
-    action_ref: String,
-    parameters: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    worker_selector: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    worker_tolerations: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    worker_affinity: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeout_seconds: Option<i32>,
-}
-
 fn parse_param_overrides(params: &[String]) -> Result<Vec<(String, serde_json::Value)>> {
     let mut overrides = Vec::with_capacity(params.len());
     for p in params {
@@ -711,10 +679,7 @@ async fn handle_rerun(
     interactive: bool,
     params: Vec<String>,
     params_json: Option<String>,
-    worker_selector: Option<String>,
-    worker_tolerations: Option<String>,
-    worker_affinity: Option<String>,
-    execution_timeout: Option<i32>,
+    execution_options: ManualExecutionOptions,
     watch: bool,
     timeout: u64,
     notifier_url: Option<String>,
@@ -772,27 +737,12 @@ async fn handle_rerun(
         ));
     }
 
-    let selector = worker_selector
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .context("Invalid --worker-selector JSON")?;
-    let tolerations = worker_tolerations
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .context("Invalid --worker-tolerations JSON")?;
-    let affinity = worker_affinity
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .context("Invalid --worker-affinity JSON")?;
-
-    let request = ExecuteActionRequest {
-        action_ref: original.action_ref.clone(),
+    let request = ManualExecutionRequest::new(
+        original.action_ref.clone(),
         parameters,
-        worker_selector: selector,
-        worker_tolerations: tolerations,
-        worker_affinity: affinity,
-        timeout_seconds: execution_timeout,
-    };
+        execution_options.parse()?,
+    );
+    request.validate()?;
 
     let new_execution: ExecutionDetail = client.post("/executions/execute", &request).await?;
 

@@ -12,6 +12,7 @@ use attune_common::scheduling::{WorkerAffinity, WorkerToleration};
 
 /// Request DTO for creating a new action
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateActionRequest {
     /// Unique reference identifier (e.g., "core.http", "aws.ec2.start_instance")
     #[validate(length(min = 1, max = 255))]
@@ -135,6 +136,7 @@ pub struct CreateActionRequest {
 
 /// Request DTO for updating an action
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateActionRequest {
     /// Human-readable label
     #[validate(length(min = 1, max = 255))]

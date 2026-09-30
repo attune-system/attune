@@ -13,6 +13,7 @@ pub mod executions;
 pub mod external_identity_mappings;
 pub mod health;
 pub mod history;
+pub mod info;
 pub mod inquiries;
 pub mod inquiry_callbacks;
 pub mod internal_files;

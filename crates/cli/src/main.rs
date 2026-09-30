@@ -42,6 +42,30 @@ async fn main() {
     // Avoid normal output initialization so completion never creates a default
     // config. API-backed completion may refresh credentials in an existing one.
     match &cli.command {
+        Commands::Info { local: true } => {
+            if cli.output == Some(CliOutputFormat::Ndjson) {
+                eprintln!(
+                    "Error: --output ndjson is only supported by 'attune cache entry scan --all'"
+                );
+                process::exit(1);
+            }
+            let format = if cli.json {
+                output::OutputFormat::Json
+            } else if cli.yaml {
+                output::OutputFormat::Yaml
+            } else {
+                cli.output
+                    .map(output::OutputFormat::from)
+                    .unwrap_or(output::OutputFormat::Table)
+            };
+            if let Err(error) =
+                attune_cli::info::handle(&cli.profile, &cli.api_url, true, format).await
+            {
+                eprintln!("Error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
         Commands::Completion { command } => {
             handle_completion(*command).unwrap_or_else(|error| {
                 eprintln!("Error: {error}");
@@ -87,6 +111,9 @@ async fn main() {
     let output_format = config_for_format.effective_format(cli_override);
 
     let result = match cli.command {
+        Commands::Info { local } => {
+            attune_cli::info::handle(&cli.profile, &cli.api_url, local, output_format).await
+        }
         Commands::Completion { command } => handle_completion(command),
         Commands::Complete { cursor, words } => {
             attune_cli::completion::print_candidates(
@@ -222,10 +249,7 @@ async fn main() {
             action_ref,
             param,
             params_json,
-            worker_selector,
-            worker_tolerations,
-            worker_affinity,
-            execution_timeout,
+            execution_options,
             watch,
             timeout,
             notifier_url,
@@ -237,10 +261,7 @@ async fn main() {
                     action_ref,
                     param,
                     params_json,
-                    worker_selector,
-                    worker_tolerations,
-                    worker_affinity,
-                    execution_timeout,
+                    execution_options,
                     watch,
                     timeout,
                     notifier_url,

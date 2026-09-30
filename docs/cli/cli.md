@@ -252,6 +252,10 @@ The scripts complete commands and options without contacting Attune. Dynamic
 action and parameter candidates use the active profile. If the API is not
 available, completion returns only local candidates.
 
+### Build information
+
+Build identity for the local CLI and its selected-profile server is available through `attune info`. `attune info --local` reports only the local binary. MCP exposes `info_get` and `attune-mcp --info`. See [Build information](../deployment/build-information.md) for output fields and build-time SHA configuration.
+
 ### Action Management
 
 #### List Actions
@@ -280,7 +284,63 @@ attune action execute core.long_task --watch
 
 # Watch with timeout
 attune action execute core.long_task --watch --timeout 600
+
+# Configure an execution independently of how long the CLI watches it
+attune action execute core.long_task \
+  --env LOG_LEVEL=debug \
+  --permission-set standard \
+  --artifact-retention-policy hours \
+  --artifact-retention-limit 24 \
+  --worker-selector '{"pool":"batch"}' \
+  --execution-timeout 1800 \
+  --watch --timeout 1900
+
+# Disable the execution API token and provide string-valued environment overrides
+attune run core.echo \
+  --param message=hello \
+  --env-json '{"LOG_LEVEL":"debug","DEBUG":"true"}' \
+  --no-api-token
 ```
+
+`action execute`, `run`, and `execution rerun` accept the same execution options:
+
+| Option | Request behavior |
+| --- | --- |
+| `--env KEY=VALUE` | Repeatable string assignments. Values remain strings, including `true` and `3`. |
+| `--env-json JSON` | String-valued JSON object. Conflicts with `--env`. |
+| `--permission-set REF` | Repeatable explicit execution-token permission sets. Omission inherits action defaults. |
+| `--no-api-token` | Sends an empty permission list. Conflicts with `--permission-set`. |
+| `--artifact-retention-policy` | `versions`, `days`, `hours`, or `minutes`. Applies to non-log artifacts. |
+| `--artifact-retention-limit` | Positive retention limit. Omission inherits the action default. |
+| `--worker-selector JSON` | Worker label requirements. `{}` clears the action selector. |
+| `--worker-tolerations JSON` | Worker taint tolerations. `[]` clears action tolerations. |
+| `--worker-affinity JSON` | Required, preferred, and anti-affinity terms. `{}` clears action affinity. |
+| `--execution-timeout SECONDS` | Positive execution timeout. Omission inherits the action or application default. |
+
+Execution environment values override runtime values and inherited process values. Names beginning with `ATTUNE_` are reserved and rejected. Environment values cannot contain NUL. Names cannot be empty or contain `=` or NUL.
+
+Omitted placement options inherit action defaults. Pack placement constraints still apply after an action override. `--timeout` limits the CLI watch duration; it does not change the execution timeout.
+
+Rerun reuses the previous parameters. Execution options supplied to rerun configure the new execution; omitted options use the current action defaults.
+
+The MCP `actions_execute` tool accepts the same API fields directly:
+
+```json
+{
+  "action_ref": "core.echo",
+  "parameters": {"message": "hello"},
+  "env_vars": {"LOG_LEVEL": "debug"},
+  "permission_set_refs": [],
+  "artifact_retention_policy": "hours",
+  "artifact_retention_limit": 24,
+  "worker_selector": {},
+  "worker_tolerations": [],
+  "worker_affinity": {},
+  "timeout_seconds": 600
+}
+```
+
+Only `action_ref` is required. Unspecified MCP fields remain omitted. Empty permission and placement collections keep the same clearing semantics as the CLI. Execution creation is asynchronous; use `executions_get` to inspect progress.
 
 Watched commands derive the notifier WebSocket from the API origin. For a
 separate notifier origin, pass `--notifier-url` or set

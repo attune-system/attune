@@ -18,13 +18,13 @@ export type CreateExecutionRequest = {
   artifact_retention_limit?: number | null;
   artifact_retention_policy?: null | RetentionPolicyType;
   /**
-   * Environment variables for this execution
+   * Environment overrides for this execution. ATTUNE_ names are reserved for internal use.
    */
-  env_vars: Record<string, any>;
+  env_vars?: any | null;
   /**
    * Execution parameters/configuration
    */
-  parameters: Record<string, any>;
+  parameters?: any | null;
   /**
    * Permission set refs to apply to this execution's API token. Omit to use
    * the action default. Provide an empty array to force no API token.

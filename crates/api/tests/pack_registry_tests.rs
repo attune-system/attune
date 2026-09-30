@@ -77,6 +77,37 @@ print("Test action executed")
 }
 
 #[tokio::test]
+async fn registration_rejects_reserved_environment_metadata_even_when_tests_are_skipped(
+) -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    for (index, (file, content)) in [
+        ("actions/run.yaml", "ref: run\nrunner_type: shell\nentry_point: run.sh\nenv_vars:\n  ATTUNE_API_TOKEN: hidden-value\n"),
+        ("rules/run.yaml", "ref: run\ntrigger_ref: core.timer\naction_ref: core.echo\nenv_vars:\n  ATTUNE_RULE: hidden-value\n"),
+        ("queues/run.yaml", "ref: run\naction_ref: core.echo\nenv_vars:\n  ATTUNE_EXEC_ID: hidden-value\n"),
+        ("actions/workflows/run.workflow.yaml", "version: '1.0'\ntasks:\n  - name: run\n    action: core.echo\n    env_vars:\n      ATTUNE_PACK_REF: hidden-value\n"),
+        ("runtimes/run.yaml", "ref: run\nname: Custom\nexecution_config: {}\nversions:\n  - version: '1.0.0'\n    execution_config:\n      env_vars:\n        ATTUNE_API_URL: hidden-value\n"),
+    ].into_iter().enumerate() {
+        let pack_ref = format!("env_check_{index}");
+        let source = create_test_pack_dir(&pack_ref, "1.0.0")?;
+        let metadata_path = source.path().join(file);
+        fs::create_dir_all(metadata_path.parent().unwrap())?;
+        fs::write(&metadata_path, content)?;
+        let response = ctx.post("/api/v1/packs/register", json!({
+            "path":source.path().to_str().unwrap(), "force":true, "skip_tests":true
+        }), ctx.token()).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json().await?;
+        let error = body["error"].as_str().expect("visible API error");
+        assert!(error.contains(file), "{error}");
+        assert!(error.contains("ATTUNE_"), "{error}");
+        assert!(!error.contains("hidden-value"));
+        assert!(PackRepository::find_by_ref(&ctx.pool, &pack_ref).await?.is_none());
+        assert!(!ctx.test_packs_dir.join(pack_ref).exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_pack_rejects_non_access_tokens_before_pack_lookup() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let jwt_config = JwtConfig {

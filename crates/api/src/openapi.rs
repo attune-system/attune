@@ -123,6 +123,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::health::readiness,
         crate::routes::health::liveness,
         crate::routes::health::content,
+        crate::routes::info::get_info,
 
         // Authentication
         crate::routes::auth::auth_settings,
@@ -718,6 +719,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
     modifiers(&SecurityAddon),
     tags(
         (name = "health", description = "Health check endpoints"),
+        (name = "info", description = "Public API process build identity"),
         (name = "auth", description = "Authentication and authorization endpoints"),
         (name = "packs", description = "Pack management endpoints"),
         (name = "actions", description = "Action management endpoints"),
@@ -897,12 +899,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 193,
+            path_count, 194,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 254,
+            operation_count, 255,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1532,6 +1534,17 @@ mod tests {
             )
             .is_none(),
             "worker_affinity must not declare a schema default; openapi-python-client rejects defaults on oneOf model properties"
+        );
+    }
+
+    #[test]
+    fn manual_execution_environment_and_parameters_are_optional_and_env_values_are_strings() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schema = &spec["components"]["schemas"]["CreateExecutionRequest"];
+        assert_eq!(schema["required"], serde_json::json!(["action_ref"]));
+        assert_eq!(
+            schema["properties"]["env_vars"]["additionalProperties"]["type"],
+            "string"
         );
     }
 
