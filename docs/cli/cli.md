@@ -117,14 +117,23 @@ attune auth login --username admin
 # Prompts for password securely
 ```
 
-#### SSO Login (OIDC)
+#### SSO login with a device code
 ```bash
 attune auth sso-login
-# Opens a browser and saves the returned tokens to the active profile
+# Displays the verification URL and user code, then opens the provider's approval page
 
 attune auth sso-login --no-browser
-# Prints the login URL for headless environments
+# Approve in a browser on any machine; the CLI uses outbound requests only
+
+attune auth sso-login --save-profile production --url https://attune.example.com --no-browser --timeout 300
 ```
+
+SSO uses the OAuth 2.0 Device Authorization Grant from RFC 8628. The CLI opens no
+local port or callback server. It polls Attune until approval, denial, or expiry,
+and saves credentials to the selected profile only after successful approval.
+The provider must advertise `device_authorization_endpoint` and enable the device
+grant for the configured client. See [OIDC device login](../deployment/oidc-device-login.md)
+for server and provider configuration.
 
 #### Passwordless Token Login
 ```bash

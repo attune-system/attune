@@ -164,6 +164,20 @@ export function useDeletePackIndex() {
   });
 }
 
+export function useRefreshPackIndex() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) =>
+      PacksService.browseIndexedPacks({
+        registryId: id,
+        includeDisabled: true,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["indexed-packs"] });
+    },
+  });
+}
+
 export function useIndexedPacks(query?: string) {
   return useQuery({
     queryKey: ["indexed-packs", query],

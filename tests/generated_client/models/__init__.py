@@ -673,6 +673,8 @@ from .delete_permission_set_role_assignment_response_200_data import (
     DeletePermissionSetRoleAssignmentResponse200Data,
 )
 from .dependency_error import DependencyError
+from .device_poll_request import DevicePollRequest
+from .device_wait_reason import DeviceWaitReason
 from .download_packs_request import DownloadPacksRequest
 from .download_packs_response import DownloadPacksResponse
 from .downloaded_pack import DownloadedPack
@@ -925,6 +927,33 @@ from .nullable_json_patch_type_1 import NullableJsonPatchType1
 from .nullable_json_patch_type_1_op import NullableJsonPatchType1Op
 from .nullable_string_patch_type_1 import NullableStringPatchType1
 from .nullable_string_patch_type_1_op import NullableStringPatchType1Op
+from .oidc_device_poll_response_200 import OidcDevicePollResponse200
+from .oidc_device_poll_response_200_data_type_0 import (
+    OidcDevicePollResponse200DataType0,
+)
+from .oidc_device_poll_response_200_data_type_0_status import (
+    OidcDevicePollResponse200DataType0Status,
+)
+from .oidc_device_poll_response_200_data_type_1 import (
+    OidcDevicePollResponse200DataType1,
+)
+from .oidc_device_poll_response_200_data_type_1_status import (
+    OidcDevicePollResponse200DataType1Status,
+)
+from .oidc_device_poll_response_200_data_type_2 import (
+    OidcDevicePollResponse200DataType2,
+)
+from .oidc_device_poll_response_200_data_type_2_status import (
+    OidcDevicePollResponse200DataType2Status,
+)
+from .oidc_device_poll_response_200_data_type_3 import (
+    OidcDevicePollResponse200DataType3,
+)
+from .oidc_device_poll_response_200_data_type_3_status import (
+    OidcDevicePollResponse200DataType3Status,
+)
+from .oidc_device_start_response_200 import OidcDeviceStartResponse200
+from .oidc_device_start_response_200_data import OidcDeviceStartResponse200Data
 from .owner_type import OwnerType
 from .pack_contents import PackContents
 from .pack_dependencies import PackDependencies
@@ -1846,6 +1875,8 @@ __all__ = (
     "DeletePermissionSetRoleAssignmentResponse200",
     "DeletePermissionSetRoleAssignmentResponse200Data",
     "DependencyError",
+    "DevicePollRequest",
+    "DeviceWaitReason",
     "DownloadPacksRequest",
     "DownloadPacksResponse",
     "DownloadedPack",
@@ -2022,6 +2053,17 @@ __all__ = (
     "NullableJsonPatchType1Op",
     "NullableStringPatchType1",
     "NullableStringPatchType1Op",
+    "OidcDevicePollResponse200",
+    "OidcDevicePollResponse200DataType0",
+    "OidcDevicePollResponse200DataType0Status",
+    "OidcDevicePollResponse200DataType1",
+    "OidcDevicePollResponse200DataType1Status",
+    "OidcDevicePollResponse200DataType2",
+    "OidcDevicePollResponse200DataType2Status",
+    "OidcDevicePollResponse200DataType3",
+    "OidcDevicePollResponse200DataType3Status",
+    "OidcDeviceStartResponse200",
+    "OidcDeviceStartResponse200Data",
     "OwnerType",
     "PackContents",
     "PackDependencies",

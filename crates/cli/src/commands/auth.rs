@@ -1,10 +1,10 @@
 use anyhow::Result;
-use axum::{extract::State, response::Html, routing::post, Form, Router};
+use attune_common::device_auth::{
+    DeviceAuthorizationResponse, DevicePollResponse, DeviceWaitReason,
+};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
-use urlencoding;
+use std::time::Duration;
 
 use crate::client::ApiClient;
 use crate::config::CliConfig;
@@ -30,7 +30,7 @@ pub enum AuthCommands {
         #[arg(long)]
         save_profile: Option<String>,
     },
-    /// Log in using SSO (OIDC) — opens a browser window for authentication
+    /// Log in using the OIDC Device Authorization Grant, without a local listener.
     SsoLogin {
         /// API URL to log in to (saved into the profile for future use)
         #[arg(long)]
@@ -40,9 +40,9 @@ pub enum AuthCommands {
         #[arg(long)]
         save_profile: Option<String>,
 
-        /// Local port for the OAuth callback server (default: random available port)
+        /// Maximum wait in seconds. Defaults to the provider's device-code lifetime.
         #[arg(long)]
-        port: Option<u16>,
+        timeout: Option<u64>,
 
         /// Print the login URL instead of opening a browser (useful for headless environments)
         #[arg(long)]
@@ -205,14 +205,14 @@ pub async fn handle_auth_command(
         AuthCommands::SsoLogin {
             url,
             save_profile,
-            port,
+            timeout,
             no_browser,
         } => {
             let effective_api_url = url.or_else(|| api_url.clone());
             handle_sso_login(
                 save_profile.as_ref().or(profile.as_ref()),
                 &effective_api_url,
-                port,
+                timeout,
                 no_browser,
                 output_format,
             )
@@ -261,41 +261,15 @@ pub async fn handle_auth_command(
 async fn handle_sso_login(
     profile: Option<&String>,
     api_url: &Option<String>,
-    port: Option<u16>,
+    timeout: Option<u64>,
     no_browser: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
-    let mut config = CliConfig::load()?;
+    let config = CliConfig::load()?;
     let target_profile_name = profile
         .cloned()
         .unwrap_or_else(|| config.current_profile.clone());
 
-    // Resolve / create the target profile so we know the base API URL.
-    if !config.profiles.contains_key(&target_profile_name) {
-        let url = api_url
-            .clone()
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-        use crate::config::Profile;
-        config.set_profile(
-            target_profile_name.clone(),
-            Profile {
-                api_url: url,
-                auth_token: None,
-                refresh_token: None,
-                output_format: None,
-                description: None,
-                auth_method: None,
-                username: None,
-            },
-        )?;
-    } else if let Some(url) = api_url {
-        if let Some(p) = config.profiles.get_mut(&target_profile_name) {
-            p.api_url = url.clone();
-        }
-        config.save()?;
-    }
-
-    let config = CliConfig::load()?;
     let base_api_url = api_url.clone().unwrap_or_else(|| {
         config
             .profiles
@@ -304,81 +278,67 @@ async fn handle_sso_login(
             .unwrap_or_else(|| config.effective_api_url(&None))
     });
 
-    // Bind the local callback server to a random (or explicit) port.
-    let listener = {
-        let addr = format!(
-            "127.0.0.1:{}",
-            port.unwrap_or(0) // 0 → OS picks a free port
-        );
-        tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to bind local callback server: {e}"))?
-    };
-    let local_port = listener.local_addr()?.port();
-    let callback_uri = format!("http://localhost:{local_port}/callback");
-
-    // Channel: the callback route sends the received tokens back to this task.
-    let (tx, rx) = oneshot::channel::<SsoCallbackTokens>();
-    let tx = Arc::new(Mutex::new(Some(tx)));
-
-    // Build a minimal Axum router for the local callback server.
-    // Accepts POST from the API's auto-submitting form (tokens in body, not URL).
-    let app = Router::new()
-        .route("/callback", post(sso_callback_handler))
-        .with_state(tx.clone());
-
-    let server = axum::serve(listener, app);
-    // Wrap in a cancellable future so we can shut the server down after receiving tokens.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_handle = tokio::spawn(async move {
-        let _ = server
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-    });
-
-    // Build the login URL pointing at the API's OIDC entry point.
-    let login_url = format!(
-        "{}/auth/oidc/login?cli_redirect_uri={}",
-        base_api_url.trim_end_matches('/'),
-        urlencoding::encode(&callback_uri),
+    validate_sso_uri(&base_api_url)?;
+    if timeout == Some(0) {
+        anyhow::bail!("--timeout must be greater than zero");
+    }
+    let client = ApiClient::from_config_with_timeout(
+        &config,
+        &Some(base_api_url.clone()),
+        // A successful poll can perform four sequential ten-second provider requests.
+        Duration::from_secs(60),
     );
-
-    if no_browser {
-        output::print_info("Open the following URL in your browser to complete SSO login:");
-        println!("{login_url}");
-    } else {
-        output::print_info("Opening browser for SSO login...");
-        if let Err(e) = open_browser(&login_url) {
-            output::print_warning(&format!(
-                "Could not open browser automatically: {e}\nOpen this URL manually: {login_url}"
-            ));
+    let authorization: DeviceAuthorizationResponse = client
+        .post_anonymous("/auth/oidc/device/start", &serde_json::json!({}))
+        .await?;
+    validate_sso_uri(&authorization.verification_uri)?;
+    if let Some(uri) = &authorization.verification_uri_complete {
+        validate_sso_uri(uri)?;
+    }
+    if authorization.user_code.is_empty() || authorization.user_code.chars().any(char::is_control) {
+        anyhow::bail!("Authentication server returned an invalid user code");
+    }
+    eprintln!(
+        "Go to {} and enter code {}.",
+        authorization.verification_uri, authorization.user_code
+    );
+    let browser_uri = authorization
+        .verification_uri_complete
+        .as_deref()
+        .unwrap_or(&authorization.verification_uri);
+    if !no_browser {
+        if let Err(error) = open_browser(browser_uri) {
+            eprintln!(
+                "Could not open the browser: {error}. Use the URL and code above on any device."
+            );
         }
     }
-    output::print_info("Waiting for authentication (press Ctrl+C to cancel)...");
-
-    // Wait for the callback with a 5-minute timeout.
-    let tokens = tokio::time::timeout(std::time::Duration::from_secs(300), rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("SSO login timed out after 5 minutes"))?
-        .map_err(|_| anyhow::anyhow!("SSO callback server shut down unexpectedly"))?;
-
-    // Shut down the local server gracefully (allow response to be sent to browser).
-    let _ = shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_handle).await;
+    eprintln!("Waiting for approval. Press Ctrl+C to cancel.");
+    let tokens = tokio::select! {
+        result = poll_device_login(&client, authorization, timeout) => result?,
+        _ = tokio::signal::ctrl_c() => anyhow::bail!("SSO device login cancelled"),
+    };
 
     // Persist tokens.
     let mut config = CliConfig::load()?;
-    if let Some(p) = config.profiles.get_mut(&target_profile_name) {
-        p.auth_token = Some(tokens.access_token.clone());
-        p.refresh_token = Some(tokens.refresh_token.clone());
-        p.auth_method = Some("sso".to_string());
-        p.username = None;
-        config.save()?;
-    } else {
-        config.set_auth(tokens.access_token.clone(), tokens.refresh_token.clone())?;
-    }
+    let p = config
+        .profiles
+        .entry(target_profile_name.clone())
+        .or_insert_with(|| crate::config::Profile {
+            api_url: base_api_url.clone(),
+            auth_token: None,
+            refresh_token: None,
+            output_format: None,
+            description: None,
+            auth_method: None,
+            username: None,
+        });
+    p.api_url = base_api_url;
+    p.auth_token = Some(tokens.access_token.clone());
+    p.refresh_token = Some(tokens.refresh_token.clone());
+    p.auth_method = Some("sso".to_string());
+    p.username = None;
+    config.save()?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -405,45 +365,94 @@ async fn handle_sso_login(
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct SsoCallbackTokens {
-    access_token: String,
-    refresh_token: String,
-    #[serde(default)]
-    expires_in: i64,
+fn validate_sso_uri(uri: &str) -> Result<()> {
+    let url = url::Url::parse(uri)?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+    {
+        anyhow::bail!("SSO device login URLs must use HTTPS; HTTP is allowed only for loopback development servers");
+    }
+    Ok(())
 }
 
-type SsoCallbackState = Arc<Mutex<Option<oneshot::Sender<SsoCallbackTokens>>>>;
-
-async fn sso_callback_handler(
-    State(tx): State<SsoCallbackState>,
-    Form(params): Form<SsoCallbackTokens>,
-) -> Html<String> {
-    // Forward tokens to the waiting handle_sso_login call.
-    if let Some(sender) = tx.lock().await.take() {
-        let _ = sender.send(params);
+async fn poll_device_login(
+    client: &ApiClient,
+    authorization: DeviceAuthorizationResponse,
+    timeout: Option<u64>,
+) -> Result<LoginResponse> {
+    if authorization.expires_in == 0
+        || authorization.expires_in > 86400
+        || authorization.interval == 0
+        || authorization.interval > 86400
+    {
+        anyhow::bail!("Authentication server returned invalid device polling limits");
     }
-
-    Html(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Attune SSO Login</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 80px auto; text-align: center; color: #222; }
-    h1 { color: #16a34a; }
-    p  { color: #555; }
-  </style>
-</head>
-<body>
-  <h1>Login successful!</h1>
-  <p>You are now authenticated with Attune. You can close this tab.</p>
-  <script>setTimeout(() => window.close(), 2000);</script>
-</body>
-</html>"#
-        .to_string(),
-    )
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(
+            timeout
+                .unwrap_or(authorization.expires_in)
+                .min(authorization.expires_in),
+        );
+    let mut code = authorization.device_code;
+    let mut interval = authorization.interval;
+    loop {
+        tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_secs(interval)))
+            .await
+            .map_err(|_| anyhow::anyhow!("SSO device login timed out; start a new login"))?;
+        let response = tokio::time::timeout_at(
+            deadline,
+            client.post_anonymous::<DevicePollResponse<LoginResponse>, _>(
+                "/auth/oidc/device/poll",
+                &serde_json::json!({"device_code":code}),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("SSO device login timed out; start a new login"))?;
+        match response {
+            Ok(DevicePollResponse::Authorized { tokens }) => {
+                if tokens.access_token.is_empty() || tokens.refresh_token.is_empty() {
+                    anyhow::bail!("Authentication server returned empty credentials");
+                }
+                return Ok(tokens);
+            }
+            Ok(DevicePollResponse::Waiting {
+                reason,
+                device_code,
+                interval: requested,
+            }) => {
+                let minimum = match reason {
+                    DeviceWaitReason::SlowDown => interval.saturating_add(5),
+                    DeviceWaitReason::ProviderTimeout => interval.saturating_mul(2),
+                    DeviceWaitReason::AuthorizationPending => interval,
+                };
+                interval = requested.max(minimum).min(86400);
+                code = device_code;
+            }
+            Ok(DevicePollResponse::AccessDenied) => {
+                anyhow::bail!("SSO device authorization was denied")
+            }
+            Ok(DevicePollResponse::Expired) => {
+                anyhow::bail!("SSO device code expired; start a new login")
+            }
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_timeout)
+                }) =>
+            {
+                interval = interval.saturating_mul(2).min(86400);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Open a URL in the system default browser.
@@ -458,8 +467,8 @@ fn open_browser(url: &str) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+        std::process::Command::new("explorer.exe")
+            .arg(url)
             .spawn()?;
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -933,7 +942,7 @@ async fn handle_refresh(
                     handle_sso_login(
                         profile.as_ref(),
                         api_url,
-                        None,  // port: random
+                        None,  // use the device-code lifetime
                         false, // no_browser: open browser
                         output_format,
                     )

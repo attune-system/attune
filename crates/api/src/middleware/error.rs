@@ -66,6 +66,8 @@ pub enum ApiError {
     InternalServerError(String),
     /// Not implemented (501)
     NotImplemented(String),
+    /// Invalid or unavailable upstream response (502)
+    BadGateway(String),
     /// Retryable database error (503)
     RetryableDatabaseError,
     /// Database error
@@ -87,6 +89,7 @@ impl ApiError {
             ApiError::ValidationError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             ApiError::RetryableDatabaseError => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::InternalServerError(_) | ApiError::DatabaseError(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -105,6 +108,7 @@ impl ApiError {
             | ApiError::UnprocessableEntity(msg)
             | ApiError::TooManyRequests(msg)
             | ApiError::NotImplemented(msg)
+            | ApiError::BadGateway(msg)
             | ApiError::InternalServerError(msg)
             | ApiError::DatabaseError(msg)
             | ApiError::ValidationError(msg) => msg,
@@ -125,6 +129,7 @@ impl ApiError {
             ApiError::UnprocessableEntity(_) => "UNPROCESSABLE_ENTITY",
             ApiError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
             ApiError::NotImplemented(_) => "NOT_IMPLEMENTED",
+            ApiError::BadGateway(_) => "BAD_GATEWAY",
             ApiError::ValidationError(_) => "VALIDATION_ERROR",
             ApiError::RetryableDatabaseError => "RETRYABLE_DATABASE_ERROR",
             ApiError::DatabaseError(_) => "DATABASE_ERROR",

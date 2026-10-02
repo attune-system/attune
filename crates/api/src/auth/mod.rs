@@ -4,6 +4,7 @@ pub mod jwt;
 pub mod ldap;
 pub mod middleware;
 pub mod oidc;
+pub mod oidc_device;
 pub mod password;
 
 pub use jwt::{generate_token, validate_token, Claims};

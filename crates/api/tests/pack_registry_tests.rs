@@ -24,6 +24,7 @@ use attune_common::{
             PermissionAssignmentRepository, PermissionSetRepository,
         },
         pack::{CreatePackInput, PackRepository},
+        pack_registry_index::{CreatePackRegistryIndexInput, PackRegistryIndexRepository},
         platform_catalog::PlatformCatalogRepository,
         runtime::{CreateRuntimeInput, RuntimeRepository},
         trigger::{CreateSensorInput, SensorRepository},
@@ -537,6 +538,56 @@ async fn standard_index_without_headers_does_not_require_encryption_key() -> Res
             .await?;
     assert_eq!(persisted, json!({}));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_index_fetch_failures_are_visible_and_disabled_preview_requires_configure(
+) -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let index = PackRegistryIndexRepository::create(
+        &ctx.pool,
+        CreatePackRegistryIndexInput {
+            name: Some("Blocked local index".to_string()),
+            url: "https://127.0.0.1:1/index.json".to_string(),
+            position: None,
+            enabled: false,
+            headers: json!({}),
+        },
+    )
+    .await?;
+    let target = format!(
+        "/api/v1/pack-indices/packs?registry_id={}&include_disabled=true",
+        index.id
+    );
+    let response = ctx.get(&target, ctx.token()).await?;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = response.json().await?;
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to fetch or validate"));
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("outbound-access policy"));
+    assert!(
+        body.get("data").is_none(),
+        "fetch failure must not be reported as an empty successful index"
+    );
+
+    let response = ctx
+        .get(
+            &format!("/api/v1/pack-indices/packs?registry_id={}", index.id),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let reader =
+        register_pack_index_user(&ctx, json!([{"resource":"packs", "actions":["read"]}])).await?;
+    let response = ctx.get(&target, Some(&reader)).await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     Ok(())
 }
 

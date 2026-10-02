@@ -146,6 +146,7 @@ export class PacksService {
         400: `Invalid or disabled selected registry`,
         401: `Unauthorized`,
         403: `Forbidden`,
+        502: `Selected index could not be fetched or validated`,
       },
     });
   }

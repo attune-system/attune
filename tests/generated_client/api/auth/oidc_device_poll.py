@@ -5,43 +5,36 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.auth_error_response import AuthErrorResponse
-from ...models.browse_indexed_packs_response_200 import BrowseIndexedPacksResponse200
+from ...models.device_poll_request import DevicePollRequest
 from ...models.error_response import ErrorResponse
-from ...types import UNSET, Response, Unset
+from ...models.oidc_device_poll_response_200 import OidcDevicePollResponse200
+from ...types import Response
 
 
 def _get_kwargs(
     *,
-    q: str | Unset = UNSET,
-    registry_id: int | Unset = UNSET,
-    include_disabled: bool | Unset = UNSET,
+    body: DevicePollRequest,
 ) -> dict[str, Any]:
-
-    params: dict[str, Any] = {}
-
-    params["q"] = q
-
-    params["registry_id"] = registry_id
-
-    params["include_disabled"] = include_disabled
-
-    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+    headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
-        "method": "get",
-        "url": "/api/v1/pack-indices/packs",
-        "params": params,
+        "method": "post",
+        "url": "/auth/oidc/device/poll",
     }
 
+    _kwargs["json"] = body.to_dict()
+
+    headers["Content-Type"] = "application/json"
+
+    _kwargs["headers"] = headers
     return _kwargs
 
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse | None:
+) -> ErrorResponse | OidcDevicePollResponse200 | None:
     if response.status_code == 200:
-        response_200 = BrowseIndexedPacksResponse200.from_dict(response.json())
+        response_200 = OidcDevicePollResponse200.from_dict(response.json())
 
         return response_200
 
@@ -51,7 +44,7 @@ def _parse_response(
         return response_400
 
     if response.status_code == 401:
-        response_401 = AuthErrorResponse.from_dict(response.json())
+        response_401 = ErrorResponse.from_dict(response.json())
 
         return response_401
 
@@ -73,7 +66,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse]:
+) -> Response[ErrorResponse | OidcDevicePollResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -84,29 +77,23 @@ def _build_response(
 
 def sync_detailed(
     *,
-    client: AuthenticatedClient,
-    q: str | Unset = UNSET,
-    registry_id: int | Unset = UNSET,
-    include_disabled: bool | Unset = UNSET,
-) -> Response[AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse]:
+    client: AuthenticatedClient | Client,
+    body: DevicePollRequest,
+) -> Response[ErrorResponse | OidcDevicePollResponse200]:
     """
     Args:
-        q (str | Unset):
-        registry_id (int | Unset):
-        include_disabled (bool | Unset):
+        body (DevicePollRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse]
+        Response[ErrorResponse | OidcDevicePollResponse200]
     """
 
     kwargs = _get_kwargs(
-        q=q,
-        registry_id=registry_id,
-        include_disabled=include_disabled,
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -118,58 +105,46 @@ def sync_detailed(
 
 def sync(
     *,
-    client: AuthenticatedClient,
-    q: str | Unset = UNSET,
-    registry_id: int | Unset = UNSET,
-    include_disabled: bool | Unset = UNSET,
-) -> AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse | None:
+    client: AuthenticatedClient | Client,
+    body: DevicePollRequest,
+) -> ErrorResponse | OidcDevicePollResponse200 | None:
     """
     Args:
-        q (str | Unset):
-        registry_id (int | Unset):
-        include_disabled (bool | Unset):
+        body (DevicePollRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse
+        ErrorResponse | OidcDevicePollResponse200
     """
 
     return sync_detailed(
         client=client,
-        q=q,
-        registry_id=registry_id,
-        include_disabled=include_disabled,
+        body=body,
     ).parsed
 
 
 async def asyncio_detailed(
     *,
-    client: AuthenticatedClient,
-    q: str | Unset = UNSET,
-    registry_id: int | Unset = UNSET,
-    include_disabled: bool | Unset = UNSET,
-) -> Response[AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse]:
+    client: AuthenticatedClient | Client,
+    body: DevicePollRequest,
+) -> Response[ErrorResponse | OidcDevicePollResponse200]:
     """
     Args:
-        q (str | Unset):
-        registry_id (int | Unset):
-        include_disabled (bool | Unset):
+        body (DevicePollRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse]
+        Response[ErrorResponse | OidcDevicePollResponse200]
     """
 
     kwargs = _get_kwargs(
-        q=q,
-        registry_id=registry_id,
-        include_disabled=include_disabled,
+        body=body,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -179,30 +154,24 @@ async def asyncio_detailed(
 
 async def asyncio(
     *,
-    client: AuthenticatedClient,
-    q: str | Unset = UNSET,
-    registry_id: int | Unset = UNSET,
-    include_disabled: bool | Unset = UNSET,
-) -> AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse | None:
+    client: AuthenticatedClient | Client,
+    body: DevicePollRequest,
+) -> ErrorResponse | OidcDevicePollResponse200 | None:
     """
     Args:
-        q (str | Unset):
-        registry_id (int | Unset):
-        include_disabled (bool | Unset):
+        body (DevicePollRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        AuthErrorResponse | BrowseIndexedPacksResponse200 | ErrorResponse
+        ErrorResponse | OidcDevicePollResponse200
     """
 
     return (
         await asyncio_detailed(
             client=client,
-            q=q,
-            registry_id=registry_id,
-            include_disabled=include_disabled,
+            body=body,
         )
     ).parsed

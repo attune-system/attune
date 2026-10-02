@@ -5,181 +5,193 @@
 use assert_cmd::Command;
 use attune_cli::config::CliConfig;
 use predicates::prelude::*;
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::{Child, Command as TokioCommand};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use url::Url;
+use serde_json::json;
+use wiremock::{
+    matchers::{body_json, method, path},
+    Mock, ResponseTemplate,
+};
 
 mod common;
 use common::*;
 
-struct SsoLoginProcess {
-    child: Child,
-    stdout_reader: JoinHandle<()>,
-    stderr_reader: JoinHandle<std::io::Result<Vec<u8>>>,
-}
-
-async fn join_reader<T>(mut reader: JoinHandle<T>) -> Option<T> {
-    match tokio::time::timeout(Duration::from_secs(2), &mut reader).await {
-        Ok(Ok(output)) => Some(output),
-        Ok(Err(_)) => None,
-        Err(_) => {
-            reader.abort();
-            let _ = reader.await;
-            None
-        }
-    }
-}
-
-async fn terminate_sso_process(process: &mut SsoLoginProcess) {
-    let _ = process.child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(2), process.child.wait()).await;
-}
-
-async fn clean_up_sso_process(mut process: SsoLoginProcess) {
-    terminate_sso_process(&mut process).await;
-    let _ = join_reader(process.stdout_reader).await;
-    let _ = join_reader(process.stderr_reader).await;
-}
-
-async fn spawn_sso_login_and_read_url(
+async fn mock_device_login(
     fixture: &TestFixture,
-    args: &[&str],
-) -> anyhow::Result<(SsoLoginProcess, Url)> {
-    let mut child = TokioCommand::new(assert_cmd::cargo::cargo_bin("attune"))
-        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
-        .env("HOME", fixture.config_dir_path())
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture CLI stdout"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture CLI stderr"))?;
-    let mut lines = BufReader::new(stdout).lines();
-    let (url_tx, url_rx) = oneshot::channel();
-
-    let stdout_reader = tokio::spawn(async move {
-        let mut url_tx = Some(url_tx);
-        while let Ok(Some(line)) = lines.next_line().await {
-            let trimmed = line.trim();
-            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                if let Some(sender) = url_tx.take() {
-                    let _ = sender.send(trimmed.to_string());
-                }
-            }
-        }
-    });
-    let stderr_reader = tokio::spawn(async move {
-        let mut output = Vec::new();
-        stderr.read_to_end(&mut output).await?;
-        Ok(output)
-    });
-    let process = SsoLoginProcess {
-        child,
-        stdout_reader,
-        stderr_reader,
-    };
-
-    let login_url = match tokio::time::timeout(Duration::from_secs(10), url_rx).await {
-        Ok(Ok(login_url)) => login_url,
-        Ok(Err(_)) => {
-            clean_up_sso_process(process).await;
-            return Err(anyhow::anyhow!(
-                "CLI exited before printing an SSO login URL"
-            ));
-        }
-        Err(error) => {
-            clean_up_sso_process(process).await;
-            return Err(error.into());
-        }
-    };
-    let login_url = match Url::parse(&login_url) {
-        Ok(login_url) => login_url,
-        Err(error) => {
-            clean_up_sso_process(process).await;
-            return Err(error.into());
-        }
-    };
-
-    Ok((process, login_url))
-}
-
-fn cli_redirect_uri(login_url: &Url) -> String {
-    login_url
-        .query_pairs()
-        .find_map(|(key, value)| {
-            if key == "cli_redirect_uri" {
-                Some(value.into_owned())
-            } else {
-                None
-            }
-        })
-        .expect("SSO login URL should include cli_redirect_uri")
-}
-
-async fn post_sso_callback(callback_uri: &str, access_token: &str, refresh_token: &str) {
-    reqwest::Client::new()
-        .post(callback_uri)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
+    access: &str,
+    refresh: &str,
+    poll_delay: std::time::Duration,
+) {
+    Mock::given(method("POST"))
+        .and(path("/auth/oidc/device/start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+            "device_code":"opaque-device-session", "user_code":"ABCD-1234",
+            "verification_uri":"https://idp.example.com/device", "expires_in":30, "interval":1
+        }})))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/auth/oidc/device/poll"))
+        .and(body_json(json!({"device_code":"opaque-device-session"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(poll_delay)
+                .set_body_json(json!({"data":{"status":"authorized", "tokens":{
+                    "access_token":access, "refresh_token":refresh, "expires_in":3600
+                }}})),
         )
-        .body(format!(
-            "access_token={}&refresh_token={}&expires_in=3600",
-            urlencoding::encode(access_token),
-            urlencoding::encode(refresh_token)
-        ))
-        .send()
-        .await
-        .expect("Failed to POST SSO callback")
-        .error_for_status()
-        .expect("SSO callback returned an error");
-}
-
-async fn wait_for_sso_child(mut process: SsoLoginProcess) {
-    let status = match tokio::time::timeout(Duration::from_secs(10), process.child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            terminate_sso_process(&mut process).await;
-            let _ = join_reader(process.stdout_reader).await;
-            let _ = join_reader(process.stderr_reader).await;
-            panic!("Failed to wait for SSO CLI process: {error}");
-        }
-        Err(_) => {
-            terminate_sso_process(&mut process).await;
-            let _ = join_reader(process.stdout_reader).await;
-            let _ = join_reader(process.stderr_reader).await;
-            panic!("SSO CLI process did not exit");
-        }
-    };
-    let _ = join_reader(process.stdout_reader).await;
-    let stderr = join_reader(process.stderr_reader)
-        .await
-        .and_then(Result::ok)
-        .unwrap_or_default();
-
-    assert!(
-        status.success(),
-        "SSO CLI failed with stderr:\n{}",
-        String::from_utf8_lossy(&stderr)
-    );
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
 }
 
 fn load_test_config(fixture: &TestFixture) -> CliConfig {
     let config_content =
         std::fs::read_to_string(&fixture.config_path).expect("Failed to read config");
     serde_yaml_ng::from_str(&config_content).expect("Failed to parse CLI config")
+}
+
+#[tokio::test]
+async fn device_denial_leaves_existing_credentials_and_profile_url_untouched() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("existing-access", "existing-refresh");
+    let before = std::fs::read_to_string(&fixture.config_path).unwrap();
+    Mock::given(method("POST")).and(path("/auth/oidc/device/start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+            "device_code":"secret-session", "user_code":"ABCD-1234", "verification_uri":"https://idp.example.com/device", "expires_in":30, "interval":1
+        }}))).expect(1).mount(&fixture.mock_server).await;
+    Mock::given(method("POST"))
+        .and(path("/auth/oidc/device/poll"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data":{"status":"access_denied"}})),
+        )
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    Command::cargo_bin("attune")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args([
+            "--api-url",
+            &fixture.server_url(),
+            "auth",
+            "sso-login",
+            "--no-browser",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("authorization was denied"));
+    assert_eq!(
+        std::fs::read_to_string(&fixture.config_path).unwrap(),
+        before
+    );
+    for request in fixture.mock_server.received_requests().await.unwrap() {
+        assert!(!request.headers.contains_key("authorization"));
+        assert_ne!(request.url.path(), "/auth/refresh");
+    }
+}
+
+#[tokio::test]
+async fn device_login_timeout_is_bounded_and_does_not_save_tokens() {
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+    let before = std::fs::read_to_string(&fixture.config_path).unwrap();
+    Mock::given(method("POST")).and(path("/auth/oidc/device/start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+            "device_code":"secret-session", "user_code":"ABCD-1234", "verification_uri":"https://idp.example.com/device", "expires_in":30, "interval":5
+        }}))).expect(1).mount(&fixture.mock_server).await;
+    Command::cargo_bin("attune")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args([
+            "--api-url",
+            &fixture.server_url(),
+            "auth",
+            "sso-login",
+            "--no-browser",
+            "--timeout",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("timed out"));
+    assert_eq!(
+        std::fs::read_to_string(&fixture.config_path).unwrap(),
+        before
+    );
+    assert_eq!(
+        fixture.mock_server.received_requests().await.unwrap().len(),
+        1
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn device_login_opens_no_listening_socket() {
+    use tokio::io::AsyncBufReadExt;
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+    Mock::given(method("POST")).and(path("/auth/oidc/device/start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+            "device_code":"secret-session", "user_code":"ABCD-1234", "verification_uri":"https://idp.example.com/device", "expires_in":30, "interval":5
+        }}))).mount(&fixture.mock_server).await;
+    let mut child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("attune"))
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args([
+            "--api-url",
+            &fixture.server_url(),
+            "auth",
+            "sso-login",
+            "--no-browser",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.contains("Waiting for approval") {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    let owns_listener = if ready {
+        let fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        ["tcp", "tcp6"].iter().any(|protocol| {
+            std::fs::read_to_string(format!("/proc/{pid}/net/{protocol}"))
+                .unwrap()
+                .lines()
+                .skip(1)
+                .any(|line| {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    fields.get(3) == Some(&"0A")
+                        && fields
+                            .get(9)
+                            .is_some_and(|inode| fds.contains(&format!("socket:[{inode}]")))
+                })
+        })
+    } else {
+        false
+    };
+    child.start_kill().unwrap();
+    child.wait().await.unwrap();
+    assert!(ready, "CLI never reached device polling");
+    assert!(
+        !owns_listener,
+        "SSO device login opened an inbound listening socket"
+    );
 }
 
 #[tokio::test]
@@ -248,38 +260,28 @@ async fn test_sso_login_no_browser_saves_tokens() {
     let fixture = TestFixture::new().await;
     fixture.write_default_config();
 
-    let (child, login_url) = spawn_sso_login_and_read_url(
+    mock_device_login(
         &fixture,
-        &[
+        "sso_access_token",
+        "sso_refresh_token",
+        std::time::Duration::ZERO,
+    )
+    .await;
+    Command::cargo_bin("attune")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args([
             "--api-url",
             &fixture.server_url(),
             "auth",
             "sso-login",
             "--no-browser",
-        ],
-    )
-    .await
-    .unwrap();
-
-    let callback_uri = cli_redirect_uri(&login_url);
-    post_sso_callback(&callback_uri, "sso_access_token", "sso_refresh_token").await;
-    wait_for_sso_child(child).await;
-
-    assert_eq!(
-        format!(
-            "{}://{}{}",
-            login_url.scheme(),
-            login_url.host_str().unwrap(),
-            login_url
-                .port()
-                .map(|port| format!(":{port}"))
-                .unwrap_or_default()
-        ),
-        fixture.server_url()
-    );
-    assert_eq!(login_url.path(), "/auth/oidc/login");
-    assert!(callback_uri.starts_with("http://localhost:"));
-    assert!(callback_uri.ends_with("/callback"));
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("ABCD-1234"))
+        .stderr(predicate::str::contains("opaque-device-session").not());
 
     let config = load_test_config(&fixture);
     let profile = config.profiles.get("default").unwrap();
@@ -307,26 +309,20 @@ profiles:
         fixture.server_url()
     ));
 
-    let (child, login_url) = spawn_sso_login_and_read_url(
+    mock_device_login(
         &fixture,
-        &["--profile", "staging", "auth", "sso-login", "--no-browser"],
-    )
-    .await
-    .unwrap();
-
-    let callback_uri = cli_redirect_uri(&login_url);
-    post_sso_callback(
-        &callback_uri,
         "staging_sso_access_token",
         "staging_sso_refresh_token",
+        std::time::Duration::ZERO,
     )
     .await;
-    wait_for_sso_child(child).await;
-
-    assert!(login_url
-        .as_str()
-        .starts_with(&format!("{}/auth/oidc/login?", fixture.server_url())));
-    assert!(!login_url.as_str().starts_with("http://127.0.0.1:9/"));
+    Command::cargo_bin("attune")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args(["--profile", "staging", "auth", "sso-login", "--no-browser"])
+        .assert()
+        .success();
 
     let config = load_test_config(&fixture);
     let staging = config.profiles.get("staging").unwrap();
@@ -342,6 +338,10 @@ profiles:
     assert_eq!(staging.auth_method.as_deref(), Some("sso"));
     assert!(default.auth_token.is_none());
     assert!(default.refresh_token.is_none());
+    assert_eq!(config.current_profile, "default");
+    for request in fixture.mock_server.received_requests().await.unwrap() {
+        assert!(!request.headers.contains_key("authorization"));
+    }
 }
 
 #[tokio::test]
@@ -366,6 +366,47 @@ async fn test_whoami_authenticated() {
         .stdout(predicate::str::contains("Test User"))
         .stdout(predicate::str::contains("API Host"))
         .stdout(predicate::str::contains(fixture.server_url()));
+}
+
+#[tokio::test]
+async fn device_login_waits_for_slow_approved_poll_without_redeeming_twice() {
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+    mock_device_login(
+        &fixture,
+        "slow-access",
+        "slow-refresh",
+        std::time::Duration::from_secs(16),
+    )
+    .await;
+    Command::cargo_bin("attune")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args([
+            "--api-url",
+            &fixture.server_url(),
+            "auth",
+            "sso-login",
+            "--no-browser",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success();
+    let config = load_test_config(&fixture);
+    assert_eq!(
+        config.profiles["default"].auth_token.as_deref(),
+        Some("slow-access")
+    );
+    let polls = fixture
+        .mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/auth/oidc/device/poll")
+        .count();
+    assert_eq!(polls, 1);
 }
 
 #[tokio::test]

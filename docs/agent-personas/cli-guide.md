@@ -104,7 +104,7 @@ attune auth sso-login --no-browser
 attune auth sso-login --url http://localhost:8080 --save-profile local
 ```
 
-`auth sso-login` opens the configured OIDC provider in a browser and saves the returned tokens to the active or selected profile. Use `--no-browser` to print the login URL for headless environments.
+`auth sso-login` uses RFC 8628 device authorization. It prints a verification URL and user code, optionally opens the provider's approval page, and polls Attune through outbound requests. It opens no local listener. `--no-browser` allows approval in a browser on another machine. `--timeout SECONDS` bounds the wait. Credentials are saved to the selected profile only after approval.
 
 Use `--profile NAME` or `ATTUNE_PROFILE=NAME` in scripts instead of changing global state:
 

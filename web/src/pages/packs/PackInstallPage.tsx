@@ -1,13 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { useInstallPack } from "@/hooks/usePackTests";
-import {
-  useCreatePackIndex,
-  useDeletePackIndex,
-  useIndexedPacks,
-  usePackIndices,
-  useUpdatePackIndex,
-} from "@/hooks/usePacks";
+import { useIndexedPacks } from "@/hooks/usePacks";
 import {
   AlertCircle,
   CheckCircle,
@@ -17,11 +11,11 @@ import {
   Info,
   Settings,
   X,
-  GripVertical,
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { hasPermission } from "@/lib/permissions";
 import PlatformCatalogStatus from "@/components/packs/PlatformCatalogStatus";
+import PackIndicesModal from "@/components/packs/PackIndicesModal";
 import { AbsentMetadataPolicy } from "@/api";
 
 type SourceType = "git" | "archive" | "registry";
@@ -34,20 +28,11 @@ export default function PackInstallPage() {
   const canConfigurePacks = hasPermission(user, "packs", "configure");
   const navigate = useNavigate();
   const installPack = useInstallPack();
-  const packIndices = usePackIndices();
-  const createPackIndex = useCreatePackIndex();
-  const updatePackIndex = useUpdatePackIndex();
-  const deletePackIndex = useDeletePackIndex();
 
   const [sourceType, setSourceType] = useState<SourceType>(() =>
     canInstallPacks ? "git" : "registry",
   );
   const [isIndexModalOpen, setIsIndexModalOpen] = useState(false);
-  const [indexForm, setIndexForm] = useState({
-    name: "",
-    url: "",
-  });
-  const [draggedIndexId, setDraggedIndexId] = useState<number | null>(null);
   const [packQuery, setPackQuery] = useState("");
   const indexedPacks = useIndexedPacks(packQuery);
   const [formData, setFormData] = useState({
@@ -57,7 +42,6 @@ export default function PackInstallPage() {
     skipDeps: false,
     absentMetadataPolicy: AbsentMetadataPolicy.REMOVE,
   });
-  const configuredIndices = packIndices.data?.data ?? [];
   const indexedPackResults = indexedPacks.data?.data ?? [];
 
   const [error, setError] = useState<string | null>(null);
@@ -129,57 +113,6 @@ export default function PackInstallPage() {
       const message = getErrorMessage(err, "Failed to install pack");
       setError(message);
       setInstallErrorToast(message);
-    }
-  };
-
-  const handleAddIndex = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    try {
-      await createPackIndex.mutateAsync({
-        name: indexForm.name || undefined,
-        url: indexForm.url,
-        enabled: true,
-        headers: {},
-      });
-      setIndexForm({ name: "", url: "" });
-    } catch (err) {
-      setError((err as Error).message || "Failed to add pack index");
-    }
-  };
-
-  const handleDropIndex = async (targetId: number) => {
-    if (draggedIndexId === null || draggedIndexId === targetId) {
-      setDraggedIndexId(null);
-      return;
-    }
-
-    const indices = [...configuredIndices];
-    const fromIndex = indices.findIndex((index) => index.id === draggedIndexId);
-    const toIndex = indices.findIndex((index) => index.id === targetId);
-    if (fromIndex === -1 || toIndex === -1) {
-      setDraggedIndexId(null);
-      return;
-    }
-
-    const [moved] = indices.splice(fromIndex, 1);
-    indices.splice(toIndex, 0, moved);
-    setDraggedIndexId(null);
-    setError(null);
-
-    try {
-      await Promise.all(
-        indices.map((index, position) =>
-          index.position === position
-            ? Promise.resolve()
-            : updatePackIndex.mutateAsync({
-                id: index.id,
-                data: { position, headers: null },
-              }),
-        ),
-      );
-    } catch (err) {
-      setError((err as Error).message || "Failed to reorder pack indices");
     }
   };
 
@@ -775,141 +708,7 @@ export default function PackInstallPage() {
       </div>
 
       {isIndexModalOpen && canConfigurePacks && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-2xl max-h-[90vh] overflow-auto rounded-lg bg-white shadow-xl">
-            <div className="flex items-center justify-between border-b border-gray-200 p-5">
-              <div>
-                <h2 className="text-xl font-semibold">
-                  Configured Pack Indices
-                </h2>
-                <p className="text-sm text-gray-600 mt-1">
-                  Drag indices by the handle to set search order. Duplicate pack
-                  refs resolve to the first enabled index that contains the ref.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setIsIndexModalOpen(false)}
-                className="rounded-lg p-2 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
-                aria-label="Close index configuration"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="p-5">
-              <form onSubmit={handleAddIndex} className="space-y-3 mb-5">
-                <input
-                  type="text"
-                  value={indexForm.name}
-                  onChange={(e) =>
-                    setIndexForm((prev) => ({ ...prev, name: e.target.value }))
-                  }
-                  placeholder="Index name"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                />
-                <input
-                  type="url"
-                  value={indexForm.url}
-                  onChange={(e) =>
-                    setIndexForm((prev) => ({ ...prev, url: e.target.value }))
-                  }
-                  placeholder="https://registry.example.com/index.json"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                  required
-                />
-                <button
-                  type="submit"
-                  disabled={createPackIndex.isPending}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
-                >
-                  Add Index
-                </button>
-              </form>
-
-              <div className="space-y-2">
-                {configuredIndices.map((index, listIndex) => (
-                  <div
-                    key={index.id}
-                    onDragOver={(event) => event.preventDefault()}
-                    onDrop={() => handleDropIndex(index.id)}
-                    className={`border rounded-lg p-3 text-sm transition-colors ${
-                      draggedIndexId === index.id
-                        ? "border-blue-300 bg-blue-50"
-                        : "border-gray-200 bg-white"
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex min-w-0 flex-1 items-start gap-3">
-                        <button
-                          type="button"
-                          draggable
-                          onDragStart={(event) => {
-                            event.dataTransfer.effectAllowed = "move";
-                            event.dataTransfer.setData(
-                              "text/plain",
-                              String(index.id),
-                            );
-                            setDraggedIndexId(index.id);
-                          }}
-                          onDragEnd={() => setDraggedIndexId(null)}
-                          className="mt-1 rounded p-1 text-gray-400 cursor-grab hover:bg-gray-100 hover:text-gray-600 active:cursor-grabbing"
-                          aria-label={`Drag to reorder ${index.name || index.url}`}
-                          title="Drag to reorder"
-                        >
-                          <GripVertical className="h-5 w-5" />
-                        </button>
-                        <div className="min-w-0">
-                          <div className="font-medium">
-                            {index.name || index.url}
-                          </div>
-                          <div className="text-xs text-gray-500">
-                            {listIndex === 0
-                              ? "Checked first"
-                              : "Checked after earlier indices"}
-                          </div>
-                          <div className="text-gray-500 break-all">
-                            {index.url}
-                          </div>
-                        </div>
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updatePackIndex.mutate({
-                              id: index.id,
-                              data: {
-                                enabled: !index.enabled,
-                                headers: null,
-                              },
-                            })
-                          }
-                          className="text-blue-600 hover:text-blue-800"
-                        >
-                          {index.enabled ? "Disable" : "Enable"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => deletePackIndex.mutate(index.id)}
-                          className="text-red-600 hover:text-red-800"
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-                {!packIndices.isLoading &&
-                  (packIndices.data?.data || []).length === 0 && (
-                    <p className="text-sm text-gray-500">
-                      No API-managed indices configured yet.
-                    </p>
-                  )}
-              </div>
-            </div>
-          </div>
-        </div>
+        <PackIndicesModal onClose={() => setIsIndexModalOpen(false)} />
       )}
     </div>
   );

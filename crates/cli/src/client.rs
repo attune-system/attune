@@ -361,6 +361,25 @@ impl ApiClient {
 
     // ── Response handling ──────────────────────────────────────────────
 
+    /// Login requests never send an existing bearer token or trigger automatic refresh.
+    pub async fn post_anonymous<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let response = self
+            .client
+            .post(self.url_for(path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::Error::from(error.without_url())
+                    .context("Failed to contact authentication API")
+            })?;
+        self.handle_response(response).await
+    }
+
     /// Parse a successful API response or return a descriptive error.
     async fn handle_response<T: DeserializeOwned>(&self, response: reqwest::Response) -> Result<T> {
         let status = response.status();

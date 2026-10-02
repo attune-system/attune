@@ -3,6 +3,8 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ChangePasswordRequest } from "../models/ChangePasswordRequest";
+import type { DevicePollRequest } from "../models/DevicePollRequest";
+import type { DeviceWaitReason } from "../models/DeviceWaitReason";
 import type { EffectivePermissionResponse } from "../models/EffectivePermissionResponse";
 import type { InternalCreateSensorTokenRequest } from "../models/InternalCreateSensorTokenRequest";
 import type { LdapLoginRequest } from "../models/LdapLoginRequest";
@@ -11,6 +13,7 @@ import type { ProviderProfileResponse } from "../models/ProviderProfileResponse"
 import type { RefreshTokenRequest } from "../models/RefreshTokenRequest";
 import type { RegisterRequest } from "../models/RegisterRequest";
 import type { TokenLoginRequest } from "../models/TokenLoginRequest";
+import type { TokenResponse } from "../models/TokenResponse";
 import type { UpdateCurrentUserRequest } from "../models/UpdateCurrentUserRequest";
 import type { UserInfo } from "../models/UserInfo";
 import type { CancelablePromise } from "../core/CancelablePromise";
@@ -27,7 +30,7 @@ export class AuthService {
       method: "GET",
       url: "/auth/callback",
       errors: {
-        307: `Redirect to the application or CLI callback`,
+        307: `Redirect to the application callback`,
         400: `Invalid OIDC callback`,
         401: `OIDC authentication failed`,
       },
@@ -357,29 +360,100 @@ export class AuthService {
     });
   }
   /**
+   * @returns any Device grant status or Attune credentials
+   * @throws ApiError
+   */
+  public static oidcDevicePoll({
+    requestBody,
+  }: {
+    requestBody: DevicePollRequest;
+  }): CancelablePromise<{
+    data:
+      | {
+          device_code: string;
+          interval: number;
+          reason: DeviceWaitReason;
+          status: "waiting";
+        }
+      | {
+          status: "authorized";
+          tokens: TokenResponse;
+        }
+      | {
+          status: "access_denied";
+        }
+      | {
+          status: "expired";
+        };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/auth/oidc/device/poll",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid device authorization session`,
+        401: `Invalid provider identity token`,
+        403: `Identity is frozen or has a conflicting binding`,
+        502: `OIDC provider exchange failed`,
+      },
+    });
+  }
+  /**
+   * @returns any Device authorization instructions
+   * @throws ApiError
+   */
+  public static oidcDeviceStart(): CancelablePromise<{
+    /**
+     * Device-code instructions returned by Attune's OIDC broker.
+     */
+    data: {
+      /**
+       * Opaque, encrypted authorization session. Never display this value.
+       */
+      device_code: string;
+      expires_in: number;
+      interval?: number;
+      user_code: string;
+      verification_uri: string;
+      verification_uri_complete?: string | null;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/auth/oidc/device/start",
+      errors: {
+        501: `OIDC device grant is unsupported or not configured`,
+        502: `OIDC provider device authorization failed`,
+      },
+    });
+  }
+  /**
    * Begin browser OIDC login by redirecting to the provider.
    * @returns void
    * @throws ApiError
    */
   public static oidcLogin({
     redirectTo,
-    cliRedirectUri,
   }: {
     /**
      * Application path to return to after login
      */
     redirectTo?: string;
-    /**
-     * Local CLI callback URI
-     */
-    cliRedirectUri?: string;
   }): CancelablePromise<void> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/auth/oidc/login",
       query: {
         redirect_to: redirectTo,
-        cli_redirect_uri: cliRedirectUri,
       },
       errors: {
         307: `Redirect to the configured OIDC provider`,

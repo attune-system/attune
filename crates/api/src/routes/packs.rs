@@ -2882,6 +2882,7 @@ async fn effective_pack_registry(
 async fn selected_managed_pack_registry(
     state: &AppState,
     registry_id: i64,
+    include_disabled: bool,
 ) -> ApiResult<EffectivePackRegistry> {
     if !state.config.pack_registry.enabled {
         return Err(ApiError::BadRequest(
@@ -2890,10 +2891,10 @@ async fn selected_managed_pack_registry(
     }
     let index = PackRegistryIndexRepository::find_by_id(&state.db, registry_id)
         .await?
-        .filter(|index| index.enabled)
+        .filter(|index| include_disabled || index.enabled)
         .ok_or_else(|| {
             ApiError::BadRequest(format!(
-                "Enabled managed pack index {} was not found",
+                "Managed pack index {} was not found or is disabled",
                 registry_id
             ))
         })?;
@@ -2908,7 +2909,7 @@ async fn selected_managed_pack_registry(
     config.indices = vec![attune_common::config::RegistryIndexConfig {
         url: index.url,
         priority: index.position.max(0) as u32,
-        enabled: true,
+        enabled: index.enabled,
         name: index.name,
         headers: headers_from_json(headers)?,
     }];
@@ -3237,6 +3238,7 @@ fn emit_pack_index_audit(
     responses(
         (status = 200, description = "Available indexed packs", body = inline(ApiResponse<Vec<IndexedPackResponse>>)),
         (status = 400, description = "Invalid or disabled selected registry", body = crate::middleware::error::ErrorResponse),
+        (status = 502, description = "Selected index could not be fetched or validated", body = crate::middleware::error::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
         (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
     ),
@@ -3252,7 +3254,9 @@ pub async fn browse_indexed_packs(
         authorize_global_pack_registry_action(&state, &user, Action::Configure).await?;
     }
     let effective = match query.registry_id {
-        Some(registry_id) => selected_managed_pack_registry(&state, registry_id).await?,
+        Some(registry_id) => {
+            selected_managed_pack_registry(&state, registry_id, query.include_disabled).await?
+        }
         None => effective_pack_registry(&state, query.include_disabled).await?,
     };
     let client = attune_common::pack_registry::RegistryClient::new(effective.config)
@@ -3293,6 +3297,11 @@ pub async fn browse_indexed_packs(
                         });
                     }
                 }
+            }
+            Err(_) if query.registry_id.is_some() => {
+                return Err(ApiError::BadGateway(
+                    "Failed to fetch or validate the selected pack index. Check its URL, HTTP headers, server outbound-access policy, and index JSON format.".to_string(),
+                ));
             }
             Err(_) => tracing::warn!(
                 registry_url = %attune_common::pack_registry::remote_url_origin_for_log(&registry.url),
@@ -3436,7 +3445,7 @@ pub async fn install_pack(
     );
     let effective_registry = if is_registry_install {
         Some(if let Some(registry_id) = request.registry_id {
-            selected_managed_pack_registry(&state, registry_id).await?
+            selected_managed_pack_registry(&state, registry_id, false).await?
         } else {
             effective_pack_registry(&state, false).await?
         })

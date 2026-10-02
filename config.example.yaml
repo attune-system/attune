@@ -106,7 +106,7 @@ security:
     show_oidc_login: true
     show_ldap_login: true
 
-  # Optional OIDC browser login configuration
+  # OIDC browser and RFC 8628 CLI device login configuration
   oidc:
     enabled: false
     discovery_url: https://auth.example.com/.well-known/openid-configuration
@@ -123,6 +123,14 @@ security:
     # ID tokens (for example the Okta org authorization server).
     scopes:
       - groups
+    # Requesting groups requires the claim at login, including an empty array.
+    # Set true for providers that deliver groups without a groups scope.
+    require_groups: false
+    # Device login reuses the client above unless a separate provider registration
+    # is required. Configure both clients with compatible subject identifiers.
+    # device_client:
+    #   client_id: your-native-device-client-id
+    #   client_secret: null # public native client; does not inherit the web secret
 
   # Optional LDAP authentication configuration
   ldap:

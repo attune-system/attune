@@ -415,9 +415,8 @@ impl IdentityRepository {
     ///    through to INSERT. The loser receives a 23505 violation, rolls
     ///    back, and reads the winner's row from the database.
     ///
-    /// Roles are deliberately *not* synchronized here — that lives in the
-    /// caller (the API service) since it depends on infrastructure outside
-    /// the common crate.
+    /// Identity attributes and OIDC-managed roles commit together. The identity
+    /// row's write lock serializes concurrent browser and device logins.
     pub async fn upsert_oidc_identity(pool: &PgPool, input: OidcUpsertInput) -> Result<Identity> {
         // Cap retries to avoid pathological loops if the database is in an
         // unexpected state. In practice 1–2 iterations are sufficient.
@@ -439,8 +438,7 @@ impl IdentityRepository {
                     &input.attributes,
                 )
                 .await?;
-                tx.commit().await?;
-                return Ok(updated);
+                return Self::finish_oidc_upsert(tx, updated, &input.roles).await;
             }
 
             // Stage 2: legacy fallback — adopt a row that pre-dates the
@@ -471,8 +469,7 @@ impl IdentityRepository {
                     .bind(legacy.id)
                     .fetch_one(&mut *tx)
                     .await?;
-                    tx.commit().await?;
-                    return Ok(updated);
+                    return Self::finish_oidc_upsert(tx, updated, &input.roles).await;
                 }
 
                 // 0 rows affected → another caller already upgraded the
@@ -509,8 +506,7 @@ impl IdentityRepository {
 
             match insert_result {
                 Ok(identity) => {
-                    tx.commit().await?;
-                    return Ok(identity);
+                    return Self::finish_oidc_upsert(tx, identity, &input.roles).await;
                 }
                 Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
                     // Roll back so we can read freshly-committed state.
@@ -518,16 +514,24 @@ impl IdentityRepository {
 
                     let constraint = db_err.constraint().map(|c| c.to_string());
                     if constraint.as_deref() == Some("uq_identity_oidc_issuer_sub") {
-                        // Concurrent OIDC insert won. Read the winning row
-                        // by (issuer, sub) and return it as-is. We do *not*
-                        // overwrite the winner's attributes here because
-                        // their client_id may legitimately differ from
-                        // ours; if it matches, a subsequent login will take
-                        // the strict-match path and update normally.
+                        // A subject from another configured client cannot adopt
+                        // this identity. Same-client races retry the strict update.
                         if let Some(winner) =
                             Self::find_oidc_by_issuer_sub(pool, &input.issuer, &input.sub).await?
                         {
-                            return Ok(winner);
+                            if winner
+                                .attributes
+                                .get("oidc")
+                                .and_then(|claims| claims.get("client_id"))
+                                .and_then(serde_json::Value::as_str)
+                                != Some(input.client_id.as_str())
+                            {
+                                return Err(crate::Error::PermissionDenied(
+                                    "OIDC identity belongs to a different configured client"
+                                        .to_string(),
+                                ));
+                            }
+                            continue;
                         }
                         // Extremely unlikely: row vanished between the
                         // 23505 violation and our follow-up read. Retry.
@@ -549,6 +553,32 @@ impl IdentityRepository {
         Err(crate::Error::internal(
             "OIDC identity upsert exceeded retry limit",
         ))
+    }
+
+    async fn finish_oidc_upsert(
+        mut tx: sqlx::Transaction<'_, Postgres>,
+        identity: Identity,
+        roles: &[String],
+    ) -> Result<Identity> {
+        if identity.frozen {
+            tx.rollback().await?;
+            return Err(crate::Error::PermissionDenied(
+                "Identity is frozen and cannot authenticate".into(),
+            ));
+        }
+        if let Err(error) = IdentityRoleAssignmentRepository::replace_managed_roles_in_transaction(
+            &mut tx,
+            identity.id,
+            "oidc",
+            roles,
+        )
+        .await
+        {
+            tx.rollback().await?;
+            return Err(error);
+        }
+        tx.commit().await?;
+        Ok(identity)
     }
 
     async fn update_oidc_row<'e, E>(
@@ -593,6 +623,8 @@ pub struct OidcUpsertInput {
     /// least `issuer`, `sub`, and `client_id` for the partial unique index
     /// to match correctly.
     pub attributes: JsonDict,
+    /// Verified group names to synchronize atomically with the identity.
+    pub roles: Vec<String>,
 }
 
 // Permission Set Repository
@@ -1079,36 +1111,46 @@ impl IdentityRoleAssignmentRepository {
         .map_err(Into::into)
     }
 
-    pub async fn replace_managed_roles<'e, E>(
-        executor: E,
+    pub async fn replace_managed_roles(
+        pool: &PgPool,
         identity_id: Id,
         source: &str,
         roles: &[String],
-    ) -> Result<()>
-    where
-        E: Executor<'e, Database = Postgres> + Copy + 'e,
-    {
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        Self::replace_managed_roles_in_transaction(&mut tx, identity_id, source, roles).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn replace_managed_roles_in_transaction(
+        connection: &mut PgConnection,
+        identity_id: Id,
+        source: &str,
+        roles: &[String],
+    ) -> Result<()> {
+        sqlx::query("SELECT id FROM identity WHERE id = $1 FOR UPDATE")
+            .bind(identity_id)
+            .fetch_one(&mut *connection)
+            .await?;
         sqlx::query(
             "DELETE FROM identity_role_assignment WHERE identity = $1 AND source = $2 AND managed = true",
         )
         .bind(identity_id)
         .bind(source)
-        .execute(executor)
+        .execute(&mut *connection)
         .await?;
 
         for role in roles {
             sqlx::query(
                 "INSERT INTO identity_role_assignment (identity, role, source, managed)
                  VALUES ($1, $2, $3, true)
-                 ON CONFLICT (identity, role) DO UPDATE
-                 SET source = EXCLUDED.source,
-                     managed = EXCLUDED.managed,
-                     updated = NOW()",
+                  ON CONFLICT (identity, role) DO NOTHING",
             )
             .bind(identity_id)
             .bind(role)
             .bind(source)
-            .execute(executor)
+            .execute(&mut *connection)
             .await?;
         }
 

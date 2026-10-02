@@ -161,6 +161,25 @@ Each registry hosts an **index file** (typically `index.json`) that catalogs ava
 
 ### Configured Index Ordering
 
+The web client's **Manage Pack Indices** dialog configures each managed index's
+name, direct HTTPS JSON URL, enabled state, and HTTP headers. **Edit** changes an
+existing index. Header values are encrypted on the server and returned as
+`[REDACTED]`; leaving that value in an edited header preserves the stored value.
+An empty header object removes all configured headers.
+
+**Refresh** fetches metadata for the selected index through
+`GET /api/v1/pack-indices/packs?registry_id=<id>&include_disabled=true`.
+This request requires global `packs:read` and `packs:configure` access. Disabled
+indices can be inspected without enabling them for discovery or installation.
+Fetch or validation failures return HTTP 502 and appear inside the dialog.
+Refreshing metadata does not install or upgrade any pack.
+
+The current API fetches metadata during browsing and installation. Per-index
+manual, automatic, and lazy refresh policies and saved snapshots are proposed
+in [Pack index refresh policies and Git-ref controls](../plans/pack-index-refresh-and-ref-policy.md)
+and are not implemented. A commit-pinned index URL continues to return the same
+snapshot when refreshed; changing the tracking URL selects different metadata.
+
 Setup validates an immutable `attune-system/index` snapshot and stores its URL
 in the API-managed **Attune Standard Pack Index** row. The packaged default is
 the snapshot tested with the release. Set `ATTUNE_STANDARD_PACK_INDEX_REF`, or

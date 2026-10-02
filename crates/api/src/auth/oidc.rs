@@ -2,9 +2,7 @@
 
 use attune_common::{
     config::OidcConfig,
-    repositories::identity::{
-        IdentityRepository, IdentityRoleAssignmentRepository, OidcUpsertInput,
-    },
+    repositories::identity::{IdentityRepository, OidcUpsertInput},
 };
 use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -12,16 +10,16 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use cookie::time::Duration as CookieDuration;
-use jsonwebtoken::{
-    decode, decode_header,
-    jwk::{AlgorithmParameters, JwkSet},
-    Algorithm, DecodingKey, Validation,
-};
 use openidconnect::{
-    core::{CoreAuthenticationFlow, CoreClient, CoreGenderClaim, CoreProviderMetadata},
+    core::{
+        CoreAuthenticationFlow, CoreClient, CoreGenderClaim, CoreIdTokenVerifier,
+        CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
+        CoreProviderMetadata,
+    },
     AdditionalClaims, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, HttpRequest,
-    HttpResponse, LocalizedClaim, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, Scope, SubjectIdentifier, TokenResponse as OidcTokenResponse, UserInfoClaims,
+    HttpResponse, IdToken, LocalizedClaim, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, SubjectIdentifier, TokenResponse as OidcTokenResponse,
+    UserInfoClaims,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -43,27 +41,7 @@ pub const OIDC_STATE_COOKIE_NAME: &str = "attune_oidc_state";
 pub const OIDC_NONCE_COOKIE_NAME: &str = "attune_oidc_nonce";
 pub const OIDC_PKCE_COOKIE_NAME: &str = "attune_oidc_pkce_verifier";
 pub const OIDC_REDIRECT_COOKIE_NAME: &str = "attune_oidc_redirect_to";
-/// Cookie that carries the CLI's local callback URI (http://localhost:{port}/callback).
-/// When present, the OIDC callback redirects to this URI with tokens as query params
-/// instead of the usual web-app fragment redirect.
-pub const OIDC_CLI_REDIRECT_COOKIE_NAME: &str = "attune_oidc_cli_redirect";
-
 const LOGIN_CALLBACK_PATH: &str = "/login/callback";
-
-/// Validate that a CLI redirect URI is a localhost HTTP URL (security guard against
-/// open redirect abuse — only loopback addresses are accepted).
-pub fn validate_cli_redirect_uri(uri: &str) -> Result<(), ApiError> {
-    let url = Url::parse(uri)
-        .map_err(|_| ApiError::BadRequest("Invalid CLI redirect URI".to_string()))?;
-    let host = url.host_str().unwrap_or("");
-    if url.scheme() != "http" || !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
-        return Err(ApiError::BadRequest(
-            "CLI redirect URI must use http://localhost, http://127.0.0.1, or http://[::1]"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
 
 #[derive(Debug, thiserror::Error)]
 enum OidcHttpClientError {
@@ -81,6 +59,8 @@ pub struct OidcDiscoveryDocument {
     pub metadata: CoreProviderMetadata,
     #[serde(default)]
     pub end_session_endpoint: Option<String>,
+    #[serde(default)]
+    pub device_authorization_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,15 +72,17 @@ pub struct OidcIdentityClaims {
     pub email_verified: Option<bool>,
     pub name: Option<String>,
     pub preferred_username: Option<String>,
-    pub groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<String>>,
+    /// Actual separately approved client whose token was validated for this login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct VerifiedIdTokenClaims {
     iss: String,
     sub: String,
-    #[serde(default)]
-    nonce: Option<String>,
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
@@ -110,7 +92,16 @@ struct VerifiedIdTokenClaims {
     #[serde(default)]
     preferred_username: Option<String>,
     #[serde(default)]
-    groups: Vec<String>,
+    groups: Option<Vec<String>>,
+    aud: JsonValue,
+    iat: i64,
+    #[serde(default)]
+    azp: Option<String>,
+}
+
+pub(super) enum IdTokenNonce<'a> {
+    Browser(&'a str),
+    Device,
 }
 
 /// Non-standard claims Attune reads from the userinfo endpoint.
@@ -160,7 +151,6 @@ pub struct OidcCallbackQuery {
 pub async fn build_login_redirect(
     state: &SharedState,
     redirect_to: Option<&str>,
-    cli_redirect_uri: Option<&str>,
 ) -> Result<OidcLoginRedirect, ApiError> {
     let oidc = oidc_config(state)?;
     let discovery = fetch_discovery_document(&oidc).await?;
@@ -211,7 +201,7 @@ pub async fn build_login_redirect(
     Ok(OidcLoginRedirect {
         authorization_url: auth_url.to_string(),
         cookies: {
-            let mut cookies = vec![
+            vec![
                 build_cookie(
                     state,
                     OIDC_STATE_COOKIE_NAME,
@@ -240,18 +230,7 @@ pub async fn build_login_redirect(
                     600,
                     false,
                 ),
-            ];
-            if let Some(cli_uri) = cli_redirect_uri {
-                validate_cli_redirect_uri(cli_uri)?;
-                cookies.push(build_cookie(
-                    state,
-                    OIDC_CLI_REDIRECT_COOKIE_NAME,
-                    cli_uri.to_string(),
-                    600,
-                    false,
-                ));
-            }
-            cookies
+            ]
         },
     })
 }
@@ -331,7 +310,33 @@ pub async fn handle_callback(
     })?;
 
     let raw_id_token = id_token.to_string();
-    let claims = verify_id_token(&raw_id_token, &discovery, &oidc, &expected_nonce).await?;
+    complete_provider_login(
+        state,
+        &oidc,
+        &discovery,
+        raw_id_token,
+        token_response.access_token().to_owned(),
+        oidc.client_id.as_deref().unwrap_or_default(),
+        IdTokenNonce::Browser(&expected_nonce),
+    )
+    .await
+}
+
+pub(super) async fn complete_provider_login(
+    state: &SharedState,
+    oidc: &OidcConfig,
+    discovery: &OidcDiscoveryDocument,
+    raw_id_token: String,
+    access_token: openidconnect::AccessToken,
+    token_client_id: &str,
+    nonce: IdTokenNonce<'_>,
+) -> Result<OidcAuthenticatedIdentity, ApiError> {
+    let claims = verify_id_token(&raw_id_token, discovery, token_client_id, nonce).await?;
+    let client = CoreClient::from_provider_metadata(
+        discovery.metadata.clone(),
+        ClientId::new(token_client_id.to_string()),
+        None,
+    );
 
     let mut oidc_claims = OidcIdentityClaims {
         issuer: claims.iss,
@@ -342,37 +347,37 @@ pub async fn handle_callback(
         name: claims.name,
         preferred_username: claims.preferred_username,
         groups: claims.groups,
+        authentication_client_id: (oidc.client_id.as_deref() != Some(token_client_id))
+            .then(|| token_client_id.to_string()),
     };
 
     let expected_subject = SubjectIdentifier::new(oidc_claims.sub.clone());
-    match client.user_info(
-        token_response.access_token().to_owned(),
-        Some(expected_subject),
-    ) {
+    match client.user_info(access_token, Some(expected_subject)) {
         Ok(userinfo_request) => match userinfo_request
             .request_async::<OidcUserInfoAdditionalClaims, _, CoreGenderClaim>(
                 &oidc_async_http_client,
             )
             .await
         {
-            Ok(userinfo) => merge_userinfo_claims(&mut oidc_claims, &userinfo),
-            Err(err) => tracing::warn!(
-                error = %err,
-                "OIDC userinfo request failed; continuing with ID token claims only"
-            ),
+            Ok(userinfo) => merge_userinfo_claims(&mut oidc_claims, &userinfo)?,
+            Err(_) => {
+                tracing::warn!("OIDC userinfo request failed; continuing with ID token claims only")
+            }
         },
-        Err(err) => tracing::debug!(
-            error = %err,
-            "OIDC userinfo endpoint is not available; using ID token claims only"
-        ),
+        Err(_) => {
+            tracing::debug!("OIDC userinfo endpoint is not available; using ID token claims only")
+        }
+    }
+
+    if (oidc.require_groups || oidc.scopes.iter().any(|scope| scope == "groups"))
+        && oidc_claims.groups.is_none()
+    {
+        return Err(ApiError::Unauthorized(
+            "OIDC login requires a groups claim in the ID token or subject-verified UserInfo response; check the provider's group claim configuration".into(),
+        ));
     }
 
     let identity = upsert_identity(state, &oidc_claims).await?;
-    if identity.frozen {
-        return Err(ApiError::Forbidden(
-            "Identity is frozen and cannot authenticate".to_string(),
-        ));
-    }
     let access_token = generate_access_token(identity.id, &identity.login, &state.jwt_config)?;
     let refresh_token = generate_refresh_token(identity.id, &identity.login, &state.jwt_config)?;
 
@@ -447,7 +452,6 @@ pub fn clear_auth_cookies(state: &SharedState) -> Vec<Cookie<'static>> {
         OIDC_NONCE_COOKIE_NAME,
         OIDC_PKCE_COOKIE_NAME,
         OIDC_REDIRECT_COOKIE_NAME,
-        OIDC_CLI_REDIRECT_COOKIE_NAME,
     ]
     .into_iter()
     .map(|name| remove_cookie(state, name))
@@ -507,44 +511,7 @@ pub fn oidc_callback_redirect_response(
     token_response: &TokenResponse,
     redirect_to: Option<String>,
     id_token: &str,
-    cli_redirect_uri: Option<String>,
 ) -> Result<Response, ApiError> {
-    // Always clear OIDC flow cookies regardless of redirect mode.
-    let clear_cookies = [
-        remove_cookie(state, OIDC_STATE_COOKIE_NAME),
-        remove_cookie(state, OIDC_NONCE_COOKIE_NAME),
-        remove_cookie(state, OIDC_PKCE_COOKIE_NAME),
-        remove_cookie(state, OIDC_REDIRECT_COOKIE_NAME),
-        remove_cookie(state, OIDC_CLI_REDIRECT_COOKIE_NAME),
-    ];
-
-    if let Some(cli_uri) = cli_redirect_uri {
-        // CLI mode: serve an auto-submitting form that POSTs tokens to the local
-        // callback server. This keeps tokens out of the browser URL bar and history
-        // (unlike a 302 redirect with query params). Per RFC 8252 §7.3, browsers
-        // correctly follow HTTPS → HTTP loopback redirects/form posts for native apps.
-        let html = format!(
-            r#"<!DOCTYPE html>
-<html><head><title>Attune SSO</title></head>
-<body>
-<form id="f" method="POST" action="{}">
-<input type="hidden" name="access_token" value="{}">
-<input type="hidden" name="refresh_token" value="{}">
-<input type="hidden" name="expires_in" value="{}">
-</form>
-<script>document.getElementById("f").submit();</script>
-<noscript><p>JavaScript is required. Please enable it and try again.</p></noscript>
-</body></html>"#,
-            cli_uri,
-            html_escape(&token_response.access_token),
-            html_escape(&token_response.refresh_token),
-            token_response.expires_in,
-        );
-        let mut response = (StatusCode::OK, axum::response::Html(html)).into_response();
-        apply_cookies_to_headers(response.headers_mut(), &clear_cookies)?;
-        return Ok(response);
-    }
-
     // Web mode: redirect to the SPA callback page with tokens in the URL fragment.
     let redirect_target = sanitize_redirect_target(redirect_to.as_deref());
     let redirect_url = format!(
@@ -561,7 +528,6 @@ pub fn oidc_callback_redirect_response(
     cookies.push(remove_cookie(state, OIDC_NONCE_COOKIE_NAME));
     cookies.push(remove_cookie(state, OIDC_PKCE_COOKIE_NAME));
     cookies.push(remove_cookie(state, OIDC_REDIRECT_COOKIE_NAME));
-    cookies.push(remove_cookie(state, OIDC_CLI_REDIRECT_COOKIE_NAME));
     apply_cookies_to_headers(response.headers_mut(), &cookies)?;
     Ok(response)
 }
@@ -604,7 +570,7 @@ pub fn has_oidc_session(headers: &HeaderMap) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-fn oidc_config(state: &SharedState) -> Result<OidcConfig, ApiError> {
+pub(super) fn oidc_config(state: &SharedState) -> Result<OidcConfig, ApiError> {
     state
         .config
         .security
@@ -616,10 +582,11 @@ fn oidc_config(state: &SharedState) -> Result<OidcConfig, ApiError> {
         })
 }
 
-fn oidc_http_client() -> &'static reqwest::Client {
+pub(super) fn oidc_http_client() -> &'static reqwest::Client {
     static OIDC_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("OIDC HTTP client should build")
     });
@@ -653,11 +620,17 @@ async fn oidc_async_http_client(request: HttpRequest) -> Result<HttpResponse, Oi
     Ok(builder.body(body)?)
 }
 
-async fn fetch_discovery_document(oidc: &OidcConfig) -> Result<OidcDiscoveryDocument, ApiError> {
+pub(super) async fn fetch_discovery_document(
+    oidc: &OidcConfig,
+) -> Result<OidcDiscoveryDocument, ApiError> {
     let discovery_url = oidc.discovery_url.as_deref().unwrap_or_default();
-    let discovery = reqwest::get(discovery_url).await.map_err(|err| {
-        ApiError::InternalServerError(format!("Failed to fetch OIDC discovery document: {err}"))
-    })?;
+    let discovery = oidc_http_client()
+        .get(discovery_url)
+        .send()
+        .await
+        .map_err(|_| {
+            ApiError::InternalServerError("Failed to fetch OIDC discovery document".to_string())
+        })?;
 
     if !discovery.status().is_success() {
         return Err(ApiError::InternalServerError(format!(
@@ -700,24 +673,13 @@ async fn upsert_identity(
             fallback_login,
             display_name,
             attributes,
+            roles: oidc_claims.groups.clone().unwrap_or_default(),
         },
     )
     .await
     .map_err(ApiError::from)?;
 
-    sync_roles(&state.db, identity.id, "oidc", &oidc_claims.groups).await?;
     Ok(identity)
-}
-
-async fn sync_roles(
-    db: &sqlx::PgPool,
-    identity_id: i64,
-    source: &str,
-    roles: &[String],
-) -> Result<(), ApiError> {
-    IdentityRoleAssignmentRepository::replace_managed_roles(db, identity_id, source, roles)
-        .await
-        .map_err(Into::into)
 }
 
 fn derive_login(oidc_claims: &OidcIdentityClaims) -> String {
@@ -731,69 +693,75 @@ fn derive_login(oidc_claims: &OidcIdentityClaims) -> String {
 async fn verify_id_token(
     raw_id_token: &str,
     discovery: &OidcDiscoveryDocument,
-    oidc: &OidcConfig,
-    expected_nonce: &str,
+    token_client_id: &str,
+    nonce: IdTokenNonce<'_>,
 ) -> Result<VerifiedIdTokenClaims, ApiError> {
-    let header = decode_header(raw_id_token).map_err(|err| {
-        ApiError::Unauthorized(format!("OIDC ID token header decode failed: {err}"))
-    })?;
-
-    let algorithm = match header.alg {
-        Algorithm::RS256 => Algorithm::RS256,
-        Algorithm::RS384 => Algorithm::RS384,
-        Algorithm::RS512 => Algorithm::RS512,
-        other => {
-            return Err(ApiError::Unauthorized(format!(
-                "OIDC ID token uses unsupported signing algorithm: {other:?}"
-            )))
-        }
-    };
-
-    let jwks = reqwest::get(discovery.metadata.jwks_uri().url().as_str())
+    let jwks = oidc_http_client()
+        .get(discovery.metadata.jwks_uri().url().as_str())
+        .send()
         .await
         .map_err(|err| ApiError::InternalServerError(format!("Failed to fetch OIDC JWKS: {err}")))?
-        .json::<JwkSet>()
+        .json::<CoreJsonWebKeySet>()
         .await
         .map_err(|err| {
             ApiError::InternalServerError(format!("Failed to parse OIDC JWKS: {err}"))
         })?;
 
-    let jwk = jwks
-        .keys
-        .iter()
-        .find(|jwk| {
-            jwk.common.key_id == header.kid
-                && matches!(
-                    jwk.common.public_key_use,
-                    Some(jsonwebtoken::jwk::PublicKeyUse::Signature)
-                )
-                && matches!(
-                    jwk.algorithm,
-                    AlgorithmParameters::RSA(_) | AlgorithmParameters::EllipticCurve(_)
-                )
-        })
-        .ok_or_else(|| ApiError::Unauthorized("OIDC signing key not found in JWKS".to_string()))?;
-
-    let decoding_key = DecodingKey::from_jwk(jwk)
-        .map_err(|err| ApiError::Unauthorized(format!("OIDC JWK decode failed: {err}")))?;
-
-    let issuer = discovery.metadata.issuer().to_string();
-    let mut validation = Validation::new(algorithm);
-    validation.set_issuer(&[issuer.as_str()]);
-    validation.set_audience(&[oidc.client_id.as_deref().unwrap_or_default()]);
-    validation.set_required_spec_claims(&["exp", "iat", "iss", "sub", "aud"]);
-    validation.validate_nbf = false;
-
-    let token = decode::<VerifiedIdTokenClaims>(raw_id_token, &decoding_key, &validation)
-        .map_err(|err| ApiError::Unauthorized(format!("OIDC ID token validation failed: {err}")))?;
-
-    if token.claims.nonce.as_deref() != Some(expected_nonce) {
+    let verifier = CoreIdTokenVerifier::new_public_client(
+        ClientId::new(token_client_id.to_string()),
+        discovery.metadata.issuer().clone(),
+        jwks,
+    )
+    .set_allowed_algs(vec![
+        CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+        CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha384,
+        CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha512,
+    ]);
+    let token: IdToken<
+        OidcUserInfoAdditionalClaims,
+        CoreGenderClaim,
+        CoreJweContentEncryptionAlgorithm,
+        CoreJwsSigningAlgorithm,
+    > = serde_json::from_value(json!(raw_id_token))
+        .map_err(|_| ApiError::Unauthorized("Invalid OIDC ID token".to_string()))?;
+    let browser_nonce;
+    let claims = match nonce {
+        IdTokenNonce::Browser(expected) => {
+            browser_nonce = Nonce::new(expected.to_string());
+            token.claims(&verifier, &browser_nonce)
+        }
+        IdTokenNonce::Device => token.claims(&verifier, |_: Option<&Nonce>| Ok(())),
+    }
+    .map_err(|_| {
+        ApiError::Unauthorized(
+            "OIDC ID token signature, issuer, audience, expiry, or nonce validation failed"
+                .to_string(),
+        )
+    })?;
+    let mut value = serde_json::to_value(claims)
+        .map_err(|_| ApiError::Unauthorized("Invalid verified OIDC claims".to_string()))?;
+    value["groups"] = json!(extract_groups_from_claims(claims.additional_claims())?);
+    let verified: VerifiedIdTokenClaims = serde_json::from_value(value)
+        .map_err(|_| ApiError::Unauthorized("Invalid verified OIDC claims".to_string()))?;
+    if verified
+        .azp
+        .as_deref()
+        .is_some_and(|party| party != token_client_id)
+        || verified.iat > chrono::Utc::now().timestamp() + 60
+    {
         return Err(ApiError::Unauthorized(
-            "OIDC nonce validation failed".to_string(),
+            "OIDC authorized party or issue time is invalid".to_string(),
         ));
     }
+    if let Some(audiences) = verified.aud.as_array() {
+        if audiences.len() > 1 && verified.azp.as_deref() != Some(token_client_id) {
+            return Err(ApiError::Unauthorized(
+                "OIDC multi-audience ID token requires a matching authorized party".to_string(),
+            ));
+        }
+    }
 
-    Ok(token.claims)
+    Ok(verified)
 }
 
 fn derive_display_name(oidc_claims: &OidcIdentityClaims) -> Option<String> {
@@ -813,24 +781,35 @@ fn fallback_subject_login(oidc_claims: &OidcIdentityClaims) -> String {
     format!("oidc:{}", &digest[..24])
 }
 
-fn extract_groups_from_claims<T>(claims: &T) -> Vec<String>
+fn extract_groups_from_claims<T>(claims: &T) -> Result<Option<Vec<String>>, ApiError>
 where
     T: Serialize,
 {
-    let Ok(json) = serde_json::to_value(claims) else {
-        return Vec::new();
-    };
+    let json = serde_json::to_value(claims)
+        .map_err(|_| ApiError::Unauthorized("Invalid OIDC group claims".into()))?;
     match json.get("groups") {
         Some(JsonValue::Array(values)) => values
             .iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect(),
-        Some(JsonValue::String(value)) => vec![value.to_string()],
-        _ => Vec::new(),
+            .map(|value| {
+                value.as_str().map(ToString::to_string).ok_or_else(|| {
+                    ApiError::Unauthorized("OIDC groups must contain only strings".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(JsonValue::String(value)) => Ok(Some(vec![value.to_string()])),
+        None | Some(JsonValue::Null) => Ok(None),
+        _ => Err(ApiError::Unauthorized(
+            "OIDC groups must be a string or an array of strings".into(),
+        )),
     }
 }
 
-fn merge_userinfo_claims(oidc_claims: &mut OidcIdentityClaims, userinfo: &OidcUserInfoClaims) {
+fn merge_userinfo_claims(
+    oidc_claims: &mut OidcIdentityClaims,
+    userinfo: &OidcUserInfoClaims,
+) -> Result<(), ApiError> {
+    let groups = extract_groups_from_claims(userinfo.additional_claims())?;
     if oidc_claims.email.is_none() {
         oidc_claims.email = userinfo.email().map(|email| email.as_str().to_string());
     }
@@ -845,9 +824,10 @@ fn merge_userinfo_claims(oidc_claims: &mut OidcIdentityClaims, userinfo: &OidcUs
             .preferred_username()
             .map(|username| username.as_str().to_string());
     }
-    if oidc_claims.groups.is_empty() {
-        oidc_claims.groups = extract_groups_from_claims(userinfo.additional_claims());
+    if oidc_claims.groups.is_none() {
+        oidc_claims.groups = groups;
     }
+    Ok(())
 }
 
 fn first_localized_claim<T>(claim: &LocalizedClaim<T>) -> Option<String>
@@ -929,15 +909,6 @@ fn encode_fragment_value(value: &str) -> String {
     byte_serialize(value.as_bytes()).collect()
 }
 
-/// Minimal HTML attribute escaping for token values embedded in hidden form fields.
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,13 +931,38 @@ mod tests {
         let string_claims = serde_json::json!({ "groups": "admins" });
 
         assert_eq!(
-            extract_groups_from_claims(&array_claims),
-            vec!["admins".to_string(), "operators".to_string()]
+            extract_groups_from_claims(&array_claims).unwrap(),
+            Some(vec!["admins".to_string(), "operators".to_string()])
         );
         assert_eq!(
-            extract_groups_from_claims(&string_claims),
-            vec!["admins".to_string()]
+            extract_groups_from_claims(&string_claims).unwrap(),
+            Some(vec!["admins".to_string()])
         );
+    }
+
+    #[test]
+    fn extract_groups_distinguishes_absence_from_empty_and_rejects_malformed_values() {
+        assert_eq!(extract_groups_from_claims(&json!({})).unwrap(), None);
+        assert_eq!(
+            extract_groups_from_claims(&json!({"groups": null})).unwrap(),
+            None
+        );
+        assert_eq!(
+            extract_groups_from_claims(&json!({"groups": []})).unwrap(),
+            Some(Vec::new())
+        );
+        for groups in [json!(false), json!({}), json!(["admins", 42])] {
+            assert!(extract_groups_from_claims(&json!({"groups": groups})).is_err());
+        }
+    }
+
+    #[test]
+    fn merge_userinfo_does_not_override_explicit_empty_id_token_groups() {
+        let userinfo = userinfo_from_json(json!({"sub": "00u123", "groups": ["admins"]}));
+        let mut claims = thin_id_token_claims();
+        claims.groups = Some(Vec::new());
+        merge_userinfo_claims(&mut claims, &userinfo).unwrap();
+        assert_eq!(claims.groups, Some(Vec::new()));
     }
 
     fn userinfo_from_json(body: serde_json::Value) -> OidcUserInfoClaims {
@@ -983,7 +979,8 @@ mod tests {
             email_verified: None,
             name: None,
             preferred_username: None,
-            groups: Vec::new(),
+            groups: None,
+            authentication_client_id: None,
         }
     }
 
@@ -999,14 +996,14 @@ mod tests {
         }));
         let mut claims = thin_id_token_claims();
 
-        merge_userinfo_claims(&mut claims, &userinfo);
+        merge_userinfo_claims(&mut claims, &userinfo).unwrap();
 
         assert_eq!(
             claims.groups,
-            vec![
+            Some(vec![
                 "AppAccess:Example".to_string(),
                 "role-example-admins".to_string()
-            ]
+            ])
         );
         assert_eq!(claims.email.as_deref(), Some("user@example.com"));
         assert_eq!(claims.email_verified, Some(true));
@@ -1025,9 +1022,9 @@ mod tests {
         }));
         let mut claims = thin_id_token_claims();
 
-        merge_userinfo_claims(&mut claims, &userinfo);
+        merge_userinfo_claims(&mut claims, &userinfo).unwrap();
 
-        assert_eq!(claims.groups, vec!["single-group".to_string()]);
+        assert_eq!(claims.groups, Some(vec!["single-group".to_string()]));
     }
 
     #[test]
@@ -1041,13 +1038,13 @@ mod tests {
         let mut claims = thin_id_token_claims();
         claims.email = Some("id-token@example.com".to_string());
         claims.email_verified = Some(true);
-        claims.groups = vec!["from-id-token".to_string()];
+        claims.groups = Some(vec!["from-id-token".to_string()]);
 
-        merge_userinfo_claims(&mut claims, &userinfo);
+        merge_userinfo_claims(&mut claims, &userinfo).unwrap();
 
         assert_eq!(claims.email.as_deref(), Some("id-token@example.com"));
         assert_eq!(claims.email_verified, Some(true));
-        assert_eq!(claims.groups, vec!["from-id-token".to_string()]);
+        assert_eq!(claims.groups, Some(vec!["from-id-token".to_string()]));
     }
 
     #[test]
@@ -1055,9 +1052,9 @@ mod tests {
         let userinfo = userinfo_from_json(serde_json::json!({ "sub": "00u123" }));
         let mut claims = thin_id_token_claims();
 
-        merge_userinfo_claims(&mut claims, &userinfo);
+        merge_userinfo_claims(&mut claims, &userinfo).unwrap();
 
-        assert!(claims.groups.is_empty());
+        assert!(claims.groups.is_none());
         assert_eq!(claims.email_verified, None);
     }
 

@@ -20,7 +20,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 authors = ["David Culbreth"]
 license = "Apache-2.0"
@@ -94,7 +94,7 @@ sha2 = "0.11"
 regex = "1.12"
 
 # HTTP client
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream", "form"] }
 eventsource-stream = "0.2"
 hyper = { version = "1.9", features = ["full"] }
 

@@ -480,6 +480,23 @@ pub struct OidcConfig {
     /// Optional requested scopes in addition to `openid email profile`.
     #[serde(default)]
     pub scopes: Vec<String>,
+
+    /// Require a groups claim even when the provider does not use a groups scope.
+    /// Requesting the groups scope also requires the claim, including an empty list.
+    #[serde(default)]
+    pub require_groups: bool,
+
+    /// Optional separately registered device client. Omit to reuse the web client.
+    /// Its verified subjects bind to the primary client identity realm.
+    #[serde(default)]
+    pub device_client: Option<OidcDeviceClientConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcDeviceClientConfig {
+    pub client_id: String,
+    /// Omit for a public native client. Never inherits the web client's secret.
+    pub client_secret: Option<String>,
 }
 
 fn default_oidc_provider_name() -> String {
@@ -2167,6 +2184,15 @@ impl Config {
                         "OIDC client ID is required when OIDC is enabled",
                     ));
                 }
+                if oidc
+                    .device_client
+                    .as_ref()
+                    .is_some_and(|client| client.client_id.trim().is_empty())
+                {
+                    return Err(crate::Error::validation(
+                        "OIDC device client ID cannot be empty",
+                    ));
+                }
                 if oidc.redirect_uri.as_deref().unwrap_or("").trim().is_empty() {
                     return Err(crate::Error::validation(
                         "OIDC redirect URI is required when OIDC is enabled",
@@ -3028,6 +3054,7 @@ enabled: false
         assert!(cfg.redirect_uri.is_none());
         assert!(cfg.client_secret.is_none());
         assert_eq!(cfg.provider_name, "oidc");
+        assert!(!cfg.require_groups);
     }
 
     #[test]

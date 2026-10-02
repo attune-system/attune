@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-10-01
+
+### Added
+
+- OIDC configuration accepts a separate device-client registration for providers such as Okta that require a Native app. Public native clients never inherit the web client's secret.
+- `security.oidc.require_groups` requires verified groups even for providers that deliver them without a `groups` scope. Requesting that scope also requires the claim.
+
+### Changed
+
+- CLI SSO uses RFC 8628 device authorization with outbound-only polling. The loopback listener, `--port`, and browser-to-CLI token callback have been removed.
+
+### Security
+
+- Device grants validate provider signatures, issuer, audience, authorization party, and identity bindings before issuing Attune tokens. Concurrent OIDC logins from unrelated clients cannot adopt the same identity.
+- Browser and device logins reject missing required or malformed group claims before identity or role changes. Explicit empty ID-token groups remain authoritative and clear OIDC-managed roles without UserInfo overriding them.
+- OIDC identity attributes and managed roles commit in one serialized transaction. Concurrent logins cannot leave roles inconsistent with the final claims, and group synchronization preserves assignments owned by other sources.
+
+### Fixed
+
+- The pack index modal exposes HTTP header configuration, source editing, and per-index metadata refresh. Errors appear inside the dialog, and stored redacted credentials survive edits.
+- Explicit index fetch failures return HTTP 502 instead of an empty successful result. Administrators can preview disabled indices without making them eligible for installation.
+- Toggling an index while editing it updates the form's enabled state, so saving does not undo the toggle.
+- CLI device requests allow time for the API's sequential provider exchanges while retaining the overall login deadline.
+
 ## [0.7.3] - 2026-09-30
 
 ### Added

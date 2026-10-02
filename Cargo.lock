@@ -443,7 +443,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "attune-api"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -469,12 +469,15 @@ dependencies = [
  "mockall",
  "openidconnect",
  "rand 0.10.2",
+ "rand 0.8.8",
  "reqwest",
+ "rsa",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha1 0.11.0",
+ "sha2 0.10.9",
  "sha2 0.11.0",
  "sqlx",
  "subtle",
@@ -493,11 +496,12 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid",
  "validator",
+ "wiremock",
 ]
 
 [[package]]
 name = "attune-cli"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -541,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "attune-common"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -596,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "attune-executor"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -625,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "attune-notifier"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -653,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "attune-sensor"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "attune-common",
@@ -680,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "attune-supervisor"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "attune-common",
@@ -699,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "attune-worker"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4842,6 +4846,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

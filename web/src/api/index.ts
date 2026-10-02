@@ -172,6 +172,8 @@ export { DashboardSourceStatus } from "./models/DashboardSourceStatus";
 export type { DashboardTimeRangeRequest } from "./models/DashboardTimeRangeRequest";
 export { DashboardVisibility } from "./models/DashboardVisibility";
 export type { DependencyError } from "./models/DependencyError";
+export type { DevicePollRequest } from "./models/DevicePollRequest";
+export { DeviceWaitReason } from "./models/DeviceWaitReason";
 export type { DownloadedPack } from "./models/DownloadedPack";
 export type { DownloadPacksRequest } from "./models/DownloadPacksRequest";
 export type { DownloadPacksResponse } from "./models/DownloadPacksResponse";

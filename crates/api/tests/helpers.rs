@@ -449,6 +449,23 @@ impl TestContext {
         }
         Ok(())
     }
+
+    /// Stop writers and await removal of this context's owned database and files.
+    #[allow(dead_code)] // This shared helper is compiled by tests that use Drop recovery only.
+    pub async fn cleanup(mut self) -> Result<()> {
+        self.app = axum::Router::new();
+        if let Some(writer) = self.audit_writer.take() {
+            writer
+                .shutdown()
+                .map_err(|_| "audit writer thread panicked")?;
+        }
+        self.pool.close().await;
+        if let Some(database) = self.database.take() {
+            database.cleanup().await?;
+        }
+        std::fs::remove_dir_all(&self.test_packs_dir)?;
+        Ok(())
+    }
 }
 
 impl Drop for TestContext {

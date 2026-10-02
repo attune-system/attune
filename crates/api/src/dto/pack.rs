@@ -248,13 +248,17 @@ pub struct CreatePackRegistryIndexRequest {
 /// Request to update a configured pack registry index.
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct UpdatePackRegistryIndexRequest {
-    #[schema(nullable = true)]
+    #[serde(
+        default,
+        deserialize_with = "crate::dto::common::deserialize_double_option"
+    )]
+    #[schema(required = false, nullable = true)]
     pub name: Option<Option<String>>,
     #[validate(length(min = 1))]
     pub url: Option<String>,
     pub position: Option<i32>,
     pub enabled: Option<bool>,
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Option<Object>, nullable = true)]
     pub headers: Option<JsonValue>,
 }
 
@@ -1128,6 +1132,18 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_updates_distinguish_omitted_names_from_explicit_clears() {
+        let omitted: UpdatePackRegistryIndexRequest =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(omitted.name, None);
+        assert_eq!(omitted.headers, None);
+        let cleared: UpdatePackRegistryIndexRequest =
+            serde_json::from_value(serde_json::json!({"name":null,"headers":{}})).unwrap();
+        assert_eq!(cleared.name, Some(None));
+        assert_eq!(cleared.headers, Some(serde_json::json!({})));
+    }
 
     #[test]
     fn test_create_pack_request_defaults() {

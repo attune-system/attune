@@ -23,15 +23,15 @@ class UpdatePackRegistryIndexRequest:
     """Request to update a configured pack registry index.
 
     Attributes:
-        headers (None | UpdatePackRegistryIndexRequestHeadersType0):
         enabled (bool | None | Unset):
+        headers (None | Unset | UpdatePackRegistryIndexRequestHeadersType0):
         name (None | str | Unset):
         position (int | None | Unset):
         url (None | str | Unset):
     """
 
-    headers: None | UpdatePackRegistryIndexRequestHeadersType0
     enabled: bool | None | Unset = UNSET
+    headers: None | Unset | UpdatePackRegistryIndexRequestHeadersType0 = UNSET
     name: None | str | Unset = UNSET
     position: int | None | Unset = UNSET
     url: None | str | Unset = UNSET
@@ -42,17 +42,19 @@ class UpdatePackRegistryIndexRequest:
             UpdatePackRegistryIndexRequestHeadersType0,
         )
 
-        headers: dict[str, Any] | None
-        if isinstance(self.headers, UpdatePackRegistryIndexRequestHeadersType0):
-            headers = self.headers.to_dict()
-        else:
-            headers = self.headers
-
         enabled: bool | None | Unset
         if isinstance(self.enabled, Unset):
             enabled = UNSET
         else:
             enabled = self.enabled
+
+        headers: dict[str, Any] | None | Unset
+        if isinstance(self.headers, Unset):
+            headers = UNSET
+        elif isinstance(self.headers, UpdatePackRegistryIndexRequestHeadersType0):
+            headers = self.headers.to_dict()
+        else:
+            headers = self.headers
 
         name: None | str | Unset
         if isinstance(self.name, Unset):
@@ -74,13 +76,11 @@ class UpdatePackRegistryIndexRequest:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "headers": headers,
-            }
-        )
+        field_dict.update({})
         if enabled is not UNSET:
             field_dict["enabled"] = enabled
+        if headers is not UNSET:
+            field_dict["headers"] = headers
         if name is not UNSET:
             field_dict["name"] = name
         if position is not UNSET:
@@ -98,10 +98,21 @@ class UpdatePackRegistryIndexRequest:
 
         d = dict(src_dict)
 
+        def _parse_enabled(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        enabled = _parse_enabled(d.pop("enabled", UNSET))
+
         def _parse_headers(
             data: object,
-        ) -> None | UpdatePackRegistryIndexRequestHeadersType0:
+        ) -> None | Unset | UpdatePackRegistryIndexRequestHeadersType0:
             if data is None:
+                return data
+            if isinstance(data, Unset):
                 return data
             try:
                 if not isinstance(data, dict):
@@ -113,18 +124,9 @@ class UpdatePackRegistryIndexRequest:
                 return headers_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(None | UpdatePackRegistryIndexRequestHeadersType0, data)
+            return cast(None | Unset | UpdatePackRegistryIndexRequestHeadersType0, data)
 
-        headers = _parse_headers(d.pop("headers"))
-
-        def _parse_enabled(data: object) -> bool | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(bool | None | Unset, data)
-
-        enabled = _parse_enabled(d.pop("enabled", UNSET))
+        headers = _parse_headers(d.pop("headers", UNSET))
 
         def _parse_name(data: object) -> None | str | Unset:
             if data is None:
@@ -154,8 +156,8 @@ class UpdatePackRegistryIndexRequest:
         url = _parse_url(d.pop("url", UNSET))
 
         update_pack_registry_index_request = cls(
-            headers=headers,
             enabled=enabled,
+            headers=headers,
             name=name,
             position=position,
             url=url,

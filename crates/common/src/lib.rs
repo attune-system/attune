@@ -18,6 +18,7 @@ pub mod config;
 pub mod crypto;
 pub mod dashboard_spec;
 pub mod db;
+pub mod device_auth;
 pub mod error;
 pub mod execution_env;
 pub mod inquiry_callback_adapter;

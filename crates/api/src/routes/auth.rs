@@ -140,6 +140,8 @@ pub fn routes() -> Router<SharedState> {
         .route("/login", post(login))
         .route("/token-login", post(token_login))
         .route("/oidc/login", get(oidc_login))
+        .route("/oidc/device/start", post(oidc_device_start))
+        .route("/oidc/device/poll", post(oidc_device_poll))
         .route("/callback", get(oidc_callback))
         .route("/ldap/login", post(ldap_login))
         .route("/logout", get(logout))
@@ -1003,10 +1005,9 @@ pub struct LdapLoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcLoginParams {
     pub redirect_to: Option<String>,
-    /// Optional local callback URI for CLI SSO login (must be http://localhost or http://127.0.0.1).
-    pub cli_redirect_uri: Option<String>,
 }
 
 /// Begin browser OIDC login by redirecting to the provider.
@@ -1016,7 +1017,6 @@ pub struct OidcLoginParams {
     tag = "auth",
     params(
         ("redirect_to" = Option<String>, Query, description = "Application path to return to after login"),
-        ("cli_redirect_uri" = Option<String>, Query, description = "Local CLI callback URI"),
     ),
     responses(
         (status = 307, description = "Redirect to the configured OIDC provider"),
@@ -1027,12 +1027,7 @@ pub async fn oidc_login(
     State(state): State<SharedState>,
     Query(params): Query<OidcLoginParams>,
 ) -> Result<Response, ApiError> {
-    let login_redirect = build_login_redirect(
-        &state,
-        params.redirect_to.as_deref(),
-        params.cli_redirect_uri.as_deref(),
-    )
-    .await?;
+    let login_redirect = build_login_redirect(&state, params.redirect_to.as_deref()).await?;
     let mut response = Redirect::temporary(&login_redirect.authorization_url).into_response();
     apply_cookies_to_headers(response.headers_mut(), &login_redirect.cookies)?;
     Ok(response)
@@ -1044,7 +1039,7 @@ pub async fn oidc_login(
     path = "/auth/callback",
     tag = "auth",
     responses(
-        (status = 307, description = "Redirect to the application or CLI callback"),
+        (status = 307, description = "Redirect to the application callback"),
         (status = 400, description = "Invalid OIDC callback"),
         (status = 401, description = "OIDC authentication failed"),
     )
@@ -1055,16 +1050,60 @@ pub async fn oidc_callback(
     Query(query): Query<OidcCallbackQuery>,
 ) -> Result<Response, ApiError> {
     let redirect_to = get_cookie_value(&headers, crate::auth::oidc::OIDC_REDIRECT_COOKIE_NAME);
-    let cli_redirect_uri =
-        get_cookie_value(&headers, crate::auth::oidc::OIDC_CLI_REDIRECT_COOKIE_NAME);
     let authenticated = crate::auth::oidc::handle_callback(&state, &headers, &query).await?;
     oidc_callback_redirect_response(
         &state,
         &authenticated.token_response,
         redirect_to,
         &authenticated.id_token,
-        cli_redirect_uri,
     )
+}
+
+#[utoipa::path(
+    post, path = "/auth/oidc/device/start", tag = "auth",
+    responses(
+        (status = 200, description = "Device authorization instructions", body = inline(ApiResponse<crate::dto::auth::DeviceAuthorizationResponse>)),
+        (status = 501, description = "OIDC device grant is unsupported or not configured", body = crate::middleware::error::ErrorResponse),
+        (status = 502, description = "OIDC provider device authorization failed", body = crate::middleware::error::ErrorResponse),
+    )
+)]
+pub async fn oidc_device_start(State(state): State<SharedState>) -> Response {
+    device_login_response(crate::auth::oidc_device::start(&state).await)
+}
+
+#[utoipa::path(
+    post, path = "/auth/oidc/device/poll", tag = "auth",
+    request_body = crate::dto::auth::DevicePollRequest,
+    responses(
+        (status = 200, description = "Device grant status or Attune credentials", body = inline(ApiResponse<crate::dto::auth::OidcDevicePollResponse>)),
+        (status = 400, description = "Invalid device authorization session", body = crate::middleware::error::ErrorResponse),
+        (status = 401, description = "Invalid provider identity token", body = crate::middleware::error::ErrorResponse),
+        (status = 403, description = "Identity is frozen or has a conflicting binding", body = crate::middleware::error::ErrorResponse),
+        (status = 502, description = "OIDC provider exchange failed", body = crate::middleware::error::ErrorResponse),
+    )
+)]
+pub async fn oidc_device_poll(
+    State(state): State<SharedState>,
+    Json(request): Json<crate::dto::auth::DevicePollRequest>,
+) -> Response {
+    let result = async {
+        request.validate()?;
+        crate::auth::oidc_device::poll(&state, &request.device_code).await
+    }
+    .await;
+    device_login_response(result)
+}
+
+fn device_login_response<T: serde::Serialize>(result: Result<T, ApiError>) -> Response {
+    let mut response = match result {
+        Ok(value) => Json(ApiResponse::new(value)).into_response(),
+        Err(error) => error.into_response(),
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 /// Authenticate via LDAP directory.

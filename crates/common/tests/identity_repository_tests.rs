@@ -7,7 +7,10 @@ mod helpers;
 
 use attune_common::{
     repositories::{
-        identity::{CreateIdentityInput, IdentityRepository, OidcUpsertInput, UpdateIdentityInput},
+        identity::{
+            CreateIdentityInput, CreateIdentityRoleAssignmentInput, IdentityRepository,
+            IdentityRoleAssignmentRepository, OidcUpsertInput, UpdateIdentityInput,
+        },
         Create, Delete, FindById, List, Update,
     },
     Error,
@@ -780,6 +783,7 @@ async fn test_upsert_oidc_identity_is_race_safe() {
                 "client_id": client_id,
             }
         }),
+        roles: Vec::new(),
     };
 
     let input_a = make_input("client-a", "race_a");
@@ -797,14 +801,20 @@ async fn test_upsert_oidc_identity_is_race_safe() {
     let result_a = task_a.await.expect("task_a panicked");
     let result_b = task_b.await.expect("task_b panicked");
 
-    let identity_a = result_a.expect("upsert A failed");
-    let identity_b = result_b.expect("upsert B failed");
-
-    // Both calls must observe the same row id — that's the whole point.
     assert_eq!(
-        identity_a.id, identity_b.id,
-        "concurrent upserts for the same (issuer, sub) must converge on one row"
+        usize::from(result_a.is_ok()) + usize::from(result_b.is_ok()),
+        1,
+        "Only the winning client may authenticate the shared subject"
     );
+    let rejected = if let Err(error) = result_a {
+        error
+    } else {
+        result_b.unwrap_err()
+    };
+    assert!(matches!(
+        rejected,
+        attune_common::Error::PermissionDenied(_)
+    ));
 
     // Verify exactly one row exists in the database for this (issuer, sub).
     let count: i64 = sqlx::query_scalar(
@@ -835,4 +845,123 @@ async fn test_upsert_oidc_identity_is_race_safe() {
         matches!(client_id.as_deref(), Some("client-a") | Some("client-b")),
         "row's client_id should be one of the two contenders, got {client_id:?}"
     );
+    pool.cleanup().await.unwrap();
+}
+
+fn oidc_login_input(roles: &[&str]) -> OidcUpsertInput {
+    OidcUpsertInput {
+        issuer: "https://oidc.example.com".into(),
+        sub: "same-subject".into(),
+        client_id: "attune-web".into(),
+        desired_login: "user@example.com".into(),
+        fallback_login: "oidc:same-subject".into(),
+        display_name: Some("OIDC user".into()),
+        attributes: json!({"oidc": {"issuer": "https://oidc.example.com", "sub": "same-subject", "client_id": "attune-web", "groups": roles}}),
+        roles: roles.iter().map(|role| role.to_string()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn oidc_identity_and_roles_roll_back_together_when_role_write_fails() {
+    let pool = create_test_pool().await.unwrap();
+    let original = IdentityRepository::upsert_oidc_identity(&pool, oidc_login_input(&["old-role"]))
+        .await
+        .unwrap();
+    let mut input = oidc_login_input(&["new-role"]);
+    input.display_name = Some("Changed name".into());
+    input.roles.push("invalid\0postgres-text".into());
+    assert!(IdentityRepository::upsert_oidc_identity(&pool, input)
+        .await
+        .is_err());
+    let unchanged = IdentityRepository::find_by_id(&pool, original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.attributes, original.attributes);
+    assert_eq!(unchanged.display_name, original.display_name);
+    assert_eq!(
+        IdentityRoleAssignmentRepository::find_role_names_by_identity(&pool, original.id)
+            .await
+            .unwrap(),
+        vec!["old-role"]
+    );
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn oidc_group_replacement_preserves_roles_owned_by_other_sources() {
+    let pool = create_test_pool().await.unwrap();
+    let original = IdentityRepository::upsert_oidc_identity(&pool, oidc_login_input(&[]))
+        .await
+        .unwrap();
+    for (role, source, managed) in [("manual-role", "local", false), ("ldap-role", "ldap", true)] {
+        IdentityRoleAssignmentRepository::create(
+            &pool,
+            CreateIdentityRoleAssignmentInput {
+                identity: original.id,
+                role: role.into(),
+                source: source.into(),
+                managed,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    IdentityRepository::upsert_oidc_identity(
+        &pool,
+        oidc_login_input(&["manual-role", "ldap-role", "oidc-role"]),
+    )
+    .await
+    .unwrap();
+    let roles = IdentityRoleAssignmentRepository::find_by_identity(&pool, original.id)
+        .await
+        .unwrap();
+    assert!(roles
+        .iter()
+        .any(|role| role.role == "manual-role" && role.source == "local" && !role.managed));
+    assert!(roles
+        .iter()
+        .any(|role| role.role == "ldap-role" && role.source == "ldap" && role.managed));
+    IdentityRepository::upsert_oidc_identity(&pool, oidc_login_input(&[]))
+        .await
+        .unwrap();
+    assert_eq!(
+        IdentityRoleAssignmentRepository::find_role_names_by_identity(&pool, original.id)
+            .await
+            .unwrap(),
+        vec!["ldap-role", "manual-role"]
+    );
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_oidc_logins_commit_matching_attributes_and_roles() {
+    let pool = create_test_pool().await.unwrap();
+    let original = IdentityRepository::upsert_oidc_identity(&pool, oidc_login_input(&[]))
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        let (nonempty, empty) = tokio::join!(
+            IdentityRepository::upsert_oidc_identity(
+                &pool,
+                oidc_login_input(&["admins", "operators"])
+            ),
+            IdentityRepository::upsert_oidc_identity(&pool, oidc_login_input(&[])),
+        );
+        assert_eq!(nonempty.unwrap().id, original.id);
+        assert_eq!(empty.unwrap().id, original.id);
+        let final_identity = IdentityRepository::find_by_id(&pool, original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let final_roles =
+            IdentityRoleAssignmentRepository::find_role_names_by_identity(&pool, original.id)
+                .await
+                .unwrap();
+        assert_eq!(
+            json!(final_roles),
+            final_identity.attributes["oidc"]["groups"]
+        );
+    }
+    pool.cleanup().await.unwrap();
 }

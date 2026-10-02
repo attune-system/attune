@@ -1,8 +1,17 @@
 //! Authentication DTOs
 
+pub use attune_common::device_auth::DeviceAuthorizationResponse;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
+pub type OidcDevicePollResponse = attune_common::device_auth::DevicePollResponse<TokenResponse>;
+
+#[derive(Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DevicePollRequest {
+    #[validate(length(min = 1, max = 32768))]
+    pub device_code: String,
+}
 
 /// Login request
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
