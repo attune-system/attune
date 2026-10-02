@@ -420,7 +420,7 @@ impl PackInstaller {
         // Create temp directory
         let install_dir = self.create_temp_dir().await?;
         let result = async {
-            self.copy_directory(source_path, &install_dir).await?;
+            Self::copy_directory(source_path, &install_dir).await?;
             let pack_dir = self.find_pack_directory(&install_dir).await?;
 
             Ok(InstalledPack {
@@ -814,8 +814,7 @@ impl PackInstaller {
     }
 
     /// Copy directory recursively
-    #[async_recursion::async_recursion]
-    async fn copy_directory(&self, src: &Path, dst: &Path) -> Result<()> {
+    async fn copy_directory(src: &Path, dst: &Path) -> Result<()> {
         use tokio::fs;
 
         // Create destination directory if it doesn't exist
@@ -850,7 +849,7 @@ impl PackInstaller {
                 )));
             } else if metadata.is_dir() {
                 // Recursively copy subdirectory
-                self.copy_directory(&path, &dest_path).await?;
+                Box::pin(Self::copy_directory(&path, &dest_path)).await?;
             } else if metadata.is_file() {
                 // Copy file
                 fs::copy(&path, &dest_path)
@@ -1223,6 +1222,9 @@ mod tests {
         let source_dir = temp_dir.path().join("source");
         std::fs::create_dir(&source_dir).unwrap();
         std::fs::write(source_dir.join("pack.yaml"), "ref: local-test\n").unwrap();
+        let nested_file = Path::new("actions/workflows/nested.yaml");
+        std::fs::create_dir_all(source_dir.join("actions/workflows")).unwrap();
+        std::fs::write(source_dir.join(nested_file), "tasks: {}\n").unwrap();
         let installer = PackInstaller::new(temp_dir.path(), None).await.unwrap();
 
         let installed = installer
@@ -1233,6 +1235,10 @@ mod tests {
             .unwrap();
 
         assert!(installed.path.join("pack.yaml").is_file());
+        assert_eq!(
+            std::fs::read_to_string(installed.path.join(nested_file)).unwrap(),
+            "tasks: {}\n"
+        );
         assert!(matches!(
             installed.source,
             PackSource::LocalDirectory { path } if path == source_dir

@@ -148,9 +148,7 @@ it("keeps the edit form's enabled state consistent after toggling its index", as
   await userEvent.click(
     screen.getByRole("button", { name: "Edit Private index" }),
   );
-  await userEvent.click(
-    screen.getByRole("button", { name: "Disable" }),
-  );
+  await userEvent.click(screen.getByRole("button", { name: "Disable" }));
   expect(await screen.findByRole("status")).toHaveTextContent(
     "Index disabled.",
   );
