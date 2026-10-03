@@ -39,8 +39,11 @@ pub struct PackReplacement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExchangeOutcome {
+    // Non-Linux platforms always return Unsupported from exchange_paths.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Exchanged,
     Unsupported,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Failed,
 }
 

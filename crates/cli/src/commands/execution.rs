@@ -12,10 +12,7 @@ use crate::client::ApiClient;
 use crate::config::CliConfig;
 use crate::manual_execution::{ManualExecutionOptions, ManualExecutionRequest};
 use crate::output::{self, OutputFormat};
-use crate::wait::{
-    extract_stdout, spawn_execution_output_watch, wait_for_execution, WaitOptions,
-    OUTPUT_WATCH_DRAIN_GRACE,
-};
+use crate::wait::{extract_stdout, watch_execution, WaitOptions, WatchOutcome};
 
 #[derive(Subcommand)]
 pub enum ExecutionCommands {
@@ -566,36 +563,24 @@ async fn handle_watch_execution(
         output::print_info(&format!("Observing execution {}...", execution_id));
     }
 
-    let interactive_wait = true;
-    let stream_live_logs = true;
-    let debug_wait = false;
-    let watch_task = Some(spawn_execution_output_watch(
+    let (summary, suppress_final_stdout) = match watch_execution(
+        WaitOptions {
+            execution_id,
+            timeout_secs: timeout,
+            api_client: &mut client,
+            notifier_ws_url: notifier_url,
+            verbose: false,
+        },
         ApiClient::from_config(&config, api_url),
-        execution_id,
-        notifier_url.clone(),
-        interactive_wait,
-        stream_live_logs,
-        debug_wait,
-    ));
-    let wait_result = wait_for_execution(WaitOptions {
-        execution_id,
-        timeout_secs: timeout,
-        api_client: &mut client,
-        notifier_ws_url: notifier_url,
-        verbose: debug_wait,
-    })
-    .await;
-    let watch_drain_grace = if wait_result.is_ok() {
-        OUTPUT_WATCH_DRAIN_GRACE
-    } else {
-        Duration::ZERO
+    )
+    .await?
+    {
+        WatchOutcome::Completed {
+            summary,
+            suppress_final_stdout,
+        } => (summary, suppress_final_stdout),
+        WatchOutcome::Stopped(stop) => return stop.report(output_format),
     };
-    let (delivered_output, root_stdout_completed) = match watch_task {
-        Some(task) => task.finish_or_stop(watch_drain_grace).await,
-        None => (false, false),
-    };
-    let summary = wait_result?;
-    let suppress_final_stdout = delivered_output && root_stdout_completed;
 
     render_watched_execution_summary(summary, output_format, suppress_final_stdout)
 }
@@ -774,36 +759,24 @@ async fn handle_rerun(
         ));
     }
 
-    let interactive_wait = true;
-    let stream_live_logs = true;
-    let debug_wait = false;
-    let watch_task = Some(spawn_execution_output_watch(
+    let (summary, suppress_final_stdout) = match watch_execution(
+        WaitOptions {
+            execution_id: new_execution.id,
+            timeout_secs: timeout,
+            api_client: &mut client,
+            notifier_ws_url: notifier_url,
+            verbose: false,
+        },
         ApiClient::from_config(&config, api_url),
-        new_execution.id,
-        notifier_url.clone(),
-        interactive_wait,
-        stream_live_logs,
-        debug_wait,
-    ));
-    let wait_result = wait_for_execution(WaitOptions {
-        execution_id: new_execution.id,
-        timeout_secs: timeout,
-        api_client: &mut client,
-        notifier_ws_url: notifier_url,
-        verbose: debug_wait,
-    })
-    .await;
-    let watch_drain_grace = if wait_result.is_ok() {
-        OUTPUT_WATCH_DRAIN_GRACE
-    } else {
-        Duration::ZERO
+    )
+    .await?
+    {
+        WatchOutcome::Completed {
+            summary,
+            suppress_final_stdout,
+        } => (summary, suppress_final_stdout),
+        WatchOutcome::Stopped(stop) => return stop.report(output_format),
     };
-    let (delivered_output, root_stdout_completed) = match watch_task {
-        Some(task) => task.finish_or_stop(watch_drain_grace).await,
-        None => (false, false),
-    };
-    let summary = wait_result?;
-    let suppress_final_stdout = delivered_output && root_stdout_completed;
 
     render_watched_execution_summary(summary, output_format, suppress_final_stdout)
 }
@@ -1357,12 +1330,12 @@ async fn open_execution_stream(
         .build()
         .context("Failed to build execution stream HTTP client")?;
 
-    let mut request = client
-        .get(format!(
-            "{}/api/v1/executions/stream",
-            base_url.trim_end_matches('/')
-        ))
-        .header(ACCEPT, "text/event-stream");
+    let url = format!(
+        "{}/api/v1/executions/stream",
+        base_url.trim_end_matches('/')
+    );
+    crate::client::log_http_request("GET", &url);
+    let mut request = client.get(&url).header(ACCEPT, "text/event-stream");
     if let Some(token) = auth_token {
         request = request.header(header::AUTHORIZATION, format!("Bearer {}", token));
     }

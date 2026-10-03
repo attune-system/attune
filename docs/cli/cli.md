@@ -332,6 +332,36 @@ Omitted placement options inherit action defaults. Pack placement constraints st
 
 Rerun reuses the previous parameters. Execution options supplied to rerun configure the new execution; omitted options use the current action defaults.
 
+### Cancel or detach while watching
+
+For `run --watch`, `action execute --watch`, `execution rerun --watch`, and
+`execution watch <id>`, use these controls:
+
+| Control | Behavior |
+| --- | --- |
+| Ctrl+C | Requests cancellation of the watched execution, stops local watchers, and exits with code `130` after the API accepts the request. |
+| Ctrl+D | Stops local watchers without requesting cancellation and exits with code `0`. No Enter key is required. |
+
+Cancellation uses your CLI credentials and requires permission to cancel that
+execution. The CLI reports cancellation failures and exits with code `1`.
+An accepted request can leave the execution in `canceling` while the worker stops
+it. The CLI does not wait for that transition to finish.
+
+Ctrl+D is available when stdin is an interactive terminal. Closed or redirected
+stdin does not detach scripted watches. Ctrl+C also handles an external SIGINT
+on Unix. The CLI restores terminal settings and stops its output readers before
+returning.
+
+Reattach to an execution after detaching:
+
+```bash
+attune execution watch 5
+```
+
+The watch's `--timeout` stops watching without requesting cancellation. Watching
+the execution list with `execution watch` still uses Ctrl+C to stop the list
+display, without cancelling executions.
+
 The MCP `actions_execute` tool accepts the same API fields directly:
 
 ```json
@@ -896,11 +926,23 @@ attune config set api_url http://localhost:8080
 attune auth login --username admin
 ```
 
-### Verbose Debugging
+### Verbose debugging
 
-Enable verbose output to see HTTP requests:
+Use `--verbose` to log each request's HTTP method and destination URL to stderr:
 ```bash
 attune --verbose pack list
+attune --verbose auth whoami
+attune --verbose auth sso-login --url https://attune.example.com
+```
+
+Request logs include the URL path and omit URL credentials, query strings, and
+fragments. Authentication refreshes and retries produce their own request logs.
+For example:
+
+```text
+DEBUG attune_cli::client: Sending HTTP request method="GET" url=https://attune.example.com/api/v1/packs
+DEBUG attune_cli::client: Sending HTTP request method="GET" url=https://attune.example.com/auth/me
+DEBUG attune_cli::client: Sending HTTP request method="POST" url=https://attune.example.com/auth/oidc/device/start
 ```
 
 ## Best Practices

@@ -7,9 +7,9 @@
 //!
 //! Public surface:
 //!   - [`WaitOptions`]  – caller-supplied parameters
-//!   - [`wait_for_execution`] – the single entry point
+//!   - [`watch_execution`] – completion, cancellation, detachment, and output cleanup
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use eventsource_stream::Eventsource;
@@ -29,11 +29,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Width};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message, MaybeTlsStream,
-    WebSocketStream,
+    connect_async_tls_with_config, tungstenite::client::IntoClientRequest, tungstenite::Message,
+    Connector, MaybeTlsStream, WebSocketStream,
 };
 
-use crate::client::ApiClient;
+use crate::client::{log_http_request, ApiClient};
+
+mod controls;
+mod output_tasks;
+use controls::{WatchControl, WatchControls};
+use output_tasks::{OutputTask, OutputTasks};
 
 // ── terminal status helpers ───────────────────────────────────────────────────
 
@@ -57,11 +62,64 @@ pub struct ExecutionSummary {
     pub updated: String,
 }
 
+pub enum WatchOutcome {
+    Completed {
+        summary: ExecutionSummary,
+        suppress_final_stdout: bool,
+    },
+    Stopped(WatchStop),
+}
+
+pub enum WatchStop {
+    Detached { execution_id: i64 },
+    CancelRequested { execution_id: i64, status: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Watched execution cancellation requested")]
+pub struct WatchCancelled;
+
+impl WatchStop {
+    pub fn report(self, format: crate::output::OutputFormat) -> Result<()> {
+        use crate::output::{self, OutputFormat};
+        let (execution_id, watch_status, status, cancelled) = match self {
+            Self::Detached { execution_id } => (execution_id, "detached", None, false),
+            Self::CancelRequested {
+                execution_id,
+                status,
+            } => (execution_id, "cancel_requested", Some(status), true),
+        };
+        match format {
+            OutputFormat::Table => {
+                if cancelled {
+                    output::print_info(&format!(
+                        "Cancellation requested for execution {execution_id}"
+                    ));
+                } else {
+                    output::print_info(&format!(
+                        "Detached from execution {execution_id}. No cancellation was requested."
+                    ));
+                }
+            }
+            OutputFormat::Json | OutputFormat::Yaml => output::print_output(
+                &serde_json::json!({
+                    "execution_id": execution_id, "watch_status": watch_status, "execution_status": status,
+                }),
+                format,
+            )?,
+        }
+        if cancelled {
+            return Err(WatchCancelled.into());
+        }
+        Ok(())
+    }
+}
+
 /// Parameters that control how we wait.
 pub struct WaitOptions<'a> {
     /// Execution ID to watch.
     pub execution_id: i64,
-    /// Overall wall-clock limit (seconds). Defaults to 300 if `None`.
+    /// Overall wall-clock limit in seconds.
     pub timeout_secs: u64,
     /// REST API client (already authenticated).
     pub api_client: &'a mut ApiClient,
@@ -72,24 +130,35 @@ pub struct WaitOptions<'a> {
     pub verbose: bool,
 }
 
-pub struct OutputWatchTask {
-    pub handle: tokio::task::JoinHandle<()>,
+struct OutputWatchTask {
+    handle: tokio::task::JoinHandle<()>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     delivered_output: Arc<AtomicBool>,
     root_stdout_completed: Arc<AtomicBool>,
 }
 
 impl OutputWatchTask {
-    pub async fn finish_or_stop(mut self, grace: Duration) -> (bool, bool) {
+    async fn finish_or_stop(mut self, grace: Duration) -> (bool, bool) {
         // Terminal status can precede the final SSE chunks. Give active streams
         // a bounded chance to flush, then cancel stale watchers.
         if tokio::time::timeout(grace, &mut self.handle).await.is_err() {
-            self.handle.abort();
-            let _ = self.handle.await;
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            let _ = (&mut self.handle).await;
         }
         (
             self.delivered_output.load(Ordering::Relaxed),
             self.root_stdout_completed.load(Ordering::Relaxed),
         )
+    }
+}
+
+impl Drop for OutputWatchTask {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
     }
 }
 
@@ -182,11 +251,12 @@ struct RootWatchState {
 struct StreamWatchHandle {
     stream_name: &'static str,
     offset: Arc<AtomicU64>,
-    handle: tokio::task::JoinHandle<()>,
+    handle: OutputTask,
 }
 
 #[derive(Clone)]
 struct StreamWatchConfig {
+    tasks: OutputTasks,
     base_url: String,
     token: String,
     execution_id: i64,
@@ -232,6 +302,7 @@ struct WatchExecutionContext {
 }
 
 struct ChildUpdateContext<'a> {
+    tasks: &'a OutputTasks,
     client: &'a mut ApiClient,
     children: &'a mut HashMap<i64, ChildWatchState>,
     stream_logs: bool,
@@ -247,7 +318,7 @@ const RENDER_TICK: Duration = Duration::from_millis(120);
 const WATCH_ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const WATCH_DESCENDANT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const WEBSOCKET_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
-pub const OUTPUT_WATCH_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const OUTPUT_WATCH_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -315,13 +386,13 @@ impl LiveRenderer {
         self.enabled
     }
 
-    fn spawn(&self) -> Option<tokio::task::JoinHandle<()>> {
+    fn spawn(&self, tasks: &OutputTasks) -> Option<OutputTask> {
         if !self.enabled {
             return None;
         }
 
         let renderer = self.clone();
-        Some(tokio::spawn(async move {
+        Some(tasks.spawn(async move {
             loop {
                 renderer.render(false);
                 if renderer.stop.load(Ordering::Relaxed) {
@@ -546,7 +617,7 @@ impl From<RestExecution> for ExecutionSummary {
 ///
 /// Returns the final [`ExecutionSummary`] on success or an error if the
 /// timeout is exceeded or a fatal error occurs.
-pub async fn wait_for_execution(opts: WaitOptions<'_>) -> Result<ExecutionSummary> {
+async fn wait_for_execution(opts: WaitOptions<'_>) -> Result<ExecutionSummary> {
     let overall_deadline = Instant::now() + Duration::from_secs(opts.timeout_secs);
 
     // Reserve at least this long for polling after WebSocket gives up.
@@ -596,7 +667,82 @@ pub async fn wait_for_execution(opts: WaitOptions<'_>) -> Result<ExecutionSummar
     .await
 }
 
-pub fn spawn_execution_output_watch(
+pub async fn watch_execution(
+    opts: WaitOptions<'_>,
+    output_client: ApiClient,
+) -> Result<WatchOutcome> {
+    enum WatchEvent {
+        Completion(Result<ExecutionSummary>),
+        Control(Result<WatchControl>),
+    }
+    #[derive(Deserialize)]
+    struct CancellationResponse {
+        status: String,
+    }
+    let WaitOptions {
+        execution_id,
+        timeout_secs,
+        api_client,
+        notifier_ws_url,
+        verbose,
+    } = opts;
+    let mut controls = WatchControls::new()?;
+    let output = spawn_execution_output_watch(
+        output_client,
+        execution_id,
+        notifier_ws_url.clone(),
+        true,
+        true,
+        verbose,
+    );
+    let interrupted = {
+        tokio::select! {
+            biased;
+            control = controls.next() => WatchEvent::Control(control),
+            result = wait_for_execution(WaitOptions {
+                execution_id, timeout_secs, api_client: &mut *api_client, notifier_ws_url, verbose,
+            }) => WatchEvent::Completion(result),
+        }
+    };
+    let grace = if matches!(&interrupted, WatchEvent::Completion(Ok(_))) {
+        OUTPUT_WATCH_DRAIN_GRACE
+    } else {
+        Duration::ZERO
+    };
+    let (delivered_output, root_stdout_completed) = output.finish_or_stop(grace).await;
+    let restored = controls.close();
+    let result = match interrupted {
+        WatchEvent::Completion(result) => result.map(|summary| WatchOutcome::Completed {
+            summary,
+            suppress_final_stdout: delivered_output && root_stdout_completed,
+        }),
+        WatchEvent::Control(Ok(WatchControl::Detach)) => {
+            Ok(WatchOutcome::Stopped(WatchStop::Detached { execution_id }))
+        }
+        WatchEvent::Control(Ok(WatchControl::Cancel)) => {
+            let response: Result<CancellationResponse> = tokio::time::timeout(
+                Duration::from_secs(10),
+                api_client.post(
+                    &format!("/executions/{execution_id}/cancel"),
+                    &serde_json::json!({}),
+                ),
+            )
+            .await
+            .context("Cancellation request timed out; its server-side outcome is unknown")?;
+            response.map(|response| {
+                WatchOutcome::Stopped(WatchStop::CancelRequested {
+                    execution_id,
+                    status: response.status,
+                })
+            })
+        }
+        WatchEvent::Control(Err(error)) => Err(error),
+    };
+    restored?;
+    result
+}
+
+fn spawn_execution_output_watch(
     mut client: ApiClient,
     execution_id: i64,
     notifier_ws_url: Option<String>,
@@ -607,6 +753,8 @@ pub fn spawn_execution_output_watch(
     let delivered_output = Arc::new(AtomicBool::new(false));
     let root_stdout_completed = Arc::new(AtomicBool::new(false));
     let live_renderer = LiveRenderer::new(show_progress);
+    let tasks = OutputTasks::default();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
     let plain_progress = show_progress && !live_renderer.enabled();
     let watch_ctx = WatchExecutionContext {
         execution_id,
@@ -614,13 +762,20 @@ pub fn spawn_execution_output_watch(
         stream_logs,
         debug,
         base_url: client.base_url().to_string(),
-        live_renderer,
+        live_renderer: live_renderer.clone(),
         plain_progress,
         delivered_output: delivered_output.clone(),
         root_stdout_completed: root_stdout_completed.clone(),
     };
     let handle = tokio::spawn(async move {
-        if let Err(err) = watch_execution_output(&mut client, watch_ctx).await {
+        let result = tokio::select! {
+            result = watch_execution_output(&mut client, watch_ctx, &tasks) => result,
+            _ = stopped => Ok(()),
+        };
+        live_renderer.stop();
+        tasks.shutdown().await;
+        live_renderer.render(true);
+        if let Err(err) = result {
             if debug {
                 eprintln!("  [watch] {}", err);
             }
@@ -629,12 +784,17 @@ pub fn spawn_execution_output_watch(
 
     OutputWatchTask {
         handle,
+        stop: Some(stop),
         delivered_output,
         root_stdout_completed,
     }
 }
 
-async fn watch_execution_output(client: &mut ApiClient, ctx: WatchExecutionContext) -> Result<()> {
+async fn watch_execution_output(
+    client: &mut ApiClient,
+    ctx: WatchExecutionContext,
+    tasks: &OutputTasks,
+) -> Result<()> {
     let WatchExecutionContext {
         execution_id,
         notifier_ws_url,
@@ -646,7 +806,7 @@ async fn watch_execution_output(client: &mut ApiClient, ctx: WatchExecutionConte
         delivered_output,
         root_stdout_completed,
     } = ctx;
-    let render_handle = live_renderer.spawn();
+    let render_handle = live_renderer.spawn(tasks);
     let mut root_watch: Option<RootWatchState> = None;
     let mut children: HashMap<i64, ChildWatchState> = HashMap::new();
     let mut next_descendant_refresh = Instant::now();
@@ -664,6 +824,7 @@ async fn watch_execution_output(client: &mut ApiClient, ctx: WatchExecutionConte
             known_execution_ids.insert(child.id);
             apply_child_execution_update(
                 ChildUpdateContext {
+                    tasks,
                     client,
                     children: &mut children,
                     stream_logs,
@@ -720,6 +881,7 @@ async fn watch_execution_output(client: &mut ApiClient, ctx: WatchExecutionConte
                     Some(state) => restart_finished_streams(
                         &mut state.stream_handles,
                         &StreamWatchConfig {
+                            tasks: tasks.clone(),
                             base_url: base_url.clone(),
                             token,
                             execution_id,
@@ -735,6 +897,7 @@ async fn watch_execution_output(client: &mut ApiClient, ctx: WatchExecutionConte
                     None => {
                         root_watch = Some(RootWatchState {
                             stream_handles: spawn_execution_log_streams(StreamWatchConfig {
+                                tasks: tasks.clone(),
                                 base_url: base_url.clone(),
                                 token,
                                 execution_id,
@@ -768,6 +931,7 @@ async fn watch_execution_output(client: &mut ApiClient, ctx: WatchExecutionConte
                     for child in notifier_updates.descendants {
                         apply_child_execution_update(
                             ChildUpdateContext {
+                                tasks,
                                 client,
                                 children: &mut children,
                                 stream_logs,
@@ -804,6 +968,7 @@ async fn watch_execution_output(client: &mut ApiClient, ctx: WatchExecutionConte
                 known_execution_ids.insert(child.id);
                 apply_child_execution_update(
                     ChildUpdateContext {
+                        tasks,
                         client,
                         children: &mut children,
                         stream_logs,
@@ -875,7 +1040,7 @@ async fn watch_execution_output(client: &mut ApiClient, ctx: WatchExecutionConte
 
     live_renderer.stop();
     if let Some(handle) = render_handle {
-        let _ = handle.await;
+        handle.join().await;
     }
 
     Ok(())
@@ -893,10 +1058,11 @@ fn spawn_execution_log_streams(config: StreamWatchConfig) -> Vec<StreamWatchHand
             };
             StreamWatchHandle {
                 stream_name,
-                handle: tokio::spawn(stream_execution_log(StreamLogTask {
+                handle: config.tasks.spawn(stream_execution_log(StreamLogTask {
                     stream_name,
                     offset: offset.clone(),
                     config: StreamWatchConfig {
+                        tasks: config.tasks.clone(),
                         base_url: config.base_url.clone(),
                         token: config.token.clone(),
                         execution_id: config.execution_id,
@@ -937,10 +1103,11 @@ fn restart_finished_streams(handles: &mut [StreamWatchHandle], config: &StreamWa
             } else {
                 None
             };
-            stream.handle = tokio::spawn(stream_execution_log(StreamLogTask {
+            stream.handle = config.tasks.spawn(stream_execution_log(StreamLogTask {
                 stream_name: stream.stream_name,
                 offset,
                 config: StreamWatchConfig {
+                    tasks: config.tasks.clone(),
                     base_url: config.base_url.clone(),
                     token: config.token.clone(),
                     execution_id: config.execution_id,
@@ -959,7 +1126,7 @@ fn restart_finished_streams(handles: &mut [StreamWatchHandle], config: &StreamWa
 
 async fn wait_for_stream_handles(handles: Vec<StreamWatchHandle>) {
     for handle in handles {
-        let _ = handle.handle.await;
+        handle.handle.join().await;
     }
 }
 
@@ -1100,6 +1267,7 @@ async fn apply_child_execution_update(ctx: ChildUpdateContext<'_>, child: Execut
             ensure_streams_running(
                 &mut entry.stream_handles,
                 &StreamWatchConfig {
+                    tasks: ctx.tasks.clone(),
                     base_url: ctx.base_url.to_string(),
                     token,
                     execution_id: child.id,
@@ -1140,9 +1308,10 @@ async fn connect_execution_notifier(
     let ws_url = format!("{}/ws", ws_base_url.trim_end_matches('/'));
     let request = build_notifier_ws_request(&ws_url, client.auth_token())?;
 
-    let (mut ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
-        .await
-        .map_err(|_| anyhow::anyhow!("WebSocket connect timed out"))??;
+    let mut ws_stream =
+        tokio::time::timeout(Duration::from_secs(5), connect_notifier_websocket(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("WebSocket connect timed out"))??;
 
     let subscribe_result: Result<()> = async {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1188,11 +1357,41 @@ async fn connect_execution_notifier(
     })
 }
 
+async fn connect_notifier_websocket(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+) -> Result<ExecutionWsStream> {
+    let connector = if request.uri().scheme_str() == Some("wss") {
+        let native = rustls_native_certs::load_native_certs();
+        if !native.errors.is_empty() {
+            tracing::warn!(errors = ?native.errors, "Native root CA certificate loading errors");
+        }
+        if native.certs.is_empty() {
+            anyhow::bail!("No native root CA certificates found: {:?}", native.errors);
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(native.certs);
+        // Reqwest and SQLx enable different providers, so feature-based selection is ambiguous.
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .context("Failed to configure notifier TLS protocol versions")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Some(Connector::Rustls(Arc::new(config)))
+    } else {
+        None
+    };
+    let (stream, _) = connect_async_tls_with_config(request, None, false, connector).await?;
+    Ok(stream)
+}
+
 fn build_notifier_ws_request(
     ws_url: &str,
     auth_token: Option<&str>,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let mut request = ws_url.into_client_request()?;
+    log_http_request("GET", ws_url);
     request
         .headers_mut()
         .insert("Sec-WebSocket-Protocol", "attune.v1".parse()?);
@@ -1363,11 +1562,14 @@ async fn wait_via_websocket(
     let effective_connect_timeout = connect_timeout.min(remaining);
 
     let request = build_notifier_ws_request(&ws_url, api_client.auth_token())?;
-    let connect_result =
-        tokio::time::timeout(effective_connect_timeout, connect_async(request)).await;
+    let connect_result = tokio::time::timeout(
+        effective_connect_timeout,
+        connect_notifier_websocket(request),
+    )
+    .await;
 
-    let (ws_stream, _response) = match connect_result {
-        Ok(Ok(pair)) => pair,
+    let ws_stream = match connect_result {
+        Ok(Ok(stream)) => stream,
         Ok(Err(e)) => anyhow::bail!("WebSocket connect failed: {}", e),
         Err(_) => anyhow::bail!("WebSocket connect timed out"),
     };
@@ -1777,6 +1979,7 @@ async fn stream_execution_log(task: StreamLogTask) {
         offset,
         config:
             StreamWatchConfig {
+                tasks: _,
                 base_url,
                 token,
                 execution_id,
@@ -1809,6 +2012,7 @@ async fn stream_execution_log(task: StreamLogTask) {
         .query_pairs_mut()
         .append_pair("offset", &current_offset);
 
+    log_http_request("GET", stream_url.as_str());
     let response = match reqwest::Client::new()
         .get(stream_url)
         .header(header::AUTHORIZATION, format!("Bearer {}", token))
@@ -2216,8 +2420,12 @@ mod tests {
 
     #[tokio::test]
     async fn output_watch_drain_grace_cancels_a_stale_notifier_update() {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = OutputWatchTask {
-            handle: tokio::spawn(async { std::future::pending::<()>().await }),
+            handle: tokio::spawn(async {
+                let _ = stopped.await;
+            }),
+            stop: Some(stop),
             delivered_output: Arc::new(AtomicBool::new(false)),
             root_stdout_completed: Arc::new(AtomicBool::new(false)),
         };
@@ -2475,6 +2683,7 @@ mod tests {
     async fn test_ensure_streams_running_spawns_for_empty_handles() {
         let mut handles = Vec::new();
         let config = StreamWatchConfig {
+            tasks: OutputTasks::default(),
             base_url: "not a url".to_string(),
             token: "token".to_string(),
             execution_id: 42,
@@ -2492,6 +2701,7 @@ mod tests {
         assert_eq!(handles.len(), 2);
 
         wait_for_stream_handles(handles).await;
+        config.tasks.shutdown().await;
     }
 
     #[test]

@@ -87,6 +87,7 @@ async fn main() {
     // Initialize logging
     if cli.verbose {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_max_level(tracing::Level::DEBUG)
             .init();
     }
@@ -274,6 +275,9 @@ async fn main() {
     };
 
     if let Err(e) = result {
+        if e.is::<attune_cli::wait::WatchCancelled>() {
+            process::exit(130);
+        }
         eprintln!("Error: {}", e);
         process::exit(1);
     }

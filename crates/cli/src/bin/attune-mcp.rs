@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use attune_cli::{
-    client::{sanitize_url_for_display, ApiClient, ApiError},
+    client::{log_http_request, sanitize_url_for_display, ApiClient, ApiError},
     config::CliConfig,
     inquiry::{self, InquiryListFilters},
     manual_execution::ManualExecutionRequest,
@@ -2128,8 +2128,10 @@ enum AuthMode {
 }
 
 async fn login_with_password(api_url: &str, login: &str, password: &str) -> Result<TokenResponse> {
+    let url = format!("{api_url}/auth/login");
+    log_http_request("POST", &url);
     let response = reqwest::Client::new()
-        .post(format!("{api_url}/auth/login"))
+        .post(&url)
         .json(&LoginRequest {
             login: login.to_string(),
             password: password.to_string(),

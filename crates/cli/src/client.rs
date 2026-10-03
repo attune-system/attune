@@ -135,6 +135,25 @@ pub fn sanitize_url_for_display(raw_url: &str) -> String {
     }
 }
 
+fn sanitize_request_url(raw_url: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw_url) else {
+        return "[invalid URL]".to_string();
+    };
+    if url.host_str().is_none() {
+        return "[invalid URL]".to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+/// Log request destinations without credentials, query strings, or fragments.
+pub fn log_http_request(method: &str, url: &str) {
+    tracing::debug!(method, url = %sanitize_request_url(url), "Sending HTTP request");
+}
+
 impl ApiClient {
     pub fn from_config_with_timeout(
         config: &CliConfig,
@@ -226,10 +245,8 @@ impl ApiClient {
             refresh_token: String,
         }
 
-        let url = format!("{}/auth/refresh", self.base_url);
         let req = self
-            .client
-            .post(&url)
+            .build_anonymous_request(Method::POST, "/auth/refresh")
             .json(&RefreshRequest { refresh_token });
 
         let response = req.send().await.context("Failed to refresh token")?;
@@ -282,10 +299,15 @@ impl ApiClient {
         }
     }
 
+    fn build_anonymous_request(&self, method: Method, path: &str) -> RequestBuilder {
+        let url = self.url_for(path);
+        log_http_request(method.as_str(), &url);
+        self.client.request(method, &url)
+    }
+
     /// Build a `RequestBuilder` with auth header applied.
     fn build_request(&self, method: Method, path: &str) -> RequestBuilder {
-        let url = self.url_for(path);
-        let mut req = self.client.request(method, &url);
+        let mut req = self.build_anonymous_request(method, path);
         if let Some(token) = &self.auth_token {
             req = req.bearer_auth(token);
         }
@@ -368,8 +390,7 @@ impl ApiClient {
         body: &B,
     ) -> Result<T> {
         let response = self
-            .client
-            .post(self.url_for(path))
+            .build_anonymous_request(Method::POST, path)
             .json(body)
             .send()
             .await
@@ -809,8 +830,6 @@ impl ApiClient {
         // must rebuild it for the retry attempt.
         let build_multipart_request =
             |client: &ApiClient, bytes: &[u8]| -> Result<reqwest::RequestBuilder> {
-                let url = format!("{}/api/v1{}", client.base_url, path);
-
                 let file_part = multipart::Part::bytes(bytes.to_vec())
                     .file_name(file_name.to_string())
                     .mime_str(mime_type)
@@ -822,11 +841,7 @@ impl ApiClient {
                     form = form.text(key.to_string(), value.clone());
                 }
 
-                let mut req = client.client.post(&url).multipart(form);
-                if let Some(token) = &client.auth_token {
-                    req = req.bearer_auth(token);
-                }
-                Ok(req)
+                Ok(client.build_request(Method::POST, path).multipart(form))
             };
 
         // First attempt
@@ -962,6 +977,21 @@ mod tests {
             ),
             "wss://[2001:db8::1]:9443"
         );
+    }
+
+    #[test]
+    fn request_url_retains_path_but_omits_credentials_query_and_fragment() {
+        assert_eq!(
+            sanitize_request_url(
+                "https://user:password@example.com:8443/auth/oidc/device/start?token=secret#fragment"
+            ),
+            "https://example.com:8443/auth/oidc/device/start"
+        );
+        assert_eq!(
+            sanitize_request_url("https://[2001:db8::1]:9443/api/v1/packs?name=demo"),
+            "https://[2001:db8::1]:9443/api/v1/packs"
+        );
+        assert_eq!(sanitize_request_url("not a URL"), "[invalid URL]");
     }
 
     #[tokio::test]

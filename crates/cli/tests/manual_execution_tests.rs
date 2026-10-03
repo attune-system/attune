@@ -25,6 +25,78 @@ fn execution(id: i64) -> Value {
 }
 
 #[tokio::test]
+async fn watched_execution_falls_back_after_secure_notifier_tls_failure() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("valid_token", "refresh_token");
+    Mock::given(method("POST"))
+        .and(path("/api/v1/executions/execute"))
+        .and(body_json(json!({
+            "action_ref": "core.echo", "parameters": {"message": "Hello POETs"}
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": execution(43)})))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    let mut completed = execution(43);
+    completed["status"] = json!("completed");
+    completed["result"] = json!({"stdout": "Hello POETs"});
+    Mock::given(method("GET"))
+        .and(path("/api/v1/executions/43"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": completed})))
+        .mount(&fixture.mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/executions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+        .mount(&fixture.mock_server)
+        .await;
+
+    // Accept TCP connections but close before TLS negotiation completes.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let notifier_url = format!("wss://{}", listener.local_addr().unwrap());
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let notifier = tokio::spawn(async move {
+        let mut connections = 0;
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return connections,
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    connections += 1;
+                    drop(stream);
+                }
+            }
+        }
+    });
+    let mut cmd = command(&fixture);
+    cmd.args([
+        "run",
+        "core.echo",
+        "--param",
+        "message=Hello POETs",
+        "-w",
+        "--notifier-url",
+        &notifier_url,
+        "--timeout",
+        "10",
+    ])
+    .timeout(std::time::Duration::from_secs(15));
+    let result = tokio::task::spawn_blocking(move || cmd.output()).await;
+    stop.send(()).unwrap();
+    let connections = notifier.await.unwrap();
+    let output = result.unwrap().unwrap();
+
+    assert!(connections > 0, "the CLI must attempt the secure notifier");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Execution 43 completed"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CryptoProvider"));
+}
+
+#[tokio::test]
 async fn manual_execution_paths_send_the_full_request_contract() {
     for prefix in [
         vec!["action", "execute", "core.echo"],
