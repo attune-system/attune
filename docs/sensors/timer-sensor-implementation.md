@@ -206,10 +206,8 @@ The timer sensor is configured via environment variables:
 
 ```bash
 ATTUNE_API_URL=http://localhost:8080
-ATTUNE_API_TOKEN=<service_account_token>
+ATTUNE_API_TOKEN=<scoped_sensor_token>
 ATTUNE_SENSOR_REF=core.interval_timer_sensor
-ATTUNE_MQ_URL=amqp://guest:guest@localhost:5672
-ATTUNE_MQ_EXCHANGE=attune
 ATTUNE_LOG_LEVEL=info
 ```
 

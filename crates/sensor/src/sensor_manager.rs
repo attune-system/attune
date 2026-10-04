@@ -62,6 +62,7 @@ use tokio::time::{interval, timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::api_client::{ApiClient, SensorTokenScope};
+use attune_common::child_process_environment::ChildProcessEnvironment;
 
 const SENSOR_RESTART_BASE_DELAY: Duration = Duration::from_secs(5);
 const SENSOR_RESTART_MAX_DELAY: Duration = Duration::from_secs(300);
@@ -80,16 +81,61 @@ const STDERR_EXCERPT_MAX_BYTES: u64 = 16 * 1024;
 const STDERR_EXCERPT_MAX_LINES: usize = 80;
 
 fn existing_command_env(cmd: &Command, key: &str) -> Option<String> {
-    cmd.as_std()
-        .get_envs()
-        .find_map(|(env_key, value)| {
-            if env_key == key {
-                value.map(|value| value.to_string_lossy().into_owned())
-            } else {
-                None
-            }
-        })
-        .or_else(|| std::env::var(key).ok())
+    cmd.as_std().get_envs().find_map(|(env_key, value)| {
+        if env_key == key {
+            value.map(|value| value.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn build_sensor_command(
+    sensor_script: &str,
+    is_native: bool,
+    exec_config: &RuntimeExecutionConfig,
+    pack_dir: &std::path::Path,
+    env_dir: Option<&std::path::Path>,
+    environment: &ChildProcessEnvironment,
+) -> (String, Command) {
+    let (program, mut command) = if is_native {
+        (sensor_script.to_string(), Command::new(sensor_script))
+    } else {
+        let interpreter = exec_config.resolve_interpreter_with_env(pack_dir, env_dir);
+        let mut command = Command::new(&interpreter);
+        command
+            .args(&exec_config.interpreter.args)
+            .arg(sensor_script);
+        (interpreter.display().to_string(), command)
+    };
+    environment.apply(command.as_std_mut());
+    (program, command)
+}
+
+fn build_sensor_setup_command(
+    program: &str,
+    args: &[String],
+    pack_dir: &std::path::Path,
+    env_dir: &std::path::Path,
+    exec_config: &RuntimeExecutionConfig,
+    environment: &ChildProcessEnvironment,
+) -> Command {
+    let mut command = Command::new(program);
+    environment.apply(command.as_std_mut());
+    apply_runtime_env_vars(&mut command, exec_config, pack_dir, Some(env_dir));
+    let home = env_dir.join(".attune-setup");
+    command
+        .args(args)
+        .current_dir(pack_dir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("PIP_CACHE_DIR", home.join("cache/pip"))
+        .env(
+            "PIP_CONFIG_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
+    command
 }
 
 fn apply_runtime_env_vars(
@@ -570,6 +616,7 @@ pub struct SensorManager {
 }
 
 pub struct SensorManagerConfig {
+    pub child_environment: ChildProcessEnvironment,
     pub api_url: String,
     pub worker_token_provider: Option<Arc<WorkerTokenProvider>>,
     pub notifier_ws_url: String,
@@ -637,6 +684,7 @@ fn remove_if_identity<T>(
 }
 
 struct SensorManagerInner {
+    child_environment: ChildProcessEnvironment,
     db: PgPool,
     sensors: Arc<RwLock<HashMap<Id, SensorInstance>>>,
     running: Arc<RwLock<bool>>,
@@ -687,6 +735,7 @@ impl SensorManager {
 
         Self {
             inner: Arc::new(SensorManagerInner {
+                child_environment: config.child_environment,
                 db,
                 sensors: Arc::new(RwLock::new(HashMap::new())),
                 running: Arc::new(RwLock::new(false)),
@@ -853,7 +902,13 @@ impl SensorManager {
         tokio::fs::create_dir_all(parent).await?;
         let temporary = cache_key.temporary_sibling(env_dir)?;
         let result = async {
-            Self::ensure_runtime_environment_in_place(exec_config, pack_dir, &temporary).await?;
+            Self::ensure_runtime_environment_in_place(
+                exec_config,
+                pack_dir,
+                &temporary,
+                &self.inner.child_environment,
+            )
+            .await?;
             if let Some(interpreter_template) = exec_config
                 .environment
                 .as_ref()
@@ -884,6 +939,7 @@ impl SensorManager {
         exec_config: &RuntimeExecutionConfig,
         pack_dir: &std::path::Path,
         env_dir: &std::path::Path,
+        child_environment: &ChildProcessEnvironment,
     ) -> Result<()> {
         let env_cfg = match &exec_config.environment {
             Some(cfg) if cfg.env_type != "none" => cfg,
@@ -925,12 +981,16 @@ impl SensorManager {
                 "Creating sensor runtime environment"
             );
 
-            let output =
-                cancellable_command_output(Command::new(program).args(args).current_dir(pack_dir))
-                    .await
-                    .map_err(|e| {
-                        anyhow!("Failed to run runtime environment create command: {e}")
-                    })?;
+            let output = cancellable_command_output(&mut build_sensor_setup_command(
+                program,
+                args,
+                pack_dir,
+                env_dir,
+                exec_config,
+                child_environment,
+            ))
+            .await
+            .map_err(|e| anyhow!("Failed to run runtime environment create command: {e}"))?;
 
             if !output.status.success() {
                 return Err(runtime_setup_failure(
@@ -970,10 +1030,16 @@ impl SensorManager {
             "Installing sensor runtime dependencies"
         );
 
-        let output =
-            cancellable_command_output(Command::new(program).args(args).current_dir(pack_dir))
-                .await
-                .map_err(|e| anyhow!("Failed to run runtime dependency install command: {e}"))?;
+        let output = cancellable_command_output(&mut build_sensor_setup_command(
+            program,
+            args,
+            pack_dir,
+            env_dir,
+            exec_config,
+            child_environment,
+        ))
+        .await
+        .map_err(|e| anyhow!("Failed to run runtime dependency install command: {e}"))?;
 
         if !output.status.success() {
             return Err(runtime_setup_failure(
@@ -1385,26 +1451,14 @@ impl SensorManager {
 
         // Build the command: use the interpreter for non-native runtimes,
         // execute the script directly for native binaries.
-        let (spawn_binary, mut cmd) = if is_native {
-            (sensor_script.clone(), Command::new(&sensor_script))
-        } else {
-            let resolved_interpreter =
-                exec_config.resolve_interpreter_with_env(&pack_dir, env_dir_opt);
-            info!(
-                sensor_id = sensor.id,
-                sensor_ref = %sensor.r#ref,
-                runtime_id = runtime.id,
-                "Resolved sensor interpreter"
-            );
-            let binary_str = resolved_interpreter.display().to_string();
-            let mut c = Command::new(&resolved_interpreter);
-            // Pass any extra interpreter args (e.g., -u for unbuffered Python)
-            for arg in &exec_config.interpreter.args {
-                c.arg(arg);
-            }
-            c.arg(&sensor_script);
-            (binary_str, c)
-        };
+        let (spawn_binary, mut cmd) = build_sensor_command(
+            &sensor_script,
+            is_native,
+            &exec_config,
+            &pack_dir,
+            env_dir_opt,
+            &self.inner.child_environment,
+        );
 
         info!(
             sensor_id = sensor.id,
@@ -1463,8 +1517,6 @@ impl SensorManager {
             .env("ATTUNE_SENSOR_TRIGGERS", &trigger_instances_json)
             .env("ATTUNE_SENSOR_CONFIG_JSON", &sensor_config_json)
             .env("ATTUNE_SENSOR_TRIGGER_TYPES", &trigger_types_json)
-            .env("ATTUNE_MQ_URL", &self.inner.mq_url)
-            .env("ATTUNE_MQ_EXCHANGE", "attune.events")
             .env(
                 "ATTUNE_ARTIFACTS_DIR",
                 self.inner.artifact_transport.base_dir(),
@@ -3820,6 +3872,144 @@ mod tests {
     use tokio::fs;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sensor_processes_and_install_hooks_do_not_inherit_service_credentials() {
+        const TEST_NAME: &str = "sensor_manager::tests::sensor_processes_and_install_hooks_do_not_inherit_service_credentials";
+        const MARKER: &str = "ATTUNE_SENSOR_ENVIRONMENT_TEST_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=4"])
+                .env(MARKER, "1")
+                .env("ATTUNE__SECURITY__JWT_SECRET", "dummy-jwt")
+                .env("ATTUNE__SECURITY__ENCRYPTION_KEY", "dummy-encryption")
+                .env("ATTUNE_API_TOKEN", "dummy-service-token")
+                .env("ATTUNE_MQ_URL", "amqp://dummy-broker")
+                .env("AWS_SECRET_ACCESS_KEY", "dummy-storage")
+                .env("SERVICE_ONLY_SENTINEL", "dummy-service")
+                .env("PYTHONPATH", "/ambient/unselected-python")
+                .env("SENSOR_PASSTHROUGH_SENTINEL", "selected")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                "The isolated sensor fixture must run its exact test"
+            );
+            assert!(
+                output.status.success(),
+                "Sensor-process environment check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        const CHECK: &str = r#"
+            test -z "${ATTUNE__SECURITY__JWT_SECRET+x}" || exit 31
+            test -z "${ATTUNE__SECURITY__ENCRYPTION_KEY+x}" || exit 32
+            test -z "${AWS_SECRET_ACCESS_KEY+x}" || exit 33
+            test -z "${SERVICE_ONLY_SENTINEL+x}" || exit 34
+            test -z "${ATTUNE_MQ_URL+x}" || exit 35
+            test "$SENSOR_PASSTHROUGH_SENTINEL" = selected || exit 36
+            test "$RUNTIME_OPTION" = configured || exit 37
+            test "$PYTHONPATH" = "$EXPECTED_PYTHONPATH" || exit 38
+            if test "${EXPECT_TOKEN:-0}" = 1; then
+                test "$ATTUNE_API_TOKEN" = sensor-token || exit 39
+            else
+                test -z "${ATTUNE_API_TOKEN+x}" || exit 40
+            fi
+        "#;
+        let root = tempfile::TempDir::new().unwrap();
+        let pack_dir = root.path().join("pack");
+        let env_dir = root.path().join("environment");
+        std::fs::create_dir(&pack_dir).unwrap();
+        let script = pack_dir.join("sensor.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n{CHECK}\nprintf 'safe sensor'\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let baseline =
+            ChildProcessEnvironment::capture(&["SENSOR_PASSTHROUGH_SENTINEL".into()]).unwrap();
+        let mut config = RuntimeExecutionConfig::default();
+        config.interpreter.binary = "/bin/sh".into();
+        config.env_vars = HashMap::from([
+            (
+                "RUNTIME_OPTION".into(),
+                RuntimeEnvVarConfig::Value("configured".into()),
+            ),
+            (
+                "EXPECTED_PYTHONPATH".into(),
+                RuntimeEnvVarConfig::Value("{pack_dir}/lib".into()),
+            ),
+            (
+                "PYTHONPATH".into(),
+                RuntimeEnvVarConfig::Spec(RuntimeEnvVarSpec {
+                    value: "{pack_dir}/lib".into(),
+                    operation: RuntimeEnvVarOperation::Prepend,
+                    separator: ":".into(),
+                }),
+            ),
+            (
+                "ATTUNE_API_TOKEN".into(),
+                RuntimeEnvVarConfig::Value("untrusted-token".into()),
+            ),
+        ]);
+        for native in [false, true] {
+            let (_, mut command) = build_sensor_command(
+                script.to_str().unwrap(),
+                native,
+                &config,
+                &pack_dir,
+                None,
+                &baseline,
+            );
+            command
+                .env("ATTUNE_API_TOKEN", "sensor-token")
+                .env("EXPECT_TOKEN", "1");
+            apply_runtime_env_vars(&mut command, &config, &pack_dir, None);
+            let output = command.output().await.unwrap();
+            assert!(
+                output.status.success(),
+                "Sensor environment failed for native={native}, exit={:?}",
+                output.status.code()
+            );
+            assert_eq!(output.stdout, b"safe sensor");
+        }
+        std::fs::write(pack_dir.join("requirements.txt"), "offline fixture").unwrap();
+        config.environment = Some(attune_common::models::runtime::EnvironmentConfig {
+            env_type: "test".into(),
+            dir_name: "environment".into(),
+            create_command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("{CHECK}\nmkdir -p \"$1/bin\" && ln -s /bin/sh \"$1/bin/sh\""),
+                "setup".into(),
+                "{env_dir}".into(),
+            ],
+            interpreter_path: Some("{env_dir}/bin/sh".into()),
+        });
+        config.dependencies = Some(attune_common::models::runtime::DependencyConfig {
+            manifest_file: "requirements.txt".into(),
+            install_command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("{CHECK}\nprintf 'safe installer' > \"$1/installed\""),
+                "install".into(),
+                "{env_dir}".into(),
+            ],
+        });
+        SensorManager::ensure_runtime_environment_in_place(&config, &pack_dir, &env_dir, &baseline)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(env_dir.join("installed")).unwrap(),
+            "safe installer"
+        );
+    }
+
     fn test_workspace_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4147,9 +4337,14 @@ mod tests {
         }))
         .unwrap();
 
-        SensorManager::ensure_runtime_environment_in_place(&exec_config, &pack_dir, &env_dir)
-            .await
-            .unwrap();
+        SensorManager::ensure_runtime_environment_in_place(
+            &exec_config,
+            &pack_dir,
+            &env_dir,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(env_dir.join(".attune_sensor_deps_installed").exists());
         fs::remove_dir_all(&test_dir).await.unwrap();

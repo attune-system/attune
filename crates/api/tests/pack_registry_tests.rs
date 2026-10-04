@@ -78,6 +78,214 @@ print("Test action executed")
 }
 
 #[tokio::test]
+async fn restricted_uploader_cannot_register_broad_permission_sets() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    let source = create_test_pack_dir("delegation_fixture", "1.0.0")?;
+    fs::create_dir(source.path().join("permission_sets"))?;
+    fs::write(source.path().join("permission_sets/escalate.yaml"),
+        "ref: delegation_fixture.escalate\ngrants:\n  - resource: identities\n    actions: [read, create, update, delete]\n  - resource: permissions\n    actions: [read, manage]\n")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({
+                "path": source.path().to_str().unwrap(), "force": true, "skip_tests": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "A pack installer must not publish grants it cannot delegate"
+    );
+    assert!(
+        PermissionSetRepository::find_by_ref(&ctx.pool, "delegation_fixture.escalate")
+            .await?
+            .is_none()
+    );
+    assert!(PackRepository::find_by_ref(&ctx.pool, "delegation_fixture")
+        .await?
+        .is_none());
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restricted_uploader_cannot_attach_admin_defaults_rules_or_queues() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    for (index, (folder, content)) in [
+        ("actions", "ref: delegation_0.run\nrunner_type: native\nentry_point: run\ndefault_execution_permission_set_refs: [core.admin]\n"),
+        ("rules", "ref: delegation_1.run\ntrigger_ref: core.alert\naction_ref: delegation_1.run\npermission_set_refs: [core.admin]\n"),
+        ("queues", "ref: delegation_2.run\nlabel: Run\ndispatch_action: delegation_2.run\npermission_set_refs: [core.admin]\n"),
+    ].into_iter().enumerate() {
+        let source = create_test_pack_dir(&format!("delegation_{index}"), "1.0.0")?;
+        fs::create_dir(source.path().join(folder))?;
+        fs::write(source.path().join(folder).join("run.yaml"), content)?;
+        let response = ctx.post("/api/v1/packs/register", json!({"path":source.path().to_str().unwrap(),"force":true,"skip_tests":true}), ctx.token()).await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(PackRepository::find_by_ref(&ctx.pool, &format!("delegation_{index}")).await?.is_none());
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_rules_and_pack_keep_the_registering_identity() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let source = create_test_pack_dir("owned_rules", "1.0.0")?;
+    fs::create_dir(source.path().join("actions"))?;
+    fs::write(source.path().join("actions/run.yaml"), "ref: owned_rules.run\nlabel: Run\nrunner_type: native\nentry_point: test.py\ndefault_execution_permission_set_refs: [standard]\n")?;
+    fs::create_dir(source.path().join("rules"))?;
+    fs::write(source.path().join("rules/run.yaml"), "ref: owned_rules.run\nlabel: Run\ntrigger_ref: core.alert\naction_ref: owned_rules.run\npermission_set_refs: []\n")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_str().unwrap(),"force":true,"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let identity = attune_common::auth::jwt::validate_token(
+        ctx.token().unwrap(),
+        &JwtConfig {
+            secret: ctx.state.config.security.jwt_secret.clone().unwrap(),
+            access_token_expiration: 300,
+            refresh_token_expiration: 3600,
+        },
+    )?
+    .sub
+    .parse::<i64>()?;
+    let pack = PackRepository::find_by_ref(&ctx.pool, "owned_rules")
+        .await?
+        .unwrap();
+    let rule = attune_common::repositories::rule::RuleRepository::find_by_ref(
+        &ctx.pool,
+        "owned_rules.run",
+    )
+    .await?
+    .unwrap();
+    assert_eq!(pack.installed_by, Some(identity));
+    assert_eq!(rule.owner_identity, Some(identity));
+    assert_eq!(rule.permission_set_refs, Some(Vec::new()));
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn assigned_pack_set_cannot_be_broadened_to_authorize_its_own_replacement() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    let pack = helpers::create_test_pack(&ctx.pool, "self_grant").await?;
+    let current = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "self_grant.client".into(),
+            pack: Some(pack.id),
+            pack_ref: Some(pack.r#ref.clone()),
+            label: None,
+            description: None,
+            grants: json!([{ "resource":"packs", "actions":["read","install"]}]),
+        },
+    )
+    .await?;
+    let identity = validate_token(
+        ctx.token().unwrap(),
+        &JwtConfig {
+            secret: ctx.state.config.security.jwt_secret.clone().unwrap(),
+            access_token_expiration: 300,
+            refresh_token_expiration: 3600,
+        },
+    )?
+    .sub
+    .parse::<i64>()?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: current.id,
+        },
+    )
+    .await?;
+    // Replacement rights are independent of policy-administration rights.
+    let configure = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "fixture.configure".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([{ "resource":"packs", "actions":["configure"]}]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: configure.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    let source = create_test_pack_dir("self_grant", "2.0.0")?;
+    fs::create_dir(source.path().join("permission_sets"))?;
+    fs::write(
+        source.path().join("permission_sets/client.yaml"),
+        "ref: self_grant.client\ngrants:\n  - resource: permissions\n    actions: [read, manage]\n",
+    )?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_str().unwrap(),"force":true,"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let stored = PermissionSetRepository::find_by_id(&ctx.pool, current.id)
+        .await?
+        .unwrap();
+    assert_eq!(stored.grants, current.grants);
+    assert_eq!(
+        PackRepository::find_by_id(&ctx.pool, pack.id)
+            .await?
+            .unwrap()
+            .version,
+        "1.0.0"
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restricted_uploader_can_publish_grants_it_already_holds() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    let source = create_test_pack_dir("narrow_grant", "1.0.0")?;
+    fs::create_dir(source.path().join("permission_sets"))?;
+    fs::write(source.path().join("permission_sets/read.yaml"), "ref: narrow_grant.read\ngrants:\n  - resource: packs\n    actions: [read]\n    constraints:\n      pack_refs: [narrow_grant]\n")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_str().unwrap(),"force":true,"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        PermissionSetRepository::find_by_ref(&ctx.pool, "narrow_grant.read")
+            .await?
+            .is_some()
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn registration_rejects_reserved_environment_metadata_even_when_tests_are_skipped(
 ) -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
@@ -1795,7 +2003,7 @@ async fn register_activates_an_immutable_source_snapshot() -> Result<()> {
 }
 
 #[tokio::test]
-async fn force_reinstall_preserves_ownerless_pack_ownership() -> Result<()> {
+async fn force_reinstall_attributes_previously_ownerless_pack_to_the_caller() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let pack_dir = create_test_pack_dir("ownership_guard", "2.0.0")?;
     PackRepository::create(
@@ -1833,10 +2041,20 @@ async fn force_reinstall_preserves_ownerless_pack_ownership() -> Result<()> {
         .await?
         .expect("reinstalled pack");
     assert_eq!(persisted.version, "2.0.0");
-    assert_eq!(persisted.installed_by, None);
+    let identity = validate_token(
+        ctx.token().unwrap(),
+        &JwtConfig {
+            secret: ctx.state.config.security.jwt_secret.clone().unwrap(),
+            access_token_expiration: 300,
+            refresh_token_expiration: 3600,
+        },
+    )?
+    .sub
+    .parse::<i64>()?;
+    assert_eq!(persisted.installed_by, Some(identity));
     assert_eq!(persisted.installers["custom_installer"]["enabled"], true);
     assert!(persisted.installers["installation_provenance"].is_object());
-
+    ctx.cleanup().await?;
     Ok(())
 }
 

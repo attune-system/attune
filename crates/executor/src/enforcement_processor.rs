@@ -330,6 +330,18 @@ impl EnforcementProcessor {
         enforcement: &Enforcement,
         rule: &Rule,
     ) -> Result<bool> {
+        let mut tx = pool.begin().await?;
+        let rule = RuleRepository::find_by_id_for_share(&mut tx, rule.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Enforcement rule is no longer active"))?;
+        let executor_identity = rule
+            .owner_identity
+            .ok_or_else(|| anyhow::anyhow!("Rule execution requires an explicit owner identity"))?;
+        let authority = attune_common::delegation::DelegationAuthority::load_for_share(
+            &mut tx,
+            executor_identity,
+        )
+        .await?;
         // Extract action ID — should_create_execution already verified it's Some,
         // but guard defensively here as well.
         let action_id = match rule.action {
@@ -370,6 +382,9 @@ impl EnforcementProcessor {
             .permission_set_refs
             .clone()
             .unwrap_or(action_default_permission_set_refs);
+        authority
+            .require_refs_for_share(&mut tx, &permission_set_refs)
+            .await?;
         let artifact_retention_policy = action
             .as_ref()
             .and_then(|action| action.artifact_retention_policy);
@@ -382,20 +397,11 @@ impl EnforcementProcessor {
                 .and_then(|action| action.timeout_seconds)
                 .unwrap_or(attune_common::config::app_default_execution_timeout_seconds() as i32),
         );
-        let trace_tag = Self::resolve_trace_tag_for_enforcement(pool, rule, enforcement).await?;
+        let trace_tag = Self::resolve_trace_tag_for_enforcement(pool, &rule, enforcement).await?;
 
         // Create the execution row first; scheduler-side policy enforcement
         // now handles both rule-triggered and manual executions uniformly.
         //
-        // SECURITY: Attribute the execution to the rule's owner identity (the
-        // user who registered/authored the rule). Legacy or system-loaded
-        // rules with NULL `owner_identity` fall back to the system identity
-        // (id 1) so the worker still mints a callback token with a known
-        // `sub` claim. This is intentionally permissive for the init-pack
-        // loader path; new rules created via the API always carry the
-        // authenticated user's identity.
-        const SYSTEM_IDENTITY_ID: i64 = 1;
-        let executor_identity = rule.owner_identity.unwrap_or(SYSTEM_IDENTITY_ID);
         let execution_input = CreateExecutionInput {
             action: Some(action_id),
             action_ref: action_ref.clone(),
@@ -419,7 +425,7 @@ impl EnforcementProcessor {
         };
 
         let execution_result = ExecutionRepository::create_top_level_for_enforcement_if_absent(
-            pool,
+            &mut tx,
             execution_input,
             enforcement.id,
             &snapshot,
@@ -428,7 +434,7 @@ impl EnforcementProcessor {
         let execution = execution_result.execution;
         if execution_result.created {
             ExecutionSecretValueRepository::copy_entity(
-                pool,
+                &mut *tx,
                 ENTITY_ENFORCEMENT_CONFIG,
                 enforcement.id,
                 ENTITY_EXECUTION_CONFIG,
@@ -436,6 +442,7 @@ impl EnforcementProcessor {
             )
             .await?;
         }
+        tx.commit().await?;
 
         if execution_result.created {
             info!(

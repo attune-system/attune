@@ -10,14 +10,14 @@ use tokio::process::Command;
 #[test]
 fn runtime_environment_fails_closed_without_an_explicit_execution_token() {
     let mut command = Command::new("echo");
-    apply_runtime_environment(&mut command, &HashMap::new());
+    apply_runtime_environment(&mut command, &HashMap::new(), &Default::default());
 
     let token = command
         .as_std()
         .get_envs()
         .find(|(key, _)| *key == ATTUNE_API_TOKEN_ENV)
         .map(|(_, value)| value);
-    assert_eq!(token, Some(None));
+    assert_eq!(token, None);
 }
 
 #[test]

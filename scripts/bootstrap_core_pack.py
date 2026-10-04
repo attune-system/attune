@@ -184,7 +184,9 @@ def create_bootstrap_token():
             )
             cursor.execute(
                 "DELETE FROM identity WHERE attributes->>'attune_bootstrap' = 'core-pack' "
-                "AND created < NOW() - INTERVAL '15 minutes'"
+                "AND created < NOW() - INTERVAL '15 minutes' "
+                "AND NOT EXISTS (SELECT 1 FROM rule WHERE owner_identity = identity.id) "
+                "AND NOT EXISTS (SELECT 1 FROM pack WHERE installed_by = identity.id)"
             )
             cursor.execute(
                 "INSERT INTO identity (login, display_name, attributes) "
@@ -228,7 +230,13 @@ def delete_bootstrap_identity(database_url, identity_id):
                     sql.Identifier(os.environ["DB_SCHEMA"])
                 )
             )
-            cursor.execute("DELETE FROM identity WHERE id = %s", (identity_id,))
+            cursor.execute("DELETE FROM integration_token WHERE identity = %s", (identity_id,))
+            cursor.execute(
+                "DELETE FROM identity WHERE id = %s "
+                "AND NOT EXISTS (SELECT 1 FROM rule WHERE owner_identity = identity.id) "
+                "AND NOT EXISTS (SELECT 1 FROM pack WHERE installed_by = identity.id)",
+                (identity_id,),
+            )
 
 
 def wait_for_core(base_url, deadline):

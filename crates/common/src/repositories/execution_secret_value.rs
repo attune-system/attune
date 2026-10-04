@@ -135,6 +135,8 @@ impl ExecutionSecretValueRepository {
                 json_path: row.json_path,
                 encrypted_value: row.encrypted_value,
                 encryption_key_hash: row.encryption_key_hash,
+                source_kind: row.source_kind,
+                source_ref: row.source_ref,
             })
             .collect())
     }

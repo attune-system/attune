@@ -8,6 +8,7 @@ use crate::{crypto, Error, Result};
 
 pub const ENTITY_EXECUTION_CONFIG: &str = "execution_config";
 pub const ENTITY_EXECUTION_RESULT: &str = "execution_result";
+pub const ENTITY_WORKFLOW_VARIABLES: &str = "workflow_variables";
 pub const ENTITY_ENFORCEMENT_CONFIG: &str = "enforcement_config";
 pub const ENTITY_EVENT_PAYLOAD: &str = "event_payload";
 pub const ENTITY_EVENT_CONFIG: &str = "event_config";
@@ -16,6 +17,7 @@ pub type JsonPointer = String;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SecretSource {
+    Bound(crate::secret_provenance::SecretProvenance),
     PackConfig {
         pack_ref: Option<String>,
         path: JsonPointer,
@@ -48,8 +50,39 @@ pub enum SecretSource {
 }
 
 impl SecretSource {
+    pub fn provenance(&self) -> crate::secret_provenance::SecretProvenance {
+        use crate::secret_provenance::{SecretOrigin, SecretProvenance};
+        match self {
+            SecretSource::Bound(provenance) => provenance.clone(),
+            SecretSource::ExecutionResult { execution_id, path } => SecretProvenance {
+                origins: vec![SecretOrigin::Entity {
+                    entity_type: ENTITY_EXECUTION_RESULT.into(),
+                    entity_id: *execution_id,
+                    path: path.clone(),
+                }],
+                templates: Vec::new(),
+            },
+            SecretSource::WorkflowParameter { execution_id, path } => SecretProvenance {
+                origins: vec![SecretOrigin::Entity {
+                    entity_type: ENTITY_EXECUTION_CONFIG.into(),
+                    entity_id: *execution_id,
+                    path: path.clone(),
+                }],
+                templates: Vec::new(),
+            },
+            _ => SecretProvenance {
+                origins: vec![SecretOrigin::Local {
+                    source_kind: self.source_kind().into(),
+                    source_ref: self.source_ref(),
+                }],
+                templates: Vec::new(),
+            },
+        }
+    }
+
     pub fn source_kind(&self) -> &'static str {
         match self {
+            SecretSource::Bound(_) => "provenance",
             SecretSource::PackConfig { .. } => "pack_config",
             SecretSource::Keystore { .. } => "keystore",
             SecretSource::ExecutionResult { .. } => "execution_result",
@@ -62,6 +95,7 @@ impl SecretSource {
 
     pub fn source_ref(&self) -> Option<String> {
         match self {
+            SecretSource::Bound(provenance) => serde_json::to_string(provenance).ok(),
             SecretSource::PackConfig { pack_ref, path } => pack_ref
                 .as_ref()
                 .map(|pack_ref| format!("{pack_ref}:{path}"))
@@ -145,6 +179,8 @@ pub struct StoredSecretValue {
     pub json_path: String,
     pub encrypted_value: JsonValue,
     pub encryption_key_hash: Option<String>,
+    pub source_kind: String,
+    pub source_ref: Option<String>,
 }
 
 pub fn redaction_marker() -> JsonValue {
@@ -179,24 +215,137 @@ pub fn redact_secret_path_sources(
     path_sources: &[SecretPathSource],
 ) -> (JsonValue, Vec<SecretValueInput>) {
     let mut secrets = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    for path_source in path_sources {
-        if !seen.insert(path_source.path.clone()) {
-            continue;
-        }
-        if let Some(secret_value) = take_at_pointer(&mut value, &path_source.path) {
+    let paths = path_sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<BTreeSet<_>>();
+    let roots = paths.iter().filter(|path| {
+        !path
+            .match_indices('/')
+            .any(|(offset, _)| paths.contains(&path[..offset]))
+    });
+    for path in roots {
+        if let Some(secret_value) = take_at_pointer(&mut value, path) {
             secrets.push(SecretValueInput {
-                json_path: path_source.path.clone(),
+                json_path: path.clone(),
                 value: secret_value,
-                source_kind: path_source.source.source_kind().to_string(),
-                source_ref: path_source.source.source_ref(),
+                source_kind: "provenance".to_string(),
+                source_ref: Some(
+                    serde_json::to_string(&provenance_for_path(path_sources, path))
+                        .expect("secret provenance is serializable"),
+                ),
             });
-            set_at_pointer(&mut value, &path_source.path, redaction_marker());
+            set_at_pointer(&mut value, path, redaction_marker());
         }
     }
 
     (value, secrets)
+}
+
+pub fn redact_action_result(
+    mut result: JsonValue,
+    schema: Option<&JsonValue>,
+    execution_id: i64,
+    parameter_secret_paths: &[String],
+) -> (JsonValue, Vec<SecretValueInput>) {
+    use crate::secret_provenance::{SecretOrigin, SecretProvenance};
+    let inherited = SecretProvenance {
+        origins: parameter_secret_paths
+            .iter()
+            .map(|path| SecretOrigin::Entity {
+                entity_type: ENTITY_EXECUTION_CONFIG.into(),
+                entity_id: execution_id,
+                path: path.clone(),
+            })
+            .collect(),
+        templates: Vec::new(),
+    };
+    let mut secrets = Vec::new();
+    if let Some(data) = result.get("data").cloned() {
+        let (data, inputs) = redact_secret_parameters(data, schema);
+        result["data"] = data;
+        secrets = inputs
+            .into_iter()
+            .map(|mut input| {
+                input.json_path = format!("/data{}", input.json_path);
+                if !inherited.origins.is_empty() {
+                    input.source_ref = Some(
+                        serde_json::to_string(&inherited)
+                            .expect("secret provenance is serializable"),
+                    );
+                }
+                input
+            })
+            .collect();
+    }
+    if !inherited.origins.is_empty() || !secret_paths_from_schema(schema).is_empty() {
+        for path in ["/stdout", "/error"] {
+            if let Some(value) = result
+                .pointer(path)
+                .filter(|value| !value.is_null() && !is_redaction_marker(value))
+                .cloned()
+            {
+                let provenance = if inherited.origins.is_empty() {
+                    SecretSource::ParameterSchema { path: path.into() }.provenance()
+                } else {
+                    inherited.clone()
+                };
+                secrets.push(SecretValueInput {
+                    json_path: path.into(),
+                    value,
+                    source_kind: "provenance".into(),
+                    source_ref: Some(
+                        serde_json::to_string(&provenance)
+                            .expect("secret provenance is serializable"),
+                    ),
+                });
+                set_at_pointer(&mut result, path, redaction_marker());
+            }
+        }
+    }
+    (result, secrets)
+}
+
+fn provenance_for_path(
+    sources: &[SecretPathSource],
+    path: &str,
+) -> crate::secret_provenance::SecretProvenance {
+    use crate::secret_provenance::{SecretOrigin, SecretProvenance};
+    let mut provenance = SecretProvenance::default();
+    for source in sources
+        .iter()
+        .filter(|source| pointer_suffix(&source.path, path).is_some())
+        .map(|source| &source.source)
+    {
+        let next = match source {
+            SecretSource::Bound(provenance) => provenance.clone(),
+            SecretSource::ExecutionResult { execution_id, path } => SecretProvenance {
+                origins: vec![SecretOrigin::Entity {
+                    entity_type: ENTITY_EXECUTION_RESULT.into(),
+                    entity_id: *execution_id,
+                    path: path.clone(),
+                }],
+                templates: Vec::new(),
+            },
+            SecretSource::WorkflowParameter { execution_id, path } => SecretProvenance {
+                origins: vec![SecretOrigin::Entity {
+                    entity_type: ENTITY_EXECUTION_CONFIG.into(),
+                    entity_id: *execution_id,
+                    path: path.clone(),
+                }],
+                templates: Vec::new(),
+            },
+            _ => SecretProvenance {
+                origins: vec![SecretOrigin::Local {
+                    source_kind: source.source_kind().into(),
+                    source_ref: source.source_ref(),
+                }],
+                templates: Vec::new(),
+            },
+        };
+        provenance.merge(next);
+    }
+    provenance
 }
 
 pub fn merge_schema_secret_redactions(
@@ -499,6 +648,107 @@ fn unescape_pointer_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enclosing_secret_keeps_all_nested_origins_regardless_of_source_order() {
+        use crate::{
+            models::OwnerType,
+            secret_provenance::{KeyOrigin, SecretProvenance},
+        };
+        let source = |path: &str, id: i64, reference: &str| SecretPathSource {
+            path: path.into(),
+            source: SecretSource::Bound(SecretProvenance::key(KeyOrigin {
+                key_id: id,
+                key_ref: reference.into(),
+                owner_type: OwnerType::System,
+                owner_identity: None,
+                owner_ref: None,
+                encrypted: true,
+            })),
+        };
+        let mut sources = vec![
+            source("/combined", 1, "system.a"),
+            source("/combined/password", 2, "system.b"),
+        ];
+        for _ in 0..2 {
+            let (redacted, inputs) = redact_secret_path_sources(
+                json!({"combined":{"password":"fixture-b", "other":"fixture-a"}}),
+                &sources,
+            );
+            assert!(is_redaction_marker(&redacted["combined"]));
+            assert_eq!(inputs.len(), 1);
+            let provenance: SecretProvenance =
+                serde_json::from_str(inputs[0].source_ref.as_ref().unwrap()).unwrap();
+            assert_eq!(provenance.origins.len(), 2);
+            assert!(provenance.origins.iter().any(|origin| matches!(origin, crate::secret_provenance::SecretOrigin::Key(key) if key.key_ref == "system.b")));
+            sources.reverse();
+        }
+    }
+
+    #[test]
+    fn secret_output_cannot_remain_visible_through_raw_stdout_or_errors() {
+        let schema = json!({"token":{"type":"string", "secret":true}});
+        let (redacted, secrets) = redact_action_result(
+            json!({"data":{"token":"fixture-private", "status":"ok"}, "stdout":"{\"token\":\"fixture-private\"}", "error":"fixture-private", "exit_code":0}),
+            Some(&schema),
+            42,
+            &["/credential".into()],
+        );
+        assert!(is_redaction_marker(&redacted["data"]["token"]));
+        assert!(is_redaction_marker(&redacted["stdout"]));
+        assert!(is_redaction_marker(&redacted["error"]));
+        assert_eq!(redacted["data"]["status"], "ok");
+        assert!(!redacted.to_string().contains("fixture-private"));
+        assert_eq!(secrets.len(), 3);
+        for secret in secrets {
+            let provenance: crate::secret_provenance::SecretProvenance =
+                serde_json::from_str(secret.source_ref.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                provenance.origins,
+                vec![crate::secret_provenance::SecretOrigin::Entity {
+                    entity_type: ENTITY_EXECUTION_CONFIG.into(),
+                    entity_id: 42,
+                    path: "/credential".into(),
+                }]
+            );
+        }
+        let (redacted, _) =
+            redact_action_result(json!({"stdout":"fixture-private"}), Some(&schema), 42, &[]);
+        assert!(is_redaction_marker(&redacted["stdout"]));
+        let (public, secrets) =
+            redact_action_result(json!({"stdout":"public status"}), None, 42, &[]);
+        assert_eq!(public["stdout"], "public status");
+        assert!(secrets.is_empty());
+    }
+
+    #[test]
+    fn one_value_combining_keys_retains_every_origin() {
+        use crate::{
+            models::OwnerType,
+            secret_provenance::{KeyOrigin, SecretProvenance},
+        };
+        let sources = ["system.a", "system.b"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, reference)| SecretPathSource {
+                path: "/combined".into(),
+                source: SecretSource::Bound(SecretProvenance::key(KeyOrigin {
+                    key_id: index as i64 + 1,
+                    key_ref: reference.into(),
+                    owner_type: OwnerType::System,
+                    owner_identity: None,
+                    owner_ref: None,
+                    encrypted: true,
+                })),
+            })
+            .collect::<Vec<_>>();
+        let (_, inputs) =
+            redact_secret_path_sources(serde_json::json!({"combined":"dummy-a:dummy-b"}), &sources);
+        assert_eq!(inputs.len(), 1);
+        let provenance: SecretProvenance =
+            serde_json::from_str(inputs[0].source_ref.as_ref().unwrap()).unwrap();
+        assert_eq!(provenance.origins.len(), 2);
+    }
     use serde_json::json;
 
     #[test]

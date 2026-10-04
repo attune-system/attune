@@ -7,6 +7,7 @@
 
 use crate::sensor_manager::cancellable_command_output;
 use attune_common::agent_runtime_detection::{detect_runtimes, DetectedRuntime};
+use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::config::Config;
 use attune_common::error::Result;
 use attune_common::models::{RuntimeVersion, Worker, WorkerRole, WorkerStatus, WorkerType};
@@ -35,6 +36,7 @@ const ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV: &str = "ATTUNE_SENSOR_AGENT_BINARY
 
 /// Sensor worker registration manager
 pub struct SensorWorkerRegistration {
+    child_environment: ChildProcessEnvironment,
     pool: PgPool,
     worker_id: Option<i64>,
     worker_name: String,
@@ -43,6 +45,11 @@ pub struct SensorWorkerRegistration {
 }
 
 impl SensorWorkerRegistration {
+    pub fn with_child_environment(mut self, environment: ChildProcessEnvironment) -> Self {
+        self.child_environment = environment;
+        self
+    }
+
     fn env_truthy(name: &str) -> bool {
         std::env::var(name)
             .ok()
@@ -256,6 +263,7 @@ impl SensorWorkerRegistration {
         capabilities.insert("runtimes".to_string(), json!(Vec::<String>::new()));
 
         Self {
+            child_environment: Default::default(),
             pool,
             worker_id: None,
             worker_name,
@@ -449,7 +457,8 @@ impl SensorWorkerRegistration {
 
         info!("Detecting sensor worker capabilities...");
 
-        let detector = RuntimeDetector::new(self.pool.clone());
+        let detector = RuntimeDetector::new(self.pool.clone())
+            .with_child_environment(self.child_environment.clone());
 
         // Get config capabilities if available
         let config_capabilities = config.sensor.as_ref().and_then(|s| s.capabilities.as_ref());
@@ -466,7 +475,7 @@ impl SensorWorkerRegistration {
         for (key, value) in detected_capabilities {
             self.capabilities.insert(key, value);
         }
-        self.set_detected_runtimes(detect_runtimes());
+        self.set_detected_runtimes(detect_runtimes(&self.child_environment));
         self.add_registered_runtime_versions().await?;
 
         info!(
@@ -514,7 +523,7 @@ impl SensorWorkerRegistration {
                 continue;
             };
             if !configured.is_disjoint(runtime_names)
-                && verify_registered_runtime_version(&version).await
+                && verify_registered_runtime_version(&version, &self.child_environment).await
             {
                 verified
                     .entry(runtime_name.clone())
@@ -532,7 +541,10 @@ impl SensorWorkerRegistration {
     }
 }
 
-async fn verify_registered_runtime_version(version: &RuntimeVersion) -> bool {
+async fn verify_registered_runtime_version(
+    version: &RuntimeVersion,
+    child_environment: &ChildProcessEnvironment,
+) -> bool {
     let commands = version
         .distributions
         .get("verification")
@@ -558,6 +570,7 @@ async fn verify_registered_runtime_version(version: &RuntimeVersion) -> bool {
                 .filter_map(|value| value.as_str())
                 .collect::<Vec<_>>();
             let mut process = Command::new(binary);
+            child_environment.apply(process.as_std_mut());
             process.args(args);
             let Ok(Ok(output)) = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -597,6 +610,7 @@ async fn verify_registered_runtime_version(version: &RuntimeVersion) -> bool {
         return false;
     }
     let mut command = Command::new(binary);
+    child_environment.apply(command.as_std_mut());
     command.arg("--version");
     let Ok(Ok(output)) = tokio::time::timeout(
         Duration::from_secs(10),

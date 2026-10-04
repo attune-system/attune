@@ -15,14 +15,12 @@
 //! vice versa.
 
 use attune_common::error::{Error, Result};
-use attune_common::models::{key::Key, Action, OwnerType};
 use attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository;
-use attune_common::repositories::key::KeyRepository;
 use attune_common::secret_values::{restore_secret_values, ENTITY_EXECUTION_CONFIG};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Secret manager for handling secret operations.
 ///
@@ -50,51 +48,6 @@ impl SecretManager {
         })
     }
 
-    /// Fetch all secrets relevant to an action execution.
-    ///
-    /// Secrets are fetched in order of precedence:
-    /// 1. System-level secrets (owner_type='system')
-    /// 2. Pack-level secrets (owner_type='pack')
-    /// 3. Action-level secrets (owner_type='action')
-    ///
-    /// More specific secrets override less specific ones with the same name.
-    /// Values are returned as [`JsonValue`] — they may be strings, objects,
-    /// arrays, numbers, or booleans.
-    pub async fn fetch_secrets_for_action(
-        &self,
-        action: &Action,
-    ) -> Result<HashMap<String, JsonValue>> {
-        debug!("Fetching secrets for action: {}", action.r#ref);
-
-        let mut secrets = HashMap::new();
-
-        // 1. Fetch system-level secrets
-        let system_secrets = self.fetch_secrets_by_owner_type(OwnerType::System).await?;
-        for secret in system_secrets {
-            let value = self.decrypt_if_needed(&secret)?;
-            secrets.insert(secret.name.clone(), value);
-        }
-        debug!("Loaded {} system secrets", secrets.len());
-
-        // 2. Fetch pack-level secrets
-        let pack_secrets = self.fetch_secrets_by_pack(action.pack).await?;
-        for secret in pack_secrets {
-            let value = self.decrypt_if_needed(&secret)?;
-            secrets.insert(secret.name.clone(), value);
-        }
-        debug!("Loaded {} pack secrets", secrets.len());
-
-        // 3. Fetch action-level secrets
-        let action_secrets = self.fetch_secrets_by_action(action.id).await?;
-        for secret in action_secrets {
-            let value = self.decrypt_if_needed(&secret)?;
-            secrets.insert(secret.name.clone(), value);
-        }
-        debug!("Total secrets loaded: {}", secrets.len());
-
-        Ok(secrets)
-    }
-
     pub async fn restore_execution_parameters(
         &self,
         execution_id: i64,
@@ -110,6 +63,20 @@ impl SecretManager {
             return Ok(redacted_config);
         }
 
+        use attune_common::repositories::FindById;
+        let execution = attune_common::repositories::execution::ExecutionRepository::find_by_id(
+            &self.pool,
+            execution_id,
+        )
+        .await?
+        .ok_or_else(|| Error::invalid_state("Execution secret owner is unavailable"))?;
+        attune_common::key_access::authorize_parameter_key_origins(
+            &self.pool,
+            execution.executor,
+            &secrets,
+        )
+        .await?;
+
         let encryption_key = self
             .encryption_key
             .as_ref()
@@ -121,76 +88,6 @@ impl SecretManager {
                 execution_id, e
             ))
         })
-    }
-
-    /// Fetch secrets by owner type
-    async fn fetch_secrets_by_owner_type(&self, owner_type: OwnerType) -> Result<Vec<Key>> {
-        KeyRepository::find_by_owner_type(&self.pool, owner_type).await
-    }
-
-    /// Fetch secrets for a specific pack
-    async fn fetch_secrets_by_pack(&self, pack_id: i64) -> Result<Vec<Key>> {
-        sqlx::query_as::<_, Key>(
-            "SELECT id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref,
-             owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted,
-             encryption_key_hash, value, created, updated
-             FROM key
-             WHERE owner_type = $1 AND owner_pack = $2
-             ORDER BY name ASC",
-        )
-        .bind(OwnerType::Pack)
-        .bind(pack_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
-    }
-
-    /// Fetch secrets for a specific action
-    async fn fetch_secrets_by_action(&self, action_id: i64) -> Result<Vec<Key>> {
-        sqlx::query_as::<_, Key>(
-            "SELECT id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref,
-             owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted,
-             encryption_key_hash, value, created, updated
-             FROM key
-             WHERE owner_type = $1 AND owner_action = $2
-             ORDER BY name ASC",
-        )
-        .bind(OwnerType::Action)
-        .bind(action_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
-    }
-
-    /// Decrypt a secret if it's encrypted, otherwise return the value as-is.
-    ///
-    /// For unencrypted keys the JSONB value is returned directly.
-    /// For encrypted keys the value (a JSON string containing base64 ciphertext)
-    /// is decrypted via `attune_common::crypto::decrypt_json` and parsed back
-    /// into the original [`JsonValue`].
-    fn decrypt_if_needed(&self, key: &Key) -> Result<JsonValue> {
-        if !key.encrypted {
-            return Ok(key.value.clone());
-        }
-
-        let encryption_key = self
-            .encryption_key
-            .as_ref()
-            .ok_or_else(|| Error::Internal("No encryption key configured".to_string()))?;
-
-        // Verify encryption key hash if present
-        if let Some(expected_hash) = &key.encryption_key_hash {
-            let actual_hash = attune_common::crypto::hash_encryption_key(encryption_key);
-            if &actual_hash != expected_hash {
-                return Err(Error::Internal(format!(
-                    "Encryption key hash mismatch for secret '{}'",
-                    key.name
-                )));
-            }
-        }
-
-        attune_common::crypto::decrypt_json(&key.value, encryption_key)
-            .map_err(|e| Error::Internal(format!("Failed to decrypt key '{}': {}", key.name, e)))
     }
 
     /// Compute hash of the encryption key.

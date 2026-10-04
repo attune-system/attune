@@ -565,9 +565,45 @@ async fn load_cache_authority(
             let identity_id = user.identity_id().map_err(|_| {
                 CacheApiError::Api(ApiError::Unauthorized("Invalid user identity".into()))
             })?;
+            let grants = sensor_cache_grants(user);
+            let sensor_ref = user
+                .claims
+                .sensor_ref()
+                .map_err(|_| CacheApiError::forbidden("Sensor scope is missing"))?;
+            let pack_ref = user
+                .claims
+                .sensor_pack_ref()
+                .map_err(|_| CacheApiError::forbidden("Sensor pack scope is missing"))?;
+            let standard =
+                attune_common::delegation::standard_sensor_cache_grants(sensor_ref, pack_ref);
+            let context = AuthorizationContext::new(identity_id);
+            let named: Vec<_> = grants
+                .iter()
+                .filter(|grant| {
+                    !attune_common::rbac::can_delegate_grants(
+                        &standard,
+                        std::slice::from_ref(*grant),
+                        &context,
+                    )
+                })
+                .cloned()
+                .collect();
+            if !named.is_empty() {
+                let pack = attune_common::repositories::pack::PackRepository::find_by_ref(
+                    &state.db, pack_ref,
+                )
+                .await?
+                .ok_or_else(|| CacheApiError::forbidden("Sensor pack is unavailable"))?;
+                let owner = pack.installed_by.ok_or_else(|| {
+                    CacheApiError::forbidden("Sensor pack has no installer authority")
+                })?;
+                attune_common::delegation::DelegationAuthority::load(&state.db, owner)
+                    .await?
+                    .require_grants(&named)?;
+            }
             Ok(CacheAuthority {
                 identity_id,
-                grants: sensor_cache_grants(user),
+                grants,
                 snapshot: None,
                 authz,
             })

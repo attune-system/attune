@@ -34,6 +34,7 @@
   - Action reference visibility (public/private/restricted) governs action discoverability and cross-pack referencing, and MUST NOT by itself grant execution-row visibility
   - Execution-row visibility must be derived from execution ownership/ancestry and execution-scoped grants, not from action publicity alone
   - Non-leak boundary for subtasks: execution rows for public child actions inside private workflows are not independently discoverable; they inherit private parent/workflow accessibility
+  - Secret disclosure requires entity-level decrypt authorization and disclosure authority on every recorded origin. Current pack templates cannot replace historical origin bindings. See [permission delegation and secret disclosure](delegation-and-secret-disclosure.md).
   - List/search boundaries: execution list/search results, expansions, and aggregates MUST NOT expose private parent workflow refs, names, or topology unless the caller can read that parent execution
 
 # Rules
@@ -147,6 +148,7 @@
   - Un-scoped (Global) key read should grant access regardless of any other grants
   - Key metadata visibility should require owner-scope access
   - Key material visibility/decryption should require explicit decrypt-level permission; metadata read MUST NOT imply value/decrypt access
+  - Operator-approved JWT signing can use `keys:use` or scoped `keys:read` without disclosing private-key material. Raw delivery requires read and decrypt authority.
   - Identity-owned keys should be visible only to the owning identity unless explicit scoped grants allow otherwise
 
 # Work Queues (Suggested Implementation)

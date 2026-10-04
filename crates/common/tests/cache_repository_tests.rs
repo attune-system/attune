@@ -2239,10 +2239,16 @@ async fn late_pack_component_failure_rolls_back_metadata_and_components() {
     let action_ref = format!("{pack_ref}.refresh");
     let temp = TempDir::new().unwrap();
     write_pack_owner_components(temp.path(), &pack_ref);
-    PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default())
-        .load_all(temp.path())
-        .await
-        .unwrap();
+    PackComponentLoader::new(
+        &pool,
+        pack.id,
+        &pack_ref,
+        &CacheAdmissionConfig::default(),
+        helpers::pack_registration_authority(&pool).await,
+    )
+    .load_all(temp.path())
+    .await
+    .unwrap();
 
     write_pack_file(
         temp.path(),
@@ -2262,7 +2268,13 @@ async fn late_pack_component_failure_rolls_back_metadata_and_components() {
         max_live_namespaces: 0,
         ..CacheAdmissionConfig::default()
     };
-    let loader = PackComponentLoader::new(&pool, pack.id, &pack_ref, &admission);
+    let loader = PackComponentLoader::new(
+        &pool,
+        pack.id,
+        &pack_ref,
+        &admission,
+        helpers::pack_registration_authority(&pool).await,
+    );
     let mut tx = pool.begin().await.unwrap();
     PackRepository::update(
         &mut *tx,
@@ -2342,8 +2354,13 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
         ),
     );
 
-    let loader =
-        PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default());
+    let loader = PackComponentLoader::new(
+        &pool,
+        pack.id,
+        &pack_ref,
+        &CacheAdmissionConfig::default(),
+        helpers::pack_registration_authority(&pool).await,
+    );
     let initial = loader.load_all(temp.path()).await.unwrap();
     assert_eq!(initial.caches_loaded, 3);
 
@@ -2568,8 +2585,13 @@ async fn component_retirement_rolls_back_when_retirement_fails() {
     let temp = TempDir::new().unwrap();
     write_pack_owner_components(temp.path(), &pack_ref);
 
-    let loader =
-        PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default());
+    let loader = PackComponentLoader::new(
+        &pool,
+        pack.id,
+        &pack_ref,
+        &CacheAdmissionConfig::default(),
+        helpers::pack_registration_authority(&pool).await,
+    );
     loader.load_all(temp.path()).await.unwrap();
     let action = ActionRepository::find_by_ref(&pool, &action_ref)
         .await
@@ -2756,10 +2778,16 @@ async fn direct_action_and_sensor_deletion_tombstones_owned_caches() {
     let sensor_ref = format!("{pack_ref}.watcher");
     let temp = TempDir::new().unwrap();
     write_pack_owner_components(temp.path(), &pack_ref);
-    PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default())
-        .load_all(temp.path())
-        .await
-        .unwrap();
+    PackComponentLoader::new(
+        &pool,
+        pack.id,
+        &pack_ref,
+        &CacheAdmissionConfig::default(),
+        helpers::pack_registration_authority(&pool).await,
+    )
+    .load_all(temp.path())
+    .await
+    .unwrap();
     let action = ActionRepository::find_by_ref(&pool, &action_ref)
         .await
         .unwrap()
@@ -2848,8 +2876,13 @@ async fn pack_deletion_tombstones_owned_caches_without_synchronous_drain() {
     let sensor_ref = format!("{pack_ref}.watcher");
     let temp = TempDir::new().unwrap();
     write_pack_owner_components(temp.path(), &pack_ref);
-    let loader =
-        PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default());
+    let loader = PackComponentLoader::new(
+        &pool,
+        pack.id,
+        &pack_ref,
+        &CacheAdmissionConfig::default(),
+        helpers::pack_registration_authority(&pool).await,
+    );
     loader.load_all(temp.path()).await.unwrap();
     let action = ActionRepository::find_by_ref(&pool, &action_ref)
         .await

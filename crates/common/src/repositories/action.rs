@@ -680,6 +680,17 @@ impl Delete for ActionRepository {
 }
 
 impl ActionRepository {
+    pub async fn find_by_refs_for_share(
+        conn: &mut sqlx::PgConnection,
+        refs: &[String],
+    ) -> Result<Vec<Action>> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(&format!("SELECT {ACTION_COLUMNS} FROM action WHERE ref = ANY($1) AND retired_at IS NULL ORDER BY ref FOR SHARE"))
+            .bind(refs).fetch_all(conn).await.map_err(Into::into)
+    }
+
     pub async fn find_by_id_including_retired<'e, E>(executor: E, id: Id) -> Result<Option<Action>>
     where
         E: Executor<'e, Database = Postgres> + 'e,

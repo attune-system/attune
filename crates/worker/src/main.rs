@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
             worker_config.name = Some(name);
         } else {
             config.worker = Some(attune_common::config::WorkerConfig {
+                passthrough_env: Vec::new(),
                 name: Some(name),
                 worker_type: None,
                 runtime_id: None,

@@ -48,6 +48,7 @@ pub enum Action {
     Respond,
     Manage,
     Decrypt,
+    Use,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +70,7 @@ pub enum ExecutionScopeConstraint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct GrantConstraints {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_refs: Option<Vec<String>>,
@@ -93,6 +95,7 @@ pub struct GrantConstraints {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
     pub resource: Resource,
     pub actions: Vec<Action>,
@@ -318,10 +321,156 @@ impl Grant {
     }
 }
 
+/// Prove that every requested resource/action is contained by a held grant.
+/// Owner-relative constraints use the same identity on both sides.
+pub fn can_delegate_grants(
+    held: &[Grant],
+    requested: &[Grant],
+    context: &AuthorizationContext,
+) -> bool {
+    requested.iter().all(|requested| {
+        requested.actions.iter().all(|action| {
+            held.iter().any(|held| {
+                held.resource == requested.resource
+                    && held.actions.contains(action)
+                    && delegation_constraints_cover(
+                        held.constraints.as_ref(),
+                        requested.constraints.as_ref(),
+                        context,
+                    )
+            })
+        })
+    })
+}
+
+fn delegation_constraints_cover(
+    held: Option<&GrantConstraints>,
+    requested: Option<&GrantConstraints>,
+    context: &AuthorizationContext,
+) -> bool {
+    let Some(held) = held else {
+        return true;
+    };
+    let empty = GrantConstraints::default();
+    let requested = requested.unwrap_or(&empty);
+    let attributes_match = held.attributes.as_ref().is_none_or(|attributes| {
+        attributes
+            .iter()
+            .all(|(name, value)| context.identity_attributes.get(name) == Some(value))
+    });
+    let owner = match held.owner {
+        None | Some(OwnerConstraint::Any) => true,
+        Some(owner) => requested.owner == Some(owner),
+    };
+    let execution_scope = match held.execution_scope {
+        None | Some(ExecutionScopeConstraint::Any) => true,
+        Some(ExecutionScopeConstraint::Descendants) => matches!(
+            requested.execution_scope,
+            Some(ExecutionScopeConstraint::SelfOnly | ExecutionScopeConstraint::Descendants)
+        ),
+        Some(ExecutionScopeConstraint::SelfOnly) => {
+            requested.execution_scope == Some(ExecutionScopeConstraint::SelfOnly)
+        }
+    };
+    attributes_match
+        && owner
+        && execution_scope
+        && selected_scope_is_subset(held.pack_refs.as_deref(), requested.pack_refs.as_deref())
+        && selected_scope_is_subset(held.refs.as_deref(), requested.refs.as_deref())
+        && selected_scope_is_subset(held.ids.as_deref(), requested.ids.as_deref())
+        && selected_scope_is_subset(
+            held.owner_types.as_deref(),
+            requested.owner_types.as_deref(),
+        )
+        && selected_scope_is_subset(held.owner_refs.as_deref(), requested.owner_refs.as_deref())
+        && selected_scope_is_subset(held.visibility.as_deref(), requested.visibility.as_deref())
+        && held
+            .encrypted
+            .is_none_or(|value| requested.encrypted == Some(value))
+}
+
+fn selected_scope_is_subset<T: PartialEq>(held: Option<&[T]>, requested: Option<&[T]>) -> bool {
+    match held {
+        None => true,
+        Some(held) => requested.is_some_and(|requested| {
+            !requested.is_empty() && requested.iter().all(|value| held.contains(value))
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn delegation_cannot_discard_requested_scope_constraints() {
+        let held: Vec<Grant> = serde_json::from_value(
+            json!([{ "resource":"keys", "actions":["read"], "constraints":{"owner":"none"}}]),
+        )
+        .unwrap();
+        let broad: Vec<Grant> =
+            serde_json::from_value(json!([{ "resource":"keys", "actions":["read"]}])).unwrap();
+        let context = AuthorizationContext::new(42);
+        assert!(held[0].allows(Resource::Keys, Action::Read, &context));
+        assert!(!can_delegate_grants(&held, &broad, &context));
+        assert!(can_delegate_grants(&held, &held, &context));
+    }
+
+    #[test]
+    fn delegation_allows_narrowing_and_separate_action_grants() {
+        let held: Vec<Grant> = serde_json::from_value(json!([
+            {"resource":"actions", "actions":["read"], "constraints":{"pack_refs":["a","b"]}},
+            {"resource":"actions", "actions":["execute"], "constraints":{"pack_refs":["a","b"]}}
+        ]))
+        .unwrap();
+        let narrow: Vec<Grant> = serde_json::from_value(json!([{ "resource":"actions", "actions":["read","execute"], "constraints":{"pack_refs":["a"]}}])).unwrap();
+        let broad: Vec<Grant> =
+            serde_json::from_value(json!([{ "resource":"actions", "actions":["read","execute"]}]))
+                .unwrap();
+        assert!(can_delegate_grants(
+            &held,
+            &narrow,
+            &AuthorizationContext::new(42)
+        ));
+        assert!(!can_delegate_grants(
+            &held,
+            &broad,
+            &AuthorizationContext::new(42)
+        ));
+    }
+
+    #[test]
+    fn delegation_checks_current_identity_attributes() {
+        let held: Vec<Grant> = serde_json::from_value(json!([{ "resource":"actions", "actions":["execute"], "constraints":{"attributes":{"department":"ops"}}}])).unwrap();
+        let requested: Vec<Grant> =
+            serde_json::from_value(json!([{ "resource":"actions", "actions":["execute"]}]))
+                .unwrap();
+        let mut context = AuthorizationContext::new(42);
+        assert!(!can_delegate_grants(&held, &requested, &context));
+        context
+            .identity_attributes
+            .insert("department".into(), json!("ops"));
+        assert!(can_delegate_grants(&held, &requested, &context));
+    }
+
+    #[test]
+    fn grant_deserialization_rejects_misspelled_security_fields() {
+        for value in [
+            json!({"resource": "actions", "actions": ["execute"], "constraint": {"refs": ["deploy.release"]}}),
+            json!({"resource": "actions", "actions": ["execute"], "constraints": {"ref": ["deploy.release"]}}),
+        ] {
+            assert!(serde_json::from_value::<Grant>(value).is_err());
+        }
+        let grant: Grant = serde_json::from_value(json!({
+            "resource": "actions", "actions": ["execute"],
+            "constraints": {"refs": ["deploy.release"]}
+        }))
+        .unwrap();
+        let mut context = AuthorizationContext::new(42);
+        context.target_ref = Some("deploy.other".to_string());
+        assert!(!grant.allows(Resource::Actions, Action::Execute, &context));
+    }
 
     #[test]
     fn grant_without_constraints_allows() {

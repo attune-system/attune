@@ -74,6 +74,7 @@ utoipa = { workspace = true }
 
 # JWT
 jsonwebtoken = { workspace = true }
+aws-lc-rs = "1.14"
 hmac = { workspace = true }
 
 # Encryption

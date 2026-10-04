@@ -1836,6 +1836,24 @@ pub async fn register_pack(
 }
 
 /// Internal helper function for pack registration logic
+async fn authorize_pack_delegation(
+    state: &Arc<AppState>,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    path: &std::path::Path,
+    pack_ref: &str,
+) -> ApiResult<()> {
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+    let authority =
+        attune_common::delegation::DelegationAuthority::load(&state.db, identity_id).await?;
+    let plan = attune_common::pack_registry::permissions::PackPermissionPlan::read(path, pack_ref)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let mut connection = state.db.acquire().await?;
+    plan.validate(&mut connection, &authority).await?;
+    Ok(())
+}
+
 async fn register_pack_internal(
     state: Arc<AppState>,
     user: &crate::auth::middleware::AuthenticatedUser,
@@ -2000,6 +2018,17 @@ async fn register_pack_internal(
             .staged_path(),
     )
     .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
+    authorize_pack_delegation(
+        &state,
+        user,
+        replacement
+            .as_ref()
+            .expect("registration source was staged")
+            .staged_path(),
+        &pack_ref,
+    )
+    .await?;
 
     // Test a private copy before changing active files or database rows.
     let mut test_install = None;
@@ -2213,6 +2242,21 @@ async fn register_pack_internal(
     let mut tx = state.db.begin().await?;
     PackRepository::acquire_mutation_lock(&mut tx, &pack_ref).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+    let registering_identity = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+    let registration_authority = attune_common::delegation::DelegationAuthority::load_for_share(
+        &mut tx,
+        registering_identity,
+    )
+    .await?;
+    attune_common::pack_registry::permissions::PackPermissionPlan::read(
+        &published_release.pack_path,
+        &pack_ref,
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?
+    .validate(&mut tx, &registration_authority)
+    .await?;
 
     // Pack metadata and every component mutation commit or roll back together.
     let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref).await?;
@@ -2224,7 +2268,6 @@ async fn register_pack_internal(
             pack_ref
         )));
     }
-    let existing_installed_by = existing_pack.as_ref().map(|pack| pack.installed_by);
 
     let pack = if let Some(existing) = existing_pack {
         let installers = installation_metadata.as_ref().map(|metadata| {
@@ -2291,6 +2334,8 @@ async fn register_pack_internal(
         .await?
     };
 
+    let pack =
+        PackRepository::set_registered_identity(&mut tx, pack.id, registering_identity).await?;
     let release = PackReleaseRepository::create_or_get(
         &mut tx,
         CreatePackReleaseInput {
@@ -2324,6 +2369,7 @@ async fn register_pack_internal(
             pack.id,
             &pack.r#ref,
             &state.config.cache_admission,
+            registration_authority,
         )
         .with_absent_metadata_policy(absent_metadata_policy);
         match component_loader
@@ -2360,6 +2406,9 @@ async fn register_pack_internal(
                 load_result.projections
             }
             Err(e) => {
+                if matches!(e, attune_common::Error::PermissionDenied(_)) {
+                    return Err(e.into());
+                }
                 let message = format!(
                     "Pack registration failed while loading components for '{}': {}",
                     pack.r#ref, e
@@ -2381,9 +2430,7 @@ async fn register_pack_internal(
         ));
     }
     if let Some(mut metadata) = installation_metadata {
-        if let Some(installed_by) = existing_installed_by {
-            metadata.installed_by = installed_by;
-        }
+        metadata.installed_by = Some(registering_identity);
         PackRepository::update_installation_metadata(
             &mut *tx,
             pack.id,
@@ -3677,6 +3724,8 @@ pub async fn install_pack(
             authorize_existing_pack_replacement(&state, &user, existing).await?;
         }
         let existing_pack_id = preflight_existing_pack.as_ref().map(|pack| pack.id);
+
+        authorize_pack_delegation(&state, &user, &candidate_path, &pack_ref_for_storage).await?;
 
         match dispatch_and_track_pack_tests(
             &state,

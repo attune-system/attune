@@ -65,6 +65,26 @@ pub struct KeySearchResult {
 
 pub struct KeyRepository;
 
+pub const SELECT_COLUMNS: &str = "id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted, encryption_key_hash, value, created, updated";
+
+impl KeyRepository {
+    pub async fn find_by_refs<'e, E>(executor: E, refs: &[String]) -> Result<Vec<Key>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(&format!(
+            "SELECT {SELECT_COLUMNS} FROM key WHERE ref = ANY($1) ORDER BY ref"
+        ))
+        .bind(refs)
+        .fetch_all(executor)
+        .await
+        .map_err(Into::into)
+    }
+}
+
 impl Repository for KeyRepository {
     type Entity = Key;
     fn table_name() -> &'static str {
@@ -163,7 +183,13 @@ impl Update for KeyRepository {
             query.push("encrypted = ").push_bind(encrypted);
             has_updates = true;
         }
-        if let Some(encryption_key_hash) = &input.encryption_key_hash {
+        if input.encrypted == Some(false) {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("encryption_key_hash = NULL");
+            has_updates = true;
+        } else if let Some(encryption_key_hash) = &input.encryption_key_hash {
             if has_updates {
                 query.push(", ");
             }

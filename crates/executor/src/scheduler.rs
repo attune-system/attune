@@ -279,7 +279,7 @@ fn apply_param_defaults(params: JsonValue, param_schema: &Option<JsonValue>) -> 
 fn build_output_map_result(
     definition_json: &JsonValue,
     wf_ctx: &WorkflowContext,
-) -> Option<JsonValue> {
+) -> Option<RenderedJson> {
     let definition: WorkflowDefinition = match serde_json::from_value(definition_json.clone()) {
         Ok(d) => d,
         Err(e) => {
@@ -297,10 +297,18 @@ fn build_output_map_result(
     }
 
     let mut out = serde_json::Map::new();
+    let mut sources = Vec::new();
     for (key, expr) in output_map {
-        match wf_ctx.render_json(&JsonValue::String(expr.clone())) {
+        match wf_ctx.render_json_with_sensitivity(&JsonValue::String(expr.clone())) {
             Ok(rendered) => {
-                out.insert(key.clone(), rendered);
+                out.insert(key.clone(), rendered.value);
+                for mut source in rendered.secret_path_sources {
+                    source.path = attune_common::secret_values::pointer_join(
+                        &format!("/{}", key.replace('~', "~0").replace('/', "~1")),
+                        &source.path,
+                    );
+                    sources.push(source);
+                }
             }
             Err(e) => {
                 warn!(
@@ -314,7 +322,12 @@ fn build_output_map_result(
     if out.is_empty() {
         None
     } else {
-        Some(JsonValue::Object(out))
+        Some(RenderedJson {
+            value: JsonValue::Object(out),
+            secret_paths: sources.iter().map(|source| source.path.clone()).collect(),
+            sources: sources.iter().map(|source| source.source.clone()).collect(),
+            secret_path_sources: sources,
+        })
     }
 }
 
@@ -392,6 +405,50 @@ fn workflow_result_secret_paths(result: &JsonValue) -> Vec<JsonPointer> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn iteration_item_sources(
+    sources: &[SecretPathSource],
+    index: usize,
+    batch_size: Option<usize>,
+    array_source: bool,
+) -> Vec<SecretPathSource> {
+    let size = batch_size.unwrap_or(1).max(1);
+    let first = index * size;
+    sources
+        .iter()
+        .filter_map(|source| {
+            let mut source = source.clone();
+            if !array_source || source.path.is_empty() {
+                return Some(source);
+            }
+            let (position, suffix) = source
+                .path
+                .strip_prefix('/')?
+                .split_once('/')
+                .unwrap_or((source.path.strip_prefix('/')?, ""));
+            let position = position.parse::<usize>().ok()?;
+            if position < first || position >= first + size {
+                return None;
+            }
+            source.path = if batch_size.is_some() {
+                format!(
+                    "/{}{}",
+                    position - first,
+                    if suffix.is_empty() {
+                        String::new()
+                    } else {
+                        format!("/{suffix}")
+                    }
+                )
+            } else if suffix.is_empty() {
+                String::new()
+            } else {
+                format!("/{suffix}")
+            };
+            Some(source)
+        })
+        .collect()
 }
 
 fn reconcile_authoritative_task_statuses<I>(
@@ -1598,7 +1655,7 @@ impl ExecutionScheduler {
         .await?;
         let workflow_params = extract_workflow_params(&Some(restored_execution_config));
         let workflow_params = apply_param_defaults(workflow_params, &workflow_def.param_schema);
-        let wf_ctx = WorkflowContext::new(
+        let mut wf_ctx = WorkflowContext::new(
             workflow_params,
             definition
                 .vars
@@ -1611,6 +1668,9 @@ impl ExecutionScheduler {
                 .collect(),
         );
         Self::mark_workflow_parameter_secret_sources(&wf_ctx, execution);
+        wf_ctx.set_template_origin("workflow", &execution.action_ref);
+        Self::populate_workflow_pack_config(&mut *pool.acquire().await?, execution, &mut wf_ctx)
+            .await?;
 
         // For each entry-point task, create a child execution and dispatch it
         for entry_task_name in &graph.entry_points {
@@ -1859,13 +1919,21 @@ impl ExecutionScheduler {
             if workflow_task.workflow_execution != workflow_execution_id {
                 continue;
             }
-            let paths = redacted_paths(&child.result.clone().unwrap_or(JsonValue::Null));
+            let result = child.result.clone().unwrap_or(JsonValue::Null);
+            let paths = workflow_result_secret_paths(&result);
             wf_ctx.mark_secret_pointer_paths(
                 &format!("task.{}", workflow_task.task_name),
                 &paths,
                 |path| SecretSource::ExecutionResult {
                     execution_id: child.id,
-                    path: path.clone(),
+                    path: if result
+                        .pointer(path)
+                        .is_some_and(attune_common::secret_values::is_redaction_marker)
+                    {
+                        path.clone()
+                    } else {
+                        format!("/data{path}")
+                    },
                 },
             );
             wf_ctx.mark_secret_pointer_paths(
@@ -1873,7 +1941,14 @@ impl ExecutionScheduler {
                 &paths,
                 |path| SecretSource::ExecutionResult {
                     execution_id: child.id,
-                    path: path.clone(),
+                    path: if result
+                        .pointer(path)
+                        .is_some_and(attune_common::secret_values::is_redaction_marker)
+                    {
+                        path.clone()
+                    } else {
+                        format!("/data{path}")
+                    },
                 },
             );
         }
@@ -2018,6 +2093,105 @@ impl ExecutionScheduler {
             &secrets,
             encryption_key,
         )?)
+    }
+
+    async fn restore_workflow_variables(
+        conn: &mut PgConnection,
+        encryption_key: Option<&str>,
+        parent: &Execution,
+        variables: &JsonValue,
+    ) -> Result<(JsonValue, Vec<(JsonPointer, SecretSource)>)> {
+        let mut secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+            &mut *conn,
+            attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+            parent.id,
+        )
+        .await?;
+        secrets.retain(|secret| {
+            variables
+                .pointer(&secret.json_path)
+                .is_some_and(attune_common::secret_values::is_redaction_marker)
+        });
+        if secrets.is_empty() {
+            return Ok((variables.clone(), Vec::new()));
+        }
+        let key = encryption_key
+            .ok_or_else(|| anyhow::anyhow!("Workflow variable decryption is not configured"))?;
+        let restored = restore_secret_values(variables.clone(), &secrets, key)?;
+        let sources = secrets
+            .into_iter()
+            .map(|secret| {
+                let provenance = if secret.source_kind == "provenance" {
+                    secret
+                        .source_ref
+                        .as_deref()
+                        .and_then(|reference| serde_json::from_str(reference).ok())
+                        .unwrap_or_default()
+                } else {
+                    attune_common::secret_provenance::SecretProvenance::default()
+                };
+                (secret.json_path, SecretSource::Bound(provenance))
+            })
+            .collect();
+        Ok((restored, sources))
+    }
+
+    async fn bind_workflow_task_keys(
+        conn: &mut PgConnection,
+        parent: &Execution,
+        task: &crate::workflow::graph::TaskNode,
+        context: &WorkflowContext,
+        encryption_key: Option<&str>,
+    ) -> Result<WorkflowContext> {
+        let mut context = context.clone();
+        context.set_template_origin(
+            "workflow_task",
+            &format!("{}/tasks/{}", parent.action_ref, task.name),
+        );
+        Self::populate_workflow_pack_config(&mut *conn, parent, &mut context).await?;
+        let refs = context.referenced_key_refs(&task.input)?;
+        if !refs.is_empty() {
+            let identity = parent.executor.ok_or_else(|| {
+                anyhow::anyhow!("Key resolution requires an explicit workflow executor")
+            })?;
+            let authority = attune_common::delegation::DelegationAuthority::load_for_share(
+                &mut *conn, identity,
+            )
+            .await?;
+            let keys = attune_common::key_access::resolve_explicit_keys(
+                &mut *conn,
+                &authority,
+                &refs,
+                encryption_key,
+            )
+            .await?;
+            context.set_resolved_keys(keys);
+        }
+        Ok(context)
+    }
+
+    async fn populate_workflow_pack_config(
+        conn: &mut PgConnection,
+        parent: &Execution,
+        context: &mut WorkflowContext,
+    ) -> Result<()> {
+        if let Some(action) = parent
+            .executable_snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.executable.action)
+        {
+            if let Some(pack) = attune_common::repositories::pack::PackRepository::find_by_id(
+                &mut *conn,
+                action.pack,
+            )
+            .await?
+            {
+                let paths =
+                    attune_common::secret_values::secret_paths_from_schema(Some(&pack.conf_schema));
+                context.set_pack_config_with_secret_paths(pack.config, Some(pack.r#ref), &paths);
+            }
+        }
+        Ok(())
     }
 
     fn workflow_task_permission_set_refs(
@@ -2282,7 +2456,7 @@ impl ExecutionScheduler {
                 .ok_or(CacheIterationInitializationError::Logical(
                     CacheIterationInitializationFailure::NotAuthorized,
                 ))?;
-        let identity = IdentityRepository::find_by_id(&mut *conn, identity_id)
+        let identity = IdentityRepository::find_by_id_for_share(&mut *conn, identity_id)
             .await
             .map_err(CacheIterationInitializationError::infrastructure)?
             .ok_or(CacheIterationInitializationError::Logical(
@@ -2313,6 +2487,23 @@ impl ExecutionScheduler {
                     )
                 })?,
             );
+        }
+        let authority =
+            attune_common::delegation::DelegationAuthority::load_for_share(&mut *conn, identity_id)
+                .await
+                .map_err(|error| match error {
+                    attune_common::Error::AuthenticationFailed(_)
+                    | attune_common::Error::PermissionDenied(_) => {
+                        CacheIterationInitializationError::Logical(
+                            CacheIterationInitializationFailure::NotAuthorized,
+                        )
+                    }
+                    other => CacheIterationInitializationError::infrastructure(other),
+                })?;
+        if !authority.covers(&grants) {
+            return Err(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::NotAuthorized,
+            ));
         }
         let context = cache_iteration_authorization_context(
             identity_id,
@@ -2569,12 +2760,20 @@ impl ExecutionScheduler {
             parent_execution.config.clone().unwrap_or(JsonValue::Null),
         )
         .await?;
+        let task_context = Self::bind_workflow_task_keys(
+            &mut *pool.acquire().await?,
+            parent_execution,
+            task_node,
+            wf_ctx,
+            encryption_key,
+        )
+        .await?;
         let rendered_input = Self::render_workflow_task_input(
             parent_execution,
             &parent_execution_config,
             task_node,
             &task_action,
-            wf_ctx,
+            &task_context,
         )?;
         let task_config = if rendered_input.value.is_object()
             && !rendered_input.value.as_object().unwrap().is_empty()
@@ -2586,6 +2785,12 @@ impl ExecutionScheduler {
 
         let permission_set_refs =
             Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
+        attune_common::delegation::require_execution_refs(
+            pool,
+            parent_execution.executor,
+            &permission_set_refs,
+        )
+        .await?;
         let (worker_selector, worker_tolerations, worker_affinity) =
             Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
         let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
@@ -3397,12 +3602,20 @@ impl ExecutionScheduler {
             parent_execution.config.clone().unwrap_or(JsonValue::Null),
         )
         .await?;
+        let task_context = Self::bind_workflow_task_keys(
+            &mut *conn,
+            parent_execution,
+            task_node,
+            wf_ctx,
+            encryption_key,
+        )
+        .await?;
         let rendered_input = Self::render_workflow_task_input(
             parent_execution,
             &parent_execution_config,
             task_node,
             &task_action,
-            wf_ctx,
+            &task_context,
         )?;
         let task_config: Option<JsonValue> = if rendered_input.value.is_object()
             && !rendered_input.value.as_object().unwrap().is_empty()
@@ -3414,6 +3627,12 @@ impl ExecutionScheduler {
 
         let permission_set_refs =
             Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
+        attune_common::delegation::require_execution_refs_for_share(
+            &mut *conn,
+            parent_execution.executor,
+            &permission_set_refs,
+        )
+        .await?;
         let (worker_selector, worker_tolerations, worker_affinity) =
             Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
         let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
@@ -4053,6 +4272,14 @@ impl ExecutionScheduler {
             };
             let mut item_ctx = wf_ctx.clone();
             item_ctx.set_current_item(item, usize::try_from(batch_index)?);
+            let item_ctx = Self::bind_workflow_task_keys(
+                &mut *conn,
+                parent_execution,
+                task_node,
+                &item_ctx,
+                encryption_key,
+            )
+            .await?;
             let batch_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
             let rendered_input = Self::render_workflow_task_input(
                 parent_execution,
@@ -4074,6 +4301,12 @@ impl ExecutionScheduler {
             };
             let permission_set_refs =
                 Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
+            attune_common::delegation::require_execution_refs_for_share(
+                &mut *conn,
+                parent_execution.executor,
+                &permission_set_refs,
+            )
+            .await?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
             let workflow_task = WorkflowTaskMetadata {
@@ -4236,7 +4469,7 @@ impl ExecutionScheduler {
     ) -> Result<()> {
         // Resolve the with_items expression to a JSON array
         let items_value = wf_ctx
-            .render_json(&JsonValue::String(with_items_expr.to_string()))
+            .render_json_with_sensitivity(&JsonValue::String(with_items_expr.to_string()))
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to resolve with_items expression '{}' for task '{}': {}",
@@ -4246,7 +4479,9 @@ impl ExecutionScheduler {
                 )
             })?;
 
-        let items = match items_value.as_array() {
+        let array_source = items_value.value.is_array();
+        let item_sources = items_value.secret_path_sources;
+        let items = match items_value.value.as_array() {
             Some(arr) => arr.clone(),
             None => {
                 warn!(
@@ -4254,7 +4489,7 @@ impl ExecutionScheduler {
                      Wrapping in single-element array.",
                     task_node.name
                 );
-                vec![items_value]
+                vec![items_value.value]
             }
         };
         let items = iteration_items(items, task_node.batch_size);
@@ -4304,6 +4539,20 @@ impl ExecutionScheduler {
 
             let mut item_ctx = wf_ctx.clone();
             item_ctx.set_current_item(item.clone(), index);
+            item_ctx.set_current_item_sources(&iteration_item_sources(
+                &item_sources,
+                index,
+                task_node.batch_size,
+                array_source,
+            ));
+            let item_ctx = Self::bind_workflow_task_keys(
+                &mut *pool.acquire().await?,
+                parent_execution,
+                task_node,
+                &item_ctx,
+                encryption_key,
+            )
+            .await?;
 
             let parent_execution_config = Self::restore_secret_entity(
                 pool,
@@ -4333,6 +4582,12 @@ impl ExecutionScheduler {
 
             let permission_set_refs =
                 Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
+            attune_common::delegation::require_execution_refs(
+                pool,
+                parent_execution.executor,
+                &permission_set_refs,
+            )
+            .await?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
             let item_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
@@ -4476,7 +4731,7 @@ impl ExecutionScheduler {
         pending_messages: &mut Vec<PendingExecutionRequested>,
     ) -> Result<()> {
         let items_value = wf_ctx
-            .render_json(&JsonValue::String(with_items_expr.to_string()))
+            .render_json_with_sensitivity(&JsonValue::String(with_items_expr.to_string()))
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to resolve with_items expression '{}' for task '{}': {}",
@@ -4486,7 +4741,9 @@ impl ExecutionScheduler {
                 )
             })?;
 
-        let items = match items_value.as_array() {
+        let array_source = items_value.value.is_array();
+        let item_sources = items_value.secret_path_sources;
+        let items = match items_value.value.as_array() {
             Some(arr) => arr.clone(),
             None => {
                 warn!(
@@ -4494,7 +4751,7 @@ impl ExecutionScheduler {
                      Wrapping in single-element array.",
                     task_node.name
                 );
-                vec![items_value]
+                vec![items_value.value]
             }
         };
         let items = iteration_items(items, task_node.batch_size);
@@ -4540,6 +4797,20 @@ impl ExecutionScheduler {
 
             let mut item_ctx = wf_ctx.clone();
             item_ctx.set_current_item(item.clone(), index);
+            item_ctx.set_current_item_sources(&iteration_item_sources(
+                &item_sources,
+                index,
+                task_node.batch_size,
+                array_source,
+            ));
+            let item_ctx = Self::bind_workflow_task_keys(
+                &mut *conn,
+                parent_execution,
+                task_node,
+                &item_ctx,
+                encryption_key,
+            )
+            .await?;
 
             let parent_execution_config = Self::restore_secret_entity(
                 &mut *conn,
@@ -4567,6 +4838,12 @@ impl ExecutionScheduler {
 
             let permission_set_refs =
                 Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
+            attune_common::delegation::require_execution_refs_for_share(
+                &mut *conn,
+                parent_execution.executor,
+                &permission_set_refs,
+            )
+            .await?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
             let item_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
@@ -5234,8 +5511,21 @@ impl ExecutionScheduler {
                 extract_workflow_params(&Some(restored_parent_config)),
                 &workflow_def.param_schema,
             );
+            let stored_variables = Self::restore_workflow_variables(
+                &mut transaction,
+                encryption_key,
+                &parent_execution,
+                &workflow_execution.variables,
+            )
+            .await?;
             let mut wf_ctx =
-                WorkflowContext::rebuild(parameters, &workflow_execution.variables, task_results);
+                WorkflowContext::rebuild(parameters, &stored_variables.0, task_results);
+            wf_ctx.set_template_origin("workflow", &parent_execution.action_ref);
+            Self::populate_workflow_pack_config(&mut transaction, &parent_execution, &mut wf_ctx)
+                .await?;
+            for (path, source) in stored_variables.1 {
+                wf_ctx.mark_secret_pointer_paths("workflow", &[path], |_| source.clone());
+            }
             Self::mark_workflow_parameter_secret_sources(&wf_ctx, &parent_execution);
             Self::mark_workflow_task_result_secret_sources(
                 &wf_ctx,
@@ -5912,11 +6202,20 @@ impl ExecutionScheduler {
         let workflow_params = extract_workflow_params(&Some(restored_parent_config));
         let workflow_params = apply_param_defaults(workflow_params, &workflow_def.param_schema);
 
-        let mut wf_ctx = WorkflowContext::rebuild(
-            workflow_params,
+        let stored_variables = Self::restore_workflow_variables(
+            &mut *conn,
+            encryption_key,
+            &parent_execution,
             &workflow_execution.variables,
-            task_results_map,
-        );
+        )
+        .await?;
+        let mut wf_ctx =
+            WorkflowContext::rebuild(workflow_params, &stored_variables.0, task_results_map);
+        wf_ctx.set_template_origin("workflow", &parent_execution.action_ref);
+        Self::populate_workflow_pack_config(&mut *conn, &parent_execution, &mut wf_ctx).await?;
+        for (path, source) in stored_variables.1 {
+            wf_ctx.mark_secret_pointer_paths("workflow", &[path], |_| source.clone());
+        }
         Self::populate_task_wait_context(&mut *conn, workflow_execution_id, &mut wf_ctx).await?;
         Self::mark_workflow_parameter_secret_sources(&wf_ctx, &parent_execution);
         Self::mark_workflow_task_result_secret_sources(
@@ -5946,7 +6245,16 @@ impl ExecutionScheduler {
             &completed_secret_paths,
             |path| SecretSource::ExecutionResult {
                 execution_id: execution.id,
-                path: path.clone(),
+                path: if execution
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.pointer(path))
+                    .is_some_and(attune_common::secret_values::is_redaction_marker)
+                {
+                    path.clone()
+                } else {
+                    format!("/data{path}")
+                },
             },
         );
 
@@ -6239,7 +6547,29 @@ impl ExecutionScheduler {
 
         // Persist updated workflow variables (from publish directives) and
         // completed/failed task lists.
-        let updated_variables = wf_ctx.export_variables();
+        let rendered_variables = wf_ctx.export_variables_with_sensitivity()?;
+        let (updated_variables, secret_inputs) =
+            attune_common::secret_values::redact_secret_path_sources(
+                rendered_variables.value,
+                &rendered_variables.secret_path_sources,
+            );
+        ExecutionSecretValueRepository::delete_by_entity(
+            &mut *conn,
+            attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+            parent_execution.id,
+        )
+        .await?;
+        if !secret_inputs.is_empty() {
+            let key = encryption_key
+                .ok_or_else(|| anyhow::anyhow!("Workflow variable encryption is not configured"))?;
+            ExecutionSecretValueRepository::upsert_many_with_conn(
+                &mut *conn,
+                attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                parent_execution.id,
+                &prepare_secret_values(secret_inputs, key)?,
+            )
+            .await?;
+        }
         WorkflowExecutionRepository::update(
             &mut *conn,
             workflow_execution_id,
@@ -6336,6 +6666,27 @@ impl ExecutionScheduler {
             // structured fields composed from task results).
             let output_map_result = if !has_failures {
                 build_output_map_result(&workflow_def.definition, &wf_ctx)
+            } else {
+                None
+            };
+            let output_map_result = if let Some(rendered) = output_map_result {
+                let (value, secrets) = attune_common::secret_values::redact_secret_path_sources(
+                    rendered.value,
+                    &rendered.secret_path_sources,
+                );
+                if !secrets.is_empty() {
+                    let key = encryption_key.ok_or_else(|| {
+                        anyhow::anyhow!("Workflow output encryption is not configured")
+                    })?;
+                    ExecutionSecretValueRepository::upsert_many_with_conn(
+                        &mut *conn,
+                        ENTITY_EXECUTION_RESULT,
+                        parent_execution.id,
+                        &prepare_secret_values(secrets, key)?,
+                    )
+                    .await?;
+                }
+                Some(value)
             } else {
                 None
             };
@@ -8251,6 +8602,165 @@ tasks:
     }
 
     #[tokio::test]
+    async fn rendered_workflow_permissions_cannot_exceed_executor_authority_in_single_or_fanout_tasks(
+    ) {
+        use attune_common::repositories::identity::{
+            CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository,
+        };
+        let fixture = InquirySchedulerFixture::create().await;
+        let pool = fixture.database.pool();
+        let identity = IdentityRepository::create(
+            pool,
+            CreateIdentityInput {
+                login: "workflow-owner@example.test".into(),
+                display_name: None,
+                password_hash: None,
+                attributes: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("create workflow owner");
+        let set = PermissionSetRepository::create(
+            pool,
+            CreatePermissionSetInput {
+                r#ref: "fixture.sensitive".into(),
+                pack: None,
+                pack_ref: None,
+                label: None,
+                description: None,
+                grants: serde_json::json!([{"resource":"identities","actions":["delete"]}]),
+            },
+        )
+        .await
+        .expect("create nondelegable set");
+        let snapshot = fixture
+            .parent
+            .executable_snapshot
+            .as_ref()
+            .expect("parent snapshot");
+        let parameters = serde_json::json!({"refs":["fixture.sensitive"], "items":[{"refs":["fixture.sensitive"]}]});
+        let parent = ExecutionRepository::create_pinned(
+            pool,
+            CreateExecutionInput {
+                action: fixture.parent.action,
+                action_ref: fixture.parent.action_ref.clone(),
+                config: Some(parameters.clone()),
+                executor: Some(identity.id),
+                status: ExecutionStatus::Running,
+                ..Default::default()
+            },
+            snapshot,
+        )
+        .await
+        .expect("create attributed parent");
+        let workflow = WorkflowExecutionRepository::create(
+            pool,
+            CreateWorkflowExecutionInput {
+                execution: parent.id,
+                workflow_def: snapshot
+                    .executable
+                    .workflow_definition
+                    .as_ref()
+                    .expect("workflow definition")
+                    .id,
+                task_graph: serde_json::to_value(&fixture.graph).unwrap(),
+                variables: serde_json::json!({}),
+                status: ExecutionStatus::Running,
+            },
+        )
+        .await
+        .expect("create attributed workflow");
+        let context = WorkflowContext::new(parameters, HashMap::new());
+        for fanout in [false, true] {
+            let mut task = fixture.guarded_task.clone();
+            task.name = if fanout {
+                "restricted_fanout"
+            } else {
+                "restricted_single"
+            }
+            .into();
+            task.permission_set_refs = Some(serde_json::json!(if fanout {
+                "{{ item.refs }}"
+            } else {
+                "{{ parameters.refs }}"
+            }));
+            task.with_items = fanout.then(|| "{{ parameters.items }}".into());
+            let mut transaction = pool.begin().await.expect("begin dispatch");
+            let mut messages = Vec::new();
+            let mut completions = Vec::new();
+            let error = ExecutionScheduler::dispatch_workflow_task_with_conn(
+                &mut transaction,
+                &AtomicUsize::new(0),
+                &parent,
+                &workflow.id,
+                &task,
+                &context,
+                None,
+                None,
+                &mut messages,
+                &mut completions,
+            )
+            .await
+            .expect_err("reject rendered permission escalation");
+            assert!(error.to_string().contains("exceed"), "{error}");
+            assert!(messages.is_empty());
+            transaction
+                .rollback()
+                .await
+                .expect("roll back denied dispatch");
+        }
+        assert!(ExecutionRepository::find_by_parent(pool, parent.id)
+            .await
+            .unwrap()
+            .is_empty());
+        PermissionAssignmentRepository::create(
+            pool,
+            CreatePermissionAssignmentInput {
+                identity: identity.id,
+                permset: set.id,
+            },
+        )
+        .await
+        .expect("grant legitimate owner authority");
+        let mut task = fixture.guarded_task.clone();
+        task.name = "permitted_single".into();
+        task.permission_set_refs = Some(serde_json::json!("{{ parameters.refs }}"));
+        let mut transaction = pool.begin().await.unwrap();
+        let mut messages = Vec::new();
+        ExecutionScheduler::dispatch_workflow_task_with_conn(
+            &mut transaction,
+            &AtomicUsize::new(0),
+            &parent,
+            &workflow.id,
+            &task,
+            &context,
+            None,
+            None,
+            &mut messages,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("allow covered child authority");
+        transaction
+            .commit()
+            .await
+            .expect("commit permitted dispatch");
+        let children = ExecutionRepository::find_by_parent(pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].permission_set_refs, vec!["fixture.sensitive"]);
+        assert_eq!(children[0].executor, Some(identity.id));
+        assert_eq!(messages.len(), 1);
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean workflow fixture");
+    }
+
+    #[tokio::test]
     async fn cancelled_workflow_child_cancels_workflow_and_parent() {
         let fixture = InquirySchedulerFixture::create().await;
         let child = ExecutionRepository::update(
@@ -9335,6 +9845,27 @@ tasks:
             iteration_items(items, Some(2)),
             vec![serde_json::json!([1, 2]), serde_json::json!([3])]
         );
+    }
+
+    #[test]
+    fn iteration_secret_sources_follow_item_and_batch_positions() {
+        let sources = vec![SecretPathSource {
+            path: "/3/token".into(),
+            source: SecretSource::WorkflowParameter {
+                execution_id: 42,
+                path: "/items/3/token".into(),
+            },
+        }];
+        assert!(iteration_item_sources(&sources, 2, None, true).is_empty());
+        assert_eq!(
+            iteration_item_sources(&sources, 3, None, true)[0].path,
+            "/token"
+        );
+        assert_eq!(
+            iteration_item_sources(&sources, 1, Some(2), true)[0].path,
+            "/1/token"
+        );
+        assert!(iteration_item_sources(&sources, 0, Some(2), true).is_empty());
     }
 
     #[test]

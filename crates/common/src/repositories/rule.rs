@@ -212,6 +212,19 @@ impl Create for RuleRepository {
 }
 
 impl RuleRepository {
+    pub async fn find_by_id_for_share(
+        conn: &mut sqlx::PgConnection,
+        id: Id,
+    ) -> Result<Option<Rule>> {
+        sqlx::query_as(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE id = $1 AND retired_at IS NULL FOR SHARE"
+        ))
+        .bind(id)
+        .fetch_optional(conn)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn find_by_ref_including_retired<'e, E>(
         executor: E,
         ref_str: &str,

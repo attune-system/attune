@@ -61,7 +61,7 @@ export type KeyResponse = {
    */
   updated: string;
   /**
-   * The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+   * JSON value, or null when the caller cannot read and decrypt encrypted material.
    */
   value: any;
 };

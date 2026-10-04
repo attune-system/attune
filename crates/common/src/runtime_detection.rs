@@ -11,6 +11,7 @@
 //! worker filters and capability strings. Aliases are declared per-runtime in
 //! pack manifests, so no hardcoded alias table is needed here.
 
+use crate::child_process_environment::ChildProcessEnvironment;
 use crate::config::Config;
 use crate::error::Result;
 use crate::models::Runtime;
@@ -65,12 +66,21 @@ pub fn runtime_aliases_contain(aliases: &[String], name: &str) -> bool {
 /// Runtime detection service
 pub struct RuntimeDetector {
     pool: PgPool,
+    child_environment: ChildProcessEnvironment,
 }
 
 impl RuntimeDetector {
     /// Create a new runtime detector
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            child_environment: Default::default(),
+        }
+    }
+
+    pub fn with_child_environment(mut self, environment: ChildProcessEnvironment) -> Self {
+        self.child_environment = environment;
+        self
     }
 
     /// Detect available runtimes using three-tier priority:
@@ -168,7 +178,7 @@ impl RuntimeDetector {
 
         // Verify each runtime
         for runtime in runtimes {
-            if Self::verify_runtime_available(&runtime).await {
+            if self.verify_runtime_available(&runtime).await {
                 info!("✓ Runtime available: {} ({})", runtime.name, runtime.r#ref);
                 available_runtimes.push(runtime.name.to_lowercase());
             } else {
@@ -185,7 +195,7 @@ impl RuntimeDetector {
     }
 
     /// Verify if a runtime is available on this system
-    pub async fn verify_runtime_available(runtime: &Runtime) -> bool {
+    pub async fn verify_runtime_available(&self, runtime: &Runtime) -> bool {
         // Check if runtime is always available (e.g., shell, native)
         if let Some(verification) = runtime.distributions.get("verification") {
             if let Some(always_available) = verification.get("always_available") {
@@ -215,7 +225,13 @@ impl RuntimeDetector {
                     });
 
                     for cmd in sorted_commands {
-                        if Self::try_verification_command(&cmd, &runtime.name).await {
+                        if Self::try_verification_command(
+                            &cmd,
+                            &runtime.name,
+                            &self.child_environment,
+                        )
+                        .await
+                        {
                             return true;
                         }
                     }
@@ -228,7 +244,11 @@ impl RuntimeDetector {
     }
 
     /// Try executing a verification command to check if runtime is available
-    async fn try_verification_command(cmd: &serde_json::Value, runtime_name: &str) -> bool {
+    async fn try_verification_command(
+        cmd: &serde_json::Value,
+        runtime_name: &str,
+        child_environment: &ChildProcessEnvironment,
+    ) -> bool {
         let binary = match cmd.get("binary").and_then(|b| b.as_str()) {
             Some(b) => b,
             None => {
@@ -266,7 +286,9 @@ impl RuntimeDetector {
         );
 
         // Execute command
-        let output = match Command::new(binary).args(&args).output() {
+        let mut command = Command::new(binary);
+        child_environment.apply(&mut command);
+        let output = match command.args(&args).output() {
             Ok(output) => output,
             Err(e) => {
                 if !optional {
@@ -328,6 +350,26 @@ impl RuntimeDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_verification_uses_selected_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::TempDir::new().unwrap();
+        let executable = root.path().join("runtime");
+        std::fs::write(&executable, "#!/bin/sh\ntest \"$LD_LIBRARY_PATH\" = /configured/library || exit 19\ntest -z \"${ATTUNE__SECURITY__JWT_SECRET+x}\" || exit 20\nprintf 'v3.14.15\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = vec![
+            ("LD_LIBRARY_PATH".into(), "/configured/library".into()),
+            ("ATTUNE__SECURITY__JWT_SECRET".into(), "dummy-jwt".into()),
+        ];
+        let minimal = ChildProcessEnvironment::from_parent(parent.clone(), &[]).unwrap();
+        let selected =
+            ChildProcessEnvironment::from_parent(parent, &["LD_LIBRARY_PATH".into()]).unwrap();
+        let command = serde_json::json!({"binary": executable, "args": [], "exit_code": 0, "pattern": "3\\.14\\.15"});
+        assert!(!RuntimeDetector::try_verification_command(&command, "fixture", &minimal).await);
+        assert!(RuntimeDetector::try_verification_command(&command, "fixture", &selected).await);
+    }
     use serde_json::json;
 
     #[test]
@@ -431,6 +473,6 @@ mod tests {
         });
 
         // This might fail on some systems, but should not panic
-        let _ = RuntimeDetector::try_verification_command(&cmd, "Shell").await;
+        let _ = RuntimeDetector::try_verification_command(&cmd, "Shell", &Default::default()).await;
     }
 }

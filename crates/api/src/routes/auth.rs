@@ -14,8 +14,8 @@ use validator::Validate;
 use attune_common::auth::{
     hash_integration_token, jwt::generate_sensor_token_with_cache_authority_and_workload_fence,
 };
-use attune_common::models::{Identity, IntegrationToken, OwnerType, Sensor, SensorWorkloadFence};
-use attune_common::rbac::{Action, Grant, GrantConstraints, Resource};
+use attune_common::models::{Identity, IntegrationToken, Sensor, SensorWorkloadFence};
+use attune_common::rbac::{Action, Grant, Resource};
 use attune_common::repositories::{
     identity::{
         CreateIdentityInput, IdentityRepository, IdentityRoleAssignmentRepository,
@@ -303,6 +303,7 @@ fn action_name(action: Action) -> &'static str {
         Action::Respond => "respond",
         Action::Manage => "manage",
         Action::Decrypt => "decrypt",
+        Action::Use => "use",
     }
 }
 
@@ -1398,19 +1399,9 @@ async fn sensor_cache_grant_snapshot(
         .iter()
         .any(|permission_ref| permission_ref == "standard")
     {
-        for (owner_type, owner_ref) in
-            [(OwnerType::Sensor, sensor_ref), (OwnerType::Pack, pack_ref)]
-        {
-            grants.push(Grant {
-                resource: Resource::Caches,
-                actions: vec![Action::Read],
-                constraints: Some(GrantConstraints {
-                    owner_types: Some(vec![owner_type]),
-                    owner_refs: Some(vec![owner_ref.to_string()]),
-                    ..Default::default()
-                }),
-            });
-        }
+        grants.extend(attune_common::delegation::standard_sensor_cache_grants(
+            sensor_ref, pack_ref,
+        ));
     }
 
     let named_refs = permission_set_refs
@@ -1425,6 +1416,7 @@ async fn sensor_cache_grant_snapshot(
             "One or more sensor cache permission sets do not exist".to_string(),
         ));
     }
+    let standard_grant_count = grants.len();
     for permission_set in permission_sets {
         let permission_grants: Vec<Grant> =
             serde_json::from_value(permission_set.grants).map_err(|err| {
@@ -1438,6 +1430,25 @@ async fn sensor_cache_grant_snapshot(
                 .into_iter()
                 .filter(|grant| grant.resource == Resource::Caches),
         );
+    }
+    if grants.len() > standard_grant_count {
+        let pack = attune_common::repositories::pack::PackRepository::find_by_ref(
+            &mut *connection,
+            pack_ref,
+        )
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Sensor pack is not available".into()))?;
+        let identity = pack.installed_by.ok_or_else(|| {
+            ApiError::Forbidden(
+                "Named sensor cache access requires an attributed pack installer".into(),
+            )
+        })?;
+        let authority = attune_common::delegation::DelegationAuthority::load_for_share(
+            &mut *connection,
+            identity,
+        )
+        .await?;
+        authority.require_grants(&grants[standard_grant_count..])?;
     }
     Ok(grants)
 }

@@ -141,6 +141,24 @@ async fn main() {
             commands::auth::handle_auth_command(&cli.profile, command, &cli.api_url, output_format)
                 .await
         }
+        Commands::Permission { command } => {
+            commands::permission::handle_permission_command(
+                &cli.profile,
+                command,
+                &cli.api_url,
+                output_format,
+            )
+            .await
+        }
+        Commands::Identity { command } => {
+            commands::identity::handle_identity_command(
+                &cli.profile,
+                command,
+                &cli.api_url,
+                output_format,
+            )
+            .await
+        }
         Commands::Pack { command } => {
             commands::pack::handle_pack_command(&cli.profile, command, &cli.api_url, output_format)
                 .await

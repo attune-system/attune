@@ -1,12 +1,27 @@
 //! Identity and permission repository for database operations
 
-use crate::models::{identity::*, Id, JsonDict};
+use crate::models::{identity::*, Id, JsonDict, ManagementOriginKind};
 use crate::Result;
 use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder};
 
 use super::{Create, Delete, FindById, FindByRef, List, Repository, Update};
 
 pub struct IdentityRepository;
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct IdentityAdminRow {
+    #[sqlx(flatten)]
+    pub identity: Identity,
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct IdentityAuthorizationRow {
+    pub identity_id: Id,
+    pub attributes: JsonDict,
+    pub frozen: bool,
+    pub grants: sqlx::types::Json<Vec<crate::rbac::Grant>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteIdentityOutcome {
@@ -166,6 +181,53 @@ impl Delete for IdentityRepository {
 }
 
 impl IdentityRepository {
+    /// One statement provides a consistent current identity/assignment snapshot.
+    pub async fn authorization_state(
+        pool: &PgPool,
+        identity_id: Id,
+    ) -> Result<Option<IdentityAuthorizationRow>> {
+        sqlx::query_as(
+            "SELECT i.id AS identity_id, i.attributes, i.frozen,
+                COALESCE((SELECT jsonb_agg(g.value)
+                    FROM permission_set ps CROSS JOIN LATERAL jsonb_array_elements(ps.grants) AS g(value)
+                    WHERE ps.retired_at IS NULL AND (
+                        EXISTS (SELECT 1 FROM permission_assignment pa WHERE pa.identity = i.id AND pa.permset = ps.id)
+                        OR EXISTS (SELECT 1 FROM identity_role_assignment ira
+                            JOIN permission_set_role_assignment ra ON ra.role = ira.role
+                            WHERE ira.identity = i.id AND ra.permset = ps.id)
+                    )), '[]'::JSONB) AS grants
+             FROM identity i WHERE i.id = $1",
+        ).bind(identity_id).fetch_optional(pool).await.map_err(Into::into)
+    }
+
+    pub async fn list_admin(
+        pool: &PgPool,
+        login: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<IdentityAdminRow>, i64)> {
+        let rows = sqlx::query_as(
+            "SELECT i.id, i.login, i.display_name, i.password_hash, i.attributes,
+                    i.frozen, i.created, i.updated,
+                    ARRAY(SELECT ra.role FROM identity_role_assignment ra
+                          WHERE ra.identity = i.id ORDER BY ra.role) AS roles
+             FROM identity i WHERE ($1::TEXT IS NULL OR i.login = $1)
+             ORDER BY i.login LIMIT $2 OFFSET $3",
+        )
+        .bind(login)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+        let count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM identity WHERE ($1::TEXT IS NULL OR login = $1)",
+        )
+        .bind(login)
+        .fetch_one(pool)
+        .await?;
+        Ok((rows, count))
+    }
+
     /// Loads an identity and prevents authorization-relevant updates until the
     /// caller's transaction completes.
     pub async fn find_by_id_for_share(conn: &mut PgConnection, id: Id) -> Result<Option<Identity>> {
@@ -630,6 +692,14 @@ pub struct OidcUpsertInput {
 // Permission Set Repository
 pub struct PermissionSetRepository;
 
+#[derive(Debug, sqlx::FromRow)]
+pub struct PermissionSetAdminRow {
+    #[sqlx(flatten)]
+    pub permission_set: PermissionSet,
+    pub management_origin: ManagementOriginKind,
+    pub roles: sqlx::types::Json<Vec<PermissionSetRoleAssignment>>,
+}
+
 impl Repository for PermissionSetRepository {
     type Entity = PermissionSet;
     fn table_name() -> &'static str {
@@ -770,6 +840,44 @@ impl Delete for PermissionSetRepository {
 }
 
 impl PermissionSetRepository {
+    pub async fn find_by_refs_for_share(
+        conn: &mut PgConnection,
+        refs: &[String],
+    ) -> Result<Vec<PermissionSet>> {
+        sqlx::query_as(
+            "SELECT id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated
+             FROM permission_set WHERE ref = ANY($1) AND retired_at IS NULL ORDER BY ref FOR SHARE",
+        ).bind(refs).fetch_all(conn).await.map_err(Into::into)
+    }
+
+    /// Administrative inspection includes retired definitions and their mappings.
+    pub async fn list_admin(
+        pool: &PgPool,
+        pack_ref: Option<&str>,
+        permission_set_ref: Option<&str>,
+        include_retired: bool,
+    ) -> Result<Vec<PermissionSetAdminRow>> {
+        sqlx::query_as(
+            "SELECT ps.id, ps.ref, ps.pack, ps.pack_ref, ps.label, ps.description,
+                    ps.grants, ps.retired_at, ps.created, ps.updated, ps.management_origin,
+                    COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                        'id', ra.id, 'permset', ra.permset, 'role', ra.role, 'created', ra.created)
+                        ORDER BY ra.role) FROM permission_set_role_assignment ra
+                        WHERE ra.permset = ps.id), '[]'::jsonb) AS roles
+             FROM permission_set ps
+             WHERE ($1::TEXT IS NULL OR ps.pack_ref = $1)
+               AND ($2::TEXT IS NULL OR ps.ref = $2)
+               AND ($3 OR ps.retired_at IS NULL)
+             ORDER BY ps.ref",
+        )
+        .bind(pack_ref)
+        .bind(permission_set_ref)
+        .bind(include_retired)
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Loads direct permission sets and holds their assignments stable for the
     /// caller's security-sensitive transaction.
     pub async fn find_by_identity_for_share(
@@ -920,6 +1028,23 @@ impl PermissionSetRepository {
 // Permission Assignment Repository
 pub struct PermissionAssignmentRepository;
 
+#[derive(Debug, Default)]
+pub struct PermissionBindingFilter<'a> {
+    pub identity_id: Option<Id>,
+    pub identity_login: Option<&'a str>,
+    pub role: Option<&'a str>,
+    pub permission_set_ref: Option<&'a str>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct DirectPermissionBindingRow {
+    pub id: Id,
+    pub identity_id: Id,
+    pub permission_set_id: Id,
+    pub permission_set_ref: String,
+    pub created: chrono::DateTime<chrono::Utc>,
+}
+
 impl Repository for PermissionAssignmentRepository {
     type Entity = PermissionAssignment;
     fn table_name() -> &'static str {
@@ -970,7 +1095,9 @@ impl Create for PermissionAssignmentRepository {
     {
         sqlx::query_as::<_, PermissionAssignment>(
             "INSERT INTO permission_assignment (identity, permset) VALUES ($1, $2) RETURNING id, identity, permset, created"
-        ).bind(input.identity).bind(input.permset).fetch_one(executor).await.map_err(Into::into)
+        ).bind(input.identity).bind(input.permset).fetch_one(executor).await.map_err(|error| {
+            assignment_create_error(error, "Permission assignment")
+        })
     }
 }
 
@@ -989,6 +1116,55 @@ impl Delete for PermissionAssignmentRepository {
 }
 
 impl PermissionAssignmentRepository {
+    /// Administrative assignment inspection retains bindings to retired sets.
+    pub async fn find_by_identity_with_refs(
+        pool: &PgPool,
+        identity_id: Id,
+    ) -> Result<Vec<DirectPermissionBindingRow>> {
+        sqlx::query_as(
+            "SELECT pa.id, pa.identity AS identity_id, pa.permset AS permission_set_id,
+                    ps.ref AS permission_set_ref, pa.created
+             FROM permission_assignment pa JOIN permission_set ps ON ps.id = pa.permset
+             WHERE pa.identity = $1 ORDER BY ps.ref, pa.id",
+        )
+        .bind(identity_id)
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn list_bindings(
+        pool: &PgPool,
+        filter: PermissionBindingFilter<'_>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<PermissionBindingRow>, i64)> {
+        let rows = sqlx::query_as(&format!(
+            "{PERMISSION_BINDINGS_QUERY} SELECT id, permission_set_id, permission_set_ref,
+             identity_id, identity_login, role, created FROM filtered
+             ORDER BY permission_set_ref, identity_login NULLS LAST, role NULLS LAST, id
+             LIMIT $5 OFFSET $6"
+        ))
+        .bind(filter.identity_id)
+        .bind(filter.identity_login)
+        .bind(filter.role)
+        .bind(filter.permission_set_ref)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+        let count = sqlx::query_scalar(&format!(
+            "{PERMISSION_BINDINGS_QUERY} SELECT COUNT(*) FROM filtered"
+        ))
+        .bind(filter.identity_id)
+        .bind(filter.identity_login)
+        .bind(filter.role)
+        .bind(filter.permission_set_ref)
+        .fetch_one(pool)
+        .await?;
+        Ok((rows, count))
+    }
+
     pub async fn find_by_identity<'e, E>(
         executor: E,
         identity_id: Id,
@@ -1057,7 +1233,7 @@ impl Create for IdentityRoleAssignmentRepository {
         .bind(input.managed)
         .fetch_one(executor)
         .await
-        .map_err(Into::into)
+        .map_err(|error| assignment_create_error(error, "Identity role assignment"))
     }
 }
 
@@ -1205,7 +1381,46 @@ impl Create for PermissionSetRoleAssignmentRepository {
         .bind(&input.role)
         .fetch_one(executor)
         .await
-        .map_err(Into::into)
+        .map_err(|error| assignment_create_error(error, "Permission set role assignment"))
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct PermissionBindingRow {
+    pub id: Id,
+    pub permission_set_id: Id,
+    pub permission_set_ref: String,
+    pub identity_id: Option<Id>,
+    pub identity_login: Option<String>,
+    pub role: Option<String>,
+    pub created: chrono::DateTime<chrono::Utc>,
+}
+
+const PERMISSION_BINDINGS_QUERY: &str = "
+    WITH bindings AS (
+        SELECT pa.id, ps.id AS permission_set_id, ps.ref AS permission_set_ref,
+               i.id AS identity_id, i.login AS identity_login, NULL::TEXT AS role, pa.created
+        FROM permission_assignment pa
+        JOIN permission_set ps ON ps.id = pa.permset
+        JOIN identity i ON i.id = pa.identity
+        UNION ALL
+        SELECT ra.id, ps.id, ps.ref, NULL::BIGINT, NULL::TEXT, ra.role, ra.created
+        FROM permission_set_role_assignment ra
+        JOIN permission_set ps ON ps.id = ra.permset
+    ), filtered AS (
+        SELECT id, permission_set_id, permission_set_ref, identity_id, identity_login, role, created
+        FROM bindings
+        WHERE ($1::BIGINT IS NULL OR identity_id = $1)
+          AND ($2::TEXT IS NULL OR identity_login = $2)
+          AND ($3::TEXT IS NULL OR role = $3)
+          AND ($4::TEXT IS NULL OR permission_set_ref = $4)
+    )";
+
+fn assignment_create_error(error: sqlx::Error, entity: &str) -> crate::Error {
+    if matches!(&error, sqlx::Error::Database(db) if db.is_unique_violation()) {
+        crate::Error::already_exists(entity, "assignment", "already assigned")
+    } else {
+        error.into()
     }
 }
 

@@ -463,6 +463,15 @@ impl ArtifactRepository {
 
     /// Find artifacts that have at least one version produced by the given execution.
     /// Uses a JOIN through `artifact_version` (per-version `execution` column).
+    pub async fn linked_execution_ids<'e, E>(executor: E, artifact_id: i64) -> Result<Vec<i64>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar(
+            "SELECT DISTINCT execution FROM artifact_version WHERE artifact = $1 AND execution IS NOT NULL ORDER BY execution",
+        ).bind(artifact_id).fetch_all(executor).await.map_err(Into::into)
+    }
+
     pub async fn find_by_execution<'e, E>(executor: E, execution_id: i64) -> Result<Vec<Artifact>>
     where
         E: Executor<'e, Database = Postgres> + 'e,

@@ -17,19 +17,32 @@ use tracing::{debug, info};
 /// Native runtime for executing compiled binaries
 pub struct NativeRuntime {
     work_dir: Option<std::path::PathBuf>,
+    child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
 }
 
 impl NativeRuntime {
     /// Create a new native runtime
     pub fn new() -> Self {
-        Self { work_dir: None }
+        Self {
+            work_dir: None,
+            child_environment: Default::default(),
+        }
     }
 
     /// Create a native runtime with custom working directory
     pub fn with_work_dir(work_dir: std::path::PathBuf) -> Self {
         Self {
             work_dir: Some(work_dir),
+            child_environment: Default::default(),
         }
+    }
+
+    pub fn with_child_environment(
+        mut self,
+        environment: attune_common::child_process_environment::ChildProcessEnvironment,
+    ) -> Self {
+        self.child_environment = environment;
+        self
     }
 
     /// Execute a native binary with parameters and environment variables
@@ -82,9 +95,7 @@ impl NativeRuntime {
             cmd.current_dir(work_dir);
         }
 
-        // Add the explicit execution environment after removing any API token
-        // inherited by the worker process.
-        parameter_passing::apply_runtime_environment(&mut cmd, env);
+        parameter_passing::apply_runtime_environment(&mut cmd, env, &self.child_environment);
 
         super::process_executor::execute_streaming_cancellable(
             cmd,
@@ -199,7 +210,9 @@ impl Runtime for NativeRuntime {
         #[cfg(unix)]
         {
             use std::process::Command;
-            let output = Command::new("uname").arg("-s").output().map_err(|e| {
+            let mut command = Command::new("uname");
+            self.child_environment.apply(&mut command);
+            let output = command.arg("-s").output().map_err(|e| {
                 RuntimeError::SetupError(format!("Failed to verify native runtime: {}", e))
             })?;
 
@@ -228,7 +241,9 @@ impl Runtime for NativeRuntime {
         #[cfg(unix)]
         {
             use std::process::Command;
-            Command::new("echo").arg("test").output().map_err(|e| {
+            let mut command = Command::new("echo");
+            self.child_environment.apply(&mut command);
+            command.arg("test").output().map_err(|e| {
                 RuntimeError::SetupError(format!("Native runtime validation failed: {}", e))
             })?;
         }

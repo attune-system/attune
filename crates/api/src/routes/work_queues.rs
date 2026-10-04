@@ -1546,7 +1546,10 @@ async fn resolve_display_key_value(
     identity_id: Option<i64>,
     key: &Key,
 ) -> Result<Option<JsonValue>, ApiError> {
-    if user.claims.token_type != TokenType::Access {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
         return decrypt_key_for_display(state, key);
     }
 

@@ -551,6 +551,15 @@ fn push_pack_visibility_filter<'args>(
 }
 
 impl PackRepository {
+    pub async fn set_registered_identity(
+        conn: &mut sqlx::PgConnection,
+        pack_id: Id,
+        identity_id: Id,
+    ) -> Result<Pack> {
+        sqlx::query_as(&format!("UPDATE pack SET installed_by = $2, updated = NOW() WHERE id = $1 RETURNING {PACK_COLUMNS}"))
+            .bind(pack_id).bind(identity_id).fetch_one(conn).await.map_err(Into::into)
+    }
+
     /// Locks the pack's releases and rejects deletion if live pinned work exists.
     /// Keep the surrounding transaction open through the eventual pack delete.
     pub async fn ensure_deletable<'e, E>(executor: E, pack_id: i64) -> Result<bool>

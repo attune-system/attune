@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1033,6 +1034,24 @@ class PackLoader:
         cursor.close()
         return sensor_ids
 
+    def ensure_registration_identity(self):
+        """Retain an attributed actor for this operator-owned initializer."""
+        with self.conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM permission_set WHERE ref = 'core.admin' AND retired_at IS NULL")
+            admin_permission = cursor.fetchone()
+            if not admin_permission:
+                raise ValueError("Trusted pack bootstrap requires the active core.admin catalog definition")
+            cursor.execute(
+                "INSERT INTO identity (login, display_name, attributes) VALUES (%s, %s, %s::jsonb) RETURNING id",
+                (f"pack-loader-{uuid.uuid4().hex}", "Trusted pack initialization", json.dumps({"initializer": "pack-loader"})),
+            )
+            self.registration_identity = cursor.fetchone()[0]
+            cursor.execute(
+                "INSERT INTO permission_assignment (identity, permset) VALUES (%s, %s) ON CONFLICT (identity, permset) DO NOTHING",
+                (self.registration_identity, admin_permission[0]),
+            )
+            cursor.execute("UPDATE pack SET installed_by = %s WHERE id = %s", (self.registration_identity, self.pack_id))
+
     def upsert_rules(
         self, trigger_ids: Dict[str, int], action_ids: Dict[str, int]
     ) -> Dict[str, int]:
@@ -1108,7 +1127,7 @@ class PackLoader:
                     conditions, action_params, trigger_params,
                     enabled, is_adhoc, owner_identity
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false, NULL)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s)
                 ON CONFLICT (ref) DO UPDATE SET
                     pack = EXCLUDED.pack,
                     pack_ref = EXCLUDED.pack_ref,
@@ -1123,7 +1142,7 @@ class PackLoader:
                     trigger_params = EXCLUDED.trigger_params,
                     enabled = EXCLUDED.enabled,
                     is_adhoc = false,
-                    owner_identity = NULL,
+                    owner_identity = EXCLUDED.owner_identity,
                     updated = NOW()
                 RETURNING id
             """,
@@ -1141,6 +1160,7 @@ class PackLoader:
                     action_params,
                     trigger_params,
                     enabled,
+                    self.registration_identity,
                 ),
             )
 
@@ -1479,6 +1499,7 @@ class PackLoader:
 
             # Load permission sets first (authorization metadata)
             permission_set_ids = self.upsert_permission_sets()
+            self.ensure_registration_identity()
 
             # Load runtimes (actions and sensors depend on them)
             runtime_ids, runtime_count = self.upsert_runtimes()

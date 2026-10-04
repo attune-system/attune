@@ -939,6 +939,7 @@ pub fn build_action_command(
     action_file: &Path,
     working_dir: Option<&Path>,
     env_vars: &HashMap<String, String>,
+    child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
 ) -> Command {
     let mut cmd = Command::new(interpreter);
 
@@ -957,7 +958,7 @@ pub fn build_action_command(
         }
     }
 
-    parameter_passing::apply_runtime_environment(&mut cmd, env_vars);
+    parameter_passing::apply_runtime_environment(&mut cmd, env_vars, child_environment);
 
     cmd
 }
@@ -975,13 +976,14 @@ pub fn build_inline_command(
     interpreter: &Path,
     code: &str,
     env_vars: &HashMap<String, String>,
+    child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
 ) -> Command {
     let mut cmd = Command::new(interpreter);
 
     // Pass code via -c flag (works for bash, python, etc.)
     cmd.arg("-c").arg(code);
 
-    parameter_passing::apply_runtime_environment(&mut cmd, env_vars);
+    parameter_passing::apply_runtime_environment(&mut cmd, env_vars, child_environment);
 
     cmd
 }
@@ -1182,7 +1184,14 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("ATTUNE_EXEC_ID".to_string(), "123".to_string());
 
-        let cmd = build_action_command(interpreter, &args, action_file, None, &env);
+        let cmd = build_action_command(
+            interpreter,
+            &args,
+            action_file,
+            None,
+            &env,
+            &Default::default(),
+        );
 
         // We can't easily inspect Command internals, but at least verify it builds without panic
         let _ = cmd;

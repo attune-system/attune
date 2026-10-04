@@ -255,3 +255,359 @@ async fn test_plain_authenticated_user_cannot_manage_identities() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn test_permission_cli_filtered_inspection_and_assignment_contract() {
+    use attune_common::repositories::{
+        identity::{CreatePermissionSetInput, PermissionSetRepository},
+        Create,
+    };
+
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
+    let pack = create_test_pack(&ctx.pool, "deploy").await.unwrap();
+    let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "deploy.operator".to_string(), pack: Some(pack.id), pack_ref: Some("deploy".to_string()),
+        label: Some("Operator".to_string()), description: None,
+        grants: json!([{"resource": "actions", "actions": ["read"], "constraints": {"refs": ["deploy.release"]}}]),
+    }).await.unwrap();
+    let response = ctx
+        .post(
+            "/api/v1/identities",
+            json!({"login": "alice+ops@example.com"}),
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let identity_id = body["data"]["id"].as_i64().unwrap();
+
+    let direct_request =
+        json!({"identity_id": identity_id, "permission_set_ref": "deploy.operator"});
+    assert_eq!(
+        ctx.post(
+            "/api/v1/permissions/assignments",
+            direct_request.clone(),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        ctx.post(
+            "/api/v1/permissions/assignments",
+            direct_request,
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let role_path = format!("/api/v1/permissions/sets/{}/roles", set.id);
+    assert_eq!(
+        ctx.post(&role_path, json!({"role": "ops & deploy"}), ctx.token())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        ctx.post(&role_path, json!({"role": "ops & deploy"}), ctx.token())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let membership_path = format!("/api/v1/identities/{identity_id}/roles");
+    assert_eq!(
+        ctx.post(
+            &membership_path,
+            json!({"role": "ops & deploy"}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        ctx.post(
+            &membership_path,
+            json!({"role": "ops & deploy"}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::CONFLICT
+    );
+
+    let response = ctx
+        .get(
+            "/api/v1/identities?login=alice%2Bops%40example.com",
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["pagination"]["total_items"], 1);
+    assert_eq!(body["items"][0]["roles"], json!(["ops & deploy"]));
+    let response = ctx
+        .get(
+            "/api/v1/permissions/sets/by-ref/deploy.operator",
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["data"]["management_origin"], "pack");
+    assert_eq!(body["data"]["roles"][0]["role"], "ops & deploy");
+
+    for (query, expected_type) in [
+        ("identity_login=alice%2Bops%40example.com", "identity"),
+        ("role=ops%20%26%20deploy", "role"),
+    ] {
+        let response = ctx
+            .get(
+                &format!(
+                    "/api/v1/permissions/assignments?{query}&permission_set_ref=deploy.operator"
+                ),
+                ctx.token(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["pagination"]["total_items"], 1);
+        assert_eq!(body["items"][0]["target"]["type"], expected_type);
+        assert_eq!(body["items"][0]["permission_set_ref"], "deploy.operator");
+    }
+    for page in [1, 2] {
+        let response = ctx.get(&format!("/api/v1/permissions/assignments?permission_set_ref=deploy.operator&page_size=1&page={page}"), ctx.token()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["pagination"]["total_items"], 2);
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["items"][0]["target"]["type"],
+            if page == 1 { "identity" } else { "role" }
+        );
+    }
+    assert_eq!(
+        ctx.get(
+            "/api/v1/permissions/assignments?identity_id=1&role=ops",
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    for endpoint in ["/api/v1/identities", "/api/v1/permissions/assignments"] {
+        for query in ["page_size=200", "page_size=0", "page=0"] {
+            assert_eq!(
+                ctx.get(&format!("{endpoint}?{query}"), ctx.token())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+    let mut tx = ctx.pool.begin().await.unwrap();
+    attune_common::repositories::component_lifecycle::ComponentLifecycleRepository::reconcile_omissions(
+        &mut tx, pack.id, &Default::default(),
+    ).await.unwrap();
+    tx.commit().await.unwrap();
+    let response = ctx
+        .get(&format!("/api/v1/identities/{identity_id}"), ctx.token())
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["data"]["direct_permissions"][0]["permission_set_ref"],
+        "deploy.operator"
+    );
+    let response = ctx
+        .get(
+            &format!("/api/v1/identities/{identity_id}/permissions"),
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body[0]["permission_set_ref"], "deploy.operator");
+    let response = ctx
+        .get("/api/v1/permissions/sets?pack_ref=deploy", ctx.token())
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body, json!([]));
+    let response = ctx
+        .get(
+            "/api/v1/permissions/sets?pack_ref=deploy&include_retired=true",
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body[0]["retired_at"].is_string());
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_permission_update_dry_run_validates_without_persisting() {
+    use attune_common::repositories::{
+        identity::{CreatePermissionSetInput, PermissionSetRepository},
+        Create,
+    };
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
+    let set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "deploy.operator".to_string(),
+            pack: None,
+            pack_ref: None,
+            label: Some("Operator".to_string()),
+            description: Some("Original description".to_string()),
+            grants: json!([{"resource": "actions", "actions": ["read"]}]),
+        },
+    )
+    .await
+    .unwrap();
+    let path = format!("/api/v1/permissions/sets/{}", set.id);
+    let request = json!({"label": "Updated", "grants": [{"resource": "actions", "actions": ["execute"], "constraints": {"refs": ["deploy.release"]}}]});
+    let response = ctx
+        .put(
+            &format!("{path}?dry_run=true"),
+            request.clone(),
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["data"]["label"], "Updated");
+    assert_eq!(body["data"]["description"], "Original description");
+    let unchanged = PermissionSetRepository::find_by_id(&ctx.pool, set.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.grants, set.grants);
+    assert_eq!(unchanged.updated, set.updated);
+    let response = ctx
+        .put(
+            &format!("{path}?dry_run=true"),
+            json!({"grants": [{"resource": "actions", "actions": ["decrypt"]}]}),
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = ctx.put(&format!("{path}?dry_run=true"), json!({"grants": [{"resource": "actions", "actions": ["execute"], "constraints": {"ref": ["deploy.release"]}}]}), ctx.token()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("unknown field"));
+    let response = ctx.put(&path, request.clone(), ctx.token()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated = PermissionSetRepository::find_by_id(&ctx.pool, set.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.grants, request["grants"]);
+    assert_eq!(updated.label.as_deref(), Some("Updated"));
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_permission_inspection_requires_auth_and_read_authority() {
+    let mut ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let token = ctx.token.take().unwrap();
+    for path in [
+        "/api/v1/permissions/assignments",
+        "/api/v1/permissions/sets/by-ref/core.admin",
+    ] {
+        assert_eq!(
+            ctx.get(path, None).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            ctx.get(path, Some(&token)).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_platform_permission_definitions_are_inspectable_but_not_editable() {
+    use attune_api::authz::AuthorizationService;
+    use attune_common::repositories::{
+        identity::{
+            CreatePermissionAssignmentInput, PermissionAssignmentRepository,
+            PermissionSetRepository,
+        },
+        platform_catalog::PlatformCatalogRepository,
+        Create, FindByRef,
+    };
+    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    PlatformCatalogRepository::reconcile(&ctx.pool)
+        .await
+        .unwrap();
+    let admin = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await
+        .unwrap()
+        .unwrap();
+    let identity_id = ctx.user.as_ref().unwrap().id;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity_id,
+            permset: admin.id,
+        },
+    )
+    .await
+    .unwrap();
+    AuthorizationService::invalidate_identity_authz_cache(identity_id).await;
+    let response = ctx
+        .get("/api/v1/permissions/sets/by-ref/core.admin", ctx.token())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["data"]["management_origin"], "platform");
+    for suffix in ["", "?dry_run=true"] {
+        let response = ctx
+            .put(
+                &format!("/api/v1/permissions/sets/{}{suffix}", admin.id),
+                json!({"grants": []}),
+                ctx.token(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("platform-managed"));
+    }
+    let unchanged = PermissionSetRepository::find_by_id(&ctx.pool, admin.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.grants, admin.grants);
+    ctx.cleanup().await.unwrap();
+}

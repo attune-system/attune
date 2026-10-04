@@ -977,35 +977,26 @@ impl EnforcementRepository {
         .map_err(Into::into)
     }
 
-    pub async fn create_or_get_by_rule_event<'e, E>(
-        executor: E,
+    pub async fn create_or_get_by_rule_event(
+        conn: &mut sqlx::PgConnection,
         input: CreateEnforcementInput,
-    ) -> Result<EnforcementCreateOrGetResult>
-    where
-        E: Executor<'e, Database = Postgres> + Copy + 'e,
-    {
-        Self::create_or_get_by_rule_event_with_snapshot(executor, input, None).await
+    ) -> Result<EnforcementCreateOrGetResult> {
+        Self::create_or_get_by_rule_event_with_snapshot(conn, input, None).await
     }
 
-    pub async fn create_or_get_by_rule_event_pinned<'e, E>(
-        executor: E,
+    pub async fn create_or_get_by_rule_event_pinned(
+        conn: &mut sqlx::PgConnection,
         input: CreateEnforcementInput,
         snapshot: &crate::models::ExecutionExecutableSnapshot,
-    ) -> Result<EnforcementCreateOrGetResult>
-    where
-        E: Executor<'e, Database = Postgres> + Copy + 'e,
-    {
-        Self::create_or_get_by_rule_event_with_snapshot(executor, input, Some(snapshot)).await
+    ) -> Result<EnforcementCreateOrGetResult> {
+        Self::create_or_get_by_rule_event_with_snapshot(conn, input, Some(snapshot)).await
     }
 
-    async fn create_or_get_by_rule_event_with_snapshot<'e, E>(
-        executor: E,
+    async fn create_or_get_by_rule_event_with_snapshot(
+        conn: &mut sqlx::PgConnection,
         input: CreateEnforcementInput,
         snapshot: Option<&crate::models::ExecutionExecutableSnapshot>,
-    ) -> Result<EnforcementCreateOrGetResult>
-    where
-        E: Executor<'e, Database = Postgres> + Copy + 'e,
-    {
+    ) -> Result<EnforcementCreateOrGetResult> {
         let (Some(rule_id), Some(event_id)) = (input.rule, input.event) else {
             let enforcement = if let Some(snapshot) = snapshot {
                 sqlx::query_as::<_, Enforcement>(&format!(
@@ -1023,10 +1014,10 @@ impl EnforcementRepository {
                 .bind(&input.payload)
                 .bind(input.condition)
                 .bind(&input.conditions)
-                .fetch_one(executor)
+                .fetch_one(&mut *conn)
                 .await?
             } else {
-                Self::create(executor, input).await?
+                Self::create(&mut *conn, input).await?
             };
             return Ok(EnforcementCreateOrGetResult {
                 enforcement,
@@ -1057,7 +1048,7 @@ impl EnforcementRepository {
         .bind(&input.payload)
         .bind(input.condition)
         .bind(&input.conditions)
-        .fetch_optional(executor)
+        .fetch_optional(&mut *conn)
         .await?;
 
         if let Some(enforcement) = inserted {
@@ -1067,7 +1058,7 @@ impl EnforcementRepository {
             });
         }
 
-        let enforcement = Self::find_by_rule_and_event(executor, rule_id, event_id)
+        let enforcement = Self::find_by_rule_and_event(&mut *conn, rule_id, event_id)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(

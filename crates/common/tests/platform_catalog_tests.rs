@@ -286,7 +286,13 @@ async fn maintenance_reconciliation_preserves_builtin_ids_assignments_and_extern
     );
     let fixture = legacy_fixture();
     let config = CacheAdmissionConfig::default();
-    let loader = PackComponentLoader::new(&db, core.id, "core", &config);
+    let loader = PackComponentLoader::new(
+        &db,
+        core.id,
+        "core",
+        &config,
+        helpers::pack_registration_authority(&db).await,
+    );
     let loaded = loader.load_all(fixture.path()).await.unwrap();
     assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
 
@@ -365,7 +371,8 @@ async fn maintenance_reconciliation_preserves_builtin_ids_assignments_and_extern
             .unwrap();
     assert_eq!(external_trigger, trigger_ids[0].1);
     assert_eq!(RuntimeRepository::list(&db).await.unwrap().len(), 9);
-    assert_eq!(PermissionSetRepository::list(&db).await.unwrap().len(), 4);
+    // Four catalog sets plus the registrar's independently owned fixture set.
+    assert_eq!(PermissionSetRepository::list(&db).await.unwrap().len(), 5);
     assert_eq!(TriggerRepository::list(&db).await.unwrap().len(), 3);
     db.cleanup().await.unwrap();
 }
@@ -553,7 +560,13 @@ async fn legacy_core_cannot_replace_platform_definitions_or_claim_ad_hoc_refs() 
     let core = PackFixture::new("core").create(&db).await.unwrap();
     let fixture = legacy_fixture();
     let config = CacheAdmissionConfig::default();
-    let loader = PackComponentLoader::new(&db, core.id, "core", &config);
+    let loader = PackComponentLoader::new(
+        &db,
+        core.id,
+        "core",
+        &config,
+        helpers::pack_registration_authority(&db).await,
+    );
     loader.load_all(fixture.path()).await.unwrap();
     let before = snapshot(&db).await;
     std::fs::write(

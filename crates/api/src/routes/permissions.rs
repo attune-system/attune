@@ -12,7 +12,10 @@ use validator::Validate;
 use attune_common::{
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome},
     auth::generate_integration_token,
-    models::identity::{Identity, IdentityRoleAssignment},
+    models::{
+        identity::{Identity, IdentityRoleAssignment},
+        ManagementOriginKind,
+    },
     mq::{
         IdentityAuthorizationChangedPayload, MessageEnvelope, MessageType,
         PermissionSetChangedPayload,
@@ -23,11 +26,11 @@ use attune_common::{
             CreateIdentityInput, CreateIdentityRoleAssignmentInput,
             CreatePermissionAssignmentInput, CreatePermissionSetRoleAssignmentInput,
             DeleteIdentityOutcome, IdentityRepository, IdentityRoleAssignmentRepository,
-            PermissionAssignmentRepository, PermissionSetRepository,
+            PermissionAssignmentRepository, PermissionBindingFilter, PermissionSetRepository,
             PermissionSetRoleAssignmentRepository, UpdateIdentityInput, UpdatePermissionSetInput,
         },
         integration_token::{CreateIntegrationTokenInput, IntegrationTokenRepository},
-        Create, Delete, FindById, FindByRef, List, Update,
+        Create, Delete, FindById, FindByRef, Update,
     },
 };
 
@@ -40,9 +43,10 @@ use crate::{
         ApiResponse, CreateIdentityRequest, CreateIdentityRoleAssignmentRequest,
         CreateIntegrationTokenRequest, CreateIntegrationTokenResponse,
         CreatePermissionAssignmentRequest, CreatePermissionSetRoleAssignmentRequest,
-        IdentityResponse, IdentityRoleAssignmentResponse, IdentitySummary,
-        IntegrationTokenResponse, PermissionAssignmentResponse, PermissionSetQueryParams,
-        PermissionSetRoleAssignmentResponse, PermissionSetSummary, RevokeIntegrationTokenRequest,
+        IdentityQueryParams, IdentityResponse, IdentityRoleAssignmentResponse, IdentitySummary,
+        IntegrationTokenResponse, PermissionAssignmentResponse, PermissionBindingQueryParams,
+        PermissionBindingResponse, PermissionSetQueryParams, PermissionSetRoleAssignmentResponse,
+        PermissionSetSummary, PermissionUpdateQueryParams, RevokeIntegrationTokenRequest,
         SuccessResponse, UpdateIdentityRequest, UpdatePermissionSetRequest,
     },
     middleware::{ApiError, ApiResult},
@@ -109,7 +113,7 @@ async fn publish_identity_authorization_metadata_change(
     get,
     path = "/api/v1/identities",
     tag = "permissions",
-    params(PaginationParams),
+    params(PaginationParams, IdentityQueryParams),
     responses(
         (status = 200, description = "List identities", body = PaginatedResponse<IdentitySummary>)
     ),
@@ -119,32 +123,30 @@ pub async fn list_identities(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Query(query): Query<PaginationParams>,
+    Query(filter): Query<IdentityQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
     authorize_permissions(&state, &user, Resource::Identities, Action::Read).await?;
+    validate_admin_pagination(&query)?;
 
-    let identities = IdentityRepository::list(&state.db).await?;
-    let total = identities.len() as u64;
-    let start = query.offset() as usize;
-    let end = (start + query.limit() as usize).min(identities.len());
-    let page_items = if start >= identities.len() {
-        Vec::new()
-    } else {
-        identities[start..end].to_vec()
-    };
-
-    let mut summaries = Vec::with_capacity(page_items.len());
-    for identity in page_items {
-        let role_assignments =
-            IdentityRoleAssignmentRepository::find_by_identity(&state.db, identity.id).await?;
-        let roles = role_assignments.into_iter().map(|ra| ra.role).collect();
-        let mut summary = IdentitySummary::from(identity);
-        summary.roles = roles;
-        summaries.push(summary);
-    }
+    let (rows, total) = IdentityRepository::list_admin(
+        &state.db,
+        filter.login.as_deref(),
+        i64::from(query.limit()),
+        i64::from(query.page.saturating_sub(1)) * i64::from(query.limit()),
+    )
+    .await?;
+    let summaries = rows
+        .into_iter()
+        .map(|row| {
+            let mut summary = IdentitySummary::from(row.identity);
+            summary.roles = row.roles;
+            summary
+        })
+        .collect();
 
     Ok((
         StatusCode::OK,
-        Json(PaginatedResponse::new(summaries, &query, total)),
+        Json(PaginatedResponse::new(summaries, &query, total as u64)),
     ))
 }
 
@@ -173,12 +175,7 @@ pub async fn get_identity(
         .ok_or_else(|| ApiError::NotFound(format!("Identity '{}' not found", identity_id)))?;
     let roles = IdentityRoleAssignmentRepository::find_by_identity(&state.db, identity_id).await?;
     let assignments =
-        PermissionAssignmentRepository::find_by_identity(&state.db, identity_id).await?;
-    let permission_sets = PermissionSetRepository::find_by_identity(&state.db, identity_id).await?;
-    let permission_set_refs = permission_sets
-        .into_iter()
-        .map(|ps| (ps.id, ps.r#ref))
-        .collect::<std::collections::HashMap<_, _>>();
+        PermissionAssignmentRepository::find_by_identity_with_refs(&state.db, identity_id).await?;
 
     Ok((
         StatusCode::OK,
@@ -194,17 +191,7 @@ pub async fn get_identity(
                 .collect(),
             direct_permissions: assignments
                 .into_iter()
-                .filter_map(|assignment| {
-                    permission_set_refs.get(&assignment.permset).cloned().map(
-                        |permission_set_ref| PermissionAssignmentResponse {
-                            id: assignment.id,
-                            identity_id: assignment.identity,
-                            permission_set_id: assignment.permset,
-                            permission_set_ref,
-                            created: assignment.created,
-                        },
-                    )
-                })
+                .map(PermissionAssignmentResponse::from)
                 .collect(),
         })),
     ))
@@ -419,41 +406,41 @@ pub async fn list_permission_sets(
 ) -> ApiResult<impl IntoResponse> {
     authorize_permissions(&state, &user, Resource::Permissions, Action::Read).await?;
 
-    let mut permission_sets = PermissionSetRepository::list(&state.db).await?;
-    if let Some(pack_ref) = &query.pack_ref {
-        permission_sets.retain(|ps| ps.pack_ref.as_deref() == Some(pack_ref.as_str()));
-    }
-
-    let mut response = Vec::with_capacity(permission_sets.len());
-    for permission_set in permission_sets {
-        let permission_set_ref = permission_set.r#ref.clone();
-        let roles = PermissionSetRoleAssignmentRepository::find_by_permission_set(
-            &state.db,
-            permission_set.id,
-        )
-        .await?;
-        response.push(PermissionSetSummary {
-            id: permission_set.id,
-            r#ref: permission_set.r#ref,
-            pack_ref: permission_set.pack_ref,
-            label: permission_set.label,
-            description: permission_set.description,
-            grants: permission_set.grants,
-            retired_at: permission_set.retired_at,
-            roles: roles
-                .into_iter()
-                .map(|assignment| PermissionSetRoleAssignmentResponse {
-                    id: assignment.id,
-                    permission_set_id: assignment.permset,
-                    permission_set_ref: Some(permission_set_ref.clone()),
-                    role: assignment.role,
-                    created: assignment.created,
-                })
-                .collect(),
-        });
-    }
+    let response: Vec<PermissionSetSummary> = PermissionSetRepository::list_admin(
+        &state.db,
+        query.pack_ref.as_deref(),
+        None,
+        query.include_retired,
+    )
+    .await?
+    .into_iter()
+    .map(Into::into)
+    .collect();
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/permissions/sets/by-ref/{permission_set_ref}",
+    tag = "permissions",
+    params(("permission_set_ref" = String, Path, description = "Permission set ref")),
+    responses((status = 200, description = "Permission set details, including retired sets", body = inline(ApiResponse<PermissionSetSummary>))),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_permission_set(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(permission_set_ref): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    authorize_permissions(&state, &user, Resource::Permissions, Action::Read).await?;
+    let row = PermissionSetRepository::list_admin(&state.db, None, Some(&permission_set_ref), true)
+        .await?
+        .pop()
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Permission set '{permission_set_ref}' not found"))
+        })?;
+    Ok(Json(ApiResponse::new(PermissionSetSummary::from(row))))
 }
 
 #[utoipa::path(
@@ -461,7 +448,8 @@ pub async fn list_permission_sets(
     path = "/api/v1/permissions/sets/{id}",
     tag = "permissions",
     params(
-        ("id" = i64, Path, description = "Permission set ID")
+        ("id" = i64, Path, description = "Permission set ID"),
+        PermissionUpdateQueryParams
     ),
     request_body = UpdatePermissionSetRequest,
     responses(
@@ -475,6 +463,7 @@ pub async fn update_permission_set(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(permission_set_id): Path<i64>,
+    Query(query): Query<PermissionUpdateQueryParams>,
     Json(request): Json<UpdatePermissionSetRequest>,
 ) -> ApiResult<impl IntoResponse> {
     authorize_permissions(&state, &user, Resource::Permissions, Action::Manage).await?;
@@ -487,6 +476,31 @@ pub async fn update_permission_set(
             ApiError::NotFound(format!("Permission set '{}' not found", permission_set_id))
         })?;
 
+    let mut preview =
+        PermissionSetRepository::list_admin(&state.db, None, Some(&existing.r#ref), false)
+            .await?
+            .pop()
+            .ok_or_else(|| ApiError::NotFound("Permission set no longer exists".to_string()))?;
+    if preview.management_origin == ManagementOriginKind::Platform {
+        return Err(ApiError::BadRequest(format!(
+            "Permission set '{}' is platform-managed and cannot be updated",
+            existing.r#ref
+        )));
+    }
+    if query.dry_run {
+        if let Some(label) = request.label {
+            preview.permission_set.label = Some(label);
+        }
+        if let Some(description) = request.description {
+            preview.permission_set.description = Some(description);
+        }
+        preview.permission_set.grants = request.grants;
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(PermissionSetSummary::from(preview))),
+        ));
+    }
+
     let updated = PermissionSetRepository::update(
         &state.db,
         existing.id,
@@ -497,9 +511,7 @@ pub async fn update_permission_set(
         },
     )
     .await?;
-    let roles =
-        PermissionSetRoleAssignmentRepository::find_by_permission_set(&state.db, updated.id)
-            .await?;
+    preview.permission_set = updated.clone();
     publish_permission_set_metadata_change(&state, updated.id, &updated.r#ref, "updated").await;
 
     emit_admin_audit(
@@ -518,26 +530,50 @@ pub async fn update_permission_set(
 
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::new(PermissionSetSummary {
-            id: updated.id,
-            r#ref: updated.r#ref.clone(),
-            pack_ref: updated.pack_ref,
-            label: updated.label,
-            description: updated.description,
-            grants: updated.grants,
-            retired_at: updated.retired_at,
-            roles: roles
-                .into_iter()
-                .map(|assignment| PermissionSetRoleAssignmentResponse {
-                    id: assignment.id,
-                    permission_set_id: assignment.permset,
-                    permission_set_ref: Some(updated.r#ref.clone()),
-                    role: assignment.role,
-                    created: assignment.created,
-                })
-                .collect(),
-        })),
+        Json(ApiResponse::new(PermissionSetSummary::from(preview))),
     ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/permissions/assignments",
+    tag = "permissions",
+    params(PaginationParams, PermissionBindingQueryParams),
+    responses((status = 200, description = "Direct identity and role permission assignments", body = PaginatedResponse<PermissionBindingResponse>)),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_permission_assignments(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<PaginationParams>,
+    Query(filter): Query<PermissionBindingQueryParams>,
+) -> ApiResult<impl IntoResponse> {
+    authorize_permissions(&state, &user, Resource::Permissions, Action::Read).await?;
+    validate_admin_pagination(&query)?;
+    if (filter.identity_id.is_some() || filter.identity_login.is_some()) && filter.role.is_some()
+        || filter.identity_id.is_some() && filter.identity_login.is_some()
+    {
+        return Err(ApiError::BadRequest(
+            "Specify only one of identity_id, identity_login, or role".to_string(),
+        ));
+    }
+    let (rows, total) = PermissionAssignmentRepository::list_bindings(
+        &state.db,
+        PermissionBindingFilter {
+            identity_id: filter.identity_id,
+            identity_login: filter.identity_login.as_deref(),
+            role: filter.role.as_deref(),
+            permission_set_ref: filter.permission_set_ref.as_deref(),
+        },
+        i64::from(query.limit()),
+        i64::from(query.page.saturating_sub(1)) * i64::from(query.limit()),
+    )
+    .await?;
+    let response = rows
+        .into_iter()
+        .map(PermissionBindingResponse::try_from)
+        .collect::<attune_common::Result<Vec<_>>>()?;
+    Ok(Json(PaginatedResponse::new(response, &query, total as u64)))
 }
 
 #[utoipa::path(
@@ -565,28 +601,11 @@ pub async fn list_identity_permissions(
         .ok_or_else(|| ApiError::NotFound(format!("Identity '{}' not found", identity_id)))?;
 
     let assignments =
-        PermissionAssignmentRepository::find_by_identity(&state.db, identity_id).await?;
-    let permission_sets = PermissionSetRepository::find_by_identity(&state.db, identity_id).await?;
-
-    let permission_set_refs = permission_sets
-        .into_iter()
-        .map(|ps| (ps.id, ps.r#ref))
-        .collect::<std::collections::HashMap<_, _>>();
+        PermissionAssignmentRepository::find_by_identity_with_refs(&state.db, identity_id).await?;
 
     let response: Vec<PermissionAssignmentResponse> = assignments
         .into_iter()
-        .filter_map(|assignment| {
-            permission_set_refs
-                .get(&assignment.permset)
-                .cloned()
-                .map(|permission_set_ref| PermissionAssignmentResponse {
-                    id: assignment.id,
-                    identity_id: assignment.identity,
-                    permission_set_id: assignment.permset,
-                    permission_set_ref,
-                    created: assignment.created,
-                })
-        })
+        .map(PermissionAssignmentResponse::from)
         .collect();
 
     Ok((StatusCode::OK, Json(response)))
@@ -1284,6 +1303,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             delete(delete_identity_role_assignment),
         )
         .route("/permissions/sets", get(list_permission_sets))
+        .route(
+            "/permissions/sets/by-ref/{permission_set_ref}",
+            get(get_permission_set),
+        )
         .route("/permissions/sets/{id}", put(update_permission_set))
         .route(
             "/permissions/sets/{id}/roles",
@@ -1295,12 +1318,21 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/permissions/assignments",
-            post(create_permission_assignment),
+            get(list_permission_assignments).post(create_permission_assignment),
         )
         .route(
             "/permissions/assignments/{id}",
             delete(delete_permission_assignment),
         )
+}
+
+fn validate_admin_pagination(query: &PaginationParams) -> ApiResult<()> {
+    if query.page == 0 || !(1..=100).contains(&query.page_size) {
+        return Err(ApiError::BadRequest(
+            "page must be at least 1 and page_size must be between 1 and 100".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn authorize_permissions(
@@ -1425,6 +1457,7 @@ fn validate_grant_actions(grant: &attune_common::rbac::Grant) -> ApiResult<()> {
             Action::Update,
             Action::Delete,
             Action::Decrypt,
+            Action::Use,
         ][..],
         Resource::Caches => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Artifacts => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],

@@ -25,6 +25,7 @@ const ATTUNE_AGENT_BINARY_VERSION_ENV: &str = "ATTUNE_AGENT_BINARY_VERSION";
 
 /// Worker registration manager
 pub struct WorkerRegistration {
+    child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     pool: PgPool,
     worker_id: Option<i64>,
     worker_name: String,
@@ -37,6 +38,14 @@ pub struct WorkerRegistration {
 }
 
 impl WorkerRegistration {
+    pub fn with_child_environment(
+        mut self,
+        environment: attune_common::child_process_environment::ChildProcessEnvironment,
+    ) -> Self {
+        self.child_environment = environment;
+        self
+    }
+
     fn env_truthy(name: &str) -> bool {
         std::env::var(name)
             .ok()
@@ -175,6 +184,7 @@ impl WorkerRegistration {
         capabilities.insert("runtimes".to_string(), json!(Vec::<String>::new()));
 
         Self {
+            child_environment: Default::default(),
             pool,
             worker_id: None,
             worker_name,
@@ -257,7 +267,8 @@ impl WorkerRegistration {
     pub async fn detect_capabilities(&mut self, config: &Config) -> Result<()> {
         info!("Detecting worker capabilities...");
 
-        let detector = RuntimeDetector::new(self.pool.clone());
+        let detector = RuntimeDetector::new(self.pool.clone())
+            .with_child_environment(self.child_environment.clone());
 
         // Get config capabilities if available
         let config_capabilities = config.worker.as_ref().and_then(|w| w.capabilities.as_ref());

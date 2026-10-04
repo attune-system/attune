@@ -25,7 +25,7 @@ grants:
   - resource: inquiries
     actions: [read, create, update, delete, respond]
   - resource: keys
-    actions: [read, create, update, delete, decrypt]
+    actions: [read, create, update, delete, decrypt, use]
   - resource: caches
     actions: [read, create, update, delete]
   - resource: artifacts

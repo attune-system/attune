@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use attune_common::repositories::{
     },
     pack::PackRepository,
     trigger::SensorRepository,
-    Create, Delete, FindByRef, Update,
+    Create, Delete, FindById, FindByRef, Update,
 };
 use attune_common::{
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome, PendingAuditEvent},
@@ -35,14 +35,17 @@ use crate::{
     authz::AuthorizationService,
     dto::{
         common::{PaginatedResponse, PaginationParams},
-        key::{CreateKeyRequest, KeyQueryParams, KeyResponse, KeySummary, UpdateKeyRequest},
+        key::{
+            CreateKeyRequest, KeyQueryParams, KeyResponse, KeySummary, SignKeyJwtRequest,
+            SignKeyJwtResponse, UpdateKeyRequest,
+        },
         ApiResponse, SuccessResponse,
     },
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
 
-async fn key_read_grants(state: &AppState, user: &RequireAuth) -> ApiResult<(i64, Vec<Grant>)> {
+async fn key_grants(state: &AppState, user: &RequireAuth) -> ApiResult<(i64, Vec<Grant>)> {
     let identity_id = user
         .0
         .identity_id()
@@ -50,10 +53,30 @@ async fn key_read_grants(state: &AppState, user: &RequireAuth) -> ApiResult<(i64
 
     match user.0.claims.token_type {
         TokenType::Access | TokenType::Execution => {
-            let grants = state
+            let snapshot = state
                 .authorization_service()
-                .effective_grants(&user.0)
-                .await?;
+                .load_snapshot(&user.0)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Unauthorized("Identity authorization is unavailable".into())
+                })?;
+            let grants = snapshot
+                .grants
+                .into_iter()
+                .filter_map(|mut grant| {
+                    if let Some(scope) = &mut grant.constraints {
+                        if scope.attributes.as_ref().is_some_and(|attributes| {
+                            attributes.iter().any(|(name, expected)| {
+                                snapshot.identity_attributes.get(name) != Some(expected)
+                            })
+                        }) {
+                            return None;
+                        }
+                        scope.attributes = None;
+                    }
+                    Some(grant)
+                })
+                .collect();
             Ok((identity_id, grants))
         }
         TokenType::Sensor => {
@@ -104,7 +127,7 @@ pub async fn list_keys(
     State(state): State<Arc<AppState>>,
     Query(query): Query<KeyQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let (identity_id, grants) = key_read_grants(&state, &user).await?;
+    let (identity_id, grants) = key_grants(&state, &user).await?;
     if !grants
         .iter()
         .any(|grant| grant.resource == Resource::Keys && grant.actions.contains(&Action::Read))
@@ -211,6 +234,190 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
     })
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/keys/{ref}/sign-jwt",
+    tag = "secrets",
+    params(("ref" = String, Path, description = "System-owned signing key reference")),
+    request_body = SignKeyJwtRequest,
+    responses((status = 200, description = "Approved signed JWT assertion; no private key is disclosed", body = inline(ApiResponse<SignKeyJwtResponse>))),
+    security(("bearer_auth" = []))
+)]
+pub async fn sign_key_jwt(
+    user: RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(key_ref): Path<String>,
+    Json(request): Json<SignKeyJwtRequest>,
+) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.0.claims.token_type,
+        TokenType::Execution | TokenType::Sensor
+    ) {
+        return Err(ApiError::Forbidden(
+            "Approved key signing requires execution-scoped access".into(),
+        ));
+    }
+    request.validate()?;
+    let (identity_id, grants, pack_ref, execution_id, sensor_ref, fence_transaction) = if user
+        .0
+        .claims
+        .token_type
+        == TokenType::Sensor
+    {
+        let sensor_ref = user
+            .0
+            .claims
+            .sensor_ref()
+            .map_err(|_| ApiError::Unauthorized("Sensor token scope is missing".into()))?
+            .to_string();
+        let pack_ref = user
+            .0
+            .claims
+            .sensor_pack_ref()
+            .map_err(|_| ApiError::Unauthorized("Sensor pack scope is missing".into()))?
+            .to_string();
+        let sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
+            .await?
+            .filter(|sensor| {
+                sensor.pack_ref.as_deref() == Some(pack_ref.as_str())
+                    && sensor.enabled
+                    && sensor.retired_at.is_none()
+            })
+            .ok_or_else(|| ApiError::Unauthorized("Sensor is not active".into()))?;
+        let fence = user
+            .0
+            .sensor_workload_fence()
+            .map_err(|_| ApiError::Unauthorized("Sensor workload scope is missing".into()))?;
+        let mut tx = state.db.begin().await?;
+        if !attune_common::repositories::sensor_workload::SensorWorkloadRepository::lock_current_fence(&mut tx, sensor.id, fence).await? {
+            return Err(ApiError::Unauthorized("Sensor workload is no longer current".into()));
+        }
+        let pack_id = sensor
+            .pack
+            .ok_or_else(|| ApiError::Forbidden("Signing requires a pack-owned sensor".into()))?;
+        let pack = PackRepository::find_by_id(&mut *tx, pack_id)
+            .await?
+            .ok_or_else(|| ApiError::Unauthorized("Sensor pack is unavailable".into()))?;
+        let identity_id = pack.installed_by.ok_or_else(|| {
+            ApiError::Forbidden("Signing requires an attributed sensor pack".into())
+        })?;
+        let authority =
+            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
+                .await?;
+        let key = KeyRepository::find_by_ref(&mut *tx, &key_ref)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Signing key is not available".into()))?;
+        let origin = attune_common::key_access::key_origin(&key);
+        if !authority.key_allows(&origin, Action::Read)
+            && !authority.key_allows(&origin, Action::Use)
+        {
+            return Err(ApiError::NotFound("Signing key is not available".into()));
+        }
+        (
+            identity_id,
+            vec![Grant {
+                resource: Resource::Keys,
+                actions: vec![Action::Use],
+                constraints: Some(GrantConstraints {
+                    refs: Some(vec![key_ref.clone()]),
+                    ..Default::default()
+                }),
+            }],
+            pack_ref,
+            None,
+            Some(sensor_ref),
+            Some(tx),
+        )
+    } else {
+        let (identity_id, grants) = key_grants(&state, &user).await?;
+        let metadata =
+            user.0.claims.metadata.as_ref().ok_or_else(|| {
+                ApiError::Unauthorized("Execution token metadata is missing".into())
+            })?;
+        let execution_id = metadata["execution_id"]
+            .as_i64()
+            .ok_or_else(|| ApiError::Unauthorized("Execution token identity is missing".into()))?;
+        let execution = attune_common::repositories::execution::ExecutionRepository::find_by_id(
+            &state.db,
+            execution_id,
+        )
+        .await?
+        .filter(|execution| {
+            execution.executor == Some(identity_id)
+                && metadata["action_ref"].as_str() == Some(execution.action_ref.as_str())
+        })
+        .ok_or_else(|| {
+            ApiError::Unauthorized("Execution token does not match its execution".into())
+        })?;
+        let snapshot = execution
+            .executable_snapshot
+            .as_ref()
+            .ok_or_else(|| ApiError::Forbidden("Signing requires a pinned executable".into()))?;
+        let pack_ref = snapshot.executable.action.pack_ref.clone();
+        (
+            identity_id,
+            grants,
+            pack_ref,
+            Some(execution_id),
+            None,
+            None,
+        )
+    };
+    let key = KeyRepository::find_by_ref(&state.db, &key_ref)
+        .await?
+        .filter(|key| {
+            key.owner_type == OwnerType::System
+                && key.encrypted
+                && (key_action_allowed(&grants, Action::Use, identity_id, key)
+                    || key_action_allowed(&grants, Action::Read, identity_id, key))
+        })
+        .ok_or_else(|| ApiError::NotFound("Signing key is not available".into()))?;
+    let encryption_key = state
+        .config
+        .security
+        .encryption_key
+        .as_ref()
+        .ok_or_else(|| ApiError::InternalServerError("Encryption key is not configured".into()))?;
+    let value = attune_common::crypto::decrypt_json(&key.value, encryption_key)
+        .map_err(|_| ApiError::InternalServerError("Signing key could not be opened".into()))?;
+    let signing_key: attune_common::key_signing::JwtSigningKey = serde_json::from_value(value)
+        .map_err(|_| {
+            ApiError::InternalServerError(
+                "Operator signing profile configuration is invalid".into(),
+            )
+        })?;
+    let profile_ref = request.profile_ref.clone();
+    let subject = request.subject.clone();
+    let signed = tokio::task::spawn_blocking(move || {
+        attune_common::key_signing::sign_approved_jwt_for_principal(
+            &signing_key,
+            &request.profile_ref,
+            &pack_ref,
+            sensor_ref.as_deref(),
+            &request.subject,
+            request.ttl_seconds,
+            chrono::Utc::now().timestamp(),
+        )
+    })
+    .await
+    .map_err(|_| ApiError::InternalServerError("Signing operation failed".into()))??;
+    if let Some(transaction) = fence_transaction {
+        transaction.commit().await?;
+    }
+    emit_key_audit(
+        &state,
+        &user,
+        "secret.key_used",
+        AuditOutcome::Success,
+        &key,
+        serde_json::json!({"operation":"sign_jwt", "profile_ref": profile_ref, "subject": subject, "execution_id":execution_id}),
+    );
+    Ok(Json(ApiResponse::new(SignKeyJwtResponse {
+        assertion: signed.assertion,
+        expires_at: signed.expires_at,
+    })))
+}
+
 /// Get a single key by reference
 #[utoipa::path(
     get,
@@ -230,7 +437,7 @@ pub async fn get_key(
     State(state): State<Arc<AppState>>,
     Path(key_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let (identity_id, grants) = key_read_grants(&state, &user).await?;
+    let (identity_id, grants) = key_grants(&state, &user).await?;
     let mut key = KeyRepository::find_by_ref(&state.db, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
@@ -326,14 +533,7 @@ pub async fn create_key(
         user.0.claims.token_type,
         TokenType::Access | TokenType::Execution
     ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let grants = state
-            .authorization_service()
-            .effective_grants(&user.0)
-            .await?;
+        let (identity_id, grants) = key_grants(&state, &user).await?;
         if !grants.iter().any(|grant| {
             grant.resource == Resource::Keys && grant.actions.contains(&Action::Create)
         }) {
@@ -505,22 +705,11 @@ pub async fn update_key(
     let existing = KeyRepository::find_by_ref(&state.db, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
-
-    if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user.0).await?;
-        if !key_action_allowed(&grants, Action::Update, identity_id, &existing) {
-            return Err(ApiError::Forbidden(
-                "Insufficient permissions: keys:update".to_string(),
-            ));
-        }
+    let (identity_id, grants) = key_grants(&state, &user).await?;
+    if !key_action_allowed(&grants, Action::Update, identity_id, &existing) {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: keys:update".to_string(),
+        ));
     }
 
     // Handle value update with encryption
@@ -552,9 +741,46 @@ pub async fn update_key(
         } else {
             (Some(new_value), Some(false), None)
         }
+    } else if let Some(encrypted) = request
+        .encrypted
+        .filter(|encrypted| *encrypted != existing.encrypted)
+    {
+        if existing.encrypted
+            && !(key_action_allowed(&grants, Action::Read, identity_id, &existing)
+                && key_action_allowed(&grants, Action::Decrypt, identity_id, &existing))
+        {
+            return Err(ApiError::Forbidden(
+                "Changing encryption of existing key material requires read and decrypt authority"
+                    .into(),
+            ));
+        }
+        let encryption_key = state
+            .config
+            .security
+            .encryption_key
+            .as_ref()
+            .ok_or_else(|| {
+                ApiError::InternalServerError("Encryption key is not configured".into())
+            })?;
+        let plaintext = if existing.encrypted {
+            attune_common::crypto::decrypt_json(&existing.value, encryption_key)?
+        } else {
+            existing.value.clone()
+        };
+        if encrypted {
+            (
+                Some(attune_common::crypto::encrypt_json(
+                    &plaintext,
+                    encryption_key,
+                )?),
+                Some(true),
+                Some(attune_common::crypto::hash_encryption_key(encryption_key)),
+            )
+        } else {
+            (Some(plaintext), Some(false), None)
+        }
     } else {
-        // No value update, but might be changing encryption status
-        (None, request.encrypted, None)
+        (None, None, None)
     };
 
     // Create update input
@@ -566,9 +792,13 @@ pub async fn update_key(
     };
 
     let mut updated_key = KeyRepository::update(&state.db, existing.id, update_input).await?;
+    let value_updated = updated_key.value != existing.value;
 
-    // Return decrypted value in response
-    if updated_key.encrypted {
+    let can_read = key_action_allowed(&grants, Action::Read, identity_id, &updated_key);
+    let can_decrypt = key_action_allowed(&grants, Action::Decrypt, identity_id, &updated_key);
+    if !can_read || updated_key.encrypted && !can_decrypt {
+        updated_key.value = serde_json::Value::Null;
+    } else if updated_key.encrypted {
         let encryption_key = state
             .config
             .security
@@ -601,7 +831,7 @@ pub async fn update_key(
                 updated_key.owner_action_ref.as_deref(),
                 updated_key.owner_sensor_ref.as_deref(),
             ),
-            "value_updated": updated_key.value != existing.value,
+            "value_updated": value_updated,
             "value": "***",
         }),
     );
@@ -641,12 +871,7 @@ pub async fn delete_key(
         user.0.claims.token_type,
         TokenType::Access | TokenType::Execution
     ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user.0).await?;
+        let (identity_id, grants) = key_grants(&state, &user).await?;
         if !key_action_allowed(&grants, Action::Delete, identity_id, &key) {
             return Err(ApiError::Forbidden(
                 "Insufficient permissions: keys:delete".to_string(),
@@ -688,6 +913,7 @@ pub async fn delete_key(
 /// Register key/secret routes
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/keys/{ref}/sign-jwt", post(sign_key_jwt))
         .route("/keys", get(list_keys).post(create_key))
         .route(
             "/keys/{ref}",

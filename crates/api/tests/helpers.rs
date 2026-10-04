@@ -463,7 +463,7 @@ impl TestContext {
         if let Some(database) = self.database.take() {
             database.cleanup().await?;
         }
-        std::fs::remove_dir_all(&self.test_packs_dir)?;
+        remove_owned_pack_tree(&self.test_packs_dir)?;
         Ok(())
     }
 }
@@ -481,9 +481,33 @@ impl Drop for TestContext {
         // Cleanup the test packs directory synchronously, then release the
         // database owner. TestDatabase terminates only sessions tagged for its
         // schema and removes only that schema.
-        let _ = std::fs::remove_dir_all(&self.test_packs_dir);
+        let _ = remove_owned_pack_tree(&self.test_packs_dir);
         drop(self.database.take());
     }
+}
+
+fn remove_owned_pack_tree(path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return std::fs::remove_file(path);
+    }
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o700);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions)?;
+    for entry in std::fs::read_dir(path)? {
+        remove_owned_pack_tree(&entry?.path())?;
+    }
+    std::fs::remove_dir(path)
 }
 
 /// Test response wrapper

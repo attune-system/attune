@@ -324,8 +324,18 @@ impl EventProcessor {
         rule: &Rule,
         event: &Event,
     ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        let rule = RuleRepository::find_by_id_for_share(&mut tx, rule.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Rule is no longer active"))?;
+        let identity_id = rule.owner_identity.ok_or_else(|| {
+            anyhow::anyhow!("Rule evaluation requires an explicit owner identity")
+        })?;
+        let authority =
+            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
+                .await?;
         // Evaluate rule conditions
-        let conditions_pass = Self::evaluate_conditions(rule, event)?;
+        let conditions_pass = Self::evaluate_conditions(&rule, event)?;
 
         if !conditions_pass {
             debug!(
@@ -355,7 +365,8 @@ impl EventProcessor {
         // Resolve action parameters using the template resolver, then move
         // parameters marked `secret: true` into encrypted per-enforcement rows.
         let rendered_params =
-            Self::resolve_action_params(pool, encryption_key, rule, event, &payload).await?;
+            Self::resolve_action_params(pool, encryption_key, &rule, event, &payload, &authority)
+                .await?;
         let action = match rule.action {
             Some(action_id) => ActionRepository::find_by_id(pool, action_id).await?,
             None => ActionRepository::find_by_ref(pool, &rule.action_ref).await?,
@@ -368,6 +379,11 @@ impl EventProcessor {
             );
             return Ok(());
         }
+        let refs = rule
+            .permission_set_refs
+            .as_deref()
+            .unwrap_or(&action.default_execution_permission_set_refs);
+        authority.require_refs_for_share(&mut tx, refs).await?;
         validate_secret_destination_paths(
             action.param_schema.as_ref(),
             &rendered_params.secret_paths,
@@ -410,21 +426,22 @@ impl EventProcessor {
         )
         .await?;
         let enforcement_result = EnforcementRepository::create_or_get_by_rule_event_pinned(
-            pool,
+            &mut tx,
             create_input,
             &snapshot,
         )
         .await?;
         let enforcement = enforcement_result.enforcement;
         if enforcement_result.created && !prepared_secrets.is_empty() {
-            ExecutionSecretValueRepository::upsert_many(
-                pool,
+            ExecutionSecretValueRepository::upsert_many_with_conn(
+                &mut *tx,
                 ENTITY_ENFORCEMENT_CONFIG,
                 enforcement.id,
                 &prepared_secrets,
             )
             .await?;
         }
+        tx.commit().await?;
 
         if enforcement_result.created {
             info!(
@@ -629,6 +646,7 @@ impl EventProcessor {
         rule: &Rule,
         event: &Event,
         event_payload: &serde_json::Value,
+        authority: &attune_common::delegation::DelegationAuthority,
     ) -> Result<RenderedJson> {
         let action_params = &rule.action_params;
 
@@ -689,7 +707,26 @@ impl EventProcessor {
             Some(event.trigger_ref.clone()),
             event_payload_secret_paths,
         )
-        .with_pack_config_secret_paths(pack_ref, pack_secret_paths);
+        .with_pack_config_secret_paths(pack_ref, pack_secret_paths)
+        .with_origin("rule", &rule.r#ref);
+
+        let expressions = attune_common::template_resolver::referenced_keystore_expressions(
+            action_params,
+            &context,
+        )?;
+        let context = if expressions.is_empty() {
+            context
+        } else {
+            let refs = expressions.values().cloned().collect::<Vec<_>>();
+            let keys = attune_common::key_access::resolve_explicit_keys(
+                pool,
+                authority,
+                &refs,
+                encryption_key.as_deref(),
+            )
+            .await?;
+            context.with_resolved_keys(&expressions, keys)
+        };
 
         let rendered = resolve_templates_with_sensitivity(action_params, &context)?;
 

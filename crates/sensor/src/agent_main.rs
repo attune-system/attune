@@ -50,8 +50,26 @@ fn main() -> Result<()> {
 
     if args.detect_only {
         let _ = observability::init_tracing(None, None)?;
-        let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES");
-        print_detect_only_report("ATTUNE_SENSOR_RUNTIMES", &bootstrap);
+        let config = if args.config.is_some() || std::env::var_os("ATTUNE_CONFIG").is_some() {
+            Some(Config::load()?)
+        } else {
+            None
+        };
+        let passthrough = config
+            .as_ref()
+            .and_then(|config| config.sensor.as_ref())
+            .map(|sensor| sensor.passthrough_env.clone())
+            .unwrap_or_else(|| {
+                std::env::var("ATTUNE__SENSOR__PASSTHROUGH_ENV")
+                    .map(|value| value.split(',').map(str::to_string).collect())
+                    .unwrap_or_default()
+            });
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::capture(
+                &passthrough,
+            )?;
+        let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &environment);
+        print_detect_only_report("ATTUNE_SENSOR_RUNTIMES", &bootstrap, &environment);
         return Ok(());
     }
 
@@ -72,7 +90,15 @@ fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES");
+    let child_environment =
+        attune_common::child_process_environment::ChildProcessEnvironment::capture(
+            config
+                .sensor
+                .as_ref()
+                .map(|sensor| sensor.passthrough_env.as_slice())
+                .unwrap_or(&[]),
+        )?;
+    let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &child_environment);
     let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
 
     let runtime = tokio::runtime::Runtime::new()?;

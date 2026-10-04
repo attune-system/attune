@@ -139,7 +139,6 @@ Not Found`.
 export ATTUNE_API_URL="http://localhost:8080"
 export ATTUNE_API_TOKEN="eyJhbGci..."
 export ATTUNE_SENSOR_REF="core.timer"
-export ATTUNE_MQ_URL="amqp://localhost:5672"
 
 ./attune-sensor
 ```
@@ -150,8 +149,7 @@ export ATTUNE_MQ_URL="amqp://localhost:5672"
 echo '{
   "api_url": "http://localhost:8080",
   "api_token": "eyJhbGci...",
-  "sensor_ref": "core.timer",
-  "mq_url": "amqp://localhost:5672"
+  "sensor_ref": "core.timer"
 }' | ./attune-sensor
 ```
 
@@ -285,7 +283,6 @@ curl -X POST http://localhost:8080/service-accounts \
 export ATTUNE_API_TOKEN="eyJhbGci..."
 export ATTUNE_API_URL="http://localhost:8080"
 export ATTUNE_SENSOR_REF="core.timer"
-export ATTUNE_MQ_URL="amqp://localhost:5672"
 
 ./attune-sensor
 

@@ -9,7 +9,9 @@ import type { CreatePermissionAssignmentRequest } from "../models/CreatePermissi
 import type { CreatePermissionSetRoleAssignmentRequest } from "../models/CreatePermissionSetRoleAssignmentRequest";
 import type { IdentityRoleAssignmentResponse } from "../models/IdentityRoleAssignmentResponse";
 import type { IntegrationTokenResponse } from "../models/IntegrationTokenResponse";
+import type { ManagementOriginKind } from "../models/ManagementOriginKind";
 import type { PaginatedResponse_IdentitySummary } from "../models/PaginatedResponse_IdentitySummary";
+import type { PaginatedResponse_PermissionBindingResponse } from "../models/PaginatedResponse_PermissionBindingResponse";
 import type { PermissionAssignmentResponse } from "../models/PermissionAssignmentResponse";
 import type { PermissionSetRoleAssignmentResponse } from "../models/PermissionSetRoleAssignmentResponse";
 import type { PermissionSetSummary } from "../models/PermissionSetSummary";
@@ -28,6 +30,7 @@ export class PermissionsService {
   public static listIdentities({
     page,
     pageSize,
+    login,
   }: {
     /**
      * Page number (1-based)
@@ -37,6 +40,10 @@ export class PermissionsService {
      * Number of items per page
      */
     pageSize?: number;
+    /**
+     * Exact identity login.
+     */
+    login?: string | null;
   }): CancelablePromise<PaginatedResponse_IdentitySummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -44,6 +51,7 @@ export class PermissionsService {
       query: {
         page: page,
         page_size: pageSize,
+        login: login,
       },
     });
   }
@@ -573,6 +581,44 @@ export class PermissionsService {
     });
   }
   /**
+   * @returns PaginatedResponse_PermissionBindingResponse Direct identity and role permission assignments
+   * @throws ApiError
+   */
+  public static listPermissionAssignments({
+    page,
+    pageSize,
+    identityId,
+    identityLogin,
+    role,
+    permissionSetRef,
+  }: {
+    /**
+     * Page number (1-based)
+     */
+    page?: number;
+    /**
+     * Number of items per page
+     */
+    pageSize?: number;
+    identityId?: number | null;
+    identityLogin?: string | null;
+    role?: string | null;
+    permissionSetRef?: string | null;
+  }): CancelablePromise<PaginatedResponse_PermissionBindingResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/permissions/assignments",
+      query: {
+        page: page,
+        page_size: pageSize,
+        identity_id: identityId,
+        identity_login: identityLogin,
+        role: role,
+        permission_set_ref: permissionSetRef,
+      },
+    });
+  }
+  /**
    * @returns any Permission assignment created
    * @throws ApiError
    */
@@ -651,14 +697,56 @@ export class PermissionsService {
    */
   public static listPermissionSets({
     packRef,
+    includeRetired,
   }: {
     packRef?: string | null;
+    /**
+     * Include retired permission sets in administrative results.
+     */
+    includeRetired?: boolean;
   }): CancelablePromise<Array<PermissionSetSummary>> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/permissions/sets",
       query: {
         pack_ref: packRef,
+        include_retired: includeRetired,
+      },
+    });
+  }
+  /**
+   * @returns any Permission set details, including retired sets
+   * @throws ApiError
+   */
+  public static getPermissionSet({
+    permissionSetRef,
+  }: {
+    /**
+     * Permission set ref
+     */
+    permissionSetRef: string;
+  }): CancelablePromise<{
+    data: {
+      description?: string | null;
+      grants: Value;
+      id: number;
+      label?: string | null;
+      management_origin: ManagementOriginKind;
+      pack_ref?: string | null;
+      ref: string;
+      retired_at?: string | null;
+      roles: Array<PermissionSetRoleAssignmentResponse>;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/permissions/sets/by-ref/{permission_set_ref}",
+      path: {
+        permission_set_ref: permissionSetRef,
       },
     });
   }
@@ -710,18 +798,24 @@ export class PermissionsService {
   public static updatePermissionSet({
     id,
     requestBody,
+    dryRun,
   }: {
     /**
      * Permission set ID
      */
     id: number;
     requestBody: UpdatePermissionSetRequest;
+    /**
+     * Validate and preview the update without persisting it.
+     */
+    dryRun?: boolean;
   }): CancelablePromise<{
     data: {
       description?: string | null;
       grants: Value;
       id: number;
       label?: string | null;
+      management_origin: ManagementOriginKind;
       pack_ref?: string | null;
       ref: string;
       retired_at?: string | null;
@@ -737,6 +831,9 @@ export class PermissionsService {
       url: "/api/v1/permissions/sets/{id}",
       path: {
         id: id,
+      },
+      query: {
+        dry_run: dryRun,
       },
       body: requestBody,
       mediaType: "application/json",

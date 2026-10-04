@@ -50,8 +50,8 @@ use attune_common::scheduling::{
     parse_worker_affinity, parse_worker_selector, parse_worker_tolerations,
 };
 use attune_common::secret_values::{
-    prepare_secret_values, redact_secret_parameters, redacted_paths, restore_secret_values,
-    ENTITY_EXECUTION_CONFIG, ENTITY_EXECUTION_RESULT,
+    prepare_secret_values, redact_secret_parameters, redacted_paths, ENTITY_EXECUTION_CONFIG,
+    ENTITY_EXECUTION_RESULT,
 };
 use attune_common::trace_tag::manual_trace_tag;
 use attune_common::workflow::{CancellationPolicy, WorkflowDefinition};
@@ -530,6 +530,7 @@ async fn authorize_execution_collection_access(
             Action::Respond => "respond",
             Action::Manage => "manage",
             Action::Decrypt => "decrypt",
+            Action::Use => "use",
         }
     )))
 }
@@ -1073,15 +1074,17 @@ pub async fn get_execution(
 
     let mut response = ExecutionResponse::from(execution.clone());
     if query.include_secret_values {
-        response.config = reveal_execution_secret_entity(
+        response.config = crate::secret_disclosure::reveal_authorized(
             &state,
+            &user,
             response.config,
             ENTITY_EXECUTION_CONFIG,
             execution.id,
         )
         .await?;
-        response.result = reveal_execution_secret_entity(
+        response.result = crate::secret_disclosure::reveal_authorized(
             &state,
+            &user,
             response.result,
             ENTITY_EXECUTION_RESULT,
             execution.id,
@@ -3088,7 +3091,7 @@ struct ExecutionVisibilityAnchorRow {
 /// against the same execution within one request only hit the database
 /// once for each of the tree anchor and the ancestor-executor chain.
 #[derive(Debug, Clone, Default)]
-struct ExecutionVisibilityCache {
+pub(crate) struct ExecutionVisibilityCache {
     anchor: Option<ExecutionVisibilityAnchorRow>,
     ancestor_ids: Option<Vec<i64>>,
 }
@@ -3135,17 +3138,19 @@ async fn authorize_execution_log_stream(
     execution: &attune_common::models::Execution,
 ) -> Result<(), ApiError> {
     if user.claims.token_type != TokenType::Access {
-        return Ok(());
+        state.authorization_service().effective_grants(user).await?;
+    } else {
+        authorize_execution_access(
+            state,
+            user,
+            execution,
+            Action::Read,
+            None,
+            &mut ExecutionVisibilityCache::default(),
+        )
+        .await?;
     }
-    authorize_execution_access(
-        state,
-        user,
-        execution,
-        Action::Read,
-        None,
-        &mut ExecutionVisibilityCache::default(),
-    )
-    .await
+    crate::secret_disclosure::authorize_runtime_log(state, user, execution).await
 }
 
 /// Authorizes access to an execution for the given action.
@@ -3155,7 +3160,7 @@ async fn authorize_execution_log_stream(
 /// reloaded from the database. `anchor_cache` memoizes the (potentially recursive)
 /// visibility-anchor lookup so that repeated Read/Decrypt checks against the same
 /// execution within one request only hit the database once.
-async fn authorize_execution_access(
+pub(crate) async fn authorize_execution_access(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     execution: &attune_common::models::Execution,
@@ -3272,36 +3277,6 @@ async fn execution_ancestor_identity_ids(
     identities.sort_unstable();
     identities.dedup();
     Ok(identities)
-}
-
-async fn reveal_execution_secret_entity(
-    state: &Arc<AppState>,
-    redacted: Option<serde_json::Value>,
-    entity_type: &str,
-    entity_id: i64,
-) -> Result<Option<serde_json::Value>, ApiError> {
-    let Some(redacted) = redacted else {
-        return Ok(None);
-    };
-    let secrets =
-        ExecutionSecretValueRepository::find_stored_by_entity(&state.db, entity_type, entity_id)
-            .await?;
-    if secrets.is_empty() {
-        return Ok(Some(redacted));
-    }
-    let encryption_key = state
-        .config
-        .security
-        .encryption_key
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::InternalServerError(
-                "Cannot reveal secret execution values without security.encryption_key".to_string(),
-            )
-        })?;
-    restore_secret_values(redacted, &secrets, encryption_key)
-        .map(Some)
-        .map_err(|e| ApiError::InternalServerError(format!("Failed to decrypt secret values: {e}")))
 }
 
 fn emit_execution_secret_disclosure_audit(

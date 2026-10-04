@@ -184,5 +184,6 @@ pub(crate) fn action_name(action: RbacAction) -> &'static str {
         RbacAction::Respond => "respond",
         RbacAction::Manage => "manage",
         RbacAction::Decrypt => "decrypt",
+        RbacAction::Use => "use",
     }
 }

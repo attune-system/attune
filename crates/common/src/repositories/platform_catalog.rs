@@ -3,20 +3,12 @@
 use serde_json::json;
 use sqlx::{Executor, PgConnection, PgPool, Postgres};
 
-use crate::models::{IntrinsicHandler, ManagementOrigin};
+use crate::models::{IntrinsicHandler, ManagementOrigin, ManagementOriginKind as StoredOrigin};
 use crate::platform_catalog::{
     definitions, ManagedComponentKind, CATALOG_REVISION, COMPATIBILITY_EPOCH,
 };
 use crate::version_matching::extract_version_components;
 use crate::{Error, Result};
-
-#[derive(Debug, sqlx::Type)]
-#[sqlx(type_name = "management_origin", rename_all = "snake_case")]
-enum StoredOrigin {
-    Platform,
-    Pack,
-    AdHoc,
-}
 
 #[derive(sqlx::FromRow)]
 struct OwnershipRow {

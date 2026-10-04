@@ -597,6 +597,10 @@ fn default_ldap_group_attr() -> String {
 /// Worker configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
+    /// Exact parent environment names to expose to actions and dependency installers.
+    #[serde(default)]
+    pub passthrough_env: Vec<String>,
+
     /// Worker name/identifier (optional, defaults to hostname)
     pub name: Option<String>,
 
@@ -697,6 +701,10 @@ fn default_execution_log_retention_limit() -> i32 {
 /// Sensor service configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorConfig {
+    /// Exact parent environment names to expose to sensors and dependency installers.
+    #[serde(default)]
+    pub passthrough_env: Vec<String>,
+
     /// Notifier websocket client URL. Secure `wss://` is required unless the
     /// URL is loopback or `allow_insecure_notifier_ws` is explicitly enabled.
     pub notifier_ws_url: Option<String>,
@@ -1896,6 +1904,9 @@ fn attune_environment_source() -> config_crate::Environment {
         .prefix_separator("__")
         .separator("__")
         .try_parsing(true)
+        .list_separator(",")
+        .with_list_parse_key("worker.passthrough_env")
+        .with_list_parse_key("sensor.passthrough_env")
 }
 
 impl Default for NotifierConfig {
@@ -2083,6 +2094,12 @@ impl Config {
 
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
+        if let Some(worker) = &self.worker {
+            crate::child_process_environment::validate_passthrough_env(&worker.passthrough_env)?;
+        }
+        if let Some(sensor) = &self.sensor {
+            crate::child_process_environment::validate_passthrough_env(&sensor.passthrough_env)?;
+        }
         self.storage.validate()?;
         if self.server.execution_log_stream_global_limit == 0
             || self.server.execution_log_stream_per_identity_limit == 0
@@ -2478,6 +2495,44 @@ mod tests {
 
         assert_eq!(probe.environment, "test");
         assert_eq!(probe.database.url, "postgresql://localhost/test");
+    }
+
+    #[test]
+    fn passthrough_lists_parse_without_turning_other_strings_into_lists() {
+        #[derive(Deserialize)]
+        struct Probe {
+            worker: WorkerConfig,
+            sensor: SensorConfig,
+            service_name: String,
+        }
+        let source = attune_environment_source().source(Some(
+            [
+                (
+                    "ATTUNE__WORKER__PASSTHROUGH_ENV".into(),
+                    "HTTP_PROXY,SSL_CERT_FILE".into(),
+                ),
+                ("ATTUNE__SENSOR__PASSTHROUGH_ENV".into(), "NO_PROXY".into()),
+                ("ATTUNE__SERVICE_NAME".into(), "worker,sensor".into()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let probe: Probe = config_crate::Config::builder()
+            .add_source(source)
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(
+            probe.worker.passthrough_env,
+            ["HTTP_PROXY", "SSL_CERT_FILE"]
+        );
+        assert_eq!(probe.sensor.passthrough_env, ["NO_PROXY"]);
+        assert_eq!(probe.service_name, "worker,sensor");
+        let worker: WorkerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let sensor: SensorConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(worker.passthrough_env.is_empty());
+        assert!(sensor.passthrough_env.is_empty());
     }
 
     #[test]

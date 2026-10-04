@@ -75,6 +75,14 @@ impl SensorService {
     /// Create a new sensor service
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Sensor Service");
+        let child_environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::capture(
+                config
+                    .sensor
+                    .as_ref()
+                    .map(|sensor| sensor.passthrough_env.as_slice())
+                    .unwrap_or(&[]),
+            )?;
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;
         let configured_api_url = std::env::var("ATTUNE_API_URL").ok();
@@ -220,12 +228,14 @@ impl SensorService {
             .as_ref()
             .map(|sensor| sensor.allow_insecure_notifier_ws)
             .unwrap_or(false);
-        let sensor_worker_registration = SensorWorkerRegistration::new(db.clone(), &config);
+        let sensor_worker_registration = SensorWorkerRegistration::new(db.clone(), &config)
+            .with_child_environment(child_environment.clone());
         let worker_name = sensor_worker_registration.worker_name().to_string();
 
         let sensor_manager = Arc::new(SensorManager::new(
             db.clone(),
             SensorManagerConfig {
+                child_environment,
                 api_url,
                 worker_token_provider: Some(worker_token_provider),
                 notifier_ws_url,

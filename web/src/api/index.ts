@@ -223,6 +223,7 @@ export type { LdapLoginRequest } from "./models/LdapLoginRequest";
 export type { LoginRequest } from "./models/LoginRequest";
 export { LogRetentionLimitPatch } from "./models/LogRetentionLimitPatch";
 export { LogRetentionPolicyPatch } from "./models/LogRetentionPolicyPatch";
+export { ManagementOriginKind } from "./models/ManagementOriginKind";
 export type { NodeJsEnvironment } from "./models/NodeJsEnvironment";
 export type { NodeJsRequirements } from "./models/NodeJsRequirements";
 export { NullableJsonPatch } from "./models/NullableJsonPatch";
@@ -261,6 +262,7 @@ export type { PaginatedResponse_InquirySummary } from "./models/PaginatedRespons
 export type { PaginatedResponse_KeySummary } from "./models/PaginatedResponse_KeySummary";
 export type { PaginatedResponse_PackSummary } from "./models/PaginatedResponse_PackSummary";
 export type { PaginatedResponse_PackTestSummary } from "./models/PaginatedResponse_PackTestSummary";
+export type { PaginatedResponse_PermissionBindingResponse } from "./models/PaginatedResponse_PermissionBindingResponse";
 export type { PaginatedResponse_PolicySummary } from "./models/PaginatedResponse_PolicySummary";
 export type { PaginatedResponse_RuleSummary } from "./models/PaginatedResponse_RuleSummary";
 export type { PaginatedResponse_RuntimeSummary } from "./models/PaginatedResponse_RuntimeSummary";
@@ -272,6 +274,12 @@ export type { PaginatedResponse_WorkQueueItemResponse } from "./models/Paginated
 export type { PaginatedResponse_WorkQueueSummary } from "./models/PaginatedResponse_WorkQueueSummary";
 export type { PaginationMeta } from "./models/PaginationMeta";
 export type { PermissionAssignmentResponse } from "./models/PermissionAssignmentResponse";
+export type { PermissionBindingResponse } from "./models/PermissionBindingResponse";
+export type { PermissionBindingTarget } from "./models/PermissionBindingTarget";
+export type { PermissionIdentityTarget } from "./models/PermissionIdentityTarget";
+export { PermissionIdentityTargetType } from "./models/PermissionIdentityTargetType";
+export type { PermissionRoleTarget } from "./models/PermissionRoleTarget";
+export { PermissionRoleTargetType } from "./models/PermissionRoleTargetType";
 export type { PermissionSetRoleAssignmentResponse } from "./models/PermissionSetRoleAssignmentResponse";
 export type { PermissionSetSummary } from "./models/PermissionSetSummary";
 export type { PlatformCatalogStateResponse } from "./models/PlatformCatalogStateResponse";
@@ -320,6 +328,8 @@ export type { SealCacheGenerationRequest } from "./models/SealCacheGenerationReq
 export type { SensorResponse } from "./models/SensorResponse";
 export type { SensorSummary } from "./models/SensorSummary";
 export type { SetDataRequest } from "./models/SetDataRequest";
+export type { SignKeyJwtRequest } from "./models/SignKeyJwtRequest";
+export type { SignKeyJwtResponse } from "./models/SignKeyJwtResponse";
 export { SourceAvailability } from "./models/SourceAvailability";
 export { SourceType } from "./models/SourceType";
 export type { SuccessResponse } from "./models/SuccessResponse";

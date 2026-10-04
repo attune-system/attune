@@ -6,6 +6,7 @@ import type { CreateKeyRequest } from "../models/CreateKeyRequest";
 import type { i64 } from "../models/i64";
 import type { OwnerType } from "../models/OwnerType";
 import type { PaginatedResponse_KeySummary } from "../models/PaginatedResponse_KeySummary";
+import type { SignKeyJwtRequest } from "../models/SignKeyJwtRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
 import type { UpdateKeyRequest } from "../models/UpdateKeyRequest";
 import type { CancelablePromise } from "../core/CancelablePromise";
@@ -118,7 +119,7 @@ export class SecretsService {
        */
       updated: string;
       /**
-       * The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+       * JSON value, or null when the caller cannot read and decrypt encrypted material.
        */
       value: any;
     };
@@ -208,7 +209,7 @@ export class SecretsService {
        */
       updated: string;
       /**
-       * The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+       * JSON value, or null when the caller cannot read and decrypt encrypted material.
        */
       value: any;
     };
@@ -300,7 +301,7 @@ export class SecretsService {
        */
       updated: string;
       /**
-       * The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+       * JSON value, or null when the caller cannot read and decrypt encrypted material.
        */
       value: any;
     };
@@ -345,6 +346,39 @@ export class SecretsService {
       errors: {
         404: `Key not found`,
       },
+    });
+  }
+  /**
+   * @returns any Approved signed JWT assertion; no private key is disclosed
+   * @throws ApiError
+   */
+  public static signKeyJwt({
+    ref,
+    requestBody,
+  }: {
+    /**
+     * System-owned signing key reference
+     */
+    ref: string;
+    requestBody: SignKeyJwtRequest;
+  }): CancelablePromise<{
+    data: {
+      assertion: string;
+      expires_at: number;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/keys/{ref}/sign-jwt",
+      path: {
+        ref: ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
     });
   }
 }

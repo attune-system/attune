@@ -310,7 +310,11 @@ impl AuthorizationService {
             ApiError::Unauthorized("Invalid authentication subject in token".to_string())
         })?;
 
-        let identity_attributes = self.load_identity_attributes_cached(identity_id).await?;
+        let identity_attributes = if user.claims.token_type == TokenType::Execution {
+            self.load_identity_attributes_uncached(identity_id).await?
+        } else {
+            self.load_identity_attributes_cached(identity_id).await?
+        };
         let grants = self.load_grants_for_token(user, identity_id).await?;
 
         Ok(Some(AuthorizationSnapshot {
@@ -425,12 +429,11 @@ impl AuthorizationService {
         }
         let requested_grants = Self::grants_from_permission_sets(requested_sets)?;
 
-        Ok(requested_grants.iter().all(|grant| {
-            grant
-                .actions
-                .iter()
-                .all(|action| Self::is_allowed(&current_grants, grant.resource, *action, &ctx))
-        }))
+        Ok(attune_common::rbac::can_delegate_grants(
+            &current_grants,
+            &requested_grants,
+            &ctx,
+        ))
     }
 
     async fn load_identity_attributes_cached(
@@ -576,7 +579,8 @@ impl AuthorizationService {
             TokenType::Access => self.load_effective_grants(identity_id).await,
             TokenType::Execution => {
                 let refs = execution_permission_set_refs(user);
-                let permission_sets = self.find_permission_sets_by_refs_cached(&refs).await?;
+                let permission_sets =
+                    PermissionSetRepository::find_by_refs(&self.db, &refs).await?;
                 if permission_sets.len() != refs.len() {
                     let found: std::collections::HashSet<_> = permission_sets
                         .iter()
@@ -593,6 +597,9 @@ impl AuthorizationService {
                     )));
                 }
                 let mut grants = Self::grants_from_permission_sets(permission_sets)?;
+                attune_common::delegation::DelegationAuthority::load(&self.db, identity_id)
+                    .await?
+                    .require_grants(&grants)?;
                 grants.extend(execution_standard_access_grants(user));
                 Ok(grants)
             }
@@ -968,6 +975,7 @@ fn action_name(action: Action) -> &'static str {
         Action::Respond => "respond",
         Action::Manage => "manage",
         Action::Decrypt => "decrypt",
+        Action::Use => "use",
     }
 }
 

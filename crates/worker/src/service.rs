@@ -109,9 +109,14 @@ async fn refresh_runtime_version_capabilities_for_registration(
     db_pool: &PgPool,
     runtime_filter: Option<&[String]>,
     registration: &Arc<RwLock<WorkerRegistration>>,
+    child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
 ) {
-    let capability =
-        version_verify::collect_runtime_versions_capability(db_pool, runtime_filter).await;
+    let capability = version_verify::collect_runtime_versions_capability(
+        db_pool,
+        runtime_filter,
+        child_environment,
+    )
+    .await;
 
     let mut reg = registration.write().await;
     reg.add_capability(
@@ -129,6 +134,7 @@ async fn refresh_runtime_version_capabilities_for_registration(
 
 /// Worker service that manages execution lifecycle
 pub struct WorkerService {
+    child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     #[allow(dead_code)]
     config: Config,
     db_pool: PgPool,
@@ -178,6 +184,14 @@ impl WorkerService {
     /// Create a new worker service
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Worker Service");
+        let child_environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::capture(
+                config
+                    .worker
+                    .as_ref()
+                    .map(|worker| worker.passthrough_env.as_slice())
+                    .unwrap_or(&[]),
+            )?;
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;
         let configured_api_url = std::env::var("ATTUNE_API_URL").ok();
@@ -246,7 +260,8 @@ impl WorkerService {
         info!("Message queue publisher initialized");
 
         // Initialize worker registration
-        let registration_state = WorkerRegistration::new(pool.clone(), &config);
+        let registration_state = WorkerRegistration::new(pool.clone(), &config)
+            .with_child_environment(child_environment.clone());
         let worker_name = registration_state.worker_name().to_string();
         let registration = Arc::new(RwLock::new(registration_state));
 
@@ -349,7 +364,8 @@ impl WorkerService {
                         exec_config,
                         packs_base_dir.clone(),
                         runtime_envs_dir.clone(),
-                    );
+                    )
+                    .with_child_environment(child_environment.clone());
                     runtime_registry.register(Box::new(process_runtime));
                     info!(
                         "Registered ProcessRuntime '{}' from database (ref: {})",
@@ -390,18 +406,22 @@ impl WorkerService {
                 },
                 packs_base_dir.clone(),
                 runtime_envs_dir.clone(),
-            );
+            )
+            .with_child_environment(child_environment.clone());
             runtime_registry.register(Box::new(shell_runtime));
             info!("Registered built-in shell ProcessRuntime");
 
             // Local runtime as catch-all fallback
-            let local_runtime = LocalRuntime::new();
+            let local_runtime =
+                LocalRuntime::new().with_child_environment(child_environment.clone());
             runtime_registry.register(Box::new(local_runtime));
             info!("Registered Local runtime (fallback)");
         }
 
         // Native execution is available alongside interpreter-backed catalog runtimes.
-        runtime_registry.register(Box::new(NativeRuntime::new()));
+        runtime_registry.register(Box::new(
+            NativeRuntime::new().with_child_environment(child_environment.clone()),
+        ));
         info!("Registered built-in Native runtime");
 
         // Validate all registered runtimes
@@ -547,6 +567,7 @@ impl WorkerService {
         );
 
         Ok(Self {
+            child_environment,
             config,
             db_pool: pool,
             registration,
@@ -709,7 +730,12 @@ impl WorkerService {
         let filter_refs: Option<Vec<String>> = self.runtime_filter.clone();
         let filter_slice: Option<&[String]> = filter_refs.as_deref();
 
-        let result = version_verify::verify_all_runtime_versions(&self.db_pool, filter_slice).await;
+        let result = version_verify::verify_all_runtime_versions(
+            &self.db_pool,
+            filter_slice,
+            &self.child_environment,
+        )
+        .await;
 
         if !result.errors.is_empty() {
             warn!(
@@ -729,6 +755,7 @@ impl WorkerService {
             &self.db_pool,
             filter_slice,
             &self.registration,
+            &self.child_environment,
         )
         .await;
     }
@@ -838,6 +865,7 @@ impl WorkerService {
             filter_slice,
             &self.packs_base_dir,
             &self.runtime_envs_dir,
+            &self.child_environment,
         )
         .await;
 
@@ -890,6 +918,7 @@ impl WorkerService {
         let packs_base_dir = self.packs_base_dir.clone();
         let runtime_envs_dir = self.runtime_envs_dir.clone();
         let registration = self.registration.clone();
+        let child_environment = self.child_environment.clone();
         let pack_transport = self.pack_transport.clone();
 
         let handle = tokio::spawn(async move {
@@ -904,6 +933,7 @@ impl WorkerService {
                     let packs_base_dir = packs_base_dir.clone();
                     let runtime_envs_dir = runtime_envs_dir.clone();
                     let registration = registration.clone();
+                    let child_environment = child_environment.clone();
                     let pack_transport = pack_transport.clone();
 
                     async move {
@@ -958,6 +988,7 @@ impl WorkerService {
                                         version_verify::verify_all_runtime_versions(
                                             &db_pool,
                                             Some(filtered_runtime_names.as_slice()),
+                                            &child_environment,
                                         )
                                         .await;
 
@@ -974,6 +1005,7 @@ impl WorkerService {
                                         &db_pool,
                                         filter_ref,
                                         &registration,
+                                        &child_environment,
                                     )
                                     .await;
                                 }
@@ -986,6 +1018,7 @@ impl WorkerService {
                                         filter_ref,
                                         &packs_base_dir,
                                         &runtime_envs_dir,
+                                        &child_environment,
                                     )
                                     .await;
 
@@ -1160,6 +1193,7 @@ impl WorkerService {
         let packs_base_dir = self.packs_base_dir.clone();
         let runtime_envs_dir = self.runtime_envs_dir.clone();
         let pack_transport = self.pack_transport.clone();
+        let child_environment = self.child_environment.clone();
 
         let consumer_for_task = consumer.clone();
         let handle = tokio::spawn(async move {
@@ -1174,6 +1208,7 @@ impl WorkerService {
                         let packs_base_dir = packs_base_dir.clone();
                         let runtime_envs_dir = runtime_envs_dir.clone();
                         let pack_transport = pack_transport.clone();
+                        let child_environment = child_environment.clone();
 
                         async move {
                             let payload = envelope.payload;
@@ -1184,6 +1219,7 @@ impl WorkerService {
                                 runtime_envs_dir.as_path(),
                                 pack_transport.as_ref(),
                                 &payload,
+                                &child_environment,
                             )
                             .await
                             {
@@ -2174,6 +2210,7 @@ async fn handle_pack_test(
     runtime_envs_dir: &std::path::Path,
     pack_transport: &dyn attune_common::pack_transport::PackFileTransport,
     payload: &PackTestRequestedPayload,
+    child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
 ) -> Result<()> {
     use attune_common::test_executor::{TestConfig, TestExecutor};
     use std::path::PathBuf;
@@ -2421,6 +2458,7 @@ async fn handle_pack_test(
                 &pack_dir,
                 runtime_envs_dir,
                 payload.pack_install_id,
+                child_environment,
             )
             .await?
         } else {
@@ -2430,6 +2468,7 @@ async fn handle_pack_test(
                 &payload.pack_ref,
                 packs_base_dir,
                 runtime_envs_dir,
+                child_environment,
             )
             .await?
         })

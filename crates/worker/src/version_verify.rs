@@ -9,6 +9,7 @@
 //! and `select_best_version()` only considers versions whose interpreters
 //! are genuinely present on this particular host/container.
 
+use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::repositories::List;
 use serde_json::{json, Value as JsonValue};
 use sqlx::PgPool;
@@ -61,6 +62,7 @@ struct VerificationCommand {
 pub async fn verify_all_runtime_versions(
     pool: &PgPool,
     runtime_filter: Option<&[String]>,
+    child_environment: &ChildProcessEnvironment,
 ) -> VersionVerificationResult {
     info!("Starting runtime version verification");
 
@@ -111,7 +113,7 @@ pub async fn verify_all_runtime_versions(
 
         result.total_checked += 1;
 
-        let is_available = verify_single_version(version).await;
+        let is_available = verify_single_version(version, child_environment).await;
 
         // Update the database
         match RuntimeVersionRepository::set_availability(pool, version.id, is_available).await {
@@ -215,6 +217,7 @@ pub fn build_runtime_versions_capability(
 pub async fn collect_runtime_versions_capability(
     pool: &PgPool,
     runtime_filter: Option<&[String]>,
+    child_environment: &ChildProcessEnvironment,
 ) -> JsonValue {
     match RuntimeVersionRepository::list(pool).await {
         Ok(versions) => {
@@ -235,7 +238,7 @@ pub async fn collect_runtime_versions_capability(
                     }
                 }
 
-                if verify_single_version(&version).await {
+                if verify_single_version(&version, child_environment).await {
                     let mut verified_version = version.clone();
                     verified_version.available = true;
                     local_versions.push(verified_version);
@@ -257,7 +260,10 @@ pub async fn collect_runtime_versions_capability(
 /// Verify a single runtime version by running its verification commands.
 ///
 /// Returns `true` if at least one verification command succeeds.
-async fn verify_single_version(version: &RuntimeVersion) -> bool {
+async fn verify_single_version(
+    version: &RuntimeVersion,
+    child_environment: &ChildProcessEnvironment,
+) -> bool {
     let commands = extract_verification_commands(&version.distributions);
 
     if commands.is_empty() {
@@ -280,12 +286,12 @@ async fn verify_single_version(version: &RuntimeVersion) -> bool {
             version.runtime_ref, version.version, binary,
         );
 
-        return run_basic_binary_check(binary).await;
+        return run_basic_binary_check(binary, child_environment).await;
     }
 
     // Run commands in priority order (lowest priority number = highest priority)
     for cmd in &commands {
-        match run_verification_command(cmd).await {
+        match run_verification_command(cmd, child_environment).await {
             Ok(true) => {
                 debug!(
                     "Verification passed for '{}' {} using binary '{}'",
@@ -388,8 +394,13 @@ fn extract_verification_commands(distributions: &serde_json::Value) -> Vec<Verif
 }
 
 /// Run a single verification command and check exit code + output pattern.
-async fn run_verification_command(cmd: &VerificationCommand) -> std::result::Result<bool, String> {
-    let output = Command::new(&cmd.binary)
+async fn run_verification_command(
+    cmd: &VerificationCommand,
+    child_environment: &ChildProcessEnvironment,
+) -> std::result::Result<bool, String> {
+    let mut command = Command::new(&cmd.binary);
+    child_environment.apply(command.as_std_mut());
+    let output = command
         .args(&cmd.args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -433,8 +444,10 @@ async fn run_verification_command(cmd: &VerificationCommand) -> std::result::Res
 }
 
 /// Basic binary availability check: run `binary --version` and check for exit 0.
-async fn run_basic_binary_check(binary: &str) -> bool {
-    match Command::new(binary)
+async fn run_basic_binary_check(binary: &str, child_environment: &ChildProcessEnvironment) -> bool {
+    let mut command = Command::new(binary);
+    child_environment.apply(command.as_std_mut());
+    match command
         .arg("--version")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -573,7 +586,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_basic_binary_check_nonexistent() {
         // A binary that definitely doesn't exist
-        let result = run_basic_binary_check("__nonexistent_binary_12345__").await;
+        let result =
+            run_basic_binary_check("__nonexistent_binary_12345__", &Default::default()).await;
         assert!(!result);
     }
 
@@ -586,7 +600,7 @@ mod tests {
             pattern: None,
             priority: 1,
         };
-        let result = run_verification_command(&cmd).await;
+        let result = run_verification_command(&cmd, &Default::default()).await;
         assert!(result.is_err());
     }
 

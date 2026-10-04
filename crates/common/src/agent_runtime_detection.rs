@@ -3,6 +3,7 @@
 //! This module probes the local system directly for well-known interpreters,
 //! without requiring database access.
 
+use crate::child_process_environment::ChildProcessEnvironment;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::process::Command;
@@ -96,13 +97,13 @@ fn candidates() -> Vec<RuntimeCandidate> {
 }
 
 /// Detect available runtimes by probing the local system.
-pub fn detect_runtimes() -> Vec<DetectedRuntime> {
+pub fn detect_runtimes(environment: &ChildProcessEnvironment) -> Vec<DetectedRuntime> {
     info!("Starting runtime auto-detection...");
 
     let mut detected = Vec::new();
 
     for candidate in candidates() {
-        match detect_single_runtime(&candidate) {
+        match detect_single_runtime(&candidate, environment) {
             Some(runtime) => {
                 info!("  ✓ Detected: {}", runtime);
                 detected.push(runtime);
@@ -126,10 +127,18 @@ pub fn detect_runtimes() -> Vec<DetectedRuntime> {
     detected
 }
 
-fn detect_single_runtime(candidate: &RuntimeCandidate) -> Option<DetectedRuntime> {
+fn detect_single_runtime(
+    candidate: &RuntimeCandidate,
+    environment: &ChildProcessEnvironment,
+) -> Option<DetectedRuntime> {
     for binary in candidate.binaries {
-        if let Some(path) = which_binary(binary) {
-            let version = get_version(&path, candidate.version_args, &candidate.version_parser);
+        if let Some(path) = which_binary(binary, environment) {
+            let version = get_version(
+                &path,
+                candidate.version_args,
+                &candidate.version_parser,
+                environment,
+            );
 
             return Some(DetectedRuntime {
                 name: candidate.name.to_string(),
@@ -142,7 +151,7 @@ fn detect_single_runtime(candidate: &RuntimeCandidate) -> Option<DetectedRuntime
     None
 }
 
-fn which_binary(binary: &str) -> Option<String> {
+fn which_binary(binary: &str, environment: &ChildProcessEnvironment) -> Option<String> {
     if binary == "bash" || binary == "sh" {
         let absolute_path = format!("/bin/{}", binary);
         if std::path::Path::new(&absolute_path).exists() {
@@ -150,7 +159,9 @@ fn which_binary(binary: &str) -> Option<String> {
         }
     }
 
-    match Command::new("which").arg(binary).output() {
+    let mut command = Command::new("which");
+    environment.apply(&mut command);
+    match command.arg(binary).output() {
         Ok(output) if output.status.success() => {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if path.is_empty() {
@@ -162,7 +173,9 @@ fn which_binary(binary: &str) -> Option<String> {
         Ok(_) => None,
         Err(e) => {
             debug!("'which' command failed ({}), trying 'command -v'", e);
-            match Command::new("sh")
+            let mut command = Command::new("sh");
+            environment.apply(&mut command);
+            match command
                 .args(["-c", &format!("command -v {}", binary)])
                 .output()
             {
@@ -180,8 +193,15 @@ fn which_binary(binary: &str) -> Option<String> {
     }
 }
 
-fn get_version(binary_path: &str, version_args: &[&str], parser: &VersionParser) -> Option<String> {
-    let output = match Command::new(binary_path).args(version_args).output() {
+fn get_version(
+    binary_path: &str,
+    version_args: &[&str],
+    parser: &VersionParser,
+    environment: &ChildProcessEnvironment,
+) -> Option<String> {
+    let mut command = Command::new(binary_path);
+    environment.apply(&mut command);
+    let output = match command.args(version_args).output() {
         Ok(output) => output,
         Err(e) => {
             debug!("Failed to run version command for {}: {}", binary_path, e);
@@ -256,6 +276,42 @@ pub fn print_detection_report_for_env(env_var_name: &str, runtimes: &[DetectedRu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn version_detection_preserves_named_opt_ins_without_inheriting_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::TempDir::new().unwrap();
+        let executable = root.path().join("runtime");
+        std::fs::write(&executable, "#!/bin/sh\ntest \"$LD_LIBRARY_PATH\" = /configured/library || exit 19\ntest -z \"${ATTUNE__SECURITY__JWT_SECRET+x}\" || exit 20\nprintf 'v3.14.15\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = vec![
+            ("LD_LIBRARY_PATH".into(), "/configured/library".into()),
+            ("ATTUNE__SECURITY__JWT_SECRET".into(), "dummy-jwt".into()),
+        ];
+        let minimal = ChildProcessEnvironment::from_parent(parent.clone(), &[]).unwrap();
+        let selected =
+            ChildProcessEnvironment::from_parent(parent, &["LD_LIBRARY_PATH".into()]).unwrap();
+        assert_eq!(
+            get_version(
+                executable.to_str().unwrap(),
+                &[],
+                &VersionParser::SemverLike,
+                &minimal
+            ),
+            None
+        );
+        assert_eq!(
+            get_version(
+                executable.to_str().unwrap(),
+                &[],
+                &VersionParser::SemverLike,
+                &selected
+            )
+            .as_deref(),
+            Some("3.14.15")
+        );
+    }
 
     #[test]
     fn test_parse_semver_like_python() {

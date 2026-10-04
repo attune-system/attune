@@ -42,7 +42,7 @@ use attune_common::repositories::runtime_version::RuntimeVersionRepository;
 use attune_common::repositories::{Create, FindById, FindByRef, Update};
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::secret_values::{
-    prepare_secret_values, redact_secret_parameters, ENTITY_EXECUTION_RESULT,
+    prepare_secret_values, redact_action_result, ENTITY_EXECUTION_RESULT,
 };
 use attune_common::version_matching::{matches_constraint, select_best_version};
 use std::path::PathBuf as StdPathBuf;
@@ -105,7 +105,6 @@ fn normalize_api_url(raw_url: &str) -> String {
 
 /// System identity used as a security fallback when an execution has no
 /// recorded triggering identity.
-const SYSTEM_IDENTITY_ID: i64 = 1;
 
 /// Default retention policy for per-execution stdout/stderr log artifacts.
 /// The worker service passes configured values into `ActionExecutor::new`.
@@ -121,21 +120,13 @@ const RUNTIME_VERSIONS_CACHE_MAX_ENTRIES: usize = 1024;
 /// Resolve the identity to embed in the execution-scoped API token (`sub`
 /// claim).
 ///
-/// Returns `executor` when set; otherwise logs a warning and falls back to
-/// the system identity (1). A missing executor indicates a bug in one of the
-/// execution-creation paths and is treated as a serious regression.
-fn resolve_execution_identity(executor: Option<i64>, execution_id: i64) -> i64 {
-    match executor {
-        Some(id) => id,
-        None => {
-            warn!(
-                "Execution {} has no executor identity set; falling back to system identity. \
-                 This indicates a bug in an execution-creation path.",
-                execution_id
-            );
-            SYSTEM_IDENTITY_ID
-        }
-    }
+/// Execution API authority always needs an explicitly attributed identity.
+fn resolve_execution_identity(executor: Option<i64>, execution_id: i64) -> Result<i64> {
+    executor.ok_or_else(|| {
+        Error::PermissionDenied(format!(
+            "Execution {execution_id} has no executor identity for API access"
+        ))
+    })
 }
 
 fn generate_runtime_api_token(
@@ -837,7 +828,7 @@ impl ActionExecutor {
                 execution.id
             );
         } else {
-            let identity_id = resolve_execution_identity(execution.executor, execution.id);
+            let identity_id = resolve_execution_identity(execution.executor, execution.id)?;
             // Add a 60s grace period beyond the process timeout for cleanup and
             // callback reporting.
             let token_ttl = (execution_timeout + 60) as i64;
@@ -906,26 +897,9 @@ impl ActionExecutor {
             HashMap::new()
         };
 
-        // Pack/action/system keys are still delivered through the dedicated
-        // stdin secret channel. Execution-specific redacted parameters are
-        // restored into `parameters` above and remain separate from these
-        // ambient execution secrets.
-        let secrets = match self.secret_manager.fetch_secrets_for_action(action).await {
-            Ok(secrets) => {
-                debug!(
-                    "Fetched {} secrets for action {} (will be passed via stdin)",
-                    secrets.len(),
-                    action.r#ref
-                );
-                secrets
-            }
-            Err(e) => {
-                warn!("Failed to fetch secrets for action {}: {}", action.r#ref, e);
-                // Don't fail execution if ambient secret lookup fails; some
-                // actions do not require pack/action secrets.
-                HashMap::new()
-            }
-        };
+        // Explicit, authorized secret inputs are restored into parameters.
+        // No keystore owner namespace is enumerated into action stdin.
+        let secrets = HashMap::new();
 
         // Determine entry point from action
         let entry_point = action.entrypoint.clone();
@@ -1874,22 +1848,27 @@ impl ActionExecutor {
         &self,
         execution_id: i64,
         action: &Action,
-        mut result_data: JsonValue,
+        result_data: JsonValue,
     ) -> Result<JsonValue> {
-        let Some(parsed_result) = result_data.get("data").cloned() else {
-            return Ok(result_data);
-        };
-
-        let (redacted_data, mut secret_inputs) =
-            redact_secret_parameters(parsed_result, action.out_schema.as_ref());
+        let parameter_secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+            &self.pool,
+            attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
+            execution_id,
+        )
+        .await?;
+        let paths = parameter_secrets
+            .into_iter()
+            .map(|secret| secret.json_path)
+            .collect::<Vec<_>>();
+        let (result_data, secret_inputs) = redact_action_result(
+            result_data,
+            action.out_schema.as_ref(),
+            execution_id,
+            &paths,
+        );
         if secret_inputs.is_empty() {
             return Ok(result_data);
         }
-
-        for input in &mut secret_inputs {
-            input.json_path = format!("/data{}", input.json_path);
-        }
-        result_data["data"] = redacted_data;
 
         let encryption_key = self
             .secret_manager
@@ -2337,23 +2316,20 @@ mod tests {
         // populated, the resolved identity for the API token must be that
         // user — never the system identity.
         let user_id = 4242;
-        let resolved = resolve_execution_identity(Some(user_id), 100);
+        let resolved = resolve_execution_identity(Some(user_id), 100).unwrap();
         assert_eq!(
             resolved, user_id,
             "resolve_execution_identity must return the execution's executor verbatim"
         );
         assert_ne!(
-            resolved, SYSTEM_IDENTITY_ID,
+            resolved, 1,
             "must not silently elevate to the system identity"
         );
     }
 
     #[test]
-    fn test_resolve_execution_identity_falls_back_when_missing() {
-        // When an execution-creation path forgets to populate `executor` we
-        // fall back to the system identity; this is logged as a warning.
-        let resolved = resolve_execution_identity(None, 100);
-        assert_eq!(resolved, SYSTEM_IDENTITY_ID);
+    fn test_resolve_execution_identity_rejects_missing_owner() {
+        assert!(resolve_execution_identity(None, 100).is_err());
     }
 
     #[test]
@@ -2410,12 +2386,12 @@ mod tests {
             refresh_token_expiration: 86400,
         };
         let user_id = 7;
-        let resolved = resolve_execution_identity(Some(user_id), 555);
+        let resolved = resolve_execution_identity(Some(user_id), 555).unwrap();
         let token = generate_execution_token(resolved, 555, "core.echo", &config, Some(60))
             .expect("token generation must succeed");
         let claims = validate_token(&token, &config).expect("token must validate");
         assert_eq!(claims.sub, user_id.to_string());
-        assert_ne!(claims.sub, SYSTEM_IDENTITY_ID.to_string());
+        assert_ne!(claims.sub, "1");
     }
 
     #[test]

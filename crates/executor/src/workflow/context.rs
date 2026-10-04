@@ -142,6 +142,7 @@ pub struct WorkflowContext {
 
     /// Secret source paths for the per-clone `item` namespace.
     current_item_secret_sources: Vec<(String, SecretSource)>,
+    origin: Option<(String, String)>,
 }
 
 impl WorkflowContext {
@@ -175,6 +176,7 @@ impl WorkflowContext {
             last_task_outcome: None,
             secret_sources: Arc::new(DashMap::new()),
             current_item_secret_sources: Vec::new(),
+            origin: None,
         }
     }
 
@@ -220,6 +222,7 @@ impl WorkflowContext {
             last_task_outcome: None,
             secret_sources: Arc::new(DashMap::new()),
             current_item_secret_sources: Vec::new(),
+            origin: None,
         }
     }
 
@@ -288,6 +291,61 @@ impl WorkflowContext {
     #[allow(dead_code)] // Part of complete context API; used in tests
     pub fn set_keystore(&mut self, secrets: JsonValue) {
         self.keystore = Arc::new(secrets);
+    }
+
+    pub fn referenced_key_refs(&self, value: &JsonValue) -> ContextResult<Vec<String>> {
+        let mut refs = std::collections::BTreeSet::new();
+        match value {
+            JsonValue::String(value) => {
+                for expression in template_expressions(value) {
+                    refs.extend(
+                        expression::keystore_references(&expression, self)
+                            .map_err(|error| ContextError::InvalidExpression(error.to_string()))?,
+                    );
+                }
+            }
+            JsonValue::Array(values) => {
+                for value in values {
+                    refs.extend(self.referenced_key_refs(value)?);
+                }
+            }
+            JsonValue::Object(values) => {
+                for value in values.values() {
+                    refs.extend(self.referenced_key_refs(value)?);
+                }
+            }
+            _ => {}
+        }
+        Ok(refs.into_iter().collect())
+    }
+
+    pub fn set_resolved_keys(
+        &mut self,
+        keys: std::collections::BTreeMap<String, attune_common::key_access::ResolvedKey>,
+    ) {
+        let mut values = serde_json::Map::new();
+        for (reference, key) in keys {
+            self.mark_secret_source_path(
+                &format!("keystore.{reference}"),
+                SecretSource::Bound(attune_common::secret_provenance::SecretProvenance::key(
+                    key.origin,
+                )),
+            );
+            values.insert(reference, key.value);
+        }
+        self.set_keystore(JsonValue::Object(values));
+    }
+
+    pub fn set_current_item_sources(&mut self, sources: &[SecretPathSource]) {
+        self.current_item_secret_sources = sources
+            .iter()
+            .map(|source| {
+                (
+                    format!("item{}", pointer_to_expression_suffix(&source.path)),
+                    source.source.clone(),
+                )
+            })
+            .collect();
     }
 
     /// Set current item for iteration
@@ -379,6 +437,17 @@ impl WorkflowContext {
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
         json!(map)
+    }
+
+    pub fn export_variables_with_sensitivity(&self) -> ContextResult<RenderedJson> {
+        Ok(rendered_from_path_sources(
+            self.export_variables(),
+            self.secret_path_sources_for_expression("workflow", "", true)?,
+        ))
+    }
+
+    pub fn set_template_origin(&mut self, component_type: &str, component_ref: &str) {
+        self.origin = Some((component_type.into(), component_ref.into()));
     }
 
     /// Render a template string, always returning a `String`.
@@ -493,7 +562,8 @@ impl WorkflowContext {
                     let trimmed = s.trim();
                     let expr = trimmed[2..trimmed.len() - 2].trim();
                     let value = result?;
-                    let path_sources = self.secret_path_sources_for_expression(expr, pointer, true);
+                    let path_sources =
+                        self.secret_path_sources_for_expression(expr, pointer, true)?;
                     return Ok(rendered_from_path_sources(value, path_sources));
                 }
 
@@ -501,7 +571,7 @@ impl WorkflowContext {
                 let mut path_sources = Vec::new();
                 for expr in template_expressions(s) {
                     path_sources
-                        .extend(self.secret_path_sources_for_expression(&expr, pointer, false));
+                        .extend(self.secret_path_sources_for_expression(&expr, pointer, false)?);
                 }
                 Ok(rendered_from_path_sources(
                     JsonValue::String(rendered),
@@ -545,33 +615,68 @@ impl WorkflowContext {
         expr: &str,
         dest_pointer: &str,
         pure_expression: bool,
-    ) -> Vec<SecretPathSource> {
-        let expr = normalize_expression_path(expr);
+    ) -> ContextResult<Vec<SecretPathSource>> {
+        let dependencies = expression::expression_dependencies(expr, self)
+            .map_err(|error| ContextError::InvalidExpression(error.to_string()))?;
         let mut sources = Vec::new();
 
-        for entry in self.secret_sources.iter() {
-            collect_matching_sources(
-                &expr,
-                dest_pointer,
-                pure_expression,
-                entry.key(),
-                entry.value(),
-                &mut sources,
-            );
+        for dependency in &dependencies.paths {
+            let direct = pure_expression && dependencies.direct_path.as_ref() == Some(dependency);
+            let dependency = self.canonical_source_path(dependency);
+            for entry in self.secret_sources.iter() {
+                collect_matching_sources(
+                    &dependency,
+                    dest_pointer,
+                    direct,
+                    &self.canonical_source_path(entry.key()),
+                    entry.value(),
+                    &mut sources,
+                );
+            }
+            for (path, source) in &self.current_item_secret_sources {
+                collect_matching_sources(
+                    &dependency,
+                    dest_pointer,
+                    direct,
+                    path,
+                    std::slice::from_ref(source),
+                    &mut sources,
+                );
+            }
         }
-
-        for (path, source) in &self.current_item_secret_sources {
-            collect_matching_sources(
-                &expr,
-                dest_pointer,
-                pure_expression,
-                path,
-                std::slice::from_ref(source),
-                &mut sources,
-            );
+        if let Some((component_type, component_ref)) = &self.origin {
+            for source in &mut sources {
+                let mut provenance = source.source.provenance();
+                provenance
+                    .templates
+                    .push(attune_common::secret_provenance::TemplateOrigin {
+                        component_type: component_type.clone(),
+                        component_ref: component_ref.clone(),
+                        input_path: dest_pointer.into(),
+                        expression: expr.into(),
+                    });
+                source.source = SecretSource::Bound(provenance);
+            }
         }
+        Ok(sources)
+    }
 
-        sources
+    fn canonical_source_path(&self, path: &str) -> String {
+        let path = normalize_expression_path(path);
+        let (root, suffix) = path.split_once('.').unwrap_or((&path, ""));
+        let canonical_root = match root {
+            "vars" | "variables" => "workflow",
+            "tasks" => "task",
+            _ if self.variables.contains_key(root) => "workflow",
+            _ => return path,
+        };
+        if canonical_root == "workflow" && self.variables.contains_key(root) {
+            format!("workflow.{path}")
+        } else if suffix.is_empty() {
+            canonical_root.into()
+        } else {
+            format!("{canonical_root}.{suffix}")
+        }
     }
 
     /// Evaluate a template expression using the expression engine.
@@ -648,13 +753,31 @@ impl WorkflowContext {
                 // (with type preservation for pure `{{ }}` expressions), while
                 // booleans, numbers, arrays, objects, and null pass through
                 // unchanged.
-                let value = self.render_json(json_value)?;
-                self.set_var(var_name, value);
+                let rendered = self.render_json_with_sensitivity(json_value)?;
+                self.set_var(var_name, rendered.value);
+                for source in rendered.secret_path_sources {
+                    self.mark_secret_source_path(
+                        &format!(
+                            "workflow.{var_name}{}",
+                            pointer_to_expression_suffix(&source.path)
+                        ),
+                        source.source,
+                    );
+                }
             }
         } else {
             // Simple variable publishing - store entire result
             for var_name in publish_vars {
                 self.set_var(var_name, result.clone());
+                for source in self.secret_path_sources_for_expression("result()", "", true)? {
+                    self.mark_secret_source_path(
+                        &format!(
+                            "workflow.{var_name}{}",
+                            pointer_to_expression_suffix(&source.path)
+                        ),
+                        source.source,
+                    );
+                }
             }
         }
 
@@ -779,6 +902,7 @@ impl WorkflowContext {
             last_task_outcome: None,
             secret_sources: Arc::new(DashMap::new()),
             current_item_secret_sources: Vec::new(),
+            origin: None,
         })
     }
 }
@@ -1752,6 +1876,94 @@ mod tests {
 
         assert_eq!(rendered.value["password"], "secret-token");
         assert_eq!(rendered.secret_paths, vec!["/password"]);
+    }
+
+    #[test]
+    fn transformations_and_published_variables_retain_all_secret_origins() {
+        let mut context =
+            WorkflowContext::new(json!({"token":"one", "password":"two"}), HashMap::new());
+        context.set_template_origin("workflow", "demo.workflow");
+        context.mark_secret_pointer_paths(
+            "parameters",
+            &["/token".into(), "/password".into()],
+            |path| SecretSource::WorkflowParameter {
+                execution_id: 42,
+                path: path.clone(),
+            },
+        );
+        context
+            .publish_from_result(
+                &json!({}),
+                &[],
+                Some(&HashMap::from([(
+                    "combined".into(),
+                    json!("{{ upper(parameters.token) + ':' + parameters.password }}"),
+                )])),
+            )
+            .unwrap();
+        let exported = context.export_variables_with_sensitivity().unwrap();
+        let (redacted, secrets) = attune_common::secret_values::redact_secret_path_sources(
+            exported.value,
+            &exported.secret_path_sources,
+        );
+        assert!(attune_common::secret_values::is_redaction_marker(
+            &redacted["combined"]
+        ));
+        let provenance: attune_common::secret_provenance::SecretProvenance =
+            serde_json::from_str(secrets[0].source_ref.as_ref().unwrap()).unwrap();
+        assert_eq!(provenance.origins.len(), 2);
+        for expression in [
+            "{{ workflow.combined }}",
+            "{{ vars.combined }}",
+            "{{ combined }}",
+        ] {
+            let rendered = context
+                .render_json_with_sensitivity(&json!({"value": expression}))
+                .unwrap();
+            assert_eq!(rendered.secret_paths, vec!["/value"]);
+            assert_eq!(rendered.value["value"], "ONE:two");
+        }
+    }
+
+    #[test]
+    fn dynamic_key_templates_record_resolved_key_and_input_expression() {
+        let mut context = WorkflowContext::new(json!({}), HashMap::new());
+        context.set_template_origin("workflow", "sales.login");
+        context.set_pack_config(json!({"signer_ref":"system.original"}));
+        let input = json!({"signer":"{{ upper(keystore[config.signer_ref].material) }}"});
+        assert_eq!(
+            context.referenced_key_refs(&input).unwrap(),
+            vec!["system.original"]
+        );
+        context.set_resolved_keys(std::collections::BTreeMap::from([(
+            "system.original".into(),
+            attune_common::key_access::ResolvedKey {
+                origin: attune_common::secret_provenance::KeyOrigin {
+                    key_id: 100,
+                    key_ref: "system.original".into(),
+                    owner_type: attune_common::models::OwnerType::System,
+                    owner_identity: None,
+                    owner_ref: None,
+                    encrypted: true,
+                },
+                value: json!({"material":"fixture-only"}),
+            },
+        )]));
+        let rendered = context.render_json_with_sensitivity(&input).unwrap();
+        assert_eq!(rendered.secret_paths, vec!["/signer"]);
+        let provenance = rendered.secret_path_sources[0].source.provenance();
+        assert!(
+            matches!(&provenance.origins[0], attune_common::secret_provenance::SecretOrigin::Key(origin) if origin.key_id == 100)
+        );
+        assert_eq!(
+            provenance.templates[0].expression,
+            "upper(keystore[config.signer_ref].material)"
+        );
+        assert_eq!(provenance.templates[0].input_path, "/signer");
+        context.set_pack_config(json!({"signer_ref":"system.replacement"}));
+        assert!(
+            matches!(&provenance.origins[0], attune_common::secret_provenance::SecretOrigin::Key(origin) if origin.key_ref == "system.original")
+        );
     }
 
     #[test]

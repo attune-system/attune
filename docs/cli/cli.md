@@ -161,6 +161,135 @@ attune auth logout
 attune auth whoami
 ```
 
+### Permissions and identities
+
+`attune permission` manages permission-set definitions and their assignments.
+`attune identity` inspects identities and manages manual role membership.
+Both groups use the selected profile and the global output options.
+
+#### Permission sets
+
+```bash
+attune permission set list
+attune permission set list --pack deploy --include-retired --json
+attune permission set show core.executor
+attune permission set export deploy.operator > operator.yaml
+attune permission set export deploy.operator --json
+attune permission set update deploy.operator --file operator.yaml --dry-run
+attune permission set update deploy.operator --file operator.yaml
+attune permission set update deploy.operator --file - < operator.yaml
+```
+
+`list` shows active definitions by default. `--include-retired` also returns
+retired definitions. `show` and `export` accept retired refs.
+Definitions report their stored `management_origin` as `platform`, `pack`, or
+`ad_hoc`. Role mappings appear in inspection output.
+
+`export` defaults to YAML and includes only `ref`, `label`, `description`, and
+`grants`. Its output omits database IDs, ownership metadata, lifecycle status,
+and assignments. An exported definition is valid input for `update` and can
+also be authored in a pack's `permission_sets/` directory.
+
+An update file uses the existing permission-set format:
+
+```yaml
+ref: deploy.operator
+label: Deployment operator
+description: Run deployment actions
+grants:
+  - resource: actions
+    actions: [read, execute]
+    constraints:
+      refs: [deploy.release]
+```
+
+`update` replaces the entire grants array. An empty array removes all grants
+from the definition. Omitted or null `label` and `description` retain their
+stored values. The file's `ref` must match the command's target.
+Unknown top-level fields produce an error.
+
+The API validates updates, including dry runs. Platform-managed definitions
+cannot be updated. Retired definitions cannot be updated or newly assigned.
+Assigning an existing relationship remains a no-op after retirement.
+A later pack update can overwrite edits to a pack-owned definition.
+
+#### Permission assignments
+
+```bash
+attune permission assignment list
+attune permission assignment list --identity alice@example.com
+attune permission assignment list --identity-id 42
+attune permission assignment list --role deployment-operators
+attune permission assignment list --set deploy.operator --page 2 --per-page 25 --json
+attune permission assign deploy.operator --identity alice@example.com
+attune permission assign deploy.operator --identity-id 42 --dry-run
+attune permission assign deploy.operator --role deployment-operators
+attune permission revoke deploy.operator --identity alice@example.com
+attune permission revoke deploy.operator --role deployment-operators --dry-run
+```
+
+`assign` and `revoke` require exactly one of `--identity`, `--identity-id`, or
+`--role`. Identity names are exact logins. Assignment listing accepts one
+identity or role filter, optionally combined with `--set`.
+
+Assignments have a typed target, either an identity or a role. Identity filters
+show direct assignments, not permission sets inherited through roles.
+Revoking a direct assignment leaves role-derived access intact.
+Assignments to retired sets remain inspectable and revocable.
+
+Assigning an existing relationship and revoking an absent relationship succeed
+with `changed: false`. Roles are opaque names, not separately created objects.
+The reserved `standard` ref belongs to execution-token authorization and cannot
+be assigned to an identity or role.
+
+#### Identities and role membership
+
+```bash
+attune identity list
+attune identity list --login alice@example.com --page 1 --per-page 25
+attune identity show alice@example.com --json
+attune identity show --identity-id 42
+attune identity role list alice@example.com
+attune identity role add alice@example.com deployment-operators
+attune identity role add --identity-id 42 deployment-operators --dry-run
+attune identity role remove alice@example.com deployment-operators
+attune identity freeze alice@example.com --dry-run
+attune identity freeze --identity-id 42
+attune identity unfreeze alice@example.com
+```
+
+Identity selectors accept either a positional login or `--identity-id`.
+Role listings include the assignment ID, source, and managed status.
+Provider-managed membership cannot be removed through the CLI. Provider
+synchronization owns those assignments.
+
+Adding an existing membership and removing an absent membership are no-ops.
+An already frozen or already unfrozen identity is also a no-op.
+
+#### Output and authorization
+
+Identity and assignment lists use `--page` and `--per-page`. The page number
+starts at 1. Page size defaults to 50 and accepts values from 1 through 100.
+JSON and YAML list output preserve the API pagination metadata.
+Permission-set lists return an array.
+
+Mutation results include `operation`, `target`, `dry_run`, `changed`,
+`would_change`, `before`, and `after`. A dry run always reports `changed: false`.
+`would_change` compares the inspected state with the requested state.
+Set updates show the previous and proposed authorable definitions.
+Assignment and membership changes show whether the relationship exists.
+Freeze changes show the previous and requested frozen state.
+
+Set-update dry runs call the API's validation path without writing.
+Assignment, membership, and freeze dry runs inspect current state and send no
+mutation request. They do not prove that a later mutation will be authorized.
+
+Permission inspection requires `permissions:read`. Permission-set updates,
+assignments, and role membership changes require `permissions:manage`.
+Identity inspection and identity-target resolution require `identities:read`.
+Freeze and unfreeze require `identities:update`.
+The API enforces authorization for every request.
+
 ### Pack Management
 
 #### List Packs

@@ -18,6 +18,7 @@ pub mod openapi;
 pub mod pack_release_upgrade;
 pub mod postgres_listener;
 pub mod routes;
+pub mod secret_disclosure;
 pub mod server;
 pub mod state;
 pub mod validation;

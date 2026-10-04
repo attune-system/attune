@@ -34,7 +34,7 @@ use attune_common::{
         trigger::{SensorRepository, TriggerRepository},
         Create, FindById, FindByRef,
     },
-    secret_values::{redacted_paths, restore_secret_values, ENTITY_ENFORCEMENT_CONFIG},
+    secret_values::{redacted_paths, restore_secret_values},
     trace_tag::normalize_trace_tag,
 };
 
@@ -1259,8 +1259,14 @@ pub async fn get_enforcement(
         response.trace_tag = enforcement_trace_tags.remove(&id);
     }
     if query.include_secret_values {
-        response.config =
-            reveal_enforcement_secret_config(&state, response.config, enforcement.id).await?;
+        response.config = crate::secret_disclosure::reveal_authorized(
+            &state,
+            &user,
+            response.config,
+            attune_common::secret_values::ENTITY_ENFORCEMENT_CONFIG,
+            enforcement.id,
+        )
+        .await?;
         emit_enforcement_secret_disclosure_audit(&state, &user, &enforcement, reveal_paths);
     }
     apply_enforcement_response_visibility(
@@ -1333,39 +1339,6 @@ async fn authorize_enforcement_access(
     }
 
     Ok(())
-}
-
-async fn reveal_enforcement_secret_config(
-    state: &Arc<AppState>,
-    redacted: Option<serde_json::Value>,
-    enforcement_id: i64,
-) -> Result<Option<serde_json::Value>, ApiError> {
-    let Some(redacted) = redacted else {
-        return Ok(None);
-    };
-    let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-        &state.db,
-        ENTITY_ENFORCEMENT_CONFIG,
-        enforcement_id,
-    )
-    .await?;
-    if secrets.is_empty() {
-        return Ok(Some(redacted));
-    }
-    let encryption_key = state
-        .config
-        .security
-        .encryption_key
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::InternalServerError(
-                "Cannot reveal secret enforcement values without security.encryption_key"
-                    .to_string(),
-            )
-        })?;
-    restore_secret_values(redacted, &secrets, encryption_key)
-        .map(Some)
-        .map_err(|e| ApiError::InternalServerError(format!("Failed to decrypt secret values: {e}")))
 }
 
 fn emit_enforcement_secret_disclosure_audit(

@@ -29,6 +29,8 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 15. **ALWAYS** maintain a zero-warning workspace. Run `cargo check --all-targets --workspace` and fix warnings you introduce.
 16. **REMEMBER** schema changes require `cargo sqlx prepare`.
 17. **REMEMBER** when adding mutable `execution` or `worker` columns, update the history trigger with `IS DISTINCT FROM` checks; for large JSONB values, store digest summaries with `_jsonb_digest_summary()` instead of raw payloads.
+18. **ALWAYS** clear inherited environments for pack-controlled processes, including setup and verification commands, using `ChildProcessEnvironment` before explicit context. For allowlists and precedence, read `docs/deployment/child-process-environments.md`.
+19. **ALWAYS** bind delegated execution grants to an explicit active owner and secret disclosure to recorded origins. For registration, token consumers, key delivery, or signing changes, read `docs/permissions/delegation-and-secret-disclosure.md`.
 
 ## Core Stack
 - **Rust** 2021

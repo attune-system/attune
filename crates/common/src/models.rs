@@ -37,6 +37,17 @@ pub use workflow::*;
 /// Common ID type used throughout the system
 pub type Id = i64;
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "management_origin", rename_all = "snake_case")]
+pub enum ManagementOriginKind {
+    Platform,
+    Pack,
+    AdHoc,
+}
+
 /// Lifecycle ownership is independent of the namespace in a component ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagementOrigin {
@@ -340,7 +351,7 @@ pub mod enums {
         Enqueue,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type, ToSchema)]
     #[sqlx(type_name = "owner_type_enum", rename_all = "lowercase")]
     #[serde(rename_all = "lowercase")]
     pub enum OwnerType {

@@ -3,6 +3,7 @@
 use crate::agent_runtime_detection::{
     detect_runtimes, format_as_env_value, print_detection_report_for_env, DetectedRuntime,
 };
+use crate::child_process_environment::ChildProcessEnvironment;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
@@ -15,7 +16,10 @@ pub struct RuntimeBootstrapResult {
 ///
 /// This must run before the Tokio runtime starts because it may mutate process
 /// environment variables.
-pub fn bootstrap_runtime_env(env_var_name: &str) -> RuntimeBootstrapResult {
+pub fn bootstrap_runtime_env(
+    env_var_name: &str,
+    environment: &ChildProcessEnvironment,
+) -> RuntimeBootstrapResult {
     let runtimes_override = std::env::var(env_var_name).ok();
     let mut detected_runtimes = None;
 
@@ -26,7 +30,7 @@ pub fn bootstrap_runtime_env(env_var_name: &str) -> RuntimeBootstrapResult {
         );
         info!("Running auto-detection for override-specified runtimes...");
 
-        let detected = detect_runtimes();
+        let detected = detect_runtimes(environment);
         let override_names: Vec<&str> = override_value.split(',').map(|s| s.trim()).collect();
 
         let filtered: Vec<_> = detected
@@ -60,7 +64,7 @@ pub fn bootstrap_runtime_env(env_var_name: &str) -> RuntimeBootstrapResult {
     } else {
         info!("No {} override — running auto-detection...", env_var_name);
 
-        let detected = detect_runtimes();
+        let detected = detect_runtimes(environment);
 
         if detected.is_empty() {
             warn!("No runtimes detected! The agent may not be able to execute any work.");
@@ -86,7 +90,11 @@ pub fn bootstrap_runtime_env(env_var_name: &str) -> RuntimeBootstrapResult {
     }
 }
 
-pub fn print_detect_only_report(env_var_name: &str, result: &RuntimeBootstrapResult) {
+pub fn print_detect_only_report(
+    env_var_name: &str,
+    result: &RuntimeBootstrapResult,
+    environment: &ChildProcessEnvironment,
+) {
     if result.runtimes_override.is_some() {
         info!("--detect-only: re-running detection to show what is available on this system...");
         println!(
@@ -96,12 +104,12 @@ pub fn print_detect_only_report(env_var_name: &str, result: &RuntimeBootstrapRes
         println!("      Showing what auto-detection would find on this system:");
         println!();
 
-        let detected = detect_runtimes();
+        let detected = detect_runtimes(environment);
         print_detection_report_for_env(env_var_name, &detected);
     } else if let Some(ref detected) = result.detected_runtimes {
         print_detection_report_for_env(env_var_name, detected);
     } else {
-        let detected = detect_runtimes();
+        let detected = detect_runtimes(environment);
         print_detection_report_for_env(env_var_name, &detected);
     }
 }

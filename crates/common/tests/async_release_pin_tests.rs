@@ -923,7 +923,7 @@ async fn deleting_pack_preserves_historical_release_snapshot() {
         .await
         .expect("pinned execution");
     let enforcement = EnforcementRepository::create_or_get_by_rule_event_pinned(
-        &pool,
+        &mut *pool.acquire().await.unwrap(),
         CreateEnforcementInput {
             rule: None,
             rule_ref: format!("{}.historical_rule", pack.r#ref),
@@ -1058,7 +1058,7 @@ async fn deleting_pack_rejects_nonterminal_pinned_work() {
         .await
         .expect("nonterminal execution");
     EnforcementRepository::create_or_get_by_rule_event_pinned(
-        &*pool,
+        &mut *pool.acquire().await.unwrap(),
         CreateEnforcementInput {
             rule: None,
             rule_ref: format!("{}.rule", pack.r#ref),

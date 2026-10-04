@@ -479,15 +479,12 @@ impl ExecutionRepository {
             .map_err(Into::into)
     }
 
-    pub async fn create_top_level_for_enforcement_if_absent<'e, E>(
-        executor: E,
+    pub async fn create_top_level_for_enforcement_if_absent(
+        conn: &mut PgConnection,
         input: CreateExecutionInput,
         enforcement_id: Id,
         snapshot: &ExecutionExecutableSnapshot,
-    ) -> Result<EnforcementExecutionCreateOrGetResult>
-    where
-        E: Executor<'e, Database = Postgres> + Copy + 'e,
-    {
+    ) -> Result<EnforcementExecutionCreateOrGetResult> {
         let mut input = input;
         if input.trace_tag.is_none() {
             input.trace_tag = Some(default_execution_trace_tag(
@@ -528,7 +525,7 @@ impl ExecutionRepository {
         .bind(&input.result)
         .bind(input.timeout_seconds)
         .bind(sqlx::types::Json(&input.workflow_task))
-        .fetch_optional(executor)
+        .fetch_optional(&mut *conn)
         .await?;
 
         if let Some(execution) = inserted {
@@ -538,7 +535,7 @@ impl ExecutionRepository {
             });
         }
 
-        let execution = Self::find_top_level_by_enforcement(executor, enforcement_id)
+        let execution = Self::find_top_level_by_enforcement(&mut *conn, enforcement_id)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1253,7 +1250,7 @@ impl Delete for ExecutionRepository {
             ),
             deleted_result_secrets AS (
                 DELETE FROM execution_secret_value
-                WHERE entity_type = 'execution_result'
+                WHERE entity_type IN ('execution_result', 'workflow_variables')
                   AND entity_id IN (SELECT id FROM deleted_execution)
             )
             SELECT

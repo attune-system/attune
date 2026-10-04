@@ -94,7 +94,28 @@ fn runtime_setup_error(stage: &str, exit_code: i32, stderr: &[u8]) -> RuntimeErr
     ))
 }
 
-fn configure_setup_command(command: &mut Command, pack_dir: &Path, env_dir: &Path) {
+fn configure_setup_command(
+    command: &mut Command,
+    pack_dir: &Path,
+    env_dir: &Path,
+    child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
+    config: &RuntimeExecutionConfig,
+) {
+    child_environment.apply(command.as_std_mut());
+    let vars = config.build_template_vars_with_env(pack_dir, Some(env_dir));
+    for (key, specification) in &config.env_vars {
+        if parameter_passing::is_reserved_runtime_env_var(key) {
+            continue;
+        }
+        let current = command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == key.as_str())
+            .and_then(|(_, value)| value)
+            .and_then(std::ffi::OsStr::to_str);
+        let value = specification.resolve(&vars, current);
+        command.env(key, value);
+    }
     let setup_home = env_dir.join(".attune-setup");
     command
         .current_dir(pack_dir)
@@ -113,6 +134,7 @@ fn configure_setup_command(command: &mut Command, pack_dir: &Path, env_dir: &Pat
 /// Each `ProcessRuntime` instance corresponds to a row in the `runtime` table.
 /// The worker creates one per registered runtime at startup (loaded from DB).
 pub struct ProcessRuntime {
+    child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     /// Runtime name (lowercase, used for matching in RuntimeRegistry).
     /// Corresponds to `runtime.name` lowercased (e.g., "python", "shell").
     runtime_name: String,
@@ -149,12 +171,21 @@ impl ProcessRuntime {
         runtime_envs_dir: PathBuf,
     ) -> Self {
         Self {
+            child_environment: Default::default(),
             runtime_name,
             config,
             packs_base_dir,
             runtime_envs_dir,
             inline_actions_dir: std::env::temp_dir().join("attune").join("inline_actions"),
         }
+    }
+
+    pub fn with_child_environment(
+        mut self,
+        environment: attune_common::child_process_environment::ChildProcessEnvironment,
+    ) -> Self {
+        self.child_environment = environment;
+        self
     }
 
     /// Set an owned scratch directory for inline action source files.
@@ -198,13 +229,14 @@ impl ProcessRuntime {
         self.config.resolve_interpreter_with_env(pack_dir, env_dir)
     }
 
-    fn interpreter_is_available(interpreter: &Path) -> bool {
+    fn interpreter_is_available(&self, interpreter: &Path) -> bool {
         if interpreter.is_absolute() || interpreter.components().count() > 1 {
             return interpreter.exists();
         }
 
-        env::var_os("PATH")
-            .map(|paths| env::split_paths(&paths).any(|dir| dir.join(interpreter).exists()))
+        self.child_environment
+            .get("PATH")
+            .map(|paths| env::split_paths(paths).any(|dir| dir.join(interpreter).exists()))
             .unwrap_or(false)
     }
 
@@ -490,7 +522,13 @@ impl ProcessRuntime {
 
         let mut command = Command::new(program);
         command.args(args);
-        configure_setup_command(&mut command, pack_dir, env_dir);
+        configure_setup_command(
+            &mut command,
+            pack_dir,
+            env_dir,
+            &self.child_environment,
+            &self.config,
+        );
         let output = process_executor::run_command_output_owned(command)
             .await
             .map_err(|e| {
@@ -594,7 +632,13 @@ impl ProcessRuntime {
 
         let mut command = Command::new(program);
         command.args(args);
-        configure_setup_command(&mut command, pack_dir, env_dir);
+        configure_setup_command(
+            &mut command,
+            pack_dir,
+            env_dir,
+            &self.child_environment,
+            &self.config,
+        );
         let output = process_executor::run_command_output_owned(command)
             .await
             .map_err(|e| {
@@ -796,7 +840,8 @@ impl ProcessRuntime {
                 effective_config.clone(),
                 self.packs_base_dir.clone(),
                 self.runtime_envs_dir.clone(),
-            );
+            )
+            .with_child_environment(self.child_environment.clone());
             match setup_runtime
                 .setup_pack_environment_with_key(pack_dir, env_dir, cache_key)
                 .await
@@ -859,7 +904,8 @@ impl ProcessRuntime {
                                 effective_config.clone(),
                                 self.packs_base_dir.clone(),
                                 self.runtime_envs_dir.clone(),
-                            );
+                            )
+                            .with_child_environment(self.child_environment.clone());
                             match setup_runtime
                                 .setup_pack_environment_with_key(pack_dir, env_dir, cache_key)
                                 .await
@@ -1009,8 +1055,7 @@ impl Runtime for ProcessRuntime {
         };
         let mut interpreter = effective_config.resolve_interpreter_with_env(&pack_dir, env_dir_opt);
 
-        if context.runtime_config_override.is_some()
-            && !Self::interpreter_is_available(&interpreter)
+        if context.runtime_config_override.is_some() && !self.interpreter_is_available(&interpreter)
         {
             warn!(
                 "Resolved interpreter '{}' for action '{}' using runtime version '{}' is not available on this worker. \
@@ -1045,7 +1090,7 @@ impl Runtime for ProcessRuntime {
             interpreter = effective_config.resolve_interpreter_with_env(&pack_dir, env_dir_opt);
         }
 
-        if !Self::interpreter_is_available(&interpreter) {
+        if !self.interpreter_is_available(&interpreter) {
             return Err(RuntimeError::SetupError(format!(
                 "Interpreter '{}' is not available for action '{}' on this worker",
                 interpreter.display(),
@@ -1084,7 +1129,12 @@ impl Runtime for ProcessRuntime {
                     );
                     continue;
                 }
-                let resolved = env_var_config.resolve(&vars, env.get(key).map(String::as_str));
+                let current = env.get(key).map(String::as_str).or_else(|| {
+                    self.child_environment
+                        .get(key)
+                        .and_then(std::ffi::OsStr::to_str)
+                });
+                let resolved = env_var_config.resolve(&vars, current);
                 debug!("Setting runtime env var: {}", key);
                 env.insert(key.clone(), resolved);
             }
@@ -1129,12 +1179,18 @@ impl Runtime for ProcessRuntime {
                 code_path,
                 working_dir,
                 &env,
+                &self.child_environment,
             )
         } else if let Some(ref code) = context.code {
             match effective_config.inline_execution.strategy {
                 InlineExecutionStrategy::Direct => {
                     debug!("Executing inline code directly ({} bytes)", code.len());
-                    let mut cmd = process_executor::build_inline_command(&interpreter, code, &env);
+                    let mut cmd = process_executor::build_inline_command(
+                        &interpreter,
+                        code,
+                        &env,
+                        &self.child_environment,
+                    );
                     if let Some(dir) = working_dir {
                         cmd.current_dir(dir);
                     }
@@ -1160,6 +1216,7 @@ impl Runtime for ProcessRuntime {
                         &inline_path,
                         working_dir,
                         &env,
+                        &self.child_environment,
                     )
                 }
             }
@@ -1175,6 +1232,7 @@ impl Runtime for ProcessRuntime {
                     &action_file,
                     working_dir,
                     &env,
+                    &self.child_environment,
                 )
             } else {
                 error!(
@@ -1235,7 +1293,9 @@ impl Runtime for ProcessRuntime {
         let binary = &self.config.interpreter.binary;
 
         // Verify the interpreter is available on the system
-        let result = Command::new(binary).arg("--version").output().await;
+        let mut command = Command::new(binary);
+        self.child_environment.apply(command.as_std_mut());
+        let result = command.arg("--version").output().await;
 
         match result {
             Ok(output) => {
@@ -1286,7 +1346,9 @@ impl Runtime for ProcessRuntime {
         let binary = &self.config.interpreter.binary;
 
         // Check if interpreter is available
-        let output = Command::new(binary).arg("--version").output().await;
+        let mut command = Command::new(binary);
+        self.child_environment.apply(command.as_std_mut());
+        let output = command.arg("--version").output().await;
 
         match output {
             Ok(output) if output.status.success() => Ok(()),
@@ -1339,6 +1401,156 @@ mod tests {
             dependencies: None,
             env_vars: HashMap::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pack_processes_and_install_hooks_use_selected_environment() {
+        const TEST_NAME: &str =
+            "runtime::process::tests::pack_processes_and_install_hooks_use_selected_environment";
+        const MARKER: &str = "ATTUNE_PACK_ENVIRONMENT_TEST_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=4"])
+                .env(MARKER, "1")
+                .env("ATTUNE__SECURITY__JWT_SECRET", "dummy-jwt")
+                .env("ATTUNE__SECURITY__ENCRYPTION_KEY", "dummy-encryption")
+                .env("ATTUNE_API_TOKEN", "dummy-service-token")
+                .env("AWS_SECRET_ACCESS_KEY", "dummy-storage")
+                .env("SERVICE_ONLY_SENTINEL", "dummy-service")
+                .env("PYTHONPATH", "/ambient/unselected-python")
+                .env("PACK_PASSTHROUGH_SENTINEL", "selected")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                "The isolated pack-process fixture must run its exact test"
+            );
+            assert!(
+                output.status.success(),
+                "Pack-process environment check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        const CHECK: &str = r#"
+            test -z "${ATTUNE__SECURITY__JWT_SECRET+x}" || exit 31
+            test -z "${ATTUNE__SECURITY__ENCRYPTION_KEY+x}" || exit 32
+            test -z "${AWS_SECRET_ACCESS_KEY+x}" || exit 33
+            test -z "${SERVICE_ONLY_SENTINEL+x}" || exit 34
+            test -z "${PYTHONPATH+x}" || exit 35
+            test "$PACK_PASSTHROUGH_SENTINEL" = selected || exit 36
+            test "$RUNTIME_OPTION" = "$EXPECTED_OPTION" || exit 37
+            if test "${EXPECT_TOKEN:-0}" = 1; then
+                test "$ATTUNE_API_TOKEN" = execution-token || exit 38
+            else
+                test -z "${ATTUNE_API_TOKEN+x}" || exit 39
+            fi
+        "#;
+        let root = TempDir::new().unwrap();
+        let baseline =
+            attune_common::child_process_environment::ChildProcessEnvironment::capture(&[
+                "PACK_PASSTHROUGH_SENTINEL".into(),
+            ])
+            .unwrap();
+        let mut config = make_shell_config();
+        config.env_vars.insert(
+            "RUNTIME_OPTION".into(),
+            RuntimeEnvVarConfig::Value("configured".into()),
+        );
+        let runtime = ProcessRuntime::new(
+            "shell".into(),
+            config,
+            root.path().into(),
+            root.path().join("envs"),
+        )
+        .with_inline_actions_dir(root.path().join("inline"))
+        .with_child_environment(baseline.clone());
+        let mut context = ExecutionContext::test_context(
+            "test.environment".into(),
+            Some(format!("{CHECK}\nprintf 'safe child'")),
+        );
+        context
+            .env
+            .insert("ATTUNE_API_TOKEN".into(), "execution-token".into());
+        context.execution_env = HashMap::from([
+            ("EXPECT_TOKEN".into(), "1".into()),
+            ("RUNTIME_OPTION".into(), "caller".into()),
+            ("EXPECTED_OPTION".into(), "caller".into()),
+        ]);
+        let native_env = context.env.clone();
+        let native_execution_env = context.execution_env.clone();
+        let result = runtime.execute(context).await.unwrap();
+        assert_eq!(result.exit_code, 0, "Interpreted action environment failed");
+        assert_eq!(result.stdout, "safe child");
+
+        let executable = root.path().join("native-action");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\n{CHECK}\nprintf 'safe native'\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut context = ExecutionContext::test_context("test.native_environment".into(), None);
+        context.entry_point = executable.display().to_string();
+        context.code_path = Some(executable);
+        context.env = native_env;
+        context.execution_env = native_execution_env;
+        let result = crate::runtime::native::NativeRuntime::new()
+            .with_child_environment(baseline.clone())
+            .execute(context)
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0, "Native action environment failed");
+        assert_eq!(result.stdout, "safe native");
+
+        let pack_dir = root.path().join("pack");
+        std::fs::create_dir(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("requirements.txt"), "offline fixture").unwrap();
+        let env_dir = root.path().join("setup");
+        let mut config = make_dependency_test_config(&format!(
+            "{CHECK}\nprintf 'safe installer' > \"$2/installed\""
+        ));
+        config.env_vars = HashMap::from([
+            (
+                "RUNTIME_OPTION".into(),
+                RuntimeEnvVarConfig::Value("configured".into()),
+            ),
+            (
+                "EXPECTED_OPTION".into(),
+                RuntimeEnvVarConfig::Value("configured".into()),
+            ),
+        ]);
+        config.environment = Some(EnvironmentConfig {
+            env_type: "test".into(),
+            dir_name: "setup".into(),
+            create_command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("{CHECK}\nmkdir -p \"$1/bin\" && ln -s /bin/sh \"$1/bin/sh\""),
+                "setup".into(),
+                "{env_dir}".into(),
+            ],
+            interpreter_path: Some("{env_dir}/bin/sh".into()),
+        });
+        let runtime = ProcessRuntime::new(
+            "shell".into(),
+            config,
+            root.path().into(),
+            root.path().join("envs"),
+        )
+        .with_child_environment(baseline);
+        runtime
+            .setup_pack_environment(&pack_dir, &env_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(env_dir.join("installed")).unwrap(),
+            "safe installer"
+        );
     }
 
     #[tokio::test]
@@ -1434,7 +1646,13 @@ mod tests {
         let env_dir = Path::new("/owned/runtime");
         let mut command = Command::new("installer");
 
-        configure_setup_command(&mut command, pack_dir, env_dir);
+        configure_setup_command(
+            &mut command,
+            pack_dir,
+            env_dir,
+            &Default::default(),
+            &Default::default(),
+        );
 
         let command = command.as_std();
         let environment = command

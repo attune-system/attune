@@ -222,6 +222,7 @@ impl PackLoadResult {
 /// Loads pack components (triggers, actions, sensors) from YAML files on disk
 /// into the database.
 pub struct PackComponentLoader<'a> {
+    authority: crate::delegation::DelegationAuthority,
     pool: &'a PgPool,
     pack_id: Id,
     pack_ref: String,
@@ -235,8 +236,10 @@ impl<'a> PackComponentLoader<'a> {
         pack_id: Id,
         pack_ref: &str,
         cache_admission: &CacheAdmissionConfig,
+        authority: crate::delegation::DelegationAuthority,
     ) -> Self {
         Self {
+            authority,
             pool,
             pack_id,
             pack_ref: pack_ref.to_string(),
@@ -273,6 +276,7 @@ impl<'a> PackComponentLoader<'a> {
         pack_dir: &Path,
     ) -> Result<PackLoadResult> {
         let mut loader = TransactionalPackComponentLoader {
+            authority: self.authority.clone(),
             connection: tx,
             pack_id: self.pack_id,
             pack_ref: self.pack_ref.clone(),
@@ -286,6 +290,7 @@ impl<'a> PackComponentLoader<'a> {
 }
 
 struct TransactionalPackComponentLoader<'a> {
+    authority: crate::delegation::DelegationAuthority,
     connection: &'a mut PgConnection,
     pack_id: Id,
     pack_ref: String,
@@ -305,6 +310,9 @@ impl TransactionalPackComponentLoader<'_> {
         // cannot leave an otherwise valid pack reload partially applied.
         self.preflight_cache_definitions(pack_dir)?;
         self.preflight_component_ownership(pack_dir).await?;
+        super::permissions::PackPermissionPlan::read(pack_dir, &self.pack_ref)?
+            .validate(&mut *self.connection, &self.authority)
+            .await?;
 
         let mut result = PackLoadResult::default();
 
@@ -2557,7 +2565,7 @@ impl TransactionalPackComponentLoader<'_> {
                     }),
                     enabled: None,
                     is_adhoc: Some(false),
-                    owner_identity: Some(Patch::Clear),
+                    owner_identity: Some(Patch::Set(self.authority.identity_id)),
                 };
 
                 RuleRepository::update(&mut *self.connection, existing.id, update_input).await?;
@@ -2599,7 +2607,7 @@ impl TransactionalPackComponentLoader<'_> {
                     permission_set_refs,
                     enabled: enabled.unwrap_or(true),
                     is_adhoc: false,
-                    owner_identity: None,
+                    owner_identity: Some(self.authority.identity_id),
                 },
                 sensor_placement,
             )
@@ -3556,7 +3564,7 @@ impl TransactionalPackComponentLoader<'_> {
     }
 }
 
-fn resolve_workflow_path(actions_dir: &Path, workflow_file: &str) -> Result<PathBuf> {
+pub(super) fn resolve_workflow_path(actions_dir: &Path, workflow_file: &str) -> Result<PathBuf> {
     let relative = Path::new(workflow_file); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- The path is parsed only for component validation before canonical confinement beneath actions/workflows.
     if relative.is_absolute()
         || !matches!(relative.components().next(), Some(std::path::Component::Normal(part)) if part == "workflows")
@@ -3618,7 +3626,7 @@ fn resolve_workflow_path(actions_dir: &Path, workflow_file: &str) -> Result<Path
 
 /// Read all YAML files from a directory, returning `(filename, content)` pairs
 /// sorted by filename for deterministic ordering.
-fn read_yaml_files(dir: &Path) -> Result<Vec<(String, String)>> {
+pub(super) fn read_yaml_files(dir: &Path) -> Result<Vec<(String, String)>> {
     let mut files = Vec::new();
 
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Pack loader scans pack-owned directories on disk after selecting the pack root.

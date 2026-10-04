@@ -1986,6 +1986,19 @@ async fn authorize_artifact_action(
             return Ok(());
         };
         if ArtifactRepository::is_readable(&state.db, artifact.id, &read_ctx).await? {
+            if artifact.classification == ArtifactClassification::RuntimeLog {
+                for execution_id in
+                    ArtifactRepository::linked_execution_ids(&state.db, artifact.id).await?
+                {
+                    let execution = ExecutionRepository::find_by_id(&state.db, execution_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ApiError::Forbidden("Runtime log execution is unavailable".into())
+                        })?;
+                    crate::secret_disclosure::authorize_runtime_log(state, user, &execution)
+                        .await?;
+                }
+            }
             return Ok(());
         }
         return Err(denied());
@@ -2246,6 +2259,7 @@ fn action_name_lower(action: Action) -> &'static str {
         Action::Respond => "respond",
         Action::Manage => "manage",
         Action::Decrypt => "decrypt",
+        Action::Use => "use",
     }
 }
 

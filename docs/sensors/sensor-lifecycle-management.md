@@ -211,7 +211,6 @@ Native sensors are standalone executables managed by the SensorManager:
 ATTUNE_API_URL=http://api:8080 \
 ATTUNE_API_TOKEN=<token> \
 ATTUNE_SENSOR_REF=core.interval_timer_sensor \
-ATTUNE_MQ_URL=amqp://rabbitmq:5672 \
 ./attune-core-timer-sensor
 
 # Process management
@@ -222,6 +221,10 @@ ATTUNE_MQ_URL=amqp://rabbitmq:5672 \
 ```
 
 ### Script-Based Sensors (Python/Shell)
+
+Managed sensor processes use scoped HTTP API access for event emission.
+Their selected base environment and operator passthrough settings are documented
+in [Child-process environments](../deployment/child-process-environments.md).
 
 Script sensors are executed through the worker runtime:
 

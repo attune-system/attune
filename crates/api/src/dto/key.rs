@@ -8,6 +8,23 @@ use validator::Validate;
 
 use attune_common::models::{key::Key, Id, OwnerType};
 
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignKeyJwtRequest {
+    #[validate(length(min = 1, max = 255))]
+    pub profile_ref: String,
+    #[validate(length(min = 1, max = 255))]
+    pub subject: String,
+    #[validate(range(min = 1, max = 300))]
+    pub ttl_seconds: u32,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SignKeyJwtResponse {
+    pub assertion: String,
+    pub expires_at: i64,
+}
+
 /// Full key response with all details (value redacted in list views)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyResponse {
@@ -66,7 +83,7 @@ pub struct KeyResponse {
     #[schema(example = true)]
     pub encrypted: bool,
 
-    /// The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+    /// JSON value, or null when the caller cannot read and decrypt encrypted material.
     #[schema(value_type = Value, example = json!("ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))]
     pub value: JsonValue,
 

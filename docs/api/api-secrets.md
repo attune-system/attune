@@ -1,6 +1,6 @@
 # Secret Management API
 
-The Secret Management API provides secure endpoints for storing, retrieving, and managing sensitive credentials, API keys, tokens, and other secret values in the Attune automation platform. All secret values are encrypted at rest using AES-256-GCM encryption.
+The key API stores credentials as JSON values with system, identity, pack, action, or sensor ownership. Values marked `encrypted: true` use AES-256-GCM encryption at rest.
 
 ## Table of Contents
 
@@ -11,6 +11,7 @@ The Secret Management API provides secure endpoints for storing, retrieving, and
 - [Endpoints](#endpoints)
   - [List Keys](#list-keys)
   - [Get Key by Reference](#get-key-by-reference)
+  - [Sign an approved JWT](#sign-an-approved-jwt)
   - [Create Key](#create-key)
   - [Update Key](#update-key)
   - [Delete Key](#delete-key)
@@ -53,7 +54,9 @@ All secret values marked as `encrypted: true` are encrypted using AES-256-GCM en
 
 ### Decryption
 
-When retrieving a secret value via GET `/api/v1/keys/:ref`, the server automatically decrypts the value if it's encrypted:
+GET `/api/v1/keys/{ref}` requires `keys:read`. An encrypted key also requires `keys:decrypt` to return plaintext. Without decrypt authority, the response contains metadata with `value: null`.
+
+When the caller holds both grants, the server decrypts the value:
 
 1. The encrypted value is base64-decoded
 2. The nonce is extracted from the beginning of the data
@@ -65,7 +68,10 @@ When retrieving a secret value via GET `/api/v1/keys/:ref`, the server automatic
 - **Authentication Required**: All endpoints require JWT authentication
 - **No List Value Exposure**: List endpoints (`GET /keys`) never return actual secret values
 - **Individual Retrieval**: Secret values can only be retrieved one at a time via GET `/keys/:ref`
-- **Audit Logging**: All access is logged (future enhancement)
+- Key reads, decrypt operations, and approved signing emit audit events without key values.
+- `keys:use` or `keys:read` permits approved JWT signing within operator-configured profiles. Neither grant alone permits plaintext retrieval of encrypted keys.
+- Explicit secret delivery and historical execution disclosure follow [recorded origin authorization](../permissions/delegation-and-secret-disclosure.md).
+- Key update responses require read and decrypt authority before returning existing encrypted material. Changing encryption without replacing the value also requires those grants.
 
 ### Server Configuration
 
@@ -135,7 +141,7 @@ ATTUNE__SECURITY__ENCRYPTION_KEY="your-encryption-key-must-be-at-least-32-charac
 | `owner_sensor_ref` | string | Optional owner sensor reference |
 | `name` | string | Human-readable name |
 | `encrypted` | boolean | Whether the value is encrypted (recommended: true) |
-| `value` | string | The secret value (decrypted in single-item GET, omitted in lists) |
+| `value` | JSON | Plaintext in authorized single-item retrieval, otherwise `null` for encrypted keys; redacted in lists |
 | `created` | datetime | Timestamp when key was created |
 | `updated` | datetime | Timestamp of last update |
 
@@ -238,7 +244,7 @@ curl -X GET "http://localhost:8080/api/v1/keys?owner_type=pack&page=1" \
 
 ### Get Key by Reference
 
-Retrieve a single key by its reference. **The secret value is decrypted and returned** in the response.
+Retrieve a single key by its reference. Read authority returns metadata. Encrypted plaintext requires separate decrypt authority.
 
 **Endpoint:** `GET /api/v1/keys/:ref`
 
@@ -281,7 +287,31 @@ curl -X GET "http://localhost:8080/api/v1/keys/pack.github.github_api_token" \
 }
 ```
 
-**Security Note**: The `value` field contains the **decrypted plaintext** secret. Handle this data carefully and never log or expose it.
+When the caller holds read and decrypt authority, `value` contains plaintext. With read authority alone, encrypted keys return `value: null`.
+
+### Sign an approved JWT
+
+`POST /api/v1/keys/{ref}/sign-jwt` accepts execution or managed sensor tokens.
+The selected key must be an encrypted system key with operator-controlled RSA signing profiles.
+The caller needs scoped `keys:use` or `keys:read` authority.
+
+```json
+{
+	"profile_ref": "sales",
+	"subject": "sales@example.com",
+	"ttl_seconds": 60
+}
+```
+
+The response contains `data.assertion` and `data.expires_at`, a Unix timestamp.
+RS256 is the only algorithm. Profiles fix issuer, audience, allowed subjects, allowed packs, optional sensor refs, and maximum lifetime.
+The maximum lifetime is 300 seconds, and requests cannot exceed the selected profile's limit.
+Unknown request fields, including caller-supplied issuer, audience, or algorithm, are rejected.
+
+The server verifies execution ownership and the pinned action or the sensor's current workload fence.
+Access tokens cannot invoke this operation directly.
+The response never contains private-key material.
+See [Share a JWT signing key across packs](../guides/shared-jwt-signing.md) for profile configuration.
 
 **Error Responses:**
 

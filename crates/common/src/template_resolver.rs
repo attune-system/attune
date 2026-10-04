@@ -59,7 +59,7 @@ use crate::secret_values::{
 /// - `event` — Event data including payload, id, trigger ref, and created timestamp
 /// - `pack.config` — Pack configuration values
 /// - `system` — System-provided variables
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TemplateContext {
     /// Event data (payload, id, trigger, created) — accessed as `event.*`
     pub event: JsonValue,
@@ -67,6 +67,8 @@ pub struct TemplateContext {
     pub pack_config: JsonValue,
     /// System-provided variables — accessed as `system.*`
     pub system_vars: JsonValue,
+    keystore: HashMap<String, JsonValue>,
+    origin: Option<(String, String)>,
     secret_sources: Vec<ContextSecretSource>,
 }
 
@@ -90,8 +92,38 @@ impl TemplateContext {
             event,
             pack_config,
             system_vars,
+            keystore: HashMap::new(),
+            origin: None,
             secret_sources: Vec::new(),
         }
+    }
+
+    pub fn with_origin(mut self, component_type: &str, component_ref: &str) -> Self {
+        self.origin = Some((component_type.into(), component_ref.into()));
+        self
+    }
+
+    pub fn with_resolved_keys(
+        mut self,
+        expressions: &std::collections::BTreeMap<String, String>,
+        keys: std::collections::BTreeMap<String, crate::key_access::ResolvedKey>,
+    ) -> Self {
+        for (expression, reference) in expressions {
+            if let Some(key) = keys.get(reference) {
+                self.secret_sources.push(ContextSecretSource {
+                    path: normalize_expression_path(expression),
+                    pointer: String::new(),
+                    source: SecretSource::Bound(crate::secret_provenance::SecretProvenance::key(
+                        key.origin.clone(),
+                    )),
+                });
+            }
+        }
+        self.keystore = keys
+            .into_iter()
+            .map(|(reference, key)| (reference, key.value))
+            .collect();
+        self
     }
 
     /// Set the event ID in the context (accessible as `{{ event.id }}`).
@@ -177,6 +209,12 @@ impl TemplateContext {
     /// - `pack.config.setting` — pack configuration
     /// - `system.timestamp` — system variables
     pub fn get_value(&self, path: &str) -> Option<JsonValue> {
+        if path.starts_with("keystore") {
+            return keystore_reference(path, self)
+                .ok()
+                .flatten()
+                .and_then(|reference| self.keystore.get(&reference).cloned());
+        }
         let parts: Vec<&str> = path.split('.').collect();
 
         if parts.is_empty() {
@@ -242,6 +280,20 @@ impl TemplateContext {
             }
         }
 
+        if let Some((component_type, component_ref)) = &self.origin {
+            for source in &mut sources {
+                let mut provenance = source.source.provenance();
+                provenance
+                    .templates
+                    .push(crate::secret_provenance::TemplateOrigin {
+                        component_type: component_type.clone(),
+                        component_ref: component_ref.clone(),
+                        input_path: dest_pointer.to_string(),
+                        expression: expr.clone(),
+                    });
+                source.source = SecretSource::Bound(provenance);
+            }
+        }
         sources
     }
 }
@@ -250,6 +302,79 @@ impl TemplateContext {
 static TEMPLATE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\{\{\s*([^}]+?)\s*\}\}").expect("Failed to compile template regex")
 });
+
+impl std::fmt::Debug for TemplateContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TemplateContext")
+            .field("origin", &self.origin)
+            .field("key_references", &self.keystore.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+fn keystore_reference(expression: &str, context: &TemplateContext) -> Result<Option<String>> {
+    let expression = normalize_expression_path(expression);
+    if let Some(reference) = expression.strip_prefix("keystore.") {
+        return Ok(Some(reference.to_string()));
+    }
+    let Some(inner) = expression
+        .strip_prefix("keystore[")
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        if expression.starts_with("keystore") {
+            anyhow::bail!("Keystore references require a canonical key ref");
+        }
+        return Ok(None);
+    };
+    let inner = inner.trim();
+    if inner.starts_with('"') {
+        return Ok(Some(serde_json::from_str::<String>(inner)?));
+    }
+    if let Some(reference) = inner
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return Ok(Some(reference.to_string()));
+    }
+    if inner.starts_with("keystore") {
+        anyhow::bail!("Nested keystore selectors are not supported");
+    }
+    context
+        .get_value(inner)
+        .and_then(|value| value.as_str().map(str::to_string))
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("Configured keystore reference is not a string"))
+}
+
+pub fn referenced_keystore_expressions(
+    value: &JsonValue,
+    context: &TemplateContext,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut references = std::collections::BTreeMap::new();
+    match value {
+        JsonValue::String(value) => {
+            for captures in TEMPLATE_REGEX.captures_iter(value) {
+                let expression = captures[1].trim();
+                if let Some(reference) = keystore_reference(expression, context)? {
+                    references.insert(expression.to_string(), reference);
+                }
+            }
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                references.extend(referenced_keystore_expressions(value, context)?);
+            }
+        }
+        JsonValue::Object(values) => {
+            for value in values.values() {
+                references.extend(referenced_keystore_expressions(value, context)?);
+            }
+        }
+        _ => {}
+    }
+    Ok(references)
+}
 
 /// Resolve all template variables in a JSON value.
 ///
@@ -519,6 +644,59 @@ fn unescape_pointer_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_keystore_references_keep_immutable_key_and_template_origins() {
+        use crate::{
+            key_access::ResolvedKey,
+            models::OwnerType,
+            secret_provenance::{KeyOrigin, SecretOrigin, SecretProvenance},
+        };
+        let parameters =
+            serde_json::json!({"signing_key":"{{ keystore[pack.config.signing_key_ref] }}"});
+        let context = TemplateContext::new(
+            serde_json::json!({}),
+            serde_json::json!({"signing_key_ref":"system.salesforce_signer"}),
+            serde_json::json!({}),
+        )
+        .with_origin("rule", "sales.login");
+        let expressions = referenced_keystore_expressions(&parameters, &context).unwrap();
+        let context = context.with_resolved_keys(
+            &expressions,
+            std::collections::BTreeMap::from([(
+                "system.salesforce_signer".into(),
+                ResolvedKey {
+                    origin: KeyOrigin {
+                        key_id: 72,
+                        key_ref: "system.salesforce_signer".into(),
+                        owner_type: OwnerType::System,
+                        owner_identity: None,
+                        owner_ref: None,
+                        encrypted: true,
+                    },
+                    value: serde_json::json!("dummy-private-key-material"),
+                },
+            )]),
+        );
+        let rendered = resolve_templates_with_sensitivity(&parameters, &context).unwrap();
+        assert_eq!(rendered.value["signing_key"], "dummy-private-key-material");
+        assert_eq!(rendered.secret_paths, ["/signing_key"]);
+        let (redacted, secrets) = crate::secret_values::redact_secret_path_sources(
+            rendered.value,
+            &rendered.secret_path_sources,
+        );
+        assert!(crate::secret_values::is_redaction_marker(
+            &redacted["signing_key"]
+        ));
+        let provenance: SecretProvenance =
+            serde_json::from_str(secrets[0].source_ref.as_ref().unwrap()).unwrap();
+        assert!(
+            matches!(&provenance.origins[0], SecretOrigin::Key(key) if key.key_id == 72 && key.key_ref == "system.salesforce_signer")
+        );
+        assert_eq!(provenance.templates[0].component_ref, "sales.login");
+        assert_eq!(provenance.templates[0].input_path, "/signing_key");
+        assert!(!format!("{context:?}").contains("dummy-private-key-material"));
+    }
     use serde_json::json;
 
     fn create_test_context() -> TemplateContext {

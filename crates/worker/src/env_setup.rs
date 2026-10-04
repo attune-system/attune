@@ -32,6 +32,7 @@ use tokio::time::{sleep, Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::metadata_cache::MetadataCache;
 use attune_common::models::{Runtime, RuntimeVersion, Worker};
 use attune_common::mq::PackRegisteredPayload;
@@ -142,6 +143,7 @@ pub async fn scan_and_setup_all_environments(
     runtime_filter: Option<&[String]>,
     packs_base_dir: &Path,
     runtime_envs_dir: &Path,
+    child_environment: &ChildProcessEnvironment,
 ) -> StartupScanResult {
     info!("Starting runtime environment scan for all registered packs");
 
@@ -229,6 +231,7 @@ pub async fn scan_and_setup_all_environments(
             runtime_envs_dir,
             &runtime_map,
             &version_map,
+            child_environment,
         )
         .await;
 
@@ -261,6 +264,7 @@ pub async fn setup_environments_for_registered_pack(
     runtime_filter: Option<&[String]>,
     packs_base_dir: &Path,
     runtime_envs_dir: &Path,
+    child_environment: &ChildProcessEnvironment,
 ) -> PackEnvSetupResult {
     info!(
         "Setting up environments for newly registered pack '{}' (version {})",
@@ -392,6 +396,7 @@ pub async fn setup_environments_for_registered_pack(
         runtime_envs_dir,
         &runtime_map,
         &version_map,
+        child_environment,
     )
     .await
 }
@@ -407,6 +412,7 @@ pub async fn prepare_python_test_runtime(
     pack_ref: &str,
     packs_base_dir: &Path,
     runtime_envs_dir: &Path,
+    child_environment: &ChildProcessEnvironment,
 ) -> attune_common::error::Result<PathBuf> {
     let pack = load_pack_by_ref_cached(db_pool, pack_ref)
         .await?
@@ -431,7 +437,8 @@ pub async fn prepare_python_test_runtime(
         exec_config.clone(),
         packs_base_dir.to_path_buf(),
         runtime_envs_dir.to_path_buf(),
-    );
+    )
+    .with_child_environment(child_environment.clone());
     let env_manager =
         PackEnvironmentManager::with_base_path(db_pool.clone(), runtime_envs_dir.to_path_buf());
 
@@ -465,6 +472,7 @@ pub async fn prepare_python_candidate_test_runtime(
     pack_dir: &Path,
     runtime_envs_dir: &Path,
     attempt_id: i64,
+    child_environment: &ChildProcessEnvironment,
 ) -> attune_common::error::Result<PathBuf> {
     let runtime = RuntimeRepository::find_by_ref(db_pool, "core.python")
         .await?
@@ -480,7 +488,8 @@ pub async fn prepare_python_candidate_test_runtime(
         exec_config.clone(),
         pack_dir.to_path_buf(),
         runtime_envs_dir.to_path_buf(),
-    );
+    )
+    .with_child_environment(child_environment.clone());
 
     process_runtime
         .setup_pack_environment(pack_dir, &env_dir)
@@ -508,6 +517,7 @@ async fn setup_environments_for_pack(
     runtime_envs_dir: &Path,
     runtime_map: &HashMap<i64, attune_common::models::Runtime>,
     version_map: &HashMap<i64, Vec<RuntimeVersion>>,
+    child_environment: &ChildProcessEnvironment,
 ) -> PackEnvSetupResult {
     let mut pack_result = PackEnvSetupResult {
         pack_ref: pack_ref.to_string(),
@@ -570,6 +580,7 @@ async fn setup_environments_for_pack(
                             packs_base_dir,
                             runtime_envs_dir,
                             &mut pack_result,
+                            child_environment,
                         )
                         .await;
                         // Also set up version-specific environments
@@ -591,6 +602,7 @@ async fn setup_environments_for_pack(
                             packs_base_dir,
                             runtime_envs_dir,
                             &mut pack_result,
+                            child_environment,
                         )
                         .await;
                         continue;
@@ -621,6 +633,7 @@ async fn setup_environments_for_pack(
             packs_base_dir,
             runtime_envs_dir,
             &mut pack_result,
+            child_environment,
         )
         .await;
 
@@ -640,6 +653,7 @@ async fn setup_environments_for_pack(
                 packs_base_dir,
                 runtime_envs_dir,
                 &mut pack_result,
+                child_environment,
             )
             .await;
         }
@@ -670,6 +684,7 @@ async fn process_runtime_for_pack(
     packs_base_dir: &Path,
     runtime_envs_dir: &Path,
     pack_result: &mut PackEnvSetupResult,
+    child_environment: &ChildProcessEnvironment,
 ) {
     let exec_config = rt.parsed_execution_config();
 
@@ -702,7 +717,8 @@ async fn process_runtime_for_pack(
         exec_config,
         packs_base_dir.to_path_buf(),
         runtime_envs_dir.to_path_buf(),
-    );
+    )
+    .with_child_environment(child_environment.clone());
 
     match coordinate_environment_setup(
         env_manager,
@@ -754,6 +770,7 @@ async fn setup_version_environments_from_list(
     packs_base_dir: &Path,
     runtime_envs_dir: &Path,
     pack_result: &mut PackEnvSetupResult,
+    child_environment: &ChildProcessEnvironment,
 ) {
     let qualifying_versions: Vec<RuntimeVersion> = versions
         .iter()
@@ -799,7 +816,8 @@ async fn setup_version_environments_from_list(
             version_exec_config,
             packs_base_dir.to_path_buf(),
             runtime_envs_dir.to_path_buf(),
-        );
+        )
+        .with_child_environment(child_environment.clone());
 
         match coordinate_environment_setup(
             env_manager,

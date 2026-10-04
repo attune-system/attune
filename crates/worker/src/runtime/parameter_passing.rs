@@ -4,6 +4,7 @@
 //! in different formats (dotenv, JSON, YAML) via different methods
 //! (environment variables, stdin, temporary files).
 
+use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::models::{ParameterDelivery, ParameterFormat};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -36,10 +37,13 @@ pub fn merge_execution_environment(
     }
 }
 
-/// Apply the explicit execution environment while preventing an API token
-/// inherited by the worker process from leaking into a no-permission action.
-pub fn apply_runtime_environment(cmd: &mut Command, env: &HashMap<String, String>) {
-    cmd.env_remove(ATTUNE_API_TOKEN_ENV);
+/// Apply only the selected baseline and the explicit execution environment.
+pub fn apply_runtime_environment(
+    cmd: &mut Command,
+    env: &HashMap<String, String>,
+    baseline: &ChildProcessEnvironment,
+) {
+    baseline.apply(cmd.as_std_mut());
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -281,6 +285,66 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_environment_does_not_inherit_service_secrets() {
+        const TEST_NAME: &str = "runtime::parameter_passing::tests::runtime_environment_does_not_inherit_service_secrets";
+        const MARKER: &str = "ATTUNE_ENVIRONMENT_REPRO_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=4"])
+                .env(MARKER, "1")
+                .env("ATTUNE__SECURITY__JWT_SECRET", "dummy-jwt-sentinel")
+                .env(
+                    "ATTUNE__SECURITY__ENCRYPTION_KEY",
+                    "dummy-encryption-sentinel",
+                )
+                .env("AWS_SECRET_ACCESS_KEY", "dummy-storage-sentinel")
+                .env("SERVICE_ONLY_SENTINEL", "dummy-service-sentinel")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                "The isolated environment fixture must run its exact test"
+            );
+            assert!(
+                output.status.success(),
+                "Isolated child environment check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", r#"
+            test "$EXPLICIT_VALUE" = action || exit 10
+            test "$ATTUNE_API_TOKEN" = scoped-token || exit 11
+            if test "${ATTUNE__SECURITY__JWT_SECRET+set}" = set; then printf 'JWT secret inherited\n'; fi
+            if test "${ATTUNE__SECURITY__ENCRYPTION_KEY+set}" = set; then printf 'Encryption key inherited\n'; fi
+            if test "${AWS_SECRET_ACCESS_KEY+set}" = set; then printf 'Storage credential inherited\n'; fi
+            if test "${SERVICE_ONLY_SENTINEL+set}" = set; then printf 'Service sentinel inherited\n'; fi
+        "#]);
+        apply_runtime_environment(
+            &mut command,
+            &HashMap::from([
+                ("EXPLICIT_VALUE".to_string(), "action".to_string()),
+                ("ATTUNE_API_TOKEN".to_string(), "scoped-token".to_string()),
+            ]),
+            &ChildProcessEnvironment::default(),
+        );
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "Explicit action context must remain available"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "Service environment leaked into action process:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn test_format_dotenv() {
         let mut params = HashMap::new();
@@ -394,13 +458,17 @@ mod tests {
     #[test]
     fn test_runtime_environment_removes_ambient_token_unless_explicitly_provided() {
         let mut without_token = Command::new("echo");
-        apply_runtime_environment(&mut without_token, &HashMap::new());
+        apply_runtime_environment(
+            &mut without_token,
+            &HashMap::new(),
+            &ChildProcessEnvironment::default(),
+        );
         let removed = without_token
             .as_std()
             .get_envs()
             .find(|(key, _)| *key == ATTUNE_API_TOKEN_ENV)
             .map(|(_, value)| value);
-        assert_eq!(removed, Some(None));
+        assert_eq!(removed, None);
 
         let mut with_token = Command::new("echo");
         apply_runtime_environment(
@@ -409,6 +477,7 @@ mod tests {
                 ATTUNE_API_TOKEN_ENV.to_string(),
                 "execution-token".to_string(),
             )]),
+            &ChildProcessEnvironment::default(),
         );
         let value = with_token
             .as_std()

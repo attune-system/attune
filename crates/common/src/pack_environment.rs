@@ -812,6 +812,7 @@ impl PackEnvironmentManager {
 
         // nosemgrep: rust.actix.command-injection.rust-actix-command-injection.rust-actix-command-injection -- action.command is accepted only after strict validation of executable shape and allowed path roots.
         let mut cmd = Command::new(&action.command);
+        crate::child_process_environment::ChildProcessEnvironment::default().apply(&mut cmd);
         cmd.args(&action.args);
 
         if let Some(cwd) = &action.cwd {

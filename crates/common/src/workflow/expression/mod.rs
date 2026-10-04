@@ -55,11 +55,13 @@
 //! - `result()`, `succeeded()`, `failed()`, `timed_out()`, `cancelled()`
 
 mod ast;
+mod dependencies;
 mod evaluator;
 mod parser;
 mod tokenizer;
 
 pub use ast::{BinaryOp, Expr, UnaryOp};
+pub use dependencies::{expression_dependencies, keystore_references, ExpressionDependencies};
 pub use evaluator::{is_truthy, EvalContext, EvalError, EvalResult};
 pub use parser::{ParseError, Parser};
 pub use tokenizer::{Token, TokenKind, Tokenizer};

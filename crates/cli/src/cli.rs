@@ -4,8 +4,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::commands::{
     action::ActionCommands, artifact::ArtifactCommands, audit::AuditCommands, auth::AuthCommands,
     cache::CacheCommands, config::ConfigCommands, execution::ExecutionCommands,
-    inquiry::InquiryCommands, key::KeyCommands, pack::PackCommands, policy::PolicyCommands,
-    queue::QueueCommands, rule::RuleCommands, sensor::SensorCommands, trigger::TriggerCommands,
+    identity::IdentityCommands, inquiry::InquiryCommands, key::KeyCommands, pack::PackCommands,
+    permission::PermissionCommands, policy::PolicyCommands, queue::QueueCommands,
+    rule::RuleCommands, sensor::SensorCommands, trigger::TriggerCommands,
     workflow::WorkflowCommands,
 };
 
@@ -66,6 +67,16 @@ pub enum Commands {
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
+    },
+    /// Permission sets and their identity/role assignments
+    Permission {
+        #[command(subcommand)]
+        command: PermissionCommands,
+    },
+    /// Identity inspection and manual role membership
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommands,
     },
     /// Pack management
     Pack {

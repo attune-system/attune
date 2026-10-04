@@ -378,6 +378,7 @@ async fn loader_retires_omitted_versions_and_rejects_a_retired_runtime_dependenc
         pack.id,
         &pack.r#ref,
         &CacheAdmissionConfig::default(),
+        helpers::pack_registration_authority(&pool).await,
     );
     loader.load_all(root.path()).await.unwrap();
     let runtime_id: i64 = sqlx::query_scalar("SELECT id FROM runtime WHERE ref = $1")

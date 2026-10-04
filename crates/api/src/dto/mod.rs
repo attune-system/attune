@@ -78,10 +78,12 @@ pub use pack::{
 pub use permission::{
     CreateIdentityRequest, CreateIdentityRoleAssignmentRequest, CreateIntegrationTokenRequest,
     CreateIntegrationTokenResponse, CreatePermissionAssignmentRequest,
-    CreatePermissionSetRoleAssignmentRequest, IdentityResponse, IdentityRoleAssignmentResponse,
-    IdentitySummary, IntegrationTokenResponse, PermissionAssignmentResponse,
+    CreatePermissionSetRoleAssignmentRequest, IdentityQueryParams, IdentityResponse,
+    IdentityRoleAssignmentResponse, IdentitySummary, IntegrationTokenResponse,
+    PermissionAssignmentResponse, PermissionBindingQueryParams, PermissionBindingResponse,
     PermissionSetQueryParams, PermissionSetRoleAssignmentResponse, PermissionSetSummary,
-    RevokeIntegrationTokenRequest, UpdateIdentityRequest, UpdatePermissionSetRequest,
+    PermissionUpdateQueryParams, RevokeIntegrationTokenRequest, UpdateIdentityRequest,
+    UpdatePermissionSetRequest,
 };
 pub use policy::{CreatePolicyRequest, PolicyResponse, PolicySummary, UpdatePolicyRequest};
 pub use rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest};

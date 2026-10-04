@@ -162,6 +162,8 @@ security:
 # Worker configuration (optional, for worker services)
 # Uncomment and configure if running worker processes
 # worker:
+#   # Exact parent variables exposed to actions and dependency installers.
+#   passthrough_env: []
 #   name: attune-worker-1
 #   worker_type: local
 #   labels:

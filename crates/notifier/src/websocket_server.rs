@@ -1203,6 +1203,10 @@ async fn load_effective_grants(
             sets
         }
         TokenType::Execution => {
+            let named = attune_common::delegation::named_refs(execution_permission_set_refs)?;
+            let authority =
+                attune_common::delegation::DelegationAuthority::load(db_pool, identity_id).await?;
+            authority.require_refs(db_pool, &named).await?;
             PermissionSetRepository::find_by_refs(db_pool, execution_permission_set_refs).await?
         }
         _ => Vec::new(),

@@ -103,6 +103,7 @@ class PackRuleReconciliationTest(unittest.TestCase):
             loader.pack_id = 7
             loader.pack_ref = "core"
 
+            loader.registration_identity = 123
             rule_ids = loader.upsert_rules(
                 {"core.event": 11},
                 {"core.run": 12},
@@ -112,6 +113,11 @@ class PackRuleReconciliationTest(unittest.TestCase):
             self.assertEqual(rule_ids, {"core.kept": 7})
             self.assertIn("ref != ALL(%s)", query)
             self.assertEqual(parameters, (7, ["core.kept"]))
+            inserts = [(query, parameters) for query, parameters in loader.conn.cursor_instance.executions
+                       if "INSERT INTO rule" in query]
+            self.assertEqual(len(inserts), 1)
+            self.assertIn("owner_identity", inserts[0][0])
+            self.assertEqual(inserts[0][1][-1], 123)
 
 
 if __name__ == "__main__":

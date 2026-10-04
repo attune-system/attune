@@ -13,7 +13,7 @@ grants:
   - {resource: events, actions: [read, decrypt]}
   - {resource: enforcements, actions: [read, decrypt]}
   - {resource: inquiries, actions: [read, create, update, delete, respond]}
-  - {resource: keys, actions: [read, create, update, delete, decrypt]}
+  - {resource: keys, actions: [read, create, update, delete, decrypt, use]}
   - {resource: caches, actions: [read, create, update, delete]}
   - {resource: artifacts, actions: [read, create, update, delete]}
   - {resource: runtimes, actions: [read, create, update, delete]}

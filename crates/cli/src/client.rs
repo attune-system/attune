@@ -42,6 +42,13 @@ pub struct ApiError {
     pub _details: Option<serde_json::Value>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ApiRequestError {
+    pub status: StatusCode,
+    message: String,
+}
+
 fn build_http_client(timeout: Duration) -> HttpClient {
     let builder = HttpClient::builder().timeout(timeout);
     match builder.build() {
@@ -424,12 +431,11 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            anyhow::bail!(api_error_message(
-                "API error",
+            Err(ApiRequestError {
                 status,
-                request_id.as_deref(),
-                &error_text
-            ));
+                message: api_error_message("API error", status, request_id.as_deref(), &error_text),
+            }
+            .into())
         }
     }
 
@@ -545,12 +551,11 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            anyhow::bail!(api_error_message(
-                "API error",
+            Err(ApiRequestError {
                 status,
-                request_id.as_deref(),
-                &error_text
-            ));
+                message: api_error_message("API error", status, request_id.as_deref(), &error_text),
+            }
+            .into())
         }
     }
 
@@ -559,6 +564,40 @@ impl ApiClient {
     /// GET request
     pub async fn get<T: DeserializeOwned>(&mut self, path: &str) -> Result<T> {
         self.execute_json::<T, ()>(Method::GET, path, None).await
+    }
+
+    /// GET an endpoint whose JSON body has no API response envelope.
+    pub async fn get_bare<T: DeserializeOwned>(&mut self, path: &str) -> Result<T> {
+        let mut response = self
+            .build_request(Method::GET, path)
+            .send()
+            .await
+            .context("Failed to send request to API")?;
+        if response.status() == StatusCode::UNAUTHORIZED
+            && self.refresh_token.is_some()
+            && self.refresh_auth_token().await?
+        {
+            response = self
+                .build_request(Method::GET, path)
+                .send()
+                .await
+                .context("Failed to send request to API (retry)")?;
+        }
+        if !response.status().is_success() {
+            return self.handle_response(response).await;
+        }
+        let status = response.status();
+        let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
+        let body = response
+            .text()
+            .await
+            .context("Failed to read API response body")?;
+        parse_json_response(
+            &body,
+            "Failed to parse API response",
+            status,
+            request_id.as_deref(),
+        )
     }
 
     pub async fn get_paginated<T: DeserializeOwned>(&mut self, path: &str) -> Result<Vec<T>> {

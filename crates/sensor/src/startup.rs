@@ -18,6 +18,7 @@ pub fn apply_sensor_name_override(config: &mut Config, name: String) {
         sensor_config.worker_name = Some(name);
     } else {
         config.sensor = Some(SensorConfig {
+            passthrough_env: Vec::new(),
             notifier_ws_url: None,
             allow_insecure_notifier_ws: false,
             worker_name: Some(name),

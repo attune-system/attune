@@ -646,6 +646,37 @@ impl WorkQueueDispatcher {
         }
         let dispatch_action = &dispatch_snapshot.executable.action;
 
+        let executor_identity = {
+            let mut iter = items.iter().map(|item| item.requested_by_identity);
+            let first = iter.next().flatten();
+            first.filter(|id| iter.all(|other| other == Some(*id)))
+        };
+        let key_context = Self::build_action_params_context(
+            queue,
+            &context.parsed_config,
+            &context.pack_config,
+            &items,
+            None,
+        );
+        let key_refs = key_context.referenced_key_refs(&queue.action_params)?;
+        let keys = if key_refs.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            let identity = executor_identity.ok_or_else(|| {
+                anyhow!("Queue key access requires one attributed requester per batch")
+            })?;
+            let authority =
+                attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity)
+                    .await?;
+            attune_common::key_access::resolve_explicit_keys(
+                &mut *tx,
+                &authority,
+                &key_refs,
+                encryption_key,
+            )
+            .await?
+        };
+
         let rendered_config = Self::build_execution_config(
             queue,
             &context.parsed_config,
@@ -653,6 +684,7 @@ impl WorkQueueDispatcher {
             context.pack_ref.clone(),
             &context.pack_secret_paths,
             &items,
+            keys,
         )?;
         validate_secret_destination_paths(
             dispatch_action.param_schema.as_ref(),
@@ -673,33 +705,22 @@ impl WorkQueueDispatcher {
             })?;
             prepare_secret_values(secret_inputs, encryption_key)?
         };
-        // SECURITY: Inherit the triggering identity from the queue items'
-        // `requested_by_identity` field if all leased items share the same
-        // initiator. Otherwise fall back to the system identity so the worker
-        // still mints a callback token with a known `sub` claim.
-        //
-        // SECURITY: This precedence is now sound end-to-end. Rule-driven
-        // executions run as `rule.owner_identity` (see enforcement_processor),
-        // and when those executions enqueue items via the API, the queue item
-        // is stamped with `requested_by_identity` = current identity. So the
-        // per-item identity already captures the rule owner — no separate
-        // rule lookup is needed here. The system fallback only fires for
-        // legacy items with NULL `requested_by_identity` (e.g. items enqueued
-        // before this column existed) and for queues fed by anonymous sources.
-        const SYSTEM_IDENTITY_ID: i64 = 1;
-        let executor_identity = {
-            let mut iter = items.iter().map(|item| item.requested_by_identity);
-            let first = iter.next().flatten();
-            if let Some(id) = first {
-                if iter.all(|other| other == Some(id)) {
-                    Some(id)
-                } else {
-                    Some(SYSTEM_IDENTITY_ID)
-                }
-            } else {
-                Some(SYSTEM_IDENTITY_ID)
-            }
-        };
+        let permission_set_refs = queue.permission_set_refs.clone().unwrap_or_else(|| {
+            dispatch_action
+                .default_execution_permission_set_refs
+                .clone()
+        });
+        if !permission_set_refs.is_empty() {
+            let identity = executor_identity.ok_or_else(|| {
+                anyhow::anyhow!("Queue API access requires one attributed requester per batch")
+            })?;
+            let authority =
+                attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity)
+                    .await?;
+            authority
+                .require_refs_for_share(&mut tx, &permission_set_refs)
+                .await?;
+        }
         let reserved_dispatch_id =
             if queue.batch_mode == attune_common::models::WorkQueueBatchMode::Batch {
                 Some(Self::reserve_dispatch_id(&mut tx).await?)
@@ -723,11 +744,7 @@ impl WorkQueueDispatcher {
                 parent: None,
                 enforcement: None,
                 executor: executor_identity,
-                permission_set_refs: queue.permission_set_refs.clone().unwrap_or_else(|| {
-                    dispatch_action
-                        .default_execution_permission_set_refs
-                        .clone()
-                }),
+                permission_set_refs,
                 artifact_retention_policy: dispatch_action.artifact_retention_policy,
                 artifact_retention_limit: dispatch_action.artifact_retention_limit,
                 worker_selector: None,
@@ -793,6 +810,7 @@ impl WorkQueueDispatcher {
         pack_ref: Option<String>,
         pack_secret_paths: &[JsonPointer],
         items: &[WorkQueueItem],
+        keys: std::collections::BTreeMap<String, attune_common::key_access::ResolvedKey>,
     ) -> Result<RenderedJson> {
         if items.is_empty() {
             return Err(anyhow!(
@@ -812,6 +830,8 @@ impl WorkQueueDispatcher {
         let context =
             Self::build_action_params_context(queue, parsed_config, pack_config, items, None);
         let mut context = context;
+        context.set_template_origin("queue", &queue.r#ref);
+        context.set_resolved_keys(keys);
         context.set_pack_config_with_secret_paths(pack_config.clone(), pack_ref, pack_secret_paths);
         Self::mark_queue_item_secret_paths(&context, queue, items);
         let rendered = context
@@ -1367,6 +1387,7 @@ mod tests {
             None,
             &[],
             &items,
+            Default::default(),
         )
         .expect("config should build");
 
@@ -1400,6 +1421,7 @@ mod tests {
             None,
             &[],
             &[item],
+            Default::default(),
         )
         .unwrap();
 
@@ -1433,6 +1455,7 @@ mod tests {
             None,
             &[],
             &[item],
+            Default::default(),
         )
         .expect("config should build");
 
@@ -1719,6 +1742,7 @@ mod tests {
             None,
             &[],
             &items,
+            Default::default(),
         )
         .expect("config should build");
 

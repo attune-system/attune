@@ -87,6 +87,16 @@ impl LocalRuntime {
         }
     }
 
+    pub fn with_child_environment(
+        mut self,
+        environment: attune_common::child_process_environment::ChildProcessEnvironment,
+    ) -> Self {
+        self.native = self.native.with_child_environment(environment.clone());
+        self.python = self.python.with_child_environment(environment.clone());
+        self.shell = self.shell.with_child_environment(environment);
+        self
+    }
+
     /// Get the appropriate runtime for the given context
     fn select_runtime(&self, context: &ExecutionContext) -> RuntimeResult<&dyn Runtime> {
         if self.native.can_execute(context) {

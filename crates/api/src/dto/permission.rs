@@ -3,10 +3,116 @@ use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
+use attune_common::{
+    models::ManagementOriginKind,
+    repositories::identity::{
+        DirectPermissionBindingRow, PermissionBindingRow, PermissionSetAdminRow,
+    },
+};
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct IdentityQueryParams {
+    /// Exact identity login.
+    pub login: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct PermissionSetQueryParams {
     #[serde(default)]
     pub pack_ref: Option<String>,
+    /// Include retired permission sets in administrative results.
+    #[serde(default)]
+    pub include_retired: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct PermissionBindingQueryParams {
+    pub identity_id: Option<i64>,
+    pub identity_login: Option<String>,
+    pub role: Option<String>,
+    pub permission_set_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct PermissionUpdateQueryParams {
+    /// Validate and preview the update without persisting it.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum PermissionBindingTarget {
+    Identity(PermissionIdentityTarget),
+    Role(PermissionRoleTarget),
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PermissionIdentityTarget {
+    pub identity_id: i64,
+    pub login: String,
+    #[serde(rename = "type")]
+    pub target_type: PermissionIdentityTargetType,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionIdentityTargetType {
+    Identity,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PermissionRoleTarget {
+    pub role: String,
+    #[serde(rename = "type")]
+    pub target_type: PermissionRoleTargetType,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionRoleTargetType {
+    Role,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PermissionBindingResponse {
+    pub id: i64,
+    pub permission_set_id: i64,
+    pub permission_set_ref: String,
+    pub target: PermissionBindingTarget,
+    pub created: chrono::DateTime<chrono::Utc>,
+}
+
+impl TryFrom<PermissionBindingRow> for PermissionBindingResponse {
+    type Error = attune_common::Error;
+
+    fn try_from(row: PermissionBindingRow) -> Result<Self, Self::Error> {
+        let target = match (row.identity_id, row.identity_login, row.role) {
+            (Some(identity_id), Some(login), None) => {
+                PermissionBindingTarget::Identity(PermissionIdentityTarget {
+                    identity_id,
+                    login,
+                    target_type: PermissionIdentityTargetType::Identity,
+                })
+            }
+            (None, None, Some(role)) => PermissionBindingTarget::Role(PermissionRoleTarget {
+                role,
+                target_type: PermissionRoleTargetType::Role,
+            }),
+            _ => {
+                return Err(attune_common::Error::invalid_state(
+                    "Invalid permission binding target",
+                ))
+            }
+        };
+        Ok(Self {
+            id: row.id,
+            permission_set_id: row.permission_set_id,
+            permission_set_ref: row.permission_set_ref,
+            target,
+            created: row.created,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -50,7 +156,36 @@ pub struct PermissionSetSummary {
     pub description: Option<String>,
     pub grants: JsonValue,
     pub retired_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub management_origin: ManagementOriginKind,
     pub roles: Vec<PermissionSetRoleAssignmentResponse>,
+}
+
+impl From<PermissionSetAdminRow> for PermissionSetSummary {
+    fn from(row: PermissionSetAdminRow) -> Self {
+        let set = row.permission_set;
+        Self {
+            roles: row
+                .roles
+                .0
+                .into_iter()
+                .map(|role| PermissionSetRoleAssignmentResponse {
+                    id: role.id,
+                    permission_set_id: role.permset,
+                    permission_set_ref: Some(set.r#ref.clone()),
+                    role: role.role,
+                    created: role.created,
+                })
+                .collect(),
+            id: set.id,
+            r#ref: set.r#ref,
+            pack_ref: set.pack_ref,
+            label: set.label,
+            description: set.description,
+            grants: set.grants,
+            retired_at: set.retired_at,
+            management_origin: row.management_origin,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
@@ -70,6 +205,18 @@ pub struct PermissionAssignmentResponse {
     pub permission_set_id: i64,
     pub permission_set_ref: String,
     pub created: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<DirectPermissionBindingRow> for PermissionAssignmentResponse {
+    fn from(row: DirectPermissionBindingRow) -> Self {
+        Self {
+            id: row.id,
+            identity_id: row.identity_id,
+            permission_set_id: row.permission_set_id,
+            permission_set_ref: row.permission_set_ref,
+            created: row.created,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]

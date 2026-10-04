@@ -31,6 +31,56 @@ use std::sync::Once;
 static INIT: Once = Once::new();
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+pub async fn pack_registration_authority(
+    pool: &PgPool,
+) -> attune_common::delegation::DelegationAuthority {
+    use attune_common::repositories::identity::{
+        CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
+        PermissionAssignmentRepository, PermissionSetRepository,
+    };
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let identity = IdentityRepository::create(
+        pool,
+        CreateIdentityInput {
+            login: format!("pack-registrar-{unique}"),
+            display_name: None,
+            password_hash: None,
+            attributes: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let definition: serde_json::Value = serde_yaml_ng::from_str(include_str!(
+        "../src/platform_catalog/permission_sets/admin.yaml"
+    ))
+    .unwrap();
+    let set = PermissionSetRepository::create(
+        pool,
+        CreatePermissionSetInput {
+            r#ref: format!("fixture.registrar_{unique}"),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: definition["grants"].clone(),
+        },
+    )
+    .await
+    .unwrap();
+    PermissionAssignmentRepository::create(
+        pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: set.id,
+        },
+    )
+    .await
+    .unwrap();
+    attune_common::delegation::DelegationAuthority::load(pool, identity.id)
+        .await
+        .unwrap()
+}
+
 /// Generate a unique test identifier for fixtures
 ///
 /// This uses a combination of timestamp (last 6 digits) and atomic counter to ensure

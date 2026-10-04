@@ -85,8 +85,26 @@ fn main() -> Result<()> {
 
     if args.detect_only {
         let _ = observability::init_tracing(None, None)?;
-        let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES");
-        print_detect_only_report("ATTUNE_WORKER_RUNTIMES", &bootstrap);
+        let config = if args.config.is_some() || std::env::var_os("ATTUNE_CONFIG").is_some() {
+            Some(Config::load()?)
+        } else {
+            None
+        };
+        let passthrough = config
+            .as_ref()
+            .and_then(|config| config.worker.as_ref())
+            .map(|worker| worker.passthrough_env.clone())
+            .unwrap_or_else(|| {
+                std::env::var("ATTUNE__WORKER__PASSTHROUGH_ENV")
+                    .map(|value| value.split(',').map(str::to_string).collect())
+                    .unwrap_or_default()
+            });
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::capture(
+                &passthrough,
+            )?;
+        let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &environment);
+        print_detect_only_report("ATTUNE_WORKER_RUNTIMES", &bootstrap, &environment);
         return Ok(());
     }
 
@@ -103,7 +121,15 @@ fn main() -> Result<()> {
     info!("Starting Attune Universal Worker Agent");
     info!("Agent binary: attune-agent {}", env!("CARGO_PKG_VERSION"));
 
-    let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES");
+    let child_environment =
+        attune_common::child_process_environment::ChildProcessEnvironment::capture(
+            config
+                .worker
+                .as_ref()
+                .map(|worker| worker.passthrough_env.as_slice())
+                .unwrap_or(&[]),
+        )?;
+    let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &child_environment);
     let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
 
     // --- Build the tokio runtime and run the async portion ---
@@ -124,6 +150,7 @@ async fn async_main(
             worker_config.name = Some(name);
         } else {
             config.worker = Some(attune_common::config::WorkerConfig {
+                passthrough_env: Vec::new(),
                 name: Some(name),
                 worker_type: None,
                 runtime_id: None,
