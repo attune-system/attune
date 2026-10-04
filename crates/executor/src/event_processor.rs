@@ -434,7 +434,7 @@ impl EventProcessor {
         let enforcement = enforcement_result.enforcement;
         if enforcement_result.created && !prepared_secrets.is_empty() {
             ExecutionSecretValueRepository::upsert_many_with_conn(
-                &mut *tx,
+                &mut tx,
                 ENTITY_ENFORCEMENT_CONFIG,
                 enforcement.id,
                 &prepared_secrets,

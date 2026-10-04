@@ -103,9 +103,6 @@ fn normalize_api_url(raw_url: &str) -> String {
         .replace("://[::]", "://127.0.0.1")
 }
 
-/// System identity used as a security fallback when an execution has no
-/// recorded triggering identity.
-
 /// Default retention policy for per-execution stdout/stderr log artifacts.
 /// The worker service passes configured values into `ActionExecutor::new`.
 const DEFAULT_LOG_ARTIFACT_RETENTION_POLICY: RetentionPolicyType = RetentionPolicyType::Days;

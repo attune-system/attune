@@ -426,7 +426,7 @@ async fn create_inquiry_returns_option_bound_handles_and_rejects_invalid_options
     let identity = create_identity(&ctx.pool, "inquiry_creator").await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "creation").await?;
     let permission_set_ref = "test.inquiry_creator";
-    PermissionSetRepository::create(
+    let permission_set = PermissionSetRepository::create(
         &ctx.pool,
         CreatePermissionSetInput {
             r#ref: permission_set_ref.to_string(),
@@ -435,6 +435,14 @@ async fn create_inquiry_returns_option_bound_handles_and_rejects_invalid_options
             label: Some("Inquiry creator".to_string()),
             description: None,
             grants: json!([{"resource": "inquiries", "actions": ["create"]}]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: permission_set.id,
         },
     )
     .await?;
@@ -548,6 +556,7 @@ async fn create_inquiry_returns_option_bound_handles_and_rejects_invalid_options
         .await?;
     assert_eq!(raw_schema.status(), StatusCode::BAD_REQUEST);
 
+    ctx.cleanup().await?;
     Ok(())
 }
 

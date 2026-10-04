@@ -15,7 +15,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // allowing the owned parallel lane to drain instead of failing at 30 seconds.
 const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(300);
 const POOL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const DATABASE_DDL_TIMEOUT: Duration = Duration::from_secs(30);
+// Physical clone creation and drop can force shared checkpoints. A four-thread
+// PostgreSQL 18 run spent 37s in DataFileSync on container storage alone.
+const DATABASE_DDL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A fully migrated, database-isolated test fixture.
 ///

@@ -917,12 +917,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 196,
+            path_count, 198,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 257,
+            operation_count, 260,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 

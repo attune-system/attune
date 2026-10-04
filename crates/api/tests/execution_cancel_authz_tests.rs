@@ -231,7 +231,7 @@ async fn execution_token_requires_embedded_cancel_permission_and_respects_owner_
         ExecutionStatus::Requested
     );
 
-    let permission_refs = vec![cancel.r#ref];
+    let permission_refs = vec![cancel.r#ref.clone()];
     let allowed_token = generate_execution_token_with_permission_sets(
         caller.id,
         owned.id,
@@ -240,6 +240,19 @@ async fn execution_token_requires_embedded_cancel_permission_and_respects_owner_
         Some(300),
         &permission_refs,
     )?;
+    let undelegable = ctx
+        .post(
+            &format!("/api/v1/executions/{}/cancel", owned.id),
+            json!({}),
+            Some(&allowed_token),
+        )
+        .await?;
+    assert_eq!(undelegable.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        execution_status(&ctx.pool, owned.id).await?,
+        ExecutionStatus::Requested
+    );
+    assign_permission_set(&ctx.pool, &caller, &cancel).await?;
     let foreign_denied = ctx
         .post(
             &format!("/api/v1/executions/{}/cancel", foreign.id),
@@ -266,5 +279,6 @@ async fn execution_token_requires_embedded_cancel_permission_and_respects_owner_
         ExecutionStatus::Cancelled
     );
 
+    ctx.cleanup().await?;
     Ok(())
 }

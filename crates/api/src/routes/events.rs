@@ -1434,7 +1434,17 @@ mod tests {
         assert!(is_redaction_marker(&payload["password"]));
         assert_eq!(redacted.payload_secrets.len(), 1);
         assert_eq!(redacted.payload_secrets[0].json_path, "/password");
-        assert_eq!(redacted.payload_secrets[0].source_kind, "trigger_schema");
+        let secret = &redacted.payload_secrets[0];
+        assert_eq!(secret.source_kind, "provenance");
+        let provenance: attune_common::secret_provenance::SecretProvenance =
+            serde_json::from_str(secret.source_ref.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            provenance.origins,
+            vec![attune_common::secret_provenance::SecretOrigin::Local {
+                source_kind: "trigger_schema".into(),
+                source_ref: Some("demo.login:payload:/password".into()),
+            }]
+        );
     }
 
     #[test]

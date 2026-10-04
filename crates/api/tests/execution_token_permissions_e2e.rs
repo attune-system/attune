@@ -16,8 +16,8 @@ use attune_common::{
         component_lifecycle::PackProjectionIds,
         execution::{CreateExecutionInput, ExecutionRepository},
         identity::{
-            CreateIdentityInput, CreatePermissionSetInput, IdentityRepository,
-            PermissionSetRepository,
+            CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository,
         },
         key::{CreateKeyInput, KeyRepository},
         pack::{CreatePackInput, PackRepository},
@@ -74,6 +74,23 @@ async fn create_permission_set(
         },
     )
     .await?)
+}
+
+async fn assign_permission_set(
+    pool: &PgPool,
+    identity: &Identity,
+    set: &PermissionSet,
+) -> TResult<()> {
+    PermissionAssignmentRepository::create(
+        pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    Ok(())
 }
 
 async fn setup_executable_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, Action)> {
@@ -426,7 +443,7 @@ async fn pack_updates_require_execution_token_configure_permission() -> TResult<
     create_pack(&ctx.pool, &target_pack_ref, "Original label").await?;
 
     let configure_ref = format!("test.exec_pack_configure_{suffix}");
-    create_permission_set(
+    let configure = create_permission_set(
         &ctx.pool,
         &configure_ref,
         json!([{
@@ -436,6 +453,7 @@ async fn pack_updates_require_execution_token_configure_permission() -> TResult<
         }]),
     )
     .await?;
+    assign_permission_set(&ctx.pool, &identity, &configure).await?;
 
     let denied_token = execution_token(&identity, &parent_execution, &action, &[])?;
     let denied = ctx
@@ -477,6 +495,7 @@ async fn pack_updates_require_execution_token_configure_permission() -> TResult<
     assert_eq!(updated.config, json!({"value": "authorized"}));
     assert_eq!(updated.label, "Updated label");
 
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -494,7 +513,7 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     let action_read_ref = format!("test.exec_token_action_read_{}", suffix);
     let action_execute_ref = format!("test.exec_token_action_execute_{}", suffix);
 
-    create_permission_set(
+    let runtime_read = create_permission_set(
         &ctx.pool,
         &runtime_read_ref,
         json!([
@@ -502,7 +521,7 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         ]),
     )
     .await?;
-    create_permission_set(
+    let worker_read = create_permission_set(
         &ctx.pool,
         &worker_read_ref,
         json!([
@@ -510,7 +529,7 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         ]),
     )
     .await?;
-    create_permission_set(
+    let action_read = create_permission_set(
         &ctx.pool,
         &action_read_ref,
         json!([
@@ -522,7 +541,7 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         ]),
     )
     .await?;
-    create_permission_set(
+    let action_execute = create_permission_set(
         &ctx.pool,
         &action_execute_ref,
         json!([
@@ -534,6 +553,9 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         ]),
     )
     .await?;
+    for set in [&runtime_read, &worker_read, &action_read, &action_execute] {
+        assign_permission_set(&ctx.pool, &identity, set).await?;
+    }
 
     let missing_token = ctx.get("/api/v1/runtimes", None).await?;
     assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);

@@ -65,10 +65,12 @@ API `TestContext` retains the owner and stops router/audit tasks before database
 1. stop the clone's TimescaleDB background workers (5-second bound);
 2. close the clone pool (5-second bound);
 3. connect to the cluster administrator database (10-second bound);
-4. force-drop the exact generated clone (30-second bound, including any checkpoint PostgreSQL requires);
+4. force-drop the exact generated clone (120-second bound, including any checkpoint PostgreSQL requires);
 5. aggregate and return cleanup errors.
 
 `DROP DATABASE ... WITH (FORCE)` terminates sessions only in the exact owned clone; neighboring databases are untouched. The drop fallback performs the same exact cleanup on a joined helper thread so panic/partial-construction recovery does not detach a writer.
+
+Physical clone creation and drop can force cluster-wide checkpoints. On container storage, a four-thread PostgreSQL 18 run spent 37 seconds syncing a required checkpoint while drops waited on `CheckpointStart` and `CheckpointDone`. The DDL deadline allows that work to finish without changing test assertions, adding retries, or suppressing cleanup failures.
 
 `crates/common/tests/test_database_lifecycle_tests.rs` covers explicit cleanup, panic/drop recovery, and a held lock/checkout. `crates/api/tests/authz_cache_isolation_tests.rs` covers partial API construction and equal-primary-ID cache isolation.
 

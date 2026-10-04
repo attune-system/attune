@@ -7,8 +7,8 @@ use attune_common::{
     },
     repositories::{
         identity::{
-            CreateIdentityInput, CreatePermissionSetInput, IdentityRepository,
-            PermissionSetRepository,
+            CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository,
         },
         rule::{CreateRuleInput, RuleRepository},
         Create, FindByRef,
@@ -108,7 +108,7 @@ async fn execution_token_with_rules_update_permission_can_update_trace_tag_templ
     let ctx = TestContext::new().await?;
     let (rule_ref, identity_id) = seed_rule_and_identity(&ctx, "allowed").await?;
     let permission_set_ref = "test.rule_update";
-    PermissionSetRepository::create(
+    let permission_set = PermissionSetRepository::create(
         &ctx.pool,
         CreatePermissionSetInput {
             r#ref: permission_set_ref.to_string(),
@@ -117,6 +117,14 @@ async fn execution_token_with_rules_update_permission_can_update_trace_tag_templ
             label: Some("Rule update".to_string()),
             description: None,
             grants: json!([{ "resource": "rules", "actions": ["update"] }]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity_id,
+            permset: permission_set.id,
         },
     )
     .await?;
@@ -147,5 +155,6 @@ async fn execution_token_with_rules_update_permission_can_update_trace_tag_templ
         Some("authorized-change")
     );
 
+    ctx.cleanup().await?;
     Ok(())
 }

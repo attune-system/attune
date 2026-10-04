@@ -260,6 +260,7 @@ struct Harness {
     controls: Vec<Arc<StoreControl>>,
     _root: tempfile::TempDir,
     worker_token: String,
+    execution_identity: i64,
     jwt: JwtConfig,
 }
 
@@ -298,6 +299,17 @@ impl Harness {
             refresh_token_expiration: 3600,
         };
         let worker_token = generate_worker_token(1, "replica-test", &jwt, None)?;
+        let execution_identity = IdentityRepository::create(
+            database.pool(),
+            CreateIdentityInput {
+                login: format!("replica-executor-{}", uuid::Uuid::new_v4().simple()),
+                display_name: None,
+                password_hash: None,
+                attributes: serde_json::json!({}),
+            },
+        )
+        .await?
+        .id;
         let mut replicas = Vec::new();
         let mut controls = Vec::new();
         for listen_for_notifications in notification_listeners {
@@ -345,6 +357,7 @@ impl Harness {
             controls,
             _root: root,
             worker_token,
+            execution_identity,
             jwt,
         })
     }
@@ -406,7 +419,7 @@ impl Harness {
                 env_vars: None,
                 parent: None,
                 enforcement: None,
-                executor: None,
+                executor: Some(self.execution_identity),
                 permission_set_refs: Vec::new(),
                 artifact_retention_policy: None,
                 artifact_retention_limit: None,
@@ -451,8 +464,13 @@ impl Harness {
             100,
         )
         .await?;
-        let execution_token =
-            generate_execution_token(1, execution_id, action_ref, &self.jwt, None)?;
+        let execution_token = generate_execution_token(
+            self.execution_identity,
+            execution_id,
+            action_ref,
+            &self.jwt,
+            None,
+        )?;
         Ok(LogFixture {
             execution_id,
             artifact_id,
