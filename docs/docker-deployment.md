@@ -19,7 +19,7 @@ This guide explains how to deploy Attune using Docker and Docker Compose.
 Attune uses Docker Compose to orchestrate multiple services:
 
 - **Infrastructure Services**:
-  - PostgreSQL 16 (database)
+  - Stock PostgreSQL 18, with PostgreSQL 16 as the minimum supported version
   - RabbitMQ 3.13 (message queue)
   - Redis 7 (cache)
 
@@ -32,6 +32,11 @@ Attune uses Docker Compose to orchestrate multiple services:
   - `attune-web` - React web UI (port 3000)
 
 All services communicate via a dedicated Docker network and use persistent volumes for data storage.
+
+No TimescaleDB extension is required. The database uses the new
+`postgres_data_plain_pg18` volume. Before deploying against existing data, read
+[PostgreSQL-only deployment](deployment/postgresql-only.md) for the separate
+conversion or reset decision and migration-checksum requirements.
 
 ## Prerequisites
 
@@ -573,13 +578,15 @@ BuildKit cache can grow to 5-10GB but dramatically speeds up rebuilds.
 2. **Volume backups**:
    ```bash
    # Backup volumes
-   docker run --rm -v attune_postgres_data_pg18:/data -v $(pwd):/backup \
+   docker run --rm -v attune_postgres_data_plain_pg18:/data -v $(pwd):/backup \
      alpine tar czf /backup/postgres_backup.tar.gz /data
    ```
 
-   PostgreSQL 16 data directories are not compatible with PostgreSQL 18.
-   Upgrade with a logical `pg_dump` and restore; do not attach the old volume
-   to the PostgreSQL 18 container.
+   Use the actual Compose project prefix for the volume name. PostgreSQL 16
+   data directories are not compatible with PostgreSQL 18. Existing TimescaleDB
+   databases also require an explicit conversion, even on the same PostgreSQL
+   major version. See [PostgreSQL-only deployment](deployment/postgresql-only.md)
+   before restoring or changing database volumes.
 
 3. **Automated backups**:
    - Use backup solutions (Velero, Restic)

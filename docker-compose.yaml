@@ -34,7 +34,7 @@ services:
   # ============================================================================
 
   postgres:
-    image: timescale/timescaledb:2.30.1-pg18
+    image: postgres:18-alpine
     container_name: attune-postgres
     shm_size: 256mb
     environment:
@@ -45,7 +45,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data_pg18:/var/lib/postgresql
+      - postgres_data_plain_pg18:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U attune"]
       interval: 10s
@@ -961,7 +961,7 @@ services:
 # Volumes
 # ============================================================================
 volumes:
-  postgres_data_pg18:
+  postgres_data_plain_pg18:
     driver: local
   rabbitmq_data_v4:
     driver: local

@@ -1,7 +1,7 @@
 //! Entity history API routes
 //!
-//! Provides read-only access to the TimescaleDB entity history hypertables.
-//! History records are written by PostgreSQL triggers — these endpoints only query them.
+//! Provides read-only access to ordinary PostgreSQL entity history tables.
+//! PostgreSQL triggers append history records. These endpoints only query them.
 
 use axum::{
     extract::{Path, Query, State},

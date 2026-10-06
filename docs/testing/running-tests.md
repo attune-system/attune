@@ -23,7 +23,10 @@ make test-sensor
 make test-cli
 ```
 
-Database-backed Rust tests run normally and require PostgreSQL/TimescaleDB:
+Database-backed Rust tests run normally and require stock PostgreSQL 16 or newer.
+Compose and CI default to PostgreSQL 18. No TimescaleDB extension or preload is
+required. Use a disposable cluster and follow
+[PostgreSQL-only deployment](../deployment/postgresql-only.md) for existing-data decisions.
 
 ```bash
 ATTUNE_TEST_RUN_ID=local1 \
@@ -109,7 +112,11 @@ After the migration fixture optimization, three four-thread warm samples retaine
 
 A later 1+3 executable-overlap prototype made the common lane slower at 456.911 seconds because `migration_tests` grew to 272.83 seconds under concurrent database DDL. The runner does not overlap executables. Fresh migration databases now include the run token in their names, and benchmark resource checks count their databases and sessions.
 
-Stopping each clone's TimescaleDB background workers before teardown reduced a two-test lifecycle sample from 14.43 seconds to 1.54 seconds on Docker Desktop. The multi-stage image and stronger executable stripping reduced image size from 5.07 GB to 2.44 GB; ignored-test artifacts fell from 2.1 GB to 1.6 GB. A runtime-harness-only rebuild now takes about 26 seconds without recompiling Rust.
+The timing samples above predate TimescaleDB removal and are historical
+baselines, not PostgreSQL-only performance measurements. Current fixtures do
+not start or stop TimescaleDB background workers. The historical multi-stage
+image and executable-stripping measurements reduced image size from 5.07 GB
+to 2.44 GB; ignored-test artifacts fell from 2.1 GB to 1.6 GB.
 
 ## Cleanup and leak checks
 

@@ -182,8 +182,7 @@ export interface DashboardSourceError {
 
 export interface DashboardSourceMeta {
   authorization_mode: "operator_global" | "identity_filtered";
-  freshness_mode:
-    "raw_only" | "aggregate_only" | "aggregate_plus_tail" | "raw_only_fallback";
+  freshness_mode: "raw_only" | "raw_only_fallback";
   aggregate_watermark: string | null;
   cache_hit: boolean;
   bucket_size: string | null;

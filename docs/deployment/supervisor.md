@@ -27,18 +27,25 @@ Use the web UI **Runtime Retention** page (`/retention`) or the API:
 
 Retention changes are audited as maintenance/admin audit events.
 
-The default database seed enables all targets, runs every 3600 seconds, deletes up to 1000 regular-table rows per target per cycle, and uses dry-run mode `false`.
+The default database seed enables all targets, runs every 3600 seconds, and uses
+dry-run mode `false`. Each target can delete up to 100 batches of 1000 rows per
+cycle. Both limits must be positive.
+
+Each target run uses one fixed cutoff and counts eligible rows once. Each batch
+commits separately. A target stops when a batch deletes no rows, its batch budget
+is consumed, or cancellation is requested between batches. Remaining backlog
+waits for the next cycle, so a busy target does not prevent later targets and
+maintenance steps from running. The leader advisory lock covers the whole cycle.
 
 | Target key | Default max age | Purge behavior |
 | --- | ---: | --- |
-| `events` | 30 days | Drops old `event` hypertable chunks. |
+| `events` | 30 days | Deletes `event` rows by `created`. |
 | `enforcements` | 30 days | Deletes only non-`created` rows older than the cutoff. |
 | `executions` | 30 days | Deletes only terminal executions (`completed`, `failed`, `cancelled`, `timeout`, `abandoned`) by `updated`. |
-| `execution_history` | 30 days | Drops old `execution_history` hypertable chunks. |
-| `worker_history` | 30 days | Drops old `worker_history` hypertable chunks. |
-| `sensor_process_history` | 30 days | Drops old `sensor_process_history` hypertable chunks. |
-| `audit_events` | 90 days | Drops old `audit_event` hypertable chunks. |
-| `continuous_aggregates` | 30 days | Drops old continuous-aggregate materialization chunks. |
+| `execution_history` | 30 days | Deletes history rows by `time`. |
+| `worker_history` | 30 days | Deletes history rows by `time`. |
+| `sensor_process_history` | 30 days | Deletes history rows by `time`. |
+| `audit_events` | 90 days | Deletes `audit_event` rows by `created`. |
 | `notifications` | 30 days | Deletes rows older than the cutoff. |
 | `webhook_event_logs` | 30 days | Deletes rows older than the cutoff. |
 | `inquiries` | 30 days | Deletes only terminal inquiries (`responded`, `timeout`, `cancelled`) by `updated`. |
@@ -50,6 +57,16 @@ The default database seed enables all targets, runs every 3600 seconds, deletes 
 | `sensor_processes` | 30 days | Deletes only `stopped`/`failed` processes with `active_rule_count = 0`. |
 
 Set a target's `enabled` field to `false` to skip it. Set `max_age_seconds` to `null` to keep that target forever while still leaving it visible in configuration.
+
+Retention preserves operational-row protections, including waiting workflows
+and undelivered runtime logs. Relationship IDs can intentionally dangle after
+independent retention removes their source rows. Audit output reports actual
+rows deleted, including history and audit targets. Dry runs count candidates
+without deleting rows.
+
+Hourly analytics use ordinary views over retained raw records. Counts change as
+soon as retention deletes source rows; there is no separately retained summary
+or `continuous_aggregates` setting. See [PostgreSQL-only deployment](postgresql-only.md).
 
 ### Artifact cleanup
 
@@ -188,6 +205,7 @@ Example API payload:
   "enabled": true,
   "check_interval_seconds": 3600,
   "batch_size": 1000,
+  "max_batches_per_target": 100,
   "dry_run": false,
   "advisory_lock_key": 7821001,
   "targets": {
@@ -202,8 +220,9 @@ Example API payload:
 | --- | ---: | --- |
 | `enabled` | `true` | Master switch for runtime retention. Maintenance jobs still use `maintenance.enabled`. |
 | `check_interval_seconds` | `3600` | Delay between supervisor cycles. Must be greater than zero. |
-| `batch_size` | `1000` | Maximum rows deleted per regular-table target per cycle. Hypertable targets drop chunks instead. |
-| `dry_run` | `false` | Counts candidates and emits audit/log output without deleting rows or chunks. |
+| `batch_size` | `1000` | Maximum rows deleted per batch for each target. Must be greater than zero. |
+| `max_batches_per_target` | `100` | Maximum delete batches per target per cycle. Must be greater than zero. |
+| `dry_run` | `false` | Counts candidates and emits audit/log output without deleting rows. |
 | `advisory_lock_key` | `7821001` | PostgreSQL advisory lock key used to make multiple supervisors safe. |
 | `targets.<target>.max_age_seconds` | target default | Maximum retained age. Use `null` to keep forever (purging disabled for that target). Must not be `0`. |
 

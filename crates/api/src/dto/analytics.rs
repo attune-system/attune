@@ -1,7 +1,6 @@
 //! Analytics DTOs for API requests and responses
 //!
-//! These types represent the API-facing view of analytics data derived from
-//! TimescaleDB continuous aggregates over entity history hypertables.
+//! Analytics over retained records, grouped into UTC hours without refresh delay.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,11 +18,11 @@ use attune_common::repositories::analytics::{
 /// Common query parameters for analytics endpoints.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct AnalyticsQueryParams {
-    /// Start of time range (ISO 8601). Defaults to 24 hours ago.
+    /// Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
     #[param(example = "2026-02-25T00:00:00Z")]
     pub since: Option<DateTime<Utc>>,
 
-    /// End of time range (ISO 8601). Defaults to now.
+    /// Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
     #[param(example = "2026-02-26T00:00:00Z")]
     pub until: Option<DateTime<Utc>>,
 
@@ -150,16 +149,16 @@ pub struct FailureRateResponse {
     pub since: DateTime<Utc>,
     /// Time range end
     pub until: DateTime<Utc>,
-    /// Total executions reaching a terminal state in the window
+    /// Total transitions to completed, failed, or timeout in the included hours
     #[schema(example = 100)]
     pub total_terminal: i64,
-    /// Number of failed executions
+    /// Number of transitions to failed, including retry attempts
     #[schema(example = 12)]
     pub failed_count: i64,
-    /// Number of timed-out executions
+    /// Number of transitions to timeout, including retry attempts
     #[schema(example = 3)]
     pub timeout_count: i64,
-    /// Number of completed executions
+    /// Number of transitions to completed
     #[schema(example = 85)]
     pub completed_count: i64,
     /// Failure rate as a percentage (0.0 – 100.0)

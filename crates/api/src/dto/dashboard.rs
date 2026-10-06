@@ -349,8 +349,6 @@ pub enum DashboardAuthorizationMode {
 #[serde(rename_all = "snake_case")]
 pub enum DashboardFreshnessMode {
     RawOnly,
-    AggregateOnly,
-    AggregatePlusTail,
     RawOnlyFallback,
 }
 

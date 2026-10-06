@@ -3,7 +3,7 @@ import { apiClient } from "@/lib/api-client";
 
 /**
  * Supported entity types for history queries.
- * Maps to the TimescaleDB history hypertables.
+ * Maps to the PostgreSQL history tables.
  */
 export type HistoryEntityType = "execution" | "worker";
 

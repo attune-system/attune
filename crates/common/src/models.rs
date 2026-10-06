@@ -2261,7 +2261,7 @@ pub mod artifact_version {
         pub artifact: Id,
         /// Version number (1-based, monotonically increasing per artifact)
         pub version: i32,
-        /// Optional execution that produced this version (no FK — execution is a hypertable)
+        /// Optional producing execution. No FK, so the version can outlive execution retention.
         pub execution: Option<Id>,
         /// MIME content type for this version
         pub content_type: Option<String>,
@@ -3088,20 +3088,20 @@ pub mod pack_test {
     }
 }
 
-/// Entity history tracking models (TimescaleDB hypertables)
+/// Entity history tracking models for ordinary PostgreSQL tables.
 ///
-/// These models represent rows in the `<entity>_history` append-only hypertables
+/// These models represent rows in the `<entity>_history` append-only tables
 /// that track field-level changes to operational tables via PostgreSQL triggers.
 pub mod entity_history {
     use super::*;
 
     /// A single history record capturing a field-level change to an entity.
     ///
-    /// History records are append-only and populated by PostgreSQL triggers —
-    /// they are never created or modified by application code.
+    /// PostgreSQL triggers append history records. Retention can delete expired
+    /// records; application code does not create or update them.
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct EntityHistoryRecord {
-        /// When the change occurred (hypertable partitioning dimension)
+        /// When the change occurred. History queries and retention use this timestamp.
         pub time: DateTime<Utc>,
 
         /// The operation that produced this record: `INSERT`, `UPDATE`, or `DELETE`
@@ -3125,7 +3125,7 @@ pub mod entity_history {
 
     /// Supported entity types that have history tracking.
     ///
-    /// Each variant maps to a `<name>_history` hypertable in the database.
+    /// Each variant maps to a `<name>_history` table in the database.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
     pub enum HistoryEntityType {

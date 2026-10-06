@@ -173,19 +173,19 @@ installer. It does not implement that coordinator or change the wire formats.
 
 ## Verification
 
-Use the separate local `attune_test` database with PostgreSQL 16 and TimescaleDB
-2.17 or newer. Each integration test owns and removes its schema.
-Install TimescaleDB into `public` before application migrations so its functions
-are visible to each test schema. The Python boundary tests require `psycopg2-binary`
+Use a disposable stock PostgreSQL 16 or newer cluster. Compose and CI default
+to PostgreSQL 18, with no TimescaleDB extension required. Each integration test
+owns and removes its database clone. See [Running tests](../testing/running-tests.md)
+for database setup and invocation ownership. The Python boundary tests require `psycopg2-binary`
 and `PyYAML`; set `ATTUNE_TEST_PYTHON` to a virtualenv interpreter if they are not
 installed for `python3`. `ATTUNE__DATABASE__URL` can select a disposable test
 database instead of the default local `attune_test`.
 
 ```sh
 make db-test-setup
-cargo test -p attune-common --lib platform_catalog::tests
-cargo test -p attune-common --test platform_catalog_tests -- --test-threads=4
-cargo test -p attune-common --test platform_catalog_boundary_tests -- --test-threads=4
+ATTUNE_TEST_RUN_ID=catalog-unit cargo test -p attune-common --lib platform_catalog::tests -- --test-threads=4
+ATTUNE_TEST_RUN_ID=catalog-repo cargo test -p attune-common --test platform_catalog_tests -- --test-threads=4
+ATTUNE_TEST_RUN_ID=catalog-boundary cargo test -p attune-common --test platform_catalog_boundary_tests -- --test-threads=4
 ```
 
 The integration tests cover fresh and concurrent reconciliation, repeat

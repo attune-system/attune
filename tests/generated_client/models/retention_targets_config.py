@@ -25,10 +25,6 @@ class RetentionTargetsConfig:
 
             A target with `max_age_seconds: None` keeps rows forever (purging disabled).
             A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-        continuous_aggregates (RetentionTargetConfig | Unset): Runtime database row retention settings.
-
-            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
         enforcements (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
             A target with `max_age_seconds: None` keeps rows forever (purging disabled).
@@ -92,7 +88,6 @@ class RetentionTargetsConfig:
     """
 
     audit_events: RetentionTargetConfig | Unset = UNSET
-    continuous_aggregates: RetentionTargetConfig | Unset = UNSET
     enforcements: RetentionTargetConfig | Unset = UNSET
     events: RetentionTargetConfig | Unset = UNSET
     execution_admission: RetentionTargetConfig | Unset = UNSET
@@ -114,10 +109,6 @@ class RetentionTargetsConfig:
         audit_events: dict[str, Any] | Unset = UNSET
         if not isinstance(self.audit_events, Unset):
             audit_events = self.audit_events.to_dict()
-
-        continuous_aggregates: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.continuous_aggregates, Unset):
-            continuous_aggregates = self.continuous_aggregates.to_dict()
 
         enforcements: dict[str, Any] | Unset = UNSET
         if not isinstance(self.enforcements, Unset):
@@ -184,8 +175,6 @@ class RetentionTargetsConfig:
         field_dict.update({})
         if audit_events is not UNSET:
             field_dict["audit_events"] = audit_events
-        if continuous_aggregates is not UNSET:
-            field_dict["continuous_aggregates"] = continuous_aggregates
         if enforcements is not UNSET:
             field_dict["enforcements"] = enforcements
         if events is not UNSET:
@@ -232,15 +221,6 @@ class RetentionTargetsConfig:
             audit_events = UNSET
         else:
             audit_events = RetentionTargetConfig.from_dict(_audit_events)
-
-        _continuous_aggregates = d.pop("continuous_aggregates", UNSET)
-        continuous_aggregates: RetentionTargetConfig | Unset
-        if isinstance(_continuous_aggregates, Unset):
-            continuous_aggregates = UNSET
-        else:
-            continuous_aggregates = RetentionTargetConfig.from_dict(
-                _continuous_aggregates
-            )
 
         _enforcements = d.pop("enforcements", UNSET)
         enforcements: RetentionTargetConfig | Unset
@@ -355,7 +335,6 @@ class RetentionTargetsConfig:
 
         retention_targets_config = cls(
             audit_events=audit_events,
-            continuous_aggregates=continuous_aggregates,
             enforcements=enforcements,
             events=events,
             execution_admission=execution_admission,

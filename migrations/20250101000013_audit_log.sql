@@ -1,13 +1,10 @@
 -- Migration: Audit Log
--- Description: Creates the audit_event TimescaleDB hypertable that captures
+-- Description: Creates the audit_event table that captures
 --              security- and compliance-relevant events across Attune services
 --              (API requests, auth, RBAC denials, secret access, admin/config
 --              changes, execution lifecycle, pack registration).
 --
---              The audit table is a hypertable partitioned on `created`. Like
---              other hypertables in the system (event/enforcement/execution),
---              it CANNOT be the target of FK constraints. Therefore actor and
---              resource references are plain BIGINT columns with denormalized
+--              Actor and resource references are plain BIGINT columns with denormalized
 --              text fields (`actor_login`, `resource_ref`) so records survive
 --              the deletion of the referenced row.
 -- Version: 20250101000013
@@ -48,7 +45,7 @@ CREATE TABLE audit_event (
     event_type          TEXT                                NOT NULL,
     outcome             audit_outcome_enum                  NOT NULL,
 
-    -- Actor (denormalized; no FK because hypertables cannot be FK targets)
+    -- Actor (denormalized; no FK so audit records survive actor deletion)
     actor_identity      BIGINT,
     actor_login         TEXT,
     actor_token_type    TEXT,
@@ -75,15 +72,14 @@ CREATE TABLE audit_event (
     -- Optional cascade chain ({rule_id, enforcement_id, execution_id, parent_request_id})
     correlation_chain   JSONB,
 
-    -- Composite PK is required by TimescaleDB when partitioning column is not the first PK column
-    PRIMARY KEY (id, created)
+    PRIMARY KEY (id)
 );
 
-COMMENT ON TABLE  audit_event IS 'Security-grade audit trail (TimescaleDB hypertable, partitioned on created).';
+COMMENT ON TABLE  audit_event IS 'Security-grade audit trail.';
 COMMENT ON COLUMN audit_event.category          IS 'Top-level category of the audit event.';
 COMMENT ON COLUMN audit_event.event_type        IS 'Dotted event-type identifier, e.g. auth.login.success, rbac.denied, key.read.';
 COMMENT ON COLUMN audit_event.outcome           IS 'Outcome of the action: success, failure, or denied.';
-COMMENT ON COLUMN audit_event.actor_identity    IS 'identity.id of the actor (NULL for anonymous/pre-auth events). No FK; hypertables cannot reference tables that may delete rows referenced from history.';
+COMMENT ON COLUMN audit_event.actor_identity    IS 'identity.id of the actor (NULL for anonymous/pre-auth events). No FK so audit records survive actor deletion.';
 COMMENT ON COLUMN audit_event.actor_login       IS 'Snapshot of identity.login at the time of the event (forensic).';
 COMMENT ON COLUMN audit_event.actor_token_type  IS 'Type of token presented: access, execution, sensor, refresh, or NULL.';
 COMMENT ON COLUMN audit_event.request_id        IS 'UUID correlation ID assigned by the API request middleware; propagated to downstream events when available.';
@@ -93,17 +89,10 @@ COMMENT ON COLUMN audit_event.details           IS 'Event-specific structured me
 COMMENT ON COLUMN audit_event.correlation_chain IS 'Optional cascade lineage: {rule_id, enforcement_id, execution_id, parent_request_id} for events caused by a chain.';
 
 -- ============================================================================
--- HYPERTABLE
--- ============================================================================
-
-SELECT create_hypertable('audit_event', 'created',
-    chunk_time_interval => INTERVAL '1 day');
-
--- ============================================================================
 -- INDEXES
 -- ============================================================================
 
--- Hypertable already creates a (created DESC) index on each chunk.
+CREATE INDEX idx_audit_event_created ON audit_event (created DESC);
 
 CREATE INDEX idx_audit_event_actor
     ON audit_event (actor_identity, created DESC)
@@ -218,17 +207,3 @@ CREATE TRIGGER trg_audit_execution_lifecycle
     AFTER INSERT OR UPDATE OF status ON execution
     FOR EACH ROW
     EXECUTE FUNCTION audit_execution_lifecycle();
-
--- ============================================================================
--- COMPRESSION
--- ============================================================================
--- Do not register database-global background jobs for temporary test schemas.
-
-ALTER TABLE audit_event SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'category, actor_identity',
-    timescaledb.compress_orderby   = 'created DESC, id DESC'
-);
-
-SELECT add_compression_policy('audit_event', INTERVAL '7 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';

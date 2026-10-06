@@ -1,5 +1,14 @@
 # WYSIWYG Dashboard Builder MVP Requirements
 
+## Current analytics data behavior
+
+Dashboard analytics query retained raw PostgreSQL records. Successful queries
+report `meta.freshness_mode: raw_only` with `meta.aggregate_watermark: null`.
+There is no aggregate refresh delay. Hourly buckets align to UTC, and retention
+deletions change subsequent counts immediately. Cached results can precede a
+source change until the next query. Summaries do not survive beyond raw-data
+retention. See [PostgreSQL-only deployment](deployment/postgresql-only.md).
+
 ## 1. Dashboard lifecycle
 - Create dashboard metadata (`ref`, `label`, `description`, `scope`, `visibility`, `tags`, `enabled`, `is_default_home`)
 - Edit dashboard metadata (`label`, `description`, `scope`, `visibility`, `tags`, `enabled`, `is_default_home`)
@@ -77,7 +86,7 @@
 - Deterministic handling of all source states in preview and runtime (`ok`, `empty`, `partial`, `stale`, `forbidden`, `invalid`, `error`)
 - Clear clone semantics (what is copied vs reset)
 - Controlled behavior for partial/planned source types in editor
-- Preview telemetry surfacing (`meta.truncated`, `meta.authorization_mode`, `meta.freshness_mode`, `meta.aggregate_watermark`)
+- Preview telemetry includes `meta.truncated`, `meta.authorization_mode`, and `meta.freshness_mode`. Raw analytics have no aggregate watermark.
 
 ## Nice-to-have post-MVP
 - Revision history browser and restore actions
@@ -96,7 +105,7 @@
 - [ ] Source forms and field mapping controls are driven by API-provided source contract metadata.
 - [ ] Layout editing produces valid positions for required breakpoints with deterministic collision behavior.
 - [ ] Preview and runtime rendering handle source-level `ok/empty/partial/stale/forbidden/invalid/error` states consistently.
-- [ ] Preview surfaces truncation and freshness/watermark metadata where applicable.
+- [ ] Preview displays truncation and raw-only freshness metadata, with no aggregate watermark for raw analytics.
 - [ ] Setting `is_default_home` in a scope is atomic and never violates single-default-per-scope constraints.
 - [ ] `ref` remains immutable after create; rename flow is clone + delete.
 - [ ] RBAC is enforced by API and reflected in UI affordances for all dashboard actions.

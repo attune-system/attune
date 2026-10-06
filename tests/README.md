@@ -325,7 +325,7 @@ pytest -m "container"
 docker run -d --name postgres \
   -e POSTGRES_PASSWORD=postgres \
   -p 5432:5432 \
-  postgres:14
+  postgres:18-alpine
 
 # RabbitMQ
 docker run -d --name rabbitmq \

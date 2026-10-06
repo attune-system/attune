@@ -228,7 +228,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       postgres:
-        image: timescale/timescaledb:2.30.1-pg18
+        image: postgres:18-alpine
         env:
           POSTGRES_USER: attune
           POSTGRES_PASSWORD: attune
@@ -273,7 +273,7 @@ jobs:
           ATTUNE__ENVIRONMENT: test
         run: |
           postgres_container="${{ job.services.postgres.id }}"
-          docker exec "$postgres_container" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET shared_preload_libraries = 'timescaledb', 'pg_stat_statements';"
+          docker exec "$postgres_container" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';"
           docker restart "${{ job.services.postgres.id }}"
           database_ready=false
           for _ in {1..60}; do
@@ -294,7 +294,7 @@ jobs:
             docker logs "$postgres_container"
             exit 1
           fi
-          docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public; CREATE SCHEMA attune; ALTER DATABASE attune_test SET search_path TO attune, public;"
+          docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE SCHEMA attune; ALTER DATABASE attune_test SET search_path TO attune, public;"
           docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;"
           cargo run -p attune-api --bin attune-api -- --config config.test.yaml --migrate
 
@@ -341,7 +341,6 @@ jobs:
           POSTGRES_DB: attune_test
           POSTGRES_USER: attune
           BASELINE_SCHEMA_COUNT: ${{ steps.test-db-baseline.outputs.schema_count }}
-          BASELINE_JOB_COUNT: ${{ steps.test-db-baseline.outputs.job_count }}
           BASELINE_DATABASE_COUNT: ${{ steps.test-db-baseline.outputs.database_count }}
           BASELINE_TEMPLATE_COUNT: ${{ steps.test-db-baseline.outputs.template_count }}
         run: bash scripts/ci-test-db-safety.sh cleanup

@@ -24,7 +24,7 @@ Workflows are composable YAML-based action graphs that enable complex automation
 ```bash
 # Ensure you have:
 - Rust 1.70+
-- PostgreSQL 14+
+- Stock PostgreSQL 16+, no TimescaleDB extension required
 - RabbitMQ 3.12+
 - Docker (for testing)
 

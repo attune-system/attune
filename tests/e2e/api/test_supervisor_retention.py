@@ -32,7 +32,6 @@ ALL_RETENTION_TARGETS = [
     "worker_history",
     "sensor_process_history",
     "audit_events",
-    "continuous_aggregates",
     "notifications",
     "webhook_event_logs",
     "inquiries",
@@ -146,6 +145,7 @@ def _write_supervisor_config(
             "enabled": True,
             "check_interval_seconds": 1,
             "batch_size": 500,
+            "max_batches_per_target": 100,
             "dry_run": dry_run,
             "advisory_lock_key": 7_900_000 + int(uuid.uuid4().hex[:5], 16),
             "targets": targets,
@@ -164,7 +164,8 @@ def _write_supervisor_config(
 def _snapshot_runtime_retention_config(cur) -> dict[str, object]:
     cur.execute(
         """
-        SELECT enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key
+        SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target,
+               dry_run, advisory_lock_key, cache_retention
         FROM runtime_retention_config
         WHERE id = TRUE
         """
@@ -194,11 +195,12 @@ def _restore_runtime_retention_config(snapshot: dict[str, object] | None):
                 cur.execute(
                     """
                     INSERT INTO runtime_retention_config (
-                        id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key
+                        id, enabled, check_interval_seconds, batch_size, max_batches_per_target,
+                        dry_run, advisory_lock_key, cache_retention
                     )
-                    VALUES (TRUE, %s, %s, %s, %s, %s)
+                    VALUES (TRUE, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     """,
-                    config,
+                    (*config[:-1], json.dumps(config[-1])),
                 )
             cur.executemany(
                 """
@@ -219,22 +221,27 @@ def _configure_runtime_retention(
     max_age_seconds: int = 5,
     dry_run: bool = False,
     enabled: bool = True,
+    batch_size: int = 500,
+    max_batches_per_target: int = 100,
+    check_interval_seconds: int = 1,
 ) -> None:
     advisory_lock_key = 7_900_000 + int(uuid.uuid4().hex[:5], 16)
     cur.execute(
         """
         INSERT INTO runtime_retention_config (
-            id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key
+            id, enabled, check_interval_seconds, batch_size, max_batches_per_target,
+            dry_run, advisory_lock_key
         )
-        VALUES (TRUE, %s, 1, 500, %s, %s)
+        VALUES (TRUE, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE SET
             enabled = EXCLUDED.enabled,
             check_interval_seconds = EXCLUDED.check_interval_seconds,
             batch_size = EXCLUDED.batch_size,
+            max_batches_per_target = EXCLUDED.max_batches_per_target,
             dry_run = EXCLUDED.dry_run,
             advisory_lock_key = EXCLUDED.advisory_lock_key
         """,
-        (enabled, dry_run, advisory_lock_key),
+        (enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key),
     )
     for target in ALL_RETENTION_TARGETS:
         cur.execute(
@@ -1407,7 +1414,7 @@ class TestSupervisorRetention:
             conn.close()
             _cleanup_marker(marker)
 
-    def test_supervisor_emits_retention_lag_alerts(self, tmp_path):
+    def test_supervisor_runs_later_targets_and_lag_monitoring_after_batch_budget(self, tmp_path):
         marker = f"retention-lag-{_uid()}"
         conn, schema = _connect()
         process: subprocess.Popen | None = None
@@ -1429,11 +1436,9 @@ class TestSupervisorRetention:
                 cur.execute(
                     """
                     INSERT INTO execution (action, action_ref, status, config, created, updated)
-                    VALUES (
-                        %s, %s, 'completed', %s::jsonb,
-                        NOW() - INTERVAL '20 seconds',
-                        NOW() - INTERVAL '20 seconds'
-                    )
+                    SELECT %s, %s, 'completed', %s::jsonb,
+                           NOW() - INTERVAL '2 days', NOW() - INTERVAL '2 days'
+                    FROM generate_series(1, 5)
                     RETURNING id
                     """,
                     (
@@ -1442,13 +1447,24 @@ class TestSupervisorRetention:
                         f'{{"marker":"{marker}","kind":"retention-lag-candidate"}}',
                     ),
                 )
-                execution_id = cur.fetchone()[0]
+                execution_ids = [row[0] for row in cur.fetchall()]
+                cur.execute(
+                    """
+                    INSERT INTO notification (channel, entity_type, entity, activity, content, created)
+                    VALUES ('e2e', 'execution', %s, 'completed', %s::jsonb,
+                            NOW() - INTERVAL '2 days') RETURNING id
+                    """,
+                    (str(execution_ids[0]), json.dumps({"marker": marker})),
+                )
+                notification_id = cur.fetchone()[0]
                 before_alerts = _alert_count(cur, correlation_id)
                 _configure_runtime_retention(
                     cur,
-                    enabled_targets={"executions"},
-                    max_age_seconds=5,
-                    dry_run=True,
+                    enabled_targets={"executions", "notifications"},
+                    max_age_seconds=86400,
+                    batch_size=1,
+                    max_batches_per_target=2,
+                    check_interval_seconds=3600,
                 )
                 conn.commit()
 
@@ -1471,9 +1487,10 @@ class TestSupervisorRetention:
             def lag_alert_is_written() -> bool:
                 with _connect()[0] as check_conn:
                     with check_conn.cursor() as cur:
-                        assert _count(cur, "execution", "id = %s", (execution_id,)) == 1
+                        assert _count(cur, "execution", "id = ANY(%s)", (execution_ids,)) == 3
+                        assert _count(cur, "notification", "id = %s", (notification_id,)) == 0
                         assert _alert_count(cur, correlation_id) > before_alerts
-                        assert _retention_audit_count(cur, "executions", dry_run=True) >= 1
+                        assert _retention_audit_count(cur, "executions", dry_run=False) >= 1
                 return True
 
             _wait_for_supervisor(process, lag_alert_is_written)
@@ -1692,8 +1709,8 @@ class TestSupervisorRetention:
             conn.close()
             _cleanup_marker(marker)
 
-    def test_supervisor_drops_hypertable_chunks_with_short_retention(self, tmp_path):
-        marker = f"retention-hypertable-{_uid()}"
+    def test_supervisor_deletes_expired_event_history_and_audit_rows(self, tmp_path):
+        marker = f"retention-rows-{_uid()}"
         conn, schema = _connect()
         process: subprocess.Popen | None = None
         retention_snapshot: dict[str, object] | None = None
@@ -1702,14 +1719,15 @@ class TestSupervisorRetention:
             with conn.cursor() as cur:
                 retention_snapshot = _snapshot_runtime_retention_config(cur)
                 ids = _seed_foundation(cur, marker)
-                old_chunk = "NOW() - INTERVAL '40 days'"
+                old = "NOW() - INTERVAL '2 days'"
 
                 cur.execute(
                     f"""
                     INSERT INTO event (
                         trigger, trigger_ref, config, payload, created, rule, rule_ref
                     )
-                    VALUES (%s, %s, %s::jsonb, %s::jsonb, {old_chunk}, %s, %s)
+                    SELECT %s, %s, %s::jsonb, %s::jsonb, {old}, %s, %s
+                    FROM generate_series(1, 5)
                     """,
                     (
                         ids["trigger_id"],
@@ -1725,7 +1743,8 @@ class TestSupervisorRetention:
                     INSERT INTO execution_history (
                         time, operation, entity_id, entity_ref, changed_fields, new_values
                     )
-                    VALUES ({old_chunk}, 'INSERT', 9000001, %s, ARRAY['status'], %s::jsonb)
+                    SELECT {old}, 'INSERT', 9000001, %s, ARRAY['status'], %s::jsonb
+                    FROM generate_series(1, 5)
                     """,
                     (f"{marker}-execution-history", f'{{"marker":"{marker}"}}'),
                 )
@@ -1734,7 +1753,8 @@ class TestSupervisorRetention:
                     INSERT INTO worker_history (
                         time, operation, entity_id, entity_ref, changed_fields, new_values
                     )
-                    VALUES ({old_chunk}, 'INSERT', 9000002, %s, ARRAY['status'], %s::jsonb)
+                    SELECT {old}, 'INSERT', 9000002, %s, ARRAY['status'], %s::jsonb
+                    FROM generate_series(1, 5)
                     """,
                     (f"{marker}-worker-history", f'{{"marker":"{marker}"}}'),
                 )
@@ -1744,7 +1764,8 @@ class TestSupervisorRetention:
                         time, operation, entity_id, entity_ref, worker_name,
                         changed_fields, new_values
                     )
-                    VALUES ({old_chunk}, 'INSERT', 9000003, %s, %s, ARRAY['status'], %s::jsonb)
+                    SELECT {old}, 'INSERT', 9000003, %s, %s, ARRAY['status'], %s::jsonb
+                    FROM generate_series(1, 5)
                     """,
                     (
                         f"{marker}-sensor-process-history",
@@ -1757,7 +1778,8 @@ class TestSupervisorRetention:
                     INSERT INTO audit_event (
                         created, category, event_type, outcome, details
                     )
-                    VALUES ({old_chunk}, 'api', 'e2e.retention', 'success', %s::jsonb)
+                    SELECT {old}, 'api', 'e2e.retention', 'success', %s::jsonb
+                    FROM generate_series(1, 5)
                     """,
                     (f'{{"marker":"{marker}"}}',),
                 )
@@ -1770,6 +1792,10 @@ class TestSupervisorRetention:
                         "sensor_process_history",
                         "audit_events",
                     },
+                    batch_size=2,
+                    max_batches_per_target=3,
+                    check_interval_seconds=3600,
+                    max_age_seconds=86400,
                 )
                 conn.commit()
 
@@ -1780,7 +1806,7 @@ class TestSupervisorRetention:
             )
             process = _start_supervisor(config_path)
 
-            def hypertable_rows_are_gone() -> bool:
+            def expired_rows_are_gone() -> bool:
                 with _connect()[0] as check_conn:
                     with check_conn.cursor() as cur:
                         assert _count(cur, "event", "payload->>'marker' = %s", (marker,)) == 0
@@ -1816,9 +1842,26 @@ class TestSupervisorRetention:
                             == 0
                         )
                         assert _retention_audit_count(cur, "events", dry_run=False) >= 1
+                        for target in [
+                            "events", "execution_history", "worker_history",
+                            "sensor_process_history", "audit_events",
+                        ]:
+                            cur.execute(
+                                """
+                                SELECT details->>'deleted'
+                                FROM audit_event
+                                WHERE event_type = 'maintenance.retention.target_completed'
+                                  AND details->>'service_name' = 'attune-supervisor-e2e'
+                                  AND resource_ref = %s
+                                ORDER BY created DESC LIMIT 1
+                                """,
+                                (target,),
+                            )
+                            row = cur.fetchone()
+                            assert row is not None and int(row[0]) == 5
                 return True
 
-            _wait_for_supervisor(process, hypertable_rows_are_gone)
+            _wait_for_supervisor(process, expired_rows_are_gone)
         finally:
             if process is not None:
                 _stop_supervisor(process)

@@ -49,7 +49,7 @@ function formatRetention(value: number | null | undefined): string {
 }
 
 function cloneConfig(config: RetentionConfig): RetentionConfig {
-  return JSON.parse(JSON.stringify(config)) as RetentionConfig;
+  return structuredClone(config);
 }
 
 export default function RetentionConfigPage() {
@@ -122,6 +122,12 @@ function RetentionConfigEditor({
     }
     if (draft.batch_size <= 0) {
       return "Batch size must be greater than zero.";
+    }
+    if (
+      !Number.isSafeInteger(draft.max_batches_per_target) ||
+      draft.max_batches_per_target <= 0
+    ) {
+      return "Maximum batches per target must be a positive integer.";
     }
     for (const key of retentionTargetKeys) {
       const value = draft.targets[key].max_age_seconds;
@@ -256,7 +262,7 @@ function RetentionConfigEditor({
             These settings control retention cycle cadence and safety behavior.
           </p>
         </div>
-        <div className="grid gap-4 p-6 md:grid-cols-2 lg:grid-cols-5">
+        <div className="grid gap-4 p-6 md:grid-cols-2 lg:grid-cols-3">
           <label className="flex items-center gap-2">
             <input
               type="checkbox"
@@ -301,7 +307,7 @@ function RetentionConfigEditor({
           </label>
           <label className="block">
             <span className="text-sm font-medium text-gray-700">
-              Batch size
+              Rows per batch
             </span>
             <input
               type="number"
@@ -313,6 +319,29 @@ function RetentionConfigEditor({
               }
               className={INPUT_CLASS}
             />
+          </label>
+          <label className="block">
+            <span className="text-sm font-medium text-gray-700">
+              Maximum batches per target
+            </span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={draft.max_batches_per_target}
+              disabled={!canUpdate}
+              onChange={(event) =>
+                setGlobalField(
+                  "max_batches_per_target",
+                  Number(event.target.value),
+                )
+              }
+              className={INPUT_CLASS}
+            />
+            <p className="mt-1 text-xs text-gray-500">
+              Each target deletes at most rows per batch times maximum batches
+              per cycle, then the supervisor continues with other maintenance.
+            </p>
           </label>
           <label className="block">
             <span className="text-sm font-medium text-gray-700">

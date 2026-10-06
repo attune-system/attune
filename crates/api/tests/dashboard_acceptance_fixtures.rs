@@ -84,6 +84,12 @@ pub fn assert_required_source_meta_fields(source: &Value) {
     assert!(meta.get("authorized_refs").is_some());
 }
 
+pub fn assert_raw_source_meta(source: &Value) {
+    assert_required_source_meta_fields(source);
+    assert_eq!(source["meta"]["freshness_mode"], "raw_only");
+    assert_eq!(source["meta"]["aggregate_watermark"], Value::Null);
+}
+
 pub fn source_by_id<'a>(body: &'a Value, source_id: &str) -> &'a Value {
     body["sources"]
         .as_array()

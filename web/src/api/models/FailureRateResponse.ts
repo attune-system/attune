@@ -7,11 +7,11 @@
  */
 export type FailureRateResponse = {
   /**
-   * Number of completed executions
+   * Number of transitions to completed
    */
   completed_count: number;
   /**
-   * Number of failed executions
+   * Number of transitions to failed, including retry attempts
    */
   failed_count: number;
   /**
@@ -23,11 +23,11 @@ export type FailureRateResponse = {
    */
   since: string;
   /**
-   * Number of timed-out executions
+   * Number of transitions to timeout, including retry attempts
    */
   timeout_count: number;
   /**
-   * Total executions reaching a terminal state in the window
+   * Total transitions to completed, failed, or timeout in the included hours
    */
   total_terminal: number;
   /**

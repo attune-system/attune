@@ -8,21 +8,29 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.update_permission_set_request import UpdatePermissionSetRequest
 from ...models.update_permission_set_response_200 import UpdatePermissionSetResponse200
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     id: int,
     *,
     body: UpdatePermissionSetRequest,
+    dry_run: bool | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+
+    params: dict[str, Any] = {}
+
+    params["dry_run"] = dry_run
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "put",
         "url": "/api/v1/permissions/sets/{id}".format(
             id=quote(str(id), safe=""),
         ),
+        "params": params,
     }
 
     _kwargs["json"] = body.to_dict()
@@ -71,10 +79,12 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: UpdatePermissionSetRequest,
+    dry_run: bool | Unset = UNSET,
 ) -> Response[Any | UpdatePermissionSetResponse200]:
     """
     Args:
         id (int):
+        dry_run (bool | Unset):
         body (UpdatePermissionSetRequest):
 
     Raises:
@@ -88,6 +98,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         id=id,
         body=body,
+        dry_run=dry_run,
     )
 
     response = client.get_httpx_client().request(
@@ -102,10 +113,12 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: UpdatePermissionSetRequest,
+    dry_run: bool | Unset = UNSET,
 ) -> Any | UpdatePermissionSetResponse200 | None:
     """
     Args:
         id (int):
+        dry_run (bool | Unset):
         body (UpdatePermissionSetRequest):
 
     Raises:
@@ -120,6 +133,7 @@ def sync(
         id=id,
         client=client,
         body=body,
+        dry_run=dry_run,
     ).parsed
 
 
@@ -128,10 +142,12 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: UpdatePermissionSetRequest,
+    dry_run: bool | Unset = UNSET,
 ) -> Response[Any | UpdatePermissionSetResponse200]:
     """
     Args:
         id (int):
+        dry_run (bool | Unset):
         body (UpdatePermissionSetRequest):
 
     Raises:
@@ -145,6 +161,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         id=id,
         body=body,
+        dry_run=dry_run,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -157,10 +174,12 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: UpdatePermissionSetRequest,
+    dry_run: bool | Unset = UNSET,
 ) -> Any | UpdatePermissionSetResponse200 | None:
     """
     Args:
         id (int):
+        dry_run (bool | Unset):
         body (UpdatePermissionSetRequest):
 
     Raises:
@@ -176,5 +195,6 @@ async def asyncio(
             id=id,
             client=client,
             body=body,
+            dry_run=dry_run,
         )
     ).parsed

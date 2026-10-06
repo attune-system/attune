@@ -39,7 +39,7 @@ use attune_common::{
             MaintenanceRepository, QueueRemediationResult, StaleExecutionCandidate,
             WorkflowRemediationResult,
         },
-        retention::{RetentionRepository, RetentionTarget, RetentionTargetResult},
+        retention::{RetentionRepository, RetentionTargetFailure, RetentionTargetResult},
         storage_maintenance::StorageMaintenanceRepository,
         workflow_cache_iteration::{
             StaleSyntheticCacheIterationCompletion, WorkflowCacheIterationRepository,
@@ -223,6 +223,8 @@ impl SupervisorService {
     }
 
     async fn run_retention_cycle(&self, cycle_reason: SupervisorCycleReason) -> Result<Duration> {
+        let mut shutdown_rx = self.inner.shutdown_tx.subscribe();
+        let mut cancelled = false;
         let retention = RetentionRepository::load_config(&self.inner.pool).await?;
         let interval = Duration::from_secs(retention.check_interval_seconds);
 
@@ -249,6 +251,7 @@ impl SupervisorService {
                 info!(
                     target_count = targets.len(),
                     batch_size = retention.batch_size,
+                    max_batches_per_target = retention.max_batches_per_target,
                     dry_run = retention.dry_run,
                     "Starting retention target cleanup"
                 );
@@ -262,12 +265,18 @@ impl SupervisorService {
                         continue;
                     };
 
-                    match RetentionRepository::run_target(
+                    match RetentionRepository::run_target_bounded(
                         &self.inner.pool,
                         target.target,
                         max_age_seconds,
-                        retention.batch_size,
-                        retention.dry_run,
+                        &retention,
+                        || {
+                            cancelled |= !matches!(
+                                shutdown_rx.try_recv(),
+                                Err(broadcast::error::TryRecvError::Empty)
+                            );
+                            cancelled
+                        },
                     )
                     .await
                     {
@@ -291,15 +300,17 @@ impl SupervisorService {
                         Err(err) => {
                             warn!(
                                 target = target.target.name(),
+                                cutoff = %err.cutoff,
+                                candidates = ?err.candidates,
+                                deleted = err.deleted,
                                 error = %err,
                                 "Retention target failed"
                             );
                             if let Err(audit_err) = self
                                 .audit_retention_target_failed(
-                                    target.target,
+                                    &err,
                                     max_age_seconds,
                                     &retention,
-                                    err.to_string(),
                                 )
                                 .await
                             {
@@ -310,6 +321,10 @@ impl SupervisorService {
                                 );
                             }
                         }
+                    }
+                    if cancelled {
+                        info!("Retention cancelled at a batch boundary");
+                        return Ok(());
                     }
                 }
             } else {
@@ -406,6 +421,7 @@ impl SupervisorService {
             "dry_run": result.dry_run,
             "retention_enabled": retention.enabled,
             "batch_size": retention.batch_size,
+            "max_batches_per_target": retention.max_batches_per_target,
             "advisory_lock_key": retention.advisory_lock_key,
             "service_name": self.inner.config.service_name,
             "environment": self.inner.config.environment,
@@ -429,20 +445,24 @@ impl SupervisorService {
 
     async fn audit_retention_target_failed(
         &self,
-        target: RetentionTarget,
+        failure: &RetentionTargetFailure,
         max_age_seconds: u64,
         retention: &attune_common::config::RetentionConfig,
-        error: String,
     ) -> Result<()> {
         let details = json!({
-            "target": target.name(),
+            "target": failure.target.name(),
+            "cutoff": failure.cutoff.to_rfc3339(),
+            "candidates": failure.candidates,
+            "deleted": failure.deleted,
+            "deleted_count_complete": false,
             "max_age_seconds": max_age_seconds,
-            "dry_run": retention.dry_run,
+            "dry_run": failure.dry_run,
             "batch_size": retention.batch_size,
+            "max_batches_per_target": retention.max_batches_per_target,
             "advisory_lock_key": retention.advisory_lock_key,
             "service_name": self.inner.config.service_name,
             "environment": self.inner.config.environment,
-            "error": error,
+            "error": failure.to_string(),
         });
 
         let event = AuditEventBuilder::new(
@@ -453,7 +473,7 @@ impl SupervisorService {
         .actor_login("attune-supervisor")
         .actor_token_type("system")
         .resource("runtime_retention")
-        .resource_ref(target.name())
+        .resource_ref(failure.target.name())
         .with_details(details)
         .build();
 
@@ -1631,6 +1651,7 @@ mod tests {
             execution::{CreateExecutionInput, ExecutionRepository},
             log_stream::LogStreamRepository,
             object_maintenance::ObjectMaintenanceRepository,
+            retention::RetentionTarget,
             Create,
         },
         test_database::TestDatabase,
@@ -1673,6 +1694,260 @@ mod tests {
     fn supervisor_run_identifiers_include_service_name() {
         assert!(supervisor_instance_id("attune-supervisor").contains("attune-supervisor"));
         assert!(supervisor_run_id("attune-supervisor").contains("attune-supervisor"));
+    }
+
+    #[tokio::test]
+    async fn retention_budget_allows_later_targets_and_lag_monitoring_under_leadership() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.artifact_cleanup_enabled = false;
+        config.maintenance.pack_release_retention_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        config.maintenance.retention_lag_alert_seconds = 1;
+        let mut retention = RetentionConfig {
+            batch_size: 1,
+            max_batches_per_target: 2,
+            ..RetentionConfig::default()
+        };
+        retention.cache_retention.enabled = false;
+        let targets: serde_json::Map<String, serde_json::Value> = RetentionTarget::all()
+            .into_iter()
+            .map(|target| (target.name().to_string(), json!({"max_age_seconds": null})))
+            .collect();
+        retention.targets = serde_json::from_value(json!(targets)).unwrap();
+        retention.targets.events.max_age_seconds = Some(86400);
+        retention.targets.notifications.max_age_seconds = Some(86400);
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO trigger (ref, label) VALUES ('core.alert', 'Core Alert')
+             ON CONFLICT (ref) DO NOTHING",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO event (trigger_ref, created)
+             SELECT 'retention.backlog', NOW() - INTERVAL '2 days' FROM generate_series(1, 5)",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO notification (channel, entity_type, entity, activity, content, created)
+             VALUES ('test', 'execution', '1', 'completed', '{}', NOW() - INTERVAL '2 days')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO execution (action_ref, status, config, created, updated)
+             VALUES ('retention.forever', 'completed', '{}',
+                     NOW() - INTERVAL '2 days', NOW() - INTERVAL '2 days')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                config,
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_tx,
+            }),
+        };
+
+        let mut leader = database.pool().acquire().await.unwrap();
+        assert!(
+            RetentionRepository::try_advisory_lock(&mut leader, retention.advisory_lock_key)
+                .await
+                .unwrap()
+        );
+        service
+            .run_retention_cycle(SupervisorCycleReason::Scheduled)
+            .await
+            .unwrap();
+        let unchanged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(unchanged, 1, "another leader must prevent cleanup");
+        RetentionRepository::advisory_unlock(&mut leader, retention.advisory_lock_key)
+            .await
+            .unwrap();
+
+        service
+            .run_retention_cycle(SupervisorCycleReason::Scheduled)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event WHERE trigger_ref = 'retention.backlog'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining, 3);
+        let notifications: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(notifications, 0, "later targets must run after the budget");
+        let executions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            executions, 1,
+            "unlimited retention must preserve expired rows"
+        );
+        let alerts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event WHERE trigger_ref = 'core.alert'
+               AND payload->>'correlation_id' = 'supervisor:retention-lag:events'
+               AND (payload->'details'->>'count')::BIGINT = 3",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(alerts, 1, "non-retention maintenance must get a turn");
+        let details: serde_json::Value = sqlx::query_scalar(
+            "SELECT details FROM audit_event
+             WHERE event_type = 'maintenance.retention.target_completed' AND resource_ref = 'events'",
+        ).fetch_one(database.pool()).await.unwrap();
+        assert_eq!(details["candidates"], json!(5));
+        assert_eq!(details["deleted"], json!(2));
+        assert_eq!(details["max_batches_per_target"], json!(2));
+        assert!(
+            RetentionRepository::try_advisory_lock(&mut leader, retention.advisory_lock_key)
+                .await
+                .unwrap(),
+            "the cycle must release leadership"
+        );
+        RetentionRepository::advisory_unlock(&mut leader, retention.advisory_lock_key)
+            .await
+            .unwrap();
+        drop(leader);
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_failure_audit_preserves_prior_committed_batches() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = false;
+        let mut retention = RetentionConfig {
+            batch_size: 2,
+            max_batches_per_target: 100,
+            ..RetentionConfig::default()
+        };
+        retention.cache_retention.enabled = false;
+        let targets: serde_json::Map<String, serde_json::Value> = RetentionTarget::all()
+            .into_iter()
+            .map(|target| (target.name().to_string(), json!({"max_age_seconds": null})))
+            .collect();
+        retention.targets = serde_json::from_value(json!(targets)).unwrap();
+        retention.targets.worker_history.max_age_seconds = Some(86400);
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO worker_history (time, operation, entity_id, entity_ref)
+             SELECT NOW() - INTERVAL '2 days' + n * INTERVAL '1 second',
+                    'UPDATE', n, 'retention.failure' FROM generate_series(1, 5) n",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION retention_reject_later_batch() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF OLD.entity_id = 3 THEN
+                     RAISE EXCEPTION 'forced second retention batch failure';
+                 END IF;
+                 RETURN OLD;
+             END;
+             $$;
+             CREATE TRIGGER retention_reject_later_batch
+             BEFORE DELETE ON worker_history FOR EACH ROW
+             EXECUTE FUNCTION retention_reject_later_batch();",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                config,
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_tx,
+            }),
+        };
+        let earliest_cutoff = Utc::now() - ChronoDuration::days(1);
+        service
+            .run_retention_cycle(SupervisorCycleReason::Scheduled)
+            .await
+            .unwrap();
+        let latest_cutoff = Utc::now() - ChronoDuration::days(1);
+        let remaining: Vec<i64> =
+            sqlx::query_scalar("SELECT entity_id FROM worker_history ORDER BY entity_id")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        let details: serde_json::Value = sqlx::query_scalar(
+            "SELECT details FROM audit_event
+             WHERE event_type = 'maintenance.retention.target_failed'
+               AND resource_ref = 'worker_history' AND outcome = 'failure'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        drop(service);
+        database.cleanup().await.unwrap();
+
+        assert_eq!(remaining, vec![3, 4, 5]);
+        assert_eq!(details["deleted"], json!(2));
+        assert_eq!(details["candidates"], json!(5));
+        assert_eq!(details["deleted_count_complete"], json!(false));
+        assert_eq!(details["batch_size"], json!(2));
+        assert_eq!(details["max_batches_per_target"], json!(100));
+        let cutoff = chrono::DateTime::parse_from_rfc3339(details["cutoff"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(cutoff >= earliest_cutoff && cutoff <= latest_cutoff);
+        assert!(details["error"]
+            .as_str()
+            .unwrap()
+            .contains("forced second retention batch failure"));
     }
 
     #[tokio::test]

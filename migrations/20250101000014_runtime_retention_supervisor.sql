@@ -1,6 +1,6 @@
 -- Migration: Runtime Retention Supervisor
 -- Description: Adds configurable runtime retention managed by the
---              attune-supervisor service. Compression policies remain in place.
+--              attune-supervisor service using bounded row deletes.
 -- Version: 20250101000014
 
 SET search_path TO attune, public;
@@ -10,6 +10,7 @@ CREATE TABLE runtime_retention_config (
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     check_interval_seconds BIGINT NOT NULL DEFAULT 3600,
     batch_size BIGINT NOT NULL DEFAULT 1000,
+    max_batches_per_target BIGINT NOT NULL DEFAULT 100,
     dry_run BOOLEAN NOT NULL DEFAULT FALSE,
     advisory_lock_key BIGINT NOT NULL DEFAULT 7821001,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -17,7 +18,8 @@ CREATE TABLE runtime_retention_config (
 
     CONSTRAINT runtime_retention_config_singleton CHECK (id = TRUE),
     CONSTRAINT runtime_retention_check_interval_positive CHECK (check_interval_seconds > 0),
-    CONSTRAINT runtime_retention_batch_size_positive CHECK (batch_size > 0)
+    CONSTRAINT runtime_retention_batch_size_positive CHECK (batch_size > 0),
+    CONSTRAINT runtime_retention_max_batches_positive CHECK (max_batches_per_target > 0)
 );
 
 CREATE TRIGGER update_runtime_retention_config_updated
@@ -80,8 +82,8 @@ CREATE TRIGGER update_execution_reschedule_state_updated
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_column();
 
-INSERT INTO runtime_retention_config (id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key)
-VALUES (TRUE, TRUE, 3600, 1000, FALSE, 7821001)
+INSERT INTO runtime_retention_config (id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key)
+VALUES (TRUE, TRUE, 3600, 1000, 100, FALSE, 7821001)
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO runtime_retention_target_config (target, max_age_seconds)
@@ -93,7 +95,6 @@ VALUES
     ('worker_history', 2592000),
     ('sensor_process_history', 2592000),
     ('audit_events', 7776000),
-    ('continuous_aggregates', 2592000),
     ('notifications', 2592000),
     ('webhook_event_logs', 2592000),
     ('inquiries', 2592000),
@@ -106,15 +107,15 @@ VALUES
 ON CONFLICT (target) DO NOTHING;
 
 COMMENT ON TABLE event IS
-    'Events are instances of triggers firing (TimescaleDB hypertable partitioned on created; retention is managed by attune-supervisor).';
+    'Events are instances of triggers firing; row retention is managed by attune-supervisor.';
 COMMENT ON TABLE audit_event IS
-    'Security-grade audit trail (TimescaleDB hypertable partitioned on created; retention is managed by attune-supervisor).';
+    'Security-grade audit trail; row retention is managed by attune-supervisor.';
 COMMENT ON TABLE execution_history IS
-    'Append-only history of field-level changes to the execution table (TimescaleDB hypertable; retention is managed by attune-supervisor).';
+    'Append-only history of field-level changes to the execution table; row retention is managed by attune-supervisor.';
 COMMENT ON TABLE worker_history IS
-    'Append-only history of field-level changes to the worker table (TimescaleDB hypertable; retention is managed by attune-supervisor).';
+    'Append-only history of field-level changes to the worker table; row retention is managed by attune-supervisor.';
 COMMENT ON TABLE sensor_process_history IS
-    'Append-only history of field-level changes to sensor_process live state (TimescaleDB hypertable; retention is managed by attune-supervisor).';
+    'Append-only history of field-level changes to sensor_process live state; row retention is managed by attune-supervisor.';
 COMMENT ON TABLE runtime_retention_config IS
     'Singleton runtime retention settings read by attune-supervisor each cycle and managed through the API.';
 COMMENT ON TABLE runtime_retention_target_config IS

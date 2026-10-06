@@ -22,11 +22,9 @@ const DATABASE_DDL_TIMEOUT: Duration = Duration::from_secs(120);
 /// A fully migrated, database-isolated test fixture.
 ///
 /// Migrations are applied once to a run-owned template database. Each test then
-/// receives a physical PostgreSQL clone, preserving production schema,
-/// extension, trigger, and synchronous TimescaleDB behavior without replaying
-/// every migration hundreds of times. Ordinary repository fixtures stop their
-/// scheduler before opening the application pool; detached migration fixtures
-/// keep it running for worker-fidelity coverage.
+/// receives a physical PostgreSQL clone, preserving production schema, triggers,
+/// and committed transaction behavior without replaying every migration
+/// hundreds of times.
 #[derive(Debug)]
 pub struct TestDatabase {
     pool: Option<PgPool>,
@@ -83,24 +81,13 @@ impl TestDatabase {
             admin_url,
         } = detached;
 
-        // Policy definitions remain intact, but repository tests do not need
-        // an idle scheduler for each physical clone.
-        if let Err(setup_error) = stop_background_workers(&database_url).await {
-            return match cleanup_parts(None, &database_url, &admin_url, &database_name).await {
-                Ok(()) => Err(setup_error),
-                Err(cleanup_error) => Err(Error::InvalidState(format!(
-                    "test database setup failed: {setup_error}; database cleanup failed: {cleanup_error}"
-                ))),
-            };
-        }
-
         let mut database_config = config.clone();
         database_config.url = database_url.clone();
         database_config.schema = Some(TEST_SCHEMA.to_string());
         let pool = match Database::new(&database_config).await {
             Ok(database) => database.pool().clone(),
             Err(setup_error) => {
-                return match cleanup_parts(None, &database_url, &admin_url, &database_name).await {
+                return match cleanup_parts(None, &admin_url, &database_name).await {
                     Ok(()) => Err(setup_error),
                     Err(cleanup_error) => Err(Error::InvalidState(format!(
                         "test database setup failed: {setup_error}; database cleanup failed: {cleanup_error}"
@@ -179,9 +166,8 @@ impl TestDatabase {
             )));
         }
 
-        let database_url = database_url_with_name(&config.url, database_name)?;
         let admin_url = database_url_with_name(&config.url, "postgres")?;
-        cleanup_parts(None, &database_url, &admin_url, database_name).await
+        cleanup_parts(None, &admin_url, database_name).await
     }
 
     /// Ensure the schema is removed if the owner reaches the end of its scope.
@@ -217,7 +203,7 @@ impl TestDatabase {
             .database_name
             .take()
             .expect("test database already cleaned up");
-        cleanup_parts(pool, &self.database_url, &self.admin_url, &database_name).await
+        cleanup_parts(pool, &self.admin_url, &database_name).await
     }
 }
 
@@ -284,7 +270,6 @@ impl Drop for TestDatabase {
         else {
             return;
         };
-        let database_url = self.database_url.clone();
         let admin_url = self.admin_url.clone();
         let database_label = database_name.clone();
         let cleanup = std::thread::spawn(move || {
@@ -293,12 +278,7 @@ impl Drop for TestDatabase {
                 .build()
                 .map_err(|error| error.to_string())?;
             runtime
-                .block_on(fallback_cleanup(
-                    pool,
-                    &database_url,
-                    &admin_url,
-                    &database_name,
-                ))
+                .block_on(fallback_cleanup(pool, &admin_url, &database_name))
                 .map_err(|error| error.to_string())
         });
 
@@ -312,16 +292,8 @@ impl Drop for TestDatabase {
     }
 }
 
-async fn cleanup_parts(
-    pool: Option<PgPool>,
-    database_url: &str,
-    admin_url: &str,
-    database_name: &str,
-) -> Result<()> {
+async fn cleanup_parts(pool: Option<PgPool>, admin_url: &str, database_name: &str) -> Result<()> {
     let mut failures = Vec::new();
-    if let Err(error) = stop_background_workers(database_url).await {
-        failures.push(format!("background worker stop failed: {error}"));
-    }
     if let Some(pool) = pool {
         // Signal all clones to close, but always continue to the independently
         // bounded database teardown so one leaked checkout cannot hang cleanup.
@@ -342,39 +314,13 @@ async fn cleanup_parts(
     cleanup_result(database_name, failures)
 }
 
-async fn fallback_cleanup(
-    pool: PgPool,
-    database_url: &str,
-    admin_url: &str,
-    database_name: &str,
-) -> Result<()> {
+async fn fallback_cleanup(pool: PgPool, admin_url: &str, database_name: &str) -> Result<()> {
     let mut failures = Vec::new();
-    if let Err(error) = stop_background_workers(database_url).await {
-        failures.push(format!("background worker stop failed: {error}"));
-    }
     drop(pool);
     if let Err(error) = drop_database(admin_url, database_name).await {
         failures.push(format!("database drop failed: {error}"));
     }
     cleanup_result(database_name, failures)
-}
-
-async fn stop_background_workers(database_url: &str) -> Result<()> {
-    let mut connection =
-        connect_with_timeout(database_url, "test background worker cleanup").await?;
-    tokio::time::timeout(
-        POOL_CLOSE_TIMEOUT,
-        sqlx::query("SELECT _timescaledb_functions.stop_background_workers()")
-            .execute(&mut connection),
-    )
-    .await
-    .map_err(|_| {
-        Error::InvalidState(format!(
-            "timed out after {}s stopping test database background workers",
-            POOL_CLOSE_TIMEOUT.as_secs()
-        ))
-    })??;
-    Ok(())
 }
 
 fn cleanup_result(database_name: &str, failures: Vec<String>) -> Result<()> {
@@ -471,8 +417,7 @@ async fn ensure_template_database(
             return Err(error);
         }
 
-        // TimescaleDB background workers can retain a template connection.
-        // Disallow new sessions first, then terminate any existing workers so
+        // Disallow new sessions first, then terminate any existing sessions so
         // PostgreSQL can clone the database safely and deterministically.
         sqlx::query(&format!(
             "ALTER DATABASE {template_name} WITH ALLOW_CONNECTIONS false"

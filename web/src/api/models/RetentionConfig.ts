@@ -13,7 +13,7 @@ export type RetentionConfig = {
    */
   advisory_lock_key?: number;
   /**
-   * Maximum rows to delete per target per cycle for regular tables.
+   * Maximum rows to delete in each committed batch.
    */
   batch_size?: number;
   /**
@@ -26,13 +26,18 @@ export type RetentionConfig = {
    */
   check_interval_seconds?: number;
   /**
-   * Report candidates without deleting rows/chunks.
+   * Report candidate rows without deleting them.
    */
   dry_run?: boolean;
   /**
    * Enable runtime row retention globally.
    */
   enabled?: boolean;
+  /**
+   * Maximum committed batches per target per cycle. Each target can delete
+   * at most batch_size * max_batches_per_target rows per cycle.
+   */
+  max_batches_per_target?: number;
   /**
    * Per-target retention settings.
    */

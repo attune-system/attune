@@ -1,8 +1,4 @@
 use attune_api::authz::AuthorizationService;
-use attune_api::dashboard_data::contracts::FreshnessMode;
-use attune_api::dashboard_data::watermark::{
-    merge_bucket_rows_deterministic, BucketCountRow, TimeRange, WatermarkCutoverPlan,
-};
 use attune_common::models::{
     ActionReferenceVisibility, DashboardScopeType, DashboardVisibility, WorkQueueBatchMode,
     WorkQueueDispatchStatus, WorkQueueItemStatus, WorkQueueUpdateStrategy,
@@ -367,7 +363,7 @@ fn fixtures_enforce_source_meta_and_order_contract_shape() {
                     "source_id": "b",
                     "meta": {
                         "authorization_mode": "identity_filtered",
-                        "freshness_mode": "raw_only_fallback",
+                        "freshness_mode": "raw_only",
                         "aggregate_watermark": null,
                         "cache_hit": true,
                         "bucket_size": "1h",
@@ -442,6 +438,193 @@ async fn analytics_dashboard_requires_authentication() -> Result<()> {
     let ctx = TestContext::new().await?;
     let response = ctx.get("/api/v1/analytics/dashboard", None).await?;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn analytics_endpoints_read_recent_raw_records_and_empty_ranges() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "analytics_raw",
+        json!([
+            {"resource": "executions", "actions": ["read"]},
+            {"resource": "events", "actions": ["read"]},
+            {"resource": "enforcements", "actions": ["read"]},
+            {"resource": "workers", "actions": ["read"]}
+        ]),
+    )
+    .await?;
+    let now = Utc::now();
+    let start = now - Duration::hours(2);
+    for status in [
+        "failed",
+        "failed",
+        "timeout",
+        "completed",
+        "cancelled",
+        "abandoned",
+    ] {
+        seed_execution_status(&ctx, 1, "fixture.a", status, now).await?;
+    }
+    sqlx::query("INSERT INTO execution (action_ref, created) VALUES ('fixture.a', $1)")
+        .bind(now)
+        .execute(&ctx.pool)
+        .await?;
+    sqlx::query("INSERT INTO event (trigger_ref, created) VALUES ('fixture.trigger', $1)")
+        .bind(now)
+        .execute(&ctx.pool)
+        .await?;
+    sqlx::query("INSERT INTO enforcement (rule_ref, trigger_ref, payload, created) VALUES ('fixture.rule', 'fixture.trigger', '{}', $1)").bind(now).execute(&ctx.pool).await?;
+    sqlx::query("INSERT INTO worker_history (time, operation, entity_id, entity_ref, changed_fields, new_values) VALUES ($1, 'UPDATE', 1, 'fixture-worker', ARRAY['status'], '{\"status\":\"offline\"}')").bind(now).execute(&ctx.pool).await?;
+    for (endpoint, expected) in [
+        ("executions/status", 6),
+        ("executions/throughput", 1),
+        ("events/volume", 1),
+        ("enforcements/volume", 1),
+        ("workers/status", 1),
+    ] {
+        let path = format!(
+            "/api/v1/analytics/{endpoint}?since={}&until={}",
+            start.to_rfc3339().replace('+', "%2B"),
+            now.to_rfc3339().replace('+', "%2B")
+        );
+        assert_eq!(
+            ctx.get(&path, None).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = ctx.get(&path, Some(&token)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await?;
+        let rows = body["data"]["data"].as_array().expect("series");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["value"].as_i64().unwrap())
+                .sum::<i64>(),
+            expected,
+            "{endpoint}"
+        );
+        let empty_path = format!(
+            "/api/v1/analytics/{endpoint}?since=2000-01-01T00:00:00Z&until=2000-01-01T01:00:00Z"
+        );
+        let empty: Value = ctx.get(&empty_path, Some(&token)).await?.json().await?;
+        assert_eq!(empty["data"]["data"], json!([]), "{endpoint}");
+    }
+    let path = format!(
+        "/api/v1/analytics/executions/failure-rate?since={}&until={}",
+        start.to_rfc3339().replace('+', "%2B"),
+        now.to_rfc3339().replace('+', "%2B")
+    );
+    let failure: Value = ctx.get(&path, Some(&token)).await?.json().await?;
+    assert_eq!(failure["data"]["total_terminal"], 4);
+    assert_eq!(failure["data"]["failed_count"], 2);
+    assert_eq!(failure["data"]["timeout_count"], 1);
+    assert_eq!(failure["data"]["completed_count"], 1);
+    assert_eq!(failure["data"]["failure_rate_pct"], 75.0);
+    let empty: Value = ctx.get("/api/v1/analytics/executions/failure-rate?since=2000-01-01T00:00:00Z&until=2000-01-01T01:00:00Z", Some(&token)).await?.json().await?;
+    assert_eq!(empty["data"]["total_terminal"], 0);
+    assert_eq!(empty["data"]["failure_rate_pct"], 0.0);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dashboard_raw_metadata_and_partial_hour_terminal_counts() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "dashboard_raw",
+        json!([
+            {"resource": "dashboards", "actions": ["read"]},
+            {"resource": "executions", "actions": ["read"]},
+            {"resource": "events", "actions": ["read"]}
+        ]),
+    )
+    .await?;
+    let dashboard_ref = format!("fixture.raw_{}", uuid::Uuid::new_v4().simple());
+    create_dashboard(
+        &ctx,
+        &dashboard_ref,
+        "Raw boundary contract",
+        dashboard_acceptance_fixtures::dashboard_spec(
+            &[
+                ("count", "execution_count"),
+                ("status", "execution_status_breakdown"),
+                ("events", "event_count"),
+            ],
+            &[
+                ("count_card", "count"),
+                ("status_card", "status"),
+                ("event_card", "events"),
+            ],
+            None,
+        ),
+    )
+    .await?;
+    let base = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+    for (minute, status) in [
+        (50, "completed"),
+        (60, "failed"),
+        (61, "running"),
+        (62, "failed"),
+        (63, "cancelled"),
+        (124, "completed"),
+        (125, "completed"),
+    ] {
+        seed_execution_status(
+            &ctx,
+            1,
+            "fixture.a",
+            status,
+            base + Duration::minutes(minute),
+        )
+        .await?;
+    }
+    for minute in [50, 60, 124, 125] {
+        sqlx::query("INSERT INTO event (trigger_ref, created) VALUES ('fixture.trigger', $1)")
+            .bind(base + Duration::minutes(minute))
+            .execute(&ctx.pool)
+            .await?;
+    }
+    let mut request = dashboard_acceptance_fixtures::sample_dashboard_data_request();
+    request["time_range"] = json!({"start": (base + Duration::minutes(30)).to_rfc3339(), "end": (base + Duration::minutes(125)).to_rfc3339()});
+    let response = ctx
+        .post(
+            &format!("/api/v1/dashboards/{dashboard_ref}/data"),
+            request,
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["partial"], false);
+    for source in body["sources"].as_array().expect("sources") {
+        assert_eq!(source["status"], "ok");
+        dashboard_acceptance_fixtures::assert_raw_source_meta(source);
+    }
+    assert_eq!(
+        dashboard_acceptance_fixtures::source_by_id(&body, "count")["data"],
+        json!([
+            {"bucket_start": "2026-06-01T01:00:00Z", "series": "all", "count": 3},
+            {"bucket_start": "2026-06-01T02:00:00Z", "series": "all", "count": 1}
+        ])
+    );
+    assert_eq!(
+        dashboard_acceptance_fixtures::source_by_id(&body, "status")["data"],
+        json!([
+            {"bucket_start": "2026-06-01T01:00:00Z", "status": "cancelled", "count": 1},
+            {"bucket_start": "2026-06-01T01:00:00Z", "status": "failed", "count": 2},
+            {"bucket_start": "2026-06-01T02:00:00Z", "status": "completed", "count": 1}
+        ])
+    );
+    assert_eq!(
+        dashboard_acceptance_fixtures::source_by_id(&body, "events")["data"],
+        json!([
+            {"bucket_start": "2026-06-01T01:00:00Z", "series": "all", "count": 1},
+            {"bucket_start": "2026-06-01T02:00:00Z", "series": "all", "count": 1}
+        ])
+    );
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -668,6 +851,14 @@ async fn dashboard_scope_rbac_isolation_and_cache_context_partitioning() -> Resu
     .await?;
     seed_execution_status(
         &ctx,
+        9101,
+        "core.allowed_action",
+        "failed",
+        now - Duration::minutes(40),
+    )
+    .await?;
+    seed_execution_status(
+        &ctx,
         9102,
         "core.blocked_action",
         "completed",
@@ -710,6 +901,16 @@ async fn dashboard_scope_rbac_isolation_and_cache_context_partitioning() -> Resu
         series.iter().all(|entry| entry == "core.allowed_action"),
         "response must not leak blocked action refs: {series:?}"
     );
+    assert_eq!(
+        source["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["count"].as_i64().unwrap())
+            .sum::<i64>(),
+        2
+    );
+    dashboard_acceptance_fixtures::assert_raw_source_meta(source);
 
     let mut denied_filter_request = base_request.clone();
     denied_filter_request["filters"] = json!({"action_ref": "core.blocked_action"});
@@ -797,6 +998,14 @@ async fn dashboard_source_params_enforce_effective_scope_intersection() -> Resul
     .await?;
     seed_execution_status(
         &ctx,
+        9201,
+        "core.allowed_action",
+        "failed",
+        now - Duration::minutes(20),
+    )
+    .await?;
+    seed_execution_status(
+        &ctx,
         9202,
         "core.other_action",
         "completed",
@@ -841,6 +1050,16 @@ async fn dashboard_source_params_enforce_effective_scope_intersection() -> Resul
             .all(|entry| entry == "core.allowed_action"),
         "source params must constrain response to declared refs: {scoped_series:?}"
     );
+    assert_eq!(
+        scoped_source["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["count"].as_i64().unwrap())
+            .sum::<i64>(),
+        2
+    );
+    dashboard_acceptance_fixtures::assert_raw_source_meta(scoped_source);
 
     let mut filtered_request = base_request.clone();
     filtered_request["filters"] = json!({"action_ref": "core.other_action"});
@@ -1188,72 +1407,6 @@ async fn dashboard_source_order_contract_is_deterministic() -> Result<()> {
         "source envelopes except cache-hit metadata must be deterministic"
     );
     Ok(())
-}
-
-#[test]
-fn dashboard_watermark_cutover_and_boundary_correctness() {
-    let start = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-    let watermark = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
-    let end = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
-    let request_range = TimeRange::new(start, end).expect("valid range");
-    let plan = WatermarkCutoverPlan::build(request_range, Some(watermark)).expect("valid cutover");
-
-    assert_eq!(plan.freshness_mode, FreshnessMode::AggregatePlusTail);
-    assert_eq!(
-        plan.aggregate_range.expect("aggregate range"),
-        TimeRange::new(start, watermark).expect("valid aggregate range")
-    );
-    assert_eq!(
-        plan.raw_range.expect("raw range"),
-        TimeRange::new(watermark, end).expect("valid raw range")
-    );
-
-    let merged = merge_bucket_rows_deterministic(
-        &plan,
-        &[
-            BucketCountRow {
-                bucket_start: Utc.with_ymd_and_hms(2026, 6, 1, 11, 0, 0).unwrap(),
-                series: "all".to_string(),
-                count: 11,
-            },
-            BucketCountRow {
-                bucket_start: watermark,
-                series: "all".to_string(),
-                count: 99,
-            },
-        ],
-        &[
-            BucketCountRow {
-                bucket_start: watermark,
-                series: "all".to_string(),
-                count: 12,
-            },
-            BucketCountRow {
-                bucket_start: Utc.with_ymd_and_hms(2026, 6, 1, 13, 0, 0).unwrap(),
-                series: "all".to_string(),
-                count: 13,
-            },
-        ],
-    );
-
-    assert_eq!(merged.len(), 3);
-    assert_eq!(merged[0].count, 11);
-    assert_eq!(merged[1].bucket_start, watermark);
-    assert_eq!(merged[1].count, 12);
-    assert_eq!(merged[2].count, 13);
-}
-
-#[test]
-fn dashboard_watermark_missing_falls_back_to_raw_only_fallback() {
-    let start = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-    let end = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
-    let request_range = TimeRange::new(start, end).expect("valid range");
-    let plan = WatermarkCutoverPlan::build(request_range, None).expect("valid fallback plan");
-
-    assert_eq!(plan.freshness_mode, FreshnessMode::RawOnlyFallback);
-    assert!(plan.aggregate_range.is_none());
-    assert_eq!(plan.raw_range, Some(request_range));
-    assert!(plan.aggregate_watermark.is_none());
 }
 
 #[tokio::test]

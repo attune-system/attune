@@ -16,7 +16,7 @@ docker run -d --name attune-postgres \
   -e POSTGRES_PASSWORD=attune \
   -e POSTGRES_USER=attune \
   -e POSTGRES_DB=attune \
-  -p 5432:5432 postgres:14
+  -p 5432:5432 postgres:18-alpine
 
 # Terminal 2: RabbitMQ (if not running as service)
 docker run -d --name attune-rabbitmq \

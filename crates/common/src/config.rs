@@ -1105,8 +1105,6 @@ pub struct RetentionTargetsConfig {
     pub sensor_process_history: RetentionTargetConfig,
     #[serde(default = "default_retention_audit_events")]
     pub audit_events: RetentionTargetConfig,
-    #[serde(default = "default_retention_continuous_aggregates")]
-    pub continuous_aggregates: RetentionTargetConfig,
     #[serde(default = "default_retention_notifications")]
     pub notifications: RetentionTargetConfig,
     #[serde(default = "default_retention_webhook_event_logs")]
@@ -1137,7 +1135,6 @@ impl Default for RetentionTargetsConfig {
             worker_history: default_retention_worker_history(),
             sensor_process_history: default_retention_sensor_process_history(),
             audit_events: default_retention_audit_events(),
-            continuous_aggregates: default_retention_continuous_aggregates(),
             notifications: default_retention_notifications(),
             webhook_event_logs: default_retention_webhook_event_logs(),
             inquiries: default_retention_inquiries(),
@@ -1181,10 +1178,6 @@ fn default_retention_sensor_process_history() -> RetentionTargetConfig {
 
 fn default_retention_audit_events() -> RetentionTargetConfig {
     retention_days(90)
-}
-
-fn default_retention_continuous_aggregates() -> RetentionTargetConfig {
-    retention_days(30)
 }
 
 fn default_retention_notifications() -> RetentionTargetConfig {
@@ -1234,11 +1227,16 @@ pub struct RetentionConfig {
     #[serde(default = "default_retention_check_interval_seconds")]
     pub check_interval_seconds: u64,
 
-    /// Maximum rows to delete per target per cycle for regular tables.
+    /// Maximum rows to delete in each committed batch.
     #[serde(default = "default_retention_batch_size")]
     pub batch_size: i64,
 
-    /// Report candidates without deleting rows/chunks.
+    /// Maximum committed batches per target per cycle. Each target can delete
+    /// at most batch_size * max_batches_per_target rows per cycle.
+    #[serde(default = "default_retention_max_batches_per_target")]
+    pub max_batches_per_target: i64,
+
+    /// Report candidate rows without deleting them.
     #[serde(default)]
     pub dry_run: bool,
 
@@ -1262,6 +1260,7 @@ impl Default for RetentionConfig {
             enabled: true,
             check_interval_seconds: default_retention_check_interval_seconds(),
             batch_size: default_retention_batch_size(),
+            max_batches_per_target: default_retention_max_batches_per_target(),
             dry_run: false,
             advisory_lock_key: default_retention_advisory_lock_key(),
             targets: RetentionTargetsConfig::default(),
@@ -1276,6 +1275,12 @@ fn default_retention_check_interval_seconds() -> u64 {
 
 fn default_retention_batch_size() -> i64 {
     1000
+}
+
+fn default_retention_max_batches_per_target() -> i64 {
+    // Provisional capacity: 100,000 rows per target per hourly cycle.
+    // Confirm against the declared ingestion/backlog workload before rollout.
+    100
 }
 
 fn default_retention_advisory_lock_key() -> i64 {
@@ -2265,6 +2270,12 @@ impl Config {
             ));
         }
 
+        if self.retention.max_batches_per_target <= 0 {
+            return Err(crate::Error::validation(
+                "retention.max_batches_per_target must be greater than zero",
+            ));
+        }
+
         if self.maintenance.artifact_cleanup_batch_size <= 0 {
             return Err(crate::Error::validation(
                 "maintenance.artifact_cleanup_batch_size must be greater than zero",
@@ -3045,6 +3056,7 @@ mod tests {
         assert!(retention.enabled);
         assert_eq!(retention.check_interval_seconds, 3600);
         assert_eq!(retention.batch_size, 1000);
+        assert_eq!(retention.max_batches_per_target, 100);
         assert_eq!(
             retention.targets.events.max_age_seconds,
             Some(30 * 24 * 60 * 60)
@@ -3095,6 +3107,24 @@ mod tests {
 
         assert_eq!(retention.targets.events.max_age_seconds, None);
         assert_eq!(retention.targets.audit_events.max_age_seconds, None);
+    }
+
+    #[test]
+    fn retention_batch_budget_is_positive_and_defaults_when_omitted() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "security": {"enable_auth": false},
+            "retention": {}
+        }))
+        .unwrap();
+        assert_eq!(config.retention.max_batches_per_target, 100);
+        assert!(config.validate().is_ok());
+        for budget in [0, -1] {
+            config.retention.max_batches_per_target = budget;
+            assert!(
+                matches!(config.validate(), Err(crate::Error::Validation(message))
+                if message.contains("max_batches_per_target"))
+            );
+        }
     }
 
     #[test]

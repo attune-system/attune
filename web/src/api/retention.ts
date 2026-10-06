@@ -19,7 +19,6 @@ export interface RetentionTargetsConfig {
   worker_history: RetentionTargetConfig;
   sensor_process_history: RetentionTargetConfig;
   audit_events: RetentionTargetConfig;
-  continuous_aggregates: RetentionTargetConfig;
   notifications: RetentionTargetConfig;
   webhook_event_logs: RetentionTargetConfig;
   inquiries: RetentionTargetConfig;
@@ -51,6 +50,7 @@ export interface RetentionConfig {
   enabled: boolean;
   check_interval_seconds: number;
   batch_size: number;
+  max_batches_per_target: number;
   dry_run: boolean;
   advisory_lock_key: number;
   targets: RetentionTargetsConfig;
@@ -68,7 +68,6 @@ export const retentionTargetLabels: Record<
   worker_history: "Worker history",
   sensor_process_history: "Sensor process history",
   audit_events: "Audit log",
-  continuous_aggregates: "Continuous aggregates",
   notifications: "Notifications",
   webhook_event_logs: "Webhook event logs",
   inquiries: "Inquiries",

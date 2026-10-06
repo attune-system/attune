@@ -192,7 +192,11 @@ PACKAGE=""
 BINARY_ENV=()
 
 if [[ -f "$BINARY_MANIFEST" ]]; then
+  # Compile-time CARGO_BIN_EXE paths still point at Cargo's output directory.
+  # Keep those paths usable alongside runtime overrides for relocated binaries.
+  mkdir -p /build/target/debug
   while IFS=$'\t' read -r binary_name binary_path; do
+    ln -s "$binary_path" "/build/target/debug/${binary_name}"
     BINARY_ENV+=("CARGO_BIN_EXE_${binary_name}=${binary_path}")
   done < "$BINARY_MANIFEST"
 fi

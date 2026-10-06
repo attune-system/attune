@@ -15,6 +15,7 @@ def _get_kwargs(
     *,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    login: None | str | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
@@ -22,6 +23,13 @@ def _get_kwargs(
     params["page"] = page
 
     params["page_size"] = page_size
+
+    json_login: None | str | Unset
+    if isinstance(login, Unset):
+        json_login = UNSET
+    else:
+        json_login = login
+    params["login"] = json_login
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -64,11 +72,13 @@ def sync_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    login: None | str | Unset = UNSET,
 ) -> Response[PaginatedResponseIdentitySummary]:
     """
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        login (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -81,6 +91,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         page=page,
         page_size=page_size,
+        login=login,
     )
 
     response = client.get_httpx_client().request(
@@ -95,11 +106,13 @@ def sync(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    login: None | str | Unset = UNSET,
 ) -> PaginatedResponseIdentitySummary | None:
     """
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        login (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -113,6 +126,7 @@ def sync(
         client=client,
         page=page,
         page_size=page_size,
+        login=login,
     ).parsed
 
 
@@ -121,11 +135,13 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    login: None | str | Unset = UNSET,
 ) -> Response[PaginatedResponseIdentitySummary]:
     """
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        login (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -138,6 +154,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         page=page,
         page_size=page_size,
+        login=login,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -150,11 +167,13 @@ async def asyncio(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    login: None | str | Unset = UNSET,
 ) -> PaginatedResponseIdentitySummary | None:
     """
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        login (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -169,5 +188,6 @@ async def asyncio(
             client=client,
             page=page,
             page_size=page_size,
+            login=login,
         )
     ).parsed

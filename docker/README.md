@@ -225,14 +225,17 @@ ENVIRONMENT=production
 The following volumes are used:
 
 **Data Volumes:**
-- `postgres_data_pg18` - PostgreSQL 18 database files
+- `postgres_data_plain_pg18` - stock PostgreSQL 18 database files
 - `rabbitmq_data_v4` - RabbitMQ 4 data
 - `redis_data` - Redis persistence
 
-PostgreSQL 16 data directories cannot be opened by PostgreSQL 18. The
-versioned volume names leave existing PostgreSQL 16 and RabbitMQ 3 volumes
-untouched. Use `pg_dump` and restore for PostgreSQL data. RabbitMQ definitions
-can be exported separately; queued messages in the old volume are not migrated.
+The new PostgreSQL-only volume leaves the previous `postgres_data_pg18`
+TimescaleDB volume untouched. A PostgreSQL 16 data directory also cannot be
+opened by PostgreSQL 18. Existing data needs a deliberate conversion or reset
+decision; neither an image switch nor rewritten migrations convert it.
+See [PostgreSQL-only deployment](../docs/deployment/postgresql-only.md).
+RabbitMQ 3 volumes remain separate too. RabbitMQ definitions can be exported
+separately; queued messages in the old volume are not migrated.
 
 **Log Volumes:**
 - `api_logs`, `executor_logs`, `worker_logs`, `sensor_logs`, `notifier_logs`

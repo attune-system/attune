@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
+from ..models.management_origin_kind import ManagementOriginKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ class UpdatePermissionSetResponse200Data:
     Attributes:
         grants (Any):
         id (int):
+        management_origin (ManagementOriginKind):
         ref (str):
         roles (list[PermissionSetRoleAssignmentResponse]):
         description (None | str | Unset):
@@ -35,6 +37,7 @@ class UpdatePermissionSetResponse200Data:
 
     grants: Any
     id: int
+    management_origin: ManagementOriginKind
     ref: str
     roles: list[PermissionSetRoleAssignmentResponse]
     description: None | str | Unset = UNSET
@@ -47,6 +50,8 @@ class UpdatePermissionSetResponse200Data:
         grants = self.grants
 
         id = self.id
+
+        management_origin = self.management_origin.value
 
         ref = self.ref
 
@@ -87,6 +92,7 @@ class UpdatePermissionSetResponse200Data:
             {
                 "grants": grants,
                 "id": id,
+                "management_origin": management_origin,
                 "ref": ref,
                 "roles": roles,
             }
@@ -112,6 +118,8 @@ class UpdatePermissionSetResponse200Data:
         grants = d.pop("grants")
 
         id = d.pop("id")
+
+        management_origin = ManagementOriginKind(d.pop("management_origin"))
 
         ref = d.pop("ref")
 
@@ -169,6 +177,7 @@ class UpdatePermissionSetResponse200Data:
         update_permission_set_response_200_data = cls(
             grants=grants,
             id=id,
+            management_origin=management_origin,
             ref=ref,
             roles=roles,
             description=description,

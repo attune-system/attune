@@ -1,8 +1,7 @@
 //! Analytics API routes
 //!
-//! Provides read-only access to TimescaleDB continuous aggregates for dashboard
-//! widgets and time-series analytics. All data is pre-computed by TimescaleDB
-//! continuous aggregate policies — these endpoints simply query the materialized views.
+//! Read-only hourly analytics over retained records. Results include whole UTC
+//! buckets whose starts lie in the inclusive requested range, including recent data.
 
 use axum::{
     extract::{Query, State},
@@ -79,7 +78,7 @@ pub async fn get_dashboard_analytics(
 
     let range = query.to_time_range();
 
-    // Run all aggregate queries concurrently
+    // Run the independent metrics concurrently.
     let (throughput, status, events, enforcements, workers, failure_rate) = tokio::try_join!(
         AnalyticsRepository::execution_throughput_hourly(&state.db, &range),
         AnalyticsRepository::execution_status_hourly(&state.db, &range),

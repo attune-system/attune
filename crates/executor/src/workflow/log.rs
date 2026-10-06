@@ -1138,10 +1138,20 @@ mod tests {
             sqlx::Error::Database(ref error)
                 if error.constraint() == Some("workflow_log_outbox_workflow_execution_fkey")
         ));
-        let retained =
-            RetentionRepository::run_target(&pool, RetentionTarget::Executions, 0, 10, false)
-                .await
-                .unwrap();
+        let retention = attune_common::config::RetentionConfig {
+            batch_size: 10,
+            max_batches_per_target: 1,
+            ..attune_common::config::RetentionConfig::default()
+        };
+        let retained = RetentionRepository::run_target_bounded(
+            &pool,
+            RetentionTarget::Executions,
+            0,
+            &retention,
+            || false,
+        )
+        .await
+        .unwrap();
         assert_eq!(retained.deleted, 0);
         let payload: Vec<u8> = sqlx::query_scalar(
             "SELECT payload FROM workflow_log_outbox WHERE workflow_execution = $1",
@@ -1156,10 +1166,15 @@ mod tests {
         let transport = Arc::new(RecordingTransport::new(pool.clone(), 0));
         let dispatcher = WorkflowLogDispatcher::new(pool.clone(), transport, 1024, 500);
         assert!(dispatcher.dispatch_once().await.unwrap());
-        let deleted =
-            RetentionRepository::run_target(&pool, RetentionTarget::Executions, 0, 10, false)
-                .await
-                .unwrap();
+        let deleted = RetentionRepository::run_target_bounded(
+            &pool,
+            RetentionTarget::Executions,
+            0,
+            &retention,
+            || false,
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted.deleted, 1, "retention result: {deleted:?}");
     }
 

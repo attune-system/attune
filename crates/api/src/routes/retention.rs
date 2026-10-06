@@ -105,6 +105,11 @@ fn validate_retention_config(config: &RetentionConfig) -> ApiResult<()> {
             "retention.batch_size must be greater than zero".to_string(),
         ));
     }
+    if config.max_batches_per_target <= 0 {
+        return Err(ApiError::BadRequest(
+            "retention.max_batches_per_target must be greater than zero".to_string(),
+        ));
+    }
     let cache = &config.cache_retention;
     for (field, value) in [
         ("batch_size", cache.batch_size),
@@ -144,10 +149,6 @@ fn validate_retention_config(config: &RetentionConfig) -> ApiResult<()> {
             &config.targets.sensor_process_history,
         ),
         ("audit_events", &config.targets.audit_events),
-        (
-            "continuous_aggregates",
-            &config.targets.continuous_aggregates,
-        ),
         ("notifications", &config.targets.notifications),
         ("webhook_event_logs", &config.targets.webhook_event_logs),
         ("inquiries", &config.targets.inquiries),
@@ -207,6 +208,21 @@ mod tests {
     #[test]
     fn cache_retention_validation_accepts_defaults() {
         assert!(validate_retention_config(&RetentionConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn retention_validation_rejects_nonpositive_batch_budgets() {
+        for budget in [0, -1] {
+            let config = RetentionConfig {
+                max_batches_per_target: budget,
+                ..RetentionConfig::default()
+            };
+            assert!(matches!(
+                validate_retention_config(&config),
+                Err(ApiError::BadRequest(message))
+                    if message.contains("max_batches_per_target")
+            ));
+        }
     }
 
     #[test]

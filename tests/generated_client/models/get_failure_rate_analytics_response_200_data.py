@@ -16,12 +16,12 @@ class GetFailureRateAnalyticsResponse200Data:
     """Response for the execution failure rate summary.
 
     Attributes:
-        completed_count (int): Number of completed executions Example: 85.
-        failed_count (int): Number of failed executions Example: 12.
+        completed_count (int): Number of transitions to completed Example: 85.
+        failed_count (int): Number of transitions to failed, including retry attempts Example: 12.
         failure_rate_pct (float): Failure rate as a percentage (0.0 – 100.0) Example: 15.0.
         since (datetime.datetime): Time range start
-        timeout_count (int): Number of timed-out executions Example: 3.
-        total_terminal (int): Total executions reaching a terminal state in the window Example: 100.
+        timeout_count (int): Number of transitions to timeout, including retry attempts Example: 3.
+        total_terminal (int): Total transitions to completed, failed, or timeout in the included hours Example: 100.
         until (datetime.datetime): Time range end
     """
 

@@ -227,9 +227,9 @@ COMMENT ON COLUMN work_queue_item.item_key IS
 COMMENT ON COLUMN work_queue_item.enqueue_source IS
     'Producer metadata such as api, execution, workflow, rule, or system';
 COMMENT ON COLUMN work_queue_item.requested_by_execution IS
-    'Initiating execution ID when a run enqueues work (no FK because execution is a hypertable)';
+    'Initiating execution ID when a run enqueues work (no FK for independent retention)';
 COMMENT ON COLUMN work_queue_item.requested_by_enforcement IS
-    'Initiating enforcement ID when a rule enqueues work (no FK because enforcement is a hypertable)';
+    'Initiating enforcement ID when a rule enqueues work (no FK for independent retention)';
 COMMENT ON COLUMN work_queue_item.leased_execution IS
     'Execution currently assigned to process this item, if known';
 COMMENT ON COLUMN work_queue_item.lease_token IS
@@ -273,7 +273,7 @@ CREATE TRIGGER update_work_queue_dispatch_updated
 COMMENT ON TABLE work_queue_dispatch IS
     'Lineage record linking a work queue release to the execution processing it';
 COMMENT ON COLUMN work_queue_dispatch.execution IS
-    'Execution ID consuming the leased queue items (no FK because execution is a hypertable)';
+    'Execution ID consuming the leased queue items (no FK for independent retention)';
 COMMENT ON COLUMN work_queue_dispatch.leased_item_count IS
     'Number of queue items leased into the dispatch batch';
 

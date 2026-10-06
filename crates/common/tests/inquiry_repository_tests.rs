@@ -1791,8 +1791,8 @@ async fn test_delete_execution_preserves_inquiry_reference() {
         .await
         .unwrap();
 
-    // Execution is a hypertable and cannot be an FK target, so the inquiry
-    // keeps its plain BIGINT reference after execution retention removes it.
+    // Inquiries can outlive execution retention. The inquiry intentionally
+    // keeps its plain BIGINT reference after the execution is removed.
     use attune_common::repositories::Delete;
     ExecutionRepository::delete(&pool, execution.id)
         .await

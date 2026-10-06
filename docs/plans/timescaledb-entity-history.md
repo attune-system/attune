@@ -1,5 +1,11 @@
 # TimescaleDB Entity History Tracking
 
+Status: archived historical design. Superseded by
+[TimescaleDB removal](remove-timescaledb.md). For current installation, history,
+analytics, and retention behavior, see
+[PostgreSQL-only deployment](../deployment/postgresql-only.md).
+The original design and measurements below remain as historical context.
+
 ## Overview
 
 This plan describes the addition of **TimescaleDB-backed history tables** to track field-level changes on key operational entities in Attune. The goal is to provide an immutable audit log and time-series analytics for status transitions and other field changes, without modifying existing operational tables or application code.

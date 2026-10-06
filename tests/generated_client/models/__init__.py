@@ -820,6 +820,8 @@ from .get_pack_test_history_response_200_items_item import (
 )
 from .get_pack_test_response_200 import GetPackTestResponse200
 from .get_pack_test_response_200_data import GetPackTestResponse200Data
+from .get_permission_set_response_200 import GetPermissionSetResponse200
+from .get_permission_set_response_200_data import GetPermissionSetResponse200Data
 from .get_platform_catalog_response_200 import GetPlatformCatalogResponse200
 from .get_platform_catalog_response_200_data import GetPlatformCatalogResponse200Data
 from .get_queue_stats_response_200 import GetQueueStatsResponse200
@@ -921,6 +923,7 @@ from .log_retention_policy_patch_type_1_op import LogRetentionPolicyPatchType1Op
 from .login_request import LoginRequest
 from .login_response_200 import LoginResponse200
 from .login_response_200_data import LoginResponse200Data
+from .management_origin_kind import ManagementOriginKind
 from .node_js_environment import NodeJsEnvironment
 from .node_js_requirements import NodeJsRequirements
 from .nullable_json_patch_type_1 import NullableJsonPatchType1
@@ -1058,6 +1061,12 @@ from .paginated_response_pack_test_summary import PaginatedResponsePackTestSumma
 from .paginated_response_pack_test_summary_items_item import (
     PaginatedResponsePackTestSummaryItemsItem,
 )
+from .paginated_response_permission_binding_response import (
+    PaginatedResponsePermissionBindingResponse,
+)
+from .paginated_response_permission_binding_response_items_item import (
+    PaginatedResponsePermissionBindingResponseItemsItem,
+)
 from .paginated_response_policy_summary import PaginatedResponsePolicySummary
 from .paginated_response_policy_summary_items_item import (
     PaginatedResponsePolicySummaryItemsItem,
@@ -1125,6 +1134,11 @@ from .paginated_response_workflow_summary_items_item import (
 )
 from .pagination_meta import PaginationMeta
 from .permission_assignment_response import PermissionAssignmentResponse
+from .permission_binding_response import PermissionBindingResponse
+from .permission_identity_target import PermissionIdentityTarget
+from .permission_identity_target_type import PermissionIdentityTargetType
+from .permission_role_target import PermissionRoleTarget
+from .permission_role_target_type import PermissionRoleTargetType
 from .permission_set_role_assignment_response import PermissionSetRoleAssignmentResponse
 from .permission_set_summary import PermissionSetSummary
 from .platform_catalog_state_response import PlatformCatalogStateResponse
@@ -1237,6 +1251,10 @@ from .set_json import SetJson
 from .set_json_op import SetJsonOp
 from .set_string import SetString
 from .set_string_op import SetStringOp
+from .sign_key_jwt_request import SignKeyJwtRequest
+from .sign_key_jwt_response import SignKeyJwtResponse
+from .sign_key_jwt_response_200 import SignKeyJwtResponse200
+from .sign_key_jwt_response_200_data import SignKeyJwtResponse200Data
 from .source_availability import SourceAvailability
 from .source_type import SourceType
 from .success_response import SuccessResponse
@@ -1974,6 +1992,8 @@ __all__ = (
     "GetPackTestHistoryResponse200ItemsItem",
     "GetPackTestResponse200",
     "GetPackTestResponse200Data",
+    "GetPermissionSetResponse200",
+    "GetPermissionSetResponse200Data",
     "GetPlatformCatalogResponse200",
     "GetPlatformCatalogResponse200Data",
     "GetQueueStatsResponse200",
@@ -2047,6 +2067,7 @@ __all__ = (
     "LoginRequest",
     "LoginResponse200",
     "LoginResponse200Data",
+    "ManagementOriginKind",
     "NodeJsEnvironment",
     "NodeJsRequirements",
     "NullableJsonPatchType1",
@@ -2124,6 +2145,8 @@ __all__ = (
     "PaginatedResponsePackSummaryItemsItem",
     "PaginatedResponsePackTestSummary",
     "PaginatedResponsePackTestSummaryItemsItem",
+    "PaginatedResponsePermissionBindingResponse",
+    "PaginatedResponsePermissionBindingResponseItemsItem",
     "PaginatedResponsePolicySummary",
     "PaginatedResponsePolicySummaryItemsItem",
     "PaginatedResponseRuleSummary",
@@ -2153,6 +2176,11 @@ __all__ = (
     "PaginatedResponseWorkflowSummaryItemsItem",
     "PaginationMeta",
     "PermissionAssignmentResponse",
+    "PermissionBindingResponse",
+    "PermissionIdentityTarget",
+    "PermissionIdentityTargetType",
+    "PermissionRoleTarget",
+    "PermissionRoleTargetType",
     "PermissionSetRoleAssignmentResponse",
     "PermissionSetSummary",
     "PlatformCatalogStateResponse",
@@ -2243,6 +2271,10 @@ __all__ = (
     "SetJsonOp",
     "SetString",
     "SetStringOp",
+    "SignKeyJwtRequest",
+    "SignKeyJwtResponse",
+    "SignKeyJwtResponse200",
+    "SignKeyJwtResponse200Data",
     "SourceAvailability",
     "SourceType",
     "SuccessResponse",

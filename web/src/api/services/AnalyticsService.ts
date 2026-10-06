@@ -22,11 +22,11 @@ export class AnalyticsService {
     hours,
   }: {
     /**
-     * Start of time range (ISO 8601). Defaults to 24 hours ago.
+     * Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
      */
     since?: string | null;
     /**
-     * End of time range (ISO 8601). Defaults to now.
+     * Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
      */
     until?: string | null;
     /**
@@ -102,11 +102,11 @@ export class AnalyticsService {
     hours,
   }: {
     /**
-     * Start of time range (ISO 8601). Defaults to 24 hours ago.
+     * Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
      */
     since?: string | null;
     /**
-     * End of time range (ISO 8601). Defaults to now.
+     * Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
      */
     until?: string | null;
     /**
@@ -159,11 +159,11 @@ export class AnalyticsService {
     hours,
   }: {
     /**
-     * Start of time range (ISO 8601). Defaults to 24 hours ago.
+     * Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
      */
     since?: string | null;
     /**
-     * End of time range (ISO 8601). Defaults to now.
+     * Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
      */
     until?: string | null;
     /**
@@ -217,11 +217,11 @@ export class AnalyticsService {
     hours,
   }: {
     /**
-     * Start of time range (ISO 8601). Defaults to 24 hours ago.
+     * Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
      */
     since?: string | null;
     /**
-     * End of time range (ISO 8601). Defaults to now.
+     * Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
      */
     until?: string | null;
     /**
@@ -235,11 +235,11 @@ export class AnalyticsService {
      */
     data: {
       /**
-       * Number of completed executions
+       * Number of transitions to completed
        */
       completed_count: number;
       /**
-       * Number of failed executions
+       * Number of transitions to failed, including retry attempts
        */
       failed_count: number;
       /**
@@ -251,11 +251,11 @@ export class AnalyticsService {
        */
       since: string;
       /**
-       * Number of timed-out executions
+       * Number of transitions to timeout, including retry attempts
        */
       timeout_count: number;
       /**
-       * Total executions reaching a terminal state in the window
+       * Total transitions to completed, failed, or timeout in the included hours
        */
       total_terminal: number;
       /**
@@ -291,11 +291,11 @@ export class AnalyticsService {
     hours,
   }: {
     /**
-     * Start of time range (ISO 8601). Defaults to 24 hours ago.
+     * Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
      */
     since?: string | null;
     /**
-     * End of time range (ISO 8601). Defaults to now.
+     * Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
      */
     until?: string | null;
     /**
@@ -348,11 +348,11 @@ export class AnalyticsService {
     hours,
   }: {
     /**
-     * Start of time range (ISO 8601). Defaults to 24 hours ago.
+     * Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
      */
     since?: string | null;
     /**
-     * End of time range (ISO 8601). Defaults to now.
+     * Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
      */
     until?: string | null;
     /**
@@ -405,11 +405,11 @@ export class AnalyticsService {
     hours,
   }: {
     /**
-     * Start of time range (ISO 8601). Defaults to 24 hours ago.
+     * Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
      */
     since?: string | null;
     /**
-     * End of time range (ISO 8601). Defaults to now.
+     * Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
      */
     until?: string | null;
     /**

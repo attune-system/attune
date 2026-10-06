@@ -79,7 +79,10 @@ SSE response.
 
 ## Run the correctness suite
 
-Provision a disposable PostgreSQL/TimescaleDB cluster with a role that can create databases. Host setup requires `psql` and `sqlx`. Set `TEST_DB_ADMIN_URL` and `TEST_DB_URL` to that cluster, then run `make db-test-setup`.
+Provision a disposable stock PostgreSQL 16 or newer cluster with a role that can
+create databases. PostgreSQL 18 is the default for Compose and CI. Host setup
+requires `psql` and `sqlx`. Set `TEST_DB_ADMIN_URL` and `TEST_DB_URL` to that
+cluster, then run `make db-test-setup`.
 
 Choose a unique owner for the run and an available S3 host port. Keep these exports for setup, tests, and teardown:
 
@@ -197,9 +200,9 @@ database, not only the two test pools or the test schema. Use a dedicated,
 otherwise idle PostgreSQL database for a clean report. Concurrent applications,
 maintenance, or tests will inflate the statement-call delta.
 
-Start PostgreSQL with both
-`timescaledb` and `pg_stat_statements` in `shared_preload_libraries`, then create
-the extension in the test database:
+Start PostgreSQL with `pg_stat_statements` in `shared_preload_libraries`, then
+create that extension in the test database. This extension is required for the
+load report only; Attune does not require TimescaleDB.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;

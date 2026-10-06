@@ -34,18 +34,19 @@ async fn explicit_cleanup_removes_owned_database() {
         .expect("create test database");
     let database_name = database.database_name().to_string();
     assert!(database_exists(&config.database.url, &database_name).await);
-    let restoring: String = sqlx::query_scalar("SHOW timescaledb.restoring")
-        .fetch_one(database.pool())
-        .await
-        .expect("read Timescale restoring mode");
-    assert_eq!(restoring, "off");
-    let compression_jobs: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_schema = 'attune'",
+    let ordinary_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relkind = 'r' AND NOT relispartition AND relname IN ('event', 'execution_history', 'worker_history', 'sensor_process_history', 'audit_event')",
     )
     .fetch_one(database.pool())
     .await
-    .expect("count cloned Timescale jobs");
-    assert_eq!(compression_jobs, 5);
+    .expect("count cloned ordinary tables");
+    assert_eq!(ordinary_tables, 5);
+    let extensions: Vec<String> =
+        sqlx::query_scalar("SELECT extname FROM pg_extension ORDER BY extname")
+            .fetch_all(database.pool())
+            .await
+            .expect("read cloned extensions");
+    assert!(!extensions.iter().any(|name| name == "timescaledb"));
 
     timeout(Duration::from_secs(30), database.cleanup())
         .await

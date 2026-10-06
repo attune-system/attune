@@ -91,8 +91,8 @@ setup_migrations_table() {
 
             IF has_attune_sqlx OR has_public_sqlx THEN
                 sqlx_history := CASE
-                    WHEN has_attune_sqlx THEN 'attune._sqlx_migrations'::regclass
-                    ELSE 'public._sqlx_migrations'::regclass
+                    WHEN has_attune_sqlx THEN to_regclass('attune._sqlx_migrations')
+                    ELSE to_regclass('public._sqlx_migrations')
                 END;
                 EXECUTE format('SELECT COUNT(*) FROM %s', sqlx_history)
                 INTO sqlx_migration_count;

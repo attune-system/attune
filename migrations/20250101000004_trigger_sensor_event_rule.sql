@@ -3,11 +3,8 @@
 --              with runtime version constraint support. Includes webhook key
 --              generation function used by webhook management functions in 000007.
 --
---              NOTE: The event and enforcement tables are converted to TimescaleDB
---              hypertables in migration 000009. Hypertables cannot be the target of
---              FK constraints, so enforcement.event is a plain BIGINT with no FK.
---              FKs *from* hypertables to regular tables (e.g., event.trigger → trigger,
---              enforcement.rule → rule) are supported by TimescaleDB 2.x and are kept.
+--              enforcement.event is a plain BIGINT with no FK so events and
+--              enforcements can be retained independently.
 -- Version: 20250101000004
 
 -- Set search_path for schema isolation
@@ -254,7 +251,7 @@ CREATE TABLE enforcement (
     rule_ref TEXT NOT NULL,
     trigger_ref TEXT NOT NULL,
     config JSONB,
-    event BIGINT,           -- references event(id); no FK because event becomes a hypertable
+    event BIGINT,           -- references event(id); no FK for independent retention
     status enforcement_status_enum NOT NULL DEFAULT 'created',
     payload JSONB NOT NULL,
     condition enforcement_condition_enum NOT NULL DEFAULT 'all',
@@ -286,7 +283,7 @@ CREATE UNIQUE INDEX uq_enforcement_rule_event
 COMMENT ON TABLE enforcement IS 'Enforcements represent rule triggering by events';
 COMMENT ON COLUMN enforcement.rule IS 'Rule being enforced (may be null if rule deleted)';
 COMMENT ON COLUMN enforcement.rule_ref IS 'Rule reference (preserved even if rule deleted)';
-COMMENT ON COLUMN enforcement.event IS 'Event that triggered this enforcement (no FK — event is a hypertable)';
+COMMENT ON COLUMN enforcement.event IS 'Event that triggered this enforcement (no FK for independent retention)';
 COMMENT ON COLUMN enforcement.status IS 'Processing status (created → processed or disabled)';
 COMMENT ON COLUMN enforcement.resolved_at IS 'Timestamp when the enforcement was resolved (status changed from created to processed/disabled). NULL while status is created.';
 COMMENT ON COLUMN enforcement.payload IS 'Event payload for rule evaluation';

@@ -15,8 +15,6 @@ pub enum SourceAvailability {
 #[serde(rename_all = "snake_case")]
 pub enum FreshnessMode {
     RawOnly,
-    AggregateOnly,
-    AggregatePlusTail,
     RawOnlyFallback,
 }
 
@@ -141,7 +139,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             source_type: ExecutionCount,
             availability: AvailableNow,
             authorization_basis: Executions,
-            default_freshness_mode: AggregatePlusTail,
+            default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
                 optional: vec!["action_ref", "pack_ref"],
@@ -154,7 +152,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             source_type: ExecutionTimeseries,
             availability: AvailableNow,
             authorization_basis: Executions,
-            default_freshness_mode: AggregatePlusTail,
+            default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
                 optional: vec!["action_ref", "pack_ref"],
@@ -167,7 +165,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             source_type: ExecutionStatusBreakdown,
             availability: AvailableNow,
             authorization_basis: Executions,
-            default_freshness_mode: AggregatePlusTail,
+            default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
                 optional: vec!["action_ref", "pack_ref"],
@@ -217,7 +215,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             source_type: EventCount,
             availability: AvailableNow,
             authorization_basis: Events,
-            default_freshness_mode: AggregatePlusTail,
+            default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
                 optional: vec!["trigger_ref", "pack_ref"],
@@ -230,7 +228,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             source_type: EventTimeseries,
             availability: AvailableNow,
             authorization_basis: Events,
-            default_freshness_mode: AggregatePlusTail,
+            default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
                 optional: vec!["trigger_ref", "pack_ref"],

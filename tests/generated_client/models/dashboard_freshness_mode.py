@@ -2,8 +2,6 @@ from enum import StrEnum
 
 
 class DashboardFreshnessMode(StrEnum):
-    AGGREGATE_ONLY = "aggregate_only"
-    AGGREGATE_PLUS_TAIL = "aggregate_plus_tail"
     RAW_ONLY = "raw_only"
     RAW_ONLY_FALLBACK = "raw_only_fallback"
 

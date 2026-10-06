@@ -91,7 +91,7 @@ The embedded runner keeps an existing `_sqlx_migrations` table in either the
 
 ### Prerequisites
 
-1. PostgreSQL 14 or later installed
+1. PostgreSQL 16 or later installed. TimescaleDB is not required.
 2. Create the database:
 
 ```bash
