@@ -1027,8 +1027,8 @@ async fn test_delete_sensor_when_pack_deleted() {
     .unwrap();
 
     // Delete the pack
-    use attune_common::repositories::{pack::PackRepository, Delete as _};
-    PackRepository::delete(&pool, pack.id).await.unwrap();
+    use attune_common::repositories::pack::PackRepository;
+    PackRepository::delete(&*pool, pack.id).await.unwrap();
 
     // Sensor should also be deleted due to CASCADE
     let result = SensorRepository::find_by_id(&pool, sensor.id)

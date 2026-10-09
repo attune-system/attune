@@ -180,7 +180,7 @@ pub fn build_transport(
                 api_url.expect("API URL was validated"),
                 auth_token.expect("auth token was validated"),
                 artifacts_dir,
-            )))
+            )?))
         }
         TransportMode::Auto => {
             let detected = detect_transport_mode(artifacts_dir);
@@ -189,7 +189,7 @@ pub fn build_transport(
                 _ => {
                     let url = api_url.unwrap_or("http://localhost:8080");
                     let token = auth_token.unwrap_or("");
-                    Ok(Box::new(ApiTransport::new(url, token, artifacts_dir)))
+                    Ok(Box::new(ApiTransport::new(url, token, artifacts_dir)?))
                 }
             }
         }
@@ -230,7 +230,7 @@ pub fn build_transport_with_worker_token_provider(
                 artifacts_dir,
                 api_url.unwrap_or("http://localhost:8080"),
                 provider,
-            ))),
+            )?)),
             None => Ok(Box::new(VolumeTransport::new(artifacts_dir))),
         },
         TransportMode::Api => {
@@ -244,7 +244,7 @@ pub fn build_transport_with_worker_token_provider(
                 api_url.expect("API URL was validated"),
                 provider,
                 artifacts_dir,
-            )))
+            )?))
         }
         TransportMode::Auto => {
             let detected = detect_transport_mode(artifacts_dir);
@@ -254,7 +254,7 @@ pub fn build_transport_with_worker_token_provider(
                         artifacts_dir,
                         api_url.unwrap_or("http://localhost:8080"),
                         provider,
-                    ))),
+                    )?)),
                     None => Ok(Box::new(VolumeTransport::new(artifacts_dir))),
                 },
                 _ => {
@@ -264,7 +264,7 @@ pub fn build_transport_with_worker_token_provider(
                             url,
                             provider,
                             artifacts_dir,
-                        )))
+                        )?))
                     } else {
                         Ok(Box::new(VolumeTransport::new(artifacts_dir)))
                     }

@@ -1105,8 +1105,6 @@ pub struct RetentionTargetsConfig {
     pub sensor_process_history: RetentionTargetConfig,
     #[serde(default = "default_retention_audit_events")]
     pub audit_events: RetentionTargetConfig,
-    #[serde(default = "default_retention_continuous_aggregates")]
-    pub continuous_aggregates: RetentionTargetConfig,
     #[serde(default = "default_retention_notifications")]
     pub notifications: RetentionTargetConfig,
     #[serde(default = "default_retention_webhook_event_logs")]
@@ -1137,7 +1135,6 @@ impl Default for RetentionTargetsConfig {
             worker_history: default_retention_worker_history(),
             sensor_process_history: default_retention_sensor_process_history(),
             audit_events: default_retention_audit_events(),
-            continuous_aggregates: default_retention_continuous_aggregates(),
             notifications: default_retention_notifications(),
             webhook_event_logs: default_retention_webhook_event_logs(),
             inquiries: default_retention_inquiries(),
@@ -1183,10 +1180,6 @@ fn default_retention_audit_events() -> RetentionTargetConfig {
     retention_days(90)
 }
 
-fn default_retention_continuous_aggregates() -> RetentionTargetConfig {
-    retention_days(30)
-}
-
 fn default_retention_notifications() -> RetentionTargetConfig {
     retention_days(30)
 }
@@ -1223,6 +1216,117 @@ fn default_retention_sensor_processes() -> RetentionTargetConfig {
     retention_days(30)
 }
 
+/// Bounded native partition and hourly-summary maintenance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(default)]
+pub struct NativeMaintenanceConfig {
+    pub enabled: bool,
+    pub partition_interval_seconds: u64,
+    pub summary_interval_seconds: u64,
+    pub partition_lookahead_days: i64,
+    pub max_partition_operations_per_cycle: i64,
+    pub default_repair_row_limit: i64,
+    pub lock_timeout_milliseconds: u64,
+    pub operation_timeout_milliseconds: u64,
+    pub max_partition_cycle_milliseconds: u64,
+    pub max_summary_buckets_per_cycle: i64,
+    pub max_summary_invalidations_per_bucket: i64,
+    pub summary_bootstrap_hours: i64,
+    pub max_summary_cycle_milliseconds: u64,
+}
+
+impl Default for NativeMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            partition_interval_seconds: 3600,
+            summary_interval_seconds: 300,
+            partition_lookahead_days: 7,
+            max_partition_operations_per_cycle: 32,
+            default_repair_row_limit: 1000,
+            lock_timeout_milliseconds: 250,
+            operation_timeout_milliseconds: 1000,
+            max_partition_cycle_milliseconds: 5000,
+            max_summary_buckets_per_cycle: 128,
+            max_summary_invalidations_per_bucket: 10_000,
+            summary_bootstrap_hours: 24,
+            max_summary_cycle_milliseconds: 5000,
+        }
+    }
+}
+
+impl NativeMaintenanceConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (name, value) in [
+            (
+                "partition_interval_seconds",
+                self.partition_interval_seconds,
+            ),
+            ("summary_interval_seconds", self.summary_interval_seconds),
+            ("lock_timeout_milliseconds", self.lock_timeout_milliseconds),
+            (
+                "operation_timeout_milliseconds",
+                self.operation_timeout_milliseconds,
+            ),
+            (
+                "max_partition_cycle_milliseconds",
+                self.max_partition_cycle_milliseconds,
+            ),
+            (
+                "max_summary_cycle_milliseconds",
+                self.max_summary_cycle_milliseconds,
+            ),
+        ] {
+            if value == 0 || value > i64::MAX as u64 {
+                return Err(format!(
+                    "native_maintenance.{name} must be a positive BIGINT"
+                ));
+            }
+        }
+        for (name, value) in [
+            ("partition_lookahead_days", self.partition_lookahead_days),
+            (
+                "max_partition_operations_per_cycle",
+                self.max_partition_operations_per_cycle,
+            ),
+            ("default_repair_row_limit", self.default_repair_row_limit),
+            (
+                "max_summary_buckets_per_cycle",
+                self.max_summary_buckets_per_cycle,
+            ),
+            (
+                "max_summary_invalidations_per_bucket",
+                self.max_summary_invalidations_per_bucket,
+            ),
+            ("summary_bootstrap_hours", self.summary_bootstrap_hours),
+        ] {
+            if value <= 0 {
+                return Err(format!("native_maintenance.{name} must be positive"));
+            }
+        }
+        if self.default_repair_row_limit == i64::MAX {
+            return Err(
+                "native_maintenance.default_repair_row_limit must be below BIGINT maximum"
+                    .to_string(),
+            );
+        }
+        for (name, value) in [
+            ("lock_timeout_milliseconds", self.lock_timeout_milliseconds),
+            (
+                "operation_timeout_milliseconds",
+                self.operation_timeout_milliseconds,
+            ),
+        ] {
+            if value > i32::MAX as u64 {
+                return Err(format!(
+                    "native_maintenance.{name} exceeds PostgreSQL's timeout range"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Supervisor-owned runtime retention configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct RetentionConfig {
@@ -1234,11 +1338,16 @@ pub struct RetentionConfig {
     #[serde(default = "default_retention_check_interval_seconds")]
     pub check_interval_seconds: u64,
 
-    /// Maximum rows to delete per target per cycle for regular tables.
+    /// Maximum rows to delete in each committed batch.
     #[serde(default = "default_retention_batch_size")]
     pub batch_size: i64,
 
-    /// Report candidates without deleting rows/chunks.
+    /// Maximum committed batches per target per cycle. Each target can delete
+    /// at most batch_size * max_batches_per_target rows per cycle.
+    #[serde(default = "default_retention_max_batches_per_target")]
+    pub max_batches_per_target: i64,
+
+    /// Report candidate rows without deleting them.
     #[serde(default)]
     pub dry_run: bool,
 
@@ -1254,6 +1363,11 @@ pub struct RetentionConfig {
     /// with the runtime retention singleton and reloaded every cycle.
     #[serde(default)]
     pub cache_retention: CacheRetentionConfig,
+
+    /// Independent native partition/summary jobs. Persisted and reloaded with
+    /// retention settings; raw reads remain available during materialization.
+    #[serde(default)]
+    pub native_maintenance: NativeMaintenanceConfig,
 }
 
 impl Default for RetentionConfig {
@@ -1262,10 +1376,12 @@ impl Default for RetentionConfig {
             enabled: true,
             check_interval_seconds: default_retention_check_interval_seconds(),
             batch_size: default_retention_batch_size(),
+            max_batches_per_target: default_retention_max_batches_per_target(),
             dry_run: false,
             advisory_lock_key: default_retention_advisory_lock_key(),
             targets: RetentionTargetsConfig::default(),
             cache_retention: CacheRetentionConfig::default(),
+            native_maintenance: NativeMaintenanceConfig::default(),
         }
     }
 }
@@ -1276,6 +1392,12 @@ fn default_retention_check_interval_seconds() -> u64 {
 
 fn default_retention_batch_size() -> i64 {
     1000
+}
+
+fn default_retention_max_batches_per_target() -> i64 {
+    // Provisional capacity: 100,000 rows per target per hourly cycle.
+    // Confirm against the declared ingestion/backlog workload before rollout.
+    100
 }
 
 fn default_retention_advisory_lock_key() -> i64 {
@@ -1495,16 +1617,29 @@ pub struct CacheRetentionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Maximum `cache_entry` rows deleted per bounded batch call.
-    #[serde(default = "default_cache_retention_batch_size")]
-    pub batch_size: i64,
+    /// Total generation-reclamation budget per supervisor cycle.
+    #[serde(default = "default_cache_cleanup_cycle_milliseconds")]
+    pub max_cleanup_cycle_milliseconds: u64,
 
-    /// Maximum entry-deletion batches performed for a single cleanup-candidate
-    /// generation within one supervisor cycle. Bounds how long a single
-    /// high-cardinality generation can dominate a cycle; entries are always
-    /// deleted in indexed bounded batches before the generation row itself.
-    #[serde(default = "default_cache_retention_max_batches_per_generation")]
-    pub max_batches_per_generation: i64,
+    /// Maximum wait for cache partition DDL locks.
+    #[serde(default = "default_cache_ddl_lock_timeout_milliseconds")]
+    pub ddl_lock_timeout_milliseconds: u64,
+
+    /// Server-side statement deadline for refresh partition creation, independent of cleanup.
+    #[serde(default = "default_cache_ddl_creation_statement_timeout_milliseconds")]
+    pub ddl_creation_statement_timeout_milliseconds: u64,
+
+    /// Server-side deadline for one atomic generation reclamation.
+    #[serde(default = "default_cache_ddl_statement_timeout_milliseconds")]
+    pub ddl_statement_timeout_milliseconds: u64,
+
+    /// Minimum interval between successful parent/leaf cache statistics refreshes.
+    #[serde(default = "default_cache_statistics_interval_seconds")]
+    pub statistics_interval_seconds: u64,
+
+    /// Independent statement deadline for cache parent/leaf ANALYZE.
+    #[serde(default = "default_cache_statistics_statement_timeout_milliseconds")]
+    pub statistics_statement_timeout_milliseconds: u64,
 
     /// Maximum cleanup-candidate generations (failed, or retired past
     /// `readable_until`) processed in a single supervisor cycle.
@@ -1562,8 +1697,14 @@ impl Default for CacheRetentionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            batch_size: default_cache_retention_batch_size(),
-            max_batches_per_generation: default_cache_retention_max_batches_per_generation(),
+            max_cleanup_cycle_milliseconds: default_cache_cleanup_cycle_milliseconds(),
+            ddl_lock_timeout_milliseconds: default_cache_ddl_lock_timeout_milliseconds(),
+            ddl_creation_statement_timeout_milliseconds:
+                default_cache_ddl_creation_statement_timeout_milliseconds(),
+            ddl_statement_timeout_milliseconds: default_cache_ddl_statement_timeout_milliseconds(),
+            statistics_interval_seconds: default_cache_statistics_interval_seconds(),
+            statistics_statement_timeout_milliseconds:
+                default_cache_statistics_statement_timeout_milliseconds(),
             max_generations_per_cycle: default_cache_retention_max_generations_per_cycle(),
             max_namespaces_per_cycle: default_cache_retention_max_namespaces_per_cycle(),
             min_traversal_window_seconds: default_cache_retention_min_traversal_window_seconds(),
@@ -1578,12 +1719,68 @@ impl Default for CacheRetentionConfig {
     }
 }
 
-fn default_cache_retention_batch_size() -> i64 {
-    1000
+fn default_cache_cleanup_cycle_milliseconds() -> u64 {
+    30_000
 }
 
-fn default_cache_retention_max_batches_per_generation() -> i64 {
-    20
+fn default_cache_ddl_lock_timeout_milliseconds() -> u64 {
+    250
+}
+
+fn default_cache_ddl_statement_timeout_milliseconds() -> u64 {
+    1_000
+}
+
+fn default_cache_ddl_creation_statement_timeout_milliseconds() -> u64 {
+    5_000
+}
+
+fn default_cache_statistics_interval_seconds() -> u64 {
+    300
+}
+
+fn default_cache_statistics_statement_timeout_milliseconds() -> u64 {
+    5_000
+}
+
+impl CacheRetentionConfig {
+    pub fn validate_storage_maintenance(&self) -> std::result::Result<(), String> {
+        for (name, value) in [
+            (
+                "max_cleanup_cycle_milliseconds",
+                self.max_cleanup_cycle_milliseconds,
+            ),
+            (
+                "ddl_lock_timeout_milliseconds",
+                self.ddl_lock_timeout_milliseconds,
+            ),
+            (
+                "ddl_creation_statement_timeout_milliseconds",
+                self.ddl_creation_statement_timeout_milliseconds,
+            ),
+            (
+                "ddl_statement_timeout_milliseconds",
+                self.ddl_statement_timeout_milliseconds,
+            ),
+            (
+                "statistics_statement_timeout_milliseconds",
+                self.statistics_statement_timeout_milliseconds,
+            ),
+        ] {
+            if value == 0 || value > 3_600_000 {
+                return Err(format!(
+                    "cache_retention.{name} must be between 1 and 3600000"
+                ));
+            }
+        }
+        if self.statistics_interval_seconds == 0 || self.statistics_interval_seconds > 86_400 {
+            return Err(
+                "cache_retention.statistics_interval_seconds must be between 1 and 86400"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn default_cache_retention_max_generations_per_cycle() -> i64 {
@@ -1759,6 +1956,9 @@ pub struct Config {
 /// tests while bounding accidental unbounded deployment growth.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheAdmissionConfig {
+    /// Provisional small-deployment safety cap, including every retained state.
+    #[serde(default = "default_cache_max_entry_partitions")]
+    pub max_entry_partitions: i64,
     #[serde(default = "default_cache_max_live_namespaces")]
     pub max_live_namespaces: i64,
     #[serde(default = "default_cache_max_live_namespaces_per_owner")]
@@ -1774,6 +1974,7 @@ pub struct CacheAdmissionConfig {
 impl Default for CacheAdmissionConfig {
     fn default() -> Self {
         Self {
+            max_entry_partitions: default_cache_max_entry_partitions(),
             max_live_namespaces: default_cache_max_live_namespaces(),
             max_live_namespaces_per_owner: default_cache_max_live_namespaces_per_owner(),
             max_physical_bytes: default_cache_max_physical_bytes(),
@@ -1786,6 +1987,10 @@ impl Default for CacheAdmissionConfig {
 
 fn default_cache_max_live_namespaces() -> i64 {
     10_000
+}
+
+fn default_cache_max_entry_partitions() -> i64 {
+    128
 }
 
 fn default_cache_max_live_namespaces_per_owner() -> i64 {
@@ -2265,6 +2470,12 @@ impl Config {
             ));
         }
 
+        if self.retention.max_batches_per_target <= 0 {
+            return Err(crate::Error::validation(
+                "retention.max_batches_per_target must be greater than zero",
+            ));
+        }
+
         if self.maintenance.artifact_cleanup_batch_size <= 0 {
             return Err(crate::Error::validation(
                 "maintenance.artifact_cleanup_batch_size must be greater than zero",
@@ -2301,7 +2512,8 @@ impl Config {
             ));
         }
 
-        if self.cache_admission.max_live_namespaces <= 0
+        if self.cache_admission.max_entry_partitions <= 0
+            || self.cache_admission.max_live_namespaces <= 0
             || self.cache_admission.max_live_namespaces_per_owner <= 0
             || self.cache_admission.max_physical_bytes <= 0
             || self.cache_admission.max_physical_bytes_per_owner <= 0
@@ -2311,6 +2523,10 @@ impl Config {
                 "cache_admission limits must be greater than zero",
             ));
         }
+
+        self.cache_retention
+            .validate_storage_maintenance()
+            .map_err(crate::Error::validation)?;
 
         if self.maintenance.alert_limit_per_cycle <= 0 {
             return Err(crate::Error::validation(
@@ -2701,6 +2917,17 @@ mod tests {
     }
 
     #[test]
+    fn distributed_docker_configuration_passes_deployed_transport_validation() {
+        let config: Config = serde_yaml_ng::from_str(include_str!(
+            "../../../docker/distributable/config.docker.yaml"
+        ))
+        .expect("distributed Docker configuration must parse");
+        config
+            .validate()
+            .expect("distributed Docker configuration must start deployed services");
+    }
+
+    #[test]
     fn deployed_sensor_accepts_explicit_pack_transport() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "environment": "production",
@@ -3045,6 +3272,7 @@ mod tests {
         assert!(retention.enabled);
         assert_eq!(retention.check_interval_seconds, 3600);
         assert_eq!(retention.batch_size, 1000);
+        assert_eq!(retention.max_batches_per_target, 100);
         assert_eq!(
             retention.targets.events.max_age_seconds,
             Some(30 * 24 * 60 * 60)
@@ -3095,6 +3323,24 @@ mod tests {
 
         assert_eq!(retention.targets.events.max_age_seconds, None);
         assert_eq!(retention.targets.audit_events.max_age_seconds, None);
+    }
+
+    #[test]
+    fn retention_batch_budget_is_positive_and_defaults_when_omitted() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "security": {"enable_auth": false},
+            "retention": {}
+        }))
+        .unwrap();
+        assert_eq!(config.retention.max_batches_per_target, 100);
+        assert!(config.validate().is_ok());
+        for budget in [0, -1] {
+            config.retention.max_batches_per_target = budget;
+            assert!(
+                matches!(config.validate(), Err(crate::Error::Validation(message))
+                if message.contains("max_batches_per_target"))
+            );
+        }
     }
 
     #[test]
@@ -3219,8 +3465,12 @@ provider_icon_url: "https://corp.com/icon.svg"
         let cfg = CacheRetentionConfig::default();
 
         assert!(cfg.enabled);
-        assert_eq!(cfg.batch_size, 1000);
-        assert_eq!(cfg.max_batches_per_generation, 20);
+        assert_eq!(cfg.max_cleanup_cycle_milliseconds, 30_000);
+        assert_eq!(cfg.ddl_lock_timeout_milliseconds, 250);
+        assert_eq!(cfg.ddl_creation_statement_timeout_milliseconds, 5_000);
+        assert_eq!(cfg.ddl_statement_timeout_milliseconds, 1_000);
+        assert_eq!(cfg.statistics_interval_seconds, 300);
+        assert_eq!(cfg.statistics_statement_timeout_milliseconds, 5_000);
         assert_eq!(cfg.max_generations_per_cycle, 50);
         assert_eq!(cfg.max_namespaces_per_cycle, 50);
         assert_eq!(cfg.min_traversal_window_seconds, 60 * 60);
@@ -3243,8 +3493,12 @@ provider_icon_url: "https://corp.com/icon.svg"
     fn cache_retention_config_serialization_round_trips() {
         let original = CacheRetentionConfig {
             enabled: false,
-            batch_size: 250,
-            max_batches_per_generation: 5,
+            max_cleanup_cycle_milliseconds: 5_000,
+            ddl_lock_timeout_milliseconds: 100,
+            ddl_creation_statement_timeout_milliseconds: 2_000,
+            ddl_statement_timeout_milliseconds: 500,
+            statistics_interval_seconds: 60,
+            statistics_statement_timeout_milliseconds: 2_000,
             max_generations_per_cycle: 10,
             max_namespaces_per_cycle: 7,
             min_traversal_window_seconds: 120,
@@ -3270,18 +3524,19 @@ provider_icon_url: "https://corp.com/icon.svg"
     #[test]
     fn cache_retention_config_partial_json_fills_defaults_on_reload() {
         let cfg: CacheRetentionConfig = serde_json::from_value(serde_json::json!({
-            "batch_size": 42,
+            "max_cleanup_cycle_milliseconds": 42,
             "dry_run": true,
         }))
         .expect("partial cache retention config should deserialize");
 
-        assert_eq!(cfg.batch_size, 42);
+        assert_eq!(cfg.max_cleanup_cycle_milliseconds, 42);
         assert!(cfg.dry_run);
         // Untouched fields fall back to defaults.
         assert!(cfg.enabled);
+        assert_eq!(cfg.ddl_creation_statement_timeout_milliseconds, 5_000);
         assert_eq!(
-            cfg.max_batches_per_generation,
-            default_cache_retention_max_batches_per_generation()
+            cfg.ddl_statement_timeout_milliseconds,
+            default_cache_ddl_statement_timeout_milliseconds()
         );
         assert_eq!(
             cfg.max_generations_per_cycle,
@@ -3326,7 +3581,10 @@ provider_icon_url: "https://corp.com/icon.svg"
         // Everything else keeps its default even though the object only
         // overrides one field, exercising the same defaulting path used
         // when the supervisor reloads its config each cycle.
-        assert_eq!(cfg.batch_size, default_cache_retention_batch_size());
+        assert_eq!(
+            cfg.max_cleanup_cycle_milliseconds,
+            default_cache_cleanup_cycle_milliseconds()
+        );
     }
 
     #[test]

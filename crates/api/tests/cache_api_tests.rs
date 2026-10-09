@@ -13,31 +13,39 @@ use serde_json::{json, Value};
 use attune_common::{
     audit::{AuditCategory, AuditEventFilters, AuditOutcome, AuditRepository},
     auth::jwt::{
-        generate_sensor_token, generate_sensor_token_with_cache_authority_and_workload_fence,
-        generate_token, generate_worker_token_with_instance, validate_token, JwtConfig, TokenType,
+        generate_execution_token_with_permission_sets, generate_sensor_token,
+        generate_sensor_token_with_cache_authority_and_workload_fence, generate_token,
+        generate_worker_token_with_instance, validate_token, JwtConfig, TokenType,
     },
     config::CacheAdmissionConfig,
     models::{
-        enums::WorkerStatus, enums::WorkerType, ActionReferenceVisibility, OwnerType,
-        SensorWorkloadFence,
+        enums::WorkerStatus, enums::WorkerType, ActionReferenceVisibility, ExecutionStatus,
+        OwnerType, SensorWorkloadFence, WorkflowCacheIterationState,
     },
     repositories::{
         cache::{
-            CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope,
+            CacheEntryRepository, CacheGenerationRepository, CacheNamespacePolicy,
+            CacheNamespaceRepository, CacheOwnerScope, CacheTransactionMode,
             CreateCacheNamespaceInput, ManagedCacheNamespaceDefinition,
         },
         component_lifecycle::PackProjectionIds,
+        execution::{CreateExecutionInput, ExecutionRepository},
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository, UpdateIdentityInput,
         },
         key::{CreateKeyInput, KeyRepository},
+        pack_release::{CreatePackReleaseInput, PackReleaseRepository},
         runtime::{CreateRuntimeInput, CreateWorkerInput, RuntimeRepository, WorkerRepository},
         sensor_workload::{
             AcquireSensorWorkloadInput, AcquireSensorWorkloadOutcome, SensorWorkloadRepository,
         },
         trigger::{CreateSensorInput, CreateTriggerInput, SensorRepository, TriggerRepository},
-        Create, Update,
+        workflow::{CreateWorkflowExecutionInput, WorkflowExecutionRepository},
+        workflow_cache_iteration::{
+            CreateWorkflowCacheIterationInput, WorkflowCacheIterationRepository,
+        },
+        Create, FindById, Update,
     },
 };
 
@@ -221,6 +229,744 @@ async fn create_namespace(
         .await
 }
 
+fn coordination_request(pack_ref: &str, refresh_id: &str) -> Value {
+    json!({
+        "owner_type": "pack",
+        "owner_ref": pack_ref,
+        "client_refresh_id": refresh_id,
+        "expected_active_generation_id": null,
+        "expected_chunk_count": 0,
+    })
+}
+
+async fn cache_partition_count(pool: &sqlx::PgPool) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_inherits WHERE inhparent = 'cache_entry'::regclass",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+#[tokio::test]
+async fn partition_cap_preserves_matching_retry_and_reuse_without_extra_storage() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new_with_cache_admission(CacheAdmissionConfig {
+        max_entry_partitions: 1,
+        ..CacheAdmissionConfig::default()
+    })
+    .await?;
+    let pack = create_test_pack(&ctx.pool, "cache_partition_cap").await?;
+    let (token, _) =
+        register_user(&ctx, "cache_partition_cap", pack_writer_grants(&pack.r#ref)).await?;
+    create_namespace(&ctx, &token, &pack.r#ref, "users", json!({}))
+        .await?
+        .assert_status(StatusCode::CREATED);
+    let id = begin_generation(&ctx, &token, &pack.r#ref, "users", "original", 0).await?;
+    let path = "/api/v1/cache/namespaces/users/generations";
+    let retry = ctx
+        .post(
+            path,
+            coordination_request(&pack.r#ref, "original"),
+            Some(&token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    let retry: Value = retry.json().await?;
+    assert_eq!(retry["data"]["generation_id"], id);
+    let rejected = ctx
+        .post(path, coordination_request(&pack.r#ref, "new"), Some(&token))
+        .await?
+        .assert_status(StatusCode::CONFLICT);
+    let rejected: Value = rejected.json().await?;
+    assert_eq!(rejected["code"], "cache_entry_partition_limit_exceeded");
+    ctx.put(
+        "/api/v1/cache/namespaces/users",
+        json!({"owner_type": "pack", "owner_ref": pack.r#ref, "refresh_concurrency": "reuse"}),
+        Some(&token),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+    let reused = ctx
+        .post(
+            path,
+            coordination_request(&pack.r#ref, "reused"),
+            Some(&token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    let reused: Value = reused.json().await?;
+    assert_eq!(reused["data"], retry["data"]);
+    assert_eq!(cache_partition_count(&ctx.pool).await?, 1);
+    let usage: (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT, COALESCE(SUM(record_count), 0)::BIGINT, \
+         COALESCE(SUM(physical_bytes), 0)::BIGINT FROM cache_generation_entry_usage",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(usage, (1, 0, 0));
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn partition_lock_timeout_returns_stable_503_and_same_refresh_retry_succeeds() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_partition_busy").await?;
+    let (token, _) = register_user(
+        &ctx,
+        "cache_partition_busy",
+        pack_writer_grants(&pack.r#ref),
+    )
+    .await?;
+    create_namespace(&ctx, &token, &pack.r#ref, "users", json!({}))
+        .await?
+        .assert_status(StatusCode::CREATED);
+    let mut blocker = ctx.pool.begin().await?;
+    sqlx::query("LOCK TABLE ONLY cache_entry IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    let observed = async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks \
+                     WHERE relation = 'cache_entry'::regclass AND NOT granted \
+                     AND mode = 'ShareUpdateExclusiveLock' \
+                     AND $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(blocker_pid)
+                .fetch_one(&ctx.pool)
+                .await?;
+                if waiting {
+                    return Ok::<_, sqlx::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let request = ctx.post(
+        "/api/v1/cache/namespaces/users/generations",
+        coordination_request(&pack.r#ref, "retry-me"),
+        Some(&token),
+    );
+    let (response, observed) = tokio::join!(request, observed);
+    // Release the owned blocker even when the request or observation failed.
+    blocker.rollback().await?;
+    observed?;
+    let response = response?.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let error: Value = response.json().await?;
+    assert_eq!(error["code"], "cache_storage_busy");
+    assert!(error.get("details").is_none(), "no relation or SQL details");
+    assert_eq!(cache_partition_count(&ctx.pool).await?, 0);
+    let resources: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM cache_generation), \
+         (SELECT COUNT(*) FROM cache_generation_entry_usage), \
+         (SELECT COUNT(*) FROM cache_ingest_chunk)",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(resources, (0, 0, 0));
+    let id = begin_generation(&ctx, &token, &pack.r#ref, "users", "retry-me", 0).await?;
+    let retry = ctx
+        .post(
+            "/api/v1/cache/namespaces/users/generations",
+            coordination_request(&pack.r#ref, "retry-me"),
+            Some(&token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    let retry: Value = retry.json().await?;
+    assert_eq!(retry["data"]["generation_id"], id);
+    assert_eq!(cache_partition_count(&ctx.pool).await?, 1);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn partition_creation_failure_rolls_back_metadata_and_retry_contract() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_partition_failure").await?;
+    let (token, _) = register_user(
+        &ctx,
+        "cache_partition_failure",
+        pack_writer_grants(&pack.r#ref),
+    )
+    .await?;
+    create_namespace(&ctx, &token, &pack.r#ref, "users", json!({}))
+        .await?
+        .assert_status(StatusCode::CREATED);
+    // Owned event trigger fails actual ATTACH DDL after generation/usage insertion.
+    sqlx::raw_sql(
+        "CREATE FUNCTION test_reject_cache_attach() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF EXISTS(SELECT 1 FROM pg_event_trigger_ddl_commands() \
+                         WHERE object_identity LIKE '%cache_entry') THEN \
+              RAISE EXCEPTION 'owned ATTACH failure' USING ERRCODE = 'XX000'; END IF; END $$; \
+         CREATE EVENT TRIGGER test_cache_attach_failure ON ddl_command_end \
+         WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION test_reject_cache_attach();",
+    )
+    .execute(&ctx.pool)
+    .await?;
+    let response = ctx
+        .post(
+            "/api/v1/cache/namespaces/users/generations",
+            coordination_request(&pack.r#ref, "ddl-retry"),
+            Some(&token),
+        )
+        .await?;
+    sqlx::raw_sql(
+        "DROP EVENT TRIGGER test_cache_attach_failure; DROP FUNCTION test_reject_cache_attach();",
+    )
+    .execute(&ctx.pool)
+    .await?;
+    response.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(cache_partition_count(&ctx.pool).await?, 0);
+    let resources: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM cache_generation), \
+         (SELECT COUNT(*) FROM cache_generation_entry_usage), \
+          (SELECT COUNT(*) FROM pg_class WHERE relkind = 'r' AND relname ~ '^cache_entry_g_[0-9]+$')",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(resources, (0, 0, 0));
+    begin_generation(&ctx, &token, &pack.r#ref, "users", "ddl-retry", 0).await?;
+    assert_eq!(cache_partition_count(&ctx.pool).await?, 1);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pack_delete_handler_waits_for_pin_admission_before_pack_sensor_and_cascade_locks(
+) -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let pack_ref = format!("cache_delete_handler_{}", &suffix[..8]);
+    let pack = create_test_pack(&ctx.pool, &pack_ref).await?;
+    let mut grants = pack_writer_grants(&pack.r#ref);
+    grants
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"resource":"packs", "actions":["read","delete"]}));
+    let (access_token, _) = register_user(&ctx, "cache_delete_handler", grants).await?;
+    let token = access_token.as_str();
+    let projection = ctx.test_packs_dir.join(&pack.r#ref);
+    let runtime = std::path::Path::new(&ctx.state.config.runtime_envs_dir)
+        .join(&pack.r#ref)
+        .join("python");
+    std::fs::create_dir_all(&projection)?;
+    std::fs::write(
+        projection.join("pack.yaml"),
+        format!("ref: {}\n", pack.r#ref),
+    )?;
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::write(runtime.join("installed"), "true")?;
+    let digest = "d".repeat(64);
+    let release_tree = ctx.test_packs_dir.join(".releases/sha256").join(&digest);
+    let release_content = release_tree.join("pack");
+    std::fs::create_dir_all(&release_content)?;
+    std::fs::write(
+        release_content.join("pack.yaml"),
+        format!("ref: {}\n", pack.r#ref),
+    )?;
+    let mut setup = ctx.pool.begin().await?;
+    PackReleaseRepository::create_or_get(
+        &mut setup,
+        CreatePackReleaseInput {
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            version: "1.0.0".into(),
+            digest,
+            object_key: "owned-cache-delete-handler".into(),
+            provider_version: "test".into(),
+            content_path: release_content.to_str().unwrap().into(),
+            archive_size: 1,
+            manifest: json!({}),
+        },
+    )
+    .await?;
+    setup.commit().await?;
+    create_namespace(&ctx, token, &pack.r#ref, "users", json!({}))
+        .await?
+        .assert_status(StatusCode::CREATED);
+    let generation =
+        begin_generation(&ctx, token, &pack.r#ref, "users", "delete-handler", 0).await?;
+    for operation in ["seal", "promote"] {
+        ctx.post(
+            &format!("/api/v1/cache/namespaces/users/generations/{generation}/{operation}"),
+            json!({"owner_type":"pack", "owner_ref":pack.r#ref,
+                "expected_chunk_count":0,"expected_active_generation_id":null}),
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    }
+    let namespace = CacheGenerationRepository::find_by_id(&ctx.pool, generation)
+        .await?
+        .unwrap()
+        .namespace;
+    let action = create_test_action(
+        &ctx.pool,
+        pack.id,
+        &pack.r#ref,
+        &format!("{}.workflow", pack.r#ref),
+    )
+    .await?;
+    let definition = create_test_workflow(&ctx.pool, pack.id, &pack.r#ref, &action.r#ref).await?;
+    let root = ExecutionRepository::create(
+        &ctx.pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref,
+            status: ExecutionStatus::Completed,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let workflow = WorkflowExecutionRepository::create(
+        &ctx.pool,
+        CreateWorkflowExecutionInput {
+            execution: root.id,
+            workflow_def: definition.id,
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Completed,
+        },
+    )
+    .await?;
+    let mut pin = ctx.pool.begin().await?;
+    CacheEntryRepository::protect_transaction(&mut pin, CacheTransactionMode::PinMutation).await?;
+    let iteration = WorkflowCacheIterationRepository::create_or_find_for_update(
+        &mut pin,
+        CreateWorkflowCacheIterationInput {
+            workflow_execution: workflow.id,
+            task_name: "consume".into(),
+            namespace,
+            generation,
+            page_size: 1,
+            batch_size: 1,
+            concurrency: 1,
+        },
+    )
+    .await?;
+    WorkflowCacheIterationRepository::mark_terminal(
+        &mut *pin,
+        iteration.id,
+        WorkflowCacheIterationState::Completed,
+        None,
+    )
+    .await?;
+    pin.commit().await?;
+    let mut gate = ctx.pool.begin().await?;
+    CacheEntryRepository::protect_transaction(&mut gate, CacheTransactionMode::PinMutation).await?;
+    let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *gate)
+        .await?;
+    let mut observer = ctx.pool.acquire().await?;
+    let request_path = format!("/api/v1/packs/{}", pack.r#ref);
+    let read_path = format!(
+        "/api/v1/cache/namespaces/users/entries?owner_type=pack&owner_ref={}&limit=1",
+        pack.r#ref
+    );
+    let deletion = ctx.delete(&request_path, Some(token));
+    let observed = async {
+        let result: Result<_> = async {
+            let waiting = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let pid: Option<i32> = sqlx::query_scalar(
+                        "SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=7821101 AND objid=0 \
+                         AND objsubid=2 AND NOT granted AND $1=ANY(pg_blocking_pids(pid))",
+                    ).bind(gate_pid).fetch_optional(&mut *observer).await?;
+                    if let Some(pid) = pid { return Ok::<_, sqlx::Error>(pid); }
+                    tokio::task::yield_now().await;
+                }
+            }).await??;
+            let locks: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted), \
+                 (SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND relation IN \
+                  ('cache_entry'::regclass,'pack'::regclass,'pack_release'::regclass,'sensor'::regclass, \
+                   'workflow_definition'::regclass,'workflow_execution'::regclass,'workflow_cache_iteration'::regclass, \
+                   'cache_namespace'::regclass,'cache_generation_entry_usage'::regclass))",
+            ).bind(waiting).fetch_one(&mut *observer).await?;
+            let before: (bool, i64, i64) = sqlx::query_as(
+                "SELECT (SELECT tombstoned_at IS NULL FROM cache_namespace WHERE id=$1), \
+                 (SELECT retained_iterations FROM cache_generation_entry_usage WHERE generation=$2), \
+                 (SELECT COUNT(*) FROM workflow_cache_iteration WHERE generation=$2)",
+            ).bind(namespace).bind(generation).fetch_one(&mut *observer).await?;
+            let read = tokio::time::timeout(std::time::Duration::from_secs(10), ctx.get(&read_path, Some(token))).await??;
+            let read_status = read.status();
+            let read_body: Value = read.json().await?;
+            Ok((locks, before, read_status, read_body,
+                projection.join("pack.yaml").is_file(), runtime.join("installed").is_file()))
+        }.await;
+        gate.rollback().await?;
+        result
+    };
+    let (response, observation) = tokio::join!(deletion, observed);
+    drop(observer);
+    let response = response?;
+    let status = response.status();
+    let observation = observation?;
+    let after: (bool, bool, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT tombstoned_at IS NOT NULL AND owner_pack IS NULL AND active_generation IS NULL \
+                 FROM cache_namespace WHERE id=$1), \
+         EXISTS(SELECT 1 FROM cache_generation WHERE id=$2), \
+         (SELECT retained_iterations FROM cache_generation_entry_usage WHERE generation=$2), \
+         (SELECT COUNT(*) FROM workflow_cache_iteration WHERE generation=$2), \
+         (SELECT COUNT(*) FROM pack_release WHERE pack=$3)",
+    ).bind(namespace).bind(generation).bind(pack.id).fetch_one(&ctx.pool).await?;
+    let pack_gone = ctx.get(&request_path, Some(token)).await?.status();
+    let removed_files = !projection.exists() && !runtime.exists() && !release_tree.exists();
+    ctx.cleanup().await?;
+    assert_eq!(
+        observation.0,
+        (0, 0),
+        "handler acquired pack/sensor advisory or source relation locks before admission"
+    );
+    assert_eq!(
+        observation.1,
+        (true, 1, 1),
+        "namespace and retained counters changed while deletion was blocked"
+    );
+    assert_eq!(
+        observation.2,
+        StatusCode::OK,
+        "ordinary API cache reads must stay concurrent with held PinMutation"
+    );
+    assert_eq!(observation.3["data"]["generation_id"], generation);
+    assert!(
+        observation.4 && observation.5,
+        "projection/runtime staging must wait for admission"
+    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pack_gone, StatusCode::NOT_FOUND);
+    assert_eq!(after, (true, true, 0, 0, 0), "pack deletion must atomically tombstone cache ownership and release iteration metadata, not storage");
+    assert!(removed_files, "committed pack deletion must remove projection, runtime environment and unreferenced release tree");
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_reuse_is_atomic_and_returns_original_generation_metadata() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_coord_reuse").await?;
+    let (token, identity_id) =
+        register_user(&ctx, "cache_coord_reuse", pack_writer_grants(&pack.r#ref)).await?;
+    let response = create_namespace(
+        &ctx,
+        &token,
+        &pack.r#ref,
+        "users",
+        json!({"refresh_concurrency": "reuse"}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let namespace: Value = response.json().await?;
+    assert_eq!(namespace["data"]["refresh_concurrency"], "reuse");
+    let namespace_id = namespace["data"]["id"].as_i64().unwrap();
+    let path = "/api/v1/cache/namespaces/users/generations";
+    let (first, second) = tokio::join!(
+        ctx.post(
+            path,
+            coordination_request(&pack.r#ref, "refresh-a"),
+            Some(&token)
+        ),
+        ctx.post(
+            path,
+            coordination_request(&pack.r#ref, "refresh-b"),
+            Some(&token)
+        ),
+    );
+    let first = first?;
+    let second = second?;
+    assert!(matches!(
+        (first.status(), second.status()),
+        (StatusCode::CREATED, StatusCode::OK) | (StatusCode::OK, StatusCode::CREATED)
+    ));
+    let first: Value = first.json().await?;
+    let second: Value = second.json().await?;
+    assert_eq!(first["data"], second["data"]);
+    assert_eq!(first["data"]["created_by"], identity_id);
+    assert!(first["data"]["created_by_execution"].is_null());
+    assert_eq!(
+        CacheGenerationRepository::list_for_namespace(&ctx.pool, namespace_id, 10)
+            .await?
+            .len(),
+        1
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_conflict_exposes_safe_metadata_only_after_cache_authorization() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_coord_conflict").await?;
+    let (token, _) = register_user(
+        &ctx,
+        "cache_coord_conflict",
+        pack_writer_grants(&pack.r#ref),
+    )
+    .await?;
+    let response = create_namespace(
+        &ctx,
+        &token,
+        &pack.r#ref,
+        "users",
+        json!({"refresh_concurrency": "conflict"}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let id = begin_generation(&ctx, &token, &pack.r#ref, "users", "original", 0).await?;
+    let response = ctx
+        .post(
+            "/api/v1/cache/namespaces/users/generations",
+            coordination_request(&pack.r#ref, "different"),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value = response.json().await?;
+    assert_eq!(body["code"], "cache_refresh_in_progress");
+    assert_eq!(body["details"]["generation_id"], id);
+    assert!(body["details"]["created_by_execution"].is_null());
+    assert_eq!(body["details"].as_object().unwrap().len(), 2);
+    let (denied, _) = register_user(&ctx, "cache_coord_denied", json!([])).await?;
+    let response = ctx
+        .post(
+            "/api/v1/cache/namespaces/users/generations",
+            coordination_request(&pack.r#ref, "denied"),
+            Some(&denied),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: Value = response.json().await?;
+    assert!(body.get("details").is_none());
+    assert_ne!(body["code"], "cache_refresh_in_progress");
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn namespace_refresh_policy_round_trips_and_keeps_parallel_default() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_coord_policy").await?;
+    let (token, _) =
+        register_user(&ctx, "cache_coord_policy", pack_writer_grants(&pack.r#ref)).await?;
+    let response = create_namespace(&ctx, &token, &pack.r#ref, "users", json!({})).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: Value = response.json().await?;
+    assert_eq!(body["data"]["refresh_concurrency"], "parallel");
+    for policy in ["reuse", "conflict", "parallel"] {
+        let response = ctx
+            .put(
+                "/api/v1/cache/namespaces/users",
+                json!({
+                    "owner_type": "pack", "owner_ref": pack.r#ref, "refresh_concurrency": policy,
+                }),
+                Some(&token),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await?;
+        assert_eq!(body["data"]["refresh_concurrency"], policy);
+        let response = ctx
+            .get(
+                &format!(
+                    "/api/v1/cache/namespaces/users?owner_type=pack&owner_ref={}",
+                    pack.r#ref
+                ),
+                Some(&token),
+            )
+            .await?;
+        let body: Value = response.json().await?;
+        assert_eq!(body["data"]["refresh_concurrency"], policy);
+    }
+    let response = ctx
+        .put(
+            "/api/v1/cache/namespaces/users",
+            json!({
+                "owner_type": "pack", "owner_ref": pack.r#ref, "refresh_concurrency": "invalid",
+            }),
+            Some(&token),
+        )
+        .await?;
+    // Typed Json extraction rejects unsupported enum values before the route runs.
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let first = begin_generation(&ctx, &token, &pack.r#ref, "users", "parallel-a", 0).await?;
+    let second = begin_generation(&ctx, &token, &pack.r#ref, "users", "parallel-b", 0).await?;
+    assert_ne!(first, second);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn execution_refresh_attribution_survives_reuse_and_metadata_reads() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_coord_execution").await?;
+    let action = create_test_action(
+        &ctx.pool,
+        pack.id,
+        &pack.r#ref,
+        "cache_coord_execution.populate",
+    )
+    .await?;
+    let grants = pack_writer_grants(&pack.r#ref);
+    let (token, identity_id) = register_user(&ctx, "cache_coord_execution", grants.clone()).await?;
+    let permission_set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "test.cache_coord_execution".to_string(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants,
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity_id,
+            permset: permission_set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity_id).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    let mut executions = Vec::new();
+    for _ in 0..2 {
+        executions.push(
+            ExecutionRepository::create(
+                &ctx.pool,
+                CreateExecutionInput {
+                    action: Some(action.id),
+                    action_ref: action.r#ref.clone(),
+                    executor: Some(identity_id),
+                    status: ExecutionStatus::Running,
+                    permission_set_refs: vec![permission_set.r#ref.clone()],
+                    ..Default::default()
+                },
+            )
+            .await?,
+        );
+    }
+    let response = create_namespace(
+        &ctx,
+        &token,
+        &pack.r#ref,
+        "users",
+        json!({"refresh_concurrency": "reuse"}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let mut generation_id = None;
+    for (index, execution) in executions.iter().enumerate() {
+        let execution_token = generate_execution_token_with_permission_sets(
+            identity_id,
+            execution.id,
+            &action.r#ref,
+            &test_jwt_config(),
+            Some(300),
+            std::slice::from_ref(&permission_set.r#ref),
+        )?;
+        let response = ctx
+            .post(
+                "/api/v1/cache/namespaces/users/generations",
+                coordination_request(&pack.r#ref, &format!("execution-{index}")),
+                Some(&execution_token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            if index == 0 {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            }
+        );
+        let body: Value = response.json().await?;
+        assert_eq!(body["data"]["created_by_execution"], executions[0].id);
+        assert_eq!(body["data"]["created_by"], identity_id);
+        let id = body["data"]["generation_id"].as_i64().unwrap();
+        assert_eq!(*generation_id.get_or_insert(id), id);
+    }
+    let id = generation_id.unwrap();
+    let response = ctx
+        .get(
+            &format!(
+                "/api/v1/cache/namespaces/users/generations/{id}?owner_type=pack&owner_ref={}",
+                pack.r#ref
+            ),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["data"]["created_by_execution"], executions[0].id);
+    let response = ctx
+        .get(
+            &format!(
+                "/api/v1/cache/namespaces/users/generations?owner_type=pack&owner_ref={}",
+                pack.r#ref
+            ),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(
+        body["data"]["generations"][0]["created_by_execution"],
+        executions[0].id
+    );
+    let generation = CacheGenerationRepository::find_by_id(&ctx.pool, id)
+        .await?
+        .unwrap();
+    assert_eq!(generation.created_by_execution, Some(executions[0].id));
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn generation_creation_rejects_client_supplied_execution_attribution() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_coord_spoof").await?;
+    let (token, _) =
+        register_user(&ctx, "cache_coord_spoof", pack_writer_grants(&pack.r#ref)).await?;
+    let response = create_namespace(&ctx, &token, &pack.r#ref, "users", json!({})).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: Value = response.json().await?;
+    let namespace_id = body["data"]["id"].as_i64().unwrap();
+    let mut request = coordination_request(&pack.r#ref, "spoofed");
+    request["created_by_execution"] = json!(12345);
+    let response = ctx
+        .post(
+            "/api/v1/cache/namespaces/users/generations",
+            request,
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        CacheGenerationRepository::list_for_namespace(&ctx.pool, namespace_id, 10)
+            .await?
+            .is_empty()
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn cache_full_refresh_and_read_lifecycle() -> Result<()> {
     init_test_env();
@@ -383,6 +1129,7 @@ async fn cache_full_refresh_and_read_lifecycle() -> Result<()> {
         }
     }
     assert_eq!(seen, vec!["u1", "u2", "u3"], "bytewise order, each id once");
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -497,6 +1244,7 @@ async fn cache_point_and_multi_lookup_honor_readable_generation_pins() -> Result
     let body: Value = response.json().await?;
     assert_eq!(body["data"]["items"][0]["value"]["revision"], "first");
 
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -523,6 +1271,7 @@ async fn cache_reports_not_populated_before_promotion() -> Result<()> {
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body: Value = response.json().await?;
     assert_eq!(body["code"], "cache_not_populated");
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -566,6 +1315,7 @@ async fn tombstoned_namespace_rejects_refresh_writes_with_specific_code() -> Res
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body: Value = response.json().await?;
     assert_eq!(body["code"], "namespace_deleted");
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -624,6 +1374,7 @@ async fn cache_policy_and_page_limits_are_rejected_at_the_api_boundary() -> Resu
         let response = ctx.get(&path, Some(&token)).await?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "path: {path}");
     }
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -683,6 +1434,7 @@ async fn pack_managed_namespace_metadata_is_read_only_through_the_api() -> Resul
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body: Value = response.json().await?;
     assert_eq!(body["code"], "pack_managed_namespace");
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -737,6 +1489,7 @@ async fn cache_namespaces_isolate_external_ids() -> Result<()> {
         let body: Value = response.json().await?;
         assert_eq!(body["data"]["item"]["value"]["kind"], expected);
     }
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -805,6 +1558,7 @@ async fn cache_rbac_list_and_read_share_visibility() -> Result<()> {
     )
     .await?
     .assert_status(StatusCode::FORBIDDEN);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -883,6 +1637,7 @@ async fn cache_list_without_owner_returns_every_accessible_scope() -> Result<()>
     )
     .await?
     .assert_status(StatusCode::BAD_REQUEST);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -926,6 +1681,7 @@ async fn cache_hidden_namespace_is_not_leaked() -> Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await?;
     assert!(body["data"]["namespaces"].as_array().unwrap().is_empty());
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -972,6 +1728,7 @@ async fn cache_rejects_worker_refresh_and_unsigned_sensor_tokens() -> Result<()>
     ctx.get(&path, Some(&refresh))
         .await?
         .assert_status(StatusCode::UNAUTHORIZED);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1414,6 +2171,7 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Resu
     )
     .await?
     .assert_status(StatusCode::FORBIDDEN);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1469,6 +2227,7 @@ async fn cache_chunk_replay_is_idempotent_and_conflicts_on_divergence() -> Resul
     assert_eq!(response.status(), StatusCode::OK);
     let sealed: Value = response.json().await?;
     assert_eq!(sealed["data"]["record_count"], 1);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1509,6 +2268,7 @@ async fn cache_chunk_route_accepts_bounded_payloads_above_axum_default_limit() -
     )
     .await?
     .assert_status(StatusCode::OK);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1557,6 +2317,7 @@ async fn cache_duplicate_external_id_across_chunks_is_rejected() -> Result<()> {
         !error_text.contains("u1"),
         "duplicate error must not leak external ids: {error_text}"
     );
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1660,6 +2421,7 @@ async fn cache_promotion_optimistic_conflict() -> Result<()> {
     let body: Value = response.json().await?;
     assert_eq!(body["data"]["generation_id"], ready[0]);
     assert_eq!(body["data"]["item"]["value"]["r"], "r1");
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1747,6 +2509,7 @@ async fn cache_cursor_rejected_across_namespaces() -> Result<()> {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await?;
     assert_eq!(body["code"], "cache_cursor_invalid");
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1818,6 +2581,7 @@ async fn cache_quota_rejected_before_promotion() -> Result<()> {
         .await?;
     let body: Value = response.json().await?;
     assert_eq!(body["data"]["cache_not_populated"], true);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1895,6 +2659,7 @@ async fn successful_chunk_insert_and_replay_emit_redacted_audits() -> Result<()>
         assert!(!audit_text.contains("sensitive-value"));
         assert!(!audit_text.contains("request_checksum"));
     }
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1923,6 +2688,7 @@ async fn aggregate_namespace_quota_returns_stable_api_code() -> Result<()> {
     let body: Value = response.json().await?;
     assert_eq!(body["code"], "cache_owner_namespace_limit_exceeded");
     assert_eq!(body["error"], "cache owner live namespace limit exceeded");
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1954,6 +2720,7 @@ async fn api_namespace_recreate_still_conflicts_while_tombstone_drains() -> Resu
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body: Value = response.json().await?;
     assert_eq!(body["code"], "cache_conflict");
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -2034,6 +2801,7 @@ async fn cache_zero_record_snapshot_is_an_empty_dataset_not_unpopulated() -> Res
     let body: Value = response.json().await?;
     assert_eq!(body["data"]["cache_not_populated"], false);
     assert_eq!(body["data"]["record_count"], 0);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -2184,6 +2952,7 @@ async fn cache_metadata_lists_support_filters_and_keyset_cursors() -> Result<()>
     generation_ids.sort_unstable();
     generation_ids.dedup();
     assert_eq!(generation_ids.len(), 3);
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -2234,5 +3003,6 @@ async fn cache_rbac_honors_identity_attributes_and_audits_denials() -> Result<()
         .await?
         .is_empty();
     assert!(audited, "RBAC denial should be persisted to the audit log");
+    ctx.cleanup().await?;
     Ok(())
 }

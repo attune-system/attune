@@ -15,6 +15,7 @@ pub mod history;
 pub mod info;
 pub mod inquiry;
 pub mod key;
+pub mod native_maintenance;
 pub mod pack;
 pub mod permission;
 pub mod policy;

@@ -60,36 +60,40 @@ pub struct ApiTransport {
 }
 
 impl ApiTransport {
-    pub fn new(api_url: &str, auth_token: &str, artifacts_dir: &str) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap_or_default();
+    pub fn new(api_url: &str, auth_token: &str, artifacts_dir: &str) -> Result<Self> {
+        let client = crate::http_client::build_http_client(|| {
+            Client::builder().timeout(std::time::Duration::from_secs(300))
+        })
+        .map_err(|error| {
+            Error::configuration(format!("Failed to build artifact HTTP client: {error}"))
+        })?;
 
-        Self {
+        Ok(Self {
             base_url: api_url.trim_end_matches('/').to_string(),
             auth_token_source: AuthTokenSource::Static(auth_token.to_string()),
             artifacts_dir: artifacts_dir.to_string(),
             client,
-        }
+        })
     }
 
     pub fn new_with_worker_token_provider(
         api_url: &str,
         token_provider: Arc<WorkerTokenProvider>,
         artifacts_dir: &str,
-    ) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap_or_default();
+    ) -> Result<Self> {
+        let client = crate::http_client::build_http_client(|| {
+            Client::builder().timeout(std::time::Duration::from_secs(300))
+        })
+        .map_err(|error| {
+            Error::configuration(format!("Failed to build artifact HTTP client: {error}"))
+        })?;
 
-        Self {
+        Ok(Self {
             base_url: api_url.trim_end_matches('/').to_string(),
             auth_token_source: AuthTokenSource::WorkerProvider(token_provider),
             artifacts_dir: artifacts_dir.to_string(),
             client,
-        }
+        })
     }
 
     /// Update the auth token (e.g., after token refresh).
@@ -944,7 +948,8 @@ mod tests {
             &base_url,
             test_worker_provider(),
             "/opt/attune/artifacts",
-        );
+        )
+        .unwrap();
 
         transport
             .write_file("logs/test.log", b"hello", Some("text/plain"))
@@ -969,7 +974,8 @@ mod tests {
         ])
         .await;
 
-        let transport = ApiTransport::new(&base_url, "static-token", "/opt/attune/artifacts");
+        let transport =
+            ApiTransport::new(&base_url, "static-token", "/opt/attune/artifacts").unwrap();
         let result = transport
             .write_file("logs/test.log", b"hello", Some("text/plain"))
             .await;
@@ -993,7 +999,8 @@ mod tests {
             &base_url,
             test_worker_provider(),
             "/opt/attune/artifacts",
-        );
+        )
+        .unwrap();
         let result = transport
             .write_file("logs/test.log", b"hello", Some("text/plain"))
             .await;
@@ -1079,7 +1086,8 @@ mod tests {
             &format!("http://{address}"),
             "token",
             "/opt/attune/artifacts",
-        );
+        )
+        .unwrap();
         let size = transport
             .write_file_from_path("artifacts/1/v1", &path, None)
             .await
@@ -1175,7 +1183,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("artifact.bin");
         tokio::fs::write(&path, b"direct artifact").await.unwrap();
-        let transport = ApiTransport::new(&format!("http://{address}"), "worker-token", "/tmp");
+        let transport =
+            ApiTransport::new(&format!("http://{address}"), "worker-token", "/tmp").unwrap();
         assert_eq!(
             transport
                 .write_file_from_path("pack/output/v1.bin", &path, None)
@@ -1212,7 +1221,7 @@ mod tests {
             MockResponse::new(403, "forbidden"),
         ])
         .await;
-        let transport = ApiTransport::new(&base_url, "token", "/artifacts");
+        let transport = ApiTransport::new(&base_url, "token", "/artifacts").unwrap();
 
         assert!(!transport.file_exists("logs/missing.log").await.unwrap());
         assert_eq!(transport.file_size("logs/missing.log").await.unwrap(), None);
@@ -1227,7 +1236,7 @@ mod tests {
             MockResponse::new(200, "").with_headers("x-attune-size: 0\r\n")
         ])
         .await;
-        let transport = ApiTransport::new(&base_url, "token", "/artifacts");
+        let transport = ApiTransport::new(&base_url, "token", "/artifacts").unwrap();
 
         assert_eq!(
             transport.complete_file("logs/final.log").await.unwrap(),
@@ -1243,7 +1252,7 @@ mod tests {
 
     #[test]
     fn file_url_rejects_ambiguous_or_escaping_paths() {
-        let transport = ApiTransport::new("http://localhost", "token", "/artifacts");
+        let transport = ApiTransport::new("http://localhost", "token", "/artifacts").unwrap();
         assert!(transport.file_url("safe/path.txt").is_ok());
         for path in ["../escape", "/absolute", "a\\b", "a//b", "C:/escape"] {
             assert!(transport.file_url(path).is_err(), "{path}");

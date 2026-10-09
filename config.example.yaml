@@ -11,6 +11,16 @@ environment: development
 # action-level `timeout_seconds` default is provided. Must be > 0. Default: 600.
 default_execution_timeout_seconds: 600
 
+# First-start bootstrap only; use the retention API after the database is seeded.
+# Creation, cleanup, and planner statistics have independent statement deadlines.
+cache_retention:
+  max_cleanup_cycle_milliseconds: 30000 # 1..3600000
+  ddl_lock_timeout_milliseconds: 250 # 1..3600000
+  ddl_creation_statement_timeout_milliseconds: 5000 # 1..3600000
+  ddl_statement_timeout_milliseconds: 1000 # 1..3600000
+  statistics_interval_seconds: 300 # 1..86400, checked during retention cycles
+  statistics_statement_timeout_milliseconds: 5000 # 1..3600000
+
 # Database configuration
 database:
   # PostgreSQL connection URL

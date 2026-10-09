@@ -317,7 +317,7 @@ if [[ "$DO_STARTUP" == true ]]; then
   echo -e "${CYAN}Waiting for RabbitMQ to become healthy...${NC}"
   local_wait=0
   while [[ $local_wait -lt 90 ]]; do
-    if compose exec -T rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+    if compose exec -T rabbitmq su-exec rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
       break
     fi
     sleep 1

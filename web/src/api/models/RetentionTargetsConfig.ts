@@ -8,7 +8,6 @@ import type { RetentionTargetConfig } from "./RetentionTargetConfig";
  */
 export type RetentionTargetsConfig = {
   audit_events?: RetentionTargetConfig;
-  continuous_aggregates?: RetentionTargetConfig;
   enforcements?: RetentionTargetConfig;
   events?: RetentionTargetConfig;
   execution_admission?: RetentionTargetConfig;

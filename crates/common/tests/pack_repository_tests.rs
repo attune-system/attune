@@ -7,7 +7,7 @@ mod helpers;
 
 use attune_common::repositories::pack::{self, PackRepository};
 use attune_common::repositories::{
-    Create, Delete, FindById, FindByRef, List, PackInstallRepository, Pagination, Patch, Update,
+    Create, FindById, FindByRef, List, PackInstallRepository, Pagination, Patch, Update,
 };
 use attune_common::{models::PackInstallStatus, Error};
 use helpers::*;
@@ -467,7 +467,7 @@ async fn test_delete_pack() {
     assert!(found.is_some());
 
     // Delete the pack
-    PackRepository::delete(&pool, pack.id).await.unwrap();
+    PackRepository::delete(&*pool, pack.id).await.unwrap();
 
     // Verify pack is gone
     let not_found = PackRepository::find_by_id(&pool, pack.id).await.unwrap();
@@ -478,7 +478,7 @@ async fn test_delete_pack() {
 async fn test_delete_pack_not_found() {
     let pool = create_test_pool().await.unwrap();
 
-    let deleted = PackRepository::delete(&pool, 999999).await.unwrap();
+    let deleted = PackRepository::delete(&*pool, 999999).await.unwrap();
 
     assert!(!deleted, "Should return false when pack doesn't exist");
 }

@@ -15,7 +15,6 @@ depends:
   - attune-common (= ${VERSION})
   - libc6 (>= 2.28)
   - postgresql-16
-  - timescaledb-2-postgresql-16
 
 contents:
   - src: "${BUNDLE_DIR}/bin/attune-supervisor"
@@ -44,7 +43,6 @@ overrides:
       - attune-common = ${VERSION}
       - glibc >= 2.28
       - postgresql16-server
-      - timescaledb-2-postgresql-16
     rpm:
       scripts:
         posttrans: ../scripts/postupgrade-attune-supervisor.sh
@@ -53,7 +51,6 @@ overrides:
       - attune-common=${VERSION}
       - glibc
       - postgresql
-      - timescaledb
     archlinux:
       scripts:
         preupgrade: ../scripts/preinstall-attune-supervisor.sh

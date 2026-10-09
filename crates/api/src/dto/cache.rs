@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 
-use attune_common::models::{cache::CacheEntry, CacheGenerationState, Id, OwnerType};
+use attune_common::models::{
+    cache::CacheEntry, CacheGenerationState, CacheRefreshConcurrency, Id, OwnerType,
+};
 
 use crate::{auth::middleware::AuthErrorResponse, middleware::error::ErrorResponse};
 
@@ -86,6 +88,9 @@ pub struct CacheGenerationListQuery {
 /// existing (or default) values.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct CacheNamespacePolicyBody {
+    /// Handling of another unpublished (`staging` or `ready`) generation.
+    /// Defaults to `parallel`; use `reuse` to coordinate one refresh producer.
+    pub refresh_concurrency: Option<CacheRefreshConcurrency>,
     pub freshness_target_seconds: Option<i64>,
     pub max_records_per_generation: Option<i64>,
     pub max_generation_bytes: Option<i64>,
@@ -152,6 +157,7 @@ pub struct CacheNamespaceResponse {
     pub max_retained_bytes: i64,
     pub max_retained_generations: i32,
     pub max_staging_generations: i32,
+    pub refresh_concurrency: CacheRefreshConcurrency,
     /// Whether the namespace is tombstoned and pending bounded cleanup.
     pub tombstoned: bool,
     #[schema(required = true, nullable = true)]
@@ -224,6 +230,11 @@ pub struct CacheGenerationResponse {
     pub source_revision: Option<String>,
     #[schema(required = true, nullable = true)]
     pub created_by: Option<Id>,
+    /// Execution that created this generation, recorded from execution authentication.
+    /// Historical attribution, not proof that the execution is still running.
+    /// Null for creation through other authentication types.
+    #[schema(required = true, nullable = true)]
+    pub created_by_execution: Option<Id>,
     pub created: DateTime<Utc>,
     #[schema(required = true, nullable = true)]
     pub sealed: Option<DateTime<Utc>>,
@@ -356,6 +367,7 @@ pub struct CacheScanPageResponse {
 
 /// Create (begin) a staging generation.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCacheGenerationRequest {
     pub owner_type: OwnerType,
     #[serde(default)]

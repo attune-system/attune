@@ -1,7 +1,7 @@
 //! History DTOs for API requests and responses
 //!
 //! These types represent the API-facing view of entity history records
-//! stored in TimescaleDB hypertables.
+//! stored in ordinary PostgreSQL history tables.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

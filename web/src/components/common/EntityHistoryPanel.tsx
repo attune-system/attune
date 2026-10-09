@@ -32,7 +32,7 @@ interface EntityHistoryPanelProps {
 /**
  * A reusable panel that displays the change history for an entity.
  *
- * Queries the TimescaleDB history hypertables via the API and renders
+ * Queries the PostgreSQL history tables via the API and renders
  * a timeline of changes with expandable details showing old/new values.
  */
 export default function EntityHistoryPanel({

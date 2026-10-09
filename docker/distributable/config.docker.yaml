@@ -13,6 +13,18 @@
 
 environment: docker
 
+# Provisional small-deployment partition cap; includes all retained generations.
+cache_admission:
+  max_entry_partitions: 128
+
+cache_retention:
+  max_cleanup_cycle_milliseconds: 30000
+  ddl_lock_timeout_milliseconds: 250
+  ddl_creation_statement_timeout_milliseconds: 5000
+  ddl_statement_timeout_milliseconds: 1000
+  statistics_interval_seconds: 300
+  statistics_statement_timeout_milliseconds: 5000
+
 # Docker database (PostgreSQL container)
 database:
   url: postgresql://attune:attune@postgres:5432/attune
@@ -101,6 +113,8 @@ runtime_envs_dir: /opt/attune/runtime_envs
 # File-type artifacts are written here by execution processes and served by the API.
 # Pattern: {artifacts_dir}/{ref_slug}/v{version}.{ext}
 artifacts_dir: /opt/attune/artifacts
+artifacts:
+  transport: volume
 
 # Public hosts required by the pinned Attune Standard Pack Index. Set this
 # list to [] to deny public registry and pack-source traffic by default.

@@ -3,20 +3,23 @@
 mod helpers;
 
 use attune_common::{
-    config::{CacheAdmissionConfig, RetentionConfig},
+    config::{CacheAdmissionConfig, CacheRetentionConfig, RetentionConfig},
     models::{
-        CacheGenerationState, ExecutionStatus, OwnerType, WorkflowCacheIterationState,
-        WorkflowTaskMetadata,
+        CacheGenerationState, CacheRefreshConcurrency, ExecutionStatus, OwnerType,
+        WorkflowCacheIterationState, WorkflowTaskMetadata,
     },
     pack_registry::PackComponentLoader,
     repositories::{
         action::ActionRepository,
         cache::{
-            CacheEntryInput, CacheEntryRepository, CacheGenerationRepository,
-            CacheIngestRepository, CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope,
-            CreateCacheGenerationInput, CreateCacheGenerationResult, CreateCacheNamespaceInput,
-            InsertCacheChunkResult, ManagedCacheNamespaceDefinition, SealCacheGenerationInput,
-            MAX_MULTI_LOOKUP_BYTES, MAX_MULTI_LOOKUP_IDS, MAX_SCAN_MATERIALIZATION_BYTES,
+            CacheEntryInput, CacheEntryRepository, CacheGenerationCleanupOutcome,
+            CacheGenerationRepository, CacheIngestRepository, CacheNamespacePolicy,
+            CacheNamespaceRepository, CacheOwnerScope, CacheStatisticsRefreshOutcome,
+            CacheStorageRepository, CacheTransactionMode, CreateCacheGenerationInput,
+            CreateCacheGenerationResult, CreateCacheNamespaceInput, InsertCacheChunkResult,
+            ManagedCacheNamespaceDefinition, SealCacheGenerationInput,
+            MAX_INGEST_CHUNKS_PER_GENERATION, MAX_MULTI_LOOKUP_BYTES, MAX_MULTI_LOOKUP_IDS,
+            MAX_SCAN_MATERIALIZATION_BYTES,
         },
         execution::{CreateExecutionInput, ExecutionRepository},
         pack::{PackRepository, UpdatePackInput},
@@ -67,6 +70,7 @@ fn generation_input(
         checksum: None,
         source_revision: None,
         created_by: None,
+        created_by_execution: None,
     }
 }
 
@@ -79,6 +83,1458 @@ fn entries(ids: &[&str]) -> Vec<CacheEntryInput> {
             source_checksum: None,
         })
         .collect()
+}
+
+async fn reclaim_generation(pool: &PgPool, generation: i64) -> attune_common::Result<u64> {
+    let config = CacheRetentionConfig {
+        min_traversal_window_seconds: 0,
+        ..CacheRetentionConfig::default()
+    };
+    match CacheGenerationRepository::drop_if_cleanup_eligible(pool, generation, &config).await? {
+        CacheGenerationCleanupOutcome::Dropped { records, .. } => Ok(records),
+        CacheGenerationCleanupOutcome::Absent | CacheGenerationCleanupOutcome::Ineligible => Ok(0),
+        outcome => panic!("unexpected cleanup deferral: {outcome:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cleanup_backlog_age_starts_after_both_readability_and_traversal_expire() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("backlog_age_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let first = CacheGenerationRepository::create_or_get(
+        &pool,
+        &generation_input(namespace.id, "first", 0, Some(0)),
+    )
+    .await
+    .unwrap();
+    let CreateCacheGenerationResult::Created(first) = first else {
+        panic!("expected fresh generation");
+    };
+    CacheGenerationRepository::seal(&pool, first.id)
+        .await
+        .unwrap();
+    CacheGenerationRepository::promote(
+        &pool,
+        namespace.id,
+        first.id,
+        None,
+        Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+    let mut second_input = generation_input(namespace.id, "second", 0, Some(0));
+    second_input.expected_active_generation = Some(first.id);
+    let second = CacheGenerationRepository::create_or_get(&pool, &second_input)
+        .await
+        .unwrap();
+    let CreateCacheGenerationResult::Created(second) = second else {
+        panic!("expected fresh generation");
+    };
+    CacheGenerationRepository::seal(&pool, second.id)
+        .await
+        .unwrap();
+    CacheGenerationRepository::promote(
+        &pool,
+        namespace.id,
+        second.id,
+        Some(first.id),
+        Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE cache_generation SET retired=clock_timestamp()-INTERVAL '1 hour',
+         readable_until=clock_timestamp()-INTERVAL '59 minutes' WHERE id=$1",
+    )
+    .bind(first.id)
+    .execute(&*pool)
+    .await
+    .unwrap();
+    let config = CacheRetentionConfig {
+        min_traversal_window_seconds: 3_590,
+        ..CacheRetentionConfig::default()
+    };
+    let observation = CacheStorageRepository::observe(&pool, &config)
+        .await
+        .unwrap();
+    pool.cleanup().await.unwrap();
+    assert_eq!(observation.cleanup_backlog, 1);
+    assert!(
+        (10..60).contains(&observation.oldest_cleanup_age_seconds),
+        "{observation:?}"
+    );
+}
+
+#[tokio::test]
+async fn cache_admission_does_not_collide_with_workflow_bigint_advisory_ids() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let mut workflow = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(7821101::BIGINT)")
+        .execute(&mut *workflow)
+        .await
+        .unwrap();
+    let mut cache = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout='100ms'")
+        .execute(&mut *cache)
+        .await
+        .unwrap();
+    let protected =
+        CacheEntryRepository::protect_transaction(&mut cache, CacheTransactionMode::PinMutation)
+            .await;
+    cache.rollback().await.unwrap();
+    let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(7821101::BIGINT)")
+        .fetch_one(&mut *workflow)
+        .await
+        .unwrap();
+    drop(workflow);
+    pool.cleanup().await.unwrap();
+    assert!(released);
+    protected.expect("cache mutation admission must not use the workflow BIGINT key space");
+}
+
+#[tokio::test]
+async fn cache_statistics_acknowledges_lifecycle_and_preserves_dry_run() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("stats_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let generation = CacheGenerationRepository::create_or_get(
+        &pool,
+        &generation_input(namespace.id, "stats", 0, Some(0)),
+    )
+    .await
+    .unwrap();
+    let CreateCacheGenerationResult::Created(generation) = generation else {
+        panic!("expected fresh generation");
+    };
+    let config = CacheRetentionConfig::default();
+    let before = CacheStorageRepository::observe(&pool, &config)
+        .await
+        .unwrap();
+    assert_eq!(before.registered_partitions, 1);
+    assert_eq!(before.partitions_created, 1);
+    assert!(before.statistics_pending);
+    let dry_run = CacheRetentionConfig {
+        dry_run: true,
+        ..config.clone()
+    };
+    assert_eq!(
+        CacheStorageRepository::refresh_statistics(&pool, &dry_run)
+            .await
+            .unwrap(),
+        CacheStatisticsRefreshOutcome::NotDue
+    );
+    assert!(
+        CacheStorageRepository::observe(&pool, &config)
+            .await
+            .unwrap()
+            .statistics_pending
+    );
+    assert_eq!(
+        CacheStorageRepository::refresh_statistics(&pool, &config)
+            .await
+            .unwrap(),
+        CacheStatisticsRefreshOutcome::Applied
+    );
+    let after = CacheStorageRepository::observe(&pool, &config)
+        .await
+        .unwrap();
+    assert!(!after.statistics_pending);
+    assert!(after.last_analyzed_at.is_some());
+    CacheGenerationRepository::fail(&pool, generation.id, "stats cleanup")
+        .await
+        .unwrap();
+    assert_eq!(
+        CacheStorageRepository::refresh_statistics(&pool, &config)
+            .await
+            .unwrap(),
+        CacheStatisticsRefreshOutcome::NotDue
+    );
+    assert!(
+        CacheStorageRepository::observe(&pool, &config)
+            .await
+            .unwrap()
+            .statistics_pending
+    );
+    reclaim_generation(&pool, generation.id).await.unwrap();
+    let after_drop = CacheStorageRepository::observe(&pool, &config)
+        .await
+        .unwrap();
+    assert_eq!(after_drop.registered_partitions, 0);
+    assert_eq!(after_drop.partitions_dropped, 1);
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_statistics_lock_deferral_preserves_pending_revision() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("stats_lock_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    CacheGenerationRepository::create_or_get(
+        &pool,
+        &generation_input(namespace.id, "stats", 0, Some(0)),
+    )
+    .await
+    .unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE ONLY cache_entry IN SHARE UPDATE EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let config = CacheRetentionConfig::default();
+    assert_eq!(
+        CacheStorageRepository::refresh_statistics(&pool, &config)
+            .await
+            .unwrap(),
+        CacheStatisticsRefreshOutcome::DeferredBusy
+    );
+    blocker.rollback().await.unwrap();
+    let observation = CacheStorageRepository::observe(&pool, &config)
+        .await
+        .unwrap();
+    assert!(observation.statistics_pending);
+    assert!(observation.last_analyzed_at.is_none());
+    assert_eq!(
+        CacheStorageRepository::refresh_statistics(&pool, &config)
+            .await
+            .unwrap(),
+        CacheStatisticsRefreshOutcome::Applied
+    );
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn statistics_acknowledgement_does_not_consume_a_concurrent_lifecycle_request() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("stats_late_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let generation = CacheGenerationRepository::create_or_get(
+        &pool,
+        &generation_input(namespace.id, "stats", 0, Some(0)),
+    )
+    .await
+    .unwrap();
+    let CreateCacheGenerationResult::Created(generation) = generation else {
+        panic!("expected fresh generation");
+    };
+    sqlx::raw_sql(
+        "CREATE FUNCTION test_hold_statistics_ack() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.completed_revision IS DISTINCT FROM OLD.completed_revision THEN
+             PERFORM pg_advisory_xact_lock(492101::BIGINT);
+           END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER test_hold_statistics_ack BEFORE UPDATE ON cache_entry_statistics_state
+           FOR EACH ROW EXECUTE FUNCTION test_hold_statistics_ack();",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+    let mut control = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(492101::BIGINT)")
+        .execute(&mut *control)
+        .await
+        .unwrap();
+    let statistics_pool = pool.pool().clone();
+    let statistics = tokio::spawn(async move {
+        // This gate tests revision acknowledgement, not the lock deadline.
+        // Leave enough server budget to observe and release both transactions.
+        let config = CacheRetentionConfig {
+            ddl_lock_timeout_milliseconds: 10_000,
+            statistics_statement_timeout_milliseconds: 10_000,
+            ..CacheRetentionConfig::default()
+        };
+        CacheStorageRepository::refresh_statistics(&statistics_pool, &config).await
+    });
+    let wait_pool = pool.pool();
+    let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    let wait_for_lock =
+        |event: &'static str, query_prefix: &'static str| async move {
+            tokio::time::timeout_at(wait_deadline, async {
+                loop {
+                    let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+                     AND pid <> pg_backend_pid() AND wait_event_type='Lock' AND wait_event=$1
+                     AND query LIKE $2)",
+                ).bind(event).bind(query_prefix).fetch_one(wait_pool).await.unwrap();
+                    if waiting {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        };
+    let statistics_waiting =
+        wait_for_lock("advisory", "UPDATE cache_entry_statistics_state%").await;
+    let lifecycle_pool = pool.pool().clone();
+    let lifecycle = tokio::spawn(async move {
+        CacheGenerationRepository::fail(&lifecycle_pool, generation.id, "owned concurrent request")
+            .await
+    });
+    let lifecycle_waiting = wait_for_lock("transactionid", "UPDATE cache_generation%").await;
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(492101::BIGINT)")
+        .fetch_one(&mut *control)
+        .await
+        .unwrap();
+    let statistics_result = statistics.await.unwrap();
+    let lifecycle_result = lifecycle.await.unwrap();
+    assert!(unlocked);
+    assert!(
+        statistics_waiting,
+        "statistics did not reach the owned acknowledgement gate"
+    );
+    assert!(
+        lifecycle_waiting,
+        "lifecycle did not reach the observed statistics-row lock"
+    );
+    assert_eq!(
+        statistics_result.unwrap(),
+        CacheStatisticsRefreshOutcome::Applied
+    );
+    lifecycle_result.unwrap();
+    let (requested, completed): (i64, i64) = sqlx::query_as(
+        "SELECT requested_revision, completed_revision FROM cache_entry_statistics_state WHERE id=TRUE",
+    ).fetch_one(&*pool).await.unwrap();
+    assert!(
+        requested > completed,
+        "concurrent request {requested} was consumed by acknowledgement {completed}"
+    );
+    assert!(
+        CacheStorageRepository::observe(&pool, &CacheRetentionConfig::default())
+            .await
+            .unwrap()
+            .statistics_pending
+    );
+    drop(control);
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_statistics_statement_cancellation_rolls_back_acknowledgement() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("stats_deadline_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    CacheGenerationRepository::create_or_get(
+        &pool,
+        &generation_input(namespace.id, "stats", 0, Some(0)),
+    )
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "CREATE FUNCTION test_delay_statistics_ack() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.completed_revision IS DISTINCT FROM OLD.completed_revision THEN
+             IF current_setting('statement_timeout') <> '50ms' THEN
+               RAISE EXCEPTION 'statistics deadline was not applied';
+             END IF;
+             PERFORM pg_sleep(1);
+           END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER test_delay_statistics_ack BEFORE UPDATE ON cache_entry_statistics_state
+           FOR EACH ROW EXECUTE FUNCTION test_delay_statistics_ack();",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+    let config = CacheRetentionConfig {
+        statistics_statement_timeout_milliseconds: 50,
+        ..CacheRetentionConfig::default()
+    };
+    assert_eq!(
+        CacheStorageRepository::refresh_statistics(&pool, &config)
+            .await
+            .unwrap(),
+        CacheStatisticsRefreshOutcome::DeferredDeadline
+    );
+    let observation = CacheStorageRepository::observe(&pool, &config)
+        .await
+        .unwrap();
+    assert!(observation.statistics_pending);
+    assert!(observation.last_analyzed_at.is_none());
+    assert_eq!(config.ddl_statement_timeout_milliseconds, 1_000);
+    sqlx::query("DROP TRIGGER test_delay_statistics_ack ON cache_entry_statistics_state")
+        .execute(&*pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        CacheStorageRepository::refresh_statistics(&pool, &config)
+            .await
+            .unwrap(),
+        CacheStatisticsRefreshOutcome::Applied
+    );
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_generation_chunk_metadata_bound_rejects_before_storage_creation() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("chunks_bound_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let error = CacheGenerationRepository::create_or_get(
+        &pool,
+        &generation_input(
+            namespace.id,
+            "too_many",
+            MAX_INGEST_CHUNKS_PER_GENERATION + 1,
+            Some(0),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Validation(_)), "{error:?}");
+    assert_eq!(
+        CacheStorageRepository::observe(&pool, &CacheRetentionConfig::default())
+            .await
+            .unwrap()
+            .registered_partitions,
+        0
+    );
+    CacheGenerationRepository::create_or_get(
+        &pool,
+        &generation_input(
+            namespace.id,
+            "at_bound",
+            MAX_INGEST_CHUNKS_PER_GENERATION,
+            Some(0),
+        ),
+    )
+    .await
+    .unwrap();
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn creation_and_cleanup_use_independent_statement_deadlines() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let mut config = RetentionRepository::load_config(&pool).await.unwrap();
+    config
+        .cache_retention
+        .ddl_creation_statement_timeout_milliseconds = 7_000;
+    config.cache_retention.ddl_statement_timeout_milliseconds = 1_000;
+    RetentionRepository::update_config(&pool, &config)
+        .await
+        .unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("creation_deadline_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::Attach)
+        .await
+        .unwrap();
+    let creation_deadline: i64 = sqlx::query_scalar(
+        "SELECT setting::BIGINT FROM pg_settings WHERE name='statement_timeout'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let lock_deadline: i64 =
+        sqlx::query_scalar("SELECT setting::BIGINT FROM pg_settings WHERE name='lock_timeout'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    let CreateCacheGenerationResult::Created(generation) =
+        CacheGenerationRepository::create_or_get_with_policy_conn(
+            &mut tx,
+            &generation_input(namespace.id, "fixture", 0, Some(0)),
+            &CacheAdmissionConfig::default(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a new generation")
+    };
+    tx.commit().await.unwrap();
+    CacheGenerationRepository::fail(&pool, generation.id, "fixture")
+        .await
+        .unwrap();
+    // Observe the cleanup statement's actual session budget at metadata deletion.
+    // This trigger is confined to this test's owned database.
+    sqlx::raw_sql(
+        "CREATE FUNCTION assert_cleanup_deadline() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN
+             IF (SELECT setting::BIGINT FROM pg_settings WHERE name='statement_timeout') <> 1000 THEN
+                 RAISE EXCEPTION 'cleanup used the creation deadline';
+             END IF;
+             RETURN OLD;
+         END; $$;
+         CREATE TRIGGER assert_cleanup_deadline BEFORE DELETE ON cache_generation
+         FOR EACH ROW EXECUTE FUNCTION assert_cleanup_deadline();",
+    ).execute(&pool).await.unwrap();
+    let reclaimed = CacheGenerationRepository::drop_if_cleanup_eligible(
+        &pool,
+        generation.id,
+        &config.cache_retention,
+    )
+    .await
+    .unwrap();
+    pool.cleanup().await.unwrap();
+    assert_eq!(creation_deadline, 7_000);
+    assert_eq!(lock_deadline, 250);
+    assert_eq!(
+        reclaimed,
+        CacheGenerationCleanupOutcome::Dropped {
+            records: 0,
+            bytes: 0
+        }
+    );
+}
+
+#[tokio::test]
+async fn partition_cap_allows_retry_and_releases_capacity_only_after_drop() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("partition_cap_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let admission = CacheAdmissionConfig {
+        max_entry_partitions: 1,
+        ..Default::default()
+    };
+    let input = generation_input(namespace.id, "first", 0, Some(0));
+    let CreateCacheGenerationResult::Created(first) =
+        CacheGenerationRepository::create_or_get_with_policy(&pool, &input, &admission)
+            .await
+            .unwrap()
+    else {
+        panic!("expected a new generation")
+    };
+    assert!(matches!(
+        CacheGenerationRepository::create_or_get_with_policy(&pool, &input, &admission)
+            .await
+            .unwrap(),
+        CreateCacheGenerationResult::Existing(_)
+    ));
+    let next = generation_input(namespace.id, "next", 0, Some(0));
+    let error = CacheGenerationRepository::create_or_get_with_policy(&pool, &next, &admission)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("partition limit"), "{error}");
+    CacheGenerationRepository::fail(&pool, first.id, "fixture")
+        .await
+        .unwrap();
+    assert!(
+        CacheGenerationRepository::create_or_get_with_policy(&pool, &next, &admission)
+            .await
+            .is_err()
+    );
+    assert_eq!(reclaim_generation(&pool, first.id).await.unwrap(), 0);
+    let next = CacheGenerationRepository::create_or_get_with_policy(&pool, &next, &admission)
+        .await
+        .unwrap();
+    assert!(matches!(next, CreateCacheGenerationResult::Created(_)));
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn matching_refresh_rejects_missing_storage_without_recreating_it() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("missing_partition_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let input = generation_input(namespace.id, "first", 0, Some(0));
+    let CreateCacheGenerationResult::Created(generation) =
+        CacheGenerationRepository::create_or_get(&pool, &input)
+            .await
+            .unwrap()
+    else {
+        panic!("expected a new generation")
+    };
+    sqlx::query(&format!("DROP TABLE cache_entry_g_{}", generation.id))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(CacheGenerationRepository::create_or_get(&pool, &input)
+        .await
+        .is_err());
+    let missing: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NULL")
+        .bind(format!("cache_entry_g_{}", generation.id))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(missing);
+    assert!(CacheGenerationRepository::find_by_id(&pool, generation.id)
+        .await
+        .unwrap()
+        .is_some());
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn drop_counter_underflow_rolls_back_partition_and_metadata() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("drop_rollback_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let generation = create_generation(&pool, namespace.id, "first", 1, Some(1)).await;
+    CacheIngestRepository::insert_chunk(&pool, generation.id, 0, "fixture", &entries(&["a"]))
+        .await
+        .unwrap();
+    CacheGenerationRepository::fail(&pool, generation.id, "fixture")
+        .await
+        .unwrap();
+    let bytes: i64 = sqlx::query_scalar(
+        "SELECT physical_bytes FROM cache_generation_entry_usage WHERE generation=$1",
+    )
+    .bind(generation.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE cache_deployment_physical_byte_usage SET physical_bytes=0 WHERE id=1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(reclaim_generation(&pool, generation.id).await.is_err());
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cache_entry WHERE generation=$1")
+        .bind(generation.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1);
+    assert!(CacheGenerationRepository::find_by_id(&pool, generation.id)
+        .await
+        .unwrap()
+        .is_some());
+    let unchanged: i64 = sqlx::query_scalar(
+        "SELECT physical_bytes FROM cache_generation_entry_usage WHERE generation=$1",
+    )
+    .bind(generation.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, bytes);
+    sqlx::query("UPDATE cache_deployment_physical_byte_usage SET physical_bytes=$1 WHERE id=1")
+        .bind(bytes)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reclaim_generation(&pool, generation.id).await.unwrap(), 1);
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn traversal_window_is_rechecked_inside_atomic_reclamation() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("drop_window_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let first = publish_generation(&pool, namespace.id, "first", &["a"], None).await;
+    publish_generation(&pool, namespace.id, "second", &["b"], Some(first.id)).await;
+    sqlx::query("UPDATE cache_generation SET readable_until=clock_timestamp()-INTERVAL '1s', retired=clock_timestamp()-INTERVAL '1s' WHERE id=$1")
+        .bind(first.id).execute(&pool).await.unwrap();
+    assert_eq!(
+        CacheGenerationRepository::drop_if_cleanup_eligible(
+            &pool,
+            first.id,
+            &CacheRetentionConfig::default()
+        )
+        .await
+        .unwrap(),
+        CacheGenerationCleanupOutcome::Ineligible
+    );
+    assert_eq!(reclaim_generation(&pool, first.id).await.unwrap(), 1);
+    pool.cleanup().await.unwrap();
+}
+
+async fn wait_for_owned_backend_blocked_by(pool: &PgPool, blocker: i32) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+             WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(blocker)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owned actor never reached its lock wait"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn reader_arriving_after_cleanup_waits_before_generation_locks() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("cleanup_first_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let generation = create_generation(&pool, namespace.id, "first", 1, Some(1)).await;
+    CacheIngestRepository::insert_chunk(&pool, generation.id, 0, "fixture", &entries(&["a"]))
+        .await
+        .unwrap();
+    CacheGenerationRepository::fail(&pool, generation.id, "fixture")
+        .await
+        .unwrap();
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE ONLY cache_entry IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *cleanup)
+        .await
+        .unwrap();
+    let reader_pool = pool.clone();
+    let reader = tokio::spawn(async move {
+        CacheEntryRepository::scan_pinned(&reader_pool, namespace.id, generation.id, None, 10).await
+    });
+    wait_for_owned_backend_blocked_by(&pool, pid).await;
+    let outcome: String =
+        sqlx::query_scalar("SELECT outcome FROM drop_cleanup_cache_generation($1,0)")
+            .bind(generation.id)
+            .fetch_one(&mut *cleanup)
+            .await
+            .unwrap();
+    assert_eq!(outcome, "dropped");
+    cleanup.commit().await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, Err(Error::CacheSnapshotExpired(_))),
+        "{result:?}"
+    );
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn bounded_scan_does_not_join_another_generations_numeric_entry_id() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("composite_scan_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let generation = publish_generation(&pool, namespace.id, "composite", &["a", "b"], None).await;
+    let mut tx = pool.begin().await.unwrap();
+    // Shadow only entry storage in this transaction. LIKE without INCLUDING
+    // INDEXES permits the same numeric ID in two generations, as a composite
+    // partitioned primary key will. Production metadata/readability stays real.
+    sqlx::query(
+        "CREATE TEMP TABLE cache_entry (LIKE cache_entry INCLUDING DEFAULTS) ON COMMIT DROP",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cache_entry (id, generation, external_id, value, size_bytes) \
+         VALUES (1, $1, 'a', '{\"selected\":true}', 1), \
+                (2, $1, 'b', '{\"selected\":true}', 1), \
+                (1, $2, 'other', '{\"selected\":false}', 1)",
+    )
+    .bind(generation.id)
+    .bind(generation.id + 1)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let first = CacheEntryRepository::scan_pinned_page_with_budget_conn(
+        &mut tx,
+        namespace.id,
+        generation.id,
+        None,
+        10,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.entries[0].generation, generation.id);
+    assert_eq!(first.entries[0].external_id, "a");
+    assert!(first.has_more);
+    let second = CacheEntryRepository::scan_pinned_page_with_budget_conn(
+        &mut tx,
+        namespace.id,
+        generation.id,
+        Some("a"),
+        10,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].external_id, "b");
+    assert!(!second.has_more);
+    tx.rollback().await.unwrap();
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_reuse_race_preserves_one_producer_and_upload_contract() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("reuse_{}", unique_test_id()),
+            CacheNamespacePolicy {
+                refresh_concurrency: CacheRefreshConcurrency::Reuse,
+                max_staging_generations: 1,
+                ..CacheNamespacePolicy::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let mut left = generation_input(namespace.id, "producer-left", 1, Some(1));
+    left.created_by_execution = Some(101);
+    left.source_revision = Some("left-revision".into());
+    let mut right = generation_input(namespace.id, "producer-right", 2, Some(2));
+    right.created_by_execution = Some(202);
+    right.source_revision = Some("right-revision".into());
+    let (left_result, right_result) = tokio::join!(
+        CacheGenerationRepository::create_or_get(&pool, &left),
+        CacheGenerationRepository::create_or_get(&pool, &right),
+    );
+    let (created, existing, original) = match (left_result.unwrap(), right_result.unwrap()) {
+        (
+            CreateCacheGenerationResult::Created(created),
+            CreateCacheGenerationResult::Existing(existing),
+        ) => (created, existing, left),
+        (
+            CreateCacheGenerationResult::Existing(existing),
+            CreateCacheGenerationResult::Created(created),
+        ) => (created, existing, right),
+        results => panic!("reuse must converge on one producer: {results:?}"),
+    };
+    assert_eq!(
+        serde_json::to_value(&created).unwrap(),
+        serde_json::to_value(&existing).unwrap()
+    );
+    assert_eq!(created.created_by_execution, original.created_by_execution);
+    assert_eq!(created.client_refresh_id, original.client_refresh_id);
+    assert_eq!(created.source_revision, original.source_revision);
+    assert_eq!(created.expected_chunk_count, original.expected_chunk_count);
+    assert_eq!(created.expected_count, original.expected_count);
+    assert_eq!(
+        CacheGenerationRepository::list_for_namespace(&pool, namespace.id, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Even a now-exhausted aggregate budget must not reject a reuse or change
+    // the existing upload contract to the waiter's different expectations.
+    let admission = CacheAdmissionConfig {
+        max_unpublished_generations_per_owner: 1,
+        ..CacheAdmissionConfig::default()
+    };
+    let waiter = generation_input(namespace.id, "waiter", 99, Some(99));
+    let CreateCacheGenerationResult::Existing(reused) =
+        CacheGenerationRepository::create_or_get_with_policy(&pool, &waiter, &admission)
+            .await
+            .unwrap()
+    else {
+        panic!("reuse must not consume admission capacity")
+    };
+    assert_eq!(
+        serde_json::to_value(created).unwrap(),
+        serde_json::to_value(reused).unwrap()
+    );
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_conflict_race_returns_original_generation_and_producer() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("conflict_{}", unique_test_id()),
+            CacheNamespacePolicy {
+                refresh_concurrency: CacheRefreshConcurrency::Conflict,
+                ..CacheNamespacePolicy::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let mut left = generation_input(namespace.id, "left", 0, Some(0));
+    left.created_by_execution = Some(301);
+    let mut right = generation_input(namespace.id, "right", 0, Some(0));
+    right.created_by_execution = Some(302);
+    let (left_result, right_result) = tokio::join!(
+        CacheGenerationRepository::create_or_get(&pool, &left),
+        CacheGenerationRepository::create_or_get(&pool, &right),
+    );
+    let (created, generation_id, producer, original) = match (left_result, right_result) {
+        (
+            Ok(CreateCacheGenerationResult::Created(created)),
+            Err(Error::CacheRefreshInProgress {
+                generation_id,
+                created_by_execution,
+            }),
+        ) => (created, generation_id, created_by_execution, left),
+        (
+            Err(Error::CacheRefreshInProgress {
+                generation_id,
+                created_by_execution,
+            }),
+            Ok(CreateCacheGenerationResult::Created(created)),
+        ) => (created, generation_id, created_by_execution, right),
+        results => panic!("conflict must admit exactly one producer: {results:?}"),
+    };
+    assert_eq!(generation_id, created.id);
+    assert_eq!(producer, original.created_by_execution);
+    assert_eq!(created.created_by_execution, producer);
+    assert_eq!(
+        CacheGenerationRepository::list_for_namespace(&pool, namespace.id, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_parallel_default_keeps_two_admissions_and_original_quota() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("parallel_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        namespace.refresh_concurrency,
+        CacheRefreshConcurrency::Parallel
+    );
+    let mut left = generation_input(namespace.id, "left", 0, Some(0));
+    left.created_by_execution = Some(401);
+    let mut right = generation_input(namespace.id, "right", 0, Some(0));
+    right.created_by_execution = Some(402);
+    let (left_result, right_result) = tokio::join!(
+        CacheGenerationRepository::create_or_get(&pool, &left),
+        CacheGenerationRepository::create_or_get(&pool, &right),
+    );
+    let (
+        CreateCacheGenerationResult::Created(left_created),
+        CreateCacheGenerationResult::Created(right_created),
+    ) = (left_result.unwrap(), right_result.unwrap())
+    else {
+        panic!("parallel must create both candidates")
+    };
+    assert_ne!(left_created.id, right_created.id);
+    assert_eq!(left_created.created_by_execution, Some(401));
+    assert_eq!(right_created.created_by_execution, Some(402));
+    assert!(matches!(
+        CacheGenerationRepository::create_or_get(
+            &pool,
+            &generation_input(namespace.id, "third", 0, Some(0))
+        )
+        .await,
+        Err(Error::Validation(_))
+    ));
+    let found = CacheGenerationRepository::find_by_ids(&pool, &[left_created.id, right_created.id])
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(found
+        .iter()
+        .any(|g| g.id == left_created.id && g.created_by_execution == Some(401)));
+    let first_page =
+        CacheGenerationRepository::list_for_namespace_page(&pool, namespace.id, None, 1)
+            .await
+            .unwrap();
+    let second_page = CacheGenerationRepository::list_for_namespace_page(
+        &pool,
+        namespace.id,
+        first_page.next_before,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_page.items.len(), 1);
+    assert_eq!(second_page.items.len(), 1);
+    assert_ne!(first_page.items[0].id, second_page.items[0].id);
+    assert!(first_page.items[0].created_by_execution.is_some());
+    assert!(second_page.items[0].created_by_execution.is_some());
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_same_id_retries_precede_policy_and_never_rewrite_execution() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    for mode in [
+        CacheRefreshConcurrency::Reuse,
+        CacheRefreshConcurrency::Conflict,
+        CacheRefreshConcurrency::Parallel,
+    ] {
+        let namespace = CacheNamespaceRepository::create(
+            &pool,
+            namespace_input(
+                format!("retry_{}", unique_test_id()),
+                CacheNamespacePolicy {
+                    refresh_concurrency: mode,
+                    ..CacheNamespacePolicy::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let mut input = generation_input(namespace.id, "stable-id", 0, Some(0));
+        input.created_by_execution = Some(501);
+        let CreateCacheGenerationResult::Created(original) =
+            CacheGenerationRepository::create_or_get(&pool, &input)
+                .await
+                .unwrap()
+        else {
+            panic!("first request must create")
+        };
+        input.created_by_execution = Some(502);
+        let CreateCacheGenerationResult::Existing(retry) =
+            CacheGenerationRepository::create_or_get(&pool, &input)
+                .await
+                .unwrap()
+        else {
+            panic!("retry must reuse")
+        };
+        assert_eq!(retry.id, original.id);
+        assert_eq!(retry.created_by_execution, Some(501));
+        input.created_by_execution = None;
+        assert!(matches!(
+            CacheGenerationRepository::create_or_get(&pool, &input)
+                .await
+                .unwrap(),
+            CreateCacheGenerationResult::Existing(_)
+        ));
+        input.expected_count = Some(1);
+        assert!(matches!(
+            CacheGenerationRepository::create_or_get(&pool, &input).await,
+            Err(Error::AlreadyExists { .. })
+        ));
+    }
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_ready_blocks_until_explicit_failure_or_promotion() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    for mode in [
+        CacheRefreshConcurrency::Reuse,
+        CacheRefreshConcurrency::Conflict,
+    ] {
+        let namespace = CacheNamespaceRepository::create(
+            &pool,
+            namespace_input(
+                format!("ready_{}", unique_test_id()),
+                CacheNamespacePolicy {
+                    refresh_concurrency: mode,
+                    ..CacheNamespacePolicy::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let first = create_generation(&pool, namespace.id, "first", 0, Some(0)).await;
+        CacheGenerationRepository::seal(&pool, first.id)
+            .await
+            .unwrap();
+        let next_input = generation_input(namespace.id, "after-ready", 0, Some(0));
+        match (
+            mode,
+            CacheGenerationRepository::create_or_get(&pool, &next_input).await,
+        ) {
+            (CacheRefreshConcurrency::Reuse, Ok(CreateCacheGenerationResult::Existing(g))) => {
+                assert_eq!(g.id, first.id);
+                assert_eq!(g.state, CacheGenerationState::Ready);
+            }
+            (
+                CacheRefreshConcurrency::Conflict,
+                Err(Error::CacheRefreshInProgress {
+                    generation_id,
+                    created_by_execution: None,
+                }),
+            ) => assert_eq!(generation_id, first.id),
+            results => panic!("ready must remain unpublished: {results:?}"),
+        }
+        CacheGenerationRepository::fail(&pool, first.id, "explicit abandon")
+            .await
+            .unwrap();
+        let CreateCacheGenerationResult::Created(second) =
+            CacheGenerationRepository::create_or_get(&pool, &next_input)
+                .await
+                .unwrap()
+        else {
+            panic!("failed candidate must release refresh")
+        };
+        CacheGenerationRepository::seal(&pool, second.id)
+            .await
+            .unwrap();
+        CacheGenerationRepository::promote(
+            &pool,
+            namespace.id,
+            second.id,
+            None,
+            Utc::now() + Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+        let mut third_input = generation_input(namespace.id, "after-active", 0, Some(0));
+        third_input.expected_active_generation = Some(second.id);
+        let CreateCacheGenerationResult::Created(third) =
+            CacheGenerationRepository::create_or_get(&pool, &third_input)
+                .await
+                .unwrap()
+        else {
+            panic!("active generation must not block refresh")
+        };
+        CacheGenerationRepository::seal(&pool, third.id)
+            .await
+            .unwrap();
+        CacheGenerationRepository::promote(
+            &pool,
+            namespace.id,
+            third.id,
+            Some(second.id),
+            Utc::now() + Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+        let fourth = create_generation(&pool, namespace.id, "after-retired", 0, Some(0)).await;
+        assert_ne!(fourth.id, third.id);
+        assert_eq!(
+            CacheGenerationRepository::find_by_id(&pool, second.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            CacheGenerationState::Retired
+        );
+    }
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_execution_attribution_accepts_dangling_ids_and_is_db_immutable() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("attribution_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let mut input = generation_input(namespace.id, "attributed", 0, Some(0));
+    for invalid in [0, -1] {
+        input.created_by_execution = Some(invalid);
+        assert!(matches!(
+            CacheGenerationRepository::create_or_get(&pool, &input).await,
+            Err(Error::Validation(_))
+        ));
+    }
+    input.created_by_execution = Some(i64::MAX);
+    let CreateCacheGenerationResult::Created(attributed) =
+        CacheGenerationRepository::create_or_get(&pool, &input)
+            .await
+            .unwrap()
+    else {
+        panic!("dangling positive execution ID must be accepted")
+    };
+    assert_eq!(attributed.created_by_execution, Some(i64::MAX));
+    let unattributed = create_generation(&pool, namespace.id, "unattributed", 0, Some(0)).await;
+    assert_eq!(unattributed.created_by_execution, None);
+    for (id, producer) in [
+        (attributed.id, None),
+        (attributed.id, Some(1)),
+        (unattributed.id, Some(1)),
+    ] {
+        assert!(
+            sqlx::query("UPDATE cache_generation SET created_by_execution = $2 WHERE id = $1")
+                .bind(id)
+                .bind(producer)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+    // The schema itself rejects invalid creator IDs even if a caller bypasses
+    // repository input validation. No execution-row FK is introduced.
+    assert!(sqlx::query("INSERT INTO cache_generation(namespace,client_refresh_id,expected_chunk_count,created_by_execution) VALUES($1,'invalid-producer',0,0)").bind(namespace.id).execute(&pool).await.is_err());
+    let roundtrip = CacheGenerationRepository::find_by_id(&pool, attributed.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(roundtrip.created_by_execution, Some(i64::MAX));
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_policy_switch_selects_oldest_without_abandoning_parallel_candidates() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("policy_switch_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let mut left_input = generation_input(namespace.id, "older", 0, Some(0));
+    left_input.created_by_execution = Some(601);
+    let mut right_input = generation_input(namespace.id, "newer", 0, Some(0));
+    right_input.created_by_execution = Some(602);
+    let CreateCacheGenerationResult::Created(left) =
+        CacheGenerationRepository::create_or_get_with_policy_conn(
+            &mut tx,
+            &left_input,
+            &CacheAdmissionConfig::default(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("first candidate")
+    };
+    let CreateCacheGenerationResult::Created(right) =
+        CacheGenerationRepository::create_or_get_with_policy_conn(
+            &mut tx,
+            &right_input,
+            &CacheAdmissionConfig::default(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("second candidate")
+    };
+    tx.commit().await.unwrap();
+    assert_eq!(left.created, right.created);
+    assert!(left.id < right.id);
+    for mode in [
+        CacheRefreshConcurrency::Reuse,
+        CacheRefreshConcurrency::Conflict,
+    ] {
+        let policy = CacheNamespacePolicy {
+            refresh_concurrency: mode,
+            max_staging_generations: 1,
+            ..CacheNamespacePolicy::default()
+        };
+        let stored = CacheNamespaceRepository::update_policy(&pool, namespace.id, &policy)
+            .await
+            .unwrap();
+        assert_eq!(stored.refresh_concurrency, mode);
+        let waiter = generation_input(namespace.id, "waiter", 0, Some(0));
+        match (
+            mode,
+            CacheGenerationRepository::create_or_get(&pool, &waiter).await,
+        ) {
+            (CacheRefreshConcurrency::Reuse, Ok(CreateCacheGenerationResult::Existing(g))) => {
+                assert_eq!(g.id, left.id)
+            }
+            (
+                CacheRefreshConcurrency::Conflict,
+                Err(Error::CacheRefreshInProgress {
+                    generation_id,
+                    created_by_execution,
+                }),
+            ) => {
+                assert_eq!(generation_id, left.id);
+                assert_eq!(created_by_execution, Some(601));
+            }
+            result => panic!("oldest created/id candidate must be selected: {result:?}"),
+        }
+        let CreateCacheGenerationResult::Existing(retry) =
+            CacheGenerationRepository::create_or_get(&pool, &right_input)
+                .await
+                .unwrap()
+        else {
+            panic!("same ID must win over oldest policy")
+        };
+        assert_eq!(retry.id, right.id);
+        let candidates = CacheGenerationRepository::list_for_namespace(&pool, namespace.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|g| g.state == CacheGenerationState::Staging));
+    }
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_managed_policy_updates_preserve_existing_generations() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let pack = PackFixture::new_unique("refresh_policy_pack")
+        .create(&pool)
+        .await
+        .unwrap();
+    let mut definition = ManagedCacheNamespaceDefinition {
+        definition_ref: format!("{}.catalog", pack.r#ref),
+        owner: CacheOwnerScope::pack(pack.id, Some(pack.r#ref.clone())),
+        namespace: "catalog".into(),
+        policy: CacheNamespacePolicy::default(),
+    };
+    let admission = CacheAdmissionConfig::default();
+    CacheNamespaceRepository::upsert_managed_definitions(
+        &pool,
+        pack.id,
+        &pack.r#ref,
+        std::slice::from_ref(&definition),
+        &admission,
+    )
+    .await
+    .unwrap();
+    let namespace = CacheNamespaceRepository::resolve_managed_definition(
+        &pool,
+        &pack.r#ref,
+        &definition.definition_ref,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut input = generation_input(namespace.id, "original", 0, Some(0));
+    input.created_by_execution = Some(701);
+    let CreateCacheGenerationResult::Created(original) =
+        CacheGenerationRepository::create_or_get(&pool, &input)
+            .await
+            .unwrap()
+    else {
+        panic!("original candidate")
+    };
+    for mode in [
+        CacheRefreshConcurrency::Reuse,
+        CacheRefreshConcurrency::Conflict,
+        CacheRefreshConcurrency::Parallel,
+    ] {
+        definition.policy.refresh_concurrency = mode;
+        let summary = CacheNamespaceRepository::upsert_managed_definitions(
+            &pool,
+            pack.id,
+            &pack.r#ref,
+            std::slice::from_ref(&definition),
+            &admission,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.updated, 1);
+        let replay = CacheNamespaceRepository::upsert_managed_definitions(
+            &pool,
+            pack.id,
+            &pack.r#ref,
+            std::slice::from_ref(&definition),
+            &admission,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.unchanged, 1);
+        let stored = CacheNamespaceRepository::resolve_managed_definition(
+            &pool,
+            &pack.r#ref,
+            &definition.definition_ref,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.id, namespace.id);
+        assert_eq!(stored.refresh_concurrency, mode);
+        let preserved = CacheGenerationRepository::find_by_id(&pool, original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&preserved).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+    }
+    pool.cleanup().await.unwrap();
 }
 
 async fn create_generation(
@@ -191,8 +1647,8 @@ async fn owner_constraints_and_canonical_owner_namespace_uniqueness() {
 async fn cache_retention_config_is_persisted_with_runtime_retention() {
     let pool = helpers::create_test_pool().await.unwrap();
     let mut config = RetentionConfig::default();
-    config.cache_retention.batch_size = 321;
-    config.cache_retention.max_batches_per_generation = 7;
+    config.cache_retention.ddl_lock_timeout_milliseconds = 321;
+    config.cache_retention.max_cleanup_cycle_milliseconds = 7;
     config.cache_retention.staging_expiry_seconds = 1234;
     config.cache_retention.freshness_alerts_enabled = false;
 
@@ -546,21 +2002,12 @@ async fn expiration_tombstone_and_bounded_cleanup_primitives() {
     assert!(candidates
         .iter()
         .any(|generation| generation.id == first.id));
-    assert_eq!(
-        CacheEntryRepository::delete_cleanup_batch(&pool, first.id, 1)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        CacheEntryRepository::delete_cleanup_batch(&pool, first.id, 10)
-            .await
-            .unwrap(),
-        1
-    );
-    assert!(CacheGenerationRepository::delete_if_empty(&pool, first.id)
+    assert_eq!(reclaim_generation(&pool, first.id).await.unwrap(), 2);
+    assert_eq!(reclaim_generation(&pool, first.id).await.unwrap(), 0);
+    assert!(CacheGenerationRepository::find_by_id(&pool, first.id)
         .await
-        .unwrap());
+        .unwrap()
+        .is_none());
 
     assert!(CacheNamespaceRepository::tombstone(&pool, namespace.id)
         .await
@@ -773,17 +2220,11 @@ async fn only_nonterminal_workflow_iteration_pins_generation() {
             .iter()
             .all(|candidate| candidate.id != pinned.id)
     );
-    assert_eq!(
-        CacheEntryRepository::delete_cleanup_batch(&pool, pinned.id, 10)
-            .await
-            .unwrap(),
-        0
-    );
-    assert!(
-        !CacheGenerationRepository::delete_if_empty(&pool, pinned.id)
-            .await
-            .unwrap()
-    );
+    assert_eq!(reclaim_generation(&pool, pinned.id).await.unwrap(), 0);
+    assert!(CacheGenerationRepository::find_by_id(&pool, pinned.id)
+        .await
+        .unwrap()
+        .is_some());
 
     assert!(WorkflowCacheIterationRepository::update_scan_progress(
         &pool,
@@ -870,15 +2311,11 @@ async fn only_nonterminal_workflow_iteration_pins_generation() {
             .iter()
             .any(|candidate| candidate.id == pinned.id)
     );
-    assert_eq!(
-        CacheEntryRepository::delete_cleanup_batch(&pool, pinned.id, 10)
-            .await
-            .unwrap(),
-        1
-    );
-    assert!(CacheGenerationRepository::delete_if_empty(&pool, pinned.id)
+    assert_eq!(reclaim_generation(&pool, pinned.id).await.unwrap(), 1);
+    assert!(CacheGenerationRepository::find_by_id(&pool, pinned.id)
         .await
-        .unwrap());
+        .unwrap()
+        .is_none());
 }
 
 /// A share lock during the scan keeps readability and the scan on one snapshot,
@@ -1539,6 +2976,7 @@ async fn aggregate_admission_limits_are_atomic_across_racing_writers() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace_policy = CacheNamespacePolicy::default();
     let admission = CacheAdmissionConfig {
+        max_entry_partitions: 128,
         max_live_namespaces: 10,
         max_live_namespaces_per_owner: 1,
         max_physical_bytes: 1024 * 1024,
@@ -1791,12 +3229,7 @@ async fn aggregate_physical_bytes_include_staging_entries_and_roll_back_rejectio
         })
     ));
 
-    assert_eq!(
-        CacheEntryRepository::delete_cleanup_batch(&pool, generation.id, 10)
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(reclaim_generation(&pool, generation.id).await.unwrap(), 1);
     let released: (i64, i64) = sqlx::query_as(
         "SELECT deployment.physical_bytes, owner.physical_bytes \
          FROM cache_deployment_physical_byte_usage deployment \
@@ -2010,7 +3443,7 @@ async fn tombstone_races_upload_and_seal_without_deadlock() {
 }
 
 #[tokio::test]
-async fn cleanup_waits_for_a_reader_pinned_before_expiry() {
+async fn cleanup_defers_until_a_reader_pinned_before_expiry_finishes() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
         &pool,
@@ -2063,25 +3496,71 @@ async fn cleanup_waits_for_a_reader_pinned_before_expiry() {
     .await
     .unwrap();
 
-    let cleanup_pool = pool.clone();
-    let mut cleanup = tokio::spawn(async move {
-        CacheEntryRepository::delete_cleanup_batch(&cleanup_pool, first.id, 10).await
-    });
-    if let Ok(result) =
-        tokio::time::timeout(std::time::Duration::from_millis(100), &mut cleanup).await
-    {
-        panic!("cleanup must wait for the pinned reader's generation share lock, got {result:?}");
-    }
-
+    let config = CacheRetentionConfig {
+        min_traversal_window_seconds: 0,
+        ..CacheRetentionConfig::default()
+    };
+    let usage_before: (i64, i64) = sqlx::query_as(
+        "SELECT record_count, physical_bytes FROM cache_generation_entry_usage WHERE generation=$1",
+    )
+    .bind(first.id)
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    let deferred = CacheGenerationRepository::drop_if_cleanup_eligible(&pool, first.id, &config)
+        .await
+        .unwrap();
+    let usage_after: (i64, i64) = sqlx::query_as(
+        "SELECT record_count, physical_bytes FROM cache_generation_entry_usage WHERE generation=$1",
+    )
+    .bind(first.id)
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    let partitions_before_release = CacheStorageRepository::observe(&pool, &config)
+        .await
+        .unwrap()
+        .registered_partitions;
+    let page = CacheEntryRepository::scan_pinned_page_with_conn(
+        &mut reader_tx,
+        namespace.id,
+        first.id,
+        None,
+        10,
+    )
+    .await
+    .unwrap();
     reader_tx.commit().await.unwrap();
+    let reclaimed = CacheGenerationRepository::drop_if_cleanup_eligible(&pool, first.id, &config)
+        .await
+        .unwrap();
+    let remaining = CacheGenerationRepository::find_by_id(&*pool, first.id)
+        .await
+        .unwrap();
+    let partitions_after_release = CacheStorageRepository::observe(&pool, &config)
+        .await
+        .unwrap()
+        .registered_partitions;
+    pool.cleanup().await.unwrap();
+
+    assert_eq!(deferred, CacheGenerationCleanupOutcome::DeferredBusy);
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), cleanup)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap(),
-        1
+        usage_after, usage_before,
+        "a deferred DROP must not release usage"
     );
+    assert_eq!(partitions_before_release, 2);
+    assert_eq!(page.generation.id, first.id);
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].external_id, "a");
+    assert_eq!(
+        reclaimed,
+        CacheGenerationCleanupOutcome::Dropped {
+            records: 1,
+            bytes: u64::try_from(usage_before.1).unwrap(),
+        }
+    );
+    assert!(remaining.is_none());
+    assert_eq!(partitions_after_release, 1);
 }
 
 /// Both within-chunk and cross-chunk duplicate external ids surface the typed,
@@ -2408,7 +3887,7 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
         "caches/catalog.yaml",
         &format!(
             "ref: {pack_definition_ref}\nnamespace: catalog\nowner_type: pack\n\
-             owner_ref: {pack_ref}\nfreshness_target_seconds: 45\n"
+             owner_ref: {pack_ref}\nfreshness_target_seconds: 45\nrefresh_concurrency: reuse\n"
         ),
     );
     let updated = loader.load_all(temp.path()).await.unwrap();
@@ -2424,6 +3903,10 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
     assert_eq!(policy_updated.id, pack_namespace.id);
     assert_eq!(policy_updated.active_generation, Some(active.id));
     assert_eq!(policy_updated.freshness_target_seconds, 45);
+    assert_eq!(
+        policy_updated.refresh_concurrency,
+        CacheRefreshConcurrency::Reuse
+    );
 
     let api_namespace = CacheNamespaceRepository::create_api(
         &pool,

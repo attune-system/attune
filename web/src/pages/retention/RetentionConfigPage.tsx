@@ -6,18 +6,127 @@ import {
   retentionTargetKeys,
   retentionTargetLabels,
   type RetentionConfig,
+  type CacheRetentionConfig,
+  type NativeMaintenanceConfig,
   type RetentionTargetConfig,
   type RetentionTargetsConfig,
 } from "@/api/retention";
 import {
   useRetentionConfig,
   useUpdateRetentionConfig,
+  useNativeMaintenanceStatus,
 } from "@/hooks/useRetentionConfig";
+import { NativeMaintenanceStatusPanel } from "./NativeMaintenanceStatusPanel";
 
 type TargetField = keyof RetentionTargetsConfig;
 
 const INPUT_CLASS =
   "w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:bg-gray-100";
+
+const cacheStorageFields = [
+  {
+    key: "max_cleanup_cycle_milliseconds",
+    label: "Cache cleanup cycle budget in milliseconds",
+    max: 3_600_000,
+  },
+  {
+    key: "ddl_lock_timeout_milliseconds",
+    label: "Cache DDL lock timeout in milliseconds",
+    max: 3_600_000,
+  },
+  {
+    key: "ddl_creation_statement_timeout_milliseconds",
+    label: "Cache partition creation deadline in milliseconds",
+    max: 3_600_000,
+  },
+  {
+    key: "ddl_statement_timeout_milliseconds",
+    label: "Cache partition cleanup deadline in milliseconds",
+    max: 3_600_000,
+  },
+  {
+    key: "statistics_interval_seconds",
+    label: "Cache statistics interval in seconds",
+    max: 86_400,
+  },
+  {
+    key: "statistics_statement_timeout_milliseconds",
+    label: "Cache statistics deadline in milliseconds",
+    max: 3_600_000,
+  },
+] satisfies Array<{
+  key: keyof CacheRetentionConfig;
+  label: string;
+  max: number;
+}>;
+
+type NativeNumericField = Exclude<keyof NativeMaintenanceConfig, "enabled">;
+const nativeFields = [
+  {
+    key: "partition_interval_seconds",
+    label: "Partition interval in seconds",
+    advanced: false,
+  },
+  {
+    key: "summary_interval_seconds",
+    label: "Summary interval in seconds",
+    advanced: false,
+  },
+  {
+    key: "partition_lookahead_days",
+    label: "Partition lookahead in days",
+    advanced: false,
+  },
+  {
+    key: "summary_bootstrap_hours",
+    label: "Recent bootstrap hours",
+    advanced: false,
+  },
+  {
+    key: "max_partition_operations_per_cycle",
+    label: "Partition operations per cycle",
+    advanced: true,
+  },
+  {
+    key: "default_repair_row_limit",
+    label: "DEFAULT repair row limit",
+    advanced: true,
+  },
+  {
+    key: "lock_timeout_milliseconds",
+    label: "Lock timeout in milliseconds",
+    advanced: true,
+  },
+  {
+    key: "operation_timeout_milliseconds",
+    label: "Operation timeout in milliseconds",
+    advanced: true,
+  },
+  {
+    key: "max_partition_cycle_milliseconds",
+    label: "Partition cycle budget in milliseconds",
+    advanced: true,
+  },
+  {
+    key: "max_summary_buckets_per_cycle",
+    label: "Summary buckets per cycle",
+    advanced: true,
+  },
+  {
+    key: "max_summary_invalidations_per_bucket",
+    label: "Invalidations per summary bucket",
+    advanced: true,
+  },
+  {
+    key: "max_summary_cycle_milliseconds",
+    label: "Summary cycle budget in milliseconds",
+    advanced: true,
+  },
+] satisfies Array<{
+  key: NativeNumericField;
+  label: string;
+  advanced: boolean;
+}>;
 
 function secondsToDays(seconds: number | null | undefined): string {
   if (seconds == null) {
@@ -49,7 +158,7 @@ function formatRetention(value: number | null | undefined): string {
 }
 
 function cloneConfig(config: RetentionConfig): RetentionConfig {
-  return JSON.parse(JSON.stringify(config)) as RetentionConfig;
+  return structuredClone(config);
 }
 
 export default function RetentionConfigPage() {
@@ -57,6 +166,7 @@ export default function RetentionConfigPage() {
   const canUpdate = hasPermission(user, "retention", "update");
   const { data, dataUpdatedAt, isLoading, error } = useRetentionConfig();
   const updateRetention = useUpdateRetentionConfig();
+  const nativeStatus = useNativeMaintenanceStatus();
 
   const loadedConfig = data?.data ?? null;
 
@@ -77,12 +187,34 @@ export default function RetentionConfigPage() {
   }
 
   return (
-    <RetentionConfigEditor
-      key={dataUpdatedAt}
-      loadedConfig={loadedConfig}
-      canUpdate={canUpdate}
-      updateRetention={updateRetention}
-    />
+    <>
+      <RetentionConfigEditor
+        key={dataUpdatedAt}
+        loadedConfig={loadedConfig}
+        canUpdate={canUpdate}
+        updateRetention={updateRetention}
+      />
+      <div className="px-6 pb-6" aria-live="polite">
+        {nativeStatus.isError ? (
+          <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+            Failed to load native maintenance status.
+            <button
+              type="button"
+              onClick={() => void nativeStatus.refetch()}
+              className="ml-3 underline"
+            >
+              Retry status
+            </button>
+          </div>
+        ) : nativeStatus.data ? (
+          <NativeMaintenanceStatusPanel status={nativeStatus.data.data} />
+        ) : (
+          <p className="text-sm text-gray-500">
+            Loading native maintenance status...
+          </p>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -123,6 +255,31 @@ function RetentionConfigEditor({
     if (draft.batch_size <= 0) {
       return "Batch size must be greater than zero.";
     }
+    for (const field of cacheStorageFields) {
+      const value = draft.cache_retention[field.key];
+      if (!Number.isSafeInteger(value) || value <= 0 || value > field.max) {
+        return `${field.label} must be an integer between 1 and ${field.max}.`;
+      }
+    }
+    for (const field of nativeFields) {
+      const value = draft.native_maintenance[field.key];
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        return `${field.label} must be a positive integer.`;
+      }
+      if (
+        (field.key === "lock_timeout_milliseconds" ||
+          field.key === "operation_timeout_milliseconds") &&
+        value > 2147483647
+      ) {
+        return `${field.label} exceeds PostgreSQL's timeout range.`;
+      }
+    }
+    if (
+      !Number.isSafeInteger(draft.max_batches_per_target) ||
+      draft.max_batches_per_target <= 0
+    ) {
+      return "Maximum batches per target must be a positive integer.";
+    }
     for (const key of retentionTargetKeys) {
       const value = draft.targets[key].max_age_seconds;
       if (value === 0) {
@@ -138,6 +295,43 @@ function RetentionConfigEditor({
   ) => {
     setDraft((current) => (current ? { ...current, [key]: value } : current));
   };
+
+  const setNativeField = <K extends keyof NativeMaintenanceConfig>(
+    key: K,
+    value: NativeMaintenanceConfig[K],
+  ) => {
+    setDraft((current) => ({
+      ...current,
+      native_maintenance: { ...current.native_maintenance, [key]: value },
+    }));
+  };
+
+  const setCacheField = <K extends keyof CacheRetentionConfig>(
+    key: K,
+    value: CacheRetentionConfig[K],
+  ) => {
+    setDraft((current) => ({
+      ...current,
+      cache_retention: { ...current.cache_retention, [key]: value },
+    }));
+  };
+
+  const nativeControl = (field: (typeof nativeFields)[number]) => (
+    <label key={field.key} className="block">
+      <span className="text-sm font-medium text-gray-700">{field.label}</span>
+      <input
+        type="number"
+        min="1"
+        step="1"
+        value={draft.native_maintenance[field.key]}
+        disabled={!canUpdate}
+        onChange={(event) =>
+          setNativeField(field.key, Number(event.target.value))
+        }
+        className={INPUT_CLASS}
+      />
+    </label>
+  );
 
   const setTargetField = <K extends keyof RetentionTargetConfig>(
     target: TargetField,
@@ -189,13 +383,13 @@ function RetentionConfigEditor({
           <div className="flex items-center gap-3">
             <DatabaseZap className="h-8 w-8 text-blue-600" />
             <h1 className="text-3xl font-bold text-gray-900">
-              Runtime Retention
+              Runtime retention
             </h1>
           </div>
           <p className="mt-2 max-w-3xl text-sm text-gray-600">
             Manage database retention for runtime metadata. Saved changes are
-            persisted in PostgreSQL and picked up by the supervisor on its next
-            retention cycle without restarting the service.
+            persisted in PostgreSQL and picked up by the supervisor without
+            restarting the service.
           </p>
         </div>
         <div className="flex gap-2">
@@ -256,7 +450,7 @@ function RetentionConfigEditor({
             These settings control retention cycle cadence and safety behavior.
           </p>
         </div>
-        <div className="grid gap-4 p-6 md:grid-cols-2 lg:grid-cols-5">
+        <div className="grid gap-4 p-6 md:grid-cols-2 lg:grid-cols-3">
           <label className="flex items-center gap-2">
             <input
               type="checkbox"
@@ -301,7 +495,7 @@ function RetentionConfigEditor({
           </label>
           <label className="block">
             <span className="text-sm font-medium text-gray-700">
-              Batch size
+              Rows per batch
             </span>
             <input
               type="number"
@@ -313,6 +507,29 @@ function RetentionConfigEditor({
               }
               className={INPUT_CLASS}
             />
+          </label>
+          <label className="block">
+            <span className="text-sm font-medium text-gray-700">
+              Maximum batches per target
+            </span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={draft.max_batches_per_target}
+              disabled={!canUpdate}
+              onChange={(event) =>
+                setGlobalField(
+                  "max_batches_per_target",
+                  Number(event.target.value),
+                )
+              }
+              className={INPUT_CLASS}
+            />
+            <p className="mt-1 text-xs text-gray-500">
+              Each target deletes at most rows per batch times maximum batches
+              per cycle, then the supervisor continues with other maintenance.
+            </p>
           </label>
           <label className="block">
             <span className="text-sm font-medium text-gray-700">
@@ -328,6 +545,112 @@ function RetentionConfigEditor({
               className={INPUT_CLASS}
             />
           </label>
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-gray-200 bg-white shadow-sm">
+        <div className="border-b border-gray-200 px-6 py-4">
+          <h2 className="text-lg font-semibold text-gray-900">
+            Native partition and summary maintenance
+          </h2>
+          <p className="mt-1 text-sm text-gray-500">
+            Partition reconciliation and hourly summaries have independent
+            cadences. Disabling these jobs keeps raw reads available. Summaries
+            follow source retention.
+          </p>
+        </div>
+        <div className="grid gap-4 p-6 md:grid-cols-2 lg:grid-cols-3">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.native_maintenance.enabled}
+              disabled={!canUpdate}
+              onChange={(event) =>
+                setNativeField("enabled", event.target.checked)
+              }
+              className="h-4 w-4 rounded border-gray-300 text-blue-600"
+            />
+            <span className="text-sm font-medium text-gray-700">
+              Enable native maintenance
+            </span>
+          </label>
+          {nativeFields.filter((field) => !field.advanced).map(nativeControl)}
+        </div>
+        <details className="border-t border-gray-200 px-6 py-4">
+          <summary className="cursor-pointer text-sm font-medium text-gray-700">
+            Advanced maintenance budgets
+          </summary>
+          <p className="mt-2 text-xs text-gray-500">
+            DEFAULT repair moves a whole UTC day atomically. Days over the row
+            limit remain in DEFAULT. Time budgets include lock waits;
+            invalidation limits bound acknowledgement, not source row counts.
+          </p>
+          <div className="grid gap-4 pt-4 md:grid-cols-2 lg:grid-cols-3">
+            {nativeFields.filter((field) => field.advanced).map(nativeControl)}
+          </div>
+        </details>
+      </section>
+
+      <section className="rounded-lg border border-gray-200 bg-white shadow-sm">
+        <div className="border-b border-gray-200 px-6 py-4">
+          <h2 className="text-lg font-semibold text-gray-900">
+            Cache partition and statistics maintenance
+          </h2>
+          <p className="mt-1 text-sm text-gray-500">
+            Creation, cleanup, and parent/leaf ANALYZE use separate deadlines.
+            Statistics refresh runs in its own transaction when lifecycle
+            changes are pending and its interval has elapsed. It is checked
+            during the retention cycle, not by a separate timer.
+          </p>
+        </div>
+        <div className="grid gap-4 p-6 md:grid-cols-2 lg:grid-cols-3">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.cache_retention.enabled}
+              disabled={!canUpdate}
+              onChange={(event) =>
+                setCacheField("enabled", event.target.checked)
+              }
+              className="h-4 w-4 rounded border-gray-300 text-blue-600"
+            />
+            <span className="text-sm font-medium text-gray-700">
+              Enable cache maintenance
+            </span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.cache_retention.dry_run}
+              disabled={!canUpdate}
+              onChange={(event) =>
+                setCacheField("dry_run", event.target.checked)
+              }
+              className="h-4 w-4 rounded border-gray-300 text-blue-600"
+            />
+            <span className="text-sm font-medium text-gray-700">
+              Cache maintenance dry run
+            </span>
+          </label>
+          {cacheStorageFields.map((field) => (
+            <label key={field.key} className="block">
+              <span className="text-sm font-medium text-gray-700">
+                {field.label}
+              </span>
+              <input
+                type="number"
+                min="1"
+                max={field.max}
+                step="1"
+                value={draft.cache_retention[field.key]}
+                disabled={!canUpdate}
+                onChange={(event) =>
+                  setCacheField(field.key, Number(event.target.value))
+                }
+                className={INPUT_CLASS}
+              />
+            </label>
+          ))}
         </div>
       </section>
 

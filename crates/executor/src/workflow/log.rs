@@ -860,6 +860,23 @@ mod tests {
         }
     }
 
+    type DispatcherJoinResult = std::result::Result<Result<()>, tokio::task::JoinError>;
+
+    async fn wait_for_dispatcher_shutdown(
+        handle: &mut tokio::task::JoinHandle<Result<()>>,
+    ) -> std::result::Result<DispatcherJoinResult, tokio::time::error::Elapsed> {
+        let shutdown_result = tokio::time::timeout(Duration::from_secs(1), &mut *handle).await;
+        if shutdown_result.is_err() {
+            // A failed deadline must not detach a writer while its database is
+            // being torn down. Production shutdown still awaits durable delivery.
+            handle.abort();
+            if let Err(error) = (&mut *handle).await {
+                assert!(error.is_cancelled(), "Dispatcher task panicked: {error}");
+            }
+        }
+        shutdown_result
+    }
+
     #[test]
     fn retry_delay_is_bounded() {
         assert_eq!(retry_delay_ms(1), 1_000);
@@ -894,6 +911,7 @@ mod tests {
         let second = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
         drain_replicas(&first, &second).await;
         assert_eq!(transport.operations(), vec!["append:0", "append:1", "seal"]);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -922,6 +940,7 @@ mod tests {
         let second = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
         drain_replicas(&first, &second).await;
         assert_eq!(transport.operations().last().unwrap(), "seal");
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -942,6 +961,7 @@ mod tests {
         let peer = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
         drain_replicas(&restarted, &peer).await;
         assert_eq!(transport.operations(), vec!["append:0", "seal"]);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -988,6 +1008,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining, 0);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1025,6 +1046,7 @@ mod tests {
         .unwrap();
         assert_eq!(assigned, 1);
         assert_eq!(transport.operations(), vec!["append:0", "append:1"]);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1057,6 +1079,7 @@ mod tests {
         .unwrap();
         assert!(payload_sizes.len() > 1);
         assert!(payload_sizes.into_iter().all(|size| size <= 8));
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1105,6 +1128,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(recovered, "ready");
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1128,20 +1152,28 @@ mod tests {
         .await
         .unwrap();
 
-        let delete_error = sqlx::query("DELETE FROM execution WHERE id = $1")
-            .bind(parent_execution)
-            .execute(&pool)
+        let delete_error = WorkflowExecutionRepository::delete(&pool, workflow_execution)
             .await
             .unwrap_err();
         assert!(matches!(
             delete_error,
-            sqlx::Error::Database(ref error)
+            attune_common::Error::Database(sqlx::Error::Database(ref error))
                 if error.constraint() == Some("workflow_log_outbox_workflow_execution_fkey")
         ));
-        let retained =
-            RetentionRepository::run_target(&pool, RetentionTarget::Executions, 0, 10, false)
-                .await
-                .unwrap();
+        let retention = attune_common::config::RetentionConfig {
+            batch_size: 10,
+            max_batches_per_target: 1,
+            ..attune_common::config::RetentionConfig::default()
+        };
+        let retained = RetentionRepository::run_target_bounded(
+            &pool,
+            RetentionTarget::Executions,
+            0,
+            &retention,
+            || false,
+        )
+        .await
+        .unwrap();
         assert_eq!(retained.deleted, 0);
         let payload: Vec<u8> = sqlx::query_scalar(
             "SELECT payload FROM workflow_log_outbox WHERE workflow_execution = $1",
@@ -1156,11 +1188,127 @@ mod tests {
         let transport = Arc::new(RecordingTransport::new(pool.clone(), 0));
         let dispatcher = WorkflowLogDispatcher::new(pool.clone(), transport, 1024, 500);
         assert!(dispatcher.dispatch_once().await.unwrap());
-        let deleted =
-            RetentionRepository::run_target(&pool, RetentionTarget::Executions, 0, 10, false)
+        let lineage: (i64, bool, bool) = sqlx::query_as(
+            "SELECT workflow.execution, outbox.delivered_at IS NOT NULL, outbox.payload IS NULL \
+             FROM workflow_execution workflow \
+             JOIN workflow_log_outbox outbox ON outbox.workflow_execution = workflow.id \
+             WHERE workflow.id = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lineage, (parent_execution, true, true));
+
+        assert!(
+            WorkflowExecutionRepository::delete(&pool, workflow_execution)
                 .await
-                .unwrap();
+                .unwrap()
+        );
+        let remaining: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM workflow_execution WHERE id = $1), \
+                    (SELECT COUNT(*) FROM workflow_log_outbox WHERE workflow_execution = $1)",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, (0, 0));
+        let deleted = RetentionRepository::run_target_bounded(
+            &pool,
+            RetentionTarget::Executions,
+            0,
+            &retention,
+            || false,
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted.deleted, 1, "retention result: {deleted:?}");
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_execution_deletion_preserves_pending_workflow_log_lineage() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        let (parent_execution, _) = workflow_log_identity(&pool, workflow_execution).await;
+        enqueue(&pool, workflow_execution, b"must survive root deletion").await;
+
+        let deleted = sqlx::query("DELETE FROM execution WHERE id = $1")
+            .bind(parent_execution)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+        let lineage: (i64, Vec<u8>, bool) = sqlx::query_as(
+            "SELECT workflow.execution, outbox.payload, outbox.delivered_at IS NULL \
+             FROM workflow_execution workflow \
+             JOIN workflow_log_outbox outbox ON outbox.workflow_execution = workflow.id \
+             WHERE workflow.id = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lineage.0, parent_execution);
+        assert_eq!(lineage.1, b"must survive root deletion");
+        assert!(lineage.2);
+
+        let delete_error = WorkflowExecutionRepository::delete(&pool, workflow_execution)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            delete_error,
+            attune_common::Error::Database(sqlx::Error::Database(ref error))
+                if error.constraint() == Some("workflow_log_outbox_workflow_execution_fkey")
+        ));
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_execution_deletion_preserves_delivered_workflow_log_lineage() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        let (parent_execution, _) = workflow_log_identity(&pool, workflow_execution).await;
+        enqueue(&pool, workflow_execution, b"finish before root deletion").await;
+        let transport = Arc::new(RecordingTransport::new(pool.clone(), 0));
+        let dispatcher = WorkflowLogDispatcher::new(pool.clone(), transport.clone(), 1024, 500);
+        assert!(dispatcher.dispatch_once().await.unwrap());
+        assert_eq!(transport.operations(), vec!["append:0"]);
+
+        let deleted = sqlx::query("DELETE FROM execution WHERE id = $1")
+            .bind(parent_execution)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+        let lineage: (i64, bool, bool) = sqlx::query_as(
+            "SELECT workflow.execution, outbox.delivered_at IS NOT NULL, outbox.payload IS NULL \
+             FROM workflow_execution workflow \
+             JOIN workflow_log_outbox outbox ON outbox.workflow_execution = workflow.id \
+             WHERE workflow.id = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lineage, (parent_execution, true, true));
+
+        assert!(
+            WorkflowExecutionRepository::delete(&pool, workflow_execution)
+                .await
+                .unwrap()
+        );
+        let remaining: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM workflow_execution WHERE id = $1), \
+                    (SELECT COUNT(*) FROM workflow_log_outbox WHERE workflow_execution = $1)",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, (0, 0));
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1207,6 +1355,7 @@ mod tests {
         let restarted = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
         assert!(restarted.dispatch_once().await.unwrap());
         assert_eq!(transport.operations(), vec!["append:0"]);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1265,6 +1414,7 @@ mod tests {
         assert_eq!(row, (Some(1), true));
         assert_eq!(direct.operations(), vec!["append:0"]);
         assert_eq!(transport.operations(), vec!["append:1"]);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1315,6 +1465,7 @@ mod tests {
         .await
         .unwrap();
         assert!(delivered);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1343,6 +1494,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending, 0);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1353,18 +1505,44 @@ mod tests {
         let transport = Arc::new(RecordingTransport::gated(pool.clone()));
         let dispatcher = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let handle = tokio::spawn(dispatcher.start(shutdown_rx));
+        let mut handle = tokio::spawn(dispatcher.start(shutdown_rx));
         transport.commit_started.notified().await;
         shutdown_tx.send(()).unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(!handle.is_finished());
         transport.commit_gate.as_ref().unwrap().add_permits(1);
-        tokio::time::timeout(Duration::from_secs(1), handle)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let shutdown_result = wait_for_dispatcher_shutdown(&mut handle).await;
+        shutdown_result.unwrap().unwrap().unwrap();
         assert_eq!(transport.operations(), vec!["append:0"]);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_does_not_leave_dispatcher_running() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        enqueue(&pool, workflow_execution, b"blocked during shutdown").await;
+        let transport = Arc::new(RecordingTransport::gated(pool.clone()));
+        let dispatcher = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let mut handle = tokio::spawn(dispatcher.start(shutdown_rx));
+        transport.commit_started.notified().await;
+        shutdown_tx.send(()).unwrap();
+
+        let result = wait_for_dispatcher_shutdown(&mut handle).await;
+        let stopped = handle.is_finished();
+        if !stopped {
+            // Keep a failing regression's teardown owned, too.
+            handle.abort();
+            assert!(handle.await.unwrap_err().is_cancelled());
+        }
+        database.cleanup().await.unwrap();
+        assert!(result.is_err(), "A gated delivery must exceed the deadline");
+        assert!(
+            stopped,
+            "The dispatcher must be joined before fixture cleanup"
+        );
+        assert!(transport.operations().is_empty());
     }
 
     #[tokio::test]
@@ -1400,6 +1578,8 @@ mod tests {
             .execute(&mut *scheduler_connection)
             .await
             .unwrap();
+        drop(scheduler_connection);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1432,6 +1612,7 @@ mod tests {
         .await
         .unwrap()
         .is_none());
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -1460,5 +1641,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(heads, vec![(1, true)]);
+        database.cleanup().await.unwrap();
     }
 }

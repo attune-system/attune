@@ -1,8 +1,8 @@
-//! Entity history repository for querying TimescaleDB history hypertables
+//! Entity history repository for querying PostgreSQL history tables.
 //!
 //! This module provides read-only query methods for the `<entity>_history` tables.
-//! History records are written exclusively by PostgreSQL triggers — this repository
-//! only reads them.
+//! PostgreSQL triggers append history records. This repository only reads them.
+//! Retention deletes expired records separately.
 
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, Postgres, QueryBuilder};
@@ -10,7 +10,7 @@ use sqlx::{Executor, Postgres, QueryBuilder};
 use crate::models::entity_history::{EntityHistoryRecord, HistoryEntityType};
 use crate::Result;
 
-/// Repository for querying entity history hypertables.
+/// Repository for querying entity history tables.
 ///
 /// All methods are read-only. History records are populated by PostgreSQL
 /// `AFTER INSERT OR UPDATE OR DELETE` triggers on the operational tables.

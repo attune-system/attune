@@ -88,7 +88,11 @@ The sensor detail page exposes stdout/stderr tabs with a configurable tail count
 
 ## Sensor process health and restarts
 
-Managed pack sensor process state is persisted in `sensor_process`, with field-level changes mirrored to the `sensor_process_history` hypertable. The live state records the sensor, owning sensor worker, process status, pid, consecutive failure count, last exit code/signal, start/stop timestamps, next restart time, stderr excerpt, active-rule count, and alert bookkeeping.
+Managed pack sensor process state is persisted in `sensor_process`. PostgreSQL
+triggers append field-level changes to the ordinary `sensor_process_history`
+table. The live state records the sensor, owning sensor worker, process status,
+pid, consecutive failure count, last exit code/signal, start/stop timestamps,
+next restart time, stderr excerpt, active-rule count, and alert bookkeeping.
 
 `SensorManager` actively checks child processes with non-blocking `try_wait`. Unexpected exits while enabled rules still reference the sensor are marked as `backoff`, stderr context is captured from the rotating stderr log, and the sensor is restarted with capped exponential backoff. Intentional stops, disabled/deleted sensors, sensors with no active rules, and placement mismatches are marked stopped and are not restarted.
 

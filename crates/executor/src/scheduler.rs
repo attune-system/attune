@@ -32,7 +32,7 @@ use attune_common::{
         action::ActionRepository,
         cache::{
             CacheEntryRepository, CacheGenerationRepository, CacheNamespaceRepository,
-            CacheOwnerScope, MAX_SCAN_MATERIALIZATION_BYTES,
+            CacheOwnerScope, CacheTransactionMode, MAX_SCAN_MATERIALIZATION_BYTES,
         },
         execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
         execution_secret_value::ExecutionSecretValueRepository,
@@ -1587,6 +1587,11 @@ impl ExecutionScheduler {
                 workflow_def.r#ref
             );
             let mut transaction = pool.begin().await?;
+            CacheEntryRepository::protect_transaction(
+                &mut transaction,
+                CacheTransactionMode::PinMutation,
+            )
+            .await?;
             logger
                 .log_with_conn(
                     &mut transaction,
@@ -1826,6 +1831,11 @@ impl ExecutionScheduler {
         triggered_by: Option<&str>,
     ) -> Result<()> {
         let mut transaction = pool.begin().await?;
+        CacheEntryRepository::protect_transaction(
+            &mut transaction,
+            CacheTransactionMode::PinMutation,
+        )
+        .await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(*workflow_execution_id)
             .execute(&mut *transaction)
@@ -3753,6 +3763,8 @@ impl ExecutionScheduler {
         triggered_by: Option<&str>,
     ) -> Result<()> {
         let mut tx = pool.begin().await?;
+        CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+            .await?;
         let mut pending_messages = Vec::new();
         let mut pending_completions = Vec::new();
         let result = Self::dispatch_cache_iteration_task_with_conn(
@@ -5340,6 +5352,11 @@ impl ExecutionScheduler {
         let waits = WorkflowTaskWaitRepository::find_reconcilable_by_target(pool, target).await?;
         for wait in waits {
             let mut transaction = pool.begin().await?;
+            CacheEntryRepository::protect_transaction(
+                &mut transaction,
+                CacheTransactionMode::PinMutation,
+            )
+            .await?;
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
                 .bind(wait.workflow_execution)
                 .execute(&mut *transaction)
@@ -5623,6 +5640,11 @@ impl ExecutionScheduler {
 
         let result = async {
             sqlx::query("BEGIN").execute(&mut *lock_conn).await?;
+            CacheEntryRepository::protect_transaction(
+                &mut lock_conn,
+                CacheTransactionMode::PinMutation,
+            )
+            .await?;
 
             logger
                 .log_with_conn(
@@ -8063,6 +8085,11 @@ mod tests {
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::collections::{BTreeMap, HashMap};
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/cache_partition_ordering/mod.rs"
+    ));
 
     struct InquirySchedulerFixture {
         database: TestDatabase,

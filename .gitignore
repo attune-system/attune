@@ -38,6 +38,8 @@ logs/
 dist/
 build/
 artifacts/
+!tests/generated_client/api/artifacts/
+!tests/generated_client/api/artifacts/*.py
 
 # Testing
 coverage/

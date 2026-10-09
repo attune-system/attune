@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.cache_retention_config import CacheRetentionConfig
+    from ..models.native_maintenance_config import NativeMaintenanceConfig
     from ..models.retention_targets_config import RetentionTargetsConfig
 
 
@@ -23,7 +24,7 @@ class ApiResponseRetentionConfigData:
 
     Attributes:
         advisory_lock_key (int | Unset): Advisory lock key used to make accidental multi-supervisor deployments safe.
-        batch_size (int | Unset): Maximum rows to delete per target per cycle for regular tables.
+        batch_size (int | Unset): Maximum rows to delete in each committed batch.
         cache_retention (CacheRetentionConfig | Unset): Supervisor-owned cache generation/entry retention configuration.
 
             Persisted as the `cache_retention` JSON object on
@@ -32,8 +33,11 @@ class ApiResponseRetentionConfigData:
             step inside the existing retention cycle and reuses its advisory lock and
             cadence rather than electing a second leader.
         check_interval_seconds (int | Unset): How often the supervisor runs retention, in seconds.
-        dry_run (bool | Unset): Report candidates without deleting rows/chunks.
+        dry_run (bool | Unset): Report candidate rows without deleting them.
         enabled (bool | Unset): Enable runtime row retention globally.
+        max_batches_per_target (int | Unset): Maximum committed batches per target per cycle. Each target can delete
+            at most batch_size * max_batches_per_target rows per cycle.
+        native_maintenance (NativeMaintenanceConfig | Unset): Bounded native partition and hourly-summary maintenance.
         targets (RetentionTargetsConfig | Unset): Per-table runtime retention targets.
     """
 
@@ -43,6 +47,8 @@ class ApiResponseRetentionConfigData:
     check_interval_seconds: int | Unset = UNSET
     dry_run: bool | Unset = UNSET
     enabled: bool | Unset = UNSET
+    max_batches_per_target: int | Unset = UNSET
+    native_maintenance: NativeMaintenanceConfig | Unset = UNSET
     targets: RetentionTargetsConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -60,6 +66,12 @@ class ApiResponseRetentionConfigData:
         dry_run = self.dry_run
 
         enabled = self.enabled
+
+        max_batches_per_target = self.max_batches_per_target
+
+        native_maintenance: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.native_maintenance, Unset):
+            native_maintenance = self.native_maintenance.to_dict()
 
         targets: dict[str, Any] | Unset = UNSET
         if not isinstance(self.targets, Unset):
@@ -80,6 +92,10 @@ class ApiResponseRetentionConfigData:
             field_dict["dry_run"] = dry_run
         if enabled is not UNSET:
             field_dict["enabled"] = enabled
+        if max_batches_per_target is not UNSET:
+            field_dict["max_batches_per_target"] = max_batches_per_target
+        if native_maintenance is not UNSET:
+            field_dict["native_maintenance"] = native_maintenance
         if targets is not UNSET:
             field_dict["targets"] = targets
 
@@ -89,6 +105,9 @@ class ApiResponseRetentionConfigData:
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         from ..models.cache_retention_config import (
             CacheRetentionConfig,
+        )
+        from ..models.native_maintenance_config import (
+            NativeMaintenanceConfig,
         )
         from ..models.retention_targets_config import (
             RetentionTargetsConfig,
@@ -112,6 +131,15 @@ class ApiResponseRetentionConfigData:
 
         enabled = d.pop("enabled", UNSET)
 
+        max_batches_per_target = d.pop("max_batches_per_target", UNSET)
+
+        _native_maintenance = d.pop("native_maintenance", UNSET)
+        native_maintenance: NativeMaintenanceConfig | Unset
+        if isinstance(_native_maintenance, Unset):
+            native_maintenance = UNSET
+        else:
+            native_maintenance = NativeMaintenanceConfig.from_dict(_native_maintenance)
+
         _targets = d.pop("targets", UNSET)
         targets: RetentionTargetsConfig | Unset
         if isinstance(_targets, Unset):
@@ -126,6 +154,8 @@ class ApiResponseRetentionConfigData:
             check_interval_seconds=check_interval_seconds,
             dry_run=dry_run,
             enabled=enabled,
+            max_batches_per_target=max_batches_per_target,
+            native_maintenance=native_maintenance,
             targets=targets,
         )
 

@@ -3,6 +3,12 @@ use sqlx::postgres::PgPoolOptions;
 use std::{path::PathBuf, time::Duration};
 use tokio::time::{timeout, Instant};
 
+// The owning fixture already budgets 5s for pool close, 10s for connecting and
+// 120s for DROP DATABASE, including its required checkpoint. See
+// docs/testing/schema-per-test.md. Do not cancel that cleanup at the old 30s
+// heap-schema deadline now that each clone also contains native leaf indexes.
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(140);
+
 fn test_config() -> Config {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.test.yaml");
     Config::load_from_file(path.to_str().expect("UTF-8 config path")).expect("load test config")
@@ -34,20 +40,25 @@ async fn explicit_cleanup_removes_owned_database() {
         .expect("create test database");
     let database_name = database.database_name().to_string();
     assert!(database_exists(&config.database.url, &database_name).await);
-    let restoring: String = sqlx::query_scalar("SHOW timescaledb.restoring")
-        .fetch_one(database.pool())
-        .await
-        .expect("read Timescale restoring mode");
-    assert_eq!(restoring, "off");
-    let compression_jobs: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_schema = 'attune'",
+    let ordinary_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relkind = 'r' AND NOT relispartition AND relname IN ('event', 'execution_history', 'worker_history', 'sensor_process_history', 'audit_event')",
     )
     .fetch_one(database.pool())
     .await
-    .expect("count cloned Timescale jobs");
-    assert_eq!(compression_jobs, 5);
+    .expect("count cloned ordinary tables");
+    assert_eq!(ordinary_tables, 2);
+    let partitioned_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relkind = 'p' AND relname IN ('event', 'execution_history', 'audit_event')",
+    ).fetch_one(database.pool()).await.expect("count cloned native parents");
+    assert_eq!(partitioned_tables, 3);
+    let extensions: Vec<String> =
+        sqlx::query_scalar("SELECT extname FROM pg_extension ORDER BY extname")
+            .fetch_all(database.pool())
+            .await
+            .expect("read cloned extensions");
+    assert!(!extensions.iter().any(|name| name == "timescaledb"));
 
-    timeout(Duration::from_secs(30), database.cleanup())
+    timeout(CLEANUP_DEADLINE, database.cleanup())
         .await
         .expect("cleanup remained bounded")
         .expect("explicit cleanup succeeded");
@@ -69,13 +80,9 @@ async fn panic_drop_fallback_removes_owned_database() {
     });
     assert!(panic_task.await.expect_err("task must panic").is_panic());
 
-    timeout(Duration::from_secs(30), async {
-        while database_exists(&config.database.url, &database_name).await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("drop fallback did not remove database");
+    // Drop joins its cleanup thread. A completed panicking task must leave no
+    // database behind; polling here would hide an incorrectly detached cleanup.
+    assert!(!database_exists(&config.database.url, &database_name).await);
 }
 
 #[tokio::test]
@@ -103,18 +110,19 @@ async fn held_database_lock_is_terminated_and_drop_remains_bounded() {
     ready_rx.await.expect("database lock holder ready");
 
     let started = Instant::now();
-    let cleanup_result = timeout(Duration::from_secs(30), database.cleanup())
-        .await
-        .expect("cleanup remained bounded");
+    let cleanup_result = timeout(CLEANUP_DEADLINE, database.cleanup()).await;
+    let elapsed = started.elapsed();
+    holder.abort();
+    let _ = holder.await;
+    let cleanup_result = cleanup_result.expect("cleanup remained bounded");
     if let Err(error) = cleanup_result {
         assert!(
-            error.to_string().contains("pool close timed out"),
+            error
+                .to_string()
+                .ends_with(": pool close timed out after 5s"),
             "unexpected cleanup error: {error}"
         );
     }
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(elapsed < CLEANUP_DEADLINE);
     assert!(!database_exists(&config.database.url, &database_name).await);
-
-    holder.abort();
-    let _ = holder.await;
 }

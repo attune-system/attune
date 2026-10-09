@@ -27,7 +27,7 @@ class KeyResponse:
         owner_type (OwnerType):
         ref (str): Unique reference identifier Example: system.github_token.
         updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
-        value (Any): The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+        value (Any): JSON value, or null when the caller cannot read and decrypt encrypted material.
         owner (None | str | Unset): Authoritative owner reference Example: github.
         owner_action (int | None | Unset):
         owner_action_ref (None | str | Unset): Owner action reference Example: github.create_issue.

@@ -182,15 +182,25 @@ export interface DashboardSourceError {
 
 export interface DashboardSourceMeta {
   authorization_mode: "operator_global" | "identity_filtered";
-  freshness_mode:
-    "raw_only" | "aggregate_only" | "aggregate_plus_tail" | "raw_only_fallback";
+  freshness_mode: DashboardFreshnessMode;
   aggregate_watermark: string | null;
+  read_coverage: DashboardReadCoverage | null;
   cache_hit: boolean;
   bucket_size: string | null;
   truncated: boolean;
   unit_hints: Record<string, string>;
   ordering: string[];
   authorized_refs: Record<string, unknown> | null;
+}
+
+export type DashboardFreshnessMode =
+  "raw_only" | "summary_only" | "summary_plus_raw" | "cache_rawfallback";
+
+export interface DashboardReadCoverage {
+  mode: DashboardFreshnessMode;
+  summary_ranges: DashboardTimeRange[];
+  raw_ranges: DashboardTimeRange[];
+  oldest_refresh: string | null;
 }
 
 export interface DashboardSourceResult {
@@ -277,7 +287,7 @@ export interface DashboardSourceContract {
   source_type: string;
   availability: "available_now" | "partial" | "planned" | string;
   authorization_basis: string;
-  default_freshness_mode: string;
+  default_freshness_mode: DashboardFreshnessMode;
   params: DashboardSourceParamDefinition[];
   ordering: string[];
   response_shape: string;

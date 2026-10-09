@@ -469,9 +469,9 @@ async fn test_delete_event_enforcement_retains_event_id() {
         .await
         .unwrap();
 
-    // Delete the event — since the event table is a TimescaleDB hypertable, the FK
-    // constraint from enforcement.event was dropped (hypertables cannot be FK targets).
-    // The enforcement.event column retains the old ID as a dangling reference.
+    // Events and enforcements have independent retention periods. There is
+    // intentionally no FK on enforcement.event, so deleting the event leaves
+    // its old ID as a dangling reference.
     EventRepository::delete(&pool, event.id).await.unwrap();
 
     // Enforcement still exists with the original event ID (now a dangling reference)

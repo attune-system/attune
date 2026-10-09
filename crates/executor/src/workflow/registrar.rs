@@ -17,7 +17,7 @@ use attune_common::repositories::workflow::{
     CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput,
 };
 use attune_common::repositories::{
-    Create, Delete, FindByRef, PackRepository, Update, WorkflowDefinitionRepository,
+    Create, FindByRef, PackRepository, Update, WorkflowDefinitionRepository,
 };
 use sqlx::PgPool;
 use std::collections::HashMap;

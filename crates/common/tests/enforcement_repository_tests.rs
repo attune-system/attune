@@ -348,9 +348,9 @@ async fn test_create_enforcement_with_invalid_rule_fails() {
 async fn test_create_enforcement_with_nonexistent_event_succeeds() {
     let pool = create_test_pool().await.unwrap();
 
-    // The enforcement.event column has no FK constraint (event is a hypertable
-    // and hypertables cannot be FK targets). A non-existent event ID is accepted
-    // as a dangling reference.
+    // The enforcement.event column intentionally has no FK constraint so event
+    // retention is independent. A non-existent event ID is accepted as a
+    // dangling reference.
     let input = CreateEnforcementInput {
         rule: None,
         rule_ref: "some.rule".to_string(),

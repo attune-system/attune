@@ -16,8 +16,8 @@
 //! - A tombstoned namespace already moves its in-flight `staging`/`ready`
 //!   generations to `failed` and retires its active generation immediately
 //!   (see `CacheNamespaceRepository::tombstone`); this module drains those
-//!   generations' entries in bounded batches, deletes the emptied
-//!   generation, and once a tombstoned namespace has no generations left,
+//!   generations by atomically dropping their entry partitions and metadata,
+//!   and once a tombstoned namespace has no generations left,
 //!   deletes the namespace row itself. Owner rows stay protected by the
 //!   `ON DELETE RESTRICT` foreign keys on `cache_namespace` until that drain
 //!   completes.
@@ -38,8 +38,11 @@ use attune_common::{
     models::{CacheGeneration, CacheGenerationState, CacheNamespace, Id, OwnerType},
     mq::Publisher,
     repositories::{
-        cache::MAX_CLEANUP_SELECTION, CacheEntryRepository, CacheGenerationRepository,
-        CacheNamespaceRepository, FindById, MaintenanceRepository,
+        cache::{
+            CacheGenerationCleanupOutcome, CacheStatisticsRefreshOutcome, CacheStorageRepository,
+            MAX_CLEANUP_SELECTION,
+        },
+        CacheGenerationRepository, CacheNamespaceRepository, FindById, MaintenanceRepository,
     },
     system_alert::{emit_core_alert, SystemAlert},
     Error, Result,
@@ -74,6 +77,7 @@ pub struct CacheRetentionContext<'a> {
 #[derive(Debug, Default)]
 pub struct CacheRetentionState {
     namespace_after_id: Mutex<Option<Id>>,
+    cleanup_after_id: Mutex<Option<Id>>,
 }
 
 impl CacheRetentionState {
@@ -97,6 +101,26 @@ pub struct CacheRetentionCycleSummary {
     pub staging_expired: usize,
     pub cleanup_candidates: usize,
     pub entries_deleted: u64,
+    pub bytes_reclaimed: u64,
+    pub lock_deferrals: u64,
+    pub deadline_deferrals: u64,
+    pub cleanup_failures: u64,
+    pub maintenance_failures: u64,
+    pub registered_partitions: i64,
+    pub partitions_created_total: i64,
+    pub partitions_dropped_total: i64,
+    pub cleanup_backlog_total: i64,
+    pub oldest_cleanup_age_seconds: i64,
+    pub reclamation_duration_ms: u64,
+    pub statistics_duration_ms: u64,
+    pub statistics_pending: bool,
+    pub storage_observed: bool,
+    pub statistics_age_seconds: Option<u64>,
+    pub statistics_refreshed: bool,
+    pub statistics_lock_deferrals: u64,
+    pub statistics_deadline_deferrals: u64,
+    pub statistics_failures: u64,
+    pub cleanup_budget_exhausted: bool,
     pub generations_deleted: usize,
     pub namespaces_deleted: usize,
     pub freshness_alerts: usize,
@@ -135,6 +159,12 @@ impl CacheRetentionCycleSummary {
             || self.entries_deleted > 0
             || self.generations_deleted > 0
             || self.namespaces_deleted > 0
+            || self.statistics_refreshed
+            || self.statistics_failures > 0
+            || self.cleanup_failures > 0
+            || self.maintenance_failures > 0
+            || self.lock_deferrals > 0
+            || self.deadline_deferrals > 0
     }
 }
 
@@ -145,31 +175,58 @@ pub async fn run_cache_retention_cycle(
     ctx: &CacheRetentionContext<'_>,
     config: &CacheRetentionConfig,
 ) -> Result<CacheRetentionCycleSummary> {
+    config
+        .validate_storage_maintenance()
+        .map_err(Error::validation)?;
     if !config.enabled {
         info!("Cache retention is disabled in configuration; skipping cache cleanup step");
         return Ok(CacheRetentionCycleSummary::default());
     }
 
     let started = Instant::now();
+    let mut summary = CacheRetentionCycleSummary {
+        dry_run: config.dry_run,
+        ..Default::default()
+    };
     let result = async {
-        let mut summary = CacheRetentionCycleSummary {
-            dry_run: config.dry_run,
-            ..Default::default()
-        };
         scan_namespaces(ctx, config, &mut summary).await?;
-        drain_cleanup_candidates(ctx, config, &mut summary).await?;
-        delete_empty_tombstoned_namespaces(ctx, config, &mut summary).await?;
-        Ok::<_, attune_common::Error>(summary)
+    drain_cleanup_candidates(ctx, config, &mut summary).await?;
+    delete_empty_tombstoned_namespaces(ctx, config, &mut summary).await?;
+
+    let statistics_started = Instant::now();
+    match CacheStorageRepository::refresh_statistics(ctx.pool, config).await {
+        Ok(CacheStatisticsRefreshOutcome::Applied) => summary.statistics_refreshed = true,
+        Ok(CacheStatisticsRefreshOutcome::DeferredBusy) => summary.statistics_lock_deferrals += 1,
+        Ok(CacheStatisticsRefreshOutcome::DeferredDeadline) => summary.statistics_deadline_deferrals += 1,
+        Ok(CacheStatisticsRefreshOutcome::NotDue) => {},
+        Err(error) => {
+            summary.statistics_failures += 1;
+            warn!(error = %error, "Cache statistics maintenance failed; committed cleanup remains recorded");
+        }
+    }
+    summary.statistics_duration_ms = u64::try_from(statistics_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match CacheStorageRepository::observe(ctx.pool, config).await {
+        Ok(observation) => {
+            summary.storage_observed = true;
+            summary.registered_partitions = observation.registered_partitions;
+            summary.partitions_created_total = observation.partitions_created;
+            summary.partitions_dropped_total = observation.partitions_dropped;
+            summary.cleanup_backlog_total = observation.cleanup_backlog;
+            summary.oldest_cleanup_age_seconds = observation.oldest_cleanup_age_seconds;
+            summary.statistics_pending = observation.statistics_pending;
+            summary.statistics_age_seconds = observation.last_analyzed_at.map(|time| age_seconds(Utc::now(), time));
+        }
+        Err(error) => {
+            summary.maintenance_failures += 1;
+            warn!(error = %error, "Cache storage observation failed; committed cleanup remains recorded");
+        }
+    }
+        Ok::<_, attune_common::Error>(())
     }
     .await;
 
     match result {
-        Ok(mut summary) => {
-            summary.maintenance_duration_ms =
-                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            emit_operational_metrics(&summary);
-            Ok(summary)
-        }
+        Ok(()) => {}
         Err(err) => {
             warn!(
                 component = "cache_maintenance",
@@ -182,9 +239,15 @@ pub async fn run_cache_retention_cycle(
                 error = %err,
                 "Cache retention step failed"
             );
-            Err(err)
+            // Earlier expiry/drop transactions may already have committed.
+            // Return their counters for auditing instead of losing progress.
+            summary.maintenance_failures += 1;
         }
     }
+    summary.maintenance_duration_ms =
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    emit_operational_metrics(&summary);
+    Ok(summary)
 }
 
 /// Expires abandoned unpublished generations and emits freshness/failure
@@ -546,10 +609,7 @@ async fn maybe_emit_staging_failure_alert(
     Ok(true)
 }
 
-/// Drains bounded cleanup-candidate generations: entries first, in indexed
-/// bounded batches, then the emptied generation, then (bounded) the emptied
-/// tombstoned namespace. Never deletes an entire high-cardinality generation
-/// in one transaction.
+/// Reclaims bounded candidates atomically, without deleting entry rows.
 async fn drain_cleanup_candidates(
     ctx: &CacheRetentionContext<'_>,
     config: &CacheRetentionConfig,
@@ -558,8 +618,26 @@ async fn drain_cleanup_candidates(
     let generation_limit = config
         .max_generations_per_cycle
         .clamp(1, MAX_CLEANUP_SELECTION);
-    let candidates =
-        CacheGenerationRepository::select_cleanup_candidates(ctx.pool, generation_limit).await?;
+    let watermark = *ctx.state.cleanup_after_id.lock().await;
+    let mut candidates = CacheGenerationRepository::select_cleanup_candidates_after(
+        ctx.pool,
+        watermark,
+        generation_limit,
+    )
+    .await?;
+    if let Some(watermark) = watermark {
+        let remaining = generation_limit - candidates.len() as i64;
+        if remaining > 0 {
+            candidates.extend(
+                CacheGenerationRepository::select_cleanup_candidates_after(
+                    ctx.pool, None, remaining,
+                )
+                .await?
+                .into_iter()
+                .filter(|generation| generation.id <= watermark),
+            );
+        }
+    }
     summary.cleanup_candidates = candidates.len();
     summary.cleanup_backlog_saturated = candidates.len() >= generation_limit as usize;
     for candidate in &candidates {
@@ -581,38 +659,33 @@ async fn drain_cleanup_candidates(
         return Ok(());
     }
 
-    let min_traversal_window = bounded_duration(config.min_traversal_window_seconds);
-    let batch_size = config.batch_size.clamp(1, MAX_CLEANUP_SELECTION);
-    let max_batches = config
-        .max_batches_per_generation
-        .clamp(1, MAX_CLEANUP_SELECTION);
+    let started = Instant::now();
     for candidate in candidates {
-        // Defensive re-check: a retired generation is only touched once both
-        // its own stored `readable_until` (already filtered by
-        // `select_cleanup_candidates`) *and* the configured minimum
-        // traversal window have elapsed since retirement. Active generations
-        // are never returned by `select_cleanup_candidates` at all.
-        if candidate.state == CacheGenerationState::Retired {
-            if let Some(retired_at) = candidate.retired {
-                if Utc::now() - retired_at < min_traversal_window {
-                    continue;
-                }
-            }
+        let remaining = config
+            .max_cleanup_cycle_milliseconds
+            .saturating_sub(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        if remaining == 0 {
+            summary.cleanup_budget_exhausted = true;
+            break;
         }
-
-        if let Err(err) =
-            drain_generation_entries(ctx, candidate.id, batch_size, max_batches, summary).await
-        {
-            warn!(
-                generation_id = candidate.id,
-                error = %err,
-                "Failed to drain cache generation entries"
-            );
-            continue;
-        }
-
-        match CacheGenerationRepository::delete_if_empty(ctx.pool, candidate.id).await {
-            Ok(true) => {
+        *ctx.state.cleanup_after_id.lock().await = Some(candidate.id);
+        let mut bounded = config.clone();
+        bounded.max_cleanup_cycle_milliseconds = remaining;
+        bounded.ddl_statement_timeout_milliseconds =
+            bounded.ddl_statement_timeout_milliseconds.min(remaining);
+        bounded.ddl_lock_timeout_milliseconds =
+            bounded.ddl_lock_timeout_milliseconds.min(remaining);
+        let ddl_started = Instant::now();
+        let outcome =
+            CacheGenerationRepository::drop_if_cleanup_eligible(ctx.pool, candidate.id, &bounded)
+                .await;
+        summary.reclamation_duration_ms = summary
+            .reclamation_duration_ms
+            .saturating_add(u64::try_from(ddl_started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        match outcome {
+            Ok(CacheGenerationCleanupOutcome::Dropped { records, bytes }) => {
+                summary.entries_deleted += records;
+                summary.bytes_reclaimed += bytes;
                 summary.generations_deleted += 1;
                 match candidate.state {
                     CacheGenerationState::Failed => {
@@ -624,12 +697,21 @@ async fn drain_cleanup_candidates(
                     _ => {}
                 }
             }
-            Ok(false) => {}
-            Err(err) => warn!(
-                generation_id = candidate.id,
-                error = %err,
-                "Failed to delete emptied cache generation"
-            ),
+            Ok(CacheGenerationCleanupOutcome::DeferredBusy) => summary.lock_deferrals += 1,
+            Ok(CacheGenerationCleanupOutcome::DeferredDeadline) => summary.deadline_deferrals += 1,
+            Ok(
+                CacheGenerationCleanupOutcome::Absent | CacheGenerationCleanupOutcome::Ineligible,
+            ) => {}
+            Err(err) => {
+                summary.cleanup_failures += 1;
+                warn!(generation_id = candidate.id, error = %err, "Cache partition reclamation failed");
+            }
+        }
+        if u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+            >= config.max_cleanup_cycle_milliseconds
+        {
+            summary.cleanup_budget_exhausted = true;
+            break;
         }
     }
 
@@ -649,30 +731,6 @@ async fn delete_empty_tombstoned_namespaces(
         .clamp(1, MAX_CLEANUP_SELECTION);
     summary.namespaces_deleted +=
         CacheNamespaceRepository::delete_empty_tombstoned_batch(ctx.pool, limit).await? as usize;
-    Ok(())
-}
-
-/// Deletes entries from one cleanup-candidate generation in indexed bounded
-/// batches, stopping once a batch removes nothing or `max_batches` is
-/// reached, whichever happens first. A generation with remaining entries
-/// beyond the per-cycle bound is simply picked up again next cycle.
-async fn drain_generation_entries(
-    ctx: &CacheRetentionContext<'_>,
-    generation_id: Id,
-    batch_size: i64,
-    max_batches: i64,
-    summary: &mut CacheRetentionCycleSummary,
-) -> Result<()> {
-    let mut batches = 0i64;
-    while batches < max_batches {
-        let deleted =
-            CacheEntryRepository::delete_cleanup_batch(ctx.pool, generation_id, batch_size).await?;
-        batches += 1;
-        summary.entries_deleted += deleted;
-        if deleted == 0 {
-            break;
-        }
-    }
     Ok(())
 }
 
@@ -708,11 +766,39 @@ fn emit_operational_metrics(summary: &CacheRetentionCycleSummary) {
     info!(
         component = "cache_maintenance",
         metric_set = "cache_maintenance_cycle",
-        status = "success",
+        status = if summary.maintenance_failures
+            + summary.cleanup_failures
+            + summary.statistics_failures
+            > 0
+        {
+            "partial_failure"
+        } else {
+            "success"
+        },
         dry_run = summary.dry_run,
         maintenance_cycle_count = 1u64,
-        maintenance_failure_count = 0u64,
+        maintenance_failure_count = summary.maintenance_failures,
         maintenance_duration_ms = summary.maintenance_duration_ms,
+        partitions_dropped = summary.generations_deleted,
+        bytes_reclaimed = summary.bytes_reclaimed,
+        lock_deferrals = summary.lock_deferrals,
+        deadline_deferrals = summary.deadline_deferrals,
+        cleanup_failures = summary.cleanup_failures,
+        registered_partitions = summary.registered_partitions,
+        partitions_created_total = summary.partitions_created_total,
+        partitions_dropped_total = summary.partitions_dropped_total,
+        cleanup_backlog_total = summary.cleanup_backlog_total,
+        oldest_cleanup_age_seconds = summary.oldest_cleanup_age_seconds,
+        reclamation_duration_ms = summary.reclamation_duration_ms,
+        statistics_duration_ms = summary.statistics_duration_ms,
+        statistics_pending = summary.statistics_pending,
+        storage_observed = summary.storage_observed,
+        statistics_age_seconds = ?summary.statistics_age_seconds,
+        statistics_refreshed = summary.statistics_refreshed,
+        statistics_lock_deferrals = summary.statistics_lock_deferrals,
+        statistics_deadline_deferrals = summary.statistics_deadline_deferrals,
+        statistics_failures = summary.statistics_failures,
+        cleanup_budget_exhausted = summary.cleanup_budget_exhausted,
         namespaces_scanned = summary.namespaces_scanned,
         fresh_namespaces = summary.fresh_namespaces,
         stale_namespaces = summary.stale_namespaces,
@@ -775,7 +861,7 @@ mod tests {
                 CacheEntryInput, CacheNamespacePolicy, CacheOwnerScope, CreateCacheGenerationInput,
                 CreateCacheGenerationResult, CreateCacheNamespaceInput, InsertCacheChunkResult,
             },
-            CacheIngestRepository, Create,
+            CacheEntryRepository, CacheIngestRepository, Create,
         },
         test_database::TestDatabase,
     };
@@ -841,8 +927,12 @@ mod tests {
     fn test_config() -> CacheRetentionConfig {
         CacheRetentionConfig {
             enabled: true,
-            batch_size: 1000,
-            max_batches_per_generation: 20,
+            max_cleanup_cycle_milliseconds: 30_000,
+            ddl_lock_timeout_milliseconds: 250,
+            ddl_creation_statement_timeout_milliseconds: 5_000,
+            ddl_statement_timeout_milliseconds: 1_000,
+            statistics_interval_seconds: 300,
+            statistics_statement_timeout_milliseconds: 5_000,
             max_generations_per_cycle: 50,
             max_namespaces_per_cycle: 50,
             min_traversal_window_seconds: 0,
@@ -888,6 +978,7 @@ mod tests {
                 checksum: None,
                 source_revision: None,
                 created_by: None,
+                created_by_execution: None,
             },
         )
         .await
@@ -1070,11 +1161,29 @@ mod tests {
             .expect("cache retention cycle");
 
         assert_eq!(summary.staging_expired, 1);
-        let expired = CacheGenerationRepository::find_by_id(&pool, abandoned.id)
+        assert_eq!(summary.cleanup_candidates, 1);
+        assert_eq!(summary.generations_deleted, 1);
+        assert_eq!(summary.failed_generations_deleted, 1);
+        assert_eq!(summary.cleanup_failures, 0);
+        let abandoned_after_cleanup = CacheGenerationRepository::find_by_id(&pool, abandoned.id)
             .await
-            .expect("find abandoned generation")
-            .expect("abandoned generation remains while earlier cleanup candidates drain");
-        assert_eq!(expired.state, CacheGenerationState::Failed);
+            .expect("find abandoned generation");
+        let newer = CacheGenerationRepository::list_for_namespace(&pool, namespace.id, 150)
+            .await
+            .expect("find remaining newer failures");
+        pool.cleanup().await.unwrap();
+        assert!(
+            abandoned_after_cleanup.is_none(),
+            "ascending-ID cleanup must reclaim the expired oldest generation first"
+        );
+        assert_eq!(
+            newer.len(),
+            101,
+            "one-generation cleanup must leave all newer candidates"
+        );
+        assert!(newer
+            .iter()
+            .all(|generation| generation.state == CacheGenerationState::Failed));
     }
 
     #[tokio::test]
@@ -1295,7 +1404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_batches_limit_entries_deleted_per_cycle() {
+    async fn atomic_reclamation_removes_all_entries_and_never_double_releases_usage() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
         let generation = create_generation(&pool, namespace.id).await;
@@ -1304,36 +1413,165 @@ mod tests {
             .await
             .expect("fail generation for cleanup eligibility");
 
-        let mut config = test_config();
-        config.batch_size = 1;
-        config.max_batches_per_generation = 2;
+        let config = test_config();
 
         let first_cycle = run_cache_retention_cycle(&ctx(&pool), &config)
             .await
             .expect("first cache retention cycle");
         assert_eq!(
-            first_cycle.entries_deleted, 2,
-            "must not delete more than batch_size * max_batches in one cycle"
+            first_cycle.entries_deleted, 5,
+            "one partition drop reclaims the entire selected generation"
         );
         assert_eq!(
-            first_cycle.generations_deleted, 0,
-            "generation still has entries left"
+            first_cycle.generations_deleted, 1,
+            "generation metadata is removed in the drop transaction"
         );
 
         let second_cycle = run_cache_retention_cycle(&ctx(&pool), &config)
             .await
             .expect("second cache retention cycle");
-        assert_eq!(second_cycle.entries_deleted, 2);
+        assert_eq!(second_cycle.entries_deleted, 0);
         assert_eq!(second_cycle.generations_deleted, 0);
+        assert_eq!(second_cycle.bytes_reclaimed, 0);
+        assert!(first_cycle.bytes_reclaimed > 0);
 
         let third_cycle = run_cache_retention_cycle(&ctx(&pool), &config)
             .await
             .expect("third cache retention cycle");
-        assert_eq!(third_cycle.entries_deleted, 1);
+        assert_eq!(third_cycle.entries_deleted, 0);
         assert_eq!(
-            third_cycle.generations_deleted, 1,
-            "generation is deleted once fully drained"
+            third_cycle.generations_deleted, 0,
+            "a completed cleanup is an idempotent no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_oldest_generation_does_not_starve_later_cycles() {
+        let pool = test_pool().await;
+        let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
+        let first = create_generation(&pool, namespace.id).await;
+        CacheGenerationRepository::fail(&pool, first.id, "fixture")
+            .await
+            .unwrap();
+        let second = create_generation(&pool, namespace.id).await;
+        CacheGenerationRepository::fail(&pool, second.id, "fixture")
+            .await
+            .unwrap();
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM cache_generation WHERE id=$1 FOR UPDATE")
+            .bind(first.id)
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let state = Arc::new(CacheRetentionState::default());
+        let context = ctx_with_state(&pool, state);
+        let mut config = test_config();
+        config.max_generations_per_cycle = 1;
+        config.ddl_lock_timeout_milliseconds = 50;
+        config.freshness_alerts_enabled = false;
+        let blocked = run_cache_retention_cycle(&context, &config).await.unwrap();
+        assert_eq!(blocked.lock_deferrals, 1);
+        assert_eq!(blocked.generations_deleted, 0);
+        let next = run_cache_retention_cycle(&context, &config).await.unwrap();
+        assert_eq!(next.generations_deleted, 1);
+        assert!(CacheGenerationRepository::find_by_id(&pool, second.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(CacheGenerationRepository::find_by_id(&pool, first.id)
+            .await
+            .unwrap()
+            .is_some());
+        held.rollback().await.unwrap();
+        let wrapped = run_cache_retention_cycle(&context, &config).await.unwrap();
+        assert_eq!(wrapped.generations_deleted, 1);
+        pool.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_admission_wait_uses_remaining_cycle_and_preserves_rotation() {
+        let pool = test_pool().await;
+        let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
+        let first = create_generation(&pool, namespace.id).await;
+        let second = create_generation(&pool, namespace.id).await;
+        for generation in [first.id, second.id] {
+            CacheGenerationRepository::fail(&pool, generation, "owned fixture")
+                .await
+                .unwrap();
+        }
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(7821101,0)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let state = Arc::new(CacheRetentionState::default());
+        let context = ctx_with_state(&pool, state.clone());
+        let mut config = test_config();
+        config.max_cleanup_cycle_milliseconds = 300;
+        let mut summary = CacheRetentionCycleSummary::default();
+        let started = Instant::now();
+        drain_cleanup_candidates(&context, &config, &mut summary)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let cursor = *state.cleanup_after_id.lock().await;
+        holder.rollback().await.unwrap();
+        let mut next = CacheRetentionCycleSummary::default();
+        config.max_cleanup_cycle_milliseconds = 2_000;
+        drain_cleanup_candidates(&context, &config, &mut next)
+            .await
+            .unwrap();
+        pool.cleanup().await.unwrap();
+        assert!(elapsed < std::time::Duration::from_secs(1));
+        assert!(summary.cleanup_budget_exhausted);
+        assert_eq!(summary.generations_deleted, 0);
+        assert_eq!(summary.entries_deleted, 0);
+        assert_eq!(summary.bytes_reclaimed, 0);
+        assert_eq!(summary.deadline_deferrals, 1);
+        assert_eq!(summary.lock_deferrals, 0);
+        assert_eq!(cursor, Some(first.id));
+        assert_eq!(next.generations_deleted, 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_later_deferral_keeps_confirmed_reclamation_counts() {
+        let pool = test_pool().await;
+        let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
+        let first = create_generation(&pool, namespace.id).await;
+        seed_entries(&pool, first.id, &["owned-first"]).await;
+        let second = create_generation(&pool, namespace.id).await;
+        seed_entries(&pool, second.id, &["owned-second"]).await;
+        for generation in [first.id, second.id] {
+            CacheGenerationRepository::fail(&pool, generation, "owned fixture")
+                .await
+                .unwrap();
+        }
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM cache_generation WHERE id=$1 FOR UPDATE")
+            .bind(second.id)
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let mut config = test_config();
+        config.max_cleanup_cycle_milliseconds = 500;
+        let mut summary = CacheRetentionCycleSummary::default();
+        drain_cleanup_candidates(&ctx(&pool), &config, &mut summary)
+            .await
+            .unwrap();
+        let first_remaining = CacheGenerationRepository::find_by_id(&pool, first.id)
+            .await
+            .unwrap();
+        let second_remaining = CacheGenerationRepository::find_by_id(&pool, second.id)
+            .await
+            .unwrap();
+        held.rollback().await.unwrap();
+        pool.cleanup().await.unwrap();
+        assert_eq!(summary.generations_deleted, 1);
+        assert_eq!(summary.entries_deleted, 1);
+        assert!(summary.bytes_reclaimed > 0);
+        assert_eq!(summary.lock_deferrals + summary.deadline_deferrals, 1);
+        assert!(first_remaining.is_none());
+        assert!(second_remaining.is_some());
     }
 
     #[tokio::test]
@@ -1652,6 +1890,100 @@ mod tests {
                 .expect("list cleaned generations")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn namespace_delete_failure_preserves_committed_partition_progress() {
+        let pool = test_pool().await;
+        let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
+        let generation = create_generation(&pool, namespace.id).await;
+        seed_entry(&pool, generation.id, "owned-entry").await;
+        CacheNamespaceRepository::tombstone_with_reason(&pool, namespace.id, "owned test cleanup")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION test_reject_namespace_delete() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+               BEGIN RAISE EXCEPTION 'owned namespace delete failure'; END $$;
+             CREATE TRIGGER test_reject_namespace_delete BEFORE DELETE ON cache_namespace
+               FOR EACH ROW EXECUTE FUNCTION test_reject_namespace_delete();",
+        )
+        .execute(&*pool)
+        .await
+        .unwrap();
+        let summary = run_cache_retention_cycle(&ctx(&pool), &test_config())
+            .await
+            .unwrap();
+        assert_eq!(summary.generations_deleted, 1);
+        assert_eq!(summary.entries_deleted, 1);
+        assert!(summary.bytes_reclaimed > 0);
+        assert_eq!(summary.maintenance_failures, 1);
+        assert!(summary.had_effect());
+        assert!(CacheGenerationRepository::find_by_id(&*pool, generation.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(CacheNamespaceRepository::find_by_id(&*pool, namespace.id)
+            .await
+            .unwrap()
+            .is_some());
+        sqlx::query("DROP TRIGGER test_reject_namespace_delete ON cache_namespace")
+            .execute(&*pool)
+            .await
+            .unwrap();
+        let next = run_cache_retention_cycle(&ctx(&pool), &test_config())
+            .await
+            .unwrap();
+        assert_eq!(next.generations_deleted, 0);
+        assert_eq!(next.namespaces_deleted, 1);
+        assert_eq!(next.maintenance_failures, 0);
+        pool.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn statistics_failure_preserves_cleanup_and_pending_work() {
+        let pool = test_pool().await;
+        let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
+        let generation = create_generation(&pool, namespace.id).await;
+        seed_entry(&pool, generation.id, "owned-entry").await;
+        CacheGenerationRepository::fail(&pool, generation.id, "owned test cleanup")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION test_reject_statistics_ack() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+               BEGIN
+                 IF NEW.completed_revision IS DISTINCT FROM OLD.completed_revision THEN
+                   RAISE EXCEPTION 'owned statistics acknowledgement failure';
+                 END IF;
+                 RETURN NEW;
+               END $$;
+             CREATE TRIGGER test_reject_statistics_ack BEFORE UPDATE ON cache_entry_statistics_state
+               FOR EACH ROW EXECUTE FUNCTION test_reject_statistics_ack();",
+        )
+        .execute(&*pool)
+        .await
+        .unwrap();
+        let summary = run_cache_retention_cycle(&ctx(&pool), &test_config())
+            .await
+            .unwrap();
+        assert_eq!(summary.generations_deleted, 1);
+        assert_eq!(summary.entries_deleted, 1);
+        assert_eq!(summary.statistics_failures, 1);
+        assert_eq!(summary.maintenance_failures, 0);
+        assert!(summary.statistics_pending);
+        assert_eq!(summary.registered_partitions, 0);
+        assert_eq!(summary.partitions_created_total, 1);
+        assert_eq!(summary.partitions_dropped_total, 1);
+        sqlx::query("DROP TRIGGER test_reject_statistics_ack ON cache_entry_statistics_state")
+            .execute(&*pool)
+            .await
+            .unwrap();
+        let next = run_cache_retention_cycle(&ctx(&pool), &test_config())
+            .await
+            .unwrap();
+        assert!(next.statistics_refreshed);
+        assert!(!next.statistics_pending);
+        assert_eq!(next.statistics_failures, 0);
+        pool.cleanup().await.unwrap();
     }
 
     #[tokio::test]

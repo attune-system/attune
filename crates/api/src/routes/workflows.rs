@@ -18,7 +18,7 @@ use attune_common::repositories::{
         CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput, WorkflowDefinitionRepository,
         WorkflowSearchFilters,
     },
-    Create, Delete, FindByRef, Patch, Update,
+    Create, FindByRef, Patch, Update,
 };
 use attune_common::{
     action_visibility::{collect_workflow_action_refs, ensure_action_reference_allowed},

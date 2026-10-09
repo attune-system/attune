@@ -22,6 +22,7 @@ Welcome to the Attune project documentation! This directory contains comprehensi
 - **[Authentication](authentication/authentication.md)** - Auth mechanisms and security
 
 ### Operations
+- [PostgreSQL-only deployment](deployment/postgresql-only.md) describes fresh installation, database volume selection, and separate existing-data conversion or reset decisions.
 - **[Production Deployment](deployment/production-deployment.md)** - Deploy to production
 - **[Supervisor Service](deployment/supervisor.md)** - Runtime retention, maintenance jobs, corrective actions, and supervisor configuration
 - **[Operational Visibility](deployment/operational-visibility.md)** - Worker cordon, health, alerts, execution reconciliation, and sensor logs

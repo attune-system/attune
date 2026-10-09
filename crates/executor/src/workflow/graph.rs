@@ -172,11 +172,11 @@ pub enum BackoffStrategy {
 /// Classify a `when` expression for quick matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionKind {
-    /// Matches `succeeded()` expressions
+    /// Matches standalone `succeeded()` expressions
     Succeeded,
-    /// Matches `failed()` expressions
+    /// Matches standalone `failed()` expressions
     Failed,
-    /// Matches `timed_out()` expressions
+    /// Matches standalone `timed_out()` expressions
     TimedOut,
     /// No condition — fires on any completion
     Always,
@@ -191,14 +191,11 @@ impl GraphTransition {
             None => TransitionKind::Always,
             Some(expr) => {
                 let normalized = expr.to_lowercase().replace(|c: char| c.is_whitespace(), "");
-                if normalized.contains("succeeded()") {
-                    TransitionKind::Succeeded
-                } else if normalized.contains("failed()") {
-                    TransitionKind::Failed
-                } else if normalized.contains("timed_out()") {
-                    TransitionKind::TimedOut
-                } else {
-                    TransitionKind::Custom
+                match normalized.as_str() {
+                    "succeeded()" | "{{succeeded()}}" => TransitionKind::Succeeded,
+                    "failed()" | "{{failed()}}" => TransitionKind::Failed,
+                    "timed_out()" | "{{timed_out()}}" => TransitionKind::TimedOut,
+                    _ => TransitionKind::Custom,
                 }
             }
         }
@@ -961,6 +958,56 @@ tasks:
             do_tasks: vec!["t".to_string()],
         };
         assert_eq!(custom.kind(), TransitionKind::Custom);
+    }
+
+    #[test]
+    fn test_transition_kind_compound_status_predicates_are_custom() {
+        for expression in [
+            "{{ succeeded() and inquiry.guarded_task.response.approved == true }}",
+            "{{ succeeded() and inquiry.guarded_task.response.approved == false }}",
+            "succeeded() and parameters.approved",
+            "succeeded() or failed()",
+            "not succeeded()",
+            "succeeded() == false",
+            "{{ failed() and result().retryable }}",
+            "not failed()",
+            "{{ timed_out() and workflow.attempts < 3 }}",
+            "not timed_out()",
+            "{{ parameters.message == 'succeeded()' }}",
+            "{{ parameters.message == 'failed()' }}",
+            "{{ parameters.message == 'timed_out()' }}",
+        ] {
+            let transition = GraphTransition {
+                when: Some(expression.to_string()),
+                publish: vec![],
+                do_tasks: vec![],
+            };
+            assert_eq!(transition.kind(), TransitionKind::Custom, "{expression}");
+        }
+    }
+
+    #[test]
+    fn test_transition_kind_standalone_status_forms() {
+        for (predicate, expected) in [
+            ("succeeded", TransitionKind::Succeeded),
+            ("failed", TransitionKind::Failed),
+            ("timed_out", TransitionKind::TimedOut),
+        ] {
+            for expression in [
+                format!("{predicate}()"),
+                format!("  {predicate} ( ) \n"),
+                format!("{{{{{predicate}()}}}}"),
+                format!("\t{{{{ \n {predicate} (\t) \n }}}} \t"),
+                format!("{{{{ {}() }}}}", predicate.to_uppercase()),
+            ] {
+                let transition = GraphTransition {
+                    when: Some(expression.clone()),
+                    publish: vec![],
+                    do_tasks: vec![],
+                };
+                assert_eq!(transition.kind(), expected, "{expression}");
+            }
+        }
     }
 
     #[test]

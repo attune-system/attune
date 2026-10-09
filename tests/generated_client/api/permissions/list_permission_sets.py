@@ -12,6 +12,7 @@ from ...types import UNSET, Response, Unset
 def _get_kwargs(
     *,
     pack_ref: None | str | Unset = UNSET,
+    include_retired: bool | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
@@ -22,6 +23,8 @@ def _get_kwargs(
     else:
         json_pack_ref = pack_ref
     params["pack_ref"] = json_pack_ref
+
+    params["include_retired"] = include_retired
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -68,10 +71,12 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     pack_ref: None | str | Unset = UNSET,
+    include_retired: bool | Unset = UNSET,
 ) -> Response[list[PermissionSetSummary]]:
     """
     Args:
         pack_ref (None | str | Unset):
+        include_retired (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -83,6 +88,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         pack_ref=pack_ref,
+        include_retired=include_retired,
     )
 
     response = client.get_httpx_client().request(
@@ -96,10 +102,12 @@ def sync(
     *,
     client: AuthenticatedClient,
     pack_ref: None | str | Unset = UNSET,
+    include_retired: bool | Unset = UNSET,
 ) -> list[PermissionSetSummary] | None:
     """
     Args:
         pack_ref (None | str | Unset):
+        include_retired (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -112,6 +120,7 @@ def sync(
     return sync_detailed(
         client=client,
         pack_ref=pack_ref,
+        include_retired=include_retired,
     ).parsed
 
 
@@ -119,10 +128,12 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     pack_ref: None | str | Unset = UNSET,
+    include_retired: bool | Unset = UNSET,
 ) -> Response[list[PermissionSetSummary]]:
     """
     Args:
         pack_ref (None | str | Unset):
+        include_retired (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -134,6 +145,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         pack_ref=pack_ref,
+        include_retired=include_retired,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -145,10 +157,12 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     pack_ref: None | str | Unset = UNSET,
+    include_retired: bool | Unset = UNSET,
 ) -> list[PermissionSetSummary] | None:
     """
     Args:
         pack_ref (None | str | Unset):
+        include_retired (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -162,5 +176,6 @@ async def asyncio(
         await asyncio_detailed(
             client=client,
             pack_ref=pack_ref,
+            include_retired=include_retired,
         )
     ).parsed

@@ -524,7 +524,7 @@ async fn test_permission_set_cascade_from_pack() {
     let (pack_id, permset) = fixture.create_with_pack().await;
 
     // Delete pack - permission set should be cascade deleted
-    let deleted = PackRepository::delete(&pool, pack_id)
+    let deleted = PackRepository::delete(&*pool, pack_id)
         .await
         .expect("Failed to delete pack");
     assert!(deleted);

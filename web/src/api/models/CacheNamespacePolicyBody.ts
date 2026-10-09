@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { CacheRefreshConcurrency } from "./CacheRefreshConcurrency";
 /**
  * Namespace-level publication policy overrides. Unspecified fields keep their
  * existing (or default) values.
@@ -17,4 +18,5 @@ export type CacheNamespacePolicyBody = {
    */
   max_retained_generations?: number | null;
   max_staging_generations?: number | null;
+  refresh_concurrency?: null | CacheRefreshConcurrency;
 };

@@ -23,6 +23,7 @@ pub mod delegation;
 pub mod device_auth;
 pub mod error;
 pub mod execution_env;
+mod http_client;
 pub mod inquiry_callback_adapter;
 pub mod inquiry_options;
 pub mod inquiry_response_handle;

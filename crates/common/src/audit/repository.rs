@@ -103,8 +103,7 @@ impl AuditRepository {
         Ok(())
     }
 
-    /// Look up a single audit event by its ID. Composite-PK hypertables can
-    /// be queried by `id` alone; the planner will scan all chunks (rare path).
+    /// Look up a single audit event by its primary-key ID.
     pub async fn find_by_id<'e, E>(executor: E, id: Id) -> Result<Option<AuditEvent>>
     where
         E: Executor<'e, Database = Postgres> + 'e,

@@ -349,7 +349,7 @@ async fn maintenance_reconciliation_preserves_builtin_ids_assignments_and_extern
             release_id: Some(release.id)
         })
     );
-    assert!(PackRepository::delete(&db, core.id).await.unwrap());
+    assert!(PackRepository::delete(&*db, core.id).await.unwrap());
     assert_eq!(
         PermissionAssignmentRepository::get_by_id(&db, assignment.id)
             .await

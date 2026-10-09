@@ -4,6 +4,7 @@ import { RetentionService, type RetentionConfig } from "@/api/retention";
 export const retentionKeys = {
   all: ["retention-config"] as const,
   detail: () => [...retentionKeys.all, "detail"] as const,
+  nativeStatus: () => [...retentionKeys.all, "native-status"] as const,
 };
 
 export function useRetentionConfig() {
@@ -23,5 +24,14 @@ export function useUpdateRetentionConfig() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: retentionKeys.all });
     },
+  });
+}
+
+export function useNativeMaintenanceStatus() {
+  return useQuery({
+    queryKey: retentionKeys.nativeStatus(),
+    queryFn: () => RetentionService.getNativeMaintenanceStatus(),
+    staleTime: 15000,
+    refetchInterval: 30000,
   });
 }

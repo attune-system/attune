@@ -58,11 +58,11 @@ def test_inquiry_response_releases_guarded_workflow_task(
     assert guarded[0]["status"] == "completed"
     assert _result_data(workflow)["outcome"] == "approved"
     assert _result_data(workflow)["response"] == response
-    assert len(
-        workflow_task_children(
-            client, run.workflow_execution["id"], "approved_handler"
-        )
-    ) == 1
+    approved = workflow_task_children(
+        client, run.workflow_execution["id"], "approved_handler"
+    )
+    assert len(approved) == 1
+    assert approved[0]["status"] == "completed"
     assert workflow_task_children(
         client, run.workflow_execution["id"], "denied_handler"
     ) == []
@@ -95,7 +95,7 @@ def test_inquiry_rejects_invalid_response_before_releasing_task(
         ],
     )
 
-    with pytest.raises(Exception, match="Failed to respond to inquiry: 400"):
+    with pytest.raises(Exception, match="Failed to respond to inquiry: 422"):
         client.respond_to_inquiry(
             run.inquiry["id"], response={"approved": "yes", "priority": "urgent"}
         )
@@ -111,14 +111,21 @@ def test_inquiry_rejects_invalid_response_before_releasing_task(
         client, run.workflow_execution["id"], "completed", timeout=30
     )
 
+    guarded = workflow_task_children(
+        client, run.workflow_execution["id"], "guarded_task"
+    )
+    assert len(guarded) == 1
+    assert guarded[0]["status"] == "completed"
     assert _result_data(workflow)["response"] == response
     assert _result_data(workflow)["outcome"] == "denied"
     assert workflow_task_children(
         client, run.workflow_execution["id"], "approved_handler"
     ) == []
-    assert len(
-        workflow_task_children(client, run.workflow_execution["id"], "denied_handler")
-    ) == 1
+    denied = workflow_task_children(
+        client, run.workflow_execution["id"], "denied_handler"
+    )
+    assert len(denied) == 1
+    assert denied[0]["status"] == "completed"
 
 
 def test_inquiry_list_filters_by_creator_execution(

@@ -76,12 +76,19 @@ pub fn assert_required_source_meta_fields(source: &Value) {
     assert!(meta["authorization_mode"].is_string());
     assert!(meta["freshness_mode"].is_string());
     assert!(meta.get("aggregate_watermark").is_some());
+    assert!(meta.get("read_coverage").is_some());
     assert!(meta["cache_hit"].is_boolean());
     assert!(meta.get("bucket_size").is_some());
     assert!(meta["truncated"].is_boolean());
     assert!(meta["unit_hints"].is_object());
     assert!(meta["ordering"].is_array());
     assert!(meta.get("authorized_refs").is_some());
+}
+
+pub fn assert_raw_source_meta(source: &Value) {
+    assert_required_source_meta_fields(source);
+    assert_eq!(source["meta"]["freshness_mode"], "raw_only");
+    assert_eq!(source["meta"]["aggregate_watermark"], Value::Null);
 }
 
 pub fn source_by_id<'a>(body: &'a Value, source_id: &str) -> &'a Value {

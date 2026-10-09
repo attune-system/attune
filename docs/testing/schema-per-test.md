@@ -2,7 +2,7 @@
 
 **Status:** Implemented with owned, bounded teardown
 
-**Updated:** 2026-09-17
+**Updated:** 2026-10-06
 
 ## Contract
 
@@ -11,7 +11,7 @@ Database-backed Rust tests use `attune_common::test_database::TestDatabase`. The
 1. immutable migration text is loaded and hashed;
 2. one run-owned template database is created for that migration hash;
 3. canonical migrations run once in the template;
-4. the template rejects connections and any Timescale background session is terminated;
+4. the template rejects connections;
 5. every test receives a unique physical clone through `CREATE DATABASE ... TEMPLATE ...`;
 6. the clone gets its own SQLx pool and is force-dropped by its owner.
 
@@ -26,6 +26,9 @@ The run ID must match `^[a-z0-9][a-z0-9-]{0,19}$`. Hyphens are encoded as unders
 
 Database cloning requires the configured PostgreSQL role to have `CREATEDB` (the disposable Docker/CI role is the database owner/superuser). Tests must target an explicitly disposable PostgreSQL cluster.
 
+Stock PostgreSQL 16 or newer is required, with PostgreSQL 18 as the Compose and
+CI default. No TimescaleDB extension or background-worker management is required.
+
 ## Why database clones
 
 The former schema fixture replayed 54 migrations for each of 937 ignored tests. A simple repository assertion spent about 6.7 seconds in setup, and later tests degraded toward 17 seconds each. On the 4-vCPU Rancher validation host:
@@ -35,9 +38,14 @@ The former schema fixture replayed 54 migrations for each of 937 ignored tests. 
 - two warm lifecycle tests completed in 0.72 seconds versus 16.12 seconds with migration-per-test;
 - 626 common-crate tests completed in 341 seconds serially, including 45 seconds of explicit migration-fidelity tests.
 
-Docker Desktop exposed a separate teardown cost: every physical clone starts a TimescaleDB scheduler, and `DROP DATABASE` waits for that scheduler and may force a checkpoint. The fixture now stops the clone's background workers before pool close and drop. On an 8-CPU/16-GiB Docker Desktop allocation, a warm two-test lifecycle sample fell from 14.43 seconds to 1.54 seconds; ten three-test runs completed in 1.79–2.39 seconds with no clone or session leaks.
+These timing samples predate TimescaleDB removal. They are historical baselines,
+not measurements of the PostgreSQL-only schema. Current fixtures do not start
+or stop TimescaleDB background workers.
 
-A database clone is a stronger isolation boundary than a shared database with separate schemas. It preserves extensions, Timescale catalogs, hypertables, triggers, functions, constraints, and committed transaction behavior without truncation or rollback approximations.
+A database clone is a stronger isolation boundary than a shared database with
+separate schemas. It preserves tables, views, indexes, triggers, functions,
+constraints, and committed transaction behavior without truncation or rollback
+approximations.
 
 ## Ownership
 
@@ -62,11 +70,10 @@ API `TestContext` retains the owner and stops router/audit tasks before database
 
 `TestDatabase::cleanup()` is bounded and ordered:
 
-1. stop the clone's TimescaleDB background workers (5-second bound);
-2. close the clone pool (5-second bound);
-3. connect to the cluster administrator database (10-second bound);
-4. force-drop the exact generated clone (120-second bound, including any checkpoint PostgreSQL requires);
-5. aggregate and return cleanup errors.
+1. close the clone pool with a 5-second bound;
+2. connect to the cluster administrator database with a 10-second bound;
+3. force-drop the exact generated clone with a 120-second bound, including any checkpoint PostgreSQL requires;
+4. aggregate and return cleanup errors.
 
 `DROP DATABASE ... WITH (FORCE)` terminates sessions only in the exact owned clone; neighboring databases are untouched. The drop fallback performs the same exact cleanup on a joined helper thread so panic/partial-construction recovery does not detach a writer.
 
@@ -94,7 +101,7 @@ Use unique run IDs for overlapping invocations. Database names, Compose projects
 - Never hardcode schema prefixes in repository SQL.
 - Never use `SELECT *` for evolving SQLx `FromRow` models.
 - Schema changes still require `cargo sqlx prepare`.
-- `event`, `enforcement`, and `execution` remain Timescale hypertables and cannot be foreign-key targets.
+- Runtime, history, and audit tables are ordinary PostgreSQL tables. Preserve intentionally dangling IDs so related records can have independent retention periods.
 
 ## Owner-scoped janitor
 
@@ -108,6 +115,8 @@ DATABASE_URL=postgresql://attune:attune@localhost:5432/attune_test \
 
 Despite its historical filename, the utility now removes exact run-owned clones, the run template, and legacy schema fixtures. It refuses broad prefixes, invalid IDs, PostgreSQL errors, and no-progress cleanup.
 
-CI records baseline counts for clones, templates, legacy schemas, and Timescale jobs. Per-test clone/schema/job leftovers fail the gate even when janitor recovery succeeds. A single run template is expected and removed after clone leak detection.
+CI records baseline counts for clones, templates, legacy schemas, and sessions.
+Per-test database or schema leftovers fail the gate even when janitor recovery
+succeeds. A single run template is expected and removed after clone leak detection.
 
 See [Running tests](running-tests.md) for runner commands and validated timings.

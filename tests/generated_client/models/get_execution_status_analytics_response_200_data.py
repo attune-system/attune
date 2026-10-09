@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ..models.analytics_read_metadata import AnalyticsReadMetadata
     from ..models.time_series_point import TimeSeriesPoint
 
 
@@ -21,11 +22,14 @@ class GetExecutionStatusAnalyticsResponse200Data:
 
     Attributes:
         data (list[TimeSeriesPoint]): Data points: one per (bucket, status) pair
+        read_coverage (AnalyticsReadMetadata): Coverage describes only this read's source-time bounds, including ledger
+            holes.
         since (datetime.datetime): Time range start
         until (datetime.datetime): Time range end
     """
 
     data: list[TimeSeriesPoint]
+    read_coverage: AnalyticsReadMetadata
     since: datetime.datetime
     until: datetime.datetime
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -36,6 +40,8 @@ class GetExecutionStatusAnalyticsResponse200Data:
             data_item = data_item_data.to_dict()
             data.append(data_item)
 
+        read_coverage = self.read_coverage.to_dict()
+
         since = self.since.isoformat()
 
         until = self.until.isoformat()
@@ -45,6 +51,7 @@ class GetExecutionStatusAnalyticsResponse200Data:
         field_dict.update(
             {
                 "data": data,
+                "read_coverage": read_coverage,
                 "since": since,
                 "until": until,
             }
@@ -54,6 +61,9 @@ class GetExecutionStatusAnalyticsResponse200Data:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.analytics_read_metadata import (
+            AnalyticsReadMetadata,
+        )
         from ..models.time_series_point import TimeSeriesPoint
 
         d = dict(src_dict)
@@ -64,12 +74,15 @@ class GetExecutionStatusAnalyticsResponse200Data:
 
             data.append(data_item)
 
+        read_coverage = AnalyticsReadMetadata.from_dict(d.pop("read_coverage"))
+
         since = datetime.datetime.fromisoformat(d.pop("since"))
 
         until = datetime.datetime.fromisoformat(d.pop("until"))
 
         get_execution_status_analytics_response_200_data = cls(
             data=data,
+            read_coverage=read_coverage,
             since=since,
             until=until,
         )

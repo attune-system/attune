@@ -1,5 +1,5 @@
 //! Background batch-writer task that drains the audit channel and inserts
-//! events into the `audit_event` hypertable.
+//! events into the ordinary PostgreSQL `audit_event` table.
 
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::time::Duration;

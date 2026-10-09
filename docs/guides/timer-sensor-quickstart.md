@@ -10,7 +10,7 @@ This guide will help you get the timer sensor up and running for development and
 ## Prerequisites
 
 - Rust 1.70+ installed
-- PostgreSQL 14+ running
+- Stock PostgreSQL 16+ running, no TimescaleDB extension required
 - Notifier service running (websocket endpoint)
 - Attune API service running
 

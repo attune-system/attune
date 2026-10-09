@@ -51,7 +51,7 @@ CREATE INDEX idx_inquiry_workflow_task
     ON inquiry(workflow_execution, workflow_task_name)
     WHERE workflow_execution IS NOT NULL;
 
-COMMENT ON COLUMN inquiry.created_by_execution IS 'Execution that created this inquiry; plain BIGINT because execution is a hypertable';
+COMMENT ON COLUMN inquiry.created_by_execution IS 'Execution that created this inquiry; plain BIGINT for independent retention';
 COMMENT ON COLUMN inquiry.workflow_execution IS 'Workflow scope derived from the creator execution';
 COMMENT ON COLUMN inquiry.workflow_task_name IS 'Creator workflow task name derived from the creator execution';
 COMMENT ON COLUMN inquiry.action_attempt_family IS 'Stable original execution ID used for idempotency across action retries';
@@ -118,7 +118,7 @@ CREATE TRIGGER update_workflow_task_wait_updated
 
 COMMENT ON TABLE workflow_task_wait IS 'Durable prerequisites resolved before workflow child execution creation';
 COMMENT ON COLUMN workflow_task_wait.inquiry IS 'Inquiry whose terminal state controls release of the guarded task';
-COMMENT ON COLUMN workflow_task_wait.target_execution IS 'Execution whose terminal state controls release of the guarded task; plain BIGINT because execution is a hypertable';
+COMMENT ON COLUMN workflow_task_wait.target_execution IS 'Execution whose terminal state controls release of the guarded task; plain BIGINT for independent retention';
 COMMENT ON COLUMN workflow_task_wait.work_queue_item IS 'Work queue item whose terminal state controls release of the guarded task; plain BIGINT to avoid retention-blocking ownership';
 COMMENT ON COLUMN workflow_task_wait.active_work_queue_item IS 'Foreign-key guard that prevents deletion only while a queue-item wait is active';
 COMMENT ON COLUMN workflow_task_wait.result IS 'Safe logical outcome used when no guarded child execution is created';

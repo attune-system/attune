@@ -31,7 +31,7 @@ use attune_common::{
     },
     repositories::{
         action::ActionRepository,
-        analytics::AnalyticsTimeRange,
+        analytics::{AnalyticsTimeRange, DashboardBucketKind},
         rule::RuleRepository,
         runtime::WorkerRepository,
         sensor_process::SensorProcessRepository,
@@ -47,10 +47,6 @@ use tokio::time::timeout;
 use tracing::{debug, info};
 
 use crate::dashboard_data::contracts::{default_source_contracts, SourceContract, SourceType};
-use crate::dashboard_data::watermark::{
-    merge_bucket_rows_deterministic, BucketCountRow, TimeRange, WatermarkCutoverPlan,
-};
-use crate::dashboard_data::FreshnessMode;
 use crate::{
     auth::middleware::{AuthenticatedUser, RequireAuth},
     authz::{AuthorizationCheck, AuthorizationService},
@@ -363,7 +359,6 @@ const MAX_CARDS_PER_DASHBOARD: usize = 40;
 const MAX_SOURCE_DEFINITIONS_PER_DASHBOARD: usize = 60;
 const MAX_SOURCES_PER_REQUEST: usize = 30;
 const MAX_HIGH_COST_SOURCE_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
-const MAX_RAW_FALLBACK_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SOURCE_ROW_CAP: usize = 2_000;
 const SMALL_COHORT_MIN_COUNT: i64 = 2;
 const SOURCE_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
@@ -376,22 +371,17 @@ const SOURCE_INFLIGHT_WAIT_CAP: StdDuration = StdDuration::from_secs(6);
 /// and execution_status_breakdown default semantics.
 const TERMINAL_EXECUTION_STATUSES: [&str; 5] =
     ["completed", "failed", "timeout", "cancelled", "abandoned"];
-const TERMINAL_QUEUE_ITEM_STATUSES: [&str; 4] = ["completed", "failed", "skipped", "cancelled"];
-const TERMINAL_QUEUE_DISPATCH_FALLBACK_STATUSES: [&str; 4] =
-    ["completed", "failed", "released", "cancelled"];
 const DEFAULT_INQUIRY_SLA_TARGET_SECONDS: i64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceCostClass {
     HighCostRaw,
-    RawFallbackBounded,
 }
 
 impl SourceCostClass {
     fn as_str(self) -> &'static str {
         match self {
             Self::HighCostRaw => "high_cost_raw",
-            Self::RawFallbackBounded => "raw_fallback_bounded",
         }
     }
 }
@@ -447,30 +437,6 @@ struct QueueBacklogSourceRow {
     total_backlog: i64,
 }
 
-/// Canonical row contract for queue_throughput.
-#[derive(Debug, Clone, serde::Serialize)]
-struct QueueThroughputSourceRow {
-    bucket_start: DateTime<Utc>,
-    queue_ref: String,
-    completed: i64,
-    failed: i64,
-    skipped: i64,
-    cancelled: i64,
-    total_processed: i64,
-}
-
-/// Canonical row contract for queue_dispatch_stats.
-#[derive(Debug, Clone, serde::Serialize)]
-struct QueueDispatchStatsSourceRow {
-    bucket_start: DateTime<Utc>,
-    queue_ref: String,
-    status: String,
-    dispatch_count: i64,
-    leased_item_count: i64,
-    avg_duration_seconds: f64,
-    max_duration_seconds: f64,
-}
-
 /// Canonical payload contract for key_value.
 #[derive(Debug, Clone, serde::Serialize)]
 struct KeyValueSourceData {
@@ -516,76 +482,6 @@ struct LastExecutionSourceRow {
     updated_at: DateTime<Utc>,
     trace_tag: Option<String>,
     result: Option<JsonValue>,
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct LatestExecutionQueryRow {
-    action_ref: String,
-    execution_id: i64,
-    status: ExecutionStatus,
-    created_at: DateTime<Utc>,
-    started_at: Option<DateTime<Utc>>,
-    updated_at: DateTime<Utc>,
-    trace_tag: Option<String>,
-    result: Option<JsonValue>,
-}
-
-/// Canonical row contract for inquiry_backlog.
-#[derive(Debug, Clone, serde::Serialize)]
-struct InquiryBacklogSourceRow {
-    pack_ref: Option<String>,
-    assigned_to: Option<i64>,
-    pending_count: i64,
-    overdue_count: i64,
-}
-
-/// Canonical row contract for inquiry_sla.
-#[derive(Debug, Clone, serde::Serialize)]
-struct InquirySlaSourceRow {
-    bucket_start: DateTime<Utc>,
-    pack_ref: Option<String>,
-    assigned_to: Option<i64>,
-    sla_target_seconds: i64,
-    total_inquiries: i64,
-    within_sla_count: i64,
-    breached_count: i64,
-    open_count: i64,
-    compliance_rate: f64,
-}
-
-/// Canonical row contract for execution_duration_stats.
-#[derive(Debug, Clone, serde::Serialize)]
-struct ExecutionDurationStatsSourceRow {
-    bucket_start: DateTime<Utc>,
-    series: String,
-    execution_count: i64,
-    avg_duration_seconds: f64,
-    p50_duration_seconds: f64,
-    p95_duration_seconds: f64,
-    max_duration_seconds: f64,
-}
-
-/// Canonical row contract for last_event.
-#[derive(Debug, Clone, serde::Serialize)]
-struct LastEventSourceRow {
-    trigger_ref: String,
-    event_id: i64,
-    created: DateTime<Utc>,
-    source_ref: Option<String>,
-    rule_ref: Option<String>,
-    trace_tag: Option<String>,
-}
-
-/// Canonical row contract for last_enforcement.
-#[derive(Debug, Clone, serde::Serialize)]
-struct LastEnforcementSourceRow {
-    rule_ref: String,
-    enforcement_id: i64,
-    trigger_ref: String,
-    status: String,
-    created: DateTime<Utc>,
-    resolved_at: Option<DateTime<Utc>>,
-    event_id: Option<i64>,
 }
 
 /// Canonical row contract for sensor_health.
@@ -1336,6 +1232,7 @@ fn default_source_meta() -> DashboardSourceMeta {
         authorization_mode: DashboardAuthorizationMode::OperatorGlobal,
         freshness_mode: DashboardFreshnessMode::RawOnly,
         aggregate_watermark: None,
+        read_coverage: None,
         cache_hit: false,
         bucket_size: None,
         truncated: false,
@@ -1347,6 +1244,35 @@ fn default_source_meta() -> DashboardSourceMeta {
 
 fn serialized_row<T: serde::Serialize>(row: T) -> JsonValue {
     serde_json::to_value(row).unwrap_or(JsonValue::Null)
+}
+
+fn apply_read_coverage(
+    meta: &mut DashboardSourceMeta,
+    coverage: attune_common::repositories::native_maintenance::read::ReadMetadata,
+) {
+    meta.freshness_mode = coverage.mode.into();
+    // Only a continuous covered prefix gets a watermark. Later covered islands
+    // remain explicit ranges and cannot conceal earlier uncovered/dirty hours.
+    meta.aggregate_watermark = coverage.summary_ranges.first().and_then(|first| {
+        if coverage
+            .raw_ranges
+            .first()
+            .is_some_and(|raw| raw.start < first.start)
+        {
+            None
+        } else {
+            Some(first.end)
+        }
+    });
+    meta.read_coverage = Some(coverage.into());
+}
+
+fn mark_cached_fallback(stale: &mut DashboardSourceResult, include_meta: bool) {
+    stale.status = DashboardSourceStatus::Stale;
+    stale.meta.cache_hit = include_meta;
+    stale.meta.freshness_mode = DashboardFreshnessMode::CacheRawFallback;
+    stale.meta.read_coverage = None;
+    stale.meta.aggregate_watermark = None;
 }
 
 fn json_object<const N: usize>(entries: [(&str, &str); N]) -> JsonValue {
@@ -1485,10 +1411,14 @@ async fn execute_source_data(
                         executed
                     }
                     Ok(Err(error)) => {
-                        if let Some(mut stale) = source_cache().get_stale(&cache_key).await {
-                            stale.status = DashboardSourceStatus::Stale;
-                            stale.meta.cache_hit = include_meta;
-                            stale.meta.freshness_mode = DashboardFreshnessMode::RawOnlyFallback;
+                        let retryable = stale_cache_error_retryable(&error);
+                        let stale = if retryable {
+                            source_cache().get_stale(&cache_key).await
+                        } else {
+                            None
+                        };
+                        if let Some(mut stale) = stale {
+                            mark_cached_fallback(&mut stale, include_meta);
                             stale.error = Some(DashboardSourceError {
                                 code: "fallback_cache".to_string(),
                                 message: format!("Source failed; returning stale cache: {}", error),
@@ -1506,7 +1436,7 @@ async fn execute_source_data(
                                 error: Some(DashboardSourceError {
                                     code: "source_error".to_string(),
                                     message: error.to_string(),
-                                    retryable: true,
+                                    retryable,
                                     details: None,
                                 }),
                             }
@@ -1514,9 +1444,7 @@ async fn execute_source_data(
                     }
                     Err(_) => {
                         if let Some(mut stale) = source_cache().get_stale(&cache_key).await {
-                            stale.status = DashboardSourceStatus::Stale;
-                            stale.meta.cache_hit = include_meta;
-                            stale.meta.freshness_mode = DashboardFreshnessMode::RawOnlyFallback;
+                            mark_cached_fallback(&mut stale, include_meta);
                             stale.error = Some(DashboardSourceError {
                                 code: "timeout_fallback".to_string(),
                                 message: "Source timed out; returning stale cache".to_string(),
@@ -1577,6 +1505,16 @@ async fn execute_source_data(
 fn should_coalesce_failure(result: &DashboardSourceResult) -> bool {
     matches!(result.status, DashboardSourceStatus::Error)
         && result.error.as_ref().is_some_and(|error| error.retryable)
+}
+
+fn stale_cache_error_retryable(error: &ApiError) -> bool {
+    // A generic database/internal error can be a broken query or a decoding
+    // bug. Preserve that error instead of hiding it behind stale data. Actual
+    // elapsed deadlines use the separate timeout_fallback branch above.
+    matches!(
+        error,
+        ApiError::RetryableDatabaseError | ApiError::BadGateway(_)
+    )
 }
 
 fn resolve_inflight_wait_budget(request_deadline: tokio::time::Instant) -> Option<StdDuration> {
@@ -1737,527 +1675,6 @@ fn emit_source_telemetry(
         error_code = result.error.as_ref().map(|err| err.code.as_str()).unwrap_or("none"),
         "dashboard source execution completed"
     );
-}
-
-#[derive(Debug, Clone, Copy)]
-enum BucketedCutoverKind {
-    ExecutionThroughput,
-    ExecutionStatus,
-    EventVolume,
-}
-
-#[derive(Debug, Clone)]
-struct BucketedSourceExecution {
-    data: Vec<BucketCountRow>,
-    freshness_mode: DashboardFreshnessMode,
-    aggregate_watermark: Option<DateTime<Utc>>,
-}
-
-async fn execute_execution_throughput_with_cutover(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    action_refs: Option<&BTreeSet<String>>,
-) -> Result<BucketedSourceExecution, ApiError> {
-    execute_bucketed_source_with_cutover(
-        state,
-        effective_time_range,
-        BucketedCutoverKind::ExecutionThroughput,
-        action_refs,
-    )
-    .await
-}
-
-async fn execute_execution_status_with_cutover(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    action_refs: Option<&BTreeSet<String>>,
-) -> Result<BucketedSourceExecution, ApiError> {
-    execute_bucketed_source_with_cutover(
-        state,
-        effective_time_range,
-        BucketedCutoverKind::ExecutionStatus,
-        action_refs,
-    )
-    .await
-}
-
-async fn execute_event_volume_with_cutover(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    trigger_refs: Option<&BTreeSet<String>>,
-) -> Result<BucketedSourceExecution, ApiError> {
-    execute_bucketed_source_with_cutover(
-        state,
-        effective_time_range,
-        BucketedCutoverKind::EventVolume,
-        trigger_refs,
-    )
-    .await
-}
-
-async fn execute_bucketed_source_with_cutover(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    kind: BucketedCutoverKind,
-    primary_refs: Option<&BTreeSet<String>>,
-) -> Result<BucketedSourceExecution, ApiError> {
-    let request_range = TimeRange::new(effective_time_range.start, effective_time_range.end)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let aggregate_watermark =
-        fetch_aggregate_watermark(state, kind.aggregate_watermark_view_name()).await;
-    let plan = WatermarkCutoverPlan::build(request_range, aggregate_watermark)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-
-    let aggregate_rows = if let Some(range) = plan.aggregate_range {
-        query_aggregate_bucket_rows(state, kind, range, primary_refs).await?
-    } else {
-        Vec::new()
-    };
-    let raw_rows = if let Some(range) = plan.raw_range {
-        query_raw_bucket_rows(state, kind, range, primary_refs).await?
-    } else {
-        Vec::new()
-    };
-    let merged = merge_bucket_rows_deterministic(&plan, &aggregate_rows, &raw_rows);
-
-    Ok(BucketedSourceExecution {
-        data: merged,
-        freshness_mode: map_freshness_mode(plan.freshness_mode),
-        aggregate_watermark: plan.aggregate_watermark,
-    })
-}
-
-impl BucketedCutoverKind {
-    #[cfg(test)]
-    fn for_source_type(source_type: &str) -> Option<Self> {
-        match source_type {
-            "execution_count" | "execution_timeseries" => Some(Self::ExecutionThroughput),
-            "execution_status_breakdown" => Some(Self::ExecutionStatus),
-            "event_count" | "event_timeseries" => Some(Self::EventVolume),
-            _ => None,
-        }
-    }
-
-    fn aggregate_query_view_name(self) -> &'static str {
-        match self {
-            Self::ExecutionThroughput | Self::ExecutionStatus => "execution_status_hourly",
-            Self::EventVolume => "event_volume_hourly",
-        }
-    }
-
-    fn aggregate_watermark_view_name(self) -> &'static str {
-        self.aggregate_query_view_name()
-    }
-}
-
-async fn fetch_aggregate_watermark(
-    state: &Arc<AppState>,
-    aggregate_view_name: &str,
-) -> Option<DateTime<Utc>> {
-    let watermark = sqlx::query_as::<_, (Option<DateTime<Utc>>, )>(
-        r#"
-        SELECT _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(ht.id)) AS watermark
-        FROM timescaledb_information.continuous_aggregates cagg
-        INNER JOIN _timescaledb_catalog.hypertable ht
-            ON ht.schema_name = cagg.materialization_hypertable_schema
-           AND ht.table_name = cagg.materialization_hypertable_name
-        WHERE cagg.view_schema = current_schema()
-          AND cagg.view_name = $1
-        LIMIT 1
-        "#,
-    )
-    .bind(aggregate_view_name)
-    .fetch_optional(&state.db)
-    .await;
-
-    match watermark {
-        Ok(Some((watermark,))) => watermark,
-        Ok(None) => None,
-        Err(error) => {
-            debug!(
-                aggregate_view_name,
-                error = %error,
-                "dashboard source watermark unavailable; falling back to raw path"
-            );
-            None
-        }
-    }
-}
-
-async fn query_aggregate_bucket_rows(
-    state: &Arc<AppState>,
-    kind: BucketedCutoverKind,
-    range: TimeRange,
-    primary_refs: Option<&BTreeSet<String>>,
-) -> Result<Vec<BucketCountRow>, ApiError> {
-    let rows = match kind {
-        BucketedCutoverKind::ExecutionThroughput => {
-            let aggregate_view_name = kind.aggregate_query_view_name();
-            if let Some(action_refs) = primary_refs {
-                let action_refs: Vec<String> = action_refs.iter().cloned().collect();
-                let query = format!(
-                    r#"
-                    SELECT
-                        bucket AS bucket_start,
-                        action_ref AS series,
-                        SUM(transition_count)::bigint AS count
-                    FROM {aggregate_view_name}
-                    WHERE bucket >= $1
-                      AND bucket < $2
-                      AND action_ref = ANY($3::text[])
-                      AND new_status = ANY($4::text[])
-                    GROUP BY bucket, action_ref
-                    ORDER BY bucket ASC, action_ref ASC
-                    "#,
-                );
-                let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(&query)
-                    .bind(range.start)
-                    .bind(range.end)
-                    .bind(action_refs)
-                    .bind(TERMINAL_EXECUTION_STATUSES)
-                    .fetch_all(&state.db)
-                    .await?;
-                rows.into_iter()
-                    .map(|(bucket_start, series, count)| BucketCountRow {
-                        bucket_start,
-                        series,
-                        count,
-                    })
-                    .collect()
-            } else {
-                let query = format!(
-                    r#"
-                    SELECT
-                        bucket AS bucket_start,
-                        SUM(transition_count)::bigint AS count
-                    FROM {aggregate_view_name}
-                    WHERE bucket >= $1 AND bucket < $2
-                      AND new_status = ANY($3::text[])
-                    GROUP BY bucket
-                    ORDER BY bucket ASC
-                    "#,
-                );
-                let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(&query)
-                    .bind(range.start)
-                    .bind(range.end)
-                    .bind(TERMINAL_EXECUTION_STATUSES)
-                    .fetch_all(&state.db)
-                    .await?;
-                rows.into_iter()
-                    .map(|(bucket_start, count)| BucketCountRow {
-                        bucket_start,
-                        series: "all".to_string(),
-                        count,
-                    })
-                    .collect()
-            }
-        }
-        BucketedCutoverKind::ExecutionStatus => {
-            let aggregate_view_name = kind.aggregate_query_view_name();
-            let rows = if let Some(action_refs) = primary_refs {
-                let action_refs: Vec<String> = action_refs.iter().cloned().collect();
-                let query = format!(
-                    r#"
-                    SELECT
-                        bucket AS bucket_start,
-                        COALESCE(new_status, 'unknown') AS series,
-                        SUM(transition_count)::bigint AS count
-                    FROM {aggregate_view_name}
-                    WHERE bucket >= $1
-                      AND bucket < $2
-                      AND action_ref = ANY($3::text[])
-                      AND new_status = ANY($4::text[])
-                    GROUP BY bucket, new_status
-                    ORDER BY bucket ASC, series ASC
-                    "#,
-                );
-                sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(&query)
-                    .bind(range.start)
-                    .bind(range.end)
-                    .bind(action_refs)
-                    .bind(TERMINAL_EXECUTION_STATUSES)
-                    .fetch_all(&state.db)
-                    .await?
-            } else {
-                let query = format!(
-                    r#"
-                    SELECT
-                        bucket AS bucket_start,
-                        COALESCE(new_status, 'unknown') AS series,
-                        SUM(transition_count)::bigint AS count
-                    FROM {aggregate_view_name}
-                    WHERE bucket >= $1
-                      AND bucket < $2
-                      AND new_status = ANY($3::text[])
-                    GROUP BY bucket, new_status
-                    ORDER BY bucket ASC, series ASC
-                    "#,
-                );
-                sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(&query)
-                    .bind(range.start)
-                    .bind(range.end)
-                    .bind(TERMINAL_EXECUTION_STATUSES)
-                    .fetch_all(&state.db)
-                    .await?
-            };
-            rows.into_iter()
-                .map(|(bucket_start, series, count)| BucketCountRow {
-                    bucket_start,
-                    series,
-                    count,
-                })
-                .collect()
-        }
-        BucketedCutoverKind::EventVolume => {
-            let aggregate_view_name = kind.aggregate_query_view_name();
-            if let Some(trigger_refs) = primary_refs {
-                let trigger_refs: Vec<String> = trigger_refs.iter().cloned().collect();
-                let query = format!(
-                    r#"
-                    SELECT
-                        bucket AS bucket_start,
-                        trigger_ref AS series,
-                        SUM(event_count)::bigint AS count
-                    FROM {aggregate_view_name}
-                    WHERE bucket >= $1
-                      AND bucket < $2
-                      AND trigger_ref = ANY($3::text[])
-                    GROUP BY bucket, trigger_ref
-                    ORDER BY bucket ASC, trigger_ref ASC
-                    "#,
-                );
-                let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(&query)
-                    .bind(range.start)
-                    .bind(range.end)
-                    .bind(trigger_refs)
-                    .fetch_all(&state.db)
-                    .await?;
-                rows.into_iter()
-                    .map(|(bucket_start, series, count)| BucketCountRow {
-                        bucket_start,
-                        series,
-                        count,
-                    })
-                    .collect()
-            } else {
-                let query = format!(
-                    r#"
-                    SELECT
-                        bucket AS bucket_start,
-                        SUM(event_count)::bigint AS count
-                    FROM {aggregate_view_name}
-                    WHERE bucket >= $1 AND bucket < $2
-                    GROUP BY bucket
-                    ORDER BY bucket ASC
-                    "#,
-                );
-                let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(&query)
-                    .bind(range.start)
-                    .bind(range.end)
-                    .fetch_all(&state.db)
-                    .await?;
-                rows.into_iter()
-                    .map(|(bucket_start, count)| BucketCountRow {
-                        bucket_start,
-                        series: "all".to_string(),
-                        count,
-                    })
-                    .collect()
-            }
-        }
-    };
-    Ok(rows)
-}
-
-async fn query_raw_bucket_rows(
-    state: &Arc<AppState>,
-    kind: BucketedCutoverKind,
-    range: TimeRange,
-    primary_refs: Option<&BTreeSet<String>>,
-) -> Result<Vec<BucketCountRow>, ApiError> {
-    let rows = match kind {
-        BucketedCutoverKind::ExecutionThroughput => {
-            if let Some(action_refs) = primary_refs {
-                let action_refs: Vec<String> = action_refs.iter().cloned().collect();
-                let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
-                    r#"
-                    SELECT
-                        date_trunc('hour', time) AS bucket_start,
-                        entity_ref AS series,
-                        COUNT(*)::bigint AS count
-                    FROM execution_history
-                    WHERE 'status' = ANY(changed_fields)
-                      AND time >= $1
-                      AND time < $2
-                      AND entity_ref = ANY($3::text[])
-                      AND COALESCE(new_values->>'status', 'unknown') = ANY($4::text[])
-                    GROUP BY bucket_start, entity_ref
-                    ORDER BY bucket_start ASC, entity_ref ASC
-                    "#,
-                )
-                .bind(range.start)
-                .bind(range.end)
-                .bind(action_refs)
-                .bind(TERMINAL_EXECUTION_STATUSES)
-                .fetch_all(&state.db)
-                .await?;
-                rows.into_iter()
-                    .map(|(bucket_start, series, count)| BucketCountRow {
-                        bucket_start,
-                        series,
-                        count,
-                    })
-                    .collect()
-            } else {
-                let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(
-                    r#"
-                    SELECT
-                        date_trunc('hour', time) AS bucket_start,
-                        COUNT(*)::bigint AS count
-                    FROM execution_history
-                    WHERE 'status' = ANY(changed_fields)
-                      AND time >= $1
-                      AND time < $2
-                      AND COALESCE(new_values->>'status', 'unknown') = ANY($3::text[])
-                    GROUP BY bucket_start
-                    ORDER BY bucket_start ASC
-                    "#,
-                )
-                .bind(range.start)
-                .bind(range.end)
-                .bind(TERMINAL_EXECUTION_STATUSES)
-                .fetch_all(&state.db)
-                .await?;
-                rows.into_iter()
-                    .map(|(bucket_start, count)| BucketCountRow {
-                        bucket_start,
-                        series: "all".to_string(),
-                        count,
-                    })
-                    .collect()
-            }
-        }
-        BucketedCutoverKind::ExecutionStatus => {
-            let rows = if let Some(action_refs) = primary_refs {
-                let action_refs: Vec<String> = action_refs.iter().cloned().collect();
-                sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
-                    r#"
-                    SELECT
-                        date_trunc('hour', time) AS bucket_start,
-                        COALESCE(new_values->>'status', 'unknown') AS series,
-                        COUNT(*)::bigint AS count
-                    FROM execution_history
-                    WHERE 'status' = ANY(changed_fields)
-                      AND time >= $1
-                      AND time < $2
-                      AND entity_ref = ANY($3::text[])
-                      AND COALESCE(new_values->>'status', 'unknown') = ANY($4::text[])
-                    GROUP BY bucket_start, COALESCE(new_values->>'status', 'unknown')
-                    ORDER BY bucket_start ASC, series ASC
-                    "#,
-                )
-                .bind(range.start)
-                .bind(range.end)
-                .bind(action_refs)
-                .bind(TERMINAL_EXECUTION_STATUSES)
-                .fetch_all(&state.db)
-                .await?
-            } else {
-                sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
-                    r#"
-                    SELECT
-                        date_trunc('hour', time) AS bucket_start,
-                        COALESCE(new_values->>'status', 'unknown') AS series,
-                        COUNT(*)::bigint AS count
-                    FROM execution_history
-                    WHERE 'status' = ANY(changed_fields)
-                      AND time >= $1
-                      AND time < $2
-                      AND COALESCE(new_values->>'status', 'unknown') = ANY($3::text[])
-                    GROUP BY bucket_start, COALESCE(new_values->>'status', 'unknown')
-                    ORDER BY bucket_start ASC, series ASC
-                    "#,
-                )
-                .bind(range.start)
-                .bind(range.end)
-                .bind(TERMINAL_EXECUTION_STATUSES)
-                .fetch_all(&state.db)
-                .await?
-            };
-            rows.into_iter()
-                .map(|(bucket_start, series, count)| BucketCountRow {
-                    bucket_start,
-                    series,
-                    count,
-                })
-                .collect()
-        }
-        BucketedCutoverKind::EventVolume => {
-            if let Some(trigger_refs) = primary_refs {
-                let trigger_refs: Vec<String> = trigger_refs.iter().cloned().collect();
-                let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
-                    r#"
-                    SELECT
-                        date_trunc('hour', created) AS bucket_start,
-                        trigger_ref AS series,
-                        COUNT(*)::bigint AS count
-                    FROM event
-                    WHERE created >= $1
-                      AND created < $2
-                      AND trigger_ref = ANY($3::text[])
-                    GROUP BY bucket_start, trigger_ref
-                    ORDER BY bucket_start ASC, trigger_ref ASC
-                    "#,
-                )
-                .bind(range.start)
-                .bind(range.end)
-                .bind(trigger_refs)
-                .fetch_all(&state.db)
-                .await?;
-                rows.into_iter()
-                    .map(|(bucket_start, series, count)| BucketCountRow {
-                        bucket_start,
-                        series,
-                        count,
-                    })
-                    .collect()
-            } else {
-                let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(
-                    r#"
-                    SELECT
-                        date_trunc('hour', created) AS bucket_start,
-                        COUNT(*)::bigint AS count
-                    FROM event
-                    WHERE created >= $1
-                      AND created < $2
-                    GROUP BY bucket_start
-                    ORDER BY bucket_start ASC
-                    "#,
-                )
-                .bind(range.start)
-                .bind(range.end)
-                .fetch_all(&state.db)
-                .await?;
-                rows.into_iter()
-                    .map(|(bucket_start, count)| BucketCountRow {
-                        bucket_start,
-                        series: "all".to_string(),
-                        count,
-                    })
-                    .collect()
-            }
-        }
-    };
-    Ok(rows)
-}
-
-fn map_freshness_mode(mode: FreshnessMode) -> DashboardFreshnessMode {
-    match mode {
-        FreshnessMode::RawOnly => DashboardFreshnessMode::RawOnly,
-        FreshnessMode::AggregateOnly => DashboardFreshnessMode::AggregateOnly,
-        FreshnessMode::AggregatePlusTail => DashboardFreshnessMode::AggregatePlusTail,
-        FreshnessMode::RawOnlyFallback => DashboardFreshnessMode::RawOnlyFallback,
-    }
 }
 
 fn normalize_request_ref_scope(
@@ -3274,652 +2691,6 @@ async fn effective_action_refs(
     .await
 }
 
-async fn query_queue_throughput_rows(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    queue_refs: Option<&BTreeSet<String>>,
-) -> Result<Vec<QueueThroughputSourceRow>, ApiError> {
-    let rows = if let Some(queue_refs) = queue_refs {
-        let queue_refs: Vec<String> = queue_refs.iter().cloned().collect();
-        sqlx::query_as::<_, (DateTime<Utc>, String, i64, i64, i64, i64, i64)>(
-            r#"
-            SELECT
-                date_trunc('hour', updated) AS bucket_start,
-                queue_ref,
-                COUNT(*) FILTER (WHERE status::text = 'completed')::bigint AS completed,
-                COUNT(*) FILTER (WHERE status::text = 'failed')::bigint AS failed,
-                COUNT(*) FILTER (WHERE status::text = 'skipped')::bigint AS skipped,
-                COUNT(*) FILTER (WHERE status::text = 'cancelled')::bigint AS cancelled,
-                COUNT(*)::bigint AS total_processed
-            FROM work_queue_item
-            WHERE updated >= $1
-              AND updated < $2
-              AND queue_ref = ANY($3::text[])
-              AND status::text = ANY($4::text[])
-            GROUP BY bucket_start, queue_ref
-            ORDER BY bucket_start ASC, queue_ref ASC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .bind(queue_refs)
-        .bind(TERMINAL_QUEUE_ITEM_STATUSES)
-        .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as::<_, (DateTime<Utc>, String, i64, i64, i64, i64, i64)>(
-            r#"
-            SELECT
-                date_trunc('hour', updated) AS bucket_start,
-                queue_ref,
-                COUNT(*) FILTER (WHERE status::text = 'completed')::bigint AS completed,
-                COUNT(*) FILTER (WHERE status::text = 'failed')::bigint AS failed,
-                COUNT(*) FILTER (WHERE status::text = 'skipped')::bigint AS skipped,
-                COUNT(*) FILTER (WHERE status::text = 'cancelled')::bigint AS cancelled,
-                COUNT(*)::bigint AS total_processed
-            FROM work_queue_item
-            WHERE updated >= $1
-              AND updated < $2
-              AND status::text = ANY($3::text[])
-            GROUP BY bucket_start, queue_ref
-            ORDER BY bucket_start ASC, queue_ref ASC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .bind(TERMINAL_QUEUE_ITEM_STATUSES)
-        .fetch_all(&state.db)
-        .await?
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(
-            |(bucket_start, queue_ref, completed, failed, skipped, cancelled, total_processed)| {
-                QueueThroughputSourceRow {
-                    bucket_start,
-                    queue_ref,
-                    completed,
-                    failed,
-                    skipped,
-                    cancelled,
-                    total_processed,
-                }
-            },
-        )
-        .collect())
-}
-
-async fn query_queue_dispatch_stats_rows(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    queue_refs: Option<&BTreeSet<String>>,
-) -> Result<Vec<QueueDispatchStatsSourceRow>, ApiError> {
-    let rows = if let Some(queue_refs) = queue_refs {
-        let queue_refs: Vec<String> = queue_refs.iter().cloned().collect();
-        sqlx::query_as::<_, (DateTime<Utc>, String, String, i64, i64, f64, f64)>(
-            r#"
-            SELECT
-                date_trunc('hour', COALESCE(e.updated, d.updated)) AS bucket_start,
-                d.queue_ref,
-                COALESCE(e.status::text, d.status::text) AS status,
-                COUNT(*)::bigint AS dispatch_count,
-                COALESCE(SUM(d.leased_item_count), 0)::bigint AS leased_item_count,
-                COALESCE(
-                    AVG(
-                        EXTRACT(EPOCH FROM (
-                            COALESCE(e.updated, d.updated)
-                            - COALESCE(e.started_at, e.created, d.created)
-                        ))
-                    ),
-                    0
-                )::double precision AS avg_duration_seconds,
-                COALESCE(
-                    MAX(
-                        EXTRACT(EPOCH FROM (
-                            COALESCE(e.updated, d.updated)
-                            - COALESCE(e.started_at, e.created, d.created)
-                        ))
-                    ),
-                    0
-                )::double precision AS max_duration_seconds
-            FROM work_queue_dispatch d
-            LEFT JOIN execution e ON e.id = d.execution
-            WHERE COALESCE(e.updated, d.updated) >= $1
-              AND COALESCE(e.updated, d.updated) < $2
-              AND d.queue_ref = ANY($3::text[])
-              AND (
-                    e.status::text = ANY($4::text[])
-                 OR (e.id IS NULL AND d.status::text = ANY($5::text[]))
-              )
-            GROUP BY bucket_start, d.queue_ref, COALESCE(e.status::text, d.status::text)
-            ORDER BY bucket_start ASC, d.queue_ref ASC, status ASC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .bind(queue_refs)
-        .bind(TERMINAL_EXECUTION_STATUSES)
-        .bind(TERMINAL_QUEUE_DISPATCH_FALLBACK_STATUSES)
-        .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as::<_, (DateTime<Utc>, String, String, i64, i64, f64, f64)>(
-            r#"
-            SELECT
-                date_trunc('hour', COALESCE(e.updated, d.updated)) AS bucket_start,
-                d.queue_ref,
-                COALESCE(e.status::text, d.status::text) AS status,
-                COUNT(*)::bigint AS dispatch_count,
-                COALESCE(SUM(d.leased_item_count), 0)::bigint AS leased_item_count,
-                COALESCE(
-                    AVG(
-                        EXTRACT(EPOCH FROM (
-                            COALESCE(e.updated, d.updated)
-                            - COALESCE(e.started_at, e.created, d.created)
-                        ))
-                    ),
-                    0
-                )::double precision AS avg_duration_seconds,
-                COALESCE(
-                    MAX(
-                        EXTRACT(EPOCH FROM (
-                            COALESCE(e.updated, d.updated)
-                            - COALESCE(e.started_at, e.created, d.created)
-                        ))
-                    ),
-                    0
-                )::double precision AS max_duration_seconds
-            FROM work_queue_dispatch d
-            LEFT JOIN execution e ON e.id = d.execution
-            WHERE COALESCE(e.updated, d.updated) >= $1
-              AND COALESCE(e.updated, d.updated) < $2
-              AND (
-                    e.status::text = ANY($3::text[])
-                 OR (e.id IS NULL AND d.status::text = ANY($4::text[]))
-              )
-            GROUP BY bucket_start, d.queue_ref, COALESCE(e.status::text, d.status::text)
-            ORDER BY bucket_start ASC, d.queue_ref ASC, status ASC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .bind(TERMINAL_EXECUTION_STATUSES)
-        .bind(TERMINAL_QUEUE_DISPATCH_FALLBACK_STATUSES)
-        .fetch_all(&state.db)
-        .await?
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(
-            |(
-                bucket_start,
-                queue_ref,
-                status,
-                dispatch_count,
-                leased_item_count,
-                avg_duration_seconds,
-                max_duration_seconds,
-            )| QueueDispatchStatsSourceRow {
-                bucket_start,
-                queue_ref,
-                status,
-                dispatch_count,
-                leased_item_count,
-                avg_duration_seconds,
-                max_duration_seconds,
-            },
-        )
-        .collect())
-}
-
-async fn query_inquiry_backlog_rows(
-    state: &Arc<AppState>,
-    pack_refs: Option<&BTreeSet<String>>,
-    assigned_to: Option<i64>,
-) -> Result<Vec<InquiryBacklogSourceRow>, ApiError> {
-    let pack_ref_expr = r#"
-        CASE
-            WHEN e.action_ref IS NOT NULL AND position('.' in e.action_ref) > 0
-                THEN split_part(e.action_ref, '.', 1)
-            ELSE NULL
-        END
-    "#;
-
-    let rows = match (pack_refs, assigned_to) {
-        (Some(pack_refs), Some(assigned_to)) => {
-            let pack_refs: Vec<String> = pack_refs.iter().cloned().collect();
-            sqlx::query_as::<_, (Option<String>, Option<i64>, i64, i64)>(&format!(
-                r#"
-                    SELECT
-                        {pack_ref_expr} AS pack_ref,
-                        i.assigned_to,
-                        COUNT(*)::bigint AS pending_count,
-                        COUNT(*) FILTER (
-                            WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
-                        )::bigint AS overdue_count
-                    FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.created_by_execution
-                    WHERE i.status::text = 'pending'
-                      AND i.assigned_to = $1
-                      AND {pack_ref_expr} = ANY($2::text[])
-                    GROUP BY 1, 2
-                    ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
-                    "#
-            ))
-            .bind(assigned_to)
-            .bind(pack_refs)
-            .fetch_all(&state.db)
-            .await?
-        }
-        (Some(pack_refs), None) => {
-            let pack_refs: Vec<String> = pack_refs.iter().cloned().collect();
-            sqlx::query_as::<_, (Option<String>, Option<i64>, i64, i64)>(&format!(
-                r#"
-                    SELECT
-                        {pack_ref_expr} AS pack_ref,
-                        i.assigned_to,
-                        COUNT(*)::bigint AS pending_count,
-                        COUNT(*) FILTER (
-                            WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
-                        )::bigint AS overdue_count
-                    FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.created_by_execution
-                    WHERE i.status::text = 'pending'
-                      AND {pack_ref_expr} = ANY($1::text[])
-                    GROUP BY 1, 2
-                    ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
-                    "#
-            ))
-            .bind(pack_refs)
-            .fetch_all(&state.db)
-            .await?
-        }
-        (None, Some(assigned_to)) => {
-            sqlx::query_as::<_, (Option<String>, Option<i64>, i64, i64)>(&format!(
-                r#"
-                    SELECT
-                        {pack_ref_expr} AS pack_ref,
-                        i.assigned_to,
-                        COUNT(*)::bigint AS pending_count,
-                        COUNT(*) FILTER (
-                            WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
-                        )::bigint AS overdue_count
-                    FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.created_by_execution
-                    WHERE i.status::text = 'pending'
-                      AND i.assigned_to = $1
-                    GROUP BY 1, 2
-                    ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
-                    "#
-            ))
-            .bind(assigned_to)
-            .fetch_all(&state.db)
-            .await?
-        }
-        (None, None) => {
-            sqlx::query_as::<_, (Option<String>, Option<i64>, i64, i64)>(&format!(
-                r#"
-                    SELECT
-                        {pack_ref_expr} AS pack_ref,
-                        i.assigned_to,
-                        COUNT(*)::bigint AS pending_count,
-                        COUNT(*) FILTER (
-                            WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
-                        )::bigint AS overdue_count
-                    FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.created_by_execution
-                    WHERE i.status::text = 'pending'
-                    GROUP BY 1, 2
-                    ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
-                    "#
-            ))
-            .fetch_all(&state.db)
-            .await?
-        }
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(
-            |(pack_ref, assigned_to, pending_count, overdue_count)| InquiryBacklogSourceRow {
-                pack_ref,
-                assigned_to,
-                pending_count,
-                overdue_count,
-            },
-        )
-        .collect())
-}
-
-async fn query_inquiry_sla_rows(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    pack_refs: Option<&BTreeSet<String>>,
-    assigned_to: Option<i64>,
-    sla_target_seconds: i64,
-) -> Result<Vec<InquirySlaSourceRow>, ApiError> {
-    let pack_ref_expr = r#"
-        CASE
-            WHEN e.action_ref IS NOT NULL AND position('.' in e.action_ref) > 0
-                THEN split_part(e.action_ref, '.', 1)
-            ELSE NULL
-        END
-    "#;
-    let elapsed_expr = r#"
-        EXTRACT(EPOCH FROM (
-            COALESCE(
-                i.responded_at,
-                CASE WHEN i.status::text = 'timeout' THEN COALESCE(i.updated, i.timeout_at) END,
-                NOW()
-            ) - i.created
-        ))
-    "#;
-
-    let rows = match (pack_refs, assigned_to) {
-        (Some(pack_refs), Some(assigned_to)) => {
-            let pack_refs: Vec<String> = pack_refs.iter().cloned().collect();
-            sqlx::query_as::<
-                _,
-                (
-                    DateTime<Utc>,
-                    Option<String>,
-                    Option<i64>,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ),
-            >(&format!(
-                r#"
-                    SELECT
-                        date_trunc('hour', i.created) AS bucket_start,
-                        {pack_ref_expr} AS pack_ref,
-                        i.assigned_to,
-                        COUNT(*)::bigint AS total_inquiries,
-                        COUNT(*) FILTER (WHERE {elapsed_expr} <= $1)::bigint AS within_sla_count,
-                        COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
-                        COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
-                    FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.created_by_execution
-                    WHERE i.created >= $2
-                      AND i.created < $3
-                      AND i.assigned_to = $4
-                      AND {pack_ref_expr} = ANY($5::text[])
-                    GROUP BY 1, 2, 3
-                    ORDER BY bucket_start ASC, pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
-                    "#
-            ))
-            .bind(sla_target_seconds as f64)
-            .bind(effective_time_range.start)
-            .bind(effective_time_range.end)
-            .bind(assigned_to)
-            .bind(pack_refs)
-            .fetch_all(&state.db)
-            .await?
-        }
-        (Some(pack_refs), None) => {
-            let pack_refs: Vec<String> = pack_refs.iter().cloned().collect();
-            sqlx::query_as::<
-                _,
-                (
-                    DateTime<Utc>,
-                    Option<String>,
-                    Option<i64>,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ),
-            >(&format!(
-                r#"
-                    SELECT
-                        date_trunc('hour', i.created) AS bucket_start,
-                        {pack_ref_expr} AS pack_ref,
-                        i.assigned_to,
-                        COUNT(*)::bigint AS total_inquiries,
-                        COUNT(*) FILTER (WHERE {elapsed_expr} <= $1)::bigint AS within_sla_count,
-                        COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
-                        COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
-                    FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.created_by_execution
-                    WHERE i.created >= $2
-                      AND i.created < $3
-                      AND {pack_ref_expr} = ANY($4::text[])
-                    GROUP BY 1, 2, 3
-                    ORDER BY bucket_start ASC, pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
-                    "#
-            ))
-            .bind(sla_target_seconds as f64)
-            .bind(effective_time_range.start)
-            .bind(effective_time_range.end)
-            .bind(pack_refs)
-            .fetch_all(&state.db)
-            .await?
-        }
-        (None, Some(assigned_to)) => {
-            sqlx::query_as::<
-                _,
-                (
-                    DateTime<Utc>,
-                    Option<String>,
-                    Option<i64>,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ),
-            >(&format!(
-                r#"
-                    SELECT
-                        date_trunc('hour', i.created) AS bucket_start,
-                        {pack_ref_expr} AS pack_ref,
-                        i.assigned_to,
-                        COUNT(*)::bigint AS total_inquiries,
-                        COUNT(*) FILTER (WHERE {elapsed_expr} <= $1)::bigint AS within_sla_count,
-                        COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
-                        COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
-                    FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.created_by_execution
-                    WHERE i.created >= $2
-                      AND i.created < $3
-                      AND i.assigned_to = $4
-                    GROUP BY 1, 2, 3
-                    ORDER BY bucket_start ASC, pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
-                    "#
-            ))
-            .bind(sla_target_seconds as f64)
-            .bind(effective_time_range.start)
-            .bind(effective_time_range.end)
-            .bind(assigned_to)
-            .fetch_all(&state.db)
-            .await?
-        }
-        (None, None) => {
-            sqlx::query_as::<
-                _,
-                (
-                    DateTime<Utc>,
-                    Option<String>,
-                    Option<i64>,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ),
-            >(&format!(
-                r#"
-                    SELECT
-                        date_trunc('hour', i.created) AS bucket_start,
-                        {pack_ref_expr} AS pack_ref,
-                        i.assigned_to,
-                        COUNT(*)::bigint AS total_inquiries,
-                        COUNT(*) FILTER (WHERE {elapsed_expr} <= $1)::bigint AS within_sla_count,
-                        COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
-                        COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
-                    FROM inquiry i
-                    LEFT JOIN execution e ON e.id = i.created_by_execution
-                    WHERE i.created >= $2
-                      AND i.created < $3
-                    GROUP BY 1, 2, 3
-                    ORDER BY bucket_start ASC, pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
-                    "#
-            ))
-            .bind(sla_target_seconds as f64)
-            .bind(effective_time_range.start)
-            .bind(effective_time_range.end)
-            .fetch_all(&state.db)
-            .await?
-        }
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(
-            |(
-                bucket_start,
-                pack_ref,
-                assigned_to,
-                total_inquiries,
-                within_sla_count,
-                breached_count,
-                open_count,
-            )| InquirySlaSourceRow {
-                bucket_start,
-                pack_ref,
-                assigned_to,
-                sla_target_seconds,
-                total_inquiries,
-                within_sla_count,
-                breached_count,
-                open_count,
-                compliance_rate: if total_inquiries > 0 {
-                    within_sla_count as f64 / total_inquiries as f64
-                } else {
-                    0.0
-                },
-            },
-        )
-        .collect())
-}
-
-async fn query_execution_duration_stats_rows(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    action_refs: Option<&BTreeSet<String>>,
-) -> Result<Vec<ExecutionDurationStatsSourceRow>, ApiError> {
-    let rows = if let Some(action_refs) = action_refs {
-        let action_refs: Vec<String> = action_refs.iter().cloned().collect();
-        sqlx::query_as::<_, (DateTime<Utc>, String, i64, f64, f64, f64, f64)>(
-            r#"
-            SELECT
-                date_trunc('hour', updated) AS bucket_start,
-                COALESCE(action_ref, 'unknown') AS series,
-                COUNT(*)::bigint AS execution_count,
-                COALESCE(
-                    AVG(EXTRACT(EPOCH FROM (updated - started_at))),
-                    0
-                )::double precision AS avg_duration_seconds,
-                COALESCE(
-                    PERCENTILE_CONT(0.5) WITHIN GROUP (
-                        ORDER BY EXTRACT(EPOCH FROM (updated - started_at))
-                    ),
-                    0
-                )::double precision AS p50_duration_seconds,
-                COALESCE(
-                    PERCENTILE_CONT(0.95) WITHIN GROUP (
-                        ORDER BY EXTRACT(EPOCH FROM (updated - started_at))
-                    ),
-                    0
-                )::double precision AS p95_duration_seconds,
-                COALESCE(
-                    MAX(EXTRACT(EPOCH FROM (updated - started_at))),
-                    0
-                )::double precision AS max_duration_seconds
-            FROM execution
-            WHERE updated >= $1
-              AND updated < $2
-              AND started_at IS NOT NULL
-              AND status::text = ANY($3::text[])
-              AND action_ref = ANY($4::text[])
-            GROUP BY 1, 2
-            ORDER BY bucket_start ASC, series ASC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .bind(TERMINAL_EXECUTION_STATUSES)
-        .bind(action_refs)
-        .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as::<_, (DateTime<Utc>, String, i64, f64, f64, f64, f64)>(
-            r#"
-            SELECT
-                date_trunc('hour', updated) AS bucket_start,
-                COALESCE(action_ref, 'unknown') AS series,
-                COUNT(*)::bigint AS execution_count,
-                COALESCE(
-                    AVG(EXTRACT(EPOCH FROM (updated - started_at))),
-                    0
-                )::double precision AS avg_duration_seconds,
-                COALESCE(
-                    PERCENTILE_CONT(0.5) WITHIN GROUP (
-                        ORDER BY EXTRACT(EPOCH FROM (updated - started_at))
-                    ),
-                    0
-                )::double precision AS p50_duration_seconds,
-                COALESCE(
-                    PERCENTILE_CONT(0.95) WITHIN GROUP (
-                        ORDER BY EXTRACT(EPOCH FROM (updated - started_at))
-                    ),
-                    0
-                )::double precision AS p95_duration_seconds,
-                COALESCE(
-                    MAX(EXTRACT(EPOCH FROM (updated - started_at))),
-                    0
-                )::double precision AS max_duration_seconds
-            FROM execution
-            WHERE updated >= $1
-              AND updated < $2
-              AND started_at IS NOT NULL
-              AND status::text = ANY($3::text[])
-            GROUP BY 1, 2
-            ORDER BY bucket_start ASC, series ASC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .bind(TERMINAL_EXECUTION_STATUSES)
-        .fetch_all(&state.db)
-        .await?
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(
-            |(
-                bucket_start,
-                series,
-                execution_count,
-                avg_duration_seconds,
-                p50_duration_seconds,
-                p95_duration_seconds,
-                max_duration_seconds,
-            )| ExecutionDurationStatsSourceRow {
-                bucket_start,
-                series,
-                execution_count,
-                avg_duration_seconds,
-                p50_duration_seconds,
-                p95_duration_seconds,
-                max_duration_seconds,
-            },
-        )
-        .collect())
-}
-
 async fn effective_trigger_refs(
     state: &Arc<AppState>,
     source_scope: &SourceQueryScope,
@@ -3994,46 +2765,6 @@ where
     }
 
     Ok(Some(refs))
-}
-
-async fn query_latest_execution_rows(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    action_refs: Option<&BTreeSet<String>>,
-    statuses: &[&str],
-) -> Result<Vec<LatestExecutionQueryRow>, ApiError> {
-    let action_refs: Option<Vec<String>> =
-        action_refs.map(|refs| refs.iter().cloned().collect::<Vec<_>>());
-    let statuses = statuses
-        .iter()
-        .map(|status| (*status).to_string())
-        .collect::<Vec<_>>();
-    sqlx::query_as::<_, LatestExecutionQueryRow>(
-        r#"
-        SELECT DISTINCT ON (e.action_ref)
-            e.action_ref AS action_ref,
-            e.id AS execution_id,
-            e.status AS status,
-            e.created AS created_at,
-            e.started_at AS started_at,
-            e.updated AS updated_at,
-            e.trace_tag AS trace_tag,
-            e.result AS result
-        FROM execution e
-        WHERE ($1::text[] IS NULL OR e.action_ref = ANY($1))
-          AND e.created >= $2
-          AND e.created < $3
-          AND e.status::text = ANY($4::text[])
-        ORDER BY e.action_ref ASC, e.created DESC, e.id DESC
-        "#,
-    )
-    .bind(action_refs)
-    .bind(effective_time_range.start)
-    .bind(effective_time_range.end)
-    .bind(statuses)
-    .fetch_all(&state.db)
-    .await
-    .map_err(ApiError::from)
 }
 
 fn key_owner_ref(
@@ -4264,201 +2995,6 @@ fn extract_json_path<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonVal
     Some(current)
 }
 
-async fn query_last_event_rows(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    trigger_refs: Option<&BTreeSet<String>>,
-) -> Result<Vec<LastEventSourceRow>, ApiError> {
-    let rows = if let Some(trigger_refs) = trigger_refs {
-        let trigger_refs: Vec<String> = trigger_refs.iter().cloned().collect();
-        sqlx::query_as::<
-            _,
-            (
-                String,
-                i64,
-                DateTime<Utc>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            ),
-        >(
-            r#"
-            SELECT trigger_ref, event_id, created, source_ref, rule_ref, trace_tag
-            FROM (
-                SELECT DISTINCT ON (trigger_ref)
-                    trigger_ref,
-                    id AS event_id,
-                    created,
-                    source_ref,
-                    rule_ref,
-                    trace_tag
-                FROM event
-                WHERE created >= $1
-                  AND created < $2
-                  AND trigger_ref = ANY($3::text[])
-                ORDER BY trigger_ref ASC, created DESC, id DESC
-            ) latest
-            ORDER BY trigger_ref ASC, event_id DESC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .bind(trigger_refs)
-        .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as::<
-            _,
-            (
-                String,
-                i64,
-                DateTime<Utc>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            ),
-        >(
-            r#"
-            SELECT trigger_ref, event_id, created, source_ref, rule_ref, trace_tag
-            FROM (
-                SELECT DISTINCT ON (trigger_ref)
-                    trigger_ref,
-                    id AS event_id,
-                    created,
-                    source_ref,
-                    rule_ref,
-                    trace_tag
-                FROM event
-                WHERE created >= $1
-                  AND created < $2
-                ORDER BY trigger_ref ASC, created DESC, id DESC
-            ) latest
-            ORDER BY trigger_ref ASC, event_id DESC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .fetch_all(&state.db)
-        .await?
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(
-            |(trigger_ref, event_id, created, source_ref, rule_ref, trace_tag)| {
-                LastEventSourceRow {
-                    trigger_ref,
-                    event_id,
-                    created,
-                    source_ref,
-                    rule_ref,
-                    trace_tag,
-                }
-            },
-        )
-        .collect())
-}
-
-async fn query_last_enforcement_rows(
-    state: &Arc<AppState>,
-    effective_time_range: &DashboardEffectiveTimeRange,
-    rule_refs: Option<&BTreeSet<String>>,
-) -> Result<Vec<LastEnforcementSourceRow>, ApiError> {
-    let rows = if let Some(rule_refs) = rule_refs {
-        let rule_refs: Vec<String> = rule_refs.iter().cloned().collect();
-        sqlx::query_as::<
-            _,
-            (
-                String,
-                i64,
-                String,
-                String,
-                DateTime<Utc>,
-                Option<DateTime<Utc>>,
-                Option<i64>,
-            ),
-        >(
-            r#"
-            SELECT rule_ref, enforcement_id, trigger_ref, status, created, resolved_at, event_id
-            FROM (
-                SELECT DISTINCT ON (rule_ref)
-                    rule_ref,
-                    id AS enforcement_id,
-                    trigger_ref,
-                    status::text AS status,
-                    created,
-                    resolved_at,
-                    event AS event_id
-                FROM enforcement
-                WHERE created >= $1
-                  AND created < $2
-                  AND rule_ref = ANY($3::text[])
-                ORDER BY rule_ref ASC, created DESC, id DESC
-            ) latest
-            ORDER BY rule_ref ASC, enforcement_id DESC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .bind(rule_refs)
-        .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as::<
-            _,
-            (
-                String,
-                i64,
-                String,
-                String,
-                DateTime<Utc>,
-                Option<DateTime<Utc>>,
-                Option<i64>,
-            ),
-        >(
-            r#"
-            SELECT rule_ref, enforcement_id, trigger_ref, status, created, resolved_at, event_id
-            FROM (
-                SELECT DISTINCT ON (rule_ref)
-                    rule_ref,
-                    id AS enforcement_id,
-                    trigger_ref,
-                    status::text AS status,
-                    created,
-                    resolved_at,
-                    event AS event_id
-                FROM enforcement
-                WHERE created >= $1
-                  AND created < $2
-                ORDER BY rule_ref ASC, created DESC, id DESC
-            ) latest
-            ORDER BY rule_ref ASC, enforcement_id DESC
-            "#,
-        )
-        .bind(effective_time_range.start)
-        .bind(effective_time_range.end)
-        .fetch_all(&state.db)
-        .await?
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(
-            |(rule_ref, enforcement_id, trigger_ref, status, created, resolved_at, event_id)| {
-                LastEnforcementSourceRow {
-                    rule_ref,
-                    enforcement_id,
-                    trigger_ref,
-                    status,
-                    created,
-                    resolved_at,
-                    event_id,
-                }
-            },
-        )
-        .collect())
-}
-
 async fn execute_source_handler(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
@@ -4538,9 +3074,9 @@ async fn execute_source_handler(
                         .collect()
                 });
             let status_refs = statuses.iter().map(String::as_str).collect::<Vec<_>>();
-            let rows = query_latest_execution_rows(
-                state,
-                effective_time_range,
+            let rows = AnalyticsRepository::dashboard_latest_execution_rows(
+                &state.db,
+                &analytics_range,
                 action_refs.as_ref(),
                 &status_refs,
             )
@@ -4572,9 +3108,9 @@ async fn execute_source_handler(
 
             let action_refs = effective_action_refs(state, source_scope).await?;
             let path = resolve_required_result_path(source, request_filters)?;
-            let rows = query_latest_execution_rows(
-                state,
-                effective_time_range,
+            let rows = AnalyticsRepository::dashboard_latest_execution_rows(
+                &state.db,
+                &analytics_range,
                 action_refs.as_ref(),
                 &TERMINAL_EXECUTION_STATUSES,
             )
@@ -4644,9 +3180,9 @@ async fn execute_source_handler(
                 resolve_optional_source_bool_param(source, request_filters, "include_in_flight")?
                     .unwrap_or(false);
             let rows = if include_in_flight {
-                query_latest_execution_rows(
-                    state,
-                    effective_time_range,
+                AnalyticsRepository::dashboard_latest_execution_rows(
+                    &state.db,
+                    &analytics_range,
                     action_refs.as_ref(),
                     &[
                         "requested",
@@ -4663,9 +3199,9 @@ async fn execute_source_handler(
                 )
                 .await?
             } else {
-                query_latest_execution_rows(
-                    state,
-                    effective_time_range,
+                AnalyticsRepository::dashboard_latest_execution_rows(
+                    &state.db,
+                    &analytics_range,
                     action_refs.as_ref(),
                     &TERMINAL_EXECUTION_STATUSES,
                 )
@@ -4689,14 +3225,14 @@ async fn execute_source_handler(
         }
         "execution_count" | "execution_timeseries" => {
             let action_refs = effective_action_refs(state, source_scope).await?;
-            let rows = execute_execution_throughput_with_cutover(
-                state,
-                effective_time_range,
+            let rows = AnalyticsRepository::dashboard_bucket_rows(
+                &state.db,
+                &analytics_range,
+                DashboardBucketKind::ExecutionThroughput,
                 action_refs.as_ref(),
             )
             .await?;
-            meta.freshness_mode = rows.freshness_mode;
-            meta.aggregate_watermark = rows.aggregate_watermark;
+            apply_read_coverage(&mut meta, rows.metadata);
             meta.unit_hints = json_object([("count", "count")]);
             meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
             JsonValue::Array(
@@ -4713,14 +3249,14 @@ async fn execute_source_handler(
         }
         "execution_status_breakdown" => {
             let action_refs = effective_action_refs(state, source_scope).await?;
-            let rows = execute_execution_status_with_cutover(
-                state,
-                effective_time_range,
+            let rows = AnalyticsRepository::dashboard_bucket_rows(
+                &state.db,
+                &analytics_range,
+                DashboardBucketKind::ExecutionStatus,
                 action_refs.as_ref(),
             )
             .await?;
-            meta.freshness_mode = rows.freshness_mode;
-            meta.aggregate_watermark = rows.aggregate_watermark;
+            apply_read_coverage(&mut meta, rows.metadata);
             meta.unit_hints = json_object([("count", "count")]);
             meta.ordering = vec!["bucket_start".to_string(), "status".to_string()];
             JsonValue::Array(
@@ -4750,9 +3286,9 @@ async fn execute_source_handler(
             ]);
             meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
             let action_refs = effective_action_refs(state, source_scope).await?;
-            let rows = query_execution_duration_stats_rows(
-                state,
-                effective_time_range,
+            let rows = AnalyticsRepository::dashboard_execution_duration_stats_rows(
+                &state.db,
+                &analytics_range,
                 action_refs.as_ref(),
             )
             .await?;
@@ -4760,14 +3296,14 @@ async fn execute_source_handler(
         }
         "event_count" | "event_timeseries" => {
             let trigger_refs = effective_trigger_refs(state, source_scope).await?;
-            let rows = execute_event_volume_with_cutover(
-                state,
-                effective_time_range,
+            let rows = AnalyticsRepository::dashboard_bucket_rows(
+                &state.db,
+                &analytics_range,
+                DashboardBucketKind::EventVolume,
                 trigger_refs.as_ref(),
             )
             .await?;
-            meta.freshness_mode = rows.freshness_mode;
-            meta.aggregate_watermark = rows.aggregate_watermark;
+            apply_read_coverage(&mut meta, rows.metadata);
             meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
             JsonValue::Array(
                 rows.data
@@ -4786,8 +3322,12 @@ async fn execute_source_handler(
             meta.freshness_mode = DashboardFreshnessMode::RawOnly;
             meta.ordering = vec!["trigger_ref".to_string(), "event_id".to_string()];
             let trigger_refs = effective_trigger_refs(state, source_scope).await?;
-            let rows =
-                query_last_event_rows(state, effective_time_range, trigger_refs.as_ref()).await?;
+            let rows = AnalyticsRepository::dashboard_last_event_rows(
+                &state.db,
+                &analytics_range,
+                trigger_refs.as_ref(),
+            )
+            .await?;
             JsonValue::Array(rows.into_iter().map(serialized_row).collect())
         }
         "enforcement_count" | "enforcement_timeseries" => {
@@ -4825,8 +3365,12 @@ async fn execute_source_handler(
             meta.freshness_mode = DashboardFreshnessMode::RawOnly;
             meta.ordering = vec!["rule_ref".to_string(), "enforcement_id".to_string()];
             let rule_refs = effective_rule_refs(state, source_scope).await?;
-            let rows = query_last_enforcement_rows(state, effective_time_range, rule_refs.as_ref())
-                .await?;
+            let rows = AnalyticsRepository::dashboard_last_enforcement_rows(
+                &state.db,
+                &analytics_range,
+                rule_refs.as_ref(),
+            )
+            .await?;
             JsonValue::Array(rows.into_iter().map(serialized_row).collect())
         }
         "inquiry_backlog" => {
@@ -4834,9 +3378,12 @@ async fn execute_source_handler(
             meta.unit_hints = json_object([("pending_count", "count"), ("overdue_count", "count")]);
             meta.ordering = vec!["pack_ref".to_string(), "assigned_to".to_string()];
             let assigned_to = resolve_source_param_i64(source, request_filters, "assigned_to")?;
-            let rows =
-                query_inquiry_backlog_rows(state, source_scope.pack_refs.as_ref(), assigned_to)
-                    .await?;
+            let rows = AnalyticsRepository::dashboard_inquiry_backlog_rows(
+                &state.db,
+                source_scope.pack_refs.as_ref(),
+                assigned_to,
+            )
+            .await?;
             JsonValue::Array(rows.into_iter().map(serialized_row).collect())
         }
         "inquiry_sla" => {
@@ -4868,9 +3415,9 @@ async fn execute_source_handler(
                     source.source_id
                 )));
             }
-            let rows = query_inquiry_sla_rows(
-                state,
-                effective_time_range,
+            let rows = AnalyticsRepository::dashboard_inquiry_sla_rows(
+                &state.db,
+                &analytics_range,
                 source_scope.pack_refs.as_ref(),
                 assigned_to,
                 sla_target_seconds,
@@ -5023,9 +3570,12 @@ async fn execute_source_handler(
             ]);
             meta.ordering = vec!["bucket_start".to_string(), "queue_ref".to_string()];
             let queue_refs = effective_queue_refs(state, source_scope).await?;
-            let rows =
-                query_queue_throughput_rows(state, effective_time_range, queue_refs.as_ref())
-                    .await?;
+            let rows = AnalyticsRepository::dashboard_queue_throughput_rows(
+                &state.db,
+                &analytics_range,
+                queue_refs.as_ref(),
+            )
+            .await?;
             JsonValue::Array(rows.into_iter().map(serialized_row).collect())
         }
         "queue_dispatch_stats" => {
@@ -5043,9 +3593,12 @@ async fn execute_source_handler(
                 "status".to_string(),
             ];
             let queue_refs = effective_queue_refs(state, source_scope).await?;
-            let rows =
-                query_queue_dispatch_stats_rows(state, effective_time_range, queue_refs.as_ref())
-                    .await?;
+            let rows = AnalyticsRepository::dashboard_queue_dispatch_stats_rows(
+                &state.db,
+                &analytics_range,
+                queue_refs.as_ref(),
+            )
+            .await?;
             JsonValue::Array(rows.into_iter().map(serialized_row).collect())
         }
         _ => return Ok(unsupported_source_result(source, "unsupported")),
@@ -6235,24 +4788,17 @@ fn source_window_bound(source_type: &str) -> Option<SourceWindowBound> {
         "enforcement_count"
         | "enforcement_timeseries"
         | "inquiry_sla"
-        | "execution_duration_stats" => Some(SourceWindowBound {
-            cost_class: SourceCostClass::HighCostRaw,
-            max_window_seconds: MAX_HIGH_COST_SOURCE_WINDOW_SECONDS,
-            freshness_mode_hint: DashboardFreshnessMode::RawOnly,
-        }),
-        "queue_throughput" | "queue_dispatch_stats" => Some(SourceWindowBound {
-            cost_class: SourceCostClass::HighCostRaw,
-            max_window_seconds: MAX_HIGH_COST_SOURCE_WINDOW_SECONDS,
-            freshness_mode_hint: DashboardFreshnessMode::RawOnly,
-        }),
-        "execution_count"
+        | "execution_duration_stats"
+        | "queue_throughput"
+        | "queue_dispatch_stats"
+        | "execution_count"
         | "execution_timeseries"
         | "execution_status_breakdown"
         | "event_count"
         | "event_timeseries" => Some(SourceWindowBound {
-            cost_class: SourceCostClass::RawFallbackBounded,
-            max_window_seconds: MAX_RAW_FALLBACK_WINDOW_SECONDS,
-            freshness_mode_hint: DashboardFreshnessMode::RawOnlyFallback,
+            cost_class: SourceCostClass::HighCostRaw,
+            max_window_seconds: MAX_HIGH_COST_SOURCE_WINDOW_SECONDS,
+            freshness_mode_hint: DashboardFreshnessMode::RawOnly,
         }),
         _ => None,
     }
@@ -6362,6 +4908,10 @@ mod tests {
     use super::*;
     use attune_common::auth::jwt::{Claims, TokenType};
     use attune_common::rbac::{Grant, GrantConstraints, Resource};
+    use attune_common::repositories::analytics::{
+        ExecutionDurationStatsSourceRow, InquiryBacklogSourceRow, InquirySlaSourceRow,
+        QueueDispatchStatsSourceRow, QueueThroughputSourceRow,
+    };
     use serde_json::json;
 
     fn valid_spec() -> JsonValue {
@@ -6466,28 +5016,6 @@ mod tests {
     }
 
     #[test]
-    fn bucketed_cutover_source_types_use_matching_watermark_and_query_views() {
-        let cases = [
-            ("execution_count", "execution_status_hourly"),
-            ("execution_timeseries", "execution_status_hourly"),
-            ("execution_status_breakdown", "execution_status_hourly"),
-            ("event_count", "event_volume_hourly"),
-            ("event_timeseries", "event_volume_hourly"),
-        ];
-
-        for (source_type, expected_view) in cases {
-            let kind = BucketedCutoverKind::for_source_type(source_type)
-                .expect("bucketed source type should map to a cutover kind");
-            assert_eq!(kind.aggregate_query_view_name(), expected_view);
-            assert_eq!(
-                kind.aggregate_watermark_view_name(),
-                kind.aggregate_query_view_name(),
-                "watermark and aggregate query view must stay aligned for source_type={source_type}"
-            );
-        }
-    }
-
-    #[test]
     fn parse_time_window_supports_standard_units() {
         assert_eq!(parse_time_window("15m").unwrap(), Duration::minutes(15));
         assert_eq!(parse_time_window("2h").unwrap(), Duration::hours(2));
@@ -6527,18 +5055,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_source_window_bounds_rejects_raw_fallback_windows_over_limit() {
+    fn validate_source_window_bounds_rejects_bucketed_raw_windows_over_limit() {
         let range = effective_range_for_test(Duration::days(8));
         let violation = validate_source_window_bounds("event_timeseries", &range)
-            .expect_err("fallback-bounded source should be bounded");
-        assert_eq!(violation.cost_class, SourceCostClass::RawFallbackBounded);
+            .expect_err("raw source should be bounded");
+        assert_eq!(violation.cost_class, SourceCostClass::HighCostRaw);
         assert_eq!(
             violation.max_window_seconds,
-            MAX_RAW_FALLBACK_WINDOW_SECONDS
+            MAX_HIGH_COST_SOURCE_WINDOW_SECONDS
         );
         assert!(matches!(
             violation.freshness_mode_hint,
-            DashboardFreshnessMode::RawOnlyFallback
+            DashboardFreshnessMode::RawOnly
         ));
     }
 
@@ -6558,13 +5086,13 @@ mod tests {
         };
         let range = effective_range_for_test(Duration::days(8));
         let violation = validate_source_window_bounds(&source.source_type, &range)
-            .expect_err("range should violate fallback bound");
+            .expect_err("range should violate raw query bound");
         let result = source_window_bound_violation_result(&source, &range, violation);
 
         assert_eq!(result.status, DashboardSourceStatus::Invalid);
         assert!(matches!(
             result.meta.freshness_mode,
-            DashboardFreshnessMode::RawOnlyFallback
+            DashboardFreshnessMode::RawOnly
         ));
         let error = result.error.expect("error should be set");
         assert_eq!(error.code, "window_bounds_exceeded");
@@ -7368,6 +5896,74 @@ mod tests {
             TERMINAL_EXECUTION_STATUSES,
             ["completed", "failed", "timeout", "cancelled", "abandoned"]
         );
+    }
+
+    #[tokio::test]
+    async fn stale_cache_does_not_claim_current_database_summary_coverage() {
+        use attune_common::repositories::native_maintenance::read::{
+            ReadMetadata, ReadMode, ReadRange,
+        };
+        let now = Utc::now();
+        let mut meta = default_source_meta();
+        apply_read_coverage(
+            &mut meta,
+            ReadMetadata {
+                mode: ReadMode::SummaryOnly,
+                summary_ranges: vec![ReadRange {
+                    start: now - Duration::hours(2),
+                    end: now - Duration::hours(1),
+                }],
+                raw_ranges: vec![],
+                oldest_refresh: Some(now),
+            },
+        );
+        assert!(meta.aggregate_watermark.is_some());
+        let cache = DashboardSourceCache::new();
+        cache
+            .insert_with_ttls(
+                "native-stale".to_string(),
+                DashboardSourceResult {
+                    source_id: "count".to_string(),
+                    source_type: "execution_count".to_string(),
+                    status: DashboardSourceStatus::Ok,
+                    data: Some(json!([{"count": 5}])),
+                    meta,
+                    error: None,
+                },
+                StdDuration::ZERO,
+                StdDuration::from_secs(60),
+            )
+            .await;
+        assert!(cache.get_fresh("native-stale").await.is_none());
+        let mut stale = cache.get_stale("native-stale").await.unwrap();
+        mark_cached_fallback(&mut stale, true);
+        assert_eq!(stale.status, DashboardSourceStatus::Stale);
+        assert_eq!(
+            serde_json::to_value(stale.meta.freshness_mode).unwrap(),
+            "cache_rawfallback"
+        );
+        assert!(stale.meta.read_coverage.is_none());
+        assert!(stale.meta.aggregate_watermark.is_none());
+        assert!(stale.meta.cache_hit);
+        assert_eq!(stale.data, Some(json!([{"count":5}])));
+    }
+
+    #[test]
+    fn stale_cache_does_not_intercept_generic_sql_or_application_errors() {
+        for error in [
+            ApiError::DatabaseError("column refreshed_at does not exist".to_string()),
+            ApiError::InternalServerError("invalid count decoding".to_string()),
+            ApiError::BadRequest("invalid source parameters".to_string()),
+            ApiError::Forbidden("source access changed".to_string()),
+        ] {
+            assert!(!stale_cache_error_retryable(&error), "{error}");
+        }
+        assert!(stale_cache_error_retryable(
+            &ApiError::RetryableDatabaseError
+        ));
+        assert!(stale_cache_error_retryable(&ApiError::BadGateway(
+            "upstream unavailable".to_string()
+        )));
     }
 
     #[test]

@@ -331,6 +331,39 @@ export function isPromotionConflictError(error: unknown): boolean {
   return cacheErrorCode(error) === CacheErrorCode.PRECONDITION_FAILED;
 }
 
+export function getRefreshInProgressDetails(error: unknown): {
+  generationId: number;
+  executionId: number | null;
+} | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  const body: unknown = error.body;
+  if (
+    !body ||
+    typeof body !== "object" ||
+    !("code" in body) ||
+    body.code !== CacheErrorCode.REFRESH_IN_PROGRESS ||
+    !("details" in body)
+  ) {
+    return null;
+  }
+  const details = body.details;
+  if (
+    !details ||
+    typeof details !== "object" ||
+    !("generation_id" in details) ||
+    typeof details.generation_id !== "number" ||
+    !("created_by_execution" in details) ||
+    (details.created_by_execution !== null &&
+      typeof details.created_by_execution !== "number")
+  ) {
+    return null;
+  }
+  return {
+    generationId: details.generation_id,
+    executionId: details.created_by_execution,
+  };
+}
+
 /** The active generation is past its freshness target and `require_fresh` was set. */
 export function isCacheStaleError(error: unknown): boolean {
   return cacheErrorCode(error) === CacheErrorCode.STALE;

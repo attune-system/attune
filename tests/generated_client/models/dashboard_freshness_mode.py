@@ -2,10 +2,10 @@ from enum import StrEnum
 
 
 class DashboardFreshnessMode(StrEnum):
-    AGGREGATE_ONLY = "aggregate_only"
-    AGGREGATE_PLUS_TAIL = "aggregate_plus_tail"
+    CACHE_RAWFALLBACK = "cache_rawfallback"
     RAW_ONLY = "raw_only"
-    RAW_ONLY_FALLBACK = "raw_only_fallback"
+    SUMMARY_ONLY = "summary_only"
+    SUMMARY_PLUS_RAW = "summary_plus_raw"
 
     def __str__(self) -> str:
         return str(self.value)

@@ -252,6 +252,11 @@ impl IdentityRepository {
         id: Id,
     ) -> Result<DeleteIdentityOutcome> {
         let mut tx = pool.begin().await?;
+        super::cache::CacheEntryRepository::protect_transaction(
+            &mut tx,
+            super::cache::CacheTransactionMode::Write,
+        )
+        .await?;
         let identity_exists =
             sqlx::query_scalar::<_, Id>("SELECT id FROM identity WHERE id = $1 FOR UPDATE")
                 .bind(id)

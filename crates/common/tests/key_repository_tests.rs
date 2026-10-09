@@ -576,8 +576,8 @@ async fn test_delete_key_when_pack_deleted() {
         .unwrap();
 
     // Delete the pack - this will fail because key references it
-    use attune_common::repositories::{pack::PackRepository, Delete as _};
-    let delete_result = PackRepository::delete(&pool, pack.id).await;
+    use attune_common::repositories::pack::PackRepository;
+    let delete_result = PackRepository::delete(&*pool, pack.id).await;
 
     // Should fail due to foreign key constraint (no CASCADE on key table)
     assert!(delete_result.is_err());

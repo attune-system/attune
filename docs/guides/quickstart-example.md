@@ -6,7 +6,7 @@ This guide walks you through running the pre-seeded example that echoes "hello, 
 
 ## Prerequisites
 
-- PostgreSQL 14+ running
+- Stock PostgreSQL 16+ running, no TimescaleDB extension required
 - RabbitMQ 3.12+ running
 - Rust toolchain installed
 - Database migrations applied

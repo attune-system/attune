@@ -36,9 +36,10 @@ use attune_common::{
             CacheEntryInput, CacheEntryRepository, CacheGenerationRepository,
             CacheIngestRepository, CacheNamespaceFreshnessFilter, CacheNamespaceGrantFilter,
             CacheNamespacePolicy, CacheNamespaceReadVisibility, CacheNamespaceRepository,
-            CacheOwnerScope, CreateCacheGenerationInput, CreateCacheGenerationResult,
-            CreateCacheNamespaceInput, InsertCacheChunkResult, SealCacheGenerationInput,
-            MAX_INGEST_CHUNK_BYTES, MAX_MULTI_LOOKUP_IDS, MAX_SCAN_PAGE_SIZE,
+            CacheOwnerScope, CacheTransactionMode, CreateCacheGenerationInput,
+            CreateCacheGenerationResult, CreateCacheNamespaceInput, InsertCacheChunkResult,
+            SealCacheGenerationInput, MAX_INGEST_CHUNK_BYTES, MAX_MULTI_LOOKUP_IDS,
+            MAX_SCAN_PAGE_SIZE,
         },
         pack::PackRepository,
         sensor_admission::SensorAdmissionRepository,
@@ -114,6 +115,10 @@ pub enum CacheApiError {
         status: StatusCode,
         code: &'static str,
         message: String,
+    },
+    RefreshInProgress {
+        generation_id: Id,
+        created_by_execution: Option<Id>,
     },
 }
 
@@ -197,13 +202,25 @@ impl From<ApiError> for CacheApiError {
 
 impl From<CommonError> for CacheApiError {
     fn from(err: CommonError) -> Self {
+        if let CommonError::Database(error) = &err {
+            if matches!(
+                error.as_database_error().and_then(|e| e.code()).as_deref(),
+                Some("55P03" | "57014")
+            ) {
+                return Self::coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "cache_storage_busy",
+                    "cache storage is busy; retry with the same refresh ID",
+                );
+            }
+        }
         Self::Api(ApiError::from(err))
     }
 }
 
 impl From<sqlx::Error> for CacheApiError {
     fn from(err: sqlx::Error) -> Self {
-        Self::Api(ApiError::from(err))
+        Self::from(CommonError::Database(err))
     }
 }
 
@@ -211,6 +228,21 @@ impl IntoResponse for CacheApiError {
     fn into_response(self) -> Response {
         match self {
             Self::Api(err) => err.into_response(),
+            Self::RefreshInProgress {
+                generation_id,
+                created_by_execution,
+            } => (
+                StatusCode::CONFLICT,
+                Json(
+                    ErrorResponse::new("cache namespace already has an unpublished generation")
+                        .with_code("cache_refresh_in_progress")
+                        .with_details(serde_json::json!({
+                            "generation_id": generation_id,
+                            "created_by_execution": created_by_execution,
+                        })),
+                ),
+            )
+                .into_response(),
             Self::Coded {
                 status,
                 code,
@@ -250,6 +282,13 @@ type CacheResult<T> = Result<T, CacheApiError>;
 /// while never revealing inaccessible existence.
 fn map_write_error(err: CommonError) -> CacheApiError {
     match &err {
+        CommonError::CacheRefreshInProgress {
+            generation_id,
+            created_by_execution,
+        } => CacheApiError::RefreshInProgress {
+            generation_id: *generation_id,
+            created_by_execution: *created_by_execution,
+        },
         // Typed cache ingestion/lifecycle errors carry no raw external IDs and
         // get distinct, actionable machine codes.
         CommonError::CacheDuplicateExternalId => CacheApiError::coded(
@@ -291,6 +330,7 @@ fn map_write_error(err: CommonError) -> CacheApiError {
 
 fn audit_write_error_reason(err: &CommonError) -> &'static str {
     match err {
+        CommonError::CacheRefreshInProgress { .. } => "refresh_in_progress",
         CommonError::CacheQuotaExceeded { .. } => "quota",
         CommonError::Validation(message) if message.to_ascii_lowercase().contains("quota") => {
             "quota"
@@ -684,8 +724,10 @@ async fn authorize_namespace_action(
 async fn begin_cache_transaction<'a>(
     state: &'a AppState,
     user: &AuthenticatedUser,
+    mode: CacheTransactionMode,
 ) -> CacheResult<sqlx::Transaction<'a, sqlx::Postgres>> {
     let mut tx = state.db.begin().await?;
+    CacheEntryRepository::protect_transaction(&mut tx, mode).await?;
     if user.claims.token_type == TokenType::Sensor {
         SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
         let sensor_ref = user
@@ -1004,6 +1046,7 @@ fn generation_response(generation: &CacheGeneration) -> CacheGenerationResponse 
         checksum: generation.checksum.clone(),
         source_revision: generation.source_revision.clone(),
         created_by: generation.created_by,
+        created_by_execution: generation.created_by_execution,
         created: generation.created,
         sealed: generation.sealed,
         activated: generation.activated,
@@ -1068,6 +1111,7 @@ fn namespace_response(
         max_retained_bytes: namespace.max_retained_bytes,
         max_retained_generations: namespace.max_retained_generations,
         max_staging_generations: namespace.max_staging_generations,
+        refresh_concurrency: namespace.refresh_concurrency,
         tombstoned: namespace.tombstoned_at.is_some(),
         retired_at: namespace.retired_at,
         created: namespace.created,
@@ -1182,6 +1226,7 @@ fn policy_from_body(
     body: &CacheNamespacePolicyBody,
 ) -> CacheNamespacePolicy {
     CacheNamespacePolicy {
+        refresh_concurrency: body.refresh_concurrency.unwrap_or(base.refresh_concurrency),
         freshness_target_seconds: body
             .freshness_target_seconds
             .unwrap_or(base.freshness_target_seconds),
@@ -1282,7 +1327,7 @@ pub async fn list_namespaces(
                 None,
             )
         };
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Read).await?;
     let page = match scope {
         CacheNamespaceListScope::Any => {
             let visibility = compile_cache_namespace_read_visibility(&authority);
@@ -1401,7 +1446,7 @@ pub async fn create_namespace(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Write).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         request.owner_type,
@@ -1477,7 +1522,7 @@ pub async fn show_namespace(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Read).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         query.owner_type,
@@ -1529,7 +1574,7 @@ pub async fn update_namespace(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Write).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         request.owner_type,
@@ -1545,6 +1590,7 @@ pub async fn update_namespace(
     validate_policy_body(&request.policy)?;
 
     let base = CacheNamespacePolicy {
+        refresh_concurrency: record.refresh_concurrency,
         freshness_target_seconds: record.freshness_target_seconds,
         max_records_per_generation: record.max_records_per_generation,
         max_generation_bytes: record.max_generation_bytes,
@@ -1609,7 +1655,7 @@ pub async fn delete_namespace(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Write).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         query.owner_type,
@@ -1809,7 +1855,7 @@ async fn resolve_namespace_for_read<'a>(
     let (authority, owner_ref) =
         authorize_namespace_action(state, user, Action::Read, owner_type, owner_ref, &namespace)
             .await?;
-    let mut tx = begin_cache_transaction(state, user).await?;
+    let mut tx = begin_cache_transaction(state, user, CacheTransactionMode::Read).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         owner_type,
@@ -2257,6 +2303,10 @@ async fn cache_traversal_window_seconds(connection: &mut sqlx::PgConnection) -> 
 // ---------------------------------------------------------------------------
 
 /// Begin a staging generation.
+/// Same-ID retries retain the original upload contract. A different refresh ID
+/// follows the namespace's `refresh_concurrency` policy: reuse an unpublished
+/// generation, return a conflict, or create in parallel.
+/// Execution attribution comes from authentication, never the request body.
 #[utoipa::path(
     post,
     path = "/api/v1/cache/namespaces/{namespace}/generations",
@@ -2266,12 +2316,12 @@ async fn cache_traversal_window_seconds(connection: &mut sqlx::PgConnection) -> 
     params(("namespace" = String, Path, description = "Cache namespace")),
     responses(
         (status = 201, description = "Staging generation created", body = CacheGenerationApiResponse),
-        (status = 200, description = "Matching idempotent generation replay", body = CacheGenerationApiResponse),
+        (status = 200, description = "Matching idempotent replay or existing unpublished generation reused by namespace policy", body = CacheGenerationApiResponse),
         (status = 400, description = "Invalid owner selector, namespace, or generation request", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = AuthErrorResponse),
         (status = 403, description = "Generation creation is not permitted", body = CacheForbiddenResponse),
         (status = 404, description = "Namespace not found", body = ErrorResponse),
-        (status = 409, description = "Refresh id, active-generation precondition, namespace state, or quota conflict", body = ErrorResponse),
+        (status = 409, description = "Refresh already in progress (code cache_refresh_in_progress with generation_id and created_by_execution in details), refresh id, active-generation precondition, namespace state, or quota conflict", body = ErrorResponse),
         (status = 500, description = "Generation creation failed", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -2300,7 +2350,7 @@ pub async fn create_generation(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Attach).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         request.owner_type,
@@ -2327,6 +2377,7 @@ pub async fn create_generation(
             checksum: None,
             source_revision: request.source_revision.clone(),
             created_by: user.0.identity_id().ok(),
+            created_by_execution: user.0.execution_id(),
         },
         &state.config.cache_admission,
     )
@@ -2435,7 +2486,7 @@ pub async fn upload_chunk(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Ingest).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         request.owner_type,
@@ -2570,7 +2621,7 @@ pub async fn seal_generation(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Write).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         request.owner_type,
@@ -2687,7 +2738,7 @@ pub async fn promote_generation(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Write).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         request.owner_type,
@@ -2808,7 +2859,7 @@ pub async fn abandon_generation(
         &namespace,
     )
     .await?;
-    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Write).await?;
     let scope = resolve_owner_scope(
         &mut tx,
         request.owner_type,
@@ -2954,6 +3005,40 @@ mod tests {
     use attune_common::rbac::{GrantConstraints, OwnerConstraint};
 
     const SECRET: &str = "test-cursor-signing-secret";
+
+    #[test]
+    fn omitted_refresh_concurrency_preserves_namespace_policy() {
+        use attune_common::models::CacheRefreshConcurrency;
+
+        let body: CacheNamespacePolicyBody = serde_json::from_value(serde_json::json!({})).unwrap();
+        for refresh_concurrency in [
+            CacheRefreshConcurrency::Reuse,
+            CacheRefreshConcurrency::Conflict,
+            CacheRefreshConcurrency::Parallel,
+        ] {
+            let base = CacheNamespacePolicy {
+                refresh_concurrency,
+                ..Default::default()
+            };
+            assert_eq!(policy_from_body(base.clone(), &body), base);
+        }
+    }
+
+    #[test]
+    fn refresh_conflict_maps_to_typed_error_without_generation_contents() {
+        let err = CommonError::CacheRefreshInProgress {
+            generation_id: 42,
+            created_by_execution: Some(123),
+        };
+        assert_eq!(audit_write_error_reason(&err), "refresh_in_progress");
+        assert!(matches!(
+            map_write_error(err),
+            CacheApiError::RefreshInProgress {
+                generation_id: 42,
+                created_by_execution: Some(123),
+            }
+        ));
+    }
 
     fn sample_cursor() -> CacheCursor {
         CacheCursor {

@@ -145,7 +145,7 @@ pub fn build_pack_transport_with_worker_token_provider(
                 url,
                 provider,
                 packs_base_dir,
-            )))
+            )?))
         }
         TransportMode::Auto => unreachable!("auto mode is resolved before transport construction"),
     }

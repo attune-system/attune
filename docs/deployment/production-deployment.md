@@ -2,10 +2,16 @@
 
 This document provides guidelines and checklists for deploying Attune to production environments.
 
+Attune uses stock PostgreSQL 16 or newer, with PostgreSQL 18 as the Compose and
+CI default. No TimescaleDB extension is required. Attune is pre-production and
+the current migration baseline targets fresh databases. See
+[PostgreSQL-only deployment](postgresql-only.md) for installation, DDL roles,
+explicit development resets, and the data-preserving migration policy from 1.0.0.
+
 ## Table of Contents
 
 - [Pre-Deployment Checklist](#pre-deployment-checklist)
-- [Database Configuration](#database-configuration)
+- [PostgreSQL deployment and roles](postgresql-only.md)
 - [Environment Variables](#environment-variables)
 - [Schema Verification](#schema-verification)
 - [Security Best Practices](#security-best-practices)
@@ -19,7 +25,7 @@ This document provides guidelines and checklists for deploying Attune to product
 
 Before deploying Attune to production, verify the following:
 
-- [ ] PostgreSQL 14+ database is provisioned and accessible
+- [ ] Stock PostgreSQL 16+ database is provisioned and accessible
 - [ ] RabbitMQ 3.12+ message queue is configured
 - [ ] All required environment variables are set (see below)
 - [ ] Database migrations have been tested in staging
@@ -372,8 +378,8 @@ Set up monitoring for:
 **Solution:**
 1. Check `_sqlx_migrations` table: `SELECT * FROM attune._sqlx_migrations;`
 2. Verify migrations are in correct order
-3. For fresh deployment, drop and recreate schema if safe
-4. Check PostgreSQL version compatibility (requires 14+)
+3. For a checksum mismatch, follow [PostgreSQL-only deployment](postgresql-only.md) and decide explicitly whether to convert or reset existing data.
+4. Check PostgreSQL version compatibility. Attune requires 16 or newer.
 
 ---
 
@@ -394,11 +400,11 @@ If issues occur after deployment:
 
 ## Additional Resources
 
-- [Configuration Guide](./configuration.md)
-- [Schema-Per-Test Architecture](./schema-per-test.md)
-- [API Documentation](./api-overview.md)
-- [Security Best Practices](./security.md)
-- [Monitoring and Observability](./monitoring.md)
+- [Configuration guide](../configuration/configuration.md)
+- [Template-cloned test databases](../testing/schema-per-test.md)
+- [API documentation](../api/)
+- [Security best practices](#security-best-practices)
+- [Operational visibility](operational-visibility.md)
 
 ---
 

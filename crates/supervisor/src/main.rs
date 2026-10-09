@@ -3,6 +3,7 @@
 //! Owns platform maintenance loops such as runtime database retention.
 
 mod cache_retention;
+mod native_maintenance;
 mod object_retention;
 mod storage_migration;
 
@@ -11,7 +12,7 @@ use attune_supervisor::artifact_cleanup;
 use std::{
     process,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
     },
     time::Duration,
@@ -39,7 +40,8 @@ use attune_common::{
             MaintenanceRepository, QueueRemediationResult, StaleExecutionCandidate,
             WorkflowRemediationResult,
         },
-        retention::{RetentionRepository, RetentionTarget, RetentionTargetResult},
+        native_maintenance::schedule::{MaintenanceJob, ScheduleRepository},
+        retention::{RetentionRepository, RetentionTargetFailure, RetentionTargetResult},
         storage_maintenance::StorageMaintenanceRepository,
         workflow_cache_iteration::{
             StaleSyntheticCacheIterationCompletion, WorkflowCacheIterationRepository,
@@ -48,7 +50,7 @@ use attune_common::{
     },
     system_alert::{emit_core_alert, SystemAlert},
 };
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use sqlx::PgPool;
@@ -113,6 +115,7 @@ struct SupervisorServiceInner {
     run_id: Mutex<Option<String>>,
     cache_retention_state: Arc<cache_retention::CacheRetentionState>,
     artifact_reconciliation_cursor: AtomicI64,
+    shutdown_requested: AtomicBool,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -131,6 +134,11 @@ impl SupervisorService {
     async fn new(config: Config) -> Result<Self> {
         let db = Database::new(&config.database).await?;
         RetentionRepository::seed_cache_config_if_empty(db.pool(), &config.cache_retention).await?;
+        RetentionRepository::seed_native_config_if_empty(
+            db.pool(),
+            &config.retention.native_maintenance,
+        )
+        .await?;
         let (mq_connection, publisher) = Self::initialize_publisher(&config).await?;
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -145,6 +153,7 @@ impl SupervisorService {
                 run_id: Mutex::new(None),
                 cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
                 artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
                 shutdown_tx,
             }),
         })
@@ -185,11 +194,11 @@ impl SupervisorService {
 
     async fn start(&self) -> Result<()> {
         let mut shutdown_rx = self.inner.shutdown_tx.subscribe();
-        let mut interval = Duration::from_secs(self.inner.config.retention.check_interval_seconds);
+        let mut interval = Duration::from_secs(60);
 
         info!(
             fallback_check_interval_seconds = self.inner.config.retention.check_interval_seconds,
-            "Supervisor retention loop started; runtime settings are loaded from the database each cycle"
+            "Supervisor maintenance scheduler started; runtime settings are loaded from the database each cycle"
         );
 
         let mut cycle_reason = SupervisorCycleReason::StartupRecovery;
@@ -199,7 +208,7 @@ impl SupervisorService {
                     interval = next_interval;
                 }
                 Err(err) => {
-                    error!("Retention cycle failed: {}", err);
+                    error!("Supervisor maintenance cycle failed: {}", err);
                 }
             }
             cycle_reason = SupervisorCycleReason::Scheduled;
@@ -218,13 +227,34 @@ impl SupervisorService {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        self.inner.shutdown_requested.store(true, Ordering::Release);
         let _ = self.inner.shutdown_tx.send(());
         Ok(())
     }
 
     async fn run_retention_cycle(&self, cycle_reason: SupervisorCycleReason) -> Result<Duration> {
-        let retention = RetentionRepository::load_config(&self.inner.pool).await?;
-        let interval = Duration::from_secs(retention.check_interval_seconds);
+        self.run_retention_cycle_at(cycle_reason, Utc::now()).await
+    }
+
+    async fn run_retention_cycle_at(
+        &self,
+        cycle_reason: SupervisorCycleReason,
+        now: DateTime<Utc>,
+    ) -> Result<Duration> {
+        if self.inner.shutdown_requested.load(Ordering::Acquire) {
+            return Ok(Duration::from_secs(60));
+        }
+        let mut shutdown_rx = self.inner.shutdown_tx.subscribe();
+        let mut cancelled = false;
+        let mut retention = RetentionRepository::load_config(&self.inner.pool).await?;
+        let native_validation_error = retention.native_maintenance.validate().err();
+        if native_validation_error.is_some() {
+            // Retention's worker-history invalidation also uses native timeout
+            // settings. Keep its row-delete fallback valid at this boundary.
+            retention.native_maintenance = Default::default();
+            retention.native_maintenance.enabled = false;
+        }
+        let interval = native_maintenance::poll_interval(&retention);
 
         let mut conn = self.inner.pool.acquire().await?;
 
@@ -235,20 +265,50 @@ impl SupervisorService {
             );
             return Ok(interval);
         }
+        // Session locks survive transaction rollback. A cancelled/panicking
+        // leader must never return its locked connection to the pool.
+        conn.close_on_drop();
 
         let cycle_result = async {
             let cycle_reason = self.ensure_supervisor_run(cycle_reason).await?;
+            ScheduleRepository::ensure(&self.inner.pool, now).await?;
             info!(
                 cycle_reason = cycle_reason.log_label(),
                 check_interval_seconds = retention.check_interval_seconds,
                 "Starting supervisor maintenance cycle"
             );
+            // Reconcile future routing before source expiry. This is one bounded
+            // attempt, never a catch-up loop ahead of housekeeping.
+            if native_validation_error.is_none() {
+                self.run_native_maintenance(
+                    &retention,
+                    cycle_reason,
+                    now,
+                    &[MaintenanceJob::Partition],
+                )
+                .await;
+            }
+            if self.inner.shutdown_requested.load(Ordering::Acquire) {
+                return Ok(());
+            }
 
-            if retention.enabled {
+            // Housekeeping retains its original cadence. A summary tick does not
+            // trigger row retention, cache expiry, or artifact cleanup again.
+            let retention_due = ScheduleRepository::begin_attempt(
+                &self.inner.pool,
+                MaintenanceJob::Retention,
+                now,
+                retention.check_interval_seconds,
+                false,
+            )
+            .await?;
+            let mut retention_success = true;
+            if retention_due && retention.enabled {
                 let targets = RetentionRepository::configured_targets(&retention.targets);
                 info!(
                     target_count = targets.len(),
                     batch_size = retention.batch_size,
+                    max_batches_per_target = retention.max_batches_per_target,
                     dry_run = retention.dry_run,
                     "Starting retention target cleanup"
                 );
@@ -262,12 +322,18 @@ impl SupervisorService {
                         continue;
                     };
 
-                    match RetentionRepository::run_target(
+                    match RetentionRepository::run_target_bounded(
                         &self.inner.pool,
                         target.target,
                         max_age_seconds,
-                        retention.batch_size,
-                        retention.dry_run,
+                        &retention,
+                        || {
+                            cancelled |= self.inner.shutdown_requested.load(Ordering::Acquire) || !matches!(
+                                shutdown_rx.try_recv(),
+                                Err(broadcast::error::TryRecvError::Empty)
+                            );
+                            cancelled
+                        },
                     )
                     .await
                     {
@@ -289,17 +355,23 @@ impl SupervisorService {
                             }
                         }
                         Err(err) => {
+                            retention_success = false;
                             warn!(
                                 target = target.target.name(),
+                                cutoff = %err.cutoff,
+                                candidates = ?err.candidates,
+                                deleted = err.deleted,
+                                partitions_dropped = err.partitions_dropped,
+                                partition_candidates = err.partition_candidates,
+                                candidates_exact = err.candidates_exact,
                                 error = %err,
                                 "Retention target failed"
                             );
                             if let Err(audit_err) = self
                                 .audit_retention_target_failed(
-                                    target.target,
+                                    &err,
                                     max_age_seconds,
                                     &retention,
-                                    err.to_string(),
                                 )
                                 .await
                             {
@@ -311,18 +383,58 @@ impl SupervisorService {
                             }
                         }
                     }
+                    if cancelled {
+                        ScheduleRepository::finish_attempt(
+                            &self.inner.pool,
+                            MaintenanceJob::Retention,
+                            now,
+                            retention.check_interval_seconds,
+                            false,
+                        )
+                        .await?;
+                        info!("Retention cancelled at a batch boundary");
+                        return Ok(());
+                    }
                 }
-            } else {
+            } else if retention_due {
                 info!(
                     check_interval_seconds = retention.check_interval_seconds,
                     "Runtime retention is disabled in database config; running non-retention maintenance only"
                 );
             }
 
-            self.run_cache_retention_step(&retention.cache_retention)
-                .await;
+            if retention_due {
+                self.run_cache_retention_step(&retention.cache_retention).await;
+            }
 
-            self.run_maintenance_cycle(&retention).await;
+            // Startup remediation still runs when a previous leader completed
+            // retention recently. Summary catch-up gets a turn after housekeeping.
+            if retention_due || !matches!(cycle_reason, SupervisorCycleReason::Scheduled) {
+                self.run_maintenance_cycle(&retention).await;
+            }
+            if retention_due {
+                ScheduleRepository::finish_attempt(
+                    &self.inner.pool,
+                    MaintenanceJob::Retention,
+                    now,
+                    retention.check_interval_seconds,
+                    retention_success,
+                )
+                .await?;
+            }
+            // Invalid persisted native settings disable only native work for
+            // this cycle, so they cannot prevent protected-row cleanup/remediation.
+            if let Some(error) = native_validation_error {
+                warn!(error, "Persisted native maintenance configuration is invalid");
+                self.report_native_problem("invalid_config", json!({"invalid_config": true})).await;
+            } else {
+                self.run_native_maintenance(
+                    &retention,
+                    cycle_reason,
+                    now,
+                    &[MaintenanceJob::Summary],
+                ).await;
+            }
 
             info!("Supervisor maintenance cycle finished");
             Ok::<(), anyhow::Error>(())
@@ -337,6 +449,9 @@ impl SupervisorService {
                 error = %err,
                 "Failed to release retention advisory lock"
             );
+        }
+        if let Err(error) = conn.close().await {
+            warn!(error = %error, "Failed to close supervisor leader session");
         }
 
         cycle_result.map(|_| interval)
@@ -370,7 +485,9 @@ impl SupervisorService {
             );
             Ok(SupervisorCycleReason::DirtyShutdownRecovery)
         } else {
-            Ok(requested_reason)
+            // This instance may have skipped its initial startup tick while
+            // another leader held the lock. Its first owned turn is still startup.
+            Ok(SupervisorCycleReason::StartupRecovery)
         }
     }
 
@@ -393,7 +510,11 @@ impl SupervisorService {
         max_age_seconds: u64,
         retention: &attune_common::config::RetentionConfig,
     ) -> Result<()> {
-        if result.candidates == 0 && result.deleted == 0 && !result.dry_run {
+        if result.candidates == 0
+            && result.deleted == 0
+            && result.partitions_dropped == 0
+            && !result.dry_run
+        {
             return Ok(());
         }
 
@@ -403,9 +524,14 @@ impl SupervisorService {
             "max_age_seconds": max_age_seconds,
             "candidates": result.candidates,
             "deleted": result.deleted,
+            "rows_deleted": result.deleted,
+            "partitions_dropped": result.partitions_dropped,
+            "partition_candidates": result.partition_candidates,
+            "candidates_exact": result.candidates_exact,
             "dry_run": result.dry_run,
             "retention_enabled": retention.enabled,
             "batch_size": retention.batch_size,
+            "max_batches_per_target": retention.max_batches_per_target,
             "advisory_lock_key": retention.advisory_lock_key,
             "service_name": self.inner.config.service_name,
             "environment": self.inner.config.environment,
@@ -429,20 +555,28 @@ impl SupervisorService {
 
     async fn audit_retention_target_failed(
         &self,
-        target: RetentionTarget,
+        failure: &RetentionTargetFailure,
         max_age_seconds: u64,
         retention: &attune_common::config::RetentionConfig,
-        error: String,
     ) -> Result<()> {
         let details = json!({
-            "target": target.name(),
+            "target": failure.target.name(),
+            "cutoff": failure.cutoff.to_rfc3339(),
+            "candidates": failure.candidates,
+            "deleted": failure.deleted,
+            "rows_deleted": failure.deleted,
+            "partitions_dropped": failure.partitions_dropped,
+            "partition_candidates": failure.partition_candidates,
+            "candidates_exact": failure.candidates_exact,
+            "deleted_count_complete": false,
             "max_age_seconds": max_age_seconds,
-            "dry_run": retention.dry_run,
+            "dry_run": failure.dry_run,
             "batch_size": retention.batch_size,
+            "max_batches_per_target": retention.max_batches_per_target,
             "advisory_lock_key": retention.advisory_lock_key,
             "service_name": self.inner.config.service_name,
             "environment": self.inner.config.environment,
-            "error": error,
+            "error": failure.to_string(),
         });
 
         let event = AuditEventBuilder::new(
@@ -453,7 +587,7 @@ impl SupervisorService {
         .actor_login("attune-supervisor")
         .actor_token_type("system")
         .resource("runtime_retention")
-        .resource_ref(target.name())
+        .resource_ref(failure.target.name())
         .with_details(details)
         .build();
 
@@ -484,9 +618,13 @@ impl SupervisorService {
             Ok(summary) => {
                 if summary.had_effect() {
                     if let Err(err) = self
-                        .audit_corrective_action(
+                        .audit_corrective_action_with_outcome(
                             "cache_retention",
-                            "cache_cleanup_cycle_completed",
+                            if summary.maintenance_failures + summary.cleanup_failures + summary.statistics_failures > 0 {
+                                "cache_cleanup_cycle_partial_failure"
+                            } else {
+                                "cache_cleanup_cycle_completed"
+                            },
                             json!({
                                 "dry_run": summary.dry_run,
                                 "namespaces_scanned": summary.namespaces_scanned,
@@ -494,10 +632,35 @@ impl SupervisorService {
                                 "cleanup_candidates": summary.cleanup_candidates,
                                 "entries_deleted": summary.entries_deleted,
                                 "generations_deleted": summary.generations_deleted,
+                                "maintenance_failures": summary.maintenance_failures,
+                                "registered_partitions": summary.registered_partitions,
+                                "partitions_created_total": summary.partitions_created_total,
+                                "partitions_dropped_total": summary.partitions_dropped_total,
+                                "cleanup_backlog_total": summary.cleanup_backlog_total,
+                                "oldest_cleanup_age_seconds": summary.oldest_cleanup_age_seconds,
+                                "reclamation_duration_ms": summary.reclamation_duration_ms,
+                                "statistics_duration_ms": summary.statistics_duration_ms,
+                                "statistics_pending": summary.statistics_pending,
+                                "storage_observed": summary.storage_observed,
+                                "statistics_age_seconds": summary.statistics_age_seconds,
+                                "statistics_refreshed": summary.statistics_refreshed,
+                                "statistics_lock_deferrals": summary.statistics_lock_deferrals,
+                                "statistics_deadline_deferrals": summary.statistics_deadline_deferrals,
+                                "statistics_failures": summary.statistics_failures,
+                                "cleanup_failures": summary.cleanup_failures,
+                                "bytes_reclaimed": summary.bytes_reclaimed,
+                                "lock_deferrals": summary.lock_deferrals,
+                                "deadline_deferrals": summary.deadline_deferrals,
+                                "cleanup_budget_exhausted": summary.cleanup_budget_exhausted,
                                 "namespaces_deleted": summary.namespaces_deleted,
                                 "freshness_alerts": summary.freshness_alerts,
                                 "staging_failure_alerts": summary.staging_failure_alerts,
                             }),
+                            if summary.maintenance_failures + summary.cleanup_failures + summary.statistics_failures > 0 {
+                                AuditOutcome::Failure
+                            } else {
+                                AuditOutcome::Success
+                            },
                         )
                         .await
                     {
@@ -1389,10 +1552,26 @@ impl SupervisorService {
         action: &str,
         details: serde_json::Value,
     ) -> Result<()> {
+        self.audit_corrective_action_with_outcome(
+            resource_type,
+            action,
+            details,
+            AuditOutcome::Success,
+        )
+        .await
+    }
+
+    async fn audit_corrective_action_with_outcome(
+        &self,
+        resource_type: &str,
+        action: &str,
+        details: serde_json::Value,
+        outcome: AuditOutcome,
+    ) -> Result<()> {
         let event = AuditEventBuilder::new(
             AuditCategory::Admin,
             event_type::maintenance::CORRECTIVE_ACTION_APPLIED,
-            AuditOutcome::Success,
+            outcome,
         )
         .actor_login("attune-supervisor")
         .actor_token_type("system")
@@ -1444,6 +1623,10 @@ fn log_target_result(result: &RetentionTargetResult) {
         cutoff = ?result.cutoff,
         candidates = result.candidates,
         deleted = result.deleted,
+        rows_deleted = result.deleted,
+        partitions_dropped = result.partitions_dropped,
+        partition_candidates = result.partition_candidates,
+        candidates_exact = result.candidates_exact,
         dry_run = result.dry_run,
         "Retention target completed"
     );
@@ -1631,6 +1814,7 @@ mod tests {
             execution::{CreateExecutionInput, ExecutionRepository},
             log_stream::LogStreamRepository,
             object_maintenance::ObjectMaintenanceRepository,
+            retention::RetentionTarget,
             Create,
         },
         test_database::TestDatabase,
@@ -1676,6 +1860,784 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_partial_failure_audit_keeps_committed_progress_and_failure_outcome() {
+        use attune_common::repositories::cache::{
+            CacheGenerationRepository, CacheNamespacePolicy, CacheNamespaceRepository,
+            CacheOwnerScope, CreateCacheGenerationInput, CreateCacheGenerationResult,
+            CreateCacheNamespaceInput,
+        };
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        let namespace = CacheNamespaceRepository::create(
+            database.pool(),
+            CreateCacheNamespaceInput {
+                owner: CacheOwnerScope::system(),
+                namespace: "owned_failure_audit".to_string(),
+                policy: CacheNamespacePolicy::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let generation = CacheGenerationRepository::create_or_get(
+            database.pool(),
+            &CreateCacheGenerationInput {
+                namespace: namespace.id,
+                client_refresh_id: "owned_failure_audit".to_string(),
+                expected_active_generation: None,
+                expected_chunk_count: 0,
+                expected_count: Some(0),
+                expected_bytes: None,
+                checksum_algorithm: None,
+                checksum: None,
+                source_revision: None,
+                created_by: None,
+                created_by_execution: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CreateCacheGenerationResult::Created(generation) = generation else {
+            panic!("expected fresh generation");
+        };
+        CacheGenerationRepository::fail(database.pool(), generation.id, "owned cleanup fixture")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION test_reject_cache_stats() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+             BEGIN
+               IF NEW.completed_revision IS DISTINCT FROM OLD.completed_revision THEN
+                 RAISE EXCEPTION 'owned statistics failure';
+               END IF;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER test_reject_cache_stats BEFORE UPDATE ON cache_entry_statistics_state
+               FOR EACH ROW EXECUTE FUNCTION test_reject_cache_stats();",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                config,
+                artifact_transport: Arc::new(VolumeTransport::new(
+                    artifacts.path().to_str().unwrap(),
+                )),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        service
+            .run_cache_retention_step(&CacheRetentionConfig::default())
+            .await;
+        let audit: serde_json::Value = sqlx::query_scalar(
+            "SELECT jsonb_build_object('outcome',outcome,'details',details) FROM audit_event
+             WHERE resource_ref='cache_cleanup_cycle_partial_failure'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(audit["outcome"], json!("failure"));
+        assert_eq!(audit["details"]["details"]["generations_deleted"], json!(1));
+        assert_eq!(audit["details"]["details"]["statistics_failures"], json!(1));
+        assert_eq!(
+            audit["details"]["details"]["partitions_dropped_total"],
+            json!(1)
+        );
+        assert_eq!(
+            audit["details"]["details"]["statistics_pending"],
+            json!(true)
+        );
+        service.inner.pool.close().await;
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_scheduler_keeps_hourly_retention_independent_and_resumes_bounded_jobs() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = false;
+        config.maintenance.monitoring_enabled = true;
+        config.maintenance.alert_limit_per_cycle = 1;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention
+            .native_maintenance
+            .max_partition_operations_per_cycle = 1;
+        retention.native_maintenance.max_summary_buckets_per_cycle = 1;
+        retention.native_maintenance.summary_bootstrap_hours = 1;
+        retention.native_maintenance.partition_lookahead_days = 1;
+        retention.native_maintenance.default_repair_row_limit = 2;
+        // This checks cadence and operation caps, not elapsed-time deadlines.
+        // Concurrent physical clones can stall DDL at shared checkpoints.
+        retention.native_maintenance.operation_timeout_milliseconds = 10_000;
+        retention
+            .native_maintenance
+            .max_partition_cycle_milliseconds = 30_000;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let now = DateTime::parse_from_rfc3339("2040-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due = $1, last_success = NULL")
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO notification (channel, entity_type, entity, activity, content, created)
+                     VALUES ('scheduler', 'execution', '1', 'completed', '{}', '2020-01-01T00:00:00Z')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO trigger (ref, label) VALUES ('core.alert', 'Core Alert') ON CONFLICT (ref) DO NOTHING")
+            .execute(database.pool()).await.unwrap();
+        sqlx::query("INSERT INTO event (trigger_ref, payload, created)
+                     SELECT 'scheduler.default', '{\"body\":\"private-native-source-body\"}', '2039-12-31T00:00:00Z'
+                     FROM generate_series(1, 5)")
+            .execute(database.pool()).await.unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                config,
+                artifact_transport: Arc::new(VolumeTransport::new(
+                    artifacts.path().to_str().unwrap(),
+                )),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::StartupRecovery, now)
+            .await
+            .unwrap();
+        let first = ScheduleRepository::status(database.pool()).await.unwrap();
+        let native_audits: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT jsonb_build_object('job', resource_ref, 'outcome', outcome, 'details', details)
+             FROM audit_event WHERE event_type = 'maintenance.native.job_completed'",
+        )
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+        for row in &first {
+            assert_eq!(
+                row.last_success,
+                Some(now),
+                "job {:?} did not get a bounded turn: {native_audits:?}",
+                row.job
+            );
+        }
+        let native_attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE event_type = 'maintenance.native.job_completed'")
+            .fetch_one(database.pool()).await.unwrap();
+        assert_eq!(native_attempts, 2);
+        let backlog_alert: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM event WHERE trigger_ref = 'core.alert'
+            AND payload->>'correlation_id' = 'supervisor:native:partition_backlog:event'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(backlog_alert["details"]["default_rows_at_least"], json!(3));
+        assert_eq!(
+            backlog_alert["details"]["default_count_exact"],
+            json!(false)
+        );
+        assert!(
+            backlog_alert["details"]["missing_future_partitions"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
+        assert!(!backlog_alert
+            .to_string()
+            .contains("private-native-source-body"));
+        // A five-minute summary tick must leave both hourly due times alone.
+        let next = now + ChronoDuration::minutes(5);
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, next)
+            .await
+            .unwrap();
+        let second = ScheduleRepository::status(database.pool()).await.unwrap();
+        let row = |job| second.iter().find(|row| row.job == job).unwrap();
+        assert_eq!(row(MaintenanceJob::Retention).last_success, Some(now));
+        assert_eq!(row(MaintenanceJob::Partition).last_success, Some(now));
+        assert_eq!(row(MaintenanceJob::Summary).last_success, Some(next));
+        assert_eq!(
+            row(MaintenanceJob::Retention).next_due,
+            now + ChronoDuration::hours(1)
+        );
+        let notifications: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM notification WHERE channel = 'scheduler'")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            notifications, 1,
+            "disabled retention must preserve expired rows while native jobs run"
+        );
+        // Enabling retention between ticks must still respect its hourly due
+        // time. Native bootstrap must not accidentally run its deletion loop.
+        retention.enabled = true;
+        retention.targets.notifications.max_age_seconds = Some(1);
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        // A replacement leader detects the dirty prior run. It reconciles
+        // partitions at startup, but still must not replay retention early.
+        *service.inner.run_id.lock().await = None;
+        service
+            .run_retention_cycle_at(
+                SupervisorCycleReason::Scheduled,
+                next + ChronoDuration::minutes(5),
+            )
+            .await
+            .unwrap();
+        let notifications: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM notification WHERE channel = 'scheduler'")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(notifications, 1);
+        let replacement = ScheduleRepository::status(database.pool()).await.unwrap();
+        assert_eq!(
+            replacement
+                .iter()
+                .find(|row| row.job == MaintenanceJob::Retention)
+                .unwrap()
+                .last_success,
+            Some(now)
+        );
+        assert_eq!(
+            replacement
+                .iter()
+                .find(|row| row.job == MaintenanceJob::Partition)
+                .unwrap()
+                .last_success,
+            Some(next + ChronoDuration::minutes(5))
+        );
+        // A whole expired leaf must produce partition units, never a fabricated
+        // deleted-row count. Its three source rows disappear atomically.
+        let expired_day = attune_common::repositories::native_maintenance::partitions::utc_day(
+            Utc::now() - ChronoDuration::days(60),
+        );
+        attune_common::repositories::native_maintenance::partitions::PartitionRepository::ensure_day(
+            database.pool(),
+            attune_common::repositories::native_maintenance::ManagedTable::Event,
+            expired_day,
+            &retention.native_maintenance,
+        ).await.unwrap();
+        sqlx::query("INSERT INTO event (trigger_ref, created) SELECT 'scheduler.drop', $1 FROM generate_series(1, 3)")
+            .bind(expired_day).execute(database.pool()).await.unwrap();
+        service
+            .mark_supervisor_run_clean("test_leader_handoff")
+            .await;
+        *service.inner.run_id.lock().await = None;
+        service
+            .run_retention_cycle_at(
+                SupervisorCycleReason::Scheduled,
+                now + ChronoDuration::hours(1),
+            )
+            .await
+            .unwrap();
+        let notifications: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM notification WHERE channel = 'scheduler'")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(notifications, 0);
+        let clean_replacement = ScheduleRepository::status(database.pool()).await.unwrap();
+        assert_eq!(clean_replacement.iter().find(|row| row.job == MaintenanceJob::Partition).unwrap().last_success,
+            Some(now + ChronoDuration::hours(1)), "the first owned turn after a clean handoff must reconcile partitions even before their due time");
+        let expiry_audit: serde_json::Value = sqlx::query_scalar("SELECT details FROM audit_event
+            WHERE event_type = 'maintenance.retention.target_completed' AND resource_ref = 'events'")
+            .fetch_one(database.pool()).await.unwrap();
+        assert_eq!(expiry_audit["rows_deleted"], json!(0));
+        assert_eq!(expiry_audit["deleted"], json!(0));
+        assert_eq!(expiry_audit["partitions_dropped"], json!(1));
+        assert_eq!(expiry_audit["partition_candidates"], json!(1));
+        assert_eq!(expiry_audit["candidates_exact"], json!(true));
+        let backlog_alerts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event WHERE trigger_ref = 'core.alert'
+            AND payload->>'correlation_id' = 'supervisor:native:partition_backlog:event'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            backlog_alerts, 1,
+            "native alerts must respect the existing cooldown"
+        );
+        let default_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event WHERE trigger_ref = 'scheduler.default'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            default_rows, 5,
+            "native catch-up must preserve over-budget DEFAULT data"
+        );
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_scheduler_retries_builder_failures_without_leaking_source_details() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = false;
+        config.maintenance.monitoring_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention
+            .native_maintenance
+            .max_partition_operations_per_cycle = 1;
+        retention.native_maintenance.max_summary_buckets_per_cycle = 4;
+        retention.native_maintenance.summary_bootstrap_hours = 1;
+        retention.native_maintenance.partition_lookahead_days = 1;
+        // Leave time for shared checkpoints without changing the one-operation cap.
+        retention.native_maintenance.operation_timeout_milliseconds = 10_000;
+        retention
+            .native_maintenance
+            .max_partition_cycle_milliseconds = 30_000;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let now = DateTime::parse_from_rfc3339("2040-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due = $1, last_success = NULL")
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_native_coverage() RETURNS trigger LANGUAGE plpgsql AS $$
+                         BEGIN RAISE EXCEPTION 'private source contents'; END; $$;
+                       CREATE TRIGGER reject_native_coverage BEFORE INSERT ON native_summary_hour
+                         FOR EACH ROW EXECUTE FUNCTION reject_native_coverage();",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                config,
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::StartupRecovery, now)
+            .await
+            .unwrap();
+        let statuses = ScheduleRepository::status(database.pool()).await.unwrap();
+        let summary = statuses
+            .iter()
+            .find(|row| row.job == MaintenanceJob::Summary)
+            .unwrap();
+        assert_eq!(summary.last_success, None);
+        assert_eq!(summary.next_due, now + ChronoDuration::minutes(1));
+        let partition_audit: serde_json::Value = sqlx::query_scalar(
+            "SELECT details FROM audit_event
+             WHERE event_type = 'maintenance.native.job_completed' AND resource_ref = 'partition'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|row| row.job == MaintenanceJob::Partition)
+                .unwrap()
+                .last_success,
+            Some(now),
+            "partition attempt: {partition_audit}"
+        );
+        let details: serde_json::Value = sqlx::query_scalar("SELECT details FROM audit_event
+            WHERE event_type = 'maintenance.native.job_completed' AND resource_ref = 'summary' AND outcome = 'failure'")
+            .fetch_one(database.pool()).await.unwrap();
+        assert!(details["failure_count"].as_u64().unwrap() > 0);
+        assert_eq!(details["buckets_processed"], json!(0));
+        assert!(!details.to_string().contains("private source contents"));
+        service
+            .run_retention_cycle_at(
+                SupervisorCycleReason::Scheduled,
+                now + ChronoDuration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE event_type = 'maintenance.native.job_completed' AND resource_ref = 'summary'")
+            .fetch_one(database.pool()).await.unwrap();
+        assert_eq!(
+            attempts, 1,
+            "failed jobs must wait for the bounded retry deadline"
+        );
+        service
+            .run_retention_cycle_at(
+                SupervisorCycleReason::Scheduled,
+                now + ChronoDuration::minutes(1),
+            )
+            .await
+            .unwrap();
+        let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE event_type = 'maintenance.native.job_completed' AND resource_ref = 'summary'")
+            .fetch_one(database.pool()).await.unwrap();
+        assert_eq!(attempts, 2);
+        // An invalid persisted native budget must stop native calls at the cycle
+        // boundary rather than reaching an unchecked builder/cadence division.
+        retention.native_maintenance.summary_interval_seconds = 0;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        service
+            .run_retention_cycle_at(
+                SupervisorCycleReason::Scheduled,
+                now + ChronoDuration::minutes(2),
+            )
+            .await
+            .unwrap();
+        let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE event_type = 'maintenance.native.job_completed' AND resource_ref = 'summary'")
+            .fetch_one(database.pool()).await.unwrap();
+        assert_eq!(attempts, 2);
+        retention.native_maintenance.summary_interval_seconds = 300;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        service.shutdown().await.unwrap();
+        service
+            .run_retention_cycle_at(
+                SupervisorCycleReason::Scheduled,
+                now + ChronoDuration::minutes(3),
+            )
+            .await
+            .unwrap();
+        let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE event_type = 'maintenance.native.job_completed' AND resource_ref = 'summary'")
+            .fetch_one(database.pool()).await.unwrap();
+        assert_eq!(
+            attempts, 2,
+            "a late subscription must not miss an already requested shutdown"
+        );
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_budget_allows_later_targets_and_lag_monitoring_under_leadership() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.artifact_cleanup_enabled = false;
+        config.maintenance.pack_release_retention_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        config.maintenance.retention_lag_alert_seconds = 1;
+        let mut retention = RetentionConfig {
+            batch_size: 1,
+            max_batches_per_target: 2,
+            ..RetentionConfig::default()
+        };
+        retention.cache_retention.enabled = false;
+        let targets: serde_json::Map<String, serde_json::Value> = RetentionTarget::all()
+            .into_iter()
+            .map(|target| (target.name().to_string(), json!({"max_age_seconds": null})))
+            .collect();
+        retention.targets = serde_json::from_value(json!(targets)).unwrap();
+        // Keep the old event cohort in a partially expired daily partition.
+        // Whole-leaf expiry would bypass the row-batch budget by design.
+        retention.targets.events.max_age_seconds =
+            Some(Utc::now().timestamp().rem_euclid(86400) as u64 + 43200);
+        retention.targets.notifications.max_age_seconds = Some(86400);
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO trigger (ref, label) VALUES ('core.alert', 'Core Alert')
+             ON CONFLICT (ref) DO NOTHING",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO event (trigger_ref, created)
+             SELECT 'retention.backlog', date_trunc('day', NOW(), 'UTC') - INTERVAL '1 day' FROM generate_series(1, 5)",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO notification (channel, entity_type, entity, activity, content, created)
+             VALUES ('test', 'execution', '1', 'completed', '{}', NOW() - INTERVAL '2 days')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO execution (action_ref, status, config, created, updated)
+             VALUES ('retention.forever', 'completed', '{}',
+                     NOW() - INTERVAL '2 days', NOW() - INTERVAL '2 days')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                config,
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+
+        let mut leader = database.pool().acquire().await.unwrap();
+        assert!(
+            RetentionRepository::try_advisory_lock(&mut leader, retention.advisory_lock_key)
+                .await
+                .unwrap()
+        );
+        service
+            .run_retention_cycle(SupervisorCycleReason::Scheduled)
+            .await
+            .unwrap();
+        let unchanged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(unchanged, 1, "another leader must prevent cleanup");
+        RetentionRepository::advisory_unlock(&mut leader, retention.advisory_lock_key)
+            .await
+            .unwrap();
+
+        service
+            .run_retention_cycle(SupervisorCycleReason::Scheduled)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event WHERE trigger_ref = 'retention.backlog'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining, 3);
+        let notifications: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(notifications, 0, "later targets must run after the budget");
+        let executions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            executions, 1,
+            "unlimited retention must preserve expired rows"
+        );
+        let alerts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event WHERE trigger_ref = 'core.alert'
+               AND payload->>'correlation_id' = 'supervisor:retention-lag:events'
+               AND (payload->'details'->>'count')::BIGINT = 3",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(alerts, 1, "non-retention maintenance must get a turn");
+        let details: serde_json::Value = sqlx::query_scalar(
+            "SELECT details FROM audit_event
+             WHERE event_type = 'maintenance.retention.target_completed' AND resource_ref = 'events'",
+        ).fetch_one(database.pool()).await.unwrap();
+        assert_eq!(details["candidates"], json!(3));
+        assert_eq!(details["candidates_exact"], json!(false));
+        assert_eq!(details["deleted"], json!(2));
+        assert_eq!(details["rows_deleted"], json!(2));
+        assert_eq!(details["partitions_dropped"], json!(0));
+        assert_eq!(details["max_batches_per_target"], json!(2));
+        assert!(
+            RetentionRepository::try_advisory_lock(&mut leader, retention.advisory_lock_key)
+                .await
+                .unwrap(),
+            "the cycle must release leadership"
+        );
+        RetentionRepository::advisory_unlock(&mut leader, retention.advisory_lock_key)
+            .await
+            .unwrap();
+        drop(leader);
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_failure_audit_preserves_prior_committed_batches() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = false;
+        let mut retention = RetentionConfig {
+            batch_size: 2,
+            max_batches_per_target: 100,
+            ..RetentionConfig::default()
+        };
+        retention.cache_retention.enabled = false;
+        let targets: serde_json::Map<String, serde_json::Value> = RetentionTarget::all()
+            .into_iter()
+            .map(|target| (target.name().to_string(), json!({"max_age_seconds": null})))
+            .collect();
+        retention.targets = serde_json::from_value(json!(targets)).unwrap();
+        retention.targets.worker_history.max_age_seconds = Some(86400);
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO worker_history (time, operation, entity_id, entity_ref)
+             SELECT NOW() - INTERVAL '2 days' + n * INTERVAL '1 second',
+                    'UPDATE', n, 'retention.failure' FROM generate_series(1, 5) n",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION retention_reject_later_batch() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF OLD.entity_id = 3 THEN
+                     RAISE EXCEPTION 'forced second retention batch failure';
+                 END IF;
+                 RETURN OLD;
+             END;
+             $$;
+             CREATE TRIGGER retention_reject_later_batch
+             BEFORE DELETE ON worker_history FOR EACH ROW
+             EXECUTE FUNCTION retention_reject_later_batch();",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                config,
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        let earliest_cutoff = Utc::now() - ChronoDuration::days(1);
+        service
+            .run_retention_cycle(SupervisorCycleReason::Scheduled)
+            .await
+            .unwrap();
+        let latest_cutoff = Utc::now() - ChronoDuration::days(1);
+        let remaining: Vec<i64> =
+            sqlx::query_scalar("SELECT entity_id FROM worker_history ORDER BY entity_id")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        let details: serde_json::Value = sqlx::query_scalar(
+            "SELECT details FROM audit_event
+             WHERE event_type = 'maintenance.retention.target_failed'
+               AND resource_ref = 'worker_history' AND outcome = 'failure'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        drop(service);
+        database.cleanup().await.unwrap();
+
+        assert_eq!(remaining, vec![3, 4, 5]);
+        assert_eq!(details["deleted"], json!(2));
+        assert_eq!(details["candidates"], json!(5));
+        assert_eq!(details["deleted_count_complete"], json!(false));
+        assert_eq!(details["batch_size"], json!(2));
+        assert_eq!(details["max_batches_per_target"], json!(100));
+        let cutoff = chrono::DateTime::parse_from_rfc3339(details["cutoff"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(cutoff >= earliest_cutoff && cutoff <= latest_cutoff);
+        assert!(details["error"]
+            .as_str()
+            .unwrap()
+            .contains("forced second retention batch failure"));
+    }
+
+    #[tokio::test]
     async fn supervisor_reconciles_abandoned_and_missing_objects_with_a_delete_delay() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).unwrap();
@@ -1702,6 +2664,7 @@ mod tests {
                 run_id: Mutex::new(None),
                 cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
                 artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
                 shutdown_tx,
             }),
         };

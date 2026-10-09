@@ -391,6 +391,7 @@ export function DashboardCard({
         authorization_mode: "operator_global",
         freshness_mode: "raw_only",
         aggregate_watermark: null,
+        read_coverage: null,
         cache_hit: false,
         bucket_size: null,
         truncated: false,

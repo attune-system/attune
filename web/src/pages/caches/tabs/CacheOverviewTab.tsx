@@ -96,6 +96,10 @@ export default function CacheOverviewTab({
           </div>
         )}
         <PolicyRow
+          label="Refresh concurrency"
+          value={namespace.refresh_concurrency}
+        />
+        <PolicyRow
           label="Freshness target"
           value={formatFreshnessTarget(namespace.freshness_target_seconds)}
         />

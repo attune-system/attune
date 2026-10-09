@@ -16,6 +16,8 @@ EXCEPTION
     WHEN duplicate_object THEN NULL;
 END $$;
 
+CREATE TYPE cache_refresh_concurrency_enum AS ENUM ('reuse', 'conflict', 'parallel');
+
 ALTER TABLE runtime_retention_config
     ADD COLUMN IF NOT EXISTS cache_retention JSONB NOT NULL DEFAULT '{}'::JSONB;
 
@@ -41,6 +43,7 @@ CREATE TABLE cache_namespace (
     max_retained_bytes BIGINT NOT NULL DEFAULT 2147483648,
     max_retained_generations INTEGER NOT NULL DEFAULT 5,
     max_staging_generations INTEGER NOT NULL DEFAULT 2,
+    refresh_concurrency cache_refresh_concurrency_enum NOT NULL DEFAULT 'parallel',
     tombstoned_at TIMESTAMPTZ,
     tombstone_reason TEXT,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -216,6 +219,9 @@ CREATE TABLE cache_generation (
     checksum TEXT,
     source_revision TEXT,
     created_by BIGINT REFERENCES identity(id) ON DELETE SET NULL,
+    -- Historical producer ID without a foreign key, so independent execution
+    -- retention does not rewrite cache metadata. It is not a writer lease.
+    created_by_execution BIGINT,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     sealed TIMESTAMPTZ,
     activated TIMESTAMPTZ,
@@ -238,6 +244,8 @@ CREATE TABLE cache_generation (
     CONSTRAINT cache_generation_failure_reason_length
         CHECK (failure_reason IS NULL OR octet_length(failure_reason) <= 4096),
     CONSTRAINT cache_generation_expected_chunk_count_nonnegative CHECK (expected_chunk_count >= 0),
+    CONSTRAINT cache_generation_created_by_execution_positive
+        CHECK (created_by_execution IS NULL OR created_by_execution > 0),
     CONSTRAINT cache_generation_expected_count_nonnegative
         CHECK (expected_count IS NULL OR expected_count >= 0),
     CONSTRAINT cache_generation_expected_bytes_nonnegative
@@ -303,7 +311,8 @@ BEGIN
        OR NEW.checksum_algorithm IS DISTINCT FROM OLD.checksum_algorithm
        OR NEW.checksum IS DISTINCT FROM OLD.checksum
        OR NEW.source_revision IS DISTINCT FROM OLD.source_revision
-       OR NEW.created_by IS DISTINCT FROM OLD.created_by THEN
+       OR NEW.created_by IS DISTINCT FROM OLD.created_by
+       OR NEW.created_by_execution IS DISTINCT FROM OLD.created_by_execution THEN
         RAISE EXCEPTION 'cache generation identity and expected metadata are immutable';
     END IF;
 
@@ -333,7 +342,7 @@ CREATE TRIGGER validate_cache_generation_transition_trigger
     EXECUTE FUNCTION validate_cache_generation_transition();
 
 CREATE TABLE cache_entry (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGSERIAL NOT NULL,
     generation BIGINT NOT NULL REFERENCES cache_generation(id) ON DELETE RESTRICT,
     external_id TEXT COLLATE "C" NOT NULL,
     value JSONB NOT NULL,
@@ -342,6 +351,7 @@ CREATE TABLE cache_entry (
     size_bytes BIGINT NOT NULL,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+    PRIMARY KEY (generation, id),
     CONSTRAINT cache_entry_external_id_nonempty CHECK (external_id <> ''),
     CONSTRAINT cache_entry_external_id_length CHECK (octet_length(external_id) <= 1024),
     CONSTRAINT cache_entry_value_size
@@ -349,11 +359,10 @@ CREATE TABLE cache_entry (
     CONSTRAINT cache_entry_source_checksum_length
         CHECK (source_checksum IS NULL OR octet_length(source_checksum) <= 1024),
     CONSTRAINT cache_entry_size_bytes_nonnegative CHECK (size_bytes >= 0)
-);
+) PARTITION BY LIST (generation);
 
 CREATE UNIQUE INDEX cache_entry_generation_external_id_bytewise_unique
     ON cache_entry (generation, external_id COLLATE "C");
-CREATE INDEX cache_entry_generation_id_idx ON cache_entry (generation, id);
 
 CREATE OR REPLACE FUNCTION account_cache_entry_size()
 RETURNS TRIGGER AS $$
@@ -375,25 +384,9 @@ CREATE OR REPLACE FUNCTION cache_entry_staging_only()
 RETURNS TRIGGER AS $$
 DECLARE
     generation_state cache_generation_state_enum;
-    generation_readable_until TIMESTAMPTZ;
     namespace_tombstoned TIMESTAMPTZ;
 BEGIN
-    IF TG_OP = 'DELETE' THEN
-        SELECT state, readable_until
-          INTO generation_state, generation_readable_until
-          FROM cache_generation
-         WHERE id = OLD.generation
-         FOR SHARE;
-        IF generation_state <> 'failed'
-           AND NOT (generation_state = 'retired'
-                    AND generation_readable_until IS NOT NULL
-                    AND generation_readable_until <= NOW()) THEN
-            RAISE EXCEPTION 'cache entries may only be deleted from failed or expired retired generations';
-        END IF;
-        RETURN OLD;
-    END IF;
-
-    IF TG_OP = 'UPDATE' THEN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
         RAISE EXCEPTION 'cache entries are immutable';
     END IF;
 

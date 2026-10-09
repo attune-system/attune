@@ -327,7 +327,11 @@ pub enum DashboardSourceStatus {
 pub struct DashboardSourceMeta {
     pub authorization_mode: DashboardAuthorizationMode,
     pub freshness_mode: DashboardFreshnessMode,
+    /// End of the continuous summarized prefix of this request, if any.
+    /// Later covered islands are listed in read_coverage, not implied here.
     pub aggregate_watermark: Option<DateTime<Utc>>,
+    /// Request-specific ranges. Null for non-summary sources and stale caches.
+    pub read_coverage: Option<super::analytics::AnalyticsReadMetadata>,
     pub cache_hit: bool,
     pub bucket_size: Option<String>,
     pub truncated: bool,
@@ -349,9 +353,23 @@ pub enum DashboardAuthorizationMode {
 #[serde(rename_all = "snake_case")]
 pub enum DashboardFreshnessMode {
     RawOnly,
-    AggregateOnly,
-    AggregatePlusTail,
-    RawOnlyFallback,
+    SummaryOnly,
+    SummaryPlusRaw,
+    #[serde(rename = "cache_rawfallback")]
+    CacheRawFallback,
+}
+
+impl From<attune_common::repositories::native_maintenance::read::ReadMode>
+    for DashboardFreshnessMode
+{
+    fn from(mode: attune_common::repositories::native_maintenance::read::ReadMode) -> Self {
+        use attune_common::repositories::native_maintenance::read::ReadMode;
+        match mode {
+            ReadMode::RawOnly => Self::RawOnly,
+            ReadMode::SummaryOnly => Self::SummaryOnly,
+            ReadMode::SummaryPlusRaw => Self::SummaryPlusRaw,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]

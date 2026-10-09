@@ -4,7 +4,7 @@
 /* eslint-disable */
 export enum FreshnessMode {
   RAW_ONLY = "raw_only",
-  AGGREGATE_ONLY = "aggregate_only",
-  AGGREGATE_PLUS_TAIL = "aggregate_plus_tail",
-  RAW_ONLY_FALLBACK = "raw_only_fallback",
+  SUMMARY_ONLY = "summary_only",
+  SUMMARY_PLUS_RAW = "summary_plus_raw",
+  CACHE_RAWFALLBACK = "cache_rawfallback",
 }

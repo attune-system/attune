@@ -14,11 +14,11 @@ mapfile -t files < <(
     --glob '!common/src/repositories/pack_test.rs'
 )
 
-pattern='^[[:space:]]*#\[ignore = "(integration test .* requires database|integration test - requires PostgreSQL|requires disposable PostgreSQL/TimescaleDB|e2e test requires PostgreSQL/TimescaleDB)"\][[:space:]]*$|^[[:space:]]*#\[ignore\][[:space:]]*// Requires database[[:space:]]*$'
+pattern='^[[:space:]]*#\[ignore = "(integration test .* requires database|integration test - requires PostgreSQL|requires disposable PostgreSQL|e2e test requires PostgreSQL)"\][[:space:]]*$|^[[:space:]]*#\[ignore\][[:space:]]*// Requires database[[:space:]]*$'
 
 if [[ "$mode" == "--fix" ]]; then
   for file in "${files[@]}"; do
-    perl -ni -e 'print unless /^\s*#\[ignore = "(?:integration test .* requires database|integration test - requires PostgreSQL|requires disposable PostgreSQL\/TimescaleDB|e2e test requires PostgreSQL\/TimescaleDB)"\]\s*$/ || /^\s*#\[ignore\]\s*\/\/ Requires database\s*$/' "$file"
+    perl -ni -e 'print unless /^\s*#\[ignore = "(?:integration test .* requires database|integration test - requires PostgreSQL|requires disposable PostgreSQL|e2e test requires PostgreSQL)"\]\s*$/ || /^\s*#\[ignore\]\s*\/\/ Requires database\s*$/' "$file"
   done
   perl -ni -e 'print unless /^\s*#\[ignore\]\s*$/' \
     "$ROOT/crates/api/tests/webhook_security_tests.rs"

@@ -75,7 +75,7 @@ attune/
 
 ### Local Development
 - **Rust**: 1.75 or later
-- **PostgreSQL**: 14 or later
+- **PostgreSQL**: 16 or later, no TimescaleDB extension required. Compose and CI use PostgreSQL 18.
 - **RabbitMQ**: 3.12 or later (for message queue)
 - **Redis**: 7.0 or later (optional, for caching)
 
@@ -111,6 +111,8 @@ Access the application:
 - **API Docs**: http://localhost:8080/api-spec/swagger-ui/
 
 For more details, see [Docker Deployment Guide](docs/docker-deployment.md).
+For database volume selection and existing-data decisions, see
+[PostgreSQL-only deployment](docs/deployment/postgresql-only.md).
 
 ### Option 2: Local Development Setup
 
@@ -131,9 +133,10 @@ createdb attune
 sqlx migrate run
 ```
 
-For an existing v0.2.1-or-earlier SQLx database, use `attune-api --migrate` once
-instead. Its embedded runner bridges legacy migration checksums before SQLx
-validation; the standalone SQLx CLI cannot perform that upgrade bridge.
+These migrations target a fresh schema. The PostgreSQL-only schema rewrites
+canonical migration contents, so existing migration checksums will differ.
+An existing database needs a deliberate conversion or reset decision before
+deployment. See [PostgreSQL-only deployment](docs/deployment/postgresql-only.md).
 
 #### 3. Load the Core Pack
 

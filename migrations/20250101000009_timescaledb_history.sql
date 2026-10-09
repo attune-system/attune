@@ -1,25 +1,12 @@
--- Migration: TimescaleDB Entity History and Analytics
--- Description: Creates append-only history hypertables for execution and worker tables.
---              Uses JSONB diff format to track field-level changes via PostgreSQL triggers.
---              Converts the event, enforcement, and execution tables into TimescaleDB
---              hypertables (events are immutable; enforcements are updated exactly once;
---              executions are updated ~4 times during their lifecycle).
---              Includes continuous aggregates for dashboard analytics.
---              See docs/plans/timescaledb-entity-history.md for full design.
---
---              NOTE: FK constraints that would reference hypertable targets were never
---              created in earlier migrations (000004, 000005, 000006), so no DROP
---              CONSTRAINT statements are needed here.
+-- Migration: Entity History and Analytics
+-- Description: Creates append-only history tables with JSONB field diffs
+--              recorded by PostgreSQL triggers and UTC-aligned hourly views.
+--              Event, enforcement, and execution references remain plain BIGINT
+--              values so independent retention can leave dangling references.
 -- Version: 20250101000009
 
 -- Set search_path for schema isolation
 SET search_path TO attune, public;
-
--- ============================================================================
--- EXTENSION
--- ============================================================================
-
-CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- ============================================================================
 -- HELPER FUNCTIONS
@@ -62,10 +49,11 @@ CREATE TABLE execution_history (
     changed_fields   TEXT[]         NOT NULL DEFAULT '{}',
     old_values       JSONB,
     new_values       JSONB
-);
+) PARTITION BY RANGE (time);
 
-SELECT create_hypertable('execution_history', 'time',
-    chunk_time_interval => INTERVAL '1 day');
+CREATE TABLE execution_history_default PARTITION OF execution_history DEFAULT;
+
+CREATE INDEX idx_execution_history_time ON execution_history (time DESC);
 
 CREATE INDEX idx_execution_history_entity
     ON execution_history (entity_id, time DESC);
@@ -80,8 +68,8 @@ CREATE INDEX idx_execution_history_status_changes
 CREATE INDEX idx_execution_history_changed_fields
     ON execution_history USING GIN (changed_fields);
 
-COMMENT ON TABLE execution_history IS 'Append-only history of field-level changes to the execution table (TimescaleDB hypertable)';
-COMMENT ON COLUMN execution_history.time IS 'When the change occurred (hypertable partitioning dimension)';
+COMMENT ON TABLE execution_history IS 'Append-only history of field-level changes to the execution table';
+COMMENT ON COLUMN execution_history.time IS 'When the change occurred';
 COMMENT ON COLUMN execution_history.operation IS 'INSERT, UPDATE, or DELETE';
 COMMENT ON COLUMN execution_history.entity_id IS 'execution.id of the changed row';
 COMMENT ON COLUMN execution_history.entity_ref IS 'Denormalized action_ref for JOIN-free queries';
@@ -103,8 +91,7 @@ CREATE TABLE worker_history (
     new_values       JSONB
 );
 
-SELECT create_hypertable('worker_history', 'time',
-    chunk_time_interval => INTERVAL '7 days');
+CREATE INDEX idx_worker_history_time ON worker_history (time DESC);
 
 CREATE INDEX idx_worker_history_entity
     ON worker_history (entity_id, time DESC);
@@ -119,7 +106,7 @@ CREATE INDEX idx_worker_history_status_changes
 CREATE INDEX idx_worker_history_changed_fields
     ON worker_history USING GIN (changed_fields);
 
-COMMENT ON TABLE worker_history IS 'Append-only history of field-level changes to the worker table (TimescaleDB hypertable)';
+COMMENT ON TABLE worker_history IS 'Append-only history of field-level changes to the worker table';
 COMMENT ON COLUMN worker_history.entity_ref IS 'Denormalized worker name for JOIN-free queries';
 
 -- ----------------------------------------------------------------------------
@@ -138,8 +125,7 @@ CREATE TABLE sensor_process_history (
     new_values       JSONB
 );
 
-SELECT create_hypertable('sensor_process_history', 'time',
-    chunk_time_interval => INTERVAL '7 days');
+CREATE INDEX idx_sensor_process_history_time ON sensor_process_history (time DESC);
 
 CREATE INDEX idx_sensor_process_history_entity
     ON sensor_process_history (entity_id, time DESC);
@@ -157,29 +143,8 @@ COMMENT ON TABLE sensor_process_history IS 'Append-only history of field-level c
 COMMENT ON COLUMN sensor_process_history.entity_ref IS 'Denormalized sensor ref for JOIN-free queries';
 COMMENT ON COLUMN sensor_process_history.worker_name IS 'Denormalized worker name for JOIN-free queries';
 
--- ============================================================================
--- CONVERT EVENT TABLE TO HYPERTABLE
--- ============================================================================
--- Events are immutable after insert — they are never updated. Instead of
--- maintaining a separate event_history table to track changes that never
--- happen, we convert the event table itself into a TimescaleDB hypertable
--- partitioned on `created`. This gives us automatic time-based partitioning,
--- compression, and retention for free.
---
--- No FK constraints reference event(id) — enforcement.event was created as a
--- plain BIGINT in migration 000004 (hypertables cannot be FK targets).
--- ----------------------------------------------------------------------------
-
--- Replace the single-column PK with a composite PK that includes the
--- partitioning column (required by TimescaleDB).
-ALTER TABLE event DROP CONSTRAINT event_pkey;
-ALTER TABLE event ADD PRIMARY KEY (id, created);
-
-SELECT create_hypertable('event', 'created',
-    chunk_time_interval => INTERVAL '1 day',
-    migrate_data        => true);
-
-COMMENT ON TABLE event IS 'Events are instances of triggers firing (TimescaleDB hypertable partitioned on created)';
+-- Events are immutable after insert, with a partition-compatible (id, created) key.
+COMMENT ON TABLE event IS 'Events are instances of triggers firing';
 
 COMMENT ON TABLE enforcement IS 'Enforcements represent rule triggering by events';
 COMMENT ON TABLE execution IS 'Executions represent action runs with workflow support. History and analytics are stored in execution_history.';
@@ -278,7 +243,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION record_execution_history() IS 'Records field-level changes to execution table in execution_history hypertable';
+COMMENT ON FUNCTION record_execution_history() IS 'Records field-level changes to execution table in execution_history';
 
 -- ----------------------------------------------------------------------------
 -- worker history trigger
@@ -391,7 +356,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION record_worker_history() IS 'Records field-level changes to worker table in worker_history hypertable. Excludes heartbeat-only updates.';
+COMMENT ON FUNCTION record_worker_history() IS 'Records field-level changes to worker table in worker_history. Excludes heartbeat-only updates.';
 
 -- ----------------------------------------------------------------------------
 -- sensor process history trigger
@@ -579,7 +544,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION record_sensor_process_history() IS 'Records field-level changes to sensor_process in sensor_process_history hypertable';
+COMMENT ON FUNCTION record_sensor_process_history() IS 'Records field-level changes to sensor_process in sensor_process_history';
 
 -- ============================================================================
 -- ATTACH TRIGGERS TO OPERATIONAL TABLES
@@ -601,66 +566,10 @@ CREATE TRIGGER sensor_process_history_trigger
     EXECUTE FUNCTION record_sensor_process_history();
 
 -- ============================================================================
--- COMPRESSION POLICIES
+-- HOURLY ANALYTICS VIEWS
 -- ============================================================================
--- Schema-per-test databases need the Timescale objects but must not register
--- database-global background jobs, which can outlive their temporary schemas.
-
--- History tables
-ALTER TABLE execution_history SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'entity_id',
-    timescaledb.compress_orderby = 'time DESC'
-);
-SELECT add_compression_policy('execution_history', INTERVAL '7 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-
-ALTER TABLE worker_history SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'entity_id',
-    timescaledb.compress_orderby = 'time DESC'
-);
-SELECT add_compression_policy('worker_history', INTERVAL '7 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-
-ALTER TABLE sensor_process_history SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'entity_id',
-    timescaledb.compress_orderby = 'time DESC'
-);
-SELECT add_compression_policy('sensor_process_history', INTERVAL '7 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-
--- Event table (hypertable)
-ALTER TABLE event SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'trigger_ref',
-    timescaledb.compress_orderby = 'created DESC, id DESC'
-);
-SELECT add_compression_policy('event', INTERVAL '7 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-
--- ============================================================================
--- CONTINUOUS AGGREGATES
--- ============================================================================
-
--- Drop existing continuous aggregates if they exist, so this migration can be
--- re-run safely after a partial failure. (TimescaleDB continuous aggregates
--- must be dropped with CASCADE to remove their associated policies.)
--- Try DROP VIEW first (handles the case where an earlier run created a plain
--- view instead of a materialized view), then DROP MATERIALIZED VIEW.
-DROP VIEW IF EXISTS execution_status_hourly CASCADE;
-DROP MATERIALIZED VIEW IF EXISTS execution_status_hourly CASCADE;
-DROP VIEW IF EXISTS execution_throughput_hourly CASCADE;
-DROP MATERIALIZED VIEW IF EXISTS execution_throughput_hourly CASCADE;
-DROP VIEW IF EXISTS event_volume_hourly CASCADE;
-DROP MATERIALIZED VIEW IF EXISTS event_volume_hourly CASCADE;
-DROP VIEW IF EXISTS worker_status_hourly CASCADE;
-DROP MATERIALIZED VIEW IF EXISTS worker_status_hourly CASCADE;
-DROP VIEW IF EXISTS enforcement_volume_hourly CASCADE;
-DROP MATERIALIZED VIEW IF EXISTS enforcement_volume_hourly CASCADE;
-DROP VIEW IF EXISTS execution_volume_hourly CASCADE;
-DROP MATERIALIZED VIEW IF EXISTS execution_volume_hourly CASCADE;
+-- Views read retained records immediately. Explicit UTC truncation makes bucket
+-- boundaries independent of the session time zone. COUNT returns BIGINT.
 
 -- ----------------------------------------------------------------------------
 -- execution_status_hourly
@@ -668,24 +577,15 @@ DROP MATERIALIZED VIEW IF EXISTS execution_volume_hourly CASCADE;
 -- Powers: execution throughput chart, failure rate widget, status breakdown over time.
 -- ----------------------------------------------------------------------------
 
-CREATE MATERIALIZED VIEW execution_status_hourly
-WITH (timescaledb.continuous) AS
+CREATE VIEW execution_status_hourly AS
 SELECT
-    time_bucket('1 hour', time) AS bucket,
+    date_trunc('hour', time, 'UTC') AS bucket,
     entity_ref AS action_ref,
     new_values->>'status' AS new_status,
     COUNT(*) AS transition_count
 FROM execution_history
 WHERE 'status' = ANY(changed_fields)
-GROUP BY bucket, entity_ref, new_values->>'status'
-WITH NO DATA;
-
-SELECT add_continuous_aggregate_policy('execution_status_hourly',
-    start_offset    => INTERVAL '7 days',
-    end_offset      => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '30 minutes'
-)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+GROUP BY bucket, entity_ref, new_values->>'status';
 
 -- ----------------------------------------------------------------------------
 -- execution_throughput_hourly
@@ -693,48 +593,29 @@ WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 -- Powers: execution throughput sparkline on the dashboard.
 -- ----------------------------------------------------------------------------
 
-CREATE MATERIALIZED VIEW execution_throughput_hourly
-WITH (timescaledb.continuous) AS
+CREATE VIEW execution_throughput_hourly AS
 SELECT
-    time_bucket('1 hour', time) AS bucket,
+    date_trunc('hour', time, 'UTC') AS bucket,
     entity_ref AS action_ref,
     COUNT(*) AS execution_count
 FROM execution_history
 WHERE operation = 'INSERT'
-GROUP BY bucket, entity_ref
-WITH NO DATA;
-
-SELECT add_continuous_aggregate_policy('execution_throughput_hourly',
-    start_offset    => INTERVAL '7 days',
-    end_offset      => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '30 minutes'
-)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+GROUP BY bucket, entity_ref;
 
 -- ----------------------------------------------------------------------------
 -- event_volume_hourly
 -- Tracks event creation volume per hour by trigger ref.
 -- Powers: event throughput monitoring widget.
--- NOTE: Queries the event table directly (it is now a hypertable) instead of
---       a separate event_history table.
+-- Queries immutable events directly instead of a separate event_history table.
 -- ----------------------------------------------------------------------------
 
-CREATE MATERIALIZED VIEW event_volume_hourly
-WITH (timescaledb.continuous) AS
+CREATE VIEW event_volume_hourly AS
 SELECT
-    time_bucket('1 hour', created) AS bucket,
+    date_trunc('hour', created, 'UTC') AS bucket,
     trigger_ref,
     COUNT(*) AS event_count
 FROM event
-GROUP BY bucket, trigger_ref
-WITH NO DATA;
-
-SELECT add_continuous_aggregate_policy('event_volume_hourly',
-    start_offset    => INTERVAL '7 days',
-    end_offset      => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '30 minutes'
-)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+GROUP BY bucket, trigger_ref;
 
 -- ----------------------------------------------------------------------------
 -- worker_status_hourly
@@ -742,36 +623,26 @@ WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 -- Powers: worker health trends widget.
 -- ----------------------------------------------------------------------------
 
-CREATE MATERIALIZED VIEW worker_status_hourly
-WITH (timescaledb.continuous) AS
+CREATE VIEW worker_status_hourly AS
 SELECT
-    time_bucket('1 hour', time) AS bucket,
+    date_trunc('hour', time, 'UTC') AS bucket,
     entity_ref AS worker_name,
     new_values->>'status' AS new_status,
     COUNT(*) AS transition_count
 FROM worker_history
 WHERE 'status' = ANY(changed_fields)
-GROUP BY bucket, entity_ref, new_values->>'status'
-WITH NO DATA;
-
-SELECT add_continuous_aggregate_policy('worker_status_hourly',
-    start_offset    => INTERVAL '30 days',
-    end_offset      => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '1 hour'
-)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+GROUP BY bucket, entity_ref, new_values->>'status';
 
 -- ----------------------------------------------------------------------------
 -- enforcement_volume_hourly
 -- Tracks enforcement creation volume per hour by rule ref.
 -- Powers: rule activation rate monitoring.
--- NOTE: Queries the enforcement table directly (it is now a hypertable)
---       instead of a separate enforcement_history table.
+-- Queries enforcements directly instead of a separate enforcement_history table.
 -- ----------------------------------------------------------------------------
 
 CREATE VIEW enforcement_volume_hourly AS
 SELECT
-    date_trunc('hour', created) AS bucket,
+    date_trunc('hour', created, 'UTC') AS bucket,
     rule_ref,
     COUNT(*) AS enforcement_count
 FROM enforcement
@@ -791,28 +662,10 @@ GROUP BY bucket, rule_ref
 
 CREATE VIEW execution_volume_hourly AS
 SELECT
-    date_trunc('hour', created) AS bucket,
+    date_trunc('hour', created, 'UTC') AS bucket,
     action_ref,
     status AS initial_status,
     COUNT(*) AS execution_count
 FROM execution
 GROUP BY bucket, action_ref, status
 ;
-
--- ============================================================================
--- INITIAL REFRESH NOTE
--- ============================================================================
--- NOTE: refresh_continuous_aggregate() cannot run inside a transaction block,
--- and the migration runner wraps each file in BEGIN/COMMIT. The continuous
--- aggregate policies configured above will automatically backfill data within
--- their first scheduled interval (30 min – 1 hour). On a fresh database there
--- is no history data to backfill anyway.
---
--- If you need an immediate manual refresh after migration, run outside a
--- transaction:
---   CALL refresh_continuous_aggregate('execution_status_hourly', NULL, NOW());
---   CALL refresh_continuous_aggregate('execution_throughput_hourly', NULL, NOW());
---   CALL refresh_continuous_aggregate('event_volume_hourly', NULL, NOW());
---   CALL refresh_continuous_aggregate('worker_status_hourly', NULL, NOW());
---   CALL refresh_continuous_aggregate('enforcement_volume_hourly', NULL, NOW());
---   CALL refresh_continuous_aggregate('execution_volume_hourly', NULL, NOW());

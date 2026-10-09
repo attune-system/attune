@@ -25,7 +25,10 @@ class CacheRetentionConfig:
         Attributes:
             alert_cooldown_seconds (int | Unset): Suppress duplicate cache alerts sharing a correlation id for this long.
             alert_limit_per_cycle (int | Unset): Maximum cache alerts emitted per supervisor cycle.
-            batch_size (int | Unset): Maximum `cache_entry` rows deleted per bounded batch call.
+            ddl_creation_statement_timeout_milliseconds (int | Unset): Server-side statement deadline for refresh partition
+                creation, independent of cleanup.
+            ddl_lock_timeout_milliseconds (int | Unset): Maximum wait for cache partition DDL locks.
+            ddl_statement_timeout_milliseconds (int | Unset): Server-side deadline for one atomic generation reclamation.
             dry_run (bool | Unset): Report cleanup candidates and metrics without deleting rows.
             enabled (bool | Unset): Enable cache generation/entry cleanup as part of the retention cycle.
             freshness_alert_grace_seconds (int | Unset): Extra grace beyond a namespace's own `freshness_target_seconds`
@@ -34,11 +37,7 @@ class CacheRetentionConfig:
             freshness_alerts_enabled (bool | Unset): Emit a `core.alert` when a namespace's active generation exceeds its
                 freshness target, or a namespace repeatedly fails to publish a
                 staging generation.
-            max_batches_per_generation (int | Unset): Maximum entry-deletion batches performed for a single cleanup-
-                candidate
-                generation within one supervisor cycle. Bounds how long a single
-                high-cardinality generation can dominate a cycle; entries are always
-                deleted in indexed bounded batches before the generation row itself.
+            max_cleanup_cycle_milliseconds (int | Unset): Total generation-reclamation budget per supervisor cycle.
             max_generations_per_cycle (int | Unset): Maximum cleanup-candidate generations (failed, or retired past
                 `readable_until`) processed in a single supervisor cycle.
             max_namespaces_per_cycle (int | Unset): Maximum namespaces inspected for staging expiry/freshness per cycle,
@@ -53,21 +52,29 @@ class CacheRetentionConfig:
             staging_failure_alert_threshold (int | Unset): Consecutive staging failures observed for the same namespace
                 within
                 the freshness lookback before a repeated-failure alert is emitted.
+            statistics_interval_seconds (int | Unset): Minimum interval between successful parent/leaf cache statistics
+                refreshes.
+            statistics_statement_timeout_milliseconds (int | Unset): Independent statement deadline for cache parent/leaf
+                ANALYZE.
     """
 
     alert_cooldown_seconds: int | Unset = UNSET
     alert_limit_per_cycle: int | Unset = UNSET
-    batch_size: int | Unset = UNSET
+    ddl_creation_statement_timeout_milliseconds: int | Unset = UNSET
+    ddl_lock_timeout_milliseconds: int | Unset = UNSET
+    ddl_statement_timeout_milliseconds: int | Unset = UNSET
     dry_run: bool | Unset = UNSET
     enabled: bool | Unset = UNSET
     freshness_alert_grace_seconds: int | Unset = UNSET
     freshness_alerts_enabled: bool | Unset = UNSET
-    max_batches_per_generation: int | Unset = UNSET
+    max_cleanup_cycle_milliseconds: int | Unset = UNSET
     max_generations_per_cycle: int | Unset = UNSET
     max_namespaces_per_cycle: int | Unset = UNSET
     min_traversal_window_seconds: int | Unset = UNSET
     staging_expiry_seconds: int | Unset = UNSET
     staging_failure_alert_threshold: int | Unset = UNSET
+    statistics_interval_seconds: int | Unset = UNSET
+    statistics_statement_timeout_milliseconds: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,7 +82,13 @@ class CacheRetentionConfig:
 
         alert_limit_per_cycle = self.alert_limit_per_cycle
 
-        batch_size = self.batch_size
+        ddl_creation_statement_timeout_milliseconds = (
+            self.ddl_creation_statement_timeout_milliseconds
+        )
+
+        ddl_lock_timeout_milliseconds = self.ddl_lock_timeout_milliseconds
+
+        ddl_statement_timeout_milliseconds = self.ddl_statement_timeout_milliseconds
 
         dry_run = self.dry_run
 
@@ -85,7 +98,7 @@ class CacheRetentionConfig:
 
         freshness_alerts_enabled = self.freshness_alerts_enabled
 
-        max_batches_per_generation = self.max_batches_per_generation
+        max_cleanup_cycle_milliseconds = self.max_cleanup_cycle_milliseconds
 
         max_generations_per_cycle = self.max_generations_per_cycle
 
@@ -97,6 +110,12 @@ class CacheRetentionConfig:
 
         staging_failure_alert_threshold = self.staging_failure_alert_threshold
 
+        statistics_interval_seconds = self.statistics_interval_seconds
+
+        statistics_statement_timeout_milliseconds = (
+            self.statistics_statement_timeout_milliseconds
+        )
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -104,8 +123,16 @@ class CacheRetentionConfig:
             field_dict["alert_cooldown_seconds"] = alert_cooldown_seconds
         if alert_limit_per_cycle is not UNSET:
             field_dict["alert_limit_per_cycle"] = alert_limit_per_cycle
-        if batch_size is not UNSET:
-            field_dict["batch_size"] = batch_size
+        if ddl_creation_statement_timeout_milliseconds is not UNSET:
+            field_dict["ddl_creation_statement_timeout_milliseconds"] = (
+                ddl_creation_statement_timeout_milliseconds
+            )
+        if ddl_lock_timeout_milliseconds is not UNSET:
+            field_dict["ddl_lock_timeout_milliseconds"] = ddl_lock_timeout_milliseconds
+        if ddl_statement_timeout_milliseconds is not UNSET:
+            field_dict["ddl_statement_timeout_milliseconds"] = (
+                ddl_statement_timeout_milliseconds
+            )
         if dry_run is not UNSET:
             field_dict["dry_run"] = dry_run
         if enabled is not UNSET:
@@ -114,8 +141,10 @@ class CacheRetentionConfig:
             field_dict["freshness_alert_grace_seconds"] = freshness_alert_grace_seconds
         if freshness_alerts_enabled is not UNSET:
             field_dict["freshness_alerts_enabled"] = freshness_alerts_enabled
-        if max_batches_per_generation is not UNSET:
-            field_dict["max_batches_per_generation"] = max_batches_per_generation
+        if max_cleanup_cycle_milliseconds is not UNSET:
+            field_dict["max_cleanup_cycle_milliseconds"] = (
+                max_cleanup_cycle_milliseconds
+            )
         if max_generations_per_cycle is not UNSET:
             field_dict["max_generations_per_cycle"] = max_generations_per_cycle
         if max_namespaces_per_cycle is not UNSET:
@@ -128,6 +157,12 @@ class CacheRetentionConfig:
             field_dict["staging_failure_alert_threshold"] = (
                 staging_failure_alert_threshold
             )
+        if statistics_interval_seconds is not UNSET:
+            field_dict["statistics_interval_seconds"] = statistics_interval_seconds
+        if statistics_statement_timeout_milliseconds is not UNSET:
+            field_dict["statistics_statement_timeout_milliseconds"] = (
+                statistics_statement_timeout_milliseconds
+            )
 
         return field_dict
 
@@ -138,7 +173,15 @@ class CacheRetentionConfig:
 
         alert_limit_per_cycle = d.pop("alert_limit_per_cycle", UNSET)
 
-        batch_size = d.pop("batch_size", UNSET)
+        ddl_creation_statement_timeout_milliseconds = d.pop(
+            "ddl_creation_statement_timeout_milliseconds", UNSET
+        )
+
+        ddl_lock_timeout_milliseconds = d.pop("ddl_lock_timeout_milliseconds", UNSET)
+
+        ddl_statement_timeout_milliseconds = d.pop(
+            "ddl_statement_timeout_milliseconds", UNSET
+        )
 
         dry_run = d.pop("dry_run", UNSET)
 
@@ -148,7 +191,7 @@ class CacheRetentionConfig:
 
         freshness_alerts_enabled = d.pop("freshness_alerts_enabled", UNSET)
 
-        max_batches_per_generation = d.pop("max_batches_per_generation", UNSET)
+        max_cleanup_cycle_milliseconds = d.pop("max_cleanup_cycle_milliseconds", UNSET)
 
         max_generations_per_cycle = d.pop("max_generations_per_cycle", UNSET)
 
@@ -162,20 +205,30 @@ class CacheRetentionConfig:
             "staging_failure_alert_threshold", UNSET
         )
 
+        statistics_interval_seconds = d.pop("statistics_interval_seconds", UNSET)
+
+        statistics_statement_timeout_milliseconds = d.pop(
+            "statistics_statement_timeout_milliseconds", UNSET
+        )
+
         cache_retention_config = cls(
             alert_cooldown_seconds=alert_cooldown_seconds,
             alert_limit_per_cycle=alert_limit_per_cycle,
-            batch_size=batch_size,
+            ddl_creation_statement_timeout_milliseconds=ddl_creation_statement_timeout_milliseconds,
+            ddl_lock_timeout_milliseconds=ddl_lock_timeout_milliseconds,
+            ddl_statement_timeout_milliseconds=ddl_statement_timeout_milliseconds,
             dry_run=dry_run,
             enabled=enabled,
             freshness_alert_grace_seconds=freshness_alert_grace_seconds,
             freshness_alerts_enabled=freshness_alerts_enabled,
-            max_batches_per_generation=max_batches_per_generation,
+            max_cleanup_cycle_milliseconds=max_cleanup_cycle_milliseconds,
             max_generations_per_cycle=max_generations_per_cycle,
             max_namespaces_per_cycle=max_namespaces_per_cycle,
             min_traversal_window_seconds=min_traversal_window_seconds,
             staging_expiry_seconds=staging_expiry_seconds,
             staging_failure_alert_threshold=staging_failure_alert_threshold,
+            statistics_interval_seconds=statistics_interval_seconds,
+            statistics_statement_timeout_milliseconds=statistics_statement_timeout_milliseconds,
         )
 
         cache_retention_config.additional_properties = d

@@ -362,6 +362,19 @@ pub mod enums {
         Sensor,
     }
 
+    /// Admission behavior when a namespace has an unpublished refresh.
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
+    )]
+    #[sqlx(type_name = "cache_refresh_concurrency_enum", rename_all = "lowercase")]
+    #[serde(rename_all = "lowercase")]
+    pub enum CacheRefreshConcurrency {
+        Reuse,
+        Conflict,
+        #[default]
+        Parallel,
+    }
+
     /// Lifecycle state for an immutable cache generation.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
     #[sqlx(type_name = "cache_generation_state_enum", rename_all = "lowercase")]
@@ -2090,6 +2103,7 @@ pub mod cache {
         pub max_retained_bytes: i64,
         pub max_retained_generations: i32,
         pub max_staging_generations: i32,
+        pub refresh_concurrency: CacheRefreshConcurrency,
         pub tombstoned_at: Option<DateTime<Utc>>,
         pub tombstone_reason: Option<String>,
         #[serde(default)]
@@ -2103,7 +2117,7 @@ pub mod cache {
             definition_ref, managing_pack, managing_pack_ref, namespace, active_generation, \
             consecutive_refresh_failures, last_refresh_failure_at, \
             freshness_target_seconds, max_records_per_generation, \
-            max_generation_bytes, max_retained_bytes, max_retained_generations, max_staging_generations, \
+            max_generation_bytes, max_retained_bytes, max_retained_generations, max_staging_generations, refresh_concurrency, \
             tombstoned_at, tombstone_reason, retired_at, created, updated";
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -2122,6 +2136,8 @@ pub mod cache {
         pub checksum: Option<String>,
         pub source_revision: Option<String>,
         pub created_by: Option<Id>,
+        /// Historical producer attribution, not a lease or execution-access grant.
+        pub created_by_execution: Option<Id>,
         pub created: DateTime<Utc>,
         pub sealed: Option<DateTime<Utc>>,
         pub activated: Option<DateTime<Utc>>,
@@ -2133,7 +2149,7 @@ pub mod cache {
 
     pub const CACHE_GENERATION_SELECT_COLUMNS: &str = "id, namespace, state, client_refresh_id, \
             expected_active_generation, expected_chunk_count, expected_count, expected_bytes, \
-            record_count, size_bytes, checksum_algorithm, checksum, source_revision, created_by, \
+            record_count, size_bytes, checksum_algorithm, checksum, source_revision, created_by, created_by_execution, \
             created, sealed, activated, retired, readable_until, failed, failure_reason";
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -2261,7 +2277,7 @@ pub mod artifact_version {
         pub artifact: Id,
         /// Version number (1-based, monotonically increasing per artifact)
         pub version: i32,
-        /// Optional execution that produced this version (no FK — execution is a hypertable)
+        /// Optional producing execution. No FK, so the version can outlive execution retention.
         pub execution: Option<Id>,
         /// MIME content type for this version
         pub content_type: Option<String>,
@@ -3088,20 +3104,20 @@ pub mod pack_test {
     }
 }
 
-/// Entity history tracking models (TimescaleDB hypertables)
+/// Entity history tracking models for ordinary PostgreSQL tables.
 ///
-/// These models represent rows in the `<entity>_history` append-only hypertables
+/// These models represent rows in the `<entity>_history` append-only tables
 /// that track field-level changes to operational tables via PostgreSQL triggers.
 pub mod entity_history {
     use super::*;
 
     /// A single history record capturing a field-level change to an entity.
     ///
-    /// History records are append-only and populated by PostgreSQL triggers —
-    /// they are never created or modified by application code.
+    /// PostgreSQL triggers append history records. Retention can delete expired
+    /// records; application code does not create or update them.
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct EntityHistoryRecord {
-        /// When the change occurred (hypertable partitioning dimension)
+        /// When the change occurred. History queries and retention use this timestamp.
         pub time: DateTime<Utc>,
 
         /// The operation that produced this record: `INSERT`, `UPDATE`, or `DELETE`
@@ -3125,7 +3141,7 @@ pub mod entity_history {
 
     /// Supported entity types that have history tracking.
     ///
-    /// Each variant maps to a `<name>_history` hypertable in the database.
+    /// Each variant maps to a `<name>_history` table in the database.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
     pub enum HistoryEntityType {

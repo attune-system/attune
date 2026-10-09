@@ -30,6 +30,8 @@ config = { workspace = true }
 
 # HTTP client
 reqwest = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-root-certs = "1.0"
 
 # Archive (for pack transport)
 tar = { workspace = true }

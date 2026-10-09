@@ -4,7 +4,7 @@ This guide will help you run a simple demonstration of Attune's timer-based auto
 
 ## Prerequisites
 
-- PostgreSQL 14+ running
+- Stock PostgreSQL 16+ running, no TimescaleDB extension required
 - RabbitMQ 3.12+ running
 - Rust toolchain installed
 - `jq` installed (for setup script)

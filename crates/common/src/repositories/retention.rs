@@ -3,7 +3,13 @@
 //! This module owns the SQL used by the supervisor to purge runtime metadata.
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{FromRow, PgConnection, PgPool, Row};
+use sqlx::{FromRow, PgConnection, PgPool};
+
+use super::native_maintenance::{
+    partitions::{bounded_transaction, PartitionRepository},
+    summaries::SummaryRepository,
+    ManagedTable, SummaryKind,
+};
 
 use crate::{
     config::{
@@ -34,7 +40,6 @@ pub enum RetentionTarget {
     WorkerHistory,
     SensorProcessHistory,
     AuditEvents,
-    ContinuousAggregates,
     Notifications,
     WebhookEventLogs,
     Inquiries,
@@ -47,7 +52,7 @@ pub enum RetentionTarget {
 }
 
 impl RetentionTarget {
-    pub fn all() -> [Self; 17] {
+    pub fn all() -> [Self; 16] {
         [
             Self::Events,
             Self::Enforcements,
@@ -56,7 +61,6 @@ impl RetentionTarget {
             Self::WorkerHistory,
             Self::SensorProcessHistory,
             Self::AuditEvents,
-            Self::ContinuousAggregates,
             Self::Notifications,
             Self::WebhookEventLogs,
             Self::Inquiries,
@@ -78,7 +82,6 @@ impl RetentionTarget {
             Self::WorkerHistory => "worker_history",
             Self::SensorProcessHistory => "sensor_process_history",
             Self::AuditEvents => "audit_events",
-            Self::ContinuousAggregates => "continuous_aggregates",
             Self::Notifications => "notifications",
             Self::WebhookEventLogs => "webhook_event_logs",
             Self::Inquiries => "inquiries",
@@ -101,9 +104,11 @@ struct RuntimeRetentionConfigRow {
     enabled: bool,
     check_interval_seconds: i64,
     batch_size: i64,
+    max_batches_per_target: i64,
     dry_run: bool,
     advisory_lock_key: i64,
     cache_retention: serde_json::Value,
+    native_maintenance: serde_json::Value,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -126,7 +131,33 @@ pub struct RetentionTargetResult {
     pub cutoff: Option<DateTime<Utc>>,
     pub candidates: i64,
     pub deleted: i64,
+    /// Row candidates can be a bounded lower bound on native targets. Whole
+    /// partition contents are deliberately never counted for DDL accounting.
+    pub candidates_exact: bool,
+    /// Eligible daily leaves selected within the partition operation budget.
+    pub partition_candidates: i64,
+    pub partitions_dropped: i64,
     pub dry_run: bool,
+}
+
+/// A failed target run, including progress confirmed before the failure.
+#[derive(Debug, thiserror::Error)]
+#[error("Retention target {target:?} failed after {deleted} confirmed deleted rows and {partitions_dropped} confirmed partition drops: {source}")]
+pub struct RetentionTargetFailure {
+    pub target: RetentionTarget,
+    pub cutoff: DateTime<Utc>,
+    /// Initial candidate count, or `None` if counting did not succeed.
+    pub candidates: Option<i64>,
+    /// Rows deleted by successful, committed batches only. The failed
+    /// statement may have committed without returning a response; its row
+    /// count is unknown and is never included here.
+    pub deleted: i64,
+    pub candidates_exact: bool,
+    pub partition_candidates: i64,
+    pub partitions_dropped: i64,
+    pub dry_run: bool,
+    #[source]
+    pub source: crate::Error,
 }
 
 /// Repository for runtime metadata retention operations.
@@ -139,18 +170,20 @@ impl RetentionRepository {
 
         sqlx::query(
             "INSERT INTO runtime_retention_config (
-                id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key,
-                cache_retention
+                id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                cache_retention, native_maintenance
              )
-             VALUES (TRUE, $1, $2, $3, $4, $5, $6)
+             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(defaults.enabled)
         .bind(defaults.check_interval_seconds as i64)
         .bind(defaults.batch_size)
+        .bind(defaults.max_batches_per_target)
         .bind(defaults.dry_run)
         .bind(defaults.advisory_lock_key)
         .bind(serde_json::to_value(&defaults.cache_retention)?)
+        .bind(serde_json::to_value(&defaults.native_maintenance)?)
         .execute(pool)
         .await?;
 
@@ -188,13 +221,33 @@ impl RetentionRepository {
         Ok(())
     }
 
+    /// Initialize native job settings once from service configuration. Operator
+    /// changes in the runtime singleton remain authoritative after initialization.
+    pub async fn seed_native_config_if_empty(
+        pool: &PgPool,
+        native_maintenance: &crate::config::NativeMaintenanceConfig,
+    ) -> Result<()> {
+        native_maintenance
+            .validate()
+            .map_err(crate::Error::validation)?;
+        Self::ensure_config(pool).await?;
+        sqlx::query(
+            "UPDATE runtime_retention_config SET native_maintenance = $1
+             WHERE id = TRUE AND native_maintenance = '{}'::JSONB",
+        )
+        .bind(serde_json::to_value(native_maintenance)?)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// Load the database-backed runtime retention config.
     pub async fn load_config(pool: &PgPool) -> Result<RetentionConfig> {
         Self::ensure_config(pool).await?;
 
         let row = sqlx::query_as::<_, RuntimeRetentionConfigRow>(
-            "SELECT enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key,
-                    cache_retention
+            "SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                    cache_retention, native_maintenance
              FROM runtime_retention_config
              WHERE id = TRUE",
         )
@@ -227,10 +280,12 @@ impl RetentionRepository {
             enabled: row.enabled,
             check_interval_seconds: row.check_interval_seconds as u64,
             batch_size: row.batch_size,
+            max_batches_per_target: row.max_batches_per_target,
             dry_run: row.dry_run,
             advisory_lock_key: row.advisory_lock_key,
             targets,
             cache_retention: serde_json::from_value(row.cache_retention)?,
+            native_maintenance: serde_json::from_value(row.native_maintenance)?,
         })
     }
 
@@ -240,24 +295,28 @@ impl RetentionRepository {
 
         sqlx::query(
             "INSERT INTO runtime_retention_config (
-                id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key,
-                cache_retention
+                id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                cache_retention, native_maintenance
              )
-             VALUES (TRUE, $1, $2, $3, $4, $5, $6)
+             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO UPDATE SET
                 enabled = EXCLUDED.enabled,
                 check_interval_seconds = EXCLUDED.check_interval_seconds,
                 batch_size = EXCLUDED.batch_size,
+                max_batches_per_target = EXCLUDED.max_batches_per_target,
                 dry_run = EXCLUDED.dry_run,
                 advisory_lock_key = EXCLUDED.advisory_lock_key,
-                cache_retention = EXCLUDED.cache_retention",
+                cache_retention = EXCLUDED.cache_retention,
+                native_maintenance = EXCLUDED.native_maintenance",
         )
         .bind(config.enabled)
         .bind(config.check_interval_seconds as i64)
         .bind(config.batch_size)
+        .bind(config.max_batches_per_target)
         .bind(config.dry_run)
         .bind(config.advisory_lock_key)
         .bind(serde_json::to_value(&config.cache_retention)?)
+        .bind(serde_json::to_value(&config.native_maintenance)?)
         .execute(&mut *tx)
         .await?;
 
@@ -299,7 +358,7 @@ impl RetentionRepository {
 
     fn target_config_pairs(
         targets: &RetentionTargetsConfig,
-    ) -> [(RetentionTarget, &RetentionTargetConfig); 17] {
+    ) -> [(RetentionTarget, &RetentionTargetConfig); 16] {
         [
             (RetentionTarget::Events, &targets.events),
             (RetentionTarget::Enforcements, &targets.enforcements),
@@ -314,10 +373,6 @@ impl RetentionRepository {
                 &targets.sensor_process_history,
             ),
             (RetentionTarget::AuditEvents, &targets.audit_events),
-            (
-                RetentionTarget::ContinuousAggregates,
-                &targets.continuous_aggregates,
-            ),
             (RetentionTarget::Notifications, &targets.notifications),
             (
                 RetentionTarget::WebhookEventLogs,
@@ -355,7 +410,6 @@ impl RetentionRepository {
             RetentionTarget::WorkerHistory => targets.worker_history = config,
             RetentionTarget::SensorProcessHistory => targets.sensor_process_history = config,
             RetentionTarget::AuditEvents => targets.audit_events = config,
-            RetentionTarget::ContinuousAggregates => targets.continuous_aggregates = config,
             RetentionTarget::Notifications => targets.notifications = config,
             RetentionTarget::WebhookEventLogs => targets.webhook_event_logs = config,
             RetentionTarget::Inquiries => targets.inquiries = config,
@@ -386,266 +440,279 @@ impl RetentionRepository {
             .map_err(Into::into)
     }
 
-    /// Run a single retention target.
-    pub async fn run_target(
+    /// Expire whole daily leaves first, then delete bounded row batches. Native
+    /// candidate probes count only bounded boundary/DEFAULT rows, not the contents
+    /// of dropped partitions. Cancellation is checked between operations, never by
+    /// dropping an in-flight delete whose commit outcome would be unknown.
+    /// Failures retain confirmed progress and exclude the failing batch's
+    /// unknown row count.
+    pub async fn run_target_bounded(
         pool: &PgPool,
         target: RetentionTarget,
         max_age_seconds: u64,
-        batch_size: i64,
-        dry_run: bool,
-    ) -> Result<RetentionTargetResult> {
-        let cutoff = retention_cutoff(max_age_seconds);
-        let batch_size = batch_size.max(1);
-        let (candidates, deleted) = match target {
-            RetentionTarget::Events => {
-                Self::drop_hypertable_chunks(pool, "event", "created", cutoff, dry_run).await?
-            }
-            RetentionTarget::ExecutionHistory => {
-                Self::drop_hypertable_chunks(pool, "execution_history", "time", cutoff, dry_run)
-                    .await?
-            }
-            RetentionTarget::WorkerHistory => {
-                Self::drop_hypertable_chunks(pool, "worker_history", "time", cutoff, dry_run)
-                    .await?
-            }
-            RetentionTarget::SensorProcessHistory => {
-                Self::drop_hypertable_chunks(
-                    pool,
-                    "sensor_process_history",
-                    "time",
-                    cutoff,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::AuditEvents => {
-                Self::drop_hypertable_chunks(pool, "audit_event", "created", cutoff, dry_run)
-                    .await?
-            }
-            RetentionTarget::ContinuousAggregates => {
-                Self::drop_continuous_aggregate_chunks(pool, cutoff, dry_run).await?
-            }
-            RetentionTarget::Enforcements => {
-                Self::delete_limited(
-                    pool,
-                    "enforcement",
-                    "created < $1 AND status <> 'created'",
-                    "created",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::Executions => {
-                Self::delete_executions(pool, cutoff, batch_size, dry_run).await?
-            }
-            RetentionTarget::Notifications => {
-                Self::delete_limited(
-                    pool,
-                    "notification",
-                    "created < $1",
-                    "created",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::WebhookEventLogs => {
-                Self::delete_limited(
-                    pool,
-                    "webhook_event_log",
-                    "created < $1",
-                    "created",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::Inquiries => {
-                Self::delete_limited(
-                    pool,
-                    "inquiry",
-                    "updated < $1 AND status IN ('responded', 'timeout', 'cancelled')",
-                    "updated",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::WorkQueueItems => {
-                Self::delete_limited(
-                    pool,
-                    "work_queue_item",
-                    "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled') \
-                     AND NOT EXISTS (SELECT 1 FROM workflow_task_wait wait \
-                         WHERE wait.work_queue_item = work_queue_item.id AND wait.state = 'waiting')",
-                    "updated",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::WorkQueueDispatches => {
-                Self::delete_limited(
-                    pool,
-                    "work_queue_dispatch",
-                    "updated < $1 AND status IN ('completed', 'failed', 'released', 'cancelled')",
-                    "updated",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::PackTestExecutions => {
-                Self::delete_limited(
-                    pool,
-                    "pack_test_execution",
-                    "execution_time < $1",
-                    "execution_time",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::ExecutionAdmission => {
-                Self::delete_execution_admission(pool, cutoff, batch_size, dry_run).await?
-            }
-            RetentionTarget::Workers => {
-                Self::delete_limited(
-                    pool,
-                    "worker",
-                    "updated < $1 AND status IN ('inactive', 'error') AND cordoned = false AND NOT EXISTS (SELECT 1 FROM sensor_process sp WHERE sp.worker = worker.id AND sp.status IN ('starting', 'running', 'backoff'))",
-                    "updated",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-            RetentionTarget::SensorProcesses => {
-                Self::delete_limited(
-                    pool,
-                    "sensor_process",
-                    "updated < $1 AND status IN ('stopped', 'failed') AND active_rule_count = 0",
-                    "updated",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
-            }
-        };
-
-        Ok(RetentionTargetResult {
+        config: &RetentionConfig,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> std::result::Result<RetentionTargetResult, Box<RetentionTargetFailure>> {
+        Self::run_target_before(
+            pool,
             target,
-            cutoff: Some(cutoff),
-            candidates,
-            deleted,
-            dry_run,
-        })
+            retention_cutoff(max_age_seconds),
+            config,
+            is_cancelled,
+        )
+        .await
     }
 
-    /// Count rows/chunks still older than a target cutoff, without mutating data.
+    async fn run_target_before(
+        pool: &PgPool,
+        target: RetentionTarget,
+        cutoff: DateTime<Utc>,
+        config: &RetentionConfig,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> std::result::Result<RetentionTargetResult, Box<RetentionTargetFailure>> {
+        let failure = |source, result: &RetentionTargetResult, counted: bool| {
+            Box::new(RetentionTargetFailure {
+                target,
+                cutoff,
+                candidates: counted.then_some(result.candidates),
+                deleted: result.deleted,
+                candidates_exact: counted && result.candidates_exact,
+                partition_candidates: result.partition_candidates,
+                partitions_dropped: result.partitions_dropped,
+                dry_run: config.dry_run,
+                source,
+            })
+        };
+        let mut result = RetentionTargetResult {
+            target,
+            cutoff: Some(cutoff),
+            candidates: 0,
+            deleted: 0,
+            candidates_exact: false,
+            partition_candidates: 0,
+            partitions_dropped: 0,
+            dry_run: config.dry_run,
+        };
+        if config.batch_size <= 0 || config.max_batches_per_target <= 0 {
+            return Err(failure(
+                crate::Error::Validation(
+                    "retention batch_size and max_batches_per_target must be positive".to_string(),
+                ),
+                &result,
+                false,
+            ));
+        }
+        if is_cancelled() {
+            return Ok(result);
+        }
+        let managed = match target {
+            RetentionTarget::Events => Some(ManagedTable::Event),
+            RetentionTarget::ExecutionHistory => Some(ManagedTable::ExecutionHistory),
+            RetentionTarget::AuditEvents => Some(ManagedTable::AuditEvent),
+            _ => None,
+        }
+        .filter(|_| config.native_maintenance.enabled);
+        if let Some(table) = managed {
+            match PartitionRepository::expire_before(
+                pool,
+                table,
+                cutoff,
+                &config.native_maintenance,
+                config.dry_run,
+                &mut is_cancelled,
+            )
+            .await
+            {
+                Ok(expiry) => {
+                    result.partition_candidates = expiry.candidates;
+                    result.partitions_dropped = expiry.partitions_dropped;
+                    if expiry.cancelled {
+                        return Ok(result);
+                    }
+                }
+                Err(expiry) => {
+                    result.partition_candidates = expiry.candidates.unwrap_or(0);
+                    result.partitions_dropped = expiry.partitions_dropped;
+                    return Err(failure(expiry.source, &result, false));
+                }
+            }
+        }
+        let (table, predicate, order_column) = Self::target_sql(target);
+        if let Some(managed) = managed {
+            let cap = config
+                .batch_size
+                .saturating_mul(config.max_batches_per_target)
+                .min(i64::MAX - 1);
+            let mut tx = bounded_transaction(pool, &config.native_maintenance)
+                .await
+                .map_err(|source| failure(source, &result, false))?;
+            let col = managed.time_column();
+            let fallback = managed.default_name();
+            // Split DEFAULT from the boundary source range so PostgreSQL can
+            // prune ALL complete old leaves, including those left by the DDL cap.
+            let count_sql = format!(
+                "SELECT COUNT(*)::BIGINT FROM (
+                    SELECT 1 FROM ONLY {fallback} WHERE {col} < $1
+                    UNION ALL
+                    SELECT 1 FROM {table} WHERE {col} >= date_trunc('day', $1::timestamptz, 'UTC')
+                        AND {col} < $1 AND tableoid <> to_regclass('{fallback}')::oid
+                    LIMIT $2
+                ) bounded",
+            );
+            let count = sqlx::query_scalar::<_, i64>(&count_sql)
+                .bind(cutoff)
+                .bind(cap + 1)
+                .fetch_one(&mut *tx)
+                .await;
+            result.candidates = match count {
+                Ok(count) => count,
+                Err(source) => {
+                    tx.rollback()
+                        .await
+                        .map_err(|e| failure(e.into(), &result, false))?;
+                    return Err(failure(source.into(), &result, false));
+                }
+            };
+            result.candidates_exact = result.candidates <= cap;
+            tx.commit()
+                .await
+                .map_err(|e| failure(e.into(), &result, false))?;
+        } else {
+            result.candidates = Self::count_target_candidates(pool, target, cutoff)
+                .await
+                .map_err(|source| failure(source, &result, false))?;
+            result.candidates_exact = true;
+        }
+        if config.dry_run {
+            return Ok(result);
+        }
+
+        let summary_kinds: &[SummaryKind] = match target {
+            RetentionTarget::Events => &[SummaryKind::EventVolume],
+            RetentionTarget::ExecutionHistory => {
+                &[SummaryKind::ExecutionStatus, SummaryKind::ExecutionCreation]
+            }
+            RetentionTarget::WorkerHistory => &[SummaryKind::WorkerStatus],
+            _ => &[],
+        };
+
+        let delete_sql = if let Some(managed) = managed {
+            Self::delete_native_boundary_sql(managed)
+        } else if target == RetentionTarget::Executions {
+            Self::delete_executions_sql()
+        } else {
+            let identity = match target {
+                RetentionTarget::ExecutionHistory
+                | RetentionTarget::WorkerHistory
+                | RetentionTarget::SensorProcessHistory => "ctid",
+                _ => "id",
+            };
+            Self::delete_sql(table, predicate, order_column, identity)
+        };
+        for _ in 0..config.max_batches_per_target {
+            if result.candidates == 0 {
+                break;
+            }
+            if is_cancelled() {
+                return Ok(result);
+            }
+            // Parent DML runs the transition-table invalidation trigger in the
+            // same transaction. Locations never escape this locked statement.
+            let deleted = if managed.is_some() || !summary_kinds.is_empty() {
+                let mut tx = bounded_transaction(pool, &config.native_maintenance)
+                    .await
+                    .map_err(|source| failure(source, &result, true))?;
+                let deleted = sqlx::query_scalar::<_, i64>(&delete_sql)
+                    .bind(cutoff)
+                    .bind(config.batch_size)
+                    .fetch_one(&mut *tx)
+                    .await;
+                let deleted = match deleted {
+                    Ok(deleted) => deleted,
+                    Err(source) => {
+                        tx.rollback()
+                            .await
+                            .map_err(|e| failure(e.into(), &result, true))?;
+                        return Err(failure(source.into(), &result, true));
+                    }
+                };
+                tx.commit()
+                    .await
+                    .map_err(|e| failure(e.into(), &result, true))?;
+                deleted
+            } else {
+                sqlx::query_scalar::<_, i64>(&delete_sql)
+                    .bind(cutoff)
+                    .bind(config.batch_size)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|source| failure(source.into(), &result, true))?
+            };
+            result.deleted += deleted;
+            if deleted == 0 {
+                break;
+            }
+        }
+        if !summary_kinds.is_empty() {
+            // Independent from candidate counts and the DDL enable flag. A prior
+            // attempt may have committed its last raw deletion before cleanup failed.
+            SummaryRepository::expire_before(
+                pool,
+                summary_kinds,
+                cutoff,
+                &config.native_maintenance,
+                &mut is_cancelled,
+            )
+            .await
+            .map_err(|source| failure(source, &result, true))?;
+        }
+        Ok(result)
+    }
+
+    /// Count eligible rows older than a target cutoff, without mutating data.
     pub async fn count_target_candidates(
         pool: &PgPool,
         target: RetentionTarget,
         cutoff: DateTime<Utc>,
     ) -> Result<i64> {
+        let (table, predicate, _) = Self::target_sql(target);
+        Self::count_predicate(pool, table, predicate, cutoff).await
+    }
+
+    // Counts and deletes share eligibility predicates. SQL identifiers are
+    // internal constants, never caller-provided names.
+    fn target_sql(target: RetentionTarget) -> (&'static str, &'static str, &'static str) {
         match target {
-            RetentionTarget::Events => Self::count_predicate(pool, "event", "created < $1", cutoff).await,
-            RetentionTarget::ExecutionHistory => {
-                Self::count_predicate(pool, "execution_history", "time < $1", cutoff).await
-            }
-            RetentionTarget::WorkerHistory => {
-                Self::count_predicate(pool, "worker_history", "time < $1", cutoff).await
-            }
-            RetentionTarget::SensorProcessHistory => {
-                Self::count_predicate(pool, "sensor_process_history", "time < $1", cutoff).await
-            }
-            RetentionTarget::AuditEvents => {
-                Self::count_predicate(pool, "audit_event", "created < $1", cutoff).await
-            }
-            RetentionTarget::ContinuousAggregates => {
-                Self::count_continuous_aggregate_candidates(pool, cutoff).await
-            }
-            RetentionTarget::Enforcements => {
-                Self::count_predicate(pool, "enforcement", "created < $1 AND status <> 'created'", cutoff).await
-            }
-            RetentionTarget::Executions => {
-                Self::count_predicate(
-                    pool,
-                    "execution",
-                    EXECUTION_RETENTION_PREDICATE,
-                    cutoff,
-                )
-                .await
-            }
-            RetentionTarget::Notifications => {
-                Self::count_predicate(pool, "notification", "created < $1", cutoff).await
-            }
-            RetentionTarget::WebhookEventLogs => {
-                Self::count_predicate(pool, "webhook_event_log", "created < $1", cutoff).await
-            }
-            RetentionTarget::Inquiries => {
-                Self::count_predicate(
-                    pool,
-                    "inquiry",
-                    "updated < $1 AND status IN ('responded', 'timeout', 'cancelled')",
-                    cutoff,
-                )
-                .await
-            }
-            RetentionTarget::WorkQueueItems => {
-                Self::count_predicate(
-                    pool,
-                    "work_queue_item",
-                    "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled') \
-                     AND NOT EXISTS (SELECT 1 FROM workflow_task_wait wait \
-                         WHERE wait.work_queue_item = work_queue_item.id AND wait.state = 'waiting')",
-                    cutoff,
-                )
-                .await
-            }
-            RetentionTarget::WorkQueueDispatches => {
-                Self::count_predicate(
-                    pool,
-                    "work_queue_dispatch",
-                    "updated < $1 AND status IN ('completed', 'failed', 'released', 'cancelled')",
-                    cutoff,
-                )
-                .await
-            }
-            RetentionTarget::PackTestExecutions => {
-                Self::count_predicate(pool, "pack_test_execution", "execution_time < $1", cutoff).await
-            }
-            RetentionTarget::ExecutionAdmission => {
-                Self::count_execution_admission_candidates(pool, cutoff).await
-            }
-            RetentionTarget::Workers => {
-                Self::count_predicate(
-                    pool,
-                    "worker",
-                    "updated < $1 AND status IN ('inactive', 'error') AND cordoned = false AND NOT EXISTS (SELECT 1 FROM sensor_process sp WHERE sp.worker = worker.id AND sp.status IN ('starting', 'running', 'backoff'))",
-                    cutoff,
-                )
-                .await
-            }
-            RetentionTarget::SensorProcesses => {
-                Self::count_predicate(
-                    pool,
-                    "sensor_process",
-                    "updated < $1 AND status IN ('stopped', 'failed') AND active_rule_count = 0",
-                    cutoff,
-                )
-                .await
-            }
+            RetentionTarget::Events => ("event", "created < $1", "created"),
+            RetentionTarget::ExecutionHistory => ("execution_history", "time < $1", "time"),
+            RetentionTarget::WorkerHistory => ("worker_history", "time < $1", "time"),
+            RetentionTarget::SensorProcessHistory => ("sensor_process_history", "time < $1", "time"),
+            RetentionTarget::AuditEvents => ("audit_event", "created < $1", "created"),
+            RetentionTarget::Enforcements => ("enforcement", "created < $1 AND status <> 'created'", "created"),
+            RetentionTarget::Executions => ("execution", EXECUTION_RETENTION_PREDICATE, "updated"),
+            RetentionTarget::Notifications => ("notification", "created < $1", "created"),
+            RetentionTarget::WebhookEventLogs => ("webhook_event_log", "created < $1", "created"),
+            RetentionTarget::Inquiries => ("inquiry", "updated < $1 AND status IN ('responded', 'timeout', 'cancelled')", "updated"),
+            RetentionTarget::WorkQueueItems => (
+                "work_queue_item",
+                "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled') \
+                 AND NOT EXISTS (SELECT 1 FROM workflow_task_wait wait \
+                     WHERE wait.work_queue_item = work_queue_item.id AND wait.state = 'waiting')",
+                "updated",
+            ),
+            RetentionTarget::WorkQueueDispatches => ("work_queue_dispatch", "updated < $1 AND status IN ('completed', 'failed', 'released', 'cancelled')", "updated"),
+            RetentionTarget::PackTestExecutions => ("pack_test_execution", "execution_time < $1", "execution_time"),
+            RetentionTarget::ExecutionAdmission => (
+                "execution_admission_state",
+                "updated < $1 AND NOT EXISTS (SELECT 1 FROM execution_admission_entry e WHERE e.state_id = execution_admission_state.id)",
+                "updated",
+            ),
+            RetentionTarget::Workers => (
+                "worker",
+                "updated < $1 AND status IN ('inactive', 'error') AND cordoned = false AND NOT EXISTS (SELECT 1 FROM sensor_process sp WHERE sp.worker = worker.id AND sp.status IN ('starting', 'running', 'backoff'))",
+                "updated",
+            ),
+            RetentionTarget::SensorProcesses => ("sensor_process", "updated < $1 AND status IN ('stopped', 'failed') AND active_rule_count = 0", "updated"),
         }
     }
 
@@ -666,80 +733,71 @@ impl RetentionRepository {
             .map_err(Into::into)
     }
 
-    fn delete_sql(table: &str, predicate: &str, order_column: &str) -> String {
+    fn delete_sql(table: &str, predicate: &str, order_column: &str, identity: &str) -> String {
+        if identity == "ctid" || table == "event" || table == "audit_event" {
+            return format!(
+                "WITH doomed AS MATERIALIZED (
+                    SELECT tableoid, ctid FROM {table} WHERE {predicate}
+                    ORDER BY {order_column} ASC, tableoid ASC, ctid ASC LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                 ), deleted AS (
+                    DELETE FROM {table} source USING doomed
+                    WHERE source.tableoid = doomed.tableoid AND source.ctid = doomed.ctid
+                    RETURNING 1
+                 ) SELECT COUNT(*)::BIGINT FROM deleted"
+            );
+        }
         format!(
-            "WITH doomed AS (
-                SELECT id FROM {table}
+            "WITH doomed AS MATERIALIZED (
+                SELECT {identity} FROM {table}
                 WHERE {predicate}
-                ORDER BY {order_column} ASC, id ASC
+                ORDER BY {order_column} ASC, {identity} ASC
                 LIMIT $2
+                FOR UPDATE SKIP LOCKED
              ),
              deleted AS (
                 DELETE FROM {table}
-                WHERE id IN (SELECT id FROM doomed)
+                WHERE {identity} IN (SELECT {identity} FROM doomed)
                 RETURNING 1
              )
              SELECT COUNT(*)::BIGINT FROM deleted"
         )
     }
 
-    async fn delete_limited(
-        pool: &PgPool,
-        table: &str,
-        predicate: &str,
-        order_column: &str,
-        cutoff: DateTime<Utc>,
-        batch_size: i64,
-        dry_run: bool,
-    ) -> Result<(i64, i64)> {
-        let candidates = sqlx::query_scalar::<_, i64>(&Self::count_sql(table, predicate))
-            .bind(cutoff)
-            .fetch_one(pool)
-            .await?;
-
-        if dry_run || candidates == 0 {
-            return Ok((candidates, 0));
-        }
-
-        let deleted =
-            sqlx::query_scalar::<_, i64>(&Self::delete_sql(table, predicate, order_column))
-                .bind(cutoff)
-                .bind(batch_size)
-                .fetch_one(pool)
-                .await?;
-
-        Ok((candidates, deleted))
+    fn delete_native_boundary_sql(managed: ManagedTable) -> String {
+        let table = managed.table_name();
+        let fallback = managed.default_name();
+        let col = managed.time_column();
+        format!(
+            "WITH default_rows AS MATERIALIZED (
+                SELECT tableoid, ctid, {col} AS sort_time FROM ONLY {fallback}
+                WHERE {col} < $1 ORDER BY {col}, ctid LIMIT $2 FOR UPDATE SKIP LOCKED
+             ), boundary_rows AS MATERIALIZED (
+                SELECT tableoid, ctid, {col} AS sort_time FROM {table}
+                WHERE {col} >= date_trunc('day', $1::timestamptz, 'UTC') AND {col} < $1
+                    AND tableoid <> to_regclass('{fallback}')::oid
+                ORDER BY {col}, tableoid, ctid LIMIT $2 FOR UPDATE SKIP LOCKED
+             ), doomed AS MATERIALIZED (
+                SELECT tableoid, ctid FROM (
+                    SELECT tableoid, ctid, sort_time FROM default_rows
+                    UNION ALL SELECT tableoid, ctid, sort_time FROM boundary_rows
+                ) candidates ORDER BY sort_time, tableoid, ctid LIMIT $2
+             ), deleted AS (
+                DELETE FROM {table} source USING doomed
+                WHERE source.tableoid = doomed.tableoid AND source.ctid = doomed.ctid
+                RETURNING 1
+             ) SELECT COUNT(*)::BIGINT FROM deleted"
+        )
     }
 
-    async fn delete_executions(
-        pool: &PgPool,
-        cutoff: DateTime<Utc>,
-        batch_size: i64,
-        dry_run: bool,
-    ) -> Result<(i64, i64)> {
-        let candidates =
-            Self::count_predicate(pool, "execution", EXECUTION_RETENTION_PREDICATE, cutoff).await?;
-        if dry_run || candidates == 0 {
-            return Ok((candidates, 0));
-        }
-
-        let deleted = sqlx::query_scalar::<_, i64>(
+    fn delete_executions_sql() -> String {
+        format!(
             "WITH doomed AS MATERIALIZED (
                  SELECT execution.id FROM execution
-                  WHERE updated < $1
-                    AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')
-                    AND NOT EXISTS (
-                        SELECT 1 FROM workflow_task_wait wait
-                        WHERE wait.target_execution = execution.id AND wait.state = 'waiting'
-                    )
-                    AND NOT EXISTS (
-                       SELECT 1 FROM workflow_execution workflow
-                       JOIN workflow_log_outbox outbox
-                         ON outbox.workflow_execution = workflow.id
-                       WHERE workflow.execution = execution.id AND outbox.delivered_at IS NULL
-                   )
+                  WHERE {EXECUTION_RETENTION_PREDICATE}
                  ORDER BY updated ASC, id ASC
                  LIMIT $2
+                 FOR UPDATE SKIP LOCKED
              ), deleted_outbox AS (
                  DELETE FROM workflow_log_outbox outbox
                  WHERE outbox.delivered_at IS NOT NULL
@@ -757,165 +815,6 @@ impl RetentionRepository {
              )
              SELECT COUNT(*)::BIGINT FROM deleted",
         )
-        .bind(cutoff)
-        .bind(batch_size.max(1))
-        .fetch_one(pool)
-        .await?;
-        Ok((candidates, deleted))
-    }
-
-    async fn drop_hypertable_chunks(
-        pool: &PgPool,
-        table: &str,
-        time_column: &str,
-        cutoff: DateTime<Utc>,
-        dry_run: bool,
-    ) -> Result<(i64, i64)> {
-        let count_sql = format!("SELECT COUNT(*)::BIGINT FROM {table} WHERE {time_column} < $1");
-        let candidates = sqlx::query_scalar::<_, i64>(&count_sql)
-            .bind(cutoff)
-            .fetch_one(pool)
-            .await?;
-
-        if dry_run || candidates == 0 {
-            return Ok((candidates, 0));
-        }
-
-        let drop_sql = format!(
-            "SELECT COUNT(*)::BIGINT FROM drop_chunks('{}', older_than => $1::timestamptz)",
-            table.replace('\'', "''")
-        );
-        let dropped_chunks = sqlx::query_scalar::<_, i64>(&drop_sql)
-            .bind(cutoff)
-            .fetch_one(pool)
-            .await?;
-
-        Ok((candidates, dropped_chunks))
-    }
-
-    async fn drop_continuous_aggregate_chunks(
-        pool: &PgPool,
-        cutoff: DateTime<Utc>,
-        dry_run: bool,
-    ) -> Result<(i64, i64)> {
-        let aggregates = [
-            "execution_status_hourly",
-            "execution_throughput_hourly",
-            "event_volume_hourly",
-            "worker_status_hourly",
-        ];
-        let mut candidates = 0;
-        let mut dropped_chunks = 0;
-
-        for aggregate in aggregates {
-            let count_sql = format!("SELECT COUNT(*)::BIGINT FROM {aggregate} WHERE bucket < $1");
-            candidates += sqlx::query_scalar::<_, i64>(&count_sql)
-                .bind(cutoff)
-                .fetch_one(pool)
-                .await?;
-
-            if !dry_run {
-                let drop_sql = format!(
-                    "SELECT COUNT(*)::BIGINT FROM drop_chunks('{}', older_than => $1::timestamptz)",
-                    aggregate
-                );
-                dropped_chunks += sqlx::query_scalar::<_, i64>(&drop_sql)
-                    .bind(cutoff)
-                    .fetch_one(pool)
-                    .await?;
-            }
-        }
-
-        Ok((candidates, dropped_chunks))
-    }
-
-    async fn count_continuous_aggregate_candidates(
-        pool: &PgPool,
-        cutoff: DateTime<Utc>,
-    ) -> Result<i64> {
-        let aggregates = [
-            "execution_status_hourly",
-            "execution_throughput_hourly",
-            "event_volume_hourly",
-            "worker_status_hourly",
-        ];
-        let mut candidates = 0;
-
-        for aggregate in aggregates {
-            let count_sql = format!("SELECT COUNT(*)::BIGINT FROM {aggregate} WHERE bucket < $1");
-            candidates += sqlx::query_scalar::<_, i64>(&count_sql)
-                .bind(cutoff)
-                .fetch_one(pool)
-                .await?;
-        }
-
-        Ok(candidates)
-    }
-
-    async fn count_execution_admission_candidates(
-        pool: &PgPool,
-        cutoff: DateTime<Utc>,
-    ) -> Result<i64> {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)::BIGINT
-             FROM execution_admission_state s
-             WHERE s.updated < $1
-               AND NOT EXISTS (
-                   SELECT 1 FROM execution_admission_entry e WHERE e.state_id = s.id
-               )",
-        )
-        .bind(cutoff)
-        .fetch_one(pool)
-        .await
-        .map_err(Into::into)
-    }
-
-    async fn delete_execution_admission(
-        pool: &PgPool,
-        cutoff: DateTime<Utc>,
-        batch_size: i64,
-        dry_run: bool,
-    ) -> Result<(i64, i64)> {
-        let candidates = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)::BIGINT
-             FROM execution_admission_state s
-             WHERE s.updated < $1
-               AND NOT EXISTS (
-                   SELECT 1 FROM execution_admission_entry e WHERE e.state_id = s.id
-               )",
-        )
-        .bind(cutoff)
-        .fetch_one(pool)
-        .await?;
-
-        if dry_run || candidates == 0 {
-            return Ok((candidates, 0));
-        }
-
-        let row = sqlx::query(
-            "WITH doomed AS (
-                SELECT s.id
-                FROM execution_admission_state s
-                WHERE s.updated < $1
-                  AND NOT EXISTS (
-                      SELECT 1 FROM execution_admission_entry e WHERE e.state_id = s.id
-                  )
-                ORDER BY s.updated ASC, s.id ASC
-                LIMIT $2
-             ),
-             deleted AS (
-                DELETE FROM execution_admission_state
-                WHERE id IN (SELECT id FROM doomed)
-                RETURNING 1
-             )
-             SELECT COUNT(*)::BIGINT AS deleted FROM deleted",
-        )
-        .bind(cutoff)
-        .bind(batch_size)
-        .fetch_one(pool)
-        .await?;
-
-        Ok((candidates, row.get::<i64, _>("deleted")))
     }
 }
 
@@ -936,8 +835,8 @@ mod tests {
 
         let configured = RetentionRepository::configured_targets(&targets);
 
-        // All 17 targets are returned regardless of max_age_seconds
-        assert_eq!(configured.len(), 17);
+        // All targets are returned regardless of max_age_seconds.
+        assert_eq!(configured.len(), 16);
         // Target with max_age_seconds = None is included (supervisor skips it at runtime)
         assert!(configured.iter().any(|target| {
             target.target == RetentionTarget::AuditEvents && target.max_age_seconds.is_none()
@@ -948,6 +847,51 @@ mod tests {
     fn retention_target_names_are_stable() {
         assert_eq!(RetentionTarget::Executions.name(), "executions");
         assert_eq!(RetentionTarget::AuditEvents.name(), "audit_events");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_work_never_acquires_a_connection() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let result = RetentionRepository::run_target_bounded(
+            &pool,
+            RetentionTarget::Events,
+            60,
+            &RetentionConfig::default(),
+            || true,
+        )
+        .await
+        .unwrap();
+        assert_eq!((result.candidates, result.deleted), (0, 0));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn failure_before_counting_reports_unknown_candidates_and_no_confirmed_deletes() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        pool.close().await;
+        let failure = RetentionRepository::run_target_bounded(
+            &pool,
+            RetentionTarget::Events,
+            60,
+            &RetentionConfig::default(),
+            || false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.target, RetentionTarget::Events);
+        assert_eq!(failure.candidates, None);
+        assert_eq!(failure.deleted, 0);
+        assert!(matches!(
+            failure.source,
+            crate::Error::Database(sqlx::Error::PoolClosed)
+        ));
+        assert!(std::error::Error::source(&failure)
+            .unwrap()
+            .is::<crate::Error>());
     }
 
     #[test]
@@ -983,8 +927,13 @@ mod tests {
         assert!(RetentionRepository::delete_sql(
             "work_queue_item",
             queue_item_predicate,
-            "updated"
+            "updated",
+            "id"
         )
         .contains("wait.state = 'waiting'"));
     }
 }
+
+#[cfg(test)]
+#[path = "retention_tests.rs"]
+mod database_tests;

@@ -110,6 +110,8 @@ cache_namespace
   freshness_target_seconds
   max_records_per_generation, max_generation_bytes
   max_retained_bytes, max_retained_generations
+  max_staging_generations
+  refresh_concurrency: reuse | conflict | parallel
   tombstoned_at, tombstone_reason
   created, updated
 
@@ -122,7 +124,8 @@ cache_generation
   record_count, size_bytes
   checksum_algorithm, checksum
   source_revision
-  created_by
+  created_by BIGINT -- identity attribution
+  created_by_execution BIGINT NULL -- authenticated producer execution, no FK
   created, sealed, activated, retired, readable_until
 
 cache_entry
@@ -175,7 +178,7 @@ The required indexes are:
   creation.
 - Generation lifecycle indexes on `(namespace_id, state, created)` and
   `(state, readable_until)`.
-- A cleanup index on `(generation_id, id)` for bounded entry deletion.
+- A composite primary key on `(generation, id)` within a LIST-partitioned entry parent. One partition stores each generation; numeric entry IDs are not globally unique by database constraint.
 - A unique `(generation_id, chunk_index)` index for idempotent chunk replay.
 
 All cache entities use `BIGINT` IDs. Foreign keys from namespace ownership may
@@ -294,6 +297,72 @@ snapshot consistency is not an authorization lease. Cursor expiration should
 not exceed the earlier of `readable_until`, the configured traversal limit,
 and the current token expiration.
 
+## Refresh coordination and execution attribution
+
+Set `refresh_concurrency` on a namespace to control requests with different
+`client_refresh_id` values while a generation is `staging` or `ready`.
+The API accepts this flat field when creating or updating an unmanaged namespace.
+For pack-managed namespaces, set it in the cache definition and register the pack.
+
+| Policy | Generation creation behavior |
+| --- | --- |
+| `parallel` | Create another generation within staging and storage quotas. This is the default. |
+| `reuse` | Return the oldest unpublished generation with HTTP 200, without changing its upload contract or creator. Recommended for asynchronous single-producer refreshes. |
+| `conflict` | Return HTTP 409 with code `cache_refresh_in_progress`. |
+
+These decisions happen under repository transaction locks, not a client-side
+check followed by an unprotected insert. A matching same-ID retry is checked
+first and retains its existing idempotency contract. A newly created generation
+returns HTTP 201. `active`, `retired`, and `failed` generations do not block new
+refreshes. Changing policy does not abandon existing generations; if several are
+unpublished, selection uses the oldest `created` timestamp and then ID.
+
+The conflict response identifies the existing generation without exposing values:
+
+```json
+{
+  "error": "cache namespace already has an unpublished generation",
+  "code": "cache_refresh_in_progress",
+  "details": {"generation_id": 42, "created_by_execution": 123}
+}
+```
+
+Generation metadata includes nullable `created_by_execution`. The API records
+the actual calling execution from authenticated execution-token claims, including
+a child action execution when it is the producer. `created_by` still identifies
+the caller's identity. Access and sensor tokens leave execution attribution null.
+Clients cannot set either creator field in generation creation requests.
+Retries and reuse preserve the original attribution.
+
+This execution ID is historical attribution, not a lease or proof of a running
+producer. It has no foreign key, so independent execution retention can leave an
+ID whose execution no longer exists. Cache access does not grant execution read
+permission or access to the execution's outputs.
+
+When `reuse` returns a different `client_refresh_id`, do not upload your own data,
+seal, or promote that other refresh automatically. An asynchronous workflow can:
+
+1. Inspect the returned generation and its `created_by_execution`.
+2. With separate execution-read authorization, poll
+   `GET /api/v1/executions/{id}` until terminal, using a bounded deadline.
+3. Re-read the specific cache generation. Execution success alone does not prove
+   that the producer sealed or promoted its data. `ready` means sealed but not
+   published; normal cache consumers need `active` or readable retained data.
+4. If the producer failed, was cancelled, timed out, or was abandoned, handle
+   unfinished staging explicitly. An authorized operator or recovery action can
+   abandon it before retrying. No mode automatically clears a failed producer's
+   unpublished generation.
+
+If attribution is null or execution retention removed the producer, bounded
+generation-status polling is still possible. Fail with diagnostics when the
+deadline expires rather than waiting forever. Implement polling in an action;
+native `wait_for.execution` is not a general cross-workflow wait. Its target must
+be a positive execution ID for an eligible descendant of the current workflow
+root, and the target must not itself be a workflow-task execution. An eligible
+API-launched descendant can use this native guard before a generation-verification
+task. A producer reused from another workflow needs API polling with separate
+execution-read authorization, or bounded generation polling.
+
 ## Native Workflow Iteration
 
 Workflow tasks consume complete cache snapshots with `iterate_cache`. The
@@ -366,6 +435,12 @@ The executor persists the generation, last external ID, next batch ordinal,
 counts, and child lineage. Restart and workflow resume continue from that
 checkpoint and reconcile existing children rather than changing to the latest
 generation or mixing snapshots.
+
+A generation may have at most 10,000 retained workflow cache-iteration rows,
+including terminal iterations. Terminalizing an iteration releases its live
+retention pin, but its row still counts toward this quota until removed. New
+iterations are rejected at the cap rather than allowing cleanup metadata work
+to grow without bound.
 
 ### Permissions, Retries, and Failure
 
@@ -461,6 +536,10 @@ records and bytes per generation, concurrent staging generations per
 namespace, and retained bytes per namespace/scope. `size_bytes` should use one
 documented accounting rule, such as PostgreSQL `pg_column_size(value)` plus
 identifier bytes, and completion must recheck the authoritative total.
+
+The declared `expected_chunk_count` must be between `0` and `10000`, inclusive.
+The cap applies to creation and sealing. A zero-chunk generation can represent
+an empty snapshot. It does not permit entries without accepted chunks.
 
 Checksums are useful only when their bytes are well-defined. Store an algorithm
 and format version. The initial release may omit whole-generation checksums and
@@ -571,22 +650,95 @@ the deployment runbook; record count alone is not an extraction criterion.
 
 Aggregate admission is enforced in addition to per-generation and per-namespace
 quotas. `cache_admission` limits live namespaces globally and per canonical
-owner, physical entry bytes globally and per owner, and unpublished
+owner, physical entry bytes globally and per owner, entry partition count, and unpublished
 (`staging` plus `ready`) generations per owner. Physical bytes include entries
-in every retained generation state and in tombstoned namespaces until bounded
-cleanup actually deletes them; logical retirement, failure, or tombstoning does
+in every retained generation state and in tombstoned namespaces until atomic
+partition cleanup commits; logical retirement, failure, or tombstoning does
 not immediately recover quota.
 
-Namespace creation, generation creation, and chunk ingestion take one shared
-PostgreSQL transaction advisory lock before measuring and admitting aggregate
-usage. This serializes competing writers across API instances, and a rejected
-chunk rolls back its entries and counters. Quotas reject new growth without
-evicting or changing published snapshots. Exact idempotent generation/chunk
+Cache mutations and pin-metadata cascade deletion acquire the shared PostgreSQL
+transaction admission lock before entry-parent protection and metadata rows.
+Admission uses the two-integer key `(7821101, 0)`, in a separate PostgreSQL lock
+namespace from single-BIGINT workflow advisory IDs. Workflow transactions use
+`PinMutation` at outer transaction entry, acquiring admission, then parent
+ACCESS SHARE, then workflow, iteration, and generation rows. Pin-metadata
+deletion cascades acquire the same admission before parent protection and rows.
+Acquiring admission inside a later scan helper is too late.
+
+This serializes outer mutation transactions across API instances and generations.
+Ordinary `Read` does not acquire mutation admission and remains concurrent;
+partition DDL can still block reads through its parent relation lock. The
+rejected parent-only protocol reproduced SQLSTATE `40P01` on PostgreSQL 16 and
+18 when two workflow roots pinned two generations in opposite order. Full
+production workflow/pin/cascade acceptance and mutation-admission latency
+measurements remain pending. Serialization is a correctness choice, not a
+performance claim. See the authoritative
+[lock protocol](plans/cache-generation-partitioning.md) for modes and transaction
+entry requirements.
+
+Namespace creation, generation creation, and chunk ingestion use this admission
+before measuring aggregate usage. A rejected chunk rolls back its entries and
+counters. Quotas reject new growth without evicting or changing published
+snapshots. Exact idempotent generation/chunk
 replays return the already accepted result, which keeps retry behavior stable
 when usage reaches a limit. Rejections expose stable codes for global/owner
 namespace limits, global/owner physical-byte limits, and the owner unpublished-
 generation limit so clients and telemetry do not parse messages. See the
 configuration guide for fields and defaults.
+
+`cache_admission.max_entry_partitions` defaults provisionally to `128`. It counts
+empty, staging, ready, active, retired, failed, and pinned generations until their
+partitions are dropped. Matching retries and refresh reuse are allowed at the cap.
+New refreshes receive `cache_entry_partition_limit_exceeded`; active or pinned
+snapshots are never evicted to make room. Partition creation commits before a
+producer fetches source data. DDL contention returns retryable HTTP 503 with
+`cache_storage_busy`; retry using the same refresh ID.
+
+Refresh partition creation has its own statement deadline,
+`cache_retention.ddl_creation_statement_timeout_milliseconds`, provisionally
+`5000`. Cleanup keeps `ddl_statement_timeout_milliseconds: 1000`. Both retain the
+250 ms DDL lock-wait limit. The creation p95 benchmark target remains below
+1 second; passing correctness tests with the safety budget does not prove it.
+
+### Planner statistics and storage observations
+
+Generation creation, lifecycle state changes, and deletion request planner
+statistics refresh through a persisted revision. The supervisor runs parent/leaf
+`ANALYZE` in a separate bounded transaction after generation cleanup. It samples
+`generation`, `external_id`, `id`, and `size_bytes`, not JSON payloads. Effective
+ownership of the `cache_entry` parent and its leaves is required; entry read/write
+privileges alone do not authorize maintenance.
+
+`cache_retention.statistics_interval_seconds` defaults to `300` and accepts
+integers from `1` through `86400`. It is the minimum interval between successful
+refreshes, checked during retention cycles, not a separate timer. The independent
+`statistics_statement_timeout_milliseconds` defaults to `5000` and accepts
+`1..3600000`. Statistics shares the 250 ms default DDL lock-wait limit but does
+not change the creation or cleanup statement deadlines. Dry-run mode skips
+statistics refresh.
+
+Successful `ANALYZE` acknowledges only its captured request revision. Concurrent
+newer lifecycle changes remain pending, and rollback or timeout acknowledges
+nothing. A failed statistics transaction cannot undo already committed cleanup.
+Cache generations, lifecycle DDL, cleanup, and runtime logs keep normal commit
+durability. Never use global `synchronous_commit=off` to accelerate this work.
+
+The `cache_maintenance_cycle` event reports attached partition count, cumulative
+committed create/drop counts, full eligible cleanup backlog and age, reclamation
+wall time, and statistics duration, refreshed/pending flags, deferrals, and
+failures. `storage_observed` distinguishes a valid storage observation from
+unavailable counters. Do not interpret an unsuccessful observation's zero counts
+or false pending flag as an empty backlog or clean statistics.
+`statistics_age_seconds` reports time since the last successful analysis; an
+absent age means no recorded analysis only when `storage_observed` is true.
+The full backlog is separate from the bounded selected cleanup cohort.
+Maintenance, cleanup, or statistics failures produce a
+`cache_cleanup_cycle_partial_failure` audit with a failure outcome while retaining
+confirmed committed cleanup counts. Lock/deadline deferrals remain separate from
+failures.
+See [supervisor operations](deployment/supervisor.md#cache-retention-configuration)
+for field names and configuration examples. Fleet-wide reporting-query
+optimization is deferred; these observations are not performance-gate evidence.
 
 ## SQLite Artifact Alternative
 
@@ -995,7 +1147,7 @@ actionable.
    namespace responses.
 2. Add a supervisor maintenance loop that retires expired staging generations,
    deletes retained generations only after their availability window, and
-   removes entries/generations in bounded batches.
+   reclaims each eligible generation's entry partition and metadata atomically.
 3. Ensure cleanup excludes active generations and generations referenced by
    unexpired published refresh sets. Use advisory leadership in the
    supervisor, consistent with other maintenance loops.
@@ -1028,14 +1180,15 @@ numeric namespace/generation IDs, never external IDs or values.
   refresh, or fail safely.
 - Cleanup must understand refresh sets before that optional feature can be
   enabled in production.
-- Do not rely on deleting a generation with 200,000 cascading entry deletes in
-  one transaction as the routine cleanup path. Delete entries by indexed
-  bounded batches, then delete the empty generation. This limits locks, WAL
-  bursts, replication lag, and table bloat; the foreign-key cascade remains a
-  safety net rather than the normal algorithm.
+- Reclaim a generation by dropping its LIST partition in one guarded transaction.
+  Remove its exact usage and chunk/generation metadata atomically. No per-entry
+  DELETE or aggregate scan is part of routine cleanup. DDL briefly locks the
+  entry parent exclusively; bounded lock/statement deadlines defer contention
+  rather than creating an unbounded queue. Chunk and iteration metadata cleanup
+  still requires row work. See `docs/plans/cache-generation-partitioning.md`.
 - Cache maintenance belongs in repository methods called by the supervisor,
   not ad hoc SQL in the service.
-- Namespace and owner deletion must use the same tombstone-and-batched-cleanup
+- Namespace and owner deletion must use the same tombstone-and-partition-cleanup
   path. Avoid owner-to-cache cascades that can synchronously delete millions
   of rows; owner foreign keys should restrict deletion until cache cleanup
   completes.

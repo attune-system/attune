@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { X } from "lucide-react";
-import { OwnerType, type CacheNamespaceResponse } from "@/api";
+import {
+  CacheRefreshConcurrency,
+  OwnerType,
+  type CacheNamespaceResponse,
+} from "@/api";
+import CacheRefreshConcurrencySelect from "./CacheRefreshConcurrencySelect";
 import { useCreateCacheNamespace } from "@/hooks/useCaches";
 import OwnerScopeSelector, {
   type OwnerScopeValue,
@@ -21,6 +26,7 @@ interface CacheNamespaceCreateModalProps {
 // crates/common/src/repositories/cache.rs so the form's placeholders/defaults
 // stay consistent with what the server would otherwise apply.
 const DEFAULT_POLICY = {
+  refresh_concurrency: CacheRefreshConcurrency.PARALLEL,
   freshness_target_seconds: 3600,
   max_records_per_generation: 200_000,
   max_generation_bytes: 512 * 1024 * 1024,
@@ -124,6 +130,13 @@ export default function CacheNamespaceCreateModal({
               cache's authorization and lifecycle boundary.
             </p>
           </div>
+
+          <CacheRefreshConcurrencySelect
+            value={policy.refresh_concurrency}
+            onChange={(value) =>
+              setPolicy((prev) => ({ ...prev, refresh_concurrency: value }))
+            }
+          />
 
           <div>
             <button

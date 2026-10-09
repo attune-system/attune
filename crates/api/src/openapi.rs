@@ -10,6 +10,7 @@ use crate::dto::{
         ActionResponse, ActionSearchHit, ActionSummary, CreateActionRequest, QueueStatsResponse,
         UpdateActionRequest,
     },
+    analytics::{AnalyticsReadMetadata, AnalyticsReadRange, DashboardAnalyticsCoverage},
     auth::{
         AuthSettingsResponse, ChangePasswordRequest, CurrentUserResponse,
         EffectivePermissionResponse, LoginRequest, ProviderProfileResponse, RefreshTokenRequest,
@@ -51,6 +52,7 @@ use crate::dto::{
         CreateKeyRequest, KeyResponse, KeySummary, SignKeyJwtRequest, SignKeyJwtResponse,
         UpdateKeyRequest,
     },
+    native_maintenance::NativeMaintenanceStatus,
     pack::{
         CreatePackRequest, InstallPackRequest, PackInstallProvenance, PackInstallResponse,
         PackInstallStatusResponse, PackReleaseResponse, PackResponse, PackSummary,
@@ -211,6 +213,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::workers::uncordon_worker,
         crate::routes::retention::get_retention_config,
         crate::routes::retention::update_retention_config,
+        crate::routes::retention::get_native_maintenance_status,
 
         // Work queues
         crate::routes::work_queues::list_queues,
@@ -588,6 +591,18 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             attune_common::config::RetentionConfig,
             attune_common::config::RetentionTargetsConfig,
             attune_common::config::RetentionTargetConfig,
+            attune_common::config::NativeMaintenanceConfig,
+            NativeMaintenanceStatus,
+            ApiResponse<NativeMaintenanceStatus>,
+            attune_common::repositories::native_maintenance::ManagedTable,
+            attune_common::repositories::native_maintenance::SummaryKind,
+            attune_common::repositories::native_maintenance::partitions::PartitionStatus,
+            attune_common::repositories::native_maintenance::summaries::SummaryStatus,
+            attune_common::repositories::native_maintenance::schedule::MaintenanceJob,
+            attune_common::repositories::native_maintenance::schedule::MaintenanceScheduleStatus,
+            AnalyticsReadMetadata,
+            AnalyticsReadRange,
+            DashboardAnalyticsCoverage,
             IdentitySummary,
             CreateWorkQueueRequest,
             EnqueueWorkQueueItemRequest,
@@ -753,6 +768,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         (name = "secrets", description = "Secret management endpoints"),
         (name = "caches", description = "Owner-scoped data cache endpoints"),
         (name = "workers", description = "Worker inventory and load endpoints"),
+        (name = "retention", description = "Runtime retention and native maintenance settings and status"),
         (name = "queues", description = "Work queue definition endpoints"),
         (name = "workflows", description = "Workflow management endpoints"),
         (name = "webhooks", description = "Webhook management and receiver endpoints"),
@@ -791,6 +807,63 @@ impl Modify for SecurityAddon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_operator_and_analytics_contracts_are_typed_and_registered() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let operation = &spec["paths"]["/api/v1/retention-config/native-status"]["get"];
+        assert_eq!(
+            operation["security"][0],
+            serde_json::json!({"bearer_auth": []})
+        );
+        for status in ["200", "401", "403", "500"] {
+            assert!(operation["responses"].get(status).is_some());
+        }
+        let schemas = &spec["components"]["schemas"];
+        for name in [
+            "NativeMaintenanceConfig",
+            "NativeMaintenanceStatus",
+            "PartitionStatus",
+            "ManagedTable",
+            "SummaryStatus",
+            "SummaryKind",
+            "MaintenanceScheduleStatus",
+            "MaintenanceJob",
+            "AnalyticsReadMetadata",
+            "AnalyticsReadRange",
+            "DashboardAnalyticsCoverage",
+        ] {
+            assert!(schemas.get(name).is_some(), "missing {name}");
+        }
+        for (field, model) in [
+            ("partitions", "PartitionStatus"),
+            ("summaries", "SummaryStatus"),
+            ("schedule", "MaintenanceScheduleStatus"),
+        ] {
+            assert_eq!(
+                schemas["NativeMaintenanceStatus"]["properties"][field]["items"]["$ref"],
+                format!("#/components/schemas/{model}")
+            );
+        }
+        assert_eq!(
+            schemas["RetentionConfig"]["properties"]["native_maintenance"]["$ref"],
+            "#/components/schemas/NativeMaintenanceConfig"
+        );
+        let defaults =
+            serde_json::to_value(attune_common::config::NativeMaintenanceConfig::default())
+                .unwrap();
+        for (field, value) in defaults.as_object().unwrap() {
+            assert_eq!(
+                schemas["NativeMaintenanceConfig"]["properties"][field]["default"], *value,
+                "schema default for {field}"
+            );
+        }
+        assert!(
+            spec["paths"]["/api/v1/retention-config"]["put"]["responses"]
+                .get("422")
+                .is_some()
+        );
+    }
 
     #[test]
     fn test_openapi_spec_generation() {
@@ -917,13 +990,21 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 198,
+            path_count, 199,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 260,
+            operation_count, 261,
             "Expected every mounted API operation in the OpenAPI spec"
+        );
+
+        assert!(
+            doc.paths
+                .paths
+                .get("/api/v1/retention-config/native-status")
+                .is_some_and(|path| path.get.is_some()),
+            "Expected the native-maintenance status GET operation in the OpenAPI spec"
         );
 
         println!("Total API paths: {}", path_count);

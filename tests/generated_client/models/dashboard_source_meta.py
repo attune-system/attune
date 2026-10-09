@@ -13,6 +13,7 @@ from ..models.dashboard_freshness_mode import DashboardFreshnessMode
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.analytics_read_metadata import AnalyticsReadMetadata
     from ..models.dashboard_source_meta_authorized_refs_type_0 import (
         DashboardSourceMetaAuthorizedRefsType0,
     )
@@ -33,8 +34,11 @@ class DashboardSourceMeta:
         ordering (list[str]):
         truncated (bool):
         unit_hints (DashboardSourceMetaUnitHints):
-        aggregate_watermark (datetime.datetime | None | Unset):
+        aggregate_watermark (datetime.datetime | None | Unset): End of the continuous summarized prefix of this request,
+            if any.
+            Later covered islands are listed in read_coverage, not implied here.
         bucket_size (None | str | Unset):
+        read_coverage (AnalyticsReadMetadata | None | Unset):
     """
 
     authorization_mode: DashboardAuthorizationMode
@@ -46,9 +50,13 @@ class DashboardSourceMeta:
     unit_hints: DashboardSourceMetaUnitHints
     aggregate_watermark: datetime.datetime | None | Unset = UNSET
     bucket_size: None | str | Unset = UNSET
+    read_coverage: AnalyticsReadMetadata | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.analytics_read_metadata import (
+            AnalyticsReadMetadata,
+        )
         from ..models.dashboard_source_meta_authorized_refs_type_0 import (
             DashboardSourceMetaAuthorizedRefsType0,
         )
@@ -85,6 +93,14 @@ class DashboardSourceMeta:
         else:
             bucket_size = self.bucket_size
 
+        read_coverage: dict[str, Any] | None | Unset
+        if isinstance(self.read_coverage, Unset):
+            read_coverage = UNSET
+        elif isinstance(self.read_coverage, AnalyticsReadMetadata):
+            read_coverage = self.read_coverage.to_dict()
+        else:
+            read_coverage = self.read_coverage
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -102,11 +118,16 @@ class DashboardSourceMeta:
             field_dict["aggregate_watermark"] = aggregate_watermark
         if bucket_size is not UNSET:
             field_dict["bucket_size"] = bucket_size
+        if read_coverage is not UNSET:
+            field_dict["read_coverage"] = read_coverage
 
         return field_dict
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.analytics_read_metadata import (
+            AnalyticsReadMetadata,
+        )
         from ..models.dashboard_source_meta_authorized_refs_type_0 import (
             DashboardSourceMetaAuthorizedRefsType0,
         )
@@ -176,6 +197,23 @@ class DashboardSourceMeta:
 
         bucket_size = _parse_bucket_size(d.pop("bucket_size", UNSET))
 
+        def _parse_read_coverage(data: object) -> AnalyticsReadMetadata | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                read_coverage_type_1 = AnalyticsReadMetadata.from_dict(data)
+
+                return read_coverage_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(AnalyticsReadMetadata | None | Unset, data)
+
+        read_coverage = _parse_read_coverage(d.pop("read_coverage", UNSET))
+
         dashboard_source_meta = cls(
             authorization_mode=authorization_mode,
             authorized_refs=authorized_refs,
@@ -186,6 +224,7 @@ class DashboardSourceMeta:
             unit_hints=unit_hints,
             aggregate_watermark=aggregate_watermark,
             bucket_size=bucket_size,
+            read_coverage=read_coverage,
         )
 
         dashboard_source_meta.additional_properties = d

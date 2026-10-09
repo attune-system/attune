@@ -1,6 +1,16 @@
 import type { CancelablePromise } from "./core/CancelablePromise";
 import { OpenAPI } from "./core/OpenAPI";
 import { request as __request } from "./core/request";
+import type { CacheRetentionConfig as GeneratedCacheRetentionConfig } from "./models/CacheRetentionConfig";
+import type { NativeMaintenanceConfig as GeneratedNativeMaintenanceConfig } from "./models/NativeMaintenanceConfig";
+import type { NativeMaintenanceStatus } from "./models/NativeMaintenanceStatus";
+
+export type { NativeMaintenanceStatus };
+// Rust serializes every setting on reads. Generated input types allow omitted
+// fields because the API fills them from the corresponding Rust defaults.
+export type NativeMaintenanceConfig =
+  Required<GeneratedNativeMaintenanceConfig>;
+export type CacheRetentionConfig = Required<GeneratedCacheRetentionConfig>;
 
 export interface ApiResponse<T> {
   data: T;
@@ -19,7 +29,6 @@ export interface RetentionTargetsConfig {
   worker_history: RetentionTargetConfig;
   sensor_process_history: RetentionTargetConfig;
   audit_events: RetentionTargetConfig;
-  continuous_aggregates: RetentionTargetConfig;
   notifications: RetentionTargetConfig;
   webhook_event_logs: RetentionTargetConfig;
   inquiries: RetentionTargetConfig;
@@ -31,30 +40,16 @@ export interface RetentionTargetsConfig {
   sensor_processes: RetentionTargetConfig;
 }
 
-export interface CacheRetentionConfig {
-  enabled: boolean;
-  batch_size: number;
-  max_batches_per_generation: number;
-  max_generations_per_cycle: number;
-  max_namespaces_per_cycle: number;
-  min_traversal_window_seconds: number;
-  staging_expiry_seconds: number;
-  dry_run: boolean;
-  freshness_alerts_enabled: boolean;
-  freshness_alert_grace_seconds: number;
-  staging_failure_alert_threshold: number;
-  alert_cooldown_seconds: number;
-  alert_limit_per_cycle: number;
-}
-
 export interface RetentionConfig {
   enabled: boolean;
   check_interval_seconds: number;
   batch_size: number;
+  max_batches_per_target: number;
   dry_run: boolean;
   advisory_lock_key: number;
   targets: RetentionTargetsConfig;
   cache_retention: CacheRetentionConfig;
+  native_maintenance: NativeMaintenanceConfig;
 }
 
 export const retentionTargetLabels: Record<
@@ -68,7 +63,6 @@ export const retentionTargetLabels: Record<
   worker_history: "Worker history",
   sensor_process_history: "Sensor process history",
   audit_events: "Audit log",
-  continuous_aggregates: "Continuous aggregates",
   notifications: "Notifications",
   webhook_event_logs: "Webhook event logs",
   inquiries: "Inquiries",
@@ -80,11 +74,35 @@ export const retentionTargetLabels: Record<
   sensor_processes: "Sensor processes",
 };
 
-export const retentionTargetKeys = Object.keys(retentionTargetLabels) as Array<
-  keyof RetentionTargetsConfig
->;
+export const retentionTargetKeys = [
+  "events",
+  "enforcements",
+  "executions",
+  "execution_history",
+  "worker_history",
+  "sensor_process_history",
+  "audit_events",
+  "notifications",
+  "webhook_event_logs",
+  "inquiries",
+  "work_queue_items",
+  "work_queue_dispatches",
+  "pack_test_executions",
+  "execution_admission",
+  "workers",
+  "sensor_processes",
+] satisfies Array<keyof RetentionTargetsConfig>;
 
 export class RetentionService {
+  public static getNativeMaintenanceStatus(): CancelablePromise<
+    ApiResponse<NativeMaintenanceStatus>
+  > {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/retention-config/native-status",
+      errors: { 401: "Unauthorized", 403: "Insufficient permissions" },
+    });
+  }
   public static getRetentionConfig(): CancelablePromise<
     ApiResponse<RetentionConfig>
   > {
@@ -110,6 +128,7 @@ export class RetentionService {
       errors: {
         400: "Invalid retention configuration",
         403: "Insufficient permissions",
+        422: "Malformed retention configuration",
       },
     });
   }

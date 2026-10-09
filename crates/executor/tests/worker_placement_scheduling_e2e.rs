@@ -1,8 +1,8 @@
 //! E2E-style scheduler tests for worker placement constraints.
 //!
 //! These tests use real database rows for packs, actions, executions, and workers,
-//! then run the executor's worker selection path. They are ignored by default
-//! because they require a PostgreSQL/TimescaleDB test database.
+//! then run the executor's worker selection path. They require a disposable
+//! PostgreSQL test database.
 
 use attune_common::{
     config::Config,

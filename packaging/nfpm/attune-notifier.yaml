@@ -15,7 +15,6 @@ depends:
   - attune-common (= ${VERSION})
   - libc6 (>= 2.28)
   - postgresql-16
-  - timescaledb-2-postgresql-16
   - rabbitmq-server
 
 contents:
@@ -45,7 +44,6 @@ overrides:
       - attune-common = ${VERSION}
       - glibc >= 2.28
       - postgresql16-server
-      - timescaledb-2-postgresql-16
       - rabbitmq-server
     rpm:
       scripts:
@@ -55,7 +53,6 @@ overrides:
       - attune-common=${VERSION}
       - glibc
       - postgresql
-      - timescaledb
       - rabbitmq
     archlinux:
       scripts:

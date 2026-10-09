@@ -143,6 +143,20 @@ function parseSourceParamDefinition(
   return { name, required, input };
 }
 
+function parseFreshnessMode(
+  value: unknown,
+): DashboardSourceContract["default_freshness_mode"] {
+  switch (value) {
+    case "raw_only":
+    case "summary_only":
+    case "summary_plus_raw":
+    case "cache_rawfallback":
+      return value;
+    default:
+      return "raw_only";
+  }
+}
+
 function normalizeSourceContract(
   payload: unknown,
   sourceTypeOverride?: string,
@@ -180,10 +194,9 @@ function normalizeSourceContract(
         typeof payload.authorization_basis === "string"
           ? payload.authorization_basis
           : "dashboards",
-      default_freshness_mode:
-        typeof payload.default_freshness_mode === "string"
-          ? payload.default_freshness_mode
-          : "raw_only",
+      default_freshness_mode: parseFreshnessMode(
+        payload.default_freshness_mode,
+      ),
       params: payload.params
         .filter(isObject)
         .map((param) =>
@@ -230,10 +243,7 @@ function normalizeSourceContract(
       typeof payload.authorization_basis === "string"
         ? payload.authorization_basis
         : "dashboards",
-    default_freshness_mode:
-      typeof payload.default_freshness_mode === "string"
-        ? payload.default_freshness_mode
-        : "raw_only",
+    default_freshness_mode: parseFreshnessMode(payload.default_freshness_mode),
     params: [
       ...required.map((name) => parseSourceParamDefinition(name, true)),
       ...optional.map((name) => parseSourceParamDefinition(name, false)),

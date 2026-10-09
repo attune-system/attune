@@ -182,7 +182,7 @@ pub async fn database_clock(pool: &PgPool) -> chrono::DateTime<chrono::Utc> {
 /// Create an owned test database from the run's migrated template.
 ///
 /// The template is migrated once per run and each test receives a unique
-/// physical database clone. This preserves full PostgreSQL/TimescaleDB
+/// physical database clone. This preserves full PostgreSQL
 /// isolation while avoiding a complete migration replay per test.
 pub async fn create_test_pool() -> Result<TestDatabase> {
     init_test_env();
@@ -204,6 +204,17 @@ fn load_test_database_config() -> Result<DatabaseConfig> {
 pub struct ReadOnlyTestPool {
     pool: PgPool,
     _database: Option<TestDatabase>,
+}
+
+impl ReadOnlyTestPool {
+    /// Close this pool and remove its clone only when the fixture owns one.
+    pub async fn cleanup(self) -> Result<()> {
+        self.pool.close().await;
+        if let Some(database) = self._database {
+            database.cleanup().await?;
+        }
+        Ok(())
+    }
 }
 
 impl Deref for ReadOnlyTestPool {
@@ -309,6 +320,17 @@ pub struct RollbackTestPool {
 impl RollbackTestPool {
     pub fn schema(&self) -> &'static str {
         "attune"
+    }
+
+    /// Await rollback and pool close before cleaning any fixture-owned clone.
+    pub async fn cleanup(self) -> Result<()> {
+        let rollback = sqlx::query("ROLLBACK").execute(&self.pool).await;
+        self.pool.close().await;
+        if let Some(database) = self._database {
+            database.cleanup().await?;
+        }
+        rollback?;
+        Ok(())
     }
 }
 

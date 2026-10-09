@@ -16,7 +16,7 @@ use crate::repositories::action::{ActionRepository, CreateActionInput, UpdateAct
 use crate::repositories::workflow::{CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput};
 use crate::repositories::Patch;
 use crate::repositories::{
-    Create, Delete, FindByRef, PackRepository, Update, WorkflowDefinitionRepository,
+    Create, FindByRef, PackRepository, Update, WorkflowDefinitionRepository,
 };
 use sqlx::PgPool;
 use std::collections::HashMap;

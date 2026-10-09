@@ -7,6 +7,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 
 ### Status / Change Policy
 - **Pre-production**: no stable release or backward-compatibility promise yet.
+- **Database baseline before 1.0.0**: target fresh installations; canonical migrations may be revised with an explicit development-database reset. Starting with 1.0.0, preserve applied migration bytes and use forward, data-preserving migrations. Never reset databases or rewrite recorded checksums automatically.
 - **Initial formats stay v1**: revise the canonical pre-production contract in place; do not invent v2 formats, dual readers, or legacy compatibility adapters without explicit approval. Safe data conversion/reset is separate from runtime backward compatibility.
 - **Breaking changes are allowed** when they improve architecture, APIs, or developer experience.
 - **Internal contracts still matter**: keep API ↔ web UI and service ↔ service expectations coherent.
@@ -18,7 +19,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 4. **ALWAYS** apply `RequireAuth` to protected Axum routes.
 5. **REMEMBER** all primary IDs are `i64` / `BIGINT`.
 6. **NEVER** use `SELECT *` for SQLx `FromRow` models on evolving tables. Use repository `SELECT_COLUMNS` constants (for example in `execution.rs`, `pack.rs`, `runtime_version.rs`).
-7. **REMEMBER** `event`, `enforcement`, and `execution` are Timescale hypertables and **cannot be FK targets**. Referencing columns are plain `BIGINT` values and may dangle.
+7. **REMEMBER** selected runtime references to `event`, `enforcement`, and `execution` intentionally use plain `BIGINT` values without foreign keys so retention can remove rows independently. Preserve dangling-ID semantics. Native partitioning does not make `id` globally unique or justify adding reference FKs.
 8. **ALWAYS** keep schema definitions flat: `param_schema`, `out_schema`, and `conf_schema` use Attune's flat per-field format, not raw JSON Schema.
 9. **ALWAYS** keep `execution.config` flat: the object itself is the parameters map. Never wrap parameters under `{"parameters": ...}`.
 10. **ALWAYS** deliver action parameters via **stdin JSON**, not environment variables.
@@ -34,7 +35,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 
 ## Core Stack
 - **Rust** 2021
-- **Database**: PostgreSQL **16+** with TimescaleDB 2.17+
+- **Database**: stock PostgreSQL **16+**, PostgreSQL 18 by default in Compose and CI. No TimescaleDB extension is required.
 - **Queue**: RabbitMQ 3.12+
 - **API**: Axum 0.8 + SQLx
 - **Web UI**: React 19 + TypeScript + Vite
@@ -105,6 +106,7 @@ attune/
 - Generated runtime environments live **outside** packs under `runtime_envs_dir`.
 - Default local Docker user: `test@attune.local` / `TestPass123!`
 - Production secrets come from env vars, especially `JWT_SECRET` and `ENCRYPTION_KEY`.
+- For fresh installation, migration-policy, or development-database reset decisions, read `docs/deployment/postgresql-only.md` before changing database volumes or migration histories.
 
 ### Musl / Cross-Compilation Guidance
 Use the shared pattern for both agent binaries and pack binaries:
@@ -133,15 +135,18 @@ For more detail, use:
 - Use transactions for multi-table work.
 - Use PostgreSQL enum mappings in Rust for custom enums.
 
-### Hypertables and History (Canonical)
-- `event`, `enforcement`, and `execution` are Timescale hypertables.
-- Because hypertables cannot be FK targets, references such as `execution.parent`, `execution.enforcement`, `workflow_execution.execution`, and `inquiry.created_by_execution` are plain `BIGINT` columns.
+### Tables and history
+- `event`, `execution_history`, and `audit_event` are native daily UTC RANGE parents with DEFAULT partitions. Their keys are `created`, `time`, and `created`. `event` and `audit_event` have composite primary keys `(id, created)`.
+- Other runtime tables, `worker_history`, and `sensor_process_history` remain ordinary PostgreSQL tables. History records have no public history-ID contract.
+- References such as `execution.parent`, `execution.enforcement`, `workflow_execution.execution`, and `inquiry.created_by_execution` retain the independent-retention semantics in guardrail 7.
 - `event` is immutable after insert.
+- `cache_entry` is LIST-partitioned by generation, with composite key `(generation, id)` and no DEFAULT. Reclamation atomically drops one partition and releases exact usage. Cache/workflow mutations acquire admission before parent protection and metadata/pin rows; use `PinMutation` at outer transaction entry for pin creation or cascades. Ordinary `Read` stays concurrent. For DDL, quotas, and lock ordering, read `docs/plans/cache-generation-partitioning.md`.
 - `enforcement` has a narrow lifecycle and no separate history table.
-- `execution` is mutable and has an `execution_history` hypertable; `worker` also has history tracking.
+- `execution` is mutable and has an `execution_history` table; `worker` and `sensor_process` also have history tracking.
 - History is trigger-driven. If you add mutable `execution`/`worker` columns, keep trigger diffs in sync with `IS DISTINCT FROM` checks.
 - For large JSONB fields in history, store `_jsonb_digest_summary()` output instead of raw content.
 - `migrations/` is the source of truth for current schema shape.
+- For partition DDL roles, summary coverage, or retention changes, read `docs/deployment/postgresql-only.md` and `docs/deployment/supervisor.md`. Partition-parent row cleanup uses statement-local `(tableoid, ctid)` pairs. Summary producers append invalidations without an FK to builder state; builders acknowledge exact snapshot-visible IDs, never an ID watermark.
 
 ### Artifact / File Storage Essentials
 - File artifacts live on the shared artifact storage volume; metadata stays in PostgreSQL.
@@ -207,6 +212,8 @@ Workflow details live in:
 - Owns retention, stale-state cleanup, corrective remediation, and related audit/alert emission.
 - Uses advisory locking so only one maintenance leader acts at a time.
 - Runtime retention config is persisted in DB and reloaded without restart.
+- Persisted retention, partition, and summary jobs have independent cadences under the same leader lock. Retention drops fully expired daily leaves and deletes boundary/DEFAULT rows in bounded batches, with separate row and partition counts.
+- Analytics use clean per-hour summary coverage plus raw fallback for gaps, dirty hours, and partial hours. Summaries do not outlive raw retention. For freshness metadata and dashboard authorization, read `docs/dashboards.md`.
 
 Use docs for specifics instead of expanding this file:
 - `docs/architecture/notifier-service.md`
@@ -247,9 +254,9 @@ make db-migrate
 
 ### Testing / Validation
 - Read `docs/testing/running-tests.md` before choosing a test runner or provisioning dependencies.
-- Database-only Rust tests run in normal Cargo suites and require PostgreSQL/TimescaleDB. Reserve `--ignored` for tests with explicit external-service or stress-test prerequisites.
+- Database-only Rust tests run in normal Cargo suites and require stock PostgreSQL 16 or newer. Reserve `--ignored` for tests with explicit external-service or stress-test prerequisites.
 - Prefer `scripts/run-rust-integration-tests.sh` for Docker-owned Rust tests and `scripts/run-integration-tests.sh` for full-stack E2E. These runners own setup and teardown and avoid fixed host ports.
-- For host-run database tests, provision disposable PostgreSQL/TimescaleDB and run `make db-test-setup` with `TEST_DB_ADMIN_URL` and `TEST_DB_URL`. Host setup requires `psql` and `sqlx`; direct Cargo runs use `ATTUNE__DATABASE__URL`.
+- For host-run database tests, provision disposable PostgreSQL and run `make db-test-setup` with `TEST_DB_ADMIN_URL` and `TEST_DB_URL`. Host setup requires `psql` and `sqlx`; direct Cargo runs use `ATTUNE__DATABASE__URL`.
 - Database fixtures use run-owned, migration-hashed templates and physical clones by default. Approved read-only and rollback-isolated tests share a runner-owned database; see `docs/testing/schema-per-test.md`.
 - Give each direct Cargo invocation a unique `ATTUNE_TEST_RUN_ID`: 1–20 lowercase letters/digits with optional non-leading hyphens. Docker runners generate run identities.
 - Database-backed test runs use at least four threads. Use `cargo test -- --nocapture --test-threads=4` for detailed failures. Docker test executables run sequentially.

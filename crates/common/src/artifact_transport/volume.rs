@@ -57,15 +57,15 @@ impl VolumeTransport {
         base_dir: &str,
         api_url: &str,
         token_provider: std::sync::Arc<WorkerTokenProvider>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             base_dir: PathBuf::from(base_dir),
             completion_api: Some(ApiTransport::new_with_worker_token_provider(
                 api_url,
                 token_provider,
                 base_dir,
-            )),
-        }
+            )?),
+        })
     }
 
     async fn resolve(&self, file_path: &str) -> Result<PathBuf> {

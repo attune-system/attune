@@ -17,6 +17,46 @@ const V040_STANDARD_PACK_INDEX_URL: &str =
     "https://raw.githubusercontent.com/attune-system/index/4c87ca62a4313f7e9646a50c44ab6b2b530e5f43/index.json";
 const LIVE_STANDARD_PACK_INDEX_URL: &str =
     "https://raw.githubusercontent.com/attune-system/index/main/index.json";
+
+#[tokio::test]
+async fn independent_runtime_lineage_columns_remain_bigint_without_foreign_keys() {
+    let database = create_read_only_test_pool().await.unwrap();
+    for (table, column) in [
+        ("enforcement", "event"),
+        ("execution", "parent"),
+        ("execution", "enforcement"),
+        ("workflow_execution", "execution"),
+        ("inquiry", "created_by_execution"),
+        ("cache_generation", "created_by_execution"),
+    ] {
+        let column_type: String = sqlx::query_scalar(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+             WHERE attrelid=to_regclass($1) AND attname=$2 AND NOT attisdropped",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&*database)
+        .await
+        .unwrap();
+        assert_eq!(column_type, "bigint", "{table}.{column}");
+        let has_foreign_key: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_attribute a
+               ON a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey)
+             WHERE c.contype='f' AND c.conrelid=to_regclass($1) AND a.attname=$2)",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&*database)
+        .await
+        .unwrap();
+        assert!(
+            !has_foreign_key,
+            "{table}.{column} must preserve dangling-ID retention semantics"
+        );
+    }
+    database.cleanup().await.unwrap();
+}
+
 fn standard_index_migration(schema: &str) -> String {
     include_str!("../../../migrations/20250101000026_standard_pack_index.sql").replace(
         "SET search_path TO attune, public;",
@@ -219,8 +259,9 @@ async fn embedded_migrator_rejects_custom_schema() {
 
 #[tokio::test]
 async fn embedded_migrator_uses_attune_history_on_fresh_database() {
+    use futures::FutureExt;
     let (database, database_url) = create_embedded_migration_database().await;
-
+    let result = std::panic::AssertUnwindSafe(async {
     database.migrate().await.unwrap();
 
     let (has_attune_history, has_public_history, runner): (bool, bool, String) = sqlx::query_as(
@@ -246,25 +287,691 @@ async fn embedded_migrator_uses_attune_history_on_fresh_database() {
     .unwrap();
     assert!(runner_claim_recorded);
 
-    let retention_job_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention' AND hypertable_schema = 'attune'",
-    )
-    .fetch_one(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(retention_job_count, 0);
+    assert_postgresql_schema(database.pool()).await;
 
-    let compression_job_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_schema = 'attune'",
-    )
-    .fetch_one(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(compression_job_count, 5);
-
+    let applied_before: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
     database.migrate().await.unwrap();
+    let applied_after: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(applied_before, applied_after);
+
+    let error = execute_docker_setup(&database).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Database uses SQLx migration history"),
+        "unexpected Docker takeover error: {error}"
+    );
+    let (runner, has_docker_history): (String, bool) = sqlx::query_as(
+        "SELECT runner, to_regclass('attune._migrations') IS NOT NULL FROM public._attune_migration_runner WHERE id = 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(runner, "sqlx");
+    assert!(!has_docker_history);
+
+    sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum = decode('00', 'hex') WHERE version = 20250101000009",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let error = database.migrate().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("previously applied but has been modified"),
+        "changed migration checksum was not rejected: {error}"
+    );
+    }).catch_unwind().await;
     database.close().await;
     Postgres::force_drop_database(&database_url).await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn assert_postgresql_schema(pool: &sqlx::PgPool) {
+    for (table, column) in [
+        ("event", "created"),
+        ("execution_history", "time"),
+        ("audit_event", "created"),
+    ] {
+        assert_native_parent(pool, table, column).await;
+        let leaves: Vec<(String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT partition_name, lower_bound, upper_bound FROM native_partition_registry WHERE parent::text = $1 ORDER BY lower_bound",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let today: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT date_trunc('day', now(), 'UTC')")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(leaves.len(), 8, "{table} initial leaf count");
+        for (offset, (name, lower, upper)) in leaves.into_iter().enumerate() {
+            assert_eq!(lower, today + chrono::Duration::days(offset as i64));
+            assert_eq!(upper, lower + chrono::Duration::days(1));
+            assert_eq!(name, format!("{table}_p{}", lower.format("%Y%m%d")));
+            sqlx::query(
+                "SELECT native_partition_check($1::text::native_partition_parent, $2, $3, $4)",
+            )
+            .bind(table)
+            .bind(name)
+            .bind(lower)
+            .bind(upper)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+    for table in [
+        "event",
+        "enforcement",
+        "execution",
+        "execution_history",
+        "worker_history",
+        "sensor_process_history",
+        "audit_event",
+    ] {
+        let (kind, partition): (String, bool) = sqlx::query_as(
+            "SELECT relkind::text, relispartition FROM pg_class WHERE oid = to_regclass($1)",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let expected = if matches!(table, "event" | "execution_history" | "audit_event") {
+            "p"
+        } else {
+            "r"
+        };
+        assert_eq!(kind, expected, "{table} relation kind");
+        assert!(!partition, "{table} must not be a partition");
+    }
+
+    for table in ["event", "audit_event"] {
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT a.attname::text FROM pg_constraint c CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY k(attnum, position) JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum WHERE c.conrelid = to_regclass($1) AND c.contype = 'p' ORDER BY k.position",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(columns, vec!["id", "created"], "{table} primary key");
+    }
+
+    for (view, columns) in [
+        (
+            "execution_status_hourly",
+            vec!["bucket", "action_ref", "new_status", "transition_count"],
+        ),
+        (
+            "execution_throughput_hourly",
+            vec!["bucket", "action_ref", "execution_count"],
+        ),
+        (
+            "event_volume_hourly",
+            vec!["bucket", "trigger_ref", "event_count"],
+        ),
+        (
+            "worker_status_hourly",
+            vec!["bucket", "worker_name", "new_status", "transition_count"],
+        ),
+        (
+            "enforcement_volume_hourly",
+            vec!["bucket", "rule_ref", "enforcement_count"],
+        ),
+        (
+            "execution_volume_hourly",
+            vec!["bucket", "action_ref", "initial_status", "execution_count"],
+        ),
+    ] {
+        let kind: String =
+            sqlx::query_scalar("SELECT relkind::text FROM pg_class WHERE oid = to_regclass($1)")
+                .bind(view)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(kind, "v", "{view} must be an ordinary view");
+        let actual: Vec<(String, String)> = sqlx::query_as(
+            "SELECT attname::text, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+        )
+        .bind(view)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            columns
+        );
+        assert_eq!(actual[0].1, "timestamp with time zone", "{view} bucket");
+        assert_eq!(actual.last().unwrap().1, "bigint", "{view} count");
+    }
+
+    for (table, index, column) in [
+        ("execution_history", "idx_execution_history_time", "time"),
+        ("worker_history", "idx_worker_history_time", "time"),
+        (
+            "sensor_process_history",
+            "idx_sensor_process_history_time",
+            "time",
+        ),
+        ("audit_event", "idx_audit_event_created", "created"),
+    ] {
+        let valid: bool = sqlx::query_scalar(
+            "SELECT i.indisvalid AND i.indisready AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnkeyatts = 1 AND a.attname = $3 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] WHERE i.indexrelid = to_regclass($2) AND i.indrelid = to_regclass($1)",
+        )
+        .bind(table)
+        .bind(index)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(valid, "{index} must cover all rows by {column}");
+    }
+
+    for (table, trigger) in [
+        ("execution", "execution_history_trigger"),
+        ("worker", "worker_history_trigger"),
+        ("sensor_process", "sensor_process_history_trigger"),
+        ("execution", "trg_audit_execution_lifecycle"),
+    ] {
+        let enabled: bool = sqlx::query_scalar(
+            "SELECT tgenabled = 'O' AND NOT tgisinternal FROM pg_trigger WHERE tgrelid = to_regclass($1) AND tgname = $2",
+        )
+        .bind(table)
+        .bind(trigger)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(enabled, "{trigger} must be enabled");
+    }
+
+    let extensions: Vec<String> =
+        sqlx::query_scalar("SELECT extname FROM pg_extension ORDER BY extname")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(!extensions.iter().any(|name| name == "timescaledb"));
+}
+
+async fn assert_native_parent(pool: &sqlx::PgPool, table: &str, column: &str) {
+    let (kind, key_matches, owner): (String, bool, bool) = sqlx::query_as(
+        "SELECT relkind::text, pg_get_partkeydef(oid) = format('RANGE (%I)', $2::text), relowner = current_user::regrole::oid FROM pg_class WHERE oid = to_regclass($1)",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "p", "{table} must be partitioned from its creation");
+    assert!(key_matches, "{table} RANGE key must be {column}");
+    assert!(owner, "{table} must belong to the migration role");
+
+    let fallback = format!("{table}_default");
+    let (bound, owner_matches): (String, bool) = sqlx::query_as(
+        "SELECT pg_get_expr(c.relpartbound, c.oid), c.relowner = p.relowner FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent WHERE p.oid = to_regclass($1) AND c.oid = to_regclass($2)",
+    )
+    .bind(table)
+    .bind(fallback)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(bound, "DEFAULT");
+    assert!(owner_matches);
+    let invalid_children: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent WHERE p.oid = to_regclass($1) AND (c.relkind <> 'r' OR c.relowner <> p.relowner OR c.relnamespace <> p.relnamespace OR EXISTS (SELECT 1 FROM pg_index pi WHERE pi.indrelid = p.oid AND (NOT pi.indisvalid OR NOT EXISTS (SELECT 1 FROM pg_inherits ii JOIN pg_index ci ON ci.indexrelid = ii.inhrelid WHERE ii.inhparent = pi.indexrelid AND ci.indrelid = c.oid AND ci.indisvalid AND ci.indisready))))",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        invalid_children, 0,
+        "{table} child owners and attached indexes"
+    );
+    let incoming_fks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND confrelid = to_regclass($1)",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(incoming_fks, 0, "{table} must retain dangling-ID semantics");
+    if table == "event" {
+        let notify_enabled: bool = sqlx::query_scalar(
+            "SELECT t.tgenabled = 'O' AND NOT t.tgisinternal AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhparent = t.tgrelid AND NOT EXISTS (SELECT 1 FROM pg_trigger ct WHERE ct.tgrelid = i.inhrelid AND ct.tgparentid = t.oid AND ct.tgenabled = 'O')) FROM pg_trigger t WHERE t.tgrelid = 'event'::regclass AND t.tgname = 'event_created_notify'",
+        ).fetch_one(pool).await.unwrap();
+        assert!(
+            notify_enabled,
+            "event notification trigger must cover every leaf"
+        );
+    }
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_constraint c CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY k(attnum, position) JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum WHERE c.conrelid = to_regclass($1) AND c.contype = 'p' ORDER BY k.position",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    if table == "execution_history" {
+        assert!(columns.is_empty(), "history has no public history-ID key");
+    } else {
+        assert_eq!(columns, ["id", "created"]);
+        let serial_owned: bool = sqlx::query_scalar(
+            "SELECT s.relkind = 'S' AND s.relowner = p.relowner AND a.atttypid = 'bigint'::regtype AND EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = s.oid AND d.refobjid = p.oid AND d.refobjsubid = a.attnum AND d.deptype = 'a') FROM pg_class p JOIN pg_class s ON s.oid = pg_get_serial_sequence($1, 'id')::regclass JOIN pg_attribute a ON a.attrelid = p.oid AND a.attname = 'id' WHERE p.oid = to_regclass($1)",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(
+            serial_owned,
+            "{table} BIGINT sequence must remain parent-owned"
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FreshMigrationRunner {
+    Sqlx,
+    Filename,
+}
+
+async fn assert_fresh_partition_creation(runner: FreshMigrationRunner) {
+    use futures::FutureExt;
+    let (database, database_url) = create_embedded_migration_database().await;
+    // These fixtures start before any application table exists. Always await
+    // their cleanup, including a failed intermediate-schema assertion.
+    let result = std::panic::AssertUnwindSafe(async {
+        match runner {
+            FreshMigrationRunner::Sqlx => {
+                sqlx::query("CREATE SCHEMA attune")
+                    .execute(database.pool())
+                    .await
+                    .unwrap();
+            }
+            FreshMigrationRunner::Filename => execute_docker_setup(&database).await.unwrap(),
+        }
+        let source = sqlx::migrate!("../../migrations");
+        let mut parents = std::collections::BTreeMap::new();
+        let mut sequences = std::collections::BTreeMap::new();
+        let mut reserved_ids = std::collections::BTreeMap::new();
+        for (index, migration) in source.iter().enumerate() {
+            if migration.version == 20261006000001 {
+                assert_initial_window_rejects_rows(database.pool()).await;
+                // Backdated source records remain DEFAULT-visible without a
+                // conversion, historical leaf creation, or sequence rewinding.
+                sqlx::raw_sql(
+                    "INSERT INTO event(created, trigger_ref) VALUES ('1970-01-01 00:00+00', 'fresh.fixture');
+                     INSERT INTO execution_history(time, operation, entity_id) VALUES ('1970-01-01 00:00+00', 'INSERT', 1);
+                     INSERT INTO audit_event(created, category, event_type, outcome) VALUES ('1970-01-01 00:00+00', 'admin', 'fresh.fixture', 'success');",
+                )
+                .execute(database.pool())
+                .await
+                .unwrap();
+                for table in ["event", "audit_event"] {
+                    let reserved: i64 = sqlx::query_scalar(
+                        "SELECT nextval(pg_get_serial_sequence($1, 'id')::regclass)",
+                    ).bind(table).fetch_one(database.pool()).await.unwrap();
+                    reserved_ids.insert(table, reserved);
+                }
+            }
+            match runner {
+                FreshMigrationRunner::Sqlx => {
+                    let prefix = sqlx::migrate::Migrator {
+                        migrations: std::borrow::Cow::Owned(source.migrations[..=index].to_vec()),
+                        ..sqlx::migrate::Migrator::DEFAULT
+                    };
+                    prefix.run(database.pool()).await.unwrap();
+                }
+                FreshMigrationRunner::Filename => {
+                    // Replay the filename runner's DDL/history transaction
+                    // boundary without adding psql to database-only Cargo tests.
+                    // Shell-runner smoke coverage belongs to its deployment lane.
+                    let mut tx = database.pool().begin().await.unwrap();
+                    sqlx::query("SELECT pg_advisory_xact_lock(78210015)")
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                    sqlx::raw_sql(&migration.sql).execute(&mut *tx).await.unwrap();
+                    let filename = format!(
+                        "{}_{}.sql",
+                        migration.version,
+                        migration.description.replace(' ', "_")
+                    );
+                    sqlx::query("INSERT INTO _migrations(filename, checksum_sha384) VALUES ($1, encode(sha384($2::bytea), 'hex'))")
+                        .bind(filename)
+                        .bind(migration.sql.as_bytes())
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                }
+            }
+            for (table, column, first_version) in [
+                ("event", "created", 20250101000004),
+                ("execution_history", "time", 20250101000009),
+                ("audit_event", "created", 20250101000013),
+            ] {
+                if migration.version < first_version {
+                    continue;
+                }
+                assert_native_parent(database.pool(), table, column).await;
+                let oid: i64 = sqlx::query_scalar("SELECT to_regclass($1)::oid::bigint")
+                    .bind(table)
+                    .fetch_one(database.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(*parents.entry(table).or_insert(oid), oid, "{table} was replaced");
+                if table != "execution_history" {
+                    let oid: i64 = sqlx::query_scalar(
+                        "SELECT pg_get_serial_sequence($1, 'id')::regclass::oid::bigint",
+                    )
+                    .bind(table)
+                    .fetch_one(database.pool())
+                    .await
+                    .unwrap();
+                    assert_eq!(*sequences.entry(table).or_insert(oid), oid, "{table} sequence was replaced");
+                }
+                let children: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass($1)",
+                )
+                .bind(table)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+                assert_eq!(children, if migration.version < 20261006000001 { 1 } else { 9 });
+            }
+            if migration.version == 20250101000004 {
+                let mut probe = database.pool().begin().await.unwrap();
+                let routed: String = sqlx::query_scalar(
+                    "INSERT INTO event(trigger_ref) VALUES ('fresh.fixture') RETURNING tableoid::regclass::text",
+                ).fetch_one(&mut *probe).await.unwrap();
+                probe.rollback().await.unwrap();
+                assert_eq!(routed, "event_default");
+            }
+            if matches!(migration.version, 20250101000009 | 20250101000013) {
+                let mut probe = database.pool().begin().await.unwrap();
+                let id: i64 = sqlx::query_scalar(
+                    "INSERT INTO execution(action_ref) VALUES ('fresh.fixture') RETURNING id",
+                )
+                .fetch_one(&mut *probe)
+                .await
+                .unwrap();
+                let history: String = sqlx::query_scalar(
+                    "SELECT tableoid::regclass::text FROM execution_history WHERE entity_id = $1 AND operation = 'INSERT'",
+                )
+                .bind(id)
+                .fetch_one(&mut *probe)
+                .await
+                .unwrap();
+                let audit = if migration.version == 20250101000013 {
+                    Some(sqlx::query_scalar::<_, String>(
+                        "SELECT tableoid::regclass::text FROM audit_event WHERE resource_id = $1 AND event_type = 'execution.requested'",
+                    ).bind(id).fetch_one(&mut *probe).await.unwrap())
+                } else { None };
+                probe.rollback().await.unwrap();
+                assert_eq!(history, "execution_history_default");
+                if let Some(audit) = audit { assert_eq!(audit, "audit_event_default"); }
+            }
+        }
+        assert_postgresql_schema(database.pool()).await;
+        for (table, reserved) in reserved_ids {
+            let next: i64 = sqlx::query_scalar(
+                "SELECT nextval(pg_get_serial_sequence($1, 'id')::regclass)",
+            ).bind(table).fetch_one(database.pool()).await.unwrap();
+            assert_eq!(next, reserved + 1, "{table} reserved sequence position");
+        }
+        for table in ["event", "execution_history", "audit_event"] {
+            let fallback_rows: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM ONLY {table}_default",
+            ))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            assert_eq!(fallback_rows, 1, "{table} backdated row stays in DEFAULT");
+        }
+        match runner {
+            FreshMigrationRunner::Sqlx => {
+                let applied: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+                    "SELECT version, checksum FROM _sqlx_migrations ORDER BY version",
+                ).fetch_all(database.pool()).await.unwrap();
+                assert_eq!(applied, source.iter().map(|m| (m.version, m.checksum.to_vec())).collect::<Vec<_>>());
+                database.migrate().await.unwrap();
+                let error = execute_docker_setup(&database).await.unwrap_err();
+                assert!(error.to_string().contains("Database uses SQLx migration history"));
+            }
+            FreshMigrationRunner::Filename => {
+                let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _migrations WHERE checksum_sha384 ~ '^[0-9a-f]{96}$'")
+                    .fetch_one(database.pool()).await.unwrap();
+                assert_eq!(count, source.iter().count() as i64);
+                let error = database.migrate().await.unwrap_err();
+                assert!(error.to_string().contains("Database uses Docker migration history"));
+            }
+        }
+    }).catch_unwind().await;
+    database.close().await;
+    Postgres::force_drop_database(&database_url).await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn assert_initial_window_rejects_rows(pool: &sqlx::PgPool) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO event(trigger_ref) VALUES ('fresh.blocked')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let error = sqlx::raw_sql(include_str!(
+        "../../../migrations/20261006000001_native_partitions.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap_err();
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55000")
+    );
+    assert!(error.to_string().contains("empty initial UTC window"));
+    let rolled_back: bool = sqlx::query_scalar(
+        "SELECT to_regclass('native_partition_registry') IS NULL AND NOT EXISTS (SELECT 1 FROM event WHERE trigger_ref = 'fresh.blocked') AND NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'runtime_retention_config'::regclass AND attname = 'native_maintenance' AND NOT attisdropped)",
+    ).fetch_one(pool).await.unwrap();
+    assert!(
+        rolled_back,
+        "rejected setup must not leave metadata or source changes"
+    );
+}
+
+#[tokio::test]
+async fn sqlx_fresh_migrations_partition_parents_from_first_creation() {
+    assert_fresh_partition_creation(FreshMigrationRunner::Sqlx).await;
+}
+
+#[tokio::test]
+async fn filename_fresh_migrations_partition_parents_from_first_creation() {
+    assert_fresh_partition_creation(FreshMigrationRunner::Filename).await;
+}
+
+#[tokio::test]
+async fn native_partition_setup_rejects_heap_schema_without_conversion() {
+    use futures::FutureExt;
+    let (database, database_url) = create_embedded_migration_database().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        sqlx::raw_sql("CREATE SCHEMA attune; CREATE TABLE event(id BIGSERIAL PRIMARY KEY, created timestamptz NOT NULL); CREATE TABLE execution_history(time timestamptz NOT NULL); CREATE TABLE audit_event(id BIGSERIAL PRIMARY KEY, created timestamptz NOT NULL); INSERT INTO event(created) VALUES ('1970-01-01 00:00+00');")
+            .execute(database.pool()).await.unwrap();
+        let oid: i64 = sqlx::query_scalar("SELECT 'event'::regclass::oid::bigint")
+            .fetch_one(database.pool()).await.unwrap();
+        let mut tx = database.pool().begin().await.unwrap();
+        let error = sqlx::raw_sql(include_str!("../../../migrations/20261006000001_native_partitions.sql"))
+            .execute(&mut *tx).await.unwrap_err();
+        tx.rollback().await.unwrap();
+        assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("55000"));
+        assert!(error.to_string().contains("canonical RANGE parent and DEFAULT"));
+        let (same_oid, rows, kind, no_registry): (bool, i64, String, bool) = sqlx::query_as(
+            "SELECT 'event'::regclass::oid::bigint = $1, (SELECT count(*) FROM event), (SELECT relkind::text FROM pg_class WHERE oid = 'event'::regclass), to_regclass('native_partition_registry') IS NULL",
+        ).bind(oid).fetch_one(database.pool()).await.unwrap();
+        assert!(same_oid && no_registry);
+        assert_eq!(rows, 1);
+        assert_eq!(kind, "r");
+    }).catch_unwind().await;
+    database.close().await;
+    Postgres::force_drop_database(&database_url).await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn migrated_fixture_has_native_postgresql_schema() {
+    let pool = create_read_only_test_pool().await.unwrap();
+    assert_postgresql_schema(&pool).await;
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn hourly_views_preserve_utc_buckets_and_metric_meanings() {
+    let pool = create_rollback_test_pool().await.unwrap();
+    sqlx::raw_sql(
+        r#"
+        SET LOCAL TIME ZONE 'Asia/Kolkata';
+        INSERT INTO execution (action_ref, created)
+        VALUES ('view.fixture', '2026-06-01 00:45:00+00');
+        DELETE FROM execution_history WHERE entity_ref = 'view.fixture';
+        INSERT INTO execution_history (time, operation, entity_id, entity_ref, changed_fields, new_values)
+        VALUES
+            ('2026-06-01 00:45:00+00', 'INSERT', 1, 'view.fixture', '{}', '{"status":"requested"}'),
+            ('2026-06-01 00:50:00+00', 'UPDATE', 1, 'view.fixture', '{status}', '{"status":"failed"}'),
+            ('2026-06-01 00:59:59+00', 'UPDATE', 1, 'view.fixture', '{status}', '{"status":"failed"}'),
+            ('2026-06-01 01:00:00+00', 'UPDATE', 1, 'view.fixture', '{status}', '{"status":"completed"}'),
+            ('2026-06-01 01:01:00+00', 'UPDATE', 1, 'view.fixture', '{result}', '{"status":"completed"}');
+        INSERT INTO worker_history (time, operation, entity_id, entity_ref, changed_fields, new_values)
+        VALUES ('2026-06-01 00:45:00+00', 'UPDATE', 1, 'view.fixture', '{status}', '{"status":"offline"}');
+        INSERT INTO event (trigger_ref, payload, created)
+        VALUES ('view.fixture', '{}', '2026-06-01 00:45:00+00');
+        INSERT INTO enforcement (rule_ref, trigger_ref, payload, created)
+        VALUES ('view.fixture', 'view.fixture', '{}', '2026-06-01 00:45:00+00');
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for (view, reference, count, expected) in [
+        (
+            "execution_status_hourly",
+            "action_ref",
+            "transition_count",
+            vec![(0, 2), (1, 1)],
+        ),
+        (
+            "execution_throughput_hourly",
+            "action_ref",
+            "execution_count",
+            vec![(0, 1)],
+        ),
+        (
+            "worker_status_hourly",
+            "worker_name",
+            "transition_count",
+            vec![(0, 1)],
+        ),
+        (
+            "event_volume_hourly",
+            "trigger_ref",
+            "event_count",
+            vec![(0, 1)],
+        ),
+        (
+            "enforcement_volume_hourly",
+            "rule_ref",
+            "enforcement_count",
+            vec![(0, 1)],
+        ),
+        (
+            "execution_volume_hourly",
+            "action_ref",
+            "execution_count",
+            vec![(0, 1)],
+        ),
+    ] {
+        let rows: Vec<(chrono::DateTime<chrono::Utc>, i64)> = sqlx::query_as(&format!(
+            "SELECT bucket, {count} FROM {view} WHERE {reference} = 'view.fixture' ORDER BY bucket"
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let expected = expected
+            .into_iter()
+            .map(|(hour, count)| {
+                (
+                    format!("2026-06-01T{hour:02}:00:00Z")
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .unwrap(),
+                    count,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected, "{view} UTC buckets and counts");
+    }
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_tables_preserve_history_digests_and_lifecycle_audit() {
+    let pool = create_rollback_test_pool().await.unwrap();
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO execution (action_ref) VALUES ('history.fixture') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE execution SET status = 'completed', result = '{\"payload\":\"test\"}' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (fields, values): (Vec<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT changed_fields, new_values FROM execution_history WHERE entity_id = $1 AND operation = 'UPDATE'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(fields.iter().any(|field| field == "status"));
+    assert!(fields.iter().any(|field| field == "result"));
+    assert_eq!(values["status"], "completed");
+    assert_eq!(values["result"]["type"], "object");
+    assert!(values["result"]["digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("md5:"));
+    assert!(values["result"].get("payload").is_none());
+    let audit: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM audit_event WHERE resource_type = 'execution' AND resource_id = $1 ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit, vec!["execution.requested", "execution.completed"]);
+    pool.cleanup().await.unwrap();
 }
 
 #[test]
@@ -410,6 +1117,14 @@ async fn docker_runner_fresh_history_requires_sha384_checksums() {
     let (database, database_url) = create_embedded_migration_database().await;
 
     execute_docker_setup(&database).await.unwrap();
+
+    let error = database.migrate().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Database uses Docker migration history"),
+        "unexpected SQLx takeover error: {error}"
+    );
 
     let (checksum_nullable, adoption, sha384_abc): (String, bool, String) = sqlx::query_as(
         r#"

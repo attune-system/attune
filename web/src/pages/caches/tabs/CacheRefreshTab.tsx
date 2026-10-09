@@ -10,18 +10,21 @@ import type { CacheOwnerParams, JsonValue } from "@/types/cache";
 import {
   useAbandonCacheGeneration,
   useBeginCacheRefresh,
+  useCacheGeneration,
   useCacheNamespace,
   usePromoteCacheGeneration,
   useSealCacheGeneration,
   useUploadCacheChunk,
 } from "@/hooks/useCaches";
 import CacheConfirmDialog from "@/components/caches/CacheConfirmDialog";
+import CacheCreatorExecution from "../CacheCreatorExecution";
 import {
   buildClientRefreshId,
   formatBytes,
   formatDateTime,
   formatRecordCount,
   getCacheErrorMessage,
+  getRefreshInProgressDetails,
   isPromotionConflictError,
   parseNdjsonRecordLine,
   streamFileRecordChunks,
@@ -51,6 +54,10 @@ interface ChunkState {
   error?: string;
 }
 
+type ObservedRefresh =
+  | { kind: "reused"; generation: CacheGenerationResponse }
+  | { kind: "conflict"; generationId: number; executionId: number | null };
+
 export default function CacheRefreshTab({
   owner,
   namespaceName,
@@ -70,6 +77,8 @@ export default function CacheRefreshTab({
   const [generation, setGeneration] = useState<CacheGenerationResponse | null>(
     null,
   );
+  const [observedRefresh, setObservedRefresh] =
+    useState<ObservedRefresh | null>(null);
   const [chunks, setChunks] = useState<ChunkState[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -84,6 +93,19 @@ export default function CacheRefreshTab({
   const promoteGeneration = usePromoteCacheGeneration(owner, namespaceName);
   const abandonGeneration = useAbandonCacheGeneration(owner, namespaceName);
   const namespaceQuery = useCacheNamespace(owner, namespaceName);
+  const observedGenerationId =
+    observedRefresh?.kind === "reused"
+      ? observedRefresh.generation.generation_id
+      : observedRefresh?.generationId;
+  const observedGeneration = useCacheGeneration(
+    owner,
+    namespaceName,
+    observedGenerationId,
+  );
+  const observedExecutionId =
+    observedRefresh?.kind === "reused"
+      ? observedRefresh.generation.created_by_execution
+      : (observedRefresh?.executionId ?? null);
 
   const expectedChunkCount = plannedChunkCount;
 
@@ -106,6 +128,7 @@ export default function CacheRefreshTab({
 
   const resetRefreshState = () => {
     setGeneration(null);
+    setObservedRefresh(null);
     setChunks([]);
     setTotalRecords(null);
     setPlannedChunkCount(null);
@@ -162,6 +185,13 @@ export default function CacheRefreshTab({
         expected_record_count: totalRecords,
         source_revision: sourceRevision.trim() || undefined,
       });
+      if (response.data.client_refresh_id !== clientRefreshId) {
+        setGeneration(null);
+        setChunks([]);
+        setObservedRefresh({ kind: "reused", generation: response.data });
+        return;
+      }
+      setObservedRefresh(null);
       setGeneration(response.data);
       setChunks(
         Array.from({ length: expectedChunkCount }, (_, index) => ({
@@ -171,7 +201,12 @@ export default function CacheRefreshTab({
         })),
       );
     } catch (err) {
-      setGenericError(getCacheErrorMessage(err, "Failed to begin refresh"));
+      const inProgress = getRefreshInProgressDetails(err);
+      if (inProgress) {
+        setObservedRefresh({ kind: "conflict", ...inProgress });
+      } else {
+        setGenericError(getCacheErrorMessage(err, "Failed to begin refresh"));
+      }
     }
   };
 
@@ -348,7 +383,68 @@ export default function CacheRefreshTab({
         </p>
       )}
 
-      {!generation && (
+      {observedRefresh && (
+        <div
+          role="status"
+          className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900"
+        >
+          <p className="font-medium">
+            {observedRefresh.kind === "reused"
+              ? "Another refresh was reused"
+              : "A refresh is already in progress"}
+            : generation #{observedGenerationId}
+          </p>
+          <p className="mt-2">
+            Creator: <CacheCreatorExecution executionId={observedExecutionId} />
+            . This is historical attribution, not live execution status.
+          </p>
+          {observedRefresh.kind === "reused" && (
+            <p className="mt-2">
+              Client refresh ID:{" "}
+              <code>{observedRefresh.generation.client_refresh_id}</code>
+            </p>
+          )}
+          <p className="mt-2">
+            Your file has not been uploaded. This screen will not upload, seal,
+            promote, or abandon another producer's generation. Wait for its
+            producer or check the Generations tab before retrying.
+          </p>
+          <p className="mt-2">
+            Generation status:{" "}
+            {observedGeneration.data?.data.status ??
+              (observedRefresh.kind === "reused"
+                ? observedRefresh.generation.status
+                : "unknown")}
+          </p>
+          {observedGeneration.error && (
+            <p className="mt-2">
+              {getCacheErrorMessage(
+                observedGeneration.error,
+                "Could not check generation status",
+              )}
+            </p>
+          )}
+          <div className="mt-3 flex gap-4">
+            <button
+              type="button"
+              disabled={observedGeneration.isFetching}
+              onClick={() => void observedGeneration.refetch()}
+              className="text-sm font-medium underline disabled:opacity-50"
+            >
+              Check generation status
+            </button>
+            <button
+              type="button"
+              onClick={() => setObservedRefresh(null)}
+              className="text-sm font-medium underline"
+            >
+              Return to refresh preparation
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!generation && !observedRefresh && (
         <div className="rounded-lg bg-white p-5 shadow">
           <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
             1. Select a local NDJSON file
@@ -451,7 +547,7 @@ export default function CacheRefreshTab({
               >
                 {beginRefresh.isPending
                   ? "Starting refresh…"
-                  : "2. Begin refresh (create staging generation)"}
+                  : "2. Begin refresh"}
               </button>
             </div>
           )}
@@ -468,6 +564,14 @@ export default function CacheRefreshTab({
               {generation.status}
             </span>
           </div>
+
+          <p className="mb-3 text-sm text-gray-600">
+            Creator:{" "}
+            <CacheCreatorExecution
+              executionId={generation.created_by_execution}
+            />
+            . Historical attribution only.
+          </p>
 
           {generation.status === CacheGenerationState.STAGING &&
             generation.record_count > 0 &&

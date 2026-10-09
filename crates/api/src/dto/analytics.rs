@@ -1,16 +1,55 @@
 //! Analytics DTOs for API requests and responses
 //!
-//! These types represent the API-facing view of analytics data derived from
-//! TimescaleDB continuous aggregates over entity history hypertables.
+//! Analytics over retained records, grouped into UTC hours without refresh delay.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use super::dashboard::DashboardFreshnessMode;
 use attune_common::repositories::analytics::{
     AnalyticsTimeRange, EnforcementVolumeBucket, EventVolumeBucket, ExecutionStatusBucket,
     ExecutionThroughputBucket, FailureRateSummary, WorkerStatusBucket,
 };
+use attune_common::repositories::native_maintenance::read::{
+    AnalyticsRead, ReadMetadata, ReadRange,
+};
+
+/// Coverage describes only this read's source-time bounds, including ledger holes.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnalyticsReadMetadata {
+    pub mode: DashboardFreshnessMode,
+    pub summary_ranges: Vec<AnalyticsReadRange>,
+    pub raw_ranges: Vec<AnalyticsReadRange>,
+    /// Oldest refresh actually used. This does not guarantee global coverage.
+    pub oldest_refresh: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnalyticsReadRange {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+impl From<ReadRange> for AnalyticsReadRange {
+    fn from(range: ReadRange) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+impl From<ReadMetadata> for AnalyticsReadMetadata {
+    fn from(meta: ReadMetadata) -> Self {
+        Self {
+            mode: meta.mode.into(),
+            summary_ranges: meta.summary_ranges.into_iter().map(Into::into).collect(),
+            raw_ranges: meta.raw_ranges.into_iter().map(Into::into).collect(),
+            oldest_refresh: meta.oldest_refresh,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Query parameters
@@ -19,11 +58,11 @@ use attune_common::repositories::analytics::{
 /// Common query parameters for analytics endpoints.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct AnalyticsQueryParams {
-    /// Start of time range (ISO 8601). Defaults to 24 hours ago.
+    /// Inclusive earliest UTC bucket start (ISO 8601). Defaults to 24 hours ago.
     #[param(example = "2026-02-25T00:00:00Z")]
     pub since: Option<DateTime<Utc>>,
 
-    /// End of time range (ISO 8601). Defaults to now.
+    /// Inclusive latest UTC bucket start (ISO 8601). Defaults to now.
     #[param(example = "2026-02-26T00:00:00Z")]
     pub until: Option<DateTime<Utc>>,
 
@@ -91,6 +130,7 @@ pub struct TimeSeriesPoint {
 /// Response for execution status transitions over time.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ExecutionStatusTimeSeriesResponse {
+    pub read_coverage: AnalyticsReadMetadata,
     /// Time range start
     pub since: DateTime<Utc>,
     /// Time range end
@@ -102,6 +142,7 @@ pub struct ExecutionStatusTimeSeriesResponse {
 /// Response for execution throughput over time.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ExecutionThroughputResponse {
+    pub read_coverage: AnalyticsReadMetadata,
     /// Time range start
     pub since: DateTime<Utc>,
     /// Time range end
@@ -113,6 +154,7 @@ pub struct ExecutionThroughputResponse {
 /// Response for event volume over time.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EventVolumeResponse {
+    pub read_coverage: AnalyticsReadMetadata,
     /// Time range start
     pub since: DateTime<Utc>,
     /// Time range end
@@ -124,6 +166,7 @@ pub struct EventVolumeResponse {
 /// Response for worker status transitions over time.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WorkerStatusTimeSeriesResponse {
+    pub read_coverage: AnalyticsReadMetadata,
     /// Time range start
     pub since: DateTime<Utc>,
     /// Time range end
@@ -146,20 +189,21 @@ pub struct EnforcementVolumeResponse {
 /// Response for the execution failure rate summary.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FailureRateResponse {
+    pub read_coverage: AnalyticsReadMetadata,
     /// Time range start
     pub since: DateTime<Utc>,
     /// Time range end
     pub until: DateTime<Utc>,
-    /// Total executions reaching a terminal state in the window
+    /// Total transitions to completed, failed, or timeout in the included hours
     #[schema(example = 100)]
     pub total_terminal: i64,
-    /// Number of failed executions
+    /// Number of transitions to failed, including retry attempts
     #[schema(example = 12)]
     pub failed_count: i64,
-    /// Number of timed-out executions
+    /// Number of transitions to timeout, including retry attempts
     #[schema(example = 3)]
     pub timeout_count: i64,
-    /// Number of completed executions
+    /// Number of transitions to completed
     #[schema(example = 85)]
     pub completed_count: i64,
     /// Failure rate as a percentage (0.0 – 100.0)
@@ -173,6 +217,8 @@ pub struct FailureRateResponse {
 /// avoiding multiple round-trips.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DashboardAnalyticsResponse {
+    /// Separate per-metric coverage, because sources can have different holes.
+    pub read_coverage: DashboardAnalyticsCoverage,
     /// Time range start
     pub since: DateTime<Utc>,
     /// Time range end
@@ -194,6 +240,14 @@ pub struct DashboardAnalyticsResponse {
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DashboardAnalyticsCoverage {
+    pub execution_throughput: AnalyticsReadMetadata,
+    pub execution_status: AnalyticsReadMetadata,
+    pub event_volume: AnalyticsReadMetadata,
+    pub worker_status: AnalyticsReadMetadata,
+}
 
 impl From<ExecutionStatusBucket> for TimeSeriesPoint {
     fn from(b: ExecutionStatusBucket) -> Self {
@@ -247,8 +301,13 @@ impl From<EnforcementVolumeBucket> for TimeSeriesPoint {
 
 impl FailureRateResponse {
     /// Create from the repository summary plus the query time range.
-    pub fn from_summary(summary: FailureRateSummary, range: &AnalyticsTimeRange) -> Self {
+    pub fn from_summary(
+        read: AnalyticsRead<FailureRateSummary>,
+        range: &AnalyticsTimeRange,
+    ) -> Self {
+        let summary = read.data;
         Self {
+            read_coverage: read.metadata.into(),
             since: range.since,
             until: range.until,
             total_terminal: summary.total_terminal,
@@ -325,7 +384,18 @@ mod tests {
             failure_rate_pct: 15.0,
         };
         let range = AnalyticsTimeRange::last_hours(24);
-        let response = FailureRateResponse::from_summary(summary, &range);
+        let response = FailureRateResponse::from_summary(
+            AnalyticsRead {
+                data: summary,
+                metadata: ReadMetadata {
+                    mode: attune_common::repositories::native_maintenance::read::ReadMode::RawOnly,
+                    summary_ranges: vec![],
+                    raw_ranges: vec![],
+                    oldest_refresh: None,
+                },
+            },
+            &range,
+        );
         assert_eq!(response.total_terminal, 100);
         assert_eq!(response.failed_count, 12);
         assert_eq!(response.failure_rate_pct, 15.0);
