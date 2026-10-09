@@ -246,7 +246,8 @@ services:
     volumes:
       - rabbitmq_data_v4:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      # A root CLI can create an unreadable cookie before the server creates it.
+      test: ["CMD", "su-exec", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5

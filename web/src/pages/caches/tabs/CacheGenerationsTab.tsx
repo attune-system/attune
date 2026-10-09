@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import type { CacheOwnerParams } from "@/types/cache";
 import { useCacheGenerations } from "@/hooks/useCaches";
 import ErrorDisplay from "@/components/common/ErrorDisplay";
+import CacheCreatorExecution from "../CacheCreatorExecution";
 import {
   formatBytes,
   formatDateTime,
@@ -150,6 +151,23 @@ export default function CacheGenerationsTab({
                         <tr>
                           <td colSpan={8} className="bg-gray-50 p-4">
                             <dl className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+                              <div>
+                                <dt className="text-xs uppercase tracking-wide text-gray-500">
+                                  Creator execution
+                                </dt>
+                                <dd className="text-gray-900">
+                                  <CacheCreatorExecution
+                                    executionId={
+                                      generation.created_by_execution
+                                    }
+                                  />
+                                </dd>
+                                <p className="mt-1 text-xs text-gray-500">
+                                  Historical attribution, not live execution
+                                  status. The execution may no longer be
+                                  retained.
+                                </p>
+                              </div>
                               <div>
                                 <dt className="text-xs uppercase tracking-wide text-gray-500">
                                   Client refresh ID

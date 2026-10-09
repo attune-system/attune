@@ -66,6 +66,7 @@ COPY docker/extract-rust-test-artifacts.py ./docker/extract-rust-test-artifacts.
 COPY docker/run-migrations.sh ./docker/run-migrations.sh
 COPY docker/Dockerfile.migrations-package ./docker/Dockerfile.migrations-package
 COPY docker/distributable/docker-compose.yaml ./docker/distributable/docker-compose.yaml
+COPY docker/distributable/config.docker.yaml ./docker/distributable/config.docker.yaml
 COPY packaging/scripts/postinstall.sh ./packaging/scripts/postinstall.sh
 COPY docker-compose.yaml ./docker-compose.yaml
 COPY config.test.yaml ./config.test.yaml

@@ -1,3 +1,4 @@
+use crate::models::CacheRefreshConcurrency;
 use crate::repositories::cache::{validate_namespace_name, CacheNamespacePolicy};
 use crate::Result;
 use serde::Deserialize;
@@ -29,6 +30,8 @@ pub(crate) struct CacheDefinitionYaml {
     pub max_retained_generations: i32,
     #[serde(default = "default_max_staging_generations")]
     pub max_staging_generations: i32,
+    #[serde(default)]
+    pub refresh_concurrency: CacheRefreshConcurrency,
 }
 
 impl CacheDefinitionYaml {
@@ -40,6 +43,7 @@ impl CacheDefinitionYaml {
             max_retained_bytes: self.max_retained_bytes,
             max_retained_generations: self.max_retained_generations,
             max_staging_generations: self.max_staging_generations,
+            refresh_concurrency: self.refresh_concurrency,
         }
     }
 
@@ -87,6 +91,28 @@ mod tests {
             parse("ref: demo.users\nnamespace: users\nowner_type: pack\nowner_ref: demo\n");
         assert_eq!(definition.policy(), CacheNamespacePolicy::default());
         assert!(definition.validate().is_ok());
+        assert_eq!(
+            definition.refresh_concurrency,
+            CacheRefreshConcurrency::Parallel
+        );
+    }
+
+    #[test]
+    fn refresh_concurrency_is_a_flat_validated_enum() {
+        for (name, expected) in [
+            ("reuse", CacheRefreshConcurrency::Reuse),
+            ("conflict", CacheRefreshConcurrency::Conflict),
+            ("parallel", CacheRefreshConcurrency::Parallel),
+        ] {
+            let definition = parse(&format!(
+                "ref: demo.users\nnamespace: users\nowner_type: pack\nowner_ref: demo\nrefresh_concurrency: {name}\n"
+            ));
+            assert_eq!(definition.policy().refresh_concurrency, expected);
+            assert!(definition.validate().is_ok());
+        }
+        assert!(serde_yaml_ng::from_str::<CacheDefinitionYaml>(
+            "ref: demo.users\nnamespace: users\nowner_type: pack\nowner_ref: demo\nrefresh_concurrency: unknown\n"
+        ).is_err());
     }
 
     #[test]

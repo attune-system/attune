@@ -4,7 +4,7 @@
 //! orchestrating the loading, validation, and registration of workflows.
 
 use crate::error::{Error, Result};
-use crate::repositories::{Delete, FindByRef, List, PackRepository, WorkflowDefinitionRepository};
+use crate::repositories::{FindByRef, List, PackRepository, WorkflowDefinitionRepository};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::PathBuf;

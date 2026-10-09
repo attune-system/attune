@@ -7,11 +7,11 @@ use crate::rbac::OwnerConstraint;
 use crate::schema::RefValidator;
 use crate::{Error, Result};
 use sha2::{Digest, Sha256};
-use sqlx::{Executor, Postgres, QueryBuilder};
+use sqlx::{Acquire, Executor, Postgres, QueryBuilder};
 
 use super::{
-    text_search_patterns, Create, Delete, FindById, FindByRef, List, Pagination, Patch, Repository,
-    Update,
+    cache::{CacheEntryRepository, CacheTransactionMode},
+    text_search_patterns, Create, FindById, FindByRef, List, Pagination, Patch, Repository, Update,
 };
 
 /// Repository for Pack operations
@@ -384,18 +384,28 @@ impl Update for PackRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Delete for PackRepository {
-    async fn delete<'e, E>(executor: E, id: i64) -> Result<bool>
+impl PackRepository {
+    /// Deletes a pack in a parent-first transaction, including workflow cascades.
+    /// Existing transactions use a savepoint. Callers performing earlier pack,
+    /// release or cache mutations must acquire pin-mutation protection at outer
+    /// transaction entry. Write, Attach and Ingest protection also take that gate.
+    pub async fn delete<'a, A>(acquire: A, id: i64) -> Result<bool>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'a, Database = Postgres>,
     {
+        let mut transaction = acquire.begin().await?;
+        CacheEntryRepository::protect_transaction(
+            &mut transaction,
+            CacheTransactionMode::PinMutation,
+        )
+        .await?;
         let state = sqlx::query_as::<_, PackDeletionState>(PACK_DELETION_QUERY)
             .bind(id)
             .bind(true)
-            .fetch_one(executor)
+            .fetch_one(&mut *transaction)
             .await?;
         state.check(id)?;
+        transaction.commit().await?;
         Ok(state.deleted)
     }
 }
@@ -561,7 +571,8 @@ impl PackRepository {
     }
 
     /// Locks the pack's releases and rejects deletion if live pinned work exists.
-    /// Keep the surrounding transaction open through the eventual pack delete.
+    /// Protect pin mutations before calling this, and keep the surrounding
+    /// transaction open through the eventual pack delete.
     pub async fn ensure_deletable<'e, E>(executor: E, pack_id: i64) -> Result<bool>
     where
         E: Executor<'e, Database = Postgres> + 'e,

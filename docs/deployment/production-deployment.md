@@ -3,14 +3,15 @@
 This document provides guidelines and checklists for deploying Attune to production environments.
 
 Attune uses stock PostgreSQL 16 or newer, with PostgreSQL 18 as the Compose and
-CI default. No TimescaleDB extension is required. Before deploying against
-existing data, follow [PostgreSQL-only deployment](postgresql-only.md) for the
-fresh-schema requirement and separate conversion or reset decision.
+CI default. No TimescaleDB extension is required. Attune is pre-production and
+the current migration baseline targets fresh databases. See
+[PostgreSQL-only deployment](postgresql-only.md) for installation, DDL roles,
+explicit development resets, and the data-preserving migration policy from 1.0.0.
 
 ## Table of Contents
 
 - [Pre-Deployment Checklist](#pre-deployment-checklist)
-- [Database Configuration](#database-configuration)
+- [PostgreSQL deployment and roles](postgresql-only.md)
 - [Environment Variables](#environment-variables)
 - [Schema Verification](#schema-verification)
 - [Security Best Practices](#security-best-practices)
@@ -399,11 +400,11 @@ If issues occur after deployment:
 
 ## Additional Resources
 
-- [Configuration Guide](./configuration.md)
-- [Schema-Per-Test Architecture](./schema-per-test.md)
-- [API Documentation](./api-overview.md)
-- [Security Best Practices](./security.md)
-- [Monitoring and Observability](./monitoring.md)
+- [Configuration guide](../configuration/configuration.md)
+- [Template-cloned test databases](../testing/schema-per-test.md)
+- [API documentation](../api/)
+- [Security best practices](#security-best-practices)
+- [Operational visibility](operational-visibility.md)
 
 ---
 

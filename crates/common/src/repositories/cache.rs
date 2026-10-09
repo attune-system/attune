@@ -16,13 +16,19 @@ use crate::{
             CACHE_ENTRY_SELECT_COLUMNS, CACHE_GENERATION_SELECT_COLUMNS,
             CACHE_INGEST_CHUNK_SELECT_COLUMNS, CACHE_NAMESPACE_SELECT_COLUMNS,
         },
-        CacheGenerationState, Id, OwnerType,
+        CacheGenerationState, CacheRefreshConcurrency, Id, OwnerType,
     },
     rbac::OwnerConstraint,
     Error, Result,
 };
 
 use super::{Create, FindById, List, Repository};
+
+mod storage;
+pub use storage::{CacheStatisticsRefreshOutcome, CacheStorageObservation, CacheStorageRepository};
+
+/// Empty chunks count toward this metadata bound too.
+pub const MAX_INGEST_CHUNKS_PER_GENERATION: i32 = 10_000;
 
 /// Largest accepted record count in one request. Records are still inserted in
 /// smaller SQL batches so request and transaction memory remain bounded.
@@ -47,7 +53,10 @@ pub const MAX_CACHE_TEXT_BYTES: usize = 1024;
 pub const MAX_CACHE_REASON_BYTES: usize = 4096;
 /// Serializes aggregate cache admissions across API instances. The lock is
 /// transaction-scoped and released automatically on commit or rollback.
-const CACHE_ADMISSION_ADVISORY_LOCK_KEY: i64 = 7_821_101;
+// Two-integer keys occupy a different PostgreSQL advisory-lock space from
+// single-BIGINT workflow IDs, even when a workflow ID equals this class value.
+const CACHE_ADMISSION_ADVISORY_LOCK_CLASS: i32 = 7_821_101;
+const CACHE_ADMISSION_ADVISORY_LOCK_KEY: i32 = 0;
 
 /// Canonical owner selector. API callers resolve owner references to these IDs
 /// before calling cache repositories.
@@ -96,6 +105,27 @@ pub struct CacheEntryPage {
     pub generation: CacheGeneration,
     pub entries: Vec<CacheEntry>,
     pub has_more: bool,
+}
+
+/// Acquire before owner, workflow, iteration, namespace, or generation row locks.
+#[derive(Debug, Clone, Copy)]
+pub enum CacheTransactionMode {
+    Read,
+    /// Coordinate pin admission and cascade release before workflow/source rows.
+    /// Multiple generations may be mutated in one outer transaction.
+    PinMutation,
+    Write,
+    Attach,
+    Ingest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheGenerationCleanupOutcome {
+    Dropped { records: u64, bytes: u64 },
+    Ineligible,
+    Absent,
+    DeferredBusy,
+    DeferredDeadline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +292,7 @@ pub struct CacheNamespacePolicy {
     pub max_retained_bytes: i64,
     pub max_retained_generations: i32,
     pub max_staging_generations: i32,
+    pub refresh_concurrency: CacheRefreshConcurrency,
 }
 
 impl Default for CacheNamespacePolicy {
@@ -273,6 +304,7 @@ impl Default for CacheNamespacePolicy {
             max_retained_bytes: 2 * 1024 * 1024 * 1024,
             max_retained_generations: 5,
             max_staging_generations: 2,
+            refresh_concurrency: CacheRefreshConcurrency::Parallel,
         }
     }
 }
@@ -341,6 +373,9 @@ pub struct CreateCacheGenerationInput {
     pub checksum: Option<String>,
     pub source_revision: Option<String>,
     pub created_by: Option<Id>,
+    /// Server-supplied execution attribution. Retrying or reusing a generation
+    /// never changes the original producer, even across different executions.
+    pub created_by_execution: Option<Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -484,7 +519,7 @@ impl CacheNamespaceRepository {
         input.policy.validate()?;
         let canonical_owner = input.owner.canonical_owner()?;
 
-        lock_cache_admission(connection).await?;
+        CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Write).await?;
         let existing_id = sqlx::query_scalar::<_, Id>(
             "SELECT id FROM cache_namespace \
              WHERE owner_type = $1 AND owner = $2 AND namespace = $3 \
@@ -559,7 +594,7 @@ impl CacheNamespaceRepository {
             validate_managed_definition(definition)?;
         }
 
-        lock_cache_admission(connection).await?;
+        CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Write).await?;
         let mut summary = ManagedCacheNamespaceUpsertSummary::default();
 
         for definition in definitions {
@@ -596,7 +631,7 @@ impl CacheNamespaceRepository {
                     "UPDATE cache_namespace SET freshness_target_seconds = $2, \
                      max_records_per_generation = $3, max_generation_bytes = $4, \
                      max_retained_bytes = $5, max_retained_generations = $6, \
-                     max_staging_generations = $7 \
+                      max_staging_generations = $7, refresh_concurrency = $8 \
                      WHERE id = $1 AND tombstoned_at IS NULL \
                      RETURNING {CACHE_NAMESPACE_SELECT_COLUMNS}"
                 );
@@ -608,6 +643,7 @@ impl CacheNamespaceRepository {
                     .bind(definition.policy.max_retained_bytes)
                     .bind(definition.policy.max_retained_generations)
                     .bind(definition.policy.max_staging_generations)
+                    .bind(definition.policy.refresh_concurrency)
                     .fetch_one(&mut *connection)
                     .await?;
                 summary.updated += 1;
@@ -1002,7 +1038,7 @@ impl CacheNamespaceRepository {
             "UPDATE cache_namespace SET freshness_target_seconds = $2, \
              max_records_per_generation = $3, max_generation_bytes = $4, \
              max_retained_bytes = $5, max_retained_generations = $6, \
-             max_staging_generations = $7 \
+              max_staging_generations = $7, refresh_concurrency = $8 \
              WHERE id = $1 AND tombstoned_at IS NULL AND retired_at IS NULL \
              RETURNING {CACHE_NAMESPACE_SELECT_COLUMNS}"
         );
@@ -1014,6 +1050,7 @@ impl CacheNamespaceRepository {
             .bind(policy.max_retained_bytes)
             .bind(policy.max_retained_generations)
             .bind(policy.max_staging_generations)
+            .bind(policy.refresh_concurrency)
             .fetch_optional(executor)
             .await?
             .ok_or_else(|| Error::not_found("cache_namespace", "id", namespace_id.to_string()))
@@ -1345,6 +1382,7 @@ impl CacheGenerationRepository {
         conn: &mut sqlx::PgConnection,
         generation_id: Id,
     ) -> Result<Option<CacheGeneration>> {
+        CacheEntryRepository::protect_transaction(conn, CacheTransactionMode::Read).await?;
         let query = format!(
             "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation \
              WHERE id = $1 FOR SHARE"
@@ -1376,7 +1414,9 @@ impl CacheGenerationRepository {
     }
 
     /// Creates a staging generation or returns the prior matching generation
-    /// for an idempotent client refresh retry.
+    /// for an idempotent client refresh retry. For a different refresh ID, the
+    /// namespace policy can reuse or reject the oldest staging/ready generation.
+    /// Existing results retain their original upload contract and attribution.
     pub async fn create_or_get(
         pool: &PgPool,
         input: &CreateCacheGenerationInput,
@@ -1401,7 +1441,7 @@ impl CacheGenerationRepository {
         admission: &CacheAdmissionConfig,
     ) -> Result<CreateCacheGenerationResult> {
         validate_generation_input(input)?;
-        lock_cache_admission(connection).await?;
+        CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Attach).await?;
         let namespace = lock_namespace(connection, input.namespace)
             .await?
             .ok_or_else(|| {
@@ -1420,6 +1460,7 @@ impl CacheGenerationRepository {
             .await?
         {
             if generation_matches_input(&existing, input) {
+                validate_generation_storage(connection, existing.id).await?;
                 return Ok(CreateCacheGenerationResult::Existing(existing));
             }
             return Err(Error::already_exists(
@@ -1427,6 +1468,31 @@ impl CacheGenerationRepository {
                 "client_refresh_id",
                 input.client_refresh_id.clone(),
             ));
+        }
+
+        if namespace.refresh_concurrency != CacheRefreshConcurrency::Parallel {
+            let unpublished_query = format!(
+                "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation \
+                 WHERE namespace = $1 AND state IN ('staging', 'ready') \
+                 ORDER BY created, id LIMIT 1 FOR UPDATE"
+            );
+            if let Some(existing) = sqlx::query_as::<_, CacheGeneration>(&unpublished_query)
+                .bind(input.namespace)
+                .fetch_optional(&mut *connection)
+                .await?
+            {
+                validate_generation_storage(connection, existing.id).await?;
+                return match namespace.refresh_concurrency {
+                    CacheRefreshConcurrency::Reuse => {
+                        Ok(CreateCacheGenerationResult::Existing(existing))
+                    }
+                    CacheRefreshConcurrency::Conflict => Err(Error::CacheRefreshInProgress {
+                        generation_id: existing.id,
+                        created_by_execution: existing.created_by_execution,
+                    }),
+                    CacheRefreshConcurrency::Parallel => unreachable!(),
+                };
+            }
         }
 
         let staging_count: i64 = sqlx::query_scalar(
@@ -1444,12 +1510,24 @@ impl CacheGenerationRepository {
         ensure_generation_admission(connection, &namespace, input.expected_bytes, admission)
             .await?;
 
+        let partitions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_inherits WHERE inhparent = 'cache_entry'::regclass",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+        if partitions >= admission.max_entry_partitions {
+            return Err(Error::cache_quota_exceeded(
+                "cache_entry_partition_limit_exceeded",
+                "deployment cache entry partition limit exceeded",
+            ));
+        }
+
         let insert = format!(
             "INSERT INTO cache_generation \
              (namespace, client_refresh_id, expected_active_generation, expected_chunk_count, \
               expected_count, expected_bytes, checksum_algorithm, checksum, source_revision, \
-              created_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+               created_by, created_by_execution) \
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              RETURNING {CACHE_GENERATION_SELECT_COLUMNS}"
         );
         let generation = sqlx::query_as::<_, CacheGeneration>(&insert)
@@ -1463,8 +1541,26 @@ impl CacheGenerationRepository {
             .bind(&input.checksum)
             .bind(&input.source_revision)
             .bind(input.created_by)
+            .bind(input.created_by_execution)
             .fetch_one(&mut *connection)
             .await?;
+        let ddl_started = std::time::Instant::now();
+        let creation = sqlx::query("SELECT create_cache_generation_partition($1)")
+            .bind(generation.id)
+            .execute(&mut *connection)
+            .await;
+        tracing::info!(
+            component = "cache_storage",
+            operation = "create_partition",
+            status = if creation.is_ok() {
+                "transaction_pending"
+            } else {
+                "failed"
+            },
+            ddl_duration_ms = u64::try_from(ddl_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Cache partition creation statement completed"
+        );
+        creation?;
         Ok(CreateCacheGenerationResult::Created(generation))
     }
 
@@ -1946,6 +2042,14 @@ impl CacheGenerationRepository {
         pool: &PgPool,
         limit: i64,
     ) -> Result<Vec<CacheGeneration>> {
+        Self::select_cleanup_candidates_after(pool, None, limit).await
+    }
+
+    pub async fn select_cleanup_candidates_after(
+        pool: &PgPool,
+        after_id: Option<Id>,
+        limit: i64,
+    ) -> Result<Vec<CacheGeneration>> {
         let limit = bounded_limit(limit, MAX_CLEANUP_SELECTION, "cleanup selection")?;
         let query = format!(
             "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation g \
@@ -1955,52 +2059,210 @@ impl CacheGenerationRepository {
                                JOIN workflow_execution w ON w.id = i.workflow_execution \
                                WHERE i.generation = g.id AND i.state = 'scanning' \
                                  AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')) \
-             ORDER BY COALESCE(readable_until, failed, retired, created), id LIMIT $1"
+               AND ($2::BIGINT IS NULL OR g.id > $2) \
+             ORDER BY id LIMIT $1"
         );
         sqlx::query_as::<_, CacheGeneration>(&query)
             .bind(limit)
+            .bind(after_id)
             .fetch_all(pool)
             .await
             .map_err(Into::into)
     }
 
-    /// Removes an empty, non-active generation after its entries were removed
-    /// by [`CacheEntryRepository::delete_cleanup_batch`]. The subordinate
-    /// ingest-chunk metadata is dropped in the same transaction so the
-    /// `ON DELETE RESTRICT` foreign key does not block finalization.
-    pub async fn delete_if_empty(pool: &PgPool, generation_id: Id) -> Result<bool> {
-        let mut tx = pool.begin().await?;
-        let eligible: Option<Id> = sqlx::query_scalar(
-            "SELECT g.id FROM cache_generation g WHERE g.id = $1 \
-             AND (g.state = 'failed' \
-                  OR (g.state = 'retired' AND g.readable_until IS NOT NULL \
-                      AND g.readable_until <= NOW())) \
-             AND NOT EXISTS (SELECT 1 FROM cache_entry e WHERE e.generation = g.id) \
-              AND NOT EXISTS (SELECT 1 FROM workflow_cache_iteration i \
-                              JOIN workflow_execution w ON w.id = i.workflow_execution \
-                              WHERE i.generation = g.id AND i.state = 'scanning' \
-                                AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')) \
-             FOR UPDATE",
-        )
-        .bind(generation_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if eligible.is_none() {
-            tx.rollback().await?;
-            return Ok(false);
+    /// Atomically reclaims eligible storage and exact usage with bounded DDL.
+    pub async fn drop_if_cleanup_eligible(
+        pool: &PgPool,
+        generation_id: Id,
+        config: &CacheRetentionConfig,
+    ) -> Result<CacheGenerationCleanupOutcome> {
+        config
+            .validate_storage_maintenance()
+            .map_err(Error::validation)?;
+        let traversal_seconds = i64::try_from(config.min_traversal_window_seconds)
+            .map_err(|_| Error::validation("cache traversal window exceeds BIGINT"))?;
+        if generation_id <= 0
+            || config.ddl_lock_timeout_milliseconds == 0
+            || config.ddl_statement_timeout_milliseconds == 0
+        {
+            return Err(Error::validation("invalid cache generation cleanup limits"));
         }
-
-        sqlx::query("DELETE FROM cache_ingest_chunk WHERE generation = $1")
-            .bind(generation_id)
-            .execute(&mut *tx)
-            .await?;
-        let result = sqlx::query("DELETE FROM cache_generation WHERE id = $1")
-            .bind(generation_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(result.rows_affected() == 1)
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(
+                config.max_cleanup_cycle_milliseconds,
+            ))
+            .ok_or_else(|| {
+                Error::validation("cache cleanup budget exceeds monotonic clock range")
+            })?;
+        let remaining_ms = || {
+            u64::try_from(
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX)
+        };
+        let connection = match tokio::time::timeout_at(deadline, pool.acquire()).await {
+            Ok(acquired) => acquired?,
+            Err(_) => {
+                tracing::info!(
+                    component = "cache_storage",
+                    operation = "cleanup",
+                    phase = "pool",
+                    status = "deferred_deadline",
+                    "Cache cleanup cycle budget exhausted"
+                );
+                return Ok(CacheGenerationCleanupOutcome::DeferredDeadline);
+            }
+        };
+        // Cancellation must not hand a still-running statement/queued rollback
+        // to SQLx's asynchronous pool-return path. Server phase timers bound SQL;
+        // this guard discards the socket on cancellation or protocol failure.
+        struct CleanupConnection(Option<sqlx::pool::PoolConnection<Postgres>>);
+        impl Drop for CleanupConnection {
+            fn drop(&mut self) {
+                if let Some(connection) = self.0.take() {
+                    drop(connection.detach());
+                }
+            }
+        }
+        let mut lease = CleanupConnection(Some(connection));
+        let mut phase = "begin";
+        let result = tokio::time::timeout_at(deadline, async {
+            let connection = lease.0.as_mut().expect("owned cleanup connection");
+            let mut tx = sqlx::Connection::begin(&mut **connection).await?;
+            phase = "admission";
+            let remaining = remaining_ms();
+            if remaining == 0 {
+                tx.rollback().await?;
+                return Ok(CacheGenerationCleanupOutcome::DeferredDeadline);
+            }
+            // Admission is coordination, not a parent DDL wait. Both server
+            // timers remain bounded by the actual remaining whole-cycle budget.
+            sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)")
+                .bind(format!("{remaining}ms")).execute(&mut *tx).await?;
+            let admission_started = std::time::Instant::now();
+            let admission = lock_cache_admission(&mut tx).await;
+            tracing::info!(component="cache_storage", operation="cleanup_admission",
+                status=if admission.is_ok() { "admitted" } else { "failed" },
+                duration_ms=u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                remaining_cycle_ms=remaining_ms(), "Cache cleanup admission completed");
+            if let Err(error) = admission {
+                let code = match &error {
+                    Error::Database(database) => database.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned()),
+                    _ => None,
+                };
+                tx.rollback().await?;
+                // Either timer expiring here exhausts the cycle, not the short
+                // DDL lock budget. SQLSTATE 55P03 can win the two-timer race.
+                return match code.as_deref() {
+                    Some("55P03" | "57014") => Ok(CacheGenerationCleanupOutcome::DeferredDeadline),
+                    _ => Err(error),
+                };
+            }
+            phase = "ddl";
+            let remaining = remaining_ms();
+            if remaining == 0 {
+                tx.rollback().await?;
+                return Ok(CacheGenerationCleanupOutcome::DeferredDeadline);
+            }
+            let lock_ms = config.ddl_lock_timeout_milliseconds.min(remaining);
+            let statement_ms = config.ddl_statement_timeout_milliseconds.min(remaining);
+            sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)")
+                .bind(format!("{lock_ms}ms")).bind(format!("{statement_ms}ms"))
+                .execute(&mut *tx).await?;
+            // The SQL function's admission call is reentrant in this transaction;
+            // its parent/leaf DDL now sees only the unchanged short DDL limits.
+            let result = sqlx::query_as::<_, (String, i64, i64)>(
+                "SELECT outcome, records_reclaimed, bytes_reclaimed FROM drop_cleanup_cache_generation($1, $2)",
+            ).bind(generation_id).bind(traversal_seconds).fetch_one(&mut *tx).await;
+            let (outcome, records, bytes) = match result {
+                Ok(row) => row,
+                Err(error) => {
+                    let code = error.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned());
+                    tx.rollback().await?;
+                    return match code.as_deref() {
+                        Some("55P03") if lock_ms < remaining => Ok(CacheGenerationCleanupOutcome::DeferredBusy),
+                        Some("55P03" | "57014") => Ok(CacheGenerationCleanupOutcome::DeferredDeadline),
+                        _ => Err(error.into()),
+                    };
+                }
+            };
+            let outcome = match outcome.as_str() {
+                "dropped" => CacheGenerationCleanupOutcome::Dropped {
+                    records: u64::try_from(records).map_err(|_| Error::invalid_state("negative cache entry usage"))?,
+                    bytes: u64::try_from(bytes).map_err(|_| Error::invalid_state("negative cache byte usage"))?,
+                },
+                "absent" => CacheGenerationCleanupOutcome::Absent,
+                "ineligible" => CacheGenerationCleanupOutcome::Ineligible,
+                _ => return Err(Error::invalid_state("unknown cache generation cleanup outcome")),
+            };
+            let remaining = remaining_ms();
+            if remaining == 0 {
+                tx.rollback().await?;
+                return Ok(CacheGenerationCleanupOutcome::DeferredDeadline);
+            }
+            sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)")
+                .bind(format!("{}ms", config.ddl_statement_timeout_milliseconds.min(remaining)))
+                .execute(&mut *tx).await?;
+            phase = "commit";
+            tx.commit().await?;
+            Ok(outcome)
+        }).await;
+        match result {
+            Ok(Ok(outcome)) => {
+                // Only acknowledged commit/rollback connections return to the pool.
+                drop(lease.0.take());
+                tracing::info!(component="cache_storage", operation="cleanup", phase,
+                    status=?outcome, "Cache cleanup completed");
+                Ok(outcome)
+            }
+            Ok(Err(error)) => {
+                // Never return a transaction with queued rollback or uncertain
+                // protocol state to the pool. Server timers bound pending work.
+                drop(lease);
+                Err(error)
+            }
+            Err(_) => {
+                // Dropping the SQL future alone is not server cancellation.
+                // Server-side phase timers bound pending SQL; also discard the
+                // socket so no waiter/rollback is handed to another pool user.
+                drop(lease);
+                if phase == "commit" {
+                    tracing::error!(
+                        component = "cache_storage",
+                        operation = "cleanup",
+                        phase,
+                        status = "commit_unconfirmed",
+                        "Cleanup commit acknowledgement exceeded cycle budget"
+                    );
+                    Err(Error::invalid_state(
+                        "cache cleanup commit outcome is unconfirmed after cycle deadline",
+                    ))
+                } else {
+                    tracing::info!(
+                        component = "cache_storage",
+                        operation = "cleanup",
+                        phase,
+                        status = "deferred_deadline",
+                        "Cache cleanup cycle budget exhausted"
+                    );
+                    Ok(CacheGenerationCleanupOutcome::DeferredDeadline)
+                }
+            }
+        }
     }
+}
+
+async fn validate_generation_storage(
+    connection: &mut sqlx::PgConnection,
+    generation_id: Id,
+) -> Result<()> {
+    sqlx::query("SELECT validate_cache_generation_partition($1)")
+        .bind(generation_id)
+        .execute(connection)
+        .await?;
+    Ok(())
 }
 
 pub struct CacheIngestRepository;
@@ -2057,7 +2319,7 @@ impl CacheIngestRepository {
         admission: &CacheAdmissionConfig,
     ) -> Result<InsertCacheChunkResult> {
         validate_chunk_input(chunk_index, request_checksum, entries)?;
-        lock_cache_admission(connection).await?;
+        CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Ingest).await?;
         // Lock namespace-before-generation (the generation's namespace is
         // immutable) so tombstone, upload, and seal share one lock order and
         // cannot deadlock against each other.
@@ -2209,6 +2471,48 @@ impl CacheIngestRepository {
 pub struct CacheEntryRepository;
 
 impl CacheEntryRepository {
+    pub async fn protect_transaction(
+        connection: &mut sqlx::PgConnection,
+        mode: CacheTransactionMode,
+    ) -> Result<()> {
+        // Admission coordination is not a DDL lock wait. Let the winning
+        // refresh commit before applying the short partition-lock deadlines,
+        // so concurrent reuse/conflict callers can inspect its generation.
+        if !matches!(mode, CacheTransactionMode::Read) {
+            lock_cache_admission(connection).await?;
+        }
+        if matches!(mode, CacheTransactionMode::Attach) {
+            let stored: Option<JsonValue> = sqlx::query_scalar(
+                "SELECT cache_retention FROM runtime_retention_config WHERE id = TRUE",
+            )
+            .fetch_optional(&mut *connection)
+            .await?;
+            let config = stored
+                .map(serde_json::from_value::<CacheRetentionConfig>)
+                .transpose()?
+                .unwrap_or_default();
+            config
+                .validate_storage_maintenance()
+                .map_err(Error::validation)?;
+            sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)")
+                .bind(format!("{}ms", config.ddl_lock_timeout_milliseconds))
+                .bind(format!("{}ms", config.ddl_creation_statement_timeout_milliseconds))
+                .execute(&mut *connection).await?;
+        }
+        let sql = match mode {
+            CacheTransactionMode::Read | CacheTransactionMode::PinMutation => {
+                "LOCK TABLE ONLY cache_entry IN ACCESS SHARE MODE"
+            }
+            CacheTransactionMode::Write => "LOCK TABLE ONLY cache_entry IN ACCESS SHARE MODE",
+            CacheTransactionMode::Attach => {
+                "LOCK TABLE ONLY cache_entry IN SHARE UPDATE EXCLUSIVE MODE"
+            }
+            CacheTransactionMode::Ingest => "LOCK TABLE ONLY cache_entry IN ROW EXCLUSIVE MODE",
+        };
+        sqlx::query(sql).execute(&mut *connection).await?;
+        Ok(())
+    }
+
     pub async fn find_active(
         pool: &PgPool,
         namespace_id: Id,
@@ -2244,6 +2548,7 @@ impl CacheEntryRepository {
         }
 
         let mut tx = pool.begin().await?;
+        Self::protect_transaction(&mut tx, CacheTransactionMode::Read).await?;
         let active_generation: Option<Id> = sqlx::query_scalar(
             "SELECT active_generation FROM cache_namespace \
              WHERE id = $1 AND tombstoned_at IS NULL AND retired_at IS NULL FOR SHARE",
@@ -2513,7 +2818,7 @@ impl CacheEntryRepository {
                  FROM candidates \
              ) \
              SELECT {} FROM bounded b \
-             JOIN cache_entry e ON e.id = b.id \
+              JOIN cache_entry e ON e.generation = $1 AND e.id = b.id \
              WHERE b.running_bytes <= $4 OR b.row_number = 1 \
              ORDER BY b.external_id COLLATE \"C\", b.id",
             qualified_columns("e", CACHE_ENTRY_SELECT_COLUMNS),
@@ -2604,7 +2909,7 @@ impl CacheEntryRepository {
                  FROM candidates \
              ) \
              SELECT {} FROM bounded b \
-             JOIN cache_entry e ON e.id = b.id \
+              JOIN cache_entry e ON e.generation = $1 AND e.id = b.id \
              WHERE b.running_bytes <= $4 OR b.row_number = 1 \
              ORDER BY b.external_id COLLATE \"C\", b.id",
             qualified_columns("e", CACHE_ENTRY_SELECT_COLUMNS),
@@ -2635,50 +2940,6 @@ impl CacheEntryRepository {
             has_more,
         })
     }
-
-    /// Deletes at most one indexed batch from a cleanup candidate generation.
-    /// It intentionally never deletes an entire high-cardinality generation in
-    /// one transaction.
-    pub async fn delete_cleanup_batch(pool: &PgPool, generation_id: Id, limit: i64) -> Result<u64> {
-        let limit = bounded_limit(limit, MAX_CLEANUP_SELECTION, "cleanup batch")?;
-        let mut tx = pool.begin().await?;
-        let eligible: Option<Id> = sqlx::query_scalar(
-            "SELECT id FROM cache_generation
-             WHERE id = $1
-               AND (state = 'failed'
-                    OR (state = 'retired' AND readable_until IS NOT NULL
-                        AND readable_until <= NOW()))
-               AND NOT EXISTS (SELECT 1 FROM workflow_cache_iteration i
-                               JOIN workflow_execution w ON w.id = i.workflow_execution
-                               WHERE i.generation = cache_generation.id
-                                 AND i.state = 'scanning'
-                                 AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned'))
-             FOR UPDATE",
-        )
-        .bind(generation_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if eligible.is_none() {
-            tx.rollback().await?;
-            return Ok(0);
-        }
-
-        let result = sqlx::query(
-            "WITH candidates AS ( \
-                 SELECT e.id FROM cache_entry e \
-                 WHERE e.generation = $1 \
-                 ORDER BY e.id LIMIT $2 \
-                 FOR UPDATE SKIP LOCKED \
-             ) \
-             DELETE FROM cache_entry e USING candidates c WHERE e.id = c.id",
-        )
-        .bind(generation_id)
-        .bind(limit)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(result.rows_affected())
-    }
 }
 
 async fn load_readable_pinned(
@@ -2686,6 +2947,7 @@ async fn load_readable_pinned(
     namespace_id: Id,
     generation_id: Id,
 ) -> Result<CacheGeneration> {
+    CacheEntryRepository::protect_transaction(tx, CacheTransactionMode::Read).await?;
     let query = format!(
         "SELECT {} FROM cache_generation g \
          JOIN cache_namespace n ON n.id = g.namespace \
@@ -2716,6 +2978,7 @@ async fn load_readable_pinned_conn(
     namespace_id: Id,
     generation_id: Id,
 ) -> Result<CacheGeneration> {
+    CacheEntryRepository::protect_transaction(conn, CacheTransactionMode::Read).await?;
     let query = format!(
         "SELECT {} FROM cache_generation g \
          JOIN cache_namespace n ON n.id = g.namespace \
@@ -2756,8 +3019,8 @@ where
          (owner_type, owner_identity, owner_pack, owner_pack_ref, owner_action, owner_action_ref, \
           owner_sensor, owner_sensor_ref, definition_ref, managing_pack, managing_pack_ref, \
           namespace, freshness_target_seconds, max_records_per_generation, max_generation_bytes, \
-          max_retained_bytes, max_retained_generations, max_staging_generations) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+          max_retained_bytes, max_retained_generations, max_staging_generations, refresh_concurrency) \
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
          RETURNING {CACHE_NAMESPACE_SELECT_COLUMNS}"
     );
     sqlx::query_as::<_, CacheNamespace>(&query)
@@ -2779,6 +3042,7 @@ where
         .bind(input.policy.max_retained_bytes)
         .bind(input.policy.max_retained_generations)
         .bind(input.policy.max_staging_generations)
+        .bind(input.policy.refresh_concurrency)
         .fetch_one(executor)
         .await
         .map_err(Into::into)
@@ -2865,6 +3129,7 @@ fn namespace_policy(namespace: &CacheNamespace) -> CacheNamespacePolicy {
         max_retained_bytes: namespace.max_retained_bytes,
         max_retained_generations: namespace.max_retained_generations,
         max_staging_generations: namespace.max_staging_generations,
+        refresh_concurrency: namespace.refresh_concurrency,
     }
 }
 
@@ -2913,8 +3178,17 @@ fn deduplicate_lookup_ids(external_ids: &[String]) -> Result<Vec<String>> {
 }
 
 fn validate_generation_input(input: &CreateCacheGenerationInput) -> Result<()> {
+    if input.created_by_execution.is_some_and(|id| id <= 0) {
+        return Err(Error::validation(
+            "cache generation producer execution ID must be positive",
+        ));
+    }
+    if !(0..=MAX_INGEST_CHUNKS_PER_GENERATION).contains(&input.expected_chunk_count) {
+        return Err(Error::validation(format!(
+            "cache generation expected_chunk_count must be between 0 and {MAX_INGEST_CHUNKS_PER_GENERATION}"
+        )));
+    }
     if input.client_refresh_id.trim().is_empty()
-        || input.expected_chunk_count < 0
         || input.expected_count.is_some_and(|value| value < 0)
         || input.expected_bytes.is_some_and(|value| value < 0)
     {
@@ -2958,9 +3232,9 @@ fn validate_chunk_input(
     request_checksum: &str,
     entries: &[CacheEntryInput],
 ) -> Result<()> {
-    if chunk_index < 0 {
+    if !(0..MAX_INGEST_CHUNKS_PER_GENERATION).contains(&chunk_index) {
         return Err(Error::validation(
-            "cache ingest chunk index and request checksum are required",
+            "cache ingest chunk_index must be between 0 and 9999",
         ));
     }
     validate_required_text(
@@ -3044,7 +3318,8 @@ fn ensure_namespace_storage_quota(
 }
 
 async fn lock_cache_admission(connection: &mut sqlx::PgConnection) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(CACHE_ADMISSION_ADVISORY_LOCK_CLASS)
         .bind(CACHE_ADMISSION_ADVISORY_LOCK_KEY)
         .execute(&mut *connection)
         .await?;
@@ -3384,6 +3659,7 @@ async fn lock_namespace(
     connection: &mut sqlx::PgConnection,
     namespace_id: Id,
 ) -> Result<Option<CacheNamespace>> {
+    CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Read).await?;
     let query = format!(
         "SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace WHERE id = $1 FOR UPDATE"
     );
@@ -3398,6 +3674,7 @@ async fn lock_generation(
     connection: &mut sqlx::PgConnection,
     generation_id: Id,
 ) -> Result<Option<CacheGeneration>> {
+    CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Read).await?;
     let query = format!(
         "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation WHERE id = $1 FOR UPDATE"
     );
@@ -3448,12 +3725,67 @@ mod tests {
     }
 
     #[test]
+    fn generation_and_chunk_metadata_admission_share_the_same_bound() {
+        let mut input = CreateCacheGenerationInput {
+            namespace: 1,
+            client_refresh_id: "bounded-refresh".to_string(),
+            expected_active_generation: None,
+            expected_chunk_count: MAX_INGEST_CHUNKS_PER_GENERATION,
+            expected_count: None,
+            expected_bytes: None,
+            checksum_algorithm: None,
+            checksum: None,
+            source_revision: None,
+            created_by: None,
+            created_by_execution: None,
+        };
+        assert!(validate_generation_input(&input).is_ok());
+        for count in [-1, MAX_INGEST_CHUNKS_PER_GENERATION + 1] {
+            input.expected_chunk_count = count;
+            let error = validate_generation_input(&input).unwrap_err();
+            assert!(error.to_string().contains("expected_chunk_count"));
+        }
+        assert!(validate_chunk_input(0, "checksum", &[]).is_ok());
+        assert!(
+            validate_chunk_input(MAX_INGEST_CHUNKS_PER_GENERATION - 1, "checksum", &[]).is_ok()
+        );
+        for index in [-1, MAX_INGEST_CHUNKS_PER_GENERATION] {
+            let error = validate_chunk_input(index, "checksum", &[]).unwrap_err();
+            assert!(error.to_string().contains("chunk_index"));
+        }
+    }
+
+    #[test]
     fn namespace_policy_requires_active_and_prior_generation_capacity() {
         let policy = CacheNamespacePolicy {
             max_retained_generations: 1,
             ..CacheNamespacePolicy::default()
         };
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn refresh_concurrency_defaults_to_parallel_and_has_canonical_names() {
+        assert_eq!(
+            CacheNamespacePolicy::default().refresh_concurrency,
+            CacheRefreshConcurrency::Parallel
+        );
+        for (mode, name) in [
+            (CacheRefreshConcurrency::Reuse, "reuse"),
+            (CacheRefreshConcurrency::Conflict, "conflict"),
+            (CacheRefreshConcurrency::Parallel, "parallel"),
+        ] {
+            let value = serde_json::Value::String(name.to_owned());
+            assert_eq!(serde_json::to_value(mode).unwrap(), value);
+            assert_eq!(
+                serde_json::from_value::<CacheRefreshConcurrency>(value).unwrap(),
+                mode
+            );
+        }
+        assert!(
+            serde_json::from_value::<CacheRefreshConcurrency>(serde_json::json!("invalid"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -663,7 +663,7 @@ async fn ordinary_artifact_upload_goes_from_manager_to_s3_without_api_body_relay
         &harness.replicas[0].url,
         &harness.worker_token,
         harness._root.path().to_str().unwrap(),
-    );
+    )?;
 
     assert_eq!(
         transport
@@ -704,7 +704,7 @@ async fn log_segment_upload_goes_from_manager_to_s3_without_api_body_relay() -> 
         &harness.replicas[0].url,
         &harness.worker_token,
         harness._root.path().to_str().unwrap(),
-    );
+    )?;
     let content = b"manager to S3 log segment";
 
     transport

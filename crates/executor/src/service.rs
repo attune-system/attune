@@ -291,7 +291,7 @@ impl ExecutorService {
                 &api_url,
                 Arc::new(WorkerTokenProvider::new(0, "executor", jwt_config)),
                 &self.inner.config.artifacts_dir,
-            ));
+            )?);
 
         // Start event processor with its own consumer
         info!("Starting event processor...");

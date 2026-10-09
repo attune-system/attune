@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { CacheRefreshConcurrency } from "./CacheRefreshConcurrency";
 import type { i64 } from "./i64";
 import type { OwnerType } from "./OwnerType";
 /**
@@ -51,6 +52,7 @@ export type CacheNamespaceResponse = {
    * Active generation record count, when populated.
    */
   record_count: number | null;
+  refresh_concurrency: CacheRefreshConcurrency;
   retired_at: string | null;
   /**
    * Active generation size in bytes, when populated.

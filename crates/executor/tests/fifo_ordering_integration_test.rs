@@ -30,7 +30,7 @@ use sqlx::PgPool;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::{
     task::JoinHandle,
     time::{sleep, timeout, timeout_at, Instant},
@@ -620,6 +620,9 @@ async fn test_multiple_workers_simulation() {
 
     let max_concurrent = 3;
     let num_executions = 30;
+    // Model three workers requesting admission, not 27 simultaneous producers
+    // holding the fixture pool behind one admission-state lock.
+    let admission_requests = Arc::new(Semaphore::new(max_concurrent as usize));
     let execution_order = Arc::new(Mutex::new(Vec::new()));
     let mut handles = vec![];
     let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
@@ -645,8 +648,13 @@ async fn test_multiple_workers_simulation() {
         let action_ref_clone = action_ref.clone();
         let order = execution_order.clone();
         let admitted_tx = admitted_tx.clone();
+        let admission_requests = admission_requests.clone();
 
         let handle = tokio::spawn(async move {
+            let _admission_request = admission_requests
+                .acquire_owned()
+                .await
+                .expect("Worker admission budget should remain open");
             let exec_id = create_test_execution(
                 &pool_clone,
                 action_id,
@@ -734,6 +742,10 @@ async fn test_multiple_workers_simulation() {
 
     // Cleanup
     cleanup_test_data(&pool, pack_id).await;
+    drop(manager);
+    pool.cleanup()
+        .await
+        .expect("Multiple-worker fixture cleanup should complete");
 }
 
 #[tokio::test]

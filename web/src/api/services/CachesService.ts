@@ -393,7 +393,11 @@ export class CachesService {
   }
   /**
    * Begin a staging generation.
-   * @returns CacheGenerationApiResponse Matching idempotent generation replay
+   * Same-ID retries retain the original upload contract. A different refresh ID
+   * follows the namespace's `refresh_concurrency` policy: reuse an unpublished
+   * generation, return a conflict, or create in parallel.
+   * Execution attribution comes from authentication, never the request body.
+   * @returns CacheGenerationApiResponse Matching idempotent replay or existing unpublished generation reused by namespace policy
    * @throws ApiError
    */
   public static createGeneration({
@@ -419,7 +423,7 @@ export class CachesService {
         401: `Authentication required`,
         403: `Generation creation is not permitted`,
         404: `Namespace not found`,
-        409: `Refresh id, active-generation precondition, namespace state, or quota conflict`,
+        409: `Refresh already in progress (code cache_refresh_in_progress with generation_id and created_by_execution in details), refresh id, active-generation precondition, namespace state, or quota conflict`,
         500: `Generation creation failed`,
       },
     });

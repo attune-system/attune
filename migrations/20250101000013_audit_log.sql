@@ -72,8 +72,10 @@ CREATE TABLE audit_event (
     -- Optional cascade chain ({rule_id, enforcement_id, execution_id, parent_request_id})
     correlation_chain   JSONB,
 
-    PRIMARY KEY (id)
-);
+    PRIMARY KEY (id, created)
+) PARTITION BY RANGE (created);
+
+CREATE TABLE audit_event_default PARTITION OF audit_event DEFAULT;
 
 COMMENT ON TABLE  audit_event IS 'Security-grade audit trail.';
 COMMENT ON COLUMN audit_event.category          IS 'Top-level category of the audit event.';

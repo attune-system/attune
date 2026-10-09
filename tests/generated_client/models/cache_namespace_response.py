@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
+from ..models.cache_refresh_concurrency import CacheRefreshConcurrency
 from ..models.owner_type import OwnerType
 
 T = TypeVar("T", bound="CacheNamespaceResponse")
@@ -37,6 +38,7 @@ class CacheNamespaceResponse:
         owner_ref (None | str): Owner reference for display, when known.
         owner_type (OwnerType):
         record_count (int | None): Active generation record count, when populated.
+        refresh_concurrency (CacheRefreshConcurrency): Admission behavior when a namespace has an unpublished refresh.
         retired_at (datetime.datetime | None):
         size_bytes (int | None): Active generation size in bytes, when populated.
         source_revision (None | str): Active generation source revision, when populated.
@@ -64,6 +66,7 @@ class CacheNamespaceResponse:
     owner_ref: None | str
     owner_type: OwnerType
     record_count: int | None
+    refresh_concurrency: CacheRefreshConcurrency
     retired_at: datetime.datetime | None
     size_bytes: int | None
     source_revision: None | str
@@ -120,6 +123,8 @@ class CacheNamespaceResponse:
         record_count: int | None
         record_count = self.record_count
 
+        refresh_concurrency = self.refresh_concurrency.value
+
         retired_at: None | str
         if isinstance(self.retired_at, datetime.datetime):
             retired_at = self.retired_at.isoformat()
@@ -161,6 +166,7 @@ class CacheNamespaceResponse:
                 "owner_ref": owner_ref,
                 "owner_type": owner_type,
                 "record_count": record_count,
+                "refresh_concurrency": refresh_concurrency,
                 "retired_at": retired_at,
                 "size_bytes": size_bytes,
                 "source_revision": source_revision,
@@ -252,6 +258,8 @@ class CacheNamespaceResponse:
 
         record_count = _parse_record_count(d.pop("record_count"))
 
+        refresh_concurrency = CacheRefreshConcurrency(d.pop("refresh_concurrency"))
+
         def _parse_retired_at(data: object) -> datetime.datetime | None:
             if data is None:
                 return data
@@ -307,6 +315,7 @@ class CacheNamespaceResponse:
             owner_ref=owner_ref,
             owner_type=owner_type,
             record_count=record_count,
+            refresh_concurrency=refresh_concurrency,
             retired_at=retired_at,
             size_bytes=size_bytes,
             source_revision=source_revision,

@@ -2,12 +2,74 @@
 
 ## Current analytics data behavior
 
-Dashboard analytics query retained raw PostgreSQL records. Successful queries
-report `meta.freshness_mode: raw_only` with `meta.aggregate_watermark: null`.
-There is no aggregate refresh delay. Hourly buckets align to UTC, and retention
-deletions change subsequent counts immediately. Cached results can precede a
-source change until the next query. Summaries do not survive beyond raw-data
-retention. See [PostgreSQL-only deployment](deployment/postgresql-only.md).
+Dashboard analytics combine clean hourly PostgreSQL summaries with retained raw
+records. Buckets align to UTC. The API chooses coverage for each request rather
+than assuming that everything before a global watermark is summarized.
+
+| `meta.freshness_mode` | Meaning |
+| --- | --- |
+| `raw_only` | This database read uses raw records for the entire source range, or the source has no hourly-summary path. |
+| `summary_only` | Clean ledger hours cover the entire source range used by this read. |
+| `summary_plus_raw` | The read combines disjoint summary ranges and raw ranges. |
+| `cache_rawfallback` | A failed source refresh returned a stale cached result. This is not a new raw database read. |
+
+Summary-capable sources report `meta.read_coverage` with `mode`, `summary_ranges`,
+`raw_ranges`, and `oldest_refresh`. Ranges are exact half-open source-time bounds.
+`oldest_refresh` is the oldest refresh among hours actually used, not global
+progress. Dirty hours, missing ledger hours, the current hour, and partially
+included hours use raw queries. Too much coverage or fragmentation also falls
+back to raw: the reader allows at most 4096 clean ledger hours and 128 ranges
+per path. Missing maintenance relations or privileges permit raw fallback;
+invalid SQL and decoding failures remain errors.
+
+`meta.aggregate_watermark` is only the end of a continuous summarized prefix
+for that request. It is `null` when a raw gap precedes the first clean range.
+Later summarized islands appear in `read_coverage` and cannot fill an earlier
+hole. Non-summary sources and stale-cache fallback have no read coverage.
+`cache_rawfallback` sets source status `stale` and clears both coverage and
+watermark. A successful response-cache hit can retain the earlier read's metadata
+until refresh, so metadata does not promise a new database snapshot on every render.
+
+### Counts and authorization
+
+Dashboard `execution_count`, `execution_timeseries`, and
+`execution_status_breakdown` use terminal history transitions, including repeated
+retry outcomes. Dedicated execution-throughput analytics use history `INSERT`
+records. Live execution-volume analytics use execution creation time and current
+status. These counts have different meanings and can differ for the same period.
+Event counts use event creation records. Worker-status summaries use worker
+history status changes even though `worker_history` remains unpartitioned.
+
+Dedicated hourly analytics select bucket starts at or after `since` and at or
+before `until`, then count those hours whole. A partial first hour is excluded.
+Hourly dashboard count sources use that same next-hour start and the exact
+exclusive request end, so a partial last hour uses raw records. For a request
+from 00:30 to 02:05 UTC, those sources read `[01:00, 02:05)`.
+`read_coverage` describes these source bounds, which can differ from the displayed
+request timestamps.
+
+Authorization intersects requested refs and packs with the source's permitted
+scope before both summary and raw queries. Unrestricted sources can include old
+refs absent from the current catalog and nullable history dimensions. Pack-only
+dashboard scopes without explicit refs resolve through the current component
+catalog. Explicit permitted refs do not require that catalog expansion. Preserve
+these rules across read modes rather than making summary storage a new authority.
+Existing metric adapters display `unknown` only where their metric already maps
+a nullable dimension to that label. Storage keeps nullable dimensions distinct.
+
+Identity-filtered count sources suppress small cohorts whose observed metrics
+are all below two. Operator-global sources do not apply that suppression.
+Suppression, terminal-status filtering, ref filtering, and truncation still apply
+after the read-mode change. A scoped rendered total can therefore differ from a
+raw global oracle. Compare equal scopes and predicates when checking counts.
+
+Raw-source changes append transactional invalidations. Retention deletes make
+affected hours dirty, so subsequent database reads use the retained raw counts
+until rebuilding finishes. Whole-leaf expiry removes summaries and coverage in
+the same transaction. Summaries do not survive beyond raw retention, but response
+caches can precede a source change until the next query. See
+[PostgreSQL-only deployment](deployment/postgresql-only.md) for storage and
+[Supervisor status](deployment/supervisor.md#native-status-and-counts) for backlog counts.
 
 ## 1. Dashboard lifecycle
 - Create dashboard metadata (`ref`, `label`, `description`, `scope`, `visibility`, `tags`, `enabled`, `is_default_home`)
@@ -86,7 +148,7 @@ retention. See [PostgreSQL-only deployment](deployment/postgresql-only.md).
 - Deterministic handling of all source states in preview and runtime (`ok`, `empty`, `partial`, `stale`, `forbidden`, `invalid`, `error`)
 - Clear clone semantics (what is copied vs reset)
 - Controlled behavior for partial/planned source types in editor
-- Preview telemetry includes `meta.truncated`, `meta.authorization_mode`, and `meta.freshness_mode`. Raw analytics have no aggregate watermark.
+- Preview telemetry includes `meta.truncated`, `meta.authorization_mode`, `meta.freshness_mode`, and request-specific `meta.read_coverage`. The aggregate watermark describes only a continuous summarized request prefix.
 
 ## Nice-to-have post-MVP
 - Revision history browser and restore actions
@@ -105,7 +167,7 @@ retention. See [PostgreSQL-only deployment](deployment/postgresql-only.md).
 - [ ] Source forms and field mapping controls are driven by API-provided source contract metadata.
 - [ ] Layout editing produces valid positions for required breakpoints with deterministic collision behavior.
 - [ ] Preview and runtime rendering handle source-level `ok/empty/partial/stale/forbidden/invalid/error` states consistently.
-- [ ] Preview displays truncation and raw-only freshness metadata, with no aggregate watermark for raw analytics.
+- [ ] Preview displays truncation, the actual freshness mode, and exact summary/raw coverage. Raw-only reads and stale-cache fallback have no aggregate watermark.
 - [ ] Setting `is_default_home` in a scope is atomic and never violates single-default-per-scope constraints.
 - [ ] `ref` remains immutable after create; rename flow is clone + delete.
 - [ ] RBAC is enforced by API and reflected in UI affordances for all dashboard actions.

@@ -1,5 +1,5 @@
 -- Migration: Entity History and Analytics
--- Description: Creates ordinary append-only history tables with JSONB field diffs
+-- Description: Creates append-only history tables with JSONB field diffs
 --              recorded by PostgreSQL triggers and UTC-aligned hourly views.
 --              Event, enforcement, and execution references remain plain BIGINT
 --              values so independent retention can leave dangling references.
@@ -49,7 +49,9 @@ CREATE TABLE execution_history (
     changed_fields   TEXT[]         NOT NULL DEFAULT '{}',
     old_values       JSONB,
     new_values       JSONB
-);
+) PARTITION BY RANGE (time);
+
+CREATE TABLE execution_history_default PARTITION OF execution_history DEFAULT;
 
 CREATE INDEX idx_execution_history_time ON execution_history (time DESC);
 
@@ -141,7 +143,7 @@ COMMENT ON TABLE sensor_process_history IS 'Append-only history of field-level c
 COMMENT ON COLUMN sensor_process_history.entity_ref IS 'Denormalized sensor ref for JOIN-free queries';
 COMMENT ON COLUMN sensor_process_history.worker_name IS 'Denormalized worker name for JOIN-free queries';
 
--- Events are immutable after insert and retain their single-column primary key.
+-- Events are immutable after insert, with a partition-compatible (id, created) key.
 COMMENT ON TABLE event IS 'Events are instances of triggers firing';
 
 COMMENT ON TABLE enforcement IS 'Enforcements represent rule triggering by events';

@@ -1465,6 +1465,11 @@ pub async fn delete_sensor(
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
+        &mut tx,
+        attune_common::repositories::cache::CacheTransactionMode::Write,
+    )
+    .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if sensor exists
     let sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)

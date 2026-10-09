@@ -1,0 +1,180 @@
+from http import HTTPStatus
+from typing import Any, cast
+from urllib.parse import quote
+
+import httpx
+
+from ... import errors
+from ...client import AuthenticatedClient, Client
+from ...models.update_artifact_request import UpdateArtifactRequest
+from ...models.update_artifact_response_200 import UpdateArtifactResponse200
+from ...types import Response
+
+
+def _get_kwargs(
+    id: int,
+    *,
+    body: UpdateArtifactRequest,
+) -> dict[str, Any]:
+    headers: dict[str, Any] = {}
+
+    _kwargs: dict[str, Any] = {
+        "method": "put",
+        "url": "/api/v1/artifacts/{id}".format(
+            id=quote(str(id), safe=""),
+        ),
+    }
+
+    _kwargs["json"] = body.to_dict()
+
+    headers["Content-Type"] = "application/json"
+
+    _kwargs["headers"] = headers
+    return _kwargs
+
+
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | UpdateArtifactResponse200 | None:
+    if response.status_code == 200:
+        response_200 = UpdateArtifactResponse200.from_dict(response.json())
+
+        return response_200
+
+    if response.status_code == 404:
+        response_404 = cast(Any, None)
+        return response_404
+
+    if client.raise_on_unexpected_status:
+        raise errors.UnexpectedStatus(response.status_code, response.content)
+    else:
+        return None
+
+
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | UpdateArtifactResponse200]:
+    return Response(
+        status_code=HTTPStatus(response.status_code),
+        content=response.content,
+        headers=response.headers,
+        parsed=_parse_response(client=client, response=response),
+    )
+
+
+def sync_detailed(
+    id: int,
+    *,
+    client: AuthenticatedClient,
+    body: UpdateArtifactRequest,
+) -> Response[Any | UpdateArtifactResponse200]:
+    """Update an existing artifact
+
+    Args:
+        id (int):
+        body (UpdateArtifactRequest): Request DTO for updating an existing artifact
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Any | UpdateArtifactResponse200]
+    """
+
+    kwargs = _get_kwargs(
+        id=id,
+        body=body,
+    )
+
+    response = client.get_httpx_client().request(
+        **kwargs,
+    )
+
+    return _build_response(client=client, response=response)
+
+
+def sync(
+    id: int,
+    *,
+    client: AuthenticatedClient,
+    body: UpdateArtifactRequest,
+) -> Any | UpdateArtifactResponse200 | None:
+    """Update an existing artifact
+
+    Args:
+        id (int):
+        body (UpdateArtifactRequest): Request DTO for updating an existing artifact
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Any | UpdateArtifactResponse200
+    """
+
+    return sync_detailed(
+        id=id,
+        client=client,
+        body=body,
+    ).parsed
+
+
+async def asyncio_detailed(
+    id: int,
+    *,
+    client: AuthenticatedClient,
+    body: UpdateArtifactRequest,
+) -> Response[Any | UpdateArtifactResponse200]:
+    """Update an existing artifact
+
+    Args:
+        id (int):
+        body (UpdateArtifactRequest): Request DTO for updating an existing artifact
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Any | UpdateArtifactResponse200]
+    """
+
+    kwargs = _get_kwargs(
+        id=id,
+        body=body,
+    )
+
+    response = await client.get_async_httpx_client().request(**kwargs)
+
+    return _build_response(client=client, response=response)
+
+
+async def asyncio(
+    id: int,
+    *,
+    client: AuthenticatedClient,
+    body: UpdateArtifactRequest,
+) -> Any | UpdateArtifactResponse200 | None:
+    """Update an existing artifact
+
+    Args:
+        id (int):
+        body (UpdateArtifactRequest): Request DTO for updating an existing artifact
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Any | UpdateArtifactResponse200
+    """
+
+    return (
+        await asyncio_detailed(
+            id=id,
+            client=client,
+            body=body,
+        )
+    ).parsed

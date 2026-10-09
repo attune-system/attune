@@ -9,19 +9,23 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import re
 import shlex
 import shutil
+import signal
 import subprocess
+import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
 import psycopg
 import pytest
 import yaml
 from psycopg import sql
-
+from psycopg.conninfo import conninfo_to_dict
+from psycopg.types.json import Jsonb
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ALL_RETENTION_TARGETS = [
@@ -55,6 +59,11 @@ def _db_url() -> str:
 
 
 def _connect():
+    settings = conninfo_to_dict(_db_url())
+    assert os.environ.get("ATTUNE_E2E_RUN_ID") and settings.get("host") == "postgres" \
+        and settings.get("dbname") == "attune", (
+            "Supervisor E2E requires the runner-owned Docker database, never a developer database"
+        )
     try:
         conn = psycopg.connect(_db_url())
     except psycopg.OperationalError as exc:
@@ -162,24 +171,49 @@ def _write_supervisor_config(
 
 
 def _snapshot_runtime_retention_config(cur) -> dict[str, object]:
-    cur.execute(
-        """
-        SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target,
-               dry_run, advisory_lock_key, cache_retention
-        FROM runtime_retention_config
-        WHERE id = TRUE
-        """
+    _assert_owned_supervisor_stack(cur)
+    tables = {
+        "runtime_retention_config": (
+            "id", "enabled", "check_interval_seconds", "batch_size",
+            "max_batches_per_target", "dry_run", "advisory_lock_key", "created",
+            "updated", "cache_retention", "native_maintenance",
+        ),
+        "runtime_retention_target_config": ("target", "max_age_seconds", "created", "updated"),
+        "native_maintenance_schedule": ("job", "next_due", "last_success"),
+        "native_partition_reconcile_state": ("id", "next_parent"),
+        "native_partition_reconcile_cursor": ("parent", "last_day"),
+    }
+    snapshot = {}
+    for table, columns in tables.items():
+        cur.execute(
+            """SELECT attname FROM pg_attribute
+               WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped""",
+            (table,),
+        )
+        actual = {row[0] for row in cur.fetchall()}
+        assert actual == set(columns), f"Refusing incomplete restoration of {table}: {actual}"
+        cur.execute(sql.SQL("SELECT {} FROM {}").format(
+            sql.SQL(", ").join(map(sql.Identifier, columns)), sql.Identifier(table)
+        ))
+        snapshot[table] = (columns, cur.fetchall())
+    return snapshot
+
+
+def _assert_owned_supervisor_stack(cur) -> None:
+    run_id = os.environ.get("ATTUNE_E2E_RUN_ID", "")
+    assert re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", run_id), (
+        "Global supervisor tests require scripts/run-integration-tests.sh's disposable project"
     )
-    config = cur.fetchone()
-    cur.execute(
-        """
-        SELECT target, max_age_seconds
-        FROM runtime_retention_target_config
-        ORDER BY target ASC
-        """
+    settings = conninfo_to_dict(_db_url())
+    assert settings.get("host") == "postgres" and settings.get("dbname") == "attune", (
+        "Refusing global retention changes outside the Docker-owned E2E database"
     )
-    targets = cur.fetchall()
-    return {"config": config, "targets": targets}
+    assert not os.environ.get("PYTEST_XDIST_WORKER"), "Supervisor scenarios must run serially"
+    cur.execute(
+        """SELECT service_name FROM supervisor_run
+           WHERE clean_shutdown = FALSE AND stopped_at IS NULL"""
+    )
+    assert not cur.fetchall(), "Stop the runner project's stack supervisor before these tests"
 
 
 def _restore_runtime_retention_config(snapshot: dict[str, object] | None):
@@ -188,28 +222,30 @@ def _restore_runtime_retention_config(snapshot: dict[str, object] | None):
     conn, _ = _connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM runtime_retention_target_config")
-            cur.execute("DELETE FROM runtime_retention_config")
-            config = snapshot["config"]
-            if config is not None:
-                cur.execute(
-                    """
-                    INSERT INTO runtime_retention_config (
-                        id, enabled, check_interval_seconds, batch_size, max_batches_per_target,
-                        dry_run, advisory_lock_key, cache_retention
-                    )
-                    VALUES (TRUE, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                    """,
-                    (*config[:-1], json.dumps(config[-1])),
-                )
-            cur.executemany(
-                """
-                INSERT INTO runtime_retention_target_config (target, max_age_seconds)
-                VALUES (%s, %s)
-                """,
-                snapshot["targets"],
-            )
+            for table in reversed(snapshot):
+                cur.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(table)))
+            for table, (columns, rows) in snapshot.items():
+                if rows:
+                    cur.executemany(sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+                        sql.Identifier(table), sql.SQL(", ").join(map(sql.Identifier, columns)),
+                        sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+                    ), [tuple(Jsonb(value) if column in {"cache_retention", "native_maintenance"}
+                              else value for column, value in zip(columns, row)) for row in rows])
         conn.commit()
+        restored = {}
+        with conn.cursor() as cur:
+            for table, (columns, rows) in snapshot.items():
+                cur.execute(sql.SQL("SELECT {} FROM {} ORDER BY {}").format(
+                    sql.SQL(", ").join(map(sql.Identifier, columns)), sql.Identifier(table),
+                    sql.Identifier(columns[0]),
+                ))
+                restored[table] = (columns, cur.fetchall())
+                # PostgreSQL enums sort by declaration order, not Python's text
+                # order. Settings restoration compares rows, not their order.
+                assert sorted(restored[table][1], key=lambda row: row[0]) == sorted(rows, key=lambda row: row[0]), (
+                    f"Runtime restoration differs for {table}"
+                )
+        _capture_json("runtime-restoration", {"verified": True, "snapshot": snapshot, "restored": restored})
     finally:
         conn.close()
 
@@ -243,6 +279,9 @@ def _configure_runtime_retention(
         """,
         (enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key),
     )
+    # Old retention scenarios intentionally test row cleanup, not native jobs.
+    cur.execute("UPDATE runtime_retention_config SET native_maintenance = '{\"enabled\":false}'::jsonb")
+    cur.execute("UPDATE native_maintenance_schedule SET next_due = clock_timestamp(), last_success = NULL")
     for target in ALL_RETENTION_TARGETS:
         cur.execute(
             """
@@ -258,10 +297,32 @@ def _configure_runtime_retention(
         )
 
 
-def _start_supervisor(config_path: Path) -> subprocess.Popen:
+class _SupervisorProcess(subprocess.Popen):
+    def __init__(self, *args, **kwargs):
+        kwargs["start_new_session"] = True
+        super().__init__(*args, **kwargs)
+        self.output = deque(maxlen=20_000)
+        self.output_changed = threading.Condition()
+        self.capture_path = None
+        self.reader = threading.Thread(target=self._drain, name=f"supervisor-log-{self.pid}")
+        self.reader.start()
+
+    def _drain(self):
+        assert self.stdout is not None
+        for line in self.stdout:
+            with self.output_changed:
+                self.output.append(line)
+                self.output_changed.notify_all()
+
+    def logs(self) -> str:
+        with self.output_changed:
+            return "".join(self.output)
+
+
+def _start_supervisor(config_path: Path) -> _SupervisorProcess:
     command = [*_supervisor_command(), "--config", str(config_path), "--log-level", "info"]
     env = {**os.environ, "RUST_LOG": "info", "ATTUNE_CONFIG": str(config_path)}
-    return subprocess.Popen(
+    return _SupervisorProcess(
         command,
         cwd=PROJECT_ROOT,
         env=env,
@@ -273,24 +334,47 @@ def _start_supervisor(config_path: Path) -> subprocess.Popen:
 
 def _stop_supervisor(process: subprocess.Popen) -> str:
     if process.poll() is None:
-        process.terminate()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            process.kill()
+            os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
 
-    output = ""
+    process.reader.join(timeout=5)
+    if process.reader.is_alive():
+        # Explicit commands may wrap the binary. Stop leftover children too.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.reader.join(timeout=5)
+    assert not process.reader.is_alive(), "Supervisor log reader did not stop"
     if process.stdout is not None:
-        output = process.stdout.read()
+        process.stdout.close()
+    output = process.logs()
+    capture_dir = os.environ.get("ATTUNE_E2E_CAPTURE_DIR")
+    if capture_dir and process.capture_path is None:
+        process.capture_path = Path(capture_dir) / f"supervisor-{process.pid}-{_uid()}.log"
+        process.capture_path.write_text(output, encoding="utf-8")
     return output
 
 
+def _capture_json(name: str, data) -> None:
+    capture_dir = os.environ.get("ATTUNE_E2E_CAPTURE_DIR")
+    if capture_dir:
+        path = Path(capture_dir) / f"{name}-{_uid()}.json"
+        path.write_text(json.dumps(data, default=str, indent=2), encoding="utf-8")
+
+
 def _wait_for_supervisor(process: subprocess.Popen, predicate, *, timeout: int = 60):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_error: Exception | None = None
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             if predicate():
                 return
@@ -312,28 +396,21 @@ def _wait_for_supervisor(process: subprocess.Popen, predicate, *, timeout: int =
 
 
 def _wait_for_log(process: subprocess.Popen, needle: str, *, timeout: int = 60) -> str:
-    assert process.stdout is not None
-    deadline = time.time() + timeout
-    output: list[str] = []
-
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        output = process.logs()
+        if needle in output:
+            return output
         if process.poll() is not None:
-            output.append(process.stdout.read())
+            output = _stop_supervisor(process)
+            if needle in output:
+                return output
             raise AssertionError(
-                f"attune-supervisor exited before logging {needle!r}:\n{''.join(output)}"
+                f"attune-supervisor exited before logging {needle!r}:\n{output}"
             )
-
-        ready, _, _ = select.select([process.stdout], [], [], 0.5)
-        if not ready:
-            continue
-
-        line = process.stdout.readline()
-        output.append(line)
-        if needle in line:
-            return "".join(output)
-
-    output.append(_stop_supervisor(process))
-    raise TimeoutError(f"Timed out waiting for {needle!r}.\nSupervisor output:\n{''.join(output)}")
+        with process.output_changed:
+            process.output_changed.wait(timeout=min(0.2, max(0, deadline - time.monotonic())))
+    raise TimeoutError(f"Timed out waiting for {needle!r}.\nSupervisor output:\n{_stop_supervisor(process)}")
 
 
 def _count(cur, table: str, predicate: str, params: tuple = ()) -> int:
@@ -566,6 +643,25 @@ def _cleanup_marker(marker: str):
             )
             cur.execute("DELETE FROM audit_event WHERE details->>'marker' = %s", (marker,))
             cur.execute("DELETE FROM pack WHERE meta->>'marker' = %s", (marker,))
+            cur.execute("""DELETE FROM supervisor_run WHERE service_name = 'attune-supervisor-e2e'
+                           AND clean_shutdown = TRUE AND stopped_at IS NOT NULL""")
+            remaining = {}
+            for table, predicate in {
+                "pack": "meta->>'marker' = %s",
+                "event": "payload->>'marker' = %s",
+                "enforcement": "config->>'marker' = %s",
+                "execution": "config->>'marker' = %s",
+                "notification": "content->>'marker' = %s",
+                "webhook_event_log": "headers->>'marker' = %s",
+                "worker": "meta->>'marker' = %s",
+                "sensor_process": "meta->>'marker' = %s",
+                "work_queue": "config->>'marker' = %s",
+                "work_queue_item": "payload->>'marker' = %s",
+                "audit_event": "details->>'marker' = %s",
+            }.items():
+                remaining[table] = _count(cur, table, predicate, (marker,))
+            assert not any(remaining.values()), f"Owned seed rows remain: {remaining}"
+            _capture_json("owned-seed-cleanup", {"marker": marker, "remaining_rows": remaining})
         conn.commit()
     finally:
         conn.close()
@@ -991,6 +1087,7 @@ class TestSupervisorRetention:
         conn, schema = _connect()
         process: subprocess.Popen | None = None
         retention_snapshot: dict[str, object] | None = None
+        seed_committed = False
         artifacts_dir = tmp_path / "artifacts"
         artifacts_dir.mkdir()
 
@@ -998,9 +1095,32 @@ class TestSupervisorRetention:
         item_correlation = "supervisor:stuck-runtime:work_queue_item:leased"
         dispatch_correlation = "supervisor:stuck-runtime:work_queue_dispatch:leased"
 
+        def capture_phase(phase: str) -> None:
+            with _connect()[0] as check_conn, check_conn.cursor() as cur:
+                rows = {
+                    "supervisor_pid": process.pid if process is not None else None,
+                    "supervisor_stopped": process.poll() is not None if process is not None else True,
+                    "reader_joined": not process.reader.is_alive() if process is not None else True,
+                }
+                for name, query, params in [
+                    ("clock", "SELECT clock_timestamp()", ()),
+                    ("executions", "SELECT id, status, created, updated FROM execution WHERE config->>'marker' = %s ORDER BY id", (marker,)),
+                    ("dispatches", "SELECT id, execution, status, created, updated FROM work_queue_dispatch WHERE queue = %s ORDER BY id", (ids["queue_id"],)),
+                    ("items", "SELECT id, status, leased_execution, lease_expires_at, created, updated FROM work_queue_item WHERE payload->>'marker' = %s ORDER BY id", (marker,)),
+                    ("admission_state", "SELECT max_concurrent, next_queue_order, total_enqueued, total_completed, created, updated FROM execution_admission_state WHERE id = %s", (admission_state_id,)),
+                    ("admission_entries", "SELECT execution_id, status, queue_order, enqueued_at, activated_at, created, updated FROM execution_admission_entry WHERE state_id = %s ORDER BY queue_order", (admission_state_id,)),
+                    ("alerts", "SELECT id, created, payload FROM event WHERE trigger_ref = 'core.alert' AND created >= %s ORDER BY created", (scenario_started,)),
+                    ("audits", "SELECT id, created, event_type, details FROM audit_event WHERE actor_login = 'attune-supervisor' AND created >= %s ORDER BY created", (scenario_started,)),
+                ]:
+                    cur.execute(query, params)
+                    rows[name] = cur.fetchall()
+                _capture_json(f"maintenance-{phase}", rows)
+
         try:
             with conn.cursor() as cur:
                 retention_snapshot = _snapshot_runtime_retention_config(cur)
+                cur.execute("SELECT clock_timestamp()")
+                scenario_started = cur.fetchone()[0]
                 ids = _seed_foundation(cur, marker)
                 cur.execute(
                     """
@@ -1009,6 +1129,24 @@ class TestSupervisorRetention:
                     WHERE NOT EXISTS (SELECT 1 FROM trigger WHERE ref = 'core.alert')
                     """,
                     (ids["pack_id"], ids["pack_ref"]),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO policy (
+                        ref, pack, pack_ref, action, action_ref, name,
+                        method, threshold, parameters
+                    )
+                    VALUES (%s, %s, %s, %s, %s, 'Remediation Admission',
+                            'enqueue', 1, ARRAY['marker']::text[])
+                    """,
+                    (
+                        f"{ids['pack_ref']}.admission",
+                        ids["pack_id"],
+                        ids["pack_ref"],
+                        ids["action_id"],
+                        ids["action_ref"],
+                    ),
                 )
 
                 artifact_file = artifacts_dir / f"{marker}-v1.txt"
@@ -1043,7 +1181,7 @@ class TestSupervisorRetention:
                     INSERT INTO execution (action, action_ref, status, config, created, updated)
                     VALUES (
                         %s, %s, 'canceling', %s::jsonb,
-                        NOW() - INTERVAL '10 seconds',
+                        NOW() - INTERVAL '20 seconds',
                         NOW() - INTERVAL '10 seconds'
                     )
                     RETURNING id
@@ -1058,35 +1196,18 @@ class TestSupervisorRetention:
 
                 cur.execute(
                     """
-                    INSERT INTO execution (action, action_ref, status, config, created, updated)
-                    VALUES (
-                        %s, %s, 'requested', %s::jsonb,
-                        NOW() - INTERVAL '1 second',
-                        NOW() - INTERVAL '1 second'
-                    )
-                    RETURNING id
-                    """,
-                    (
-                        ids["action_id"],
-                        ids["action_ref"],
-                        f'{{"marker":"{marker}","kind":"admission-queued"}}',
-                    ),
-                )
-                queued_execution_id = cur.fetchone()[0]
-
-                cur.execute(
-                    """
                     INSERT INTO execution_admission_state (
-                        action_id, group_key, max_concurrent, created, updated
+                        action_id, group_key, max_concurrent, next_queue_order,
+                        total_enqueued, created, updated
                     )
                     VALUES (
-                        %s, %s, 1,
+                        %s, %s, 1, 2, 1,
                         NOW() - INTERVAL '20 seconds',
-                        NOW() - INTERVAL '20 seconds'
+                        clock_timestamp()
                     )
                     RETURNING id
                     """,
-                    (ids["action_id"], f"{marker}-remediation"),
+                    (ids["action_id"], json.dumps({"marker": marker}, separators=(",", ":"))),
                 )
                 admission_state_id = cur.fetchone()[0]
                 cur.execute(
@@ -1100,18 +1221,11 @@ class TestSupervisorRetention:
                             %s, %s, 'active', 1,
                             NOW() - INTERVAL '20 seconds', NOW() - INTERVAL '20 seconds',
                             NOW() - INTERVAL '20 seconds', NOW() - INTERVAL '20 seconds'
-                        ),
-                        (
-                            %s, %s, 'queued', 2,
-                            NOW() - INTERVAL '20 seconds', NULL,
-                            NOW() - INTERVAL '20 seconds', NOW() - INTERVAL '20 seconds'
                         )
                     """,
                     (
                         admission_state_id,
                         stuck_execution_id,
-                        admission_state_id,
-                        queued_execution_id,
                     ),
                 )
 
@@ -1149,6 +1263,73 @@ class TestSupervisorRetention:
                     (ids["queue_id"], ids["queue_ref"], stuck_execution_id),
                 )
 
+                cur.execute(
+                    """
+                    DELETE FROM event
+                    WHERE trigger_ref = 'core.alert'
+                      AND payload->>'correlation_id' = ANY(%s)
+                    """,
+                    ([execution_correlation, item_correlation, dispatch_correlation],),
+                )
+                before_execution_alerts = _alert_count(cur, execution_correlation)
+                before_item_alerts = _alert_count(cur, item_correlation)
+                before_dispatch_alerts = _alert_count(cur, dispatch_correlation)
+
+                _configure_runtime_retention(cur, enabled_targets=set(), enabled=False)
+                conn.commit()
+                seed_committed = True
+
+            maintenance_config = {
+                "enabled": True,
+                "artifact_cleanup_enabled": True,
+                "artifact_cleanup_batch_size": 10,
+                "monitoring_enabled": True,
+                "corrective_actions_enabled": True,
+                "stuck_execution_seconds": 5,
+                "execution_remediation_seconds": 5,
+                "execution_reschedule_grace_seconds": 1,
+                "stuck_queue_seconds": 5,
+                "queue_remediation_seconds": 5,
+                "admission_remediation_seconds": 5,
+                "retention_lag_alert_seconds": 5,
+                "alert_limit_per_cycle": 10,
+                "alert_cooldown_seconds": 1,
+            }
+            deadline = time.monotonic() + 60
+            capture_phase("before-monitoring")
+            config_path = _write_supervisor_config(
+                tmp_path,
+                schema=schema,
+                enabled_targets=set(),
+                artifacts_dir=artifacts_dir,
+                maintenance={
+                    **maintenance_config,
+                    "artifact_cleanup_enabled": False,
+                    "corrective_actions_enabled": False,
+                },
+            )
+            process = _start_supervisor(config_path)
+
+            def monitoring_state_is_correct() -> bool:
+                with _connect()[0] as check_conn, check_conn.cursor() as cur:
+                    assert _alert_count(cur, execution_correlation) > before_execution_alerts
+                    assert _alert_count(cur, item_correlation) > before_item_alerts
+                    assert _alert_count(cur, dispatch_correlation) > before_dispatch_alerts
+                    assert _count(cur, "execution", "id = %s AND status = 'canceling'", (stuck_execution_id,)) == 1
+                    assert _count(cur, "work_queue_dispatch", "execution = %s AND status = 'leased'", (stuck_execution_id,)) == 1
+                    assert _count(cur, "work_queue_item", "payload->>'marker' = %s AND status = 'leased'", (marker,)) == 1
+                return True
+
+            # Monitoring must observe the leased rows before correction releases
+            # them. Both real supervisor phases share one observation deadline.
+            _wait_for_supervisor(
+                process, monitoring_state_is_correct,
+                timeout=max(0, deadline - time.monotonic()),
+            )
+            _stop_supervisor(process)
+            capture_phase("alerts-observed")
+
+            with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO workflow_definition (
@@ -1207,7 +1388,7 @@ class TestSupervisorRetention:
                     VALUES (
                         %s, %s, 'running', %s::jsonb, %s,
                         NOW() - INTERVAL '20 seconds',
-                        NOW()
+                        clock_timestamp()
                     )
                     RETURNING id
                     """,
@@ -1251,49 +1432,80 @@ class TestSupervisorRetention:
                         '{"task_name": "child"}',
                     ),
                 )
-
+                # Seed the fresh successor last. NOW() would reuse the timestamp
+                # from before workflow setup in this transaction.
                 cur.execute(
                     """
-                    DELETE FROM event
-                    WHERE trigger_ref = 'core.alert'
-                      AND payload->>'correlation_id' = ANY(%s)
+                    INSERT INTO execution (action, action_ref, status, config, created, updated)
+                    VALUES (%s, %s, 'requested', %s::jsonb,
+                            clock_timestamp(), clock_timestamp())
+                    RETURNING id
                     """,
-                    ([execution_correlation, item_correlation, dispatch_correlation],),
+                    (
+                        ids["action_id"],
+                        ids["action_ref"],
+                        f'{{"marker":"{marker}","kind":"admission-queued"}}',
+                    ),
                 )
-                before_execution_alerts = _alert_count(cur, execution_correlation)
-                before_item_alerts = _alert_count(cur, item_correlation)
-                before_dispatch_alerts = _alert_count(cur, dispatch_correlation)
-
-                _configure_runtime_retention(cur, enabled_targets=set(), enabled=False)
+                queued_execution_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO execution_admission_entry (
+                        state_id, execution_id, status, queue_order, enqueued_at,
+                        created, updated
+                    )
+                    VALUES (%s, %s, 'queued', 2, clock_timestamp(),
+                            clock_timestamp(), clock_timestamp())
+                    """,
+                    (admission_state_id, queued_execution_id),
+                )
+                cur.execute(
+                    """UPDATE execution_admission_state
+                       SET next_queue_order = 3, total_enqueued = 2 WHERE id = %s""",
+                    (admission_state_id,),
+                )
                 conn.commit()
 
+            capture_phase("before-correction")
             config_path = _write_supervisor_config(
                 tmp_path,
                 schema=schema,
                 enabled_targets=set(),
                 artifacts_dir=artifacts_dir,
-                maintenance={
-                    "enabled": True,
-                    "artifact_cleanup_enabled": True,
-                    "artifact_cleanup_batch_size": 10,
-                    "monitoring_enabled": True,
-                    "corrective_actions_enabled": True,
-                    "stuck_execution_seconds": 5,
-                    "execution_remediation_seconds": 5,
-                    "execution_reschedule_grace_seconds": 1,
-                    "stuck_queue_seconds": 5,
-                    "queue_remediation_seconds": 5,
-                    "admission_remediation_seconds": 5,
-                    "retention_lag_alert_seconds": 5,
-                    "alert_limit_per_cycle": 10,
-                    "alert_cooldown_seconds": 1,
-                },
+                maintenance=maintenance_config,
             )
             process = _start_supervisor(config_path)
 
             def maintenance_state_is_correct() -> bool:
                 with _connect()[0] as check_conn:
                     with check_conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT id, status, created, updated FROM execution
+                               WHERE id = ANY(%s) ORDER BY id""",
+                            ([stuck_execution_id, queued_execution_id,
+                              terminal_parent_execution_id, stale_parent_execution_id],),
+                        )
+                        executions = cur.fetchall()
+                        cur.execute(
+                            """SELECT action_id, group_key, max_concurrent, next_queue_order,
+                                      total_enqueued, total_completed, created, updated
+                               FROM execution_admission_state WHERE id = %s""",
+                            (admission_state_id,),
+                        )
+                        admission_state = cur.fetchall()
+                        cur.execute(
+                            """SELECT execution_id, status, queue_order, enqueued_at,
+                                      activated_at, created, updated
+                               FROM execution_admission_entry WHERE state_id = %s
+                               ORDER BY queue_order""",
+                            (admission_state_id,),
+                        )
+                        _capture_json("admission-remediation-cycle", {
+                            "executions": executions,
+                            "state": admission_state,
+                            "entries": cur.fetchall(),
+                            "supervisor_stopped": process.poll() is not None,
+                        })
                         assert _count(cur, "artifact_version", "artifact = %s", (artifact_id,)) == 0
                         assert _count(cur, "artifact", "id = %s", (artifact_id,)) == 0
                         assert not artifact_file.exists()
@@ -1406,10 +1618,21 @@ class TestSupervisorRetention:
                         )
                 return True
 
-            _wait_for_supervisor(process, maintenance_state_is_correct)
+            # The alerts are already recorded. Stop after the corrective cycle
+            # before a later cycle abandons the undispatched requested successor.
+            _wait_for_log(
+                process, "Supervisor maintenance cycle finished",
+                timeout=max(0, deadline - time.monotonic()),
+            )
+            _stop_supervisor(process)
+            capture_phase("after-correction")
+            assert maintenance_state_is_correct()
         finally:
             if process is not None:
                 _stop_supervisor(process)
+            conn.rollback()
+            if seed_committed:
+                capture_phase("before-cleanup")
             _restore_runtime_retention_config(retention_snapshot)
             conn.close()
             _cleanup_marker(marker)

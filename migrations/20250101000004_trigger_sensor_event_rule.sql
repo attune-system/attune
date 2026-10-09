@@ -211,7 +211,7 @@ COMMENT ON COLUMN sensor.artifact_retention_limit IS 'Optional per-sensor defaul
 -- ============================================================================
 
 CREATE TABLE event (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGSERIAL NOT NULL,
     trigger BIGINT REFERENCES trigger(id) ON DELETE SET NULL,
     trigger_ref TEXT NOT NULL,
     config JSONB,
@@ -220,8 +220,11 @@ CREATE TABLE event (
     source_ref TEXT,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     rule BIGINT,
-    rule_ref TEXT
-);
+    rule_ref TEXT,
+    PRIMARY KEY (id, created)
+) PARTITION BY RANGE (created);
+
+CREATE TABLE event_default PARTITION OF event DEFAULT;
 
 -- Indexes
 CREATE INDEX idx_event_trigger ON event(trigger);

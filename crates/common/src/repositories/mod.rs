@@ -50,6 +50,7 @@ pub mod integration_token;
 pub mod key;
 pub mod log_stream;
 pub mod maintenance;
+pub mod native_maintenance;
 pub mod notification;
 pub mod object_maintenance;
 pub mod pack;

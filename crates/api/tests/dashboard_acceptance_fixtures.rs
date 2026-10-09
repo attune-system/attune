@@ -76,6 +76,7 @@ pub fn assert_required_source_meta_fields(source: &Value) {
     assert!(meta["authorization_mode"].is_string());
     assert!(meta["freshness_mode"].is_string());
     assert!(meta.get("aggregate_watermark").is_some());
+    assert!(meta.get("read_coverage").is_some());
     assert!(meta["cache_hit"].is_boolean());
     assert!(meta.get("bucket_size").is_some());
     assert!(meta["truncated"].is_boolean());

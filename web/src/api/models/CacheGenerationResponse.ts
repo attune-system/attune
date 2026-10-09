@@ -15,6 +15,7 @@ export type CacheGenerationResponse = {
   client_refresh_id: string;
   created: string;
   created_by: null | i64;
+  created_by_execution: null | i64;
   expected_active_generation_id: null | i64;
   expected_chunk_count: number;
   expected_record_count: number | null;

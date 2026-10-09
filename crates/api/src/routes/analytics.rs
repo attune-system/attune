@@ -20,9 +20,10 @@ use crate::{
     authz::AuthorizationCheck,
     dto::{
         analytics::{
-            AnalyticsQueryParams, DashboardAnalyticsResponse, EnforcementVolumeResponse,
-            EventVolumeResponse, ExecutionStatusTimeSeriesResponse, ExecutionThroughputResponse,
-            FailureRateResponse, TimeSeriesPoint, WorkerStatusTimeSeriesResponse,
+            AnalyticsQueryParams, DashboardAnalyticsCoverage, DashboardAnalyticsResponse,
+            EnforcementVolumeResponse, EventVolumeResponse, ExecutionStatusTimeSeriesResponse,
+            ExecutionThroughputResponse, FailureRateResponse, TimeSeriesPoint,
+            WorkerStatusTimeSeriesResponse,
         },
         common::ApiResponse,
     },
@@ -89,13 +90,19 @@ pub async fn get_dashboard_analytics(
     )?;
 
     let response = DashboardAnalyticsResponse {
+        read_coverage: DashboardAnalyticsCoverage {
+            execution_throughput: throughput.metadata.into(),
+            execution_status: status.metadata.into(),
+            event_volume: events.metadata.into(),
+            worker_status: workers.metadata.into(),
+        },
         since: range.since,
         until: range.until,
-        execution_throughput: throughput.into_iter().map(Into::into).collect(),
-        execution_status: status.into_iter().map(Into::into).collect(),
-        event_volume: events.into_iter().map(Into::into).collect(),
+        execution_throughput: throughput.data.into_iter().map(Into::into).collect(),
+        execution_status: status.data.into_iter().map(Into::into).collect(),
+        event_volume: events.data.into_iter().map(Into::into).collect(),
         enforcement_volume: enforcements.into_iter().map(Into::into).collect(),
-        worker_status: workers.into_iter().map(Into::into).collect(),
+        worker_status: workers.data.into_iter().map(Into::into).collect(),
         failure_rate: FailureRateResponse::from_summary(failure_rate, &range),
     };
 
@@ -125,9 +132,10 @@ pub async fn get_execution_status_analytics(
     let range = query.to_time_range();
     let rows = AnalyticsRepository::execution_status_hourly(&state.db, &range).await?;
 
-    let data: Vec<TimeSeriesPoint> = rows.into_iter().map(Into::into).collect();
+    let data: Vec<TimeSeriesPoint> = rows.data.into_iter().map(Into::into).collect();
 
     let response = ExecutionStatusTimeSeriesResponse {
+        read_coverage: rows.metadata.into(),
         since: range.since,
         until: range.until,
         data,
@@ -158,9 +166,10 @@ pub async fn get_execution_throughput_analytics(
     let range = query.to_time_range();
     let rows = AnalyticsRepository::execution_throughput_hourly(&state.db, &range).await?;
 
-    let data: Vec<TimeSeriesPoint> = rows.into_iter().map(Into::into).collect();
+    let data: Vec<TimeSeriesPoint> = rows.data.into_iter().map(Into::into).collect();
 
     let response = ExecutionThroughputResponse {
+        read_coverage: rows.metadata.into(),
         since: range.since,
         until: range.until,
         data,
@@ -219,9 +228,10 @@ pub async fn get_event_volume_analytics(
     let range = query.to_time_range();
     let rows = AnalyticsRepository::event_volume_hourly(&state.db, &range).await?;
 
-    let data: Vec<TimeSeriesPoint> = rows.into_iter().map(Into::into).collect();
+    let data: Vec<TimeSeriesPoint> = rows.data.into_iter().map(Into::into).collect();
 
     let response = EventVolumeResponse {
+        read_coverage: rows.metadata.into(),
         since: range.since,
         until: range.until,
         data,
@@ -252,9 +262,10 @@ pub async fn get_worker_status_analytics(
     let range = query.to_time_range();
     let rows = AnalyticsRepository::worker_status_hourly(&state.db, &range).await?;
 
-    let data: Vec<TimeSeriesPoint> = rows.into_iter().map(Into::into).collect();
+    let data: Vec<TimeSeriesPoint> = rows.data.into_iter().map(Into::into).collect();
 
     let response = WorkerStatusTimeSeriesResponse {
+        read_coverage: rows.metadata.into(),
         since: range.since,
         until: range.until,
         data,

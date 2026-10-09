@@ -98,6 +98,8 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  ATTUNE_E2E_RUN_ID         Optional unique run identity"
       echo "  ATTUNE_E2E_PROJECT_NAME  Optional Compose project for a pre-started stack"
+      echo "  ATTUNE_DOCKER_CONFIG_PATH  Config mounted into owned stacks"
+      echo "                            Default: docker/distributable/config.docker.yaml"
       echo "  -k <EXPR>         Pytest filter expression"
       echo "  -m <MARKER>       Pytest marker filter"
       echo "  -x                Stop on first failure"
@@ -123,6 +125,20 @@ fi
 if [[ "$DO_STARTUP" == false && "$DO_BUILD" == true ]]; then
   echo "ERROR: --no-startup also requires --no-build so the attached project cannot be mutated" >&2
   exit 2
+fi
+
+# Owned E2E stacks use the tracked configuration, not an ignored developer
+# file which may be absent from a source snapshot. Never create/overwrite it.
+if [[ "$DO_STARTUP" == true ]]; then
+  ATTUNE_DOCKER_CONFIG_PATH="${ATTUNE_DOCKER_CONFIG_PATH:-$PROJECT_ROOT/docker/distributable/config.docker.yaml}"
+  if [[ "$ATTUNE_DOCKER_CONFIG_PATH" != /* ]]; then
+    ATTUNE_DOCKER_CONFIG_PATH="$PROJECT_ROOT/$ATTUNE_DOCKER_CONFIG_PATH"
+  fi
+  if [[ ! -f "$ATTUNE_DOCKER_CONFIG_PATH" || ! -r "$ATTUNE_DOCKER_CONFIG_PATH" ]]; then
+    echo "ERROR: ATTUNE_DOCKER_CONFIG_PATH must name a readable configuration file" >&2
+    exit 2
+  fi
+  export ATTUNE_DOCKER_CONFIG_PATH
 fi
 
 RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/attune-e2e-${RUN_ID}.XXXXXX")"
@@ -296,27 +312,29 @@ if [[ "$DO_STARTUP" == true ]]; then
   # Start infrastructure + application services (not e2e-tests — that's run separately)
   compose up -d "${SERVICES[@]}"
 
-  # Read this project's container health directly; no fixed host port or
-  # in-image curl/wget dependency is required.
-  log_info "Waiting for API to become healthy..."
+  # Read this project's container health directly; no fixed host port is used.
+  # Tier assertions do not exercise notifier startup, so gate it explicitly.
   max_wait="${ATTUNE_E2E_API_WAIT_SECONDS:-180}"
-  elapsed=0
-  while true; do
-    api_container="$(compose ps -q api 2>/dev/null || true)"
-    api_health=""
-    if [[ -n "$api_container" ]]; then
-      api_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$api_container" 2>/dev/null || true)"
-    fi
-    [[ "$api_health" == "healthy" ]] && break
-    if [ "$elapsed" -ge "$max_wait" ]; then
-      log_error "API did not become healthy within ${max_wait}s"
-      compose logs --tail=50 api
-      exit 1
-    fi
-    sleep 3
-    elapsed=$((elapsed + 3))
+  for service in api notifier; do
+    log_info "Waiting for ${service} to become healthy..."
+    elapsed=0
+    while true; do
+      service_container="$(compose ps -q "$service" 2>/dev/null || true)"
+      service_health=""
+      if [[ -n "$service_container" ]]; then
+        service_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$service_container" 2>/dev/null || true)"
+      fi
+      [[ "$service_health" == "healthy" ]] && break
+      if [ "$elapsed" -ge "$max_wait" ]; then
+        log_error "${service} did not become healthy within ${max_wait}s"
+        compose logs --tail=50 "$service"
+        exit 1
+      fi
+      sleep 3
+      elapsed=$((elapsed + 3))
+    done
+    log_success "${service} healthy (${elapsed}s)"
   done
-  log_success "API healthy (${elapsed}s)"
 
   # Configure the ephemeral stack's short cache lifecycle windows through the
   # public API before starting the supervisor. This keeps production defaults

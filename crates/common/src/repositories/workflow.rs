@@ -2,9 +2,12 @@
 
 use crate::models::{enums::ExecutionStatus, workflow::*, Id, JsonDict, JsonSchema};
 use crate::Result;
-use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{Acquire, Executor, PgConnection, PgPool, Postgres, QueryBuilder};
 
-use super::{Create, Delete, FindById, FindByRef, List, Repository, Update};
+use super::{
+    cache::{CacheEntryRepository, CacheTransactionMode},
+    Create, FindById, FindByRef, List, Repository, Update,
+};
 
 const WORKFLOW_DEFINITION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, retired_at, created, updated";
 
@@ -224,16 +227,25 @@ impl Update for WorkflowDefinitionRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Delete for WorkflowDefinitionRepository {
-    async fn delete<'e, E>(executor: E, id: i64) -> Result<bool>
+impl WorkflowDefinitionRepository {
+    /// Deletes a definition and its iteration metadata in a parent-first transaction.
+    /// Existing transactions use a savepoint. Call this before locking cascade
+    /// source rows, or acquire pin-mutation protection at outer transaction entry.
+    pub async fn delete<'a, A>(acquire: A, id: i64) -> Result<bool>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'a, Database = Postgres>,
     {
+        let mut transaction = acquire.begin().await?;
+        CacheEntryRepository::protect_transaction(
+            &mut transaction,
+            CacheTransactionMode::PinMutation,
+        )
+        .await?;
         let result = sqlx::query("DELETE FROM workflow_definition WHERE id = $1")
             .bind(id)
-            .execute(executor)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -620,16 +632,26 @@ impl Update for WorkflowExecutionRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Delete for WorkflowExecutionRepository {
-    async fn delete<'e, E>(executor: E, id: i64) -> Result<bool>
+impl WorkflowExecutionRepository {
+    /// Deletes a workflow and releases iteration counters atomically.
+    /// Existing transactions use a savepoint. Parent protection precedes all
+    /// delete locks; callers with earlier row locks need pin-mutation protection
+    /// at outer transaction entry.
+    pub async fn delete<'a, A>(acquire: A, id: i64) -> Result<bool>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'a, Database = Postgres>,
     {
+        let mut transaction = acquire.begin().await?;
+        CacheEntryRepository::protect_transaction(
+            &mut transaction,
+            CacheTransactionMode::PinMutation,
+        )
+        .await?;
         let result = sqlx::query("DELETE FROM workflow_execution WHERE id = $1")
             .bind(id)
-            .execute(executor)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }

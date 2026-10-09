@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ..models.dashboard_analytics_coverage import DashboardAnalyticsCoverage
     from ..models.failure_rate_response import FailureRateResponse
     from ..models.time_series_point import TimeSeriesPoint
 
@@ -29,6 +30,7 @@ class GetDashboardAnalyticsResponse200Data:
             execution_status (list[TimeSeriesPoint]): Execution status transitions per hour
             execution_throughput (list[TimeSeriesPoint]): Execution throughput per hour
             failure_rate (FailureRateResponse): Response for the execution failure rate summary.
+            read_coverage (DashboardAnalyticsCoverage):
             since (datetime.datetime): Time range start
             until (datetime.datetime): Time range end
             worker_status (list[TimeSeriesPoint]): Worker status transitions per hour
@@ -39,6 +41,7 @@ class GetDashboardAnalyticsResponse200Data:
     execution_status: list[TimeSeriesPoint]
     execution_throughput: list[TimeSeriesPoint]
     failure_rate: FailureRateResponse
+    read_coverage: DashboardAnalyticsCoverage
     since: datetime.datetime
     until: datetime.datetime
     worker_status: list[TimeSeriesPoint]
@@ -67,6 +70,8 @@ class GetDashboardAnalyticsResponse200Data:
 
         failure_rate = self.failure_rate.to_dict()
 
+        read_coverage = self.read_coverage.to_dict()
+
         since = self.since.isoformat()
 
         until = self.until.isoformat()
@@ -85,6 +90,7 @@ class GetDashboardAnalyticsResponse200Data:
                 "execution_status": execution_status,
                 "execution_throughput": execution_throughput,
                 "failure_rate": failure_rate,
+                "read_coverage": read_coverage,
                 "since": since,
                 "until": until,
                 "worker_status": worker_status,
@@ -95,6 +101,9 @@ class GetDashboardAnalyticsResponse200Data:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.dashboard_analytics_coverage import (
+            DashboardAnalyticsCoverage,
+        )
         from ..models.failure_rate_response import FailureRateResponse
         from ..models.time_series_point import TimeSeriesPoint
 
@@ -135,6 +144,8 @@ class GetDashboardAnalyticsResponse200Data:
 
         failure_rate = FailureRateResponse.from_dict(d.pop("failure_rate"))
 
+        read_coverage = DashboardAnalyticsCoverage.from_dict(d.pop("read_coverage"))
+
         since = datetime.datetime.fromisoformat(d.pop("since"))
 
         until = datetime.datetime.fromisoformat(d.pop("until"))
@@ -152,6 +163,7 @@ class GetDashboardAnalyticsResponse200Data:
             execution_status=execution_status,
             execution_throughput=execution_throughput,
             failure_rate=failure_rate,
+            read_coverage=read_coverage,
             since=since,
             until=until,
             worker_status=worker_status,

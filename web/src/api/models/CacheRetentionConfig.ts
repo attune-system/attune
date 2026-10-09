@@ -21,9 +21,17 @@ export type CacheRetentionConfig = {
    */
   alert_limit_per_cycle?: number;
   /**
-   * Maximum `cache_entry` rows deleted per bounded batch call.
+   * Server-side statement deadline for refresh partition creation, independent of cleanup.
    */
-  batch_size?: number;
+  ddl_creation_statement_timeout_milliseconds?: number;
+  /**
+   * Maximum wait for cache partition DDL locks.
+   */
+  ddl_lock_timeout_milliseconds?: number;
+  /**
+   * Server-side deadline for one atomic generation reclamation.
+   */
+  ddl_statement_timeout_milliseconds?: number;
   /**
    * Report cleanup candidates and metrics without deleting rows.
    */
@@ -44,12 +52,9 @@ export type CacheRetentionConfig = {
    */
   freshness_alerts_enabled?: boolean;
   /**
-   * Maximum entry-deletion batches performed for a single cleanup-candidate
-   * generation within one supervisor cycle. Bounds how long a single
-   * high-cardinality generation can dominate a cycle; entries are always
-   * deleted in indexed bounded batches before the generation row itself.
+   * Total generation-reclamation budget per supervisor cycle.
    */
-  max_batches_per_generation?: number;
+  max_cleanup_cycle_milliseconds?: number;
   /**
    * Maximum cleanup-candidate generations (failed, or retired past
    * `readable_until`) processed in a single supervisor cycle.
@@ -78,4 +83,12 @@ export type CacheRetentionConfig = {
    * the freshness lookback before a repeated-failure alert is emitted.
    */
   staging_failure_alert_threshold?: number;
+  /**
+   * Minimum interval between successful parent/leaf cache statistics refreshes.
+   */
+  statistics_interval_seconds?: number;
+  /**
+   * Independent statement deadline for cache parent/leaf ANALYZE.
+   */
+  statistics_statement_timeout_milliseconds?: number;
 };

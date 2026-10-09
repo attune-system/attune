@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
-import { OwnerType } from "@/api";
+import { CacheRefreshConcurrency, OwnerType } from "@/api";
 import CachesPage from "./CachesPage";
 
 const useCacheNamespaces = vi.fn();
@@ -36,6 +36,7 @@ function namespace(
     active_generation: null,
     cache_not_populated: true,
     freshness_target_seconds: 3600,
+    refresh_concurrency: CacheRefreshConcurrency.PARALLEL,
     stale: false,
     record_count: null,
     size_bytes: null,

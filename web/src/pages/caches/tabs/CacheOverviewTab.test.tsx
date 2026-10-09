@@ -1,7 +1,11 @@
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
-import { OwnerType, type CacheNamespaceResponse } from "@/api";
+import {
+  CacheRefreshConcurrency,
+  OwnerType,
+  type CacheNamespaceResponse,
+} from "@/api";
 import CacheOverviewTab from "@/pages/caches/tabs/CacheOverviewTab";
 
 vi.mock("@/contexts/AuthContext", () => ({
@@ -33,12 +37,14 @@ const managedNamespace: CacheNamespaceResponse = {
   managing_pack_ref: "salesforce",
   active_generation: 10,
   freshness_target_seconds: 0,
+  refresh_concurrency: CacheRefreshConcurrency.REUSE,
   max_records_per_generation: 1000,
   max_generation_bytes: 1024,
   max_retained_bytes: 4096,
   max_retained_generations: 2,
   max_staging_generations: 2,
   tombstoned: false,
+  retired_at: null,
   created: "2026-08-01T00:00:00Z",
   updated: "2026-08-01T00:00:00Z",
   cache_not_populated: false,
@@ -64,6 +70,7 @@ describe("CacheOverviewTab", () => {
       screen.getByText("Pack-managed policy (read-only)"),
     ).toBeInTheDocument();
     expect(screen.getByText("salesforce.users")).toBeInTheDocument();
+    expect(screen.getByText("reuse")).toBeInTheDocument();
     expect(
       screen.getByText(/Remove the cache definition.*reload the pack/),
     ).toBeInTheDocument();

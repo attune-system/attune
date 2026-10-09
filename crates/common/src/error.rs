@@ -4,7 +4,7 @@
 
 use thiserror::Error;
 
-use crate::mq::MqError;
+use crate::{models::Id, mq::MqError};
 
 /// Result type alias using Attune's Error type
 pub type Result<T> = std::result::Result<T, Error>;
@@ -75,6 +75,14 @@ pub enum Error {
     /// avoid leaking caller data.
     #[error("Cache ingest contains duplicate external identifiers")]
     CacheDuplicateExternalId,
+
+    /// An unpublished refresh blocks a different client refresh ID. These IDs
+    /// are cache metadata; they grant no access to the producer execution.
+    #[error("Cache refresh in progress: generation {generation_id}")]
+    CacheRefreshInProgress {
+        generation_id: Id,
+        created_by_execution: Option<Id>,
+    },
 
     /// A cache admission policy rejected an operation. The code is stable and
     /// is surfaced directly by the cache API for quota telemetry.

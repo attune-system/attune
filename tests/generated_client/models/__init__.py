@@ -25,6 +25,8 @@ from .allocate_file_version_by_ref_response_201 import (
 from .allocate_file_version_by_ref_response_201_data import (
     AllocateFileVersionByRefResponse201Data,
 )
+from .analytics_read_metadata import AnalyticsReadMetadata
+from .analytics_read_range import AnalyticsReadRange
 from .analyzed_pack import AnalyzedPack
 from .api_response_action_response import ApiResponseActionResponse
 from .api_response_action_response_data import ApiResponseActionResponseData
@@ -161,6 +163,10 @@ from .api_response_inquiry_response_data_response_type_0 import (
 )
 from .api_response_key_response import ApiResponseKeyResponse
 from .api_response_key_response_data import ApiResponseKeyResponseData
+from .api_response_native_maintenance_status import ApiResponseNativeMaintenanceStatus
+from .api_response_native_maintenance_status_data import (
+    ApiResponseNativeMaintenanceStatusData,
+)
 from .api_response_pack_install_response import ApiResponsePackInstallResponse
 from .api_response_pack_install_response_data import ApiResponsePackInstallResponseData
 from .api_response_pack_install_status_response import (
@@ -408,6 +414,7 @@ from .cache_owner_body import CacheOwnerBody
 from .cache_point_lookup_api_response import CachePointLookupApiResponse
 from .cache_point_lookup_request import CachePointLookupRequest
 from .cache_point_lookup_response import CachePointLookupResponse
+from .cache_refresh_concurrency import CacheRefreshConcurrency
 from .cache_retention_config import CacheRetentionConfig
 from .cache_scan_page_api_response import CacheScanPageApiResponse
 from .cache_scan_page_response import CacheScanPageResponse
@@ -623,6 +630,7 @@ from .create_workflow_response_201_data_param_schema_type_0 import (
     CreateWorkflowResponse201DataParamSchemaType0,
 )
 from .current_user_response import CurrentUserResponse
+from .dashboard_analytics_coverage import DashboardAnalyticsCoverage
 from .dashboard_authorization_mode import DashboardAuthorizationMode
 from .dashboard_data_request import DashboardDataRequest
 from .dashboard_data_request_filters import DashboardDataRequestFilters
@@ -923,7 +931,12 @@ from .log_retention_policy_patch_type_1_op import LogRetentionPolicyPatchType1Op
 from .login_request import LoginRequest
 from .login_response_200 import LoginResponse200
 from .login_response_200_data import LoginResponse200Data
+from .maintenance_job import MaintenanceJob
+from .maintenance_schedule_status import MaintenanceScheduleStatus
+from .managed_table import ManagedTable
 from .management_origin_kind import ManagementOriginKind
+from .native_maintenance_config import NativeMaintenanceConfig
+from .native_maintenance_status import NativeMaintenanceStatus
 from .node_js_environment import NodeJsEnvironment
 from .node_js_requirements import NodeJsRequirements
 from .nullable_json_patch_type_1 import NullableJsonPatchType1
@@ -1133,6 +1146,7 @@ from .paginated_response_workflow_summary_items_item import (
     PaginatedResponseWorkflowSummaryItemsItem,
 )
 from .pagination_meta import PaginationMeta
+from .partition_status import PartitionStatus
 from .permission_assignment_response import PermissionAssignmentResponse
 from .permission_binding_response import PermissionBindingResponse
 from .permission_identity_target import PermissionIdentityTarget
@@ -1258,6 +1272,8 @@ from .sign_key_jwt_response_200_data import SignKeyJwtResponse200Data
 from .source_availability import SourceAvailability
 from .source_type import SourceType
 from .success_response import SuccessResponse
+from .summary_kind import SummaryKind
+from .summary_status import SummaryStatus
 from .sync_pack_workflows_response_200 import SyncPackWorkflowsResponse200
 from .sync_pack_workflows_response_200_data import SyncPackWorkflowsResponse200Data
 from .taint_effect import TaintEffect
@@ -1517,6 +1533,8 @@ __all__ = (
     "AllocateFileVersionByRefRequestMetaType0",
     "AllocateFileVersionByRefResponse201",
     "AllocateFileVersionByRefResponse201Data",
+    "AnalyticsReadMetadata",
+    "AnalyticsReadRange",
     "AnalyzedPack",
     "ApiResponseActionResponse",
     "ApiResponseActionResponseData",
@@ -1579,6 +1597,8 @@ __all__ = (
     "ApiResponseInquiryResponseDataResponseType0",
     "ApiResponseKeyResponse",
     "ApiResponseKeyResponseData",
+    "ApiResponseNativeMaintenanceStatus",
+    "ApiResponseNativeMaintenanceStatusData",
     "ApiResponsePackInstallResponse",
     "ApiResponsePackInstallResponseData",
     "ApiResponsePackInstallStatusResponse",
@@ -1726,6 +1746,7 @@ __all__ = (
     "CachePointLookupApiResponse",
     "CachePointLookupRequest",
     "CachePointLookupResponse",
+    "CacheRefreshConcurrency",
     "CacheRetentionConfig",
     "CacheScanPageApiResponse",
     "CacheScanPageResponse",
@@ -1859,6 +1880,7 @@ __all__ = (
     "CreateWorkflowResponse201DataOutSchemaType0",
     "CreateWorkflowResponse201DataParamSchemaType0",
     "CurrentUserResponse",
+    "DashboardAnalyticsCoverage",
     "DashboardAuthorizationMode",
     "DashboardDataRequest",
     "DashboardDataRequestFilters",
@@ -2067,7 +2089,12 @@ __all__ = (
     "LoginRequest",
     "LoginResponse200",
     "LoginResponse200Data",
+    "MaintenanceJob",
+    "MaintenanceScheduleStatus",
+    "ManagedTable",
     "ManagementOriginKind",
+    "NativeMaintenanceConfig",
+    "NativeMaintenanceStatus",
     "NodeJsEnvironment",
     "NodeJsRequirements",
     "NullableJsonPatchType1",
@@ -2175,6 +2202,7 @@ __all__ = (
     "PaginatedResponseWorkflowSummary",
     "PaginatedResponseWorkflowSummaryItemsItem",
     "PaginationMeta",
+    "PartitionStatus",
     "PermissionAssignmentResponse",
     "PermissionBindingResponse",
     "PermissionIdentityTarget",
@@ -2278,6 +2306,8 @@ __all__ = (
     "SourceAvailability",
     "SourceType",
     "SuccessResponse",
+    "SummaryKind",
+    "SummaryStatus",
     "SyncPackWorkflowsResponse200",
     "SyncPackWorkflowsResponse200Data",
     "TaintEffect",

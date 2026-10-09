@@ -885,7 +885,7 @@ async fn test_trigger_cascade_delete_with_pack() {
 
     // Delete the pack
     use attune_common::repositories::pack::PackRepository;
-    PackRepository::delete(&pool, pack.id).await.unwrap();
+    PackRepository::delete(&*pool, pack.id).await.unwrap();
 
     // Verify trigger was cascade deleted
     let not_found = TriggerRepository::find_by_id(&pool, trigger.id)

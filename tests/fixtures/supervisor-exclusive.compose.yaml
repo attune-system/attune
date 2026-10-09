@@ -1,0 +1,19 @@
+# Select only TestSupervisorRetention / TestSupervisorNativeMaintenance.
+# Pytest owns, stops, and joins its real supervisor processes. The runner still
+# owns this entire disposable stack and builds the current supervisor binary
+# into the e2e-tests image. Do not use this override for other E2E selections.
+# These SQL-seeded maintenance scenarios do not publish execution requests.
+# Keep normal executor loops from changing leased dispatches before the fixture
+# supervisor can observe them. API, notifier, and worker liveness stay real.
+services:
+  supervisor:
+    command: ["/bin/sleep", "infinity"]
+  executor:
+    command: ["/bin/sleep", "infinity"]
+  executor-2:
+    command: ["/bin/sleep", "infinity"]
+  e2e-tests:
+    environment:
+      ATTUNE_E2E_CAPTURE_DIR: /captures
+    volumes:
+      - ${ATTUNE_E2E_CAPTURE_DIR:-/tmp/opencode/native-supervisor-e2e-captures}:/captures

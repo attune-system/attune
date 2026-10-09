@@ -5,6 +5,12 @@
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{FromRow, PgConnection, PgPool};
 
+use super::native_maintenance::{
+    partitions::{bounded_transaction, PartitionRepository},
+    summaries::SummaryRepository,
+    ManagedTable, SummaryKind,
+};
+
 use crate::{
     config::{
         CacheRetentionConfig, RetentionConfig, RetentionTargetConfig, RetentionTargetsConfig,
@@ -102,6 +108,7 @@ struct RuntimeRetentionConfigRow {
     dry_run: bool,
     advisory_lock_key: i64,
     cache_retention: serde_json::Value,
+    native_maintenance: serde_json::Value,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -124,12 +131,18 @@ pub struct RetentionTargetResult {
     pub cutoff: Option<DateTime<Utc>>,
     pub candidates: i64,
     pub deleted: i64,
+    /// Row candidates can be a bounded lower bound on native targets. Whole
+    /// partition contents are deliberately never counted for DDL accounting.
+    pub candidates_exact: bool,
+    /// Eligible daily leaves selected within the partition operation budget.
+    pub partition_candidates: i64,
+    pub partitions_dropped: i64,
     pub dry_run: bool,
 }
 
 /// A failed target run, including progress confirmed before the failure.
 #[derive(Debug, thiserror::Error)]
-#[error("Retention target {target:?} failed after {deleted} confirmed deleted rows: {source}")]
+#[error("Retention target {target:?} failed after {deleted} confirmed deleted rows and {partitions_dropped} confirmed partition drops: {source}")]
 pub struct RetentionTargetFailure {
     pub target: RetentionTarget,
     pub cutoff: DateTime<Utc>,
@@ -139,6 +152,9 @@ pub struct RetentionTargetFailure {
     /// statement may have committed without returning a response; its row
     /// count is unknown and is never included here.
     pub deleted: i64,
+    pub candidates_exact: bool,
+    pub partition_candidates: i64,
+    pub partitions_dropped: i64,
     pub dry_run: bool,
     #[source]
     pub source: crate::Error,
@@ -155,9 +171,9 @@ impl RetentionRepository {
         sqlx::query(
             "INSERT INTO runtime_retention_config (
                 id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
-                cache_retention
+                cache_retention, native_maintenance
              )
-             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7)
+             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(defaults.enabled)
@@ -167,6 +183,7 @@ impl RetentionRepository {
         .bind(defaults.dry_run)
         .bind(defaults.advisory_lock_key)
         .bind(serde_json::to_value(&defaults.cache_retention)?)
+        .bind(serde_json::to_value(&defaults.native_maintenance)?)
         .execute(pool)
         .await?;
 
@@ -204,13 +221,33 @@ impl RetentionRepository {
         Ok(())
     }
 
+    /// Initialize native job settings once from service configuration. Operator
+    /// changes in the runtime singleton remain authoritative after initialization.
+    pub async fn seed_native_config_if_empty(
+        pool: &PgPool,
+        native_maintenance: &crate::config::NativeMaintenanceConfig,
+    ) -> Result<()> {
+        native_maintenance
+            .validate()
+            .map_err(crate::Error::validation)?;
+        Self::ensure_config(pool).await?;
+        sqlx::query(
+            "UPDATE runtime_retention_config SET native_maintenance = $1
+             WHERE id = TRUE AND native_maintenance = '{}'::JSONB",
+        )
+        .bind(serde_json::to_value(native_maintenance)?)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// Load the database-backed runtime retention config.
     pub async fn load_config(pool: &PgPool) -> Result<RetentionConfig> {
         Self::ensure_config(pool).await?;
 
         let row = sqlx::query_as::<_, RuntimeRetentionConfigRow>(
             "SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
-                    cache_retention
+                    cache_retention, native_maintenance
              FROM runtime_retention_config
              WHERE id = TRUE",
         )
@@ -248,6 +285,7 @@ impl RetentionRepository {
             advisory_lock_key: row.advisory_lock_key,
             targets,
             cache_retention: serde_json::from_value(row.cache_retention)?,
+            native_maintenance: serde_json::from_value(row.native_maintenance)?,
         })
     }
 
@@ -258,9 +296,9 @@ impl RetentionRepository {
         sqlx::query(
             "INSERT INTO runtime_retention_config (
                 id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
-                cache_retention
+                cache_retention, native_maintenance
              )
-             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7)
+             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO UPDATE SET
                 enabled = EXCLUDED.enabled,
                 check_interval_seconds = EXCLUDED.check_interval_seconds,
@@ -268,7 +306,8 @@ impl RetentionRepository {
                 max_batches_per_target = EXCLUDED.max_batches_per_target,
                 dry_run = EXCLUDED.dry_run,
                 advisory_lock_key = EXCLUDED.advisory_lock_key,
-                cache_retention = EXCLUDED.cache_retention",
+                cache_retention = EXCLUDED.cache_retention,
+                native_maintenance = EXCLUDED.native_maintenance",
         )
         .bind(config.enabled)
         .bind(config.check_interval_seconds as i64)
@@ -277,6 +316,7 @@ impl RetentionRepository {
         .bind(config.dry_run)
         .bind(config.advisory_lock_key)
         .bind(serde_json::to_value(&config.cache_retention)?)
+        .bind(serde_json::to_value(&config.native_maintenance)?)
         .execute(&mut *tx)
         .await?;
 
@@ -400,8 +440,9 @@ impl RetentionRepository {
             .map_err(Into::into)
     }
 
-    /// Count candidates once, then delete bounded, independently committed batches.
-    /// Cancellation is checked before counting and between batches, never by
+    /// Expire whole daily leaves first, then delete bounded row batches. Native
+    /// candidate probes count only bounded boundary/DEFAULT rows, not the contents
+    /// of dropped partitions. Cancellation is checked between operations, never by
     /// dropping an in-flight delete whose commit outcome would be unknown.
     /// Failures retain confirmed progress and exclude the failing batch's
     /// unknown row count.
@@ -429,42 +470,134 @@ impl RetentionRepository {
         config: &RetentionConfig,
         mut is_cancelled: impl FnMut() -> bool,
     ) -> std::result::Result<RetentionTargetResult, RetentionTargetFailure> {
-        let failure = |source, candidates, deleted| RetentionTargetFailure {
+        let failure =
+            |source, result: &RetentionTargetResult, counted: bool| RetentionTargetFailure {
+                target,
+                cutoff,
+                candidates: counted.then_some(result.candidates),
+                deleted: result.deleted,
+                candidates_exact: counted && result.candidates_exact,
+                partition_candidates: result.partition_candidates,
+                partitions_dropped: result.partitions_dropped,
+                dry_run: config.dry_run,
+                source,
+            };
+        let mut result = RetentionTargetResult {
             target,
-            cutoff,
-            candidates,
-            deleted,
+            cutoff: Some(cutoff),
+            candidates: 0,
+            deleted: 0,
+            candidates_exact: false,
+            partition_candidates: 0,
+            partitions_dropped: 0,
             dry_run: config.dry_run,
-            source,
         };
         if config.batch_size <= 0 || config.max_batches_per_target <= 0 {
             return Err(failure(
                 crate::Error::Validation(
                     "retention batch_size and max_batches_per_target must be positive".to_string(),
                 ),
-                None,
-                0,
+                &result,
+                false,
             ));
         }
-        let mut result = RetentionTargetResult {
-            target,
-            cutoff: Some(cutoff),
-            candidates: 0,
-            deleted: 0,
-            dry_run: config.dry_run,
-        };
         if is_cancelled() {
             return Ok(result);
         }
-        result.candidates = Self::count_target_candidates(pool, target, cutoff)
+        let managed = match target {
+            RetentionTarget::Events => Some(ManagedTable::Event),
+            RetentionTarget::ExecutionHistory => Some(ManagedTable::ExecutionHistory),
+            RetentionTarget::AuditEvents => Some(ManagedTable::AuditEvent),
+            _ => None,
+        }
+        .filter(|_| config.native_maintenance.enabled);
+        if let Some(table) = managed {
+            match PartitionRepository::expire_before(
+                pool,
+                table,
+                cutoff,
+                &config.native_maintenance,
+                config.dry_run,
+                &mut is_cancelled,
+            )
             .await
-            .map_err(|source| failure(source, None, 0))?;
-        if config.dry_run || result.candidates == 0 {
+            {
+                Ok(expiry) => {
+                    result.partition_candidates = expiry.candidates;
+                    result.partitions_dropped = expiry.partitions_dropped;
+                    if expiry.cancelled {
+                        return Ok(result);
+                    }
+                }
+                Err(expiry) => {
+                    result.partition_candidates = expiry.candidates.unwrap_or(0);
+                    result.partitions_dropped = expiry.partitions_dropped;
+                    return Err(failure(expiry.source, &result, false));
+                }
+            }
+        }
+        let (table, predicate, order_column) = Self::target_sql(target);
+        if let Some(managed) = managed {
+            let cap = config
+                .batch_size
+                .saturating_mul(config.max_batches_per_target)
+                .min(i64::MAX - 1);
+            let mut tx = bounded_transaction(pool, &config.native_maintenance)
+                .await
+                .map_err(|source| failure(source, &result, false))?;
+            let col = managed.time_column();
+            let fallback = managed.default_name();
+            // Split DEFAULT from the boundary source range so PostgreSQL can
+            // prune ALL complete old leaves, including those left by the DDL cap.
+            let count_sql = format!(
+                "SELECT COUNT(*)::BIGINT FROM (
+                    SELECT 1 FROM ONLY {fallback} WHERE {col} < $1
+                    UNION ALL
+                    SELECT 1 FROM {table} WHERE {col} >= date_trunc('day', $1::timestamptz, 'UTC')
+                        AND {col} < $1 AND tableoid <> to_regclass('{fallback}')::oid
+                    LIMIT $2
+                ) bounded",
+            );
+            let count = sqlx::query_scalar::<_, i64>(&count_sql)
+                .bind(cutoff)
+                .bind(cap + 1)
+                .fetch_one(&mut *tx)
+                .await;
+            result.candidates = match count {
+                Ok(count) => count,
+                Err(source) => {
+                    tx.rollback()
+                        .await
+                        .map_err(|e| failure(e.into(), &result, false))?;
+                    return Err(failure(source.into(), &result, false));
+                }
+            };
+            result.candidates_exact = result.candidates <= cap;
+            tx.commit()
+                .await
+                .map_err(|e| failure(e.into(), &result, false))?;
+        } else {
+            result.candidates = Self::count_target_candidates(pool, target, cutoff)
+                .await
+                .map_err(|source| failure(source, &result, false))?;
+            result.candidates_exact = true;
+        }
+        if config.dry_run {
             return Ok(result);
         }
 
-        let (table, predicate, order_column) = Self::target_sql(target);
-        let delete_sql = if target == RetentionTarget::Executions {
+        let summary_kinds: &[SummaryKind] = match target {
+            RetentionTarget::Events => &[SummaryKind::EventVolume],
+            RetentionTarget::ExecutionHistory => {
+                &[SummaryKind::ExecutionStatus, SummaryKind::ExecutionCreation]
+            }
+            RetentionTarget::WorkerHistory => &[SummaryKind::WorkerStatus],
+            _ => &[],
+        };
+
+        let delete_sql = if let Some(managed) = managed {
+            Self::delete_native_boundary_sql(managed)
+        } else if target == RetentionTarget::Executions {
             Self::delete_executions_sql()
         } else {
             let identity = match target {
@@ -476,23 +609,61 @@ impl RetentionRepository {
             Self::delete_sql(table, predicate, order_column, identity)
         };
         for _ in 0..config.max_batches_per_target {
-            if is_cancelled() {
+            if result.candidates == 0 {
                 break;
             }
-            // One statement is one autocommitted batch, including execution
-            // outbox cleanup. Row locations never escape this statement.
-            let deleted = sqlx::query_scalar::<_, i64>(&delete_sql)
-                .bind(cutoff)
-                .bind(config.batch_size)
-                .fetch_one(pool)
-                .await
-                .map_err(|source| {
-                    failure(source.into(), Some(result.candidates), result.deleted)
-                })?;
+            if is_cancelled() {
+                return Ok(result);
+            }
+            // Parent DML runs the transition-table invalidation trigger in the
+            // same transaction. Locations never escape this locked statement.
+            let deleted = if managed.is_some() || !summary_kinds.is_empty() {
+                let mut tx = bounded_transaction(pool, &config.native_maintenance)
+                    .await
+                    .map_err(|source| failure(source, &result, true))?;
+                let deleted = sqlx::query_scalar::<_, i64>(&delete_sql)
+                    .bind(cutoff)
+                    .bind(config.batch_size)
+                    .fetch_one(&mut *tx)
+                    .await;
+                let deleted = match deleted {
+                    Ok(deleted) => deleted,
+                    Err(source) => {
+                        tx.rollback()
+                            .await
+                            .map_err(|e| failure(e.into(), &result, true))?;
+                        return Err(failure(source.into(), &result, true));
+                    }
+                };
+                tx.commit()
+                    .await
+                    .map_err(|e| failure(e.into(), &result, true))?;
+                deleted
+            } else {
+                sqlx::query_scalar::<_, i64>(&delete_sql)
+                    .bind(cutoff)
+                    .bind(config.batch_size)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|source| failure(source.into(), &result, true))?
+            };
             result.deleted += deleted;
             if deleted == 0 {
                 break;
             }
+        }
+        if !summary_kinds.is_empty() {
+            // Independent from candidate counts and the DDL enable flag. A prior
+            // attempt may have committed its last raw deletion before cleanup failed.
+            SummaryRepository::expire_before(
+                pool,
+                summary_kinds,
+                cutoff,
+                &config.native_maintenance,
+                &mut is_cancelled,
+            )
+            .await
+            .map_err(|source| failure(source, &result, true))?;
         }
         Ok(result)
     }
@@ -562,6 +733,19 @@ impl RetentionRepository {
     }
 
     fn delete_sql(table: &str, predicate: &str, order_column: &str, identity: &str) -> String {
+        if identity == "ctid" || table == "event" || table == "audit_event" {
+            return format!(
+                "WITH doomed AS MATERIALIZED (
+                    SELECT tableoid, ctid FROM {table} WHERE {predicate}
+                    ORDER BY {order_column} ASC, tableoid ASC, ctid ASC LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                 ), deleted AS (
+                    DELETE FROM {table} source USING doomed
+                    WHERE source.tableoid = doomed.tableoid AND source.ctid = doomed.ctid
+                    RETURNING 1
+                 ) SELECT COUNT(*)::BIGINT FROM deleted"
+            );
+        }
         format!(
             "WITH doomed AS MATERIALIZED (
                 SELECT {identity} FROM {table}
@@ -576,6 +760,32 @@ impl RetentionRepository {
                 RETURNING 1
              )
              SELECT COUNT(*)::BIGINT FROM deleted"
+        )
+    }
+
+    fn delete_native_boundary_sql(managed: ManagedTable) -> String {
+        let table = managed.table_name();
+        let fallback = managed.default_name();
+        let col = managed.time_column();
+        format!(
+            "WITH default_rows AS MATERIALIZED (
+                SELECT tableoid, ctid, {col} AS sort_time FROM ONLY {fallback}
+                WHERE {col} < $1 ORDER BY {col}, ctid LIMIT $2 FOR UPDATE SKIP LOCKED
+             ), boundary_rows AS MATERIALIZED (
+                SELECT tableoid, ctid, {col} AS sort_time FROM {table}
+                WHERE {col} >= date_trunc('day', $1::timestamptz, 'UTC') AND {col} < $1
+                    AND tableoid <> to_regclass('{fallback}')::oid
+                ORDER BY {col}, tableoid, ctid LIMIT $2 FOR UPDATE SKIP LOCKED
+             ), doomed AS MATERIALIZED (
+                SELECT tableoid, ctid FROM (
+                    SELECT tableoid, ctid, sort_time FROM default_rows
+                    UNION ALL SELECT tableoid, ctid, sort_time FROM boundary_rows
+                ) candidates ORDER BY sort_time, tableoid, ctid LIMIT $2
+             ), deleted AS (
+                DELETE FROM {table} source USING doomed
+                WHERE source.tableoid = doomed.tableoid AND source.ctid = doomed.ctid
+                RETURNING 1
+             ) SELECT COUNT(*)::BIGINT FROM deleted"
         )
     }
 

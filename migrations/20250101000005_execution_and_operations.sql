@@ -103,8 +103,8 @@ COMMENT ON COLUMN execution.action IS 'Action being executed (may be null if act
 COMMENT ON COLUMN execution.action_ref IS 'Action reference (preserved even if action deleted)';
 COMMENT ON COLUMN execution.config IS 'Snapshot of action configuration at execution time';
 COMMENT ON COLUMN execution.env_vars IS 'Environment variables for this execution as key-value pairs (string -> string). These are set in the execution environment and are separate from action parameters. Used for execution context, configuration, and non-sensitive metadata.';
-COMMENT ON COLUMN execution.parent IS 'Parent execution ID for workflow hierarchies';
-COMMENT ON COLUMN execution.enforcement IS 'Enforcement that triggered this execution';
+COMMENT ON COLUMN execution.parent IS 'Parent execution ID for workflow hierarchies; may dangle after independent retention';
+COMMENT ON COLUMN execution.enforcement IS 'Enforcement that triggered this execution; may dangle after independent retention';
 COMMENT ON COLUMN execution.executor IS 'Identity that initiated the execution';
 COMMENT ON COLUMN execution.permission_set_refs IS 'Permission set refs embedded in the execution-scoped API token. Empty means the worker omits ATTUNE_API_TOKEN.';
 COMMENT ON COLUMN execution.artifact_retention_policy IS 'Optional per-execution override for non-log artifacts created by this execution. NULL inherits the action/sensor default or API default.';
@@ -199,16 +199,8 @@ ALTER TABLE execution
     FOREIGN KEY (action) REFERENCES action(id) ON DELETE SET NULL;
 
 ALTER TABLE execution
-    ADD CONSTRAINT execution_parent_fkey
-    FOREIGN KEY (parent) REFERENCES execution(id) ON DELETE SET NULL;
-
-ALTER TABLE execution
     ADD CONSTRAINT execution_original_execution_fkey
     FOREIGN KEY (original_execution) REFERENCES execution(id) ON DELETE SET NULL;
-
-ALTER TABLE execution
-    ADD CONSTRAINT execution_enforcement_fkey
-    FOREIGN KEY (enforcement) REFERENCES enforcement(id) ON DELETE SET NULL;
 
 ALTER TABLE execution
     ADD CONSTRAINT execution_executor_fkey

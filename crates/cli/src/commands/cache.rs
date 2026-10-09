@@ -70,6 +70,9 @@ pub enum CacheNamespaceCommands {
         cursor: Option<String>,
     },
     /// Create a namespace. Owner and namespace cannot later be changed.
+    #[command(
+        after_help = "Examples:\n  attune cache namespace create users --owner-type system --refresh-concurrency parallel\n  attune cache namespace create users --owner-type pack --owner-pack-ref salesforce --refresh-concurrency reuse"
+    )]
     Create {
         /// Namespace name
         namespace: String,
@@ -86,6 +89,9 @@ pub enum CacheNamespaceCommands {
         owner: OwnerSelectorArgs,
     },
     /// Update mutable namespace policy fields
+    #[command(
+        after_help = "Examples:\n  attune cache namespace update users --owner-type system --refresh-concurrency conflict"
+    )]
     Update {
         /// Namespace name
         namespace: String,
@@ -189,6 +195,9 @@ pub enum CacheGenerationCommands {
 #[derive(Subcommand)]
 pub enum CacheRefreshCommands {
     /// Begin an idempotent staging generation
+    #[command(
+        after_help = "Examples:\n  attune cache refresh begin users --owner-type system --client-refresh-id sync-42 --expected-chunk-count 1 --expect-empty\n\nWith reuse policy, this can return another producer's generation unchanged. Inspect client_refresh_id and created_by_execution before writing to it."
+    )]
     Begin {
         /// Namespace name
         namespace: String,
@@ -285,6 +294,9 @@ pub enum CacheRefreshCommands {
         yes: bool,
     },
     /// Stream an NDJSON input through begin, upload, seal, and promote
+    #[command(
+        after_help = "Examples:\n  attune cache refresh apply users --owner-type system --input users.ndjson --client-refresh-id sync-42 --expect-empty\n\nStops without modifying the generation if reuse returns another client_refresh_id. Inspect that generation and retry after its producer finishes."
+    )]
     Apply {
         /// Namespace name
         namespace: String,
@@ -392,6 +404,9 @@ impl CacheOwnerType {
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct NamespacePolicyArgs {
+    /// When another refresh is staging or ready: reuse it, reject, or allow parallel refreshes
+    #[arg(long, value_enum)]
+    refresh_concurrency: Option<CacheRefreshConcurrency>,
     /// Desired freshness interval in seconds
     #[arg(long)]
     freshness_target_seconds: Option<i64>,
@@ -410,6 +425,24 @@ pub struct NamespacePolicyArgs {
     /// Maximum concurrent staging generations
     #[arg(long)]
     max_staging_generations: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CacheRefreshConcurrency {
+    Reuse,
+    Conflict,
+    Parallel,
+}
+
+impl CacheRefreshConcurrency {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reuse => "reuse",
+            Self::Conflict => "conflict",
+            Self::Parallel => "parallel",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,6 +543,8 @@ struct CreateNamespaceRequest {
 #[derive(Debug, Serialize, Default)]
 struct NamespacePolicyRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_concurrency: Option<CacheRefreshConcurrency>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     freshness_target_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_records_per_generation: Option<i64>,
@@ -526,6 +561,7 @@ struct NamespacePolicyRequest {
 impl NamespacePolicyArgs {
     fn request(&self) -> NamespacePolicyRequest {
         NamespacePolicyRequest {
+            refresh_concurrency: self.refresh_concurrency,
             freshness_target_seconds: self.freshness_target_seconds,
             max_records_per_generation: self.max_records_per_generation,
             max_generation_bytes: self.max_generation_bytes,
@@ -536,7 +572,8 @@ impl NamespacePolicyArgs {
     }
 
     fn has_values(&self) -> bool {
-        self.freshness_target_seconds.is_some()
+        self.refresh_concurrency.is_some()
+            || self.freshness_target_seconds.is_some()
             || self.max_records_per_generation.is_some()
             || self.max_generation_bytes.is_some()
             || self.max_retained_bytes.is_some()
@@ -548,6 +585,7 @@ impl NamespacePolicyArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheNamespaceResponse {
     id: i64,
+    refresh_concurrency: CacheRefreshConcurrency,
     owner_type: String,
     #[serde(default)]
     owner: Option<String>,
@@ -611,6 +649,7 @@ struct CacheGenerationResponse {
     checksum: Option<String>,
     source_revision: Option<String>,
     created_by: Option<i64>,
+    created_by_execution: Option<i64>,
     created: String,
     sealed: Option<String>,
     activated: Option<String>,
@@ -1061,7 +1100,7 @@ async fn handle_refresh(
             print_generation(
                 &generation,
                 output_format,
-                Some("staging generation created"),
+                Some("refresh generation returned"),
             )
         }
         CacheRefreshCommands::Upload {
@@ -1185,12 +1224,13 @@ async fn handle_refresh(
                 plan
             };
 
+            let requested_refresh_id = client_refresh_id.unwrap_or_else(new_refresh_id);
             let generation = begin_refresh(
                 &mut client,
                 &namespace,
                 &owner,
                 BeginRefreshRequest {
-                    client_refresh_id: client_refresh_id.unwrap_or_else(new_refresh_id),
+                    client_refresh_id: requested_refresh_id.clone(),
                     expected_active_generation_id: expected_active,
                     expected_chunk_count: plan.expected_chunk_count,
                     expected_count: plan.expected_count,
@@ -1199,6 +1239,18 @@ async fn handle_refresh(
                 },
             )
             .await?;
+
+            if generation.client_refresh_id != requested_refresh_id {
+                anyhow::bail!(
+                    "Cache refresh reused generation {} from client refresh ID '{}' (created by execution {}). No upload, seal, promote, or abandon was sent. Wait for its producer or check it with 'attune cache generation show {} {} {}'. Retry apply after that refresh finishes.",
+                    generation.id,
+                    generation.client_refresh_id,
+                    optional_display(generation.created_by_execution),
+                    namespace,
+                    generation.id,
+                    owner_inspection_flags(&owner),
+                );
+            }
 
             let uploaded = upload_all_chunks(
                 &mut client,
@@ -1245,6 +1297,20 @@ fn configured_client(profile: &Option<String>, api_url: &Option<String>) -> Resu
 
 fn namespace_base_path(namespace: &str) -> String {
     format!("/cache/namespaces/{}", urlencoding::encode(namespace))
+}
+
+fn owner_inspection_flags(owner: &OwnerSelectorArgs) -> String {
+    let reference = match owner.owner_type {
+        CacheOwnerType::System | CacheOwnerType::Identity => None,
+        CacheOwnerType::Pack => owner.owner_pack_ref.as_ref().map(|r| ("pack", r)),
+        CacheOwnerType::Action => owner.owner_action_ref.as_ref().map(|r| ("action", r)),
+        CacheOwnerType::Sensor => owner.owner_sensor_ref.as_ref().map(|r| ("sensor", r)),
+    };
+    let mut flags = format!("--owner-type {}", owner.owner_type.as_str());
+    if let Some((kind, reference)) = reference {
+        flags.push_str(&format!(" --owner-{kind}-ref '{reference}'"));
+    }
+    flags
 }
 
 fn namespace_query_path(namespace: &str, owner: &OwnerSelectorArgs) -> Result<String> {
@@ -1814,6 +1880,10 @@ fn print_namespace(
                 ("ID", namespace.id.to_string()),
                 ("Owner", namespace_owner_display(namespace)),
                 (
+                    "Refresh Concurrency",
+                    namespace.refresh_concurrency.as_str().into(),
+                ),
+                (
                     "Active Generation",
                     optional_display(namespace.active_generation),
                 ),
@@ -1903,6 +1973,7 @@ fn print_generations(
                     "Records",
                     "Bytes",
                     "Source Revision",
+                    "Creator Execution",
                     "Created",
                 ],
             );
@@ -1915,6 +1986,7 @@ fn print_generations(
                     generation
                         .source_revision
                         .unwrap_or_else(|| "-".to_string()),
+                    optional_display(generation.created_by_execution),
                     output::format_timestamp(&generation.created),
                 ]);
             }
@@ -1943,6 +2015,10 @@ fn print_generation(
                 ("Namespace", generation.namespace.to_string()),
                 ("State", generation.state.clone()),
                 ("Client Refresh ID", generation.client_refresh_id.clone()),
+                (
+                    "Creator Execution",
+                    optional_display(generation.created_by_execution),
+                ),
                 (
                     "Expected Chunks",
                     generation.expected_chunk_count.to_string(),
@@ -2195,6 +2271,53 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         command: CacheCommands,
+    }
+
+    #[test]
+    fn refresh_concurrency_policy_is_typed_flat_and_explicit_only() {
+        let default = NamespacePolicyArgs::default();
+        assert!(!default.has_values());
+        assert_eq!(serde_json::to_value(default.request()).unwrap(), json!({}));
+        for value in ["reuse", "conflict", "parallel"] {
+            for operation in ["create", "update"] {
+                let parsed = TestCli::try_parse_from([
+                    "attune",
+                    "namespace",
+                    operation,
+                    "users",
+                    "--owner-type",
+                    "system",
+                    "--refresh-concurrency",
+                    value,
+                ])
+                .unwrap();
+                let policy = match parsed.command {
+                    CacheCommands::Namespace {
+                        command: CacheNamespaceCommands::Create { policy, .. },
+                    }
+                    | CacheCommands::Namespace {
+                        command: CacheNamespaceCommands::Update { policy, .. },
+                    } => policy,
+                    _ => panic!("unexpected cache command"),
+                };
+                assert!(policy.has_values());
+                assert_eq!(
+                    serde_json::to_value(policy.request()).unwrap(),
+                    json!({"refresh_concurrency": value})
+                );
+            }
+        }
+        assert!(TestCli::try_parse_from([
+            "attune",
+            "namespace",
+            "create",
+            "users",
+            "--owner-type",
+            "system",
+            "--refresh-concurrency",
+            "wait",
+        ])
+        .is_err());
     }
 
     #[test]

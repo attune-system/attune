@@ -351,6 +351,7 @@ fn fixtures_enforce_source_meta_and_order_contract_shape() {
                         "authorization_mode": "operator_global",
                         "freshness_mode": "raw_only",
                         "aggregate_watermark": null,
+                        "read_coverage": null,
                         "cache_hit": false,
                         "bucket_size": null,
                         "truncated": false,
@@ -365,6 +366,7 @@ fn fixtures_enforce_source_meta_and_order_contract_shape() {
                         "authorization_mode": "identity_filtered",
                         "freshness_mode": "raw_only",
                         "aggregate_watermark": null,
+                        "read_coverage": null,
                         "cache_hit": true,
                         "bucket_size": "1h",
                         "truncated": false,
@@ -497,6 +499,13 @@ async fn analytics_endpoints_read_recent_raw_records_and_empty_ranges() -> Resul
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = response.json().await?;
         let rows = body["data"]["data"].as_array().expect("series");
+        if endpoint != "enforcements/volume" {
+            assert_eq!(
+                body["data"]["read_coverage"]["mode"], "raw_only",
+                "{endpoint}"
+            );
+            assert_eq!(body["data"]["read_coverage"]["summary_ranges"], json!([]));
+        }
         assert_eq!(
             rows.iter()
                 .map(|row| row["value"].as_i64().unwrap())
@@ -624,6 +633,172 @@ async fn dashboard_raw_metadata_and_partial_hour_terminal_counts() -> Result<()>
             {"bucket_start": "2026-06-01T02:00:00Z", "series": "all", "count": 1}
         ])
     );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_dashboard_clean_dirty_and_raw_modes_keep_authorized_terminal_attempts() -> Result<()>
+{
+    let ctx = TestContext::new().await?;
+    let operator = register_user_with_grants(
+        &ctx,
+        "native_analytics",
+        json!([
+            {"resource":"executions", "actions":["read"]}
+        ]),
+    )
+    .await?;
+    let token = register_user_with_grants(&ctx, "native_dashboard", json!([
+        {"resource":"dashboards", "actions":["read"]},
+        {"resource":"executions", "actions":["read"], "constraints":{"pack_refs":["core"], "refs":["core.allowed_action"]}}
+    ])).await?;
+    let base = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+    // Identity-filtered sources suppress cohorts smaller than two. Keep each
+    // terminal-status bucket visible so all three read modes exercise it.
+    for (minute, status) in [
+        (5, "failed"),
+        (6, "failed"),
+        (7, "cancelled"),
+        (8, "abandoned"),
+        (9, "cancelled"),
+        (10, "abandoned"),
+        (65, "completed"),
+        (66, "running"),
+        (67, "completed"),
+    ] {
+        seed_execution_status(
+            &ctx,
+            1,
+            "core.allowed_action",
+            status,
+            base + Duration::minutes(minute),
+        )
+        .await?;
+    }
+    seed_execution_status(
+        &ctx,
+        2,
+        "core.blocked_action",
+        "failed",
+        base + Duration::minutes(20),
+    )
+    .await?;
+    let request = json!({"include_meta":true, "time_range":{"start":base.to_rfc3339(), "end":(base + Duration::hours(2)).to_rfc3339()}});
+    for (phase, mode, expected) in [
+        (0, "raw_only", 8),
+        (1, "summary_only", 8),
+        (2, "summary_plus_raw", 9),
+    ] {
+        if phase == 1 {
+            // Test-owned oracle materialization, including empty hours.
+            let mut tx = ctx.pool.begin().await?;
+            sqlx::query("INSERT INTO execution_status_hourly_summary (bucket, action_ref, new_status, transition_count) SELECT date_trunc('hour', time, 'UTC'), entity_ref, new_values->>'status', COUNT(*)::bigint FROM execution_history WHERE time >= $1 AND time < $2 AND 'status' = ANY(changed_fields) GROUP BY 1, 2, 3")
+                .bind(base).bind(base + Duration::hours(3)).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO native_summary_hour (kind, bucket, refreshed_at) SELECT 'execution_status', bucket, NOW() FROM generate_series($1::timestamptz, $2::timestamptz, INTERVAL '1 hour') AS bucket")
+                .bind(base).bind(base + Duration::hours(2)).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM native_summary_invalidation WHERE kind = 'execution_status'")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        if phase == 2 {
+            seed_execution_status(
+                &ctx,
+                1,
+                "core.allowed_action",
+                "failed",
+                base + Duration::minutes(45),
+            )
+            .await?;
+        }
+        let dedicated_path = format!(
+            "/api/v1/analytics/executions/status?since={}&until={}",
+            base.to_rfc3339().replace('+', "%2B"),
+            (base + Duration::minutes(119))
+                .to_rfc3339()
+                .replace('+', "%2B")
+        );
+        let dedicated_response = ctx.get(&dedicated_path, Some(&operator)).await?;
+        assert_eq!(dedicated_response.status(), StatusCode::OK);
+        let dedicated: Value = dedicated_response.json().await?;
+        assert_eq!(dedicated["data"]["read_coverage"]["mode"], mode);
+        assert_eq!(
+            dedicated["data"]["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["value"].as_i64().unwrap())
+                .sum::<i64>(),
+            expected + 2,
+            "dedicated status includes running and the globally authorized blocked action"
+        );
+        // Each phase has a distinct cache key. Fresh response caching must not
+        // obscure which database read plan this test exercises.
+        let dashboard_ref = format!("core.native_{phase}_{}", uuid::Uuid::new_v4().simple());
+        create_dashboard(
+            &ctx,
+            &dashboard_ref,
+            "Native analytics",
+            dashboard_acceptance_fixtures::dashboard_spec(
+                &[
+                    ("count", "execution_count"),
+                    ("status", "execution_status_breakdown"),
+                ],
+                &[("count_card", "count"), ("status_card", "status")],
+                None,
+            ),
+        )
+        .await?;
+        let path = format!("/api/v1/dashboards/{dashboard_ref}/data");
+        assert_eq!(
+            ctx.post(&path, request.clone(), None).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = ctx.post(&path, request.clone(), Some(&token)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await?;
+        for source in body["sources"].as_array().unwrap() {
+            assert_eq!(source["meta"]["freshness_mode"], mode);
+            assert_eq!(source["meta"]["read_coverage"]["mode"], mode);
+            assert_eq!(source["meta"]["authorization_mode"], "identity_filtered");
+            assert_eq!(
+                source["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["count"].as_i64().unwrap())
+                    .sum::<i64>(),
+                expected,
+                "phase {phase}, source {}: {}",
+                source["source_id"],
+                source["data"]
+            );
+        }
+        let count = dashboard_acceptance_fixtures::source_by_id(&body, "count");
+        assert!(count["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["series"] == "core.allowed_action"));
+        assert_eq!(
+            dashboard_acceptance_fixtures::source_by_id(&body, "status")["data"],
+            json!([
+                {"bucket_start": "2026-06-01T00:00:00Z", "status": "abandoned", "count": 2},
+                {"bucket_start": "2026-06-01T00:00:00Z", "status": "cancelled", "count": 2},
+                {"bucket_start": "2026-06-01T00:00:00Z", "status": "failed", "count": if phase == 2 { 3 } else { 2 }},
+                {"bucket_start": "2026-06-01T01:00:00Z", "status": "completed", "count": 2}
+            ]),
+            "phase {phase} must preserve authorized terminal attempts"
+        );
+        if phase == 2 {
+            assert_eq!(
+                count["meta"]["aggregate_watermark"],
+                Value::Null,
+                "dirty prefix cannot get a watermark from a later clean hour"
+            );
+        }
+    }
     ctx.cleanup().await?;
     Ok(())
 }

@@ -1232,6 +1232,7 @@ fn default_source_meta() -> DashboardSourceMeta {
         authorization_mode: DashboardAuthorizationMode::OperatorGlobal,
         freshness_mode: DashboardFreshnessMode::RawOnly,
         aggregate_watermark: None,
+        read_coverage: None,
         cache_hit: false,
         bucket_size: None,
         truncated: false,
@@ -1243,6 +1244,35 @@ fn default_source_meta() -> DashboardSourceMeta {
 
 fn serialized_row<T: serde::Serialize>(row: T) -> JsonValue {
     serde_json::to_value(row).unwrap_or(JsonValue::Null)
+}
+
+fn apply_read_coverage(
+    meta: &mut DashboardSourceMeta,
+    coverage: attune_common::repositories::native_maintenance::read::ReadMetadata,
+) {
+    meta.freshness_mode = coverage.mode.into();
+    // Only a continuous covered prefix gets a watermark. Later covered islands
+    // remain explicit ranges and cannot conceal earlier uncovered/dirty hours.
+    meta.aggregate_watermark = coverage.summary_ranges.first().and_then(|first| {
+        if coverage
+            .raw_ranges
+            .first()
+            .is_some_and(|raw| raw.start < first.start)
+        {
+            None
+        } else {
+            Some(first.end)
+        }
+    });
+    meta.read_coverage = Some(coverage.into());
+}
+
+fn mark_cached_fallback(stale: &mut DashboardSourceResult, include_meta: bool) {
+    stale.status = DashboardSourceStatus::Stale;
+    stale.meta.cache_hit = include_meta;
+    stale.meta.freshness_mode = DashboardFreshnessMode::CacheRawFallback;
+    stale.meta.read_coverage = None;
+    stale.meta.aggregate_watermark = None;
 }
 
 fn json_object<const N: usize>(entries: [(&str, &str); N]) -> JsonValue {
@@ -1381,10 +1411,14 @@ async fn execute_source_data(
                         executed
                     }
                     Ok(Err(error)) => {
-                        if let Some(mut stale) = source_cache().get_stale(&cache_key).await {
-                            stale.status = DashboardSourceStatus::Stale;
-                            stale.meta.cache_hit = include_meta;
-                            stale.meta.freshness_mode = DashboardFreshnessMode::RawOnlyFallback;
+                        let retryable = stale_cache_error_retryable(&error);
+                        let stale = if retryable {
+                            source_cache().get_stale(&cache_key).await
+                        } else {
+                            None
+                        };
+                        if let Some(mut stale) = stale {
+                            mark_cached_fallback(&mut stale, include_meta);
                             stale.error = Some(DashboardSourceError {
                                 code: "fallback_cache".to_string(),
                                 message: format!("Source failed; returning stale cache: {}", error),
@@ -1402,7 +1436,7 @@ async fn execute_source_data(
                                 error: Some(DashboardSourceError {
                                     code: "source_error".to_string(),
                                     message: error.to_string(),
-                                    retryable: true,
+                                    retryable,
                                     details: None,
                                 }),
                             }
@@ -1410,9 +1444,7 @@ async fn execute_source_data(
                     }
                     Err(_) => {
                         if let Some(mut stale) = source_cache().get_stale(&cache_key).await {
-                            stale.status = DashboardSourceStatus::Stale;
-                            stale.meta.cache_hit = include_meta;
-                            stale.meta.freshness_mode = DashboardFreshnessMode::RawOnlyFallback;
+                            mark_cached_fallback(&mut stale, include_meta);
                             stale.error = Some(DashboardSourceError {
                                 code: "timeout_fallback".to_string(),
                                 message: "Source timed out; returning stale cache".to_string(),
@@ -1473,6 +1505,16 @@ async fn execute_source_data(
 fn should_coalesce_failure(result: &DashboardSourceResult) -> bool {
     matches!(result.status, DashboardSourceStatus::Error)
         && result.error.as_ref().is_some_and(|error| error.retryable)
+}
+
+fn stale_cache_error_retryable(error: &ApiError) -> bool {
+    // A generic database/internal error can be a broken query or a decoding
+    // bug. Preserve that error instead of hiding it behind stale data. Actual
+    // elapsed deadlines use the separate timeout_fallback branch above.
+    matches!(
+        error,
+        ApiError::RetryableDatabaseError | ApiError::BadGateway(_)
+    )
 }
 
 fn resolve_inflight_wait_budget(request_deadline: tokio::time::Instant) -> Option<StdDuration> {
@@ -3190,11 +3232,12 @@ async fn execute_source_handler(
                 action_refs.as_ref(),
             )
             .await?;
-            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            apply_read_coverage(&mut meta, rows.metadata);
             meta.unit_hints = json_object([("count", "count")]);
             meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
             JsonValue::Array(
-                rows.into_iter()
+                rows.data
+                    .into_iter()
                     .map(|row| BucketCountSourceRow {
                         bucket_start: row.bucket_start,
                         series: row.series,
@@ -3213,11 +3256,12 @@ async fn execute_source_handler(
                 action_refs.as_ref(),
             )
             .await?;
-            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            apply_read_coverage(&mut meta, rows.metadata);
             meta.unit_hints = json_object([("count", "count")]);
             meta.ordering = vec!["bucket_start".to_string(), "status".to_string()];
             JsonValue::Array(
-                rows.into_iter()
+                rows.data
+                    .into_iter()
                     .map(|row| ExecutionStatusSourceRow {
                         bucket_start: row.bucket_start,
                         status: row.series,
@@ -3259,10 +3303,11 @@ async fn execute_source_handler(
                 trigger_refs.as_ref(),
             )
             .await?;
-            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            apply_read_coverage(&mut meta, rows.metadata);
             meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
             JsonValue::Array(
-                rows.into_iter()
+                rows.data
+                    .into_iter()
                     .map(|row| {
                         serde_json::json!({
                             "bucket_start": row.bucket_start,
@@ -5851,6 +5896,74 @@ mod tests {
             TERMINAL_EXECUTION_STATUSES,
             ["completed", "failed", "timeout", "cancelled", "abandoned"]
         );
+    }
+
+    #[tokio::test]
+    async fn stale_cache_does_not_claim_current_database_summary_coverage() {
+        use attune_common::repositories::native_maintenance::read::{
+            ReadMetadata, ReadMode, ReadRange,
+        };
+        let now = Utc::now();
+        let mut meta = default_source_meta();
+        apply_read_coverage(
+            &mut meta,
+            ReadMetadata {
+                mode: ReadMode::SummaryOnly,
+                summary_ranges: vec![ReadRange {
+                    start: now - Duration::hours(2),
+                    end: now - Duration::hours(1),
+                }],
+                raw_ranges: vec![],
+                oldest_refresh: Some(now),
+            },
+        );
+        assert!(meta.aggregate_watermark.is_some());
+        let cache = DashboardSourceCache::new();
+        cache
+            .insert_with_ttls(
+                "native-stale".to_string(),
+                DashboardSourceResult {
+                    source_id: "count".to_string(),
+                    source_type: "execution_count".to_string(),
+                    status: DashboardSourceStatus::Ok,
+                    data: Some(json!([{"count": 5}])),
+                    meta,
+                    error: None,
+                },
+                StdDuration::ZERO,
+                StdDuration::from_secs(60),
+            )
+            .await;
+        assert!(cache.get_fresh("native-stale").await.is_none());
+        let mut stale = cache.get_stale("native-stale").await.unwrap();
+        mark_cached_fallback(&mut stale, true);
+        assert_eq!(stale.status, DashboardSourceStatus::Stale);
+        assert_eq!(
+            serde_json::to_value(stale.meta.freshness_mode).unwrap(),
+            "cache_rawfallback"
+        );
+        assert!(stale.meta.read_coverage.is_none());
+        assert!(stale.meta.aggregate_watermark.is_none());
+        assert!(stale.meta.cache_hit);
+        assert_eq!(stale.data, Some(json!([{"count":5}])));
+    }
+
+    #[test]
+    fn stale_cache_does_not_intercept_generic_sql_or_application_errors() {
+        for error in [
+            ApiError::DatabaseError("column refreshed_at does not exist".to_string()),
+            ApiError::InternalServerError("invalid count decoding".to_string()),
+            ApiError::BadRequest("invalid source parameters".to_string()),
+            ApiError::Forbidden("source access changed".to_string()),
+        ] {
+            assert!(!stale_cache_error_retryable(&error), "{error}");
+        }
+        assert!(stale_cache_error_retryable(
+            &ApiError::RetryableDatabaseError
+        ));
+        assert!(stale_cache_error_retryable(&ApiError::BadGateway(
+            "upstream unavailable".to_string()
+        )));
     }
 
     #[test]

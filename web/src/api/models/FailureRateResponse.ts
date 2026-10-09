@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AnalyticsReadMetadata } from "./AnalyticsReadMetadata";
 /**
  * Response for the execution failure rate summary.
  */
@@ -18,6 +19,7 @@ export type FailureRateResponse = {
    * Failure rate as a percentage (0.0 – 100.0)
    */
   failure_rate_pct: number;
+  read_coverage: AnalyticsReadMetadata;
   /**
    * Time range start
    */

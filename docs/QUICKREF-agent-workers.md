@@ -35,6 +35,15 @@ If your agent workers mount the `agent_bin` volume directly (the default in `doc
 3. On startup, the agent auto-detects available runtimes (Python, Ruby, Node.js, Shell, etc.)
 4. The worker registers with Attune and starts processing executions
 
+Artifact and pack HTTP clients use the container's system CA trust store,
+including installed private CAs. If the system store contains no usable roots,
+they fall back to the Mozilla roots bundled in the binary. Minimal images such
+as `debian:bookworm-slim` do not need a CA package for these clients to initialize.
+Certificate and hostname verification remain enabled. Private HTTPS endpoints
+still require their CA in the container's trust store, for example through
+`SSL_CERT_FILE` or `SSL_CERT_DIR`. Client configuration errors other than an
+empty system trust store fail startup rather than resetting client settings.
+
 ## Quick Start
 
 ### Option A: Use the override file

@@ -7,13 +7,19 @@ use attune_common::{
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome},
     config::RetentionConfig,
     rbac::{Action, AuthorizationContext, Resource},
-    repositories::retention::RetentionRepository,
+    repositories::{
+        native_maintenance::{
+            partitions::PartitionRepository, schedule::ScheduleRepository,
+            summaries::SummaryRepository,
+        },
+        retention::RetentionRepository,
+    },
 };
 
 use crate::{
     auth::RequireAuth,
     authz::AuthorizationCheck,
-    dto::ApiResponse,
+    dto::{native_maintenance::NativeMaintenanceStatus, ApiResponse},
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
@@ -24,6 +30,22 @@ fn retention_check(action: Action) -> AuthorizationCheck {
         action,
         context: AuthorizationContext::new(0),
     }
+}
+
+fn native_status_error(error: attune_common::error::Error) -> ApiError {
+    // Metadata reads inherit bounded maintenance deadlines. Their cancellation
+    // is temporary unavailability, not a public PostgreSQL error message.
+    if let attune_common::error::Error::Database(ref database_error) = error {
+        if database_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref()
+            == Some("57014")
+        {
+            return ApiError::RetryableDatabaseError;
+        }
+    }
+    error.into()
 }
 
 /// Get runtime retention configuration.
@@ -52,6 +74,54 @@ pub async fn get_retention_config(
     Ok((StatusCode::OK, Json(ApiResponse::new(config))))
 }
 
+/// Inspect partition coverage, DEFAULT backlog, summary invalidations and job cadences.
+#[utoipa::path(
+    get,
+    path = "/api/v1/retention-config/native-status",
+    tag = "retention",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Native maintenance observations", body = ApiResponse<NativeMaintenanceStatus>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 503, description = "Native maintenance observations temporarily unavailable"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn get_native_maintenance_status(
+    user: RequireAuth,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<impl IntoResponse> {
+    state
+        .authorization_service()
+        .authorize(&user.0, retention_check(Action::Read))
+        .await?;
+    let config = RetentionRepository::load_config(&state.db)
+        .await
+        .map_err(native_status_error)?;
+    let observed_at = chrono::Utc::now();
+    let partitions =
+        PartitionRepository::status(&state.db, &config.native_maintenance, observed_at)
+            .await
+            .map_err(native_status_error)?;
+    let summaries = SummaryRepository::status(&state.db)
+        .await
+        .map_err(native_status_error)?;
+    let schedule = ScheduleRepository::status(&state.db)
+        .await
+        .map_err(native_status_error)?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::new(NativeMaintenanceStatus {
+            observed_at,
+            enabled: config.native_maintenance.enabled,
+            partitions,
+            summaries,
+            schedule,
+        })),
+    ))
+}
+
 /// Update runtime retention configuration.
 #[utoipa::path(
     put,
@@ -64,6 +134,7 @@ pub async fn get_retention_config(
         (status = 400, description = "Invalid retention configuration"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 422, description = "Malformed retention configuration"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -88,13 +159,22 @@ pub async fn update_retention_config(
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new().route(
-        "/retention-config",
-        get(get_retention_config).put(update_retention_config),
-    )
+    Router::new()
+        .route(
+            "/retention-config",
+            get(get_retention_config).put(update_retention_config),
+        )
+        .route(
+            "/retention-config/native-status",
+            get(get_native_maintenance_status),
+        )
 }
 
 fn validate_retention_config(config: &RetentionConfig) -> ApiResult<()> {
+    config
+        .native_maintenance
+        .validate()
+        .map_err(ApiError::BadRequest)?;
     if config.check_interval_seconds == 0 {
         return Err(ApiError::BadRequest(
             "retention.check_interval_seconds must be greater than zero".to_string(),
@@ -112,11 +192,6 @@ fn validate_retention_config(config: &RetentionConfig) -> ApiResult<()> {
     }
     let cache = &config.cache_retention;
     for (field, value) in [
-        ("batch_size", cache.batch_size),
-        (
-            "max_batches_per_generation",
-            cache.max_batches_per_generation,
-        ),
         ("max_generations_per_cycle", cache.max_generations_per_cycle),
         ("max_namespaces_per_cycle", cache.max_namespaces_per_cycle),
     ] {
@@ -126,6 +201,9 @@ fn validate_retention_config(config: &RetentionConfig) -> ApiResult<()> {
             )));
         }
     }
+    cache
+        .validate_storage_maintenance()
+        .map_err(|message| ApiError::BadRequest(format!("retention.{message}")))?;
     if cache.staging_failure_alert_threshold == 0 {
         return Err(ApiError::BadRequest(
             "retention.cache_retention.staging_failure_alert_threshold must be greater than zero"
@@ -226,13 +304,70 @@ mod tests {
     }
 
     #[test]
-    fn cache_retention_validation_rejects_unbounded_batches() {
+    fn cache_retention_validation_rejects_unbounded_ddl() {
         let mut config = RetentionConfig::default();
-        config.cache_retention.max_batches_per_generation = 0;
+        config.cache_retention.ddl_statement_timeout_milliseconds = 0;
         assert!(matches!(
             validate_retention_config(&config),
             Err(ApiError::BadRequest(message))
-                if message.contains("max_batches_per_generation")
+                if message.contains("ddl_statement_timeout_milliseconds")
         ));
+    }
+
+    #[test]
+    fn cache_statistics_deadline_and_cadence_have_independent_bounds() {
+        let mut config = RetentionConfig::default();
+        for interval in [0, 86_401] {
+            config.cache_retention.statistics_interval_seconds = interval;
+            assert!(
+                matches!(validate_retention_config(&config), Err(ApiError::BadRequest(message)) if message.contains("statistics_interval_seconds"))
+            );
+        }
+        config.cache_retention.statistics_interval_seconds = 86_400;
+        for deadline in [0, 3_600_001] {
+            config
+                .cache_retention
+                .statistics_statement_timeout_milliseconds = deadline;
+            assert!(
+                matches!(validate_retention_config(&config), Err(ApiError::BadRequest(message)) if message.contains("statistics_statement_timeout_milliseconds"))
+            );
+        }
+        config
+            .cache_retention
+            .statistics_statement_timeout_milliseconds = 3_600_000;
+        assert!(validate_retention_config(&config).is_ok());
+        assert_eq!(
+            config.cache_retention.ddl_statement_timeout_milliseconds,
+            1_000
+        );
+        assert_eq!(
+            config
+                .cache_retention
+                .ddl_creation_statement_timeout_milliseconds,
+            5_000
+        );
+    }
+
+    #[test]
+    fn cache_creation_deadline_is_validated_independently_of_cleanup() {
+        let mut config = RetentionConfig::default();
+        config
+            .cache_retention
+            .ddl_creation_statement_timeout_milliseconds = 7_000;
+        assert!(validate_retention_config(&config).is_ok());
+        assert_eq!(
+            config.cache_retention.ddl_statement_timeout_milliseconds,
+            1_000
+        );
+        for deadline in [0, 3_600_001] {
+            config
+                .cache_retention
+                .ddl_creation_statement_timeout_milliseconds = deadline;
+            assert!(matches!(
+                validate_retention_config(&config),
+                Err(ApiError::BadRequest(message))
+                    if message.contains("ddl_creation_statement_timeout_milliseconds")
+            ));
+        }
     }
 }

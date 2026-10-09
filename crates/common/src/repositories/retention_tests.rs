@@ -19,6 +19,12 @@ fn config(batch_size: i64, max_batches_per_target: i64) -> RetentionConfig {
     RetentionConfig {
         batch_size,
         max_batches_per_target,
+        // These tests exercise row-batch accounting. Native DROP accounting has
+        // its own tests with historical registered leaves.
+        native_maintenance: crate::config::NativeMaintenanceConfig {
+            enabled: false,
+            ..Default::default()
+        },
         ..RetentionConfig::default()
     }
 }
@@ -41,6 +47,119 @@ async fn seed_history(pool: &PgPool, table: &str, time: DateTime<Utc>, rows: i64
     .execute(pool)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn native_boundary_retention_keeps_exact_cutoff_and_reports_drop_separately() {
+    let db = database().await;
+    let day = DateTime::parse_from_rfc3339("2020-09-02T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let cutoff = day + Duration::hours(12);
+    let native = crate::config::NativeMaintenanceConfig {
+        operation_timeout_milliseconds: 10_000,
+        max_partition_cycle_milliseconds: 20_000,
+        ..Default::default()
+    };
+    for start in [day - Duration::days(1), day] {
+        PartitionRepository::ensure_day(db.pool(), ManagedTable::Event, start, &native)
+            .await
+            .unwrap();
+    }
+    for time in [
+        day - Duration::days(1),
+        day - Duration::days(3),
+        cutoff - Duration::microseconds(1),
+        cutoff,
+        cutoff + Duration::microseconds(1),
+    ] {
+        sqlx::query("INSERT INTO event(created,trigger_ref) VALUES($1,'boundary.fixture')")
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    let settings = RetentionConfig {
+        batch_size: 10,
+        max_batches_per_target: 1,
+        native_maintenance: native,
+        ..Default::default()
+    };
+    let result = RetentionRepository::run_target_before(
+        db.pool(),
+        RetentionTarget::Events,
+        cutoff,
+        &settings,
+        || false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            result.partitions_dropped,
+            result.partition_candidates,
+            result.candidates,
+            result.deleted
+        ),
+        (1, 1, 2, 2)
+    );
+    assert!(result.candidates_exact);
+    assert_eq!(count(db.pool(), "event").await, 2);
+    let minimum: DateTime<Utc> = sqlx::query_scalar("SELECT min(created) FROM event")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(minimum, cutoff);
+    assert_eq!(count(db.pool(), "event_default").await, 0);
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_row_failure_retains_confirmed_partition_drops_and_bounded_candidate_metadata() {
+    let db = database().await;
+    let day = DateTime::parse_from_rfc3339("2020-10-02T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let native = crate::config::NativeMaintenanceConfig {
+        operation_timeout_milliseconds: 10_000,
+        max_partition_cycle_milliseconds: 20_000,
+        ..Default::default()
+    };
+    PartitionRepository::ensure_day(db.pool(), ManagedTable::Event, day, &native)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO event(created,trigger_ref) SELECT $1,'failure.fixture' FROM generate_series(1,100)").bind(day).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO event(created,trigger_ref) SELECT $1,'failure.fixture' FROM generate_series(1,4)").bind(day+Duration::days(2)).execute(db.pool()).await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION fixture_fail_default() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owned default failure'; END $$; CREATE TRIGGER fixture_fail_default BEFORE DELETE ON event_default FOR EACH ROW EXECUTE FUNCTION fixture_fail_default();")
+        .execute(db.pool()).await.unwrap();
+    let settings = RetentionConfig {
+        batch_size: 2,
+        max_batches_per_target: 1,
+        native_maintenance: native,
+        ..Default::default()
+    };
+    let failure = RetentionRepository::run_target_before(
+        db.pool(),
+        RetentionTarget::Events,
+        day + Duration::days(3),
+        &settings,
+        || false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (
+            failure.partitions_dropped,
+            failure.partition_candidates,
+            failure.deleted,
+            failure.candidates
+        ),
+        (1, 1, 0, Some(3))
+    );
+    assert!(!failure.candidates_exact);
+    assert!(failure.source.to_string().contains("owned default failure"));
+    assert_eq!(count(db.pool(), "event").await, 4);
+    db.cleanup().await.unwrap();
 }
 
 #[tokio::test]
@@ -133,8 +252,8 @@ async fn locked_history_stops_at_zero_progress_and_can_retry_next_cycle() {
     .unwrap();
     assert_eq!((result.candidates, result.deleted), (3, 0));
     assert_eq!(
-        checks, 2,
-        "one initial check and one batch, with no retry spin"
+        checks, 4,
+        "one initial check, one batch and two summary-kind checks, with no raw retry spin"
     );
     assert_eq!(count(db.pool(), "execution_history").await, 3);
     lock.rollback().await.unwrap();

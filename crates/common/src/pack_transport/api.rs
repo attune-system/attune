@@ -72,36 +72,40 @@ pub struct ApiPackTransport {
 }
 
 impl ApiPackTransport {
-    pub fn new(api_url: &str, auth_token: &str, packs_base_dir: &str) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap_or_default();
+    pub fn new(api_url: &str, auth_token: &str, packs_base_dir: &str) -> Result<Self> {
+        let client = crate::http_client::build_http_client(|| {
+            Client::builder().timeout(std::time::Duration::from_secs(300))
+        })
+        .map_err(|error| {
+            Error::configuration(format!("Failed to build pack HTTP client: {error}"))
+        })?;
 
-        Self {
+        Ok(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             auth_token_source: AuthTokenSource::Static(auth_token.to_string()),
             packs_base_dir: packs_base_dir.to_string(),
             client,
-        }
+        })
     }
 
     pub fn new_with_worker_token_provider(
         api_url: &str,
         token_provider: Arc<WorkerTokenProvider>,
         packs_base_dir: &str,
-    ) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap_or_default();
+    ) -> Result<Self> {
+        let client = crate::http_client::build_http_client(|| {
+            Client::builder().timeout(std::time::Duration::from_secs(300))
+        })
+        .map_err(|error| {
+            Error::configuration(format!("Failed to build pack HTTP client: {error}"))
+        })?;
 
-        Self {
+        Ok(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             auth_token_source: AuthTokenSource::WorkerProvider(token_provider),
             packs_base_dir: packs_base_dir.to_string(),
             client,
-        }
+        })
     }
 
     /// Update the auth token (e.g., after token refresh).
@@ -649,7 +653,8 @@ mod tests {
             "http://localhost:8080",
             "token",
             tmp.path().to_str().unwrap(),
-        );
+        )
+        .unwrap();
 
         let digest = "a".repeat(64);
         assert!(!transport.is_release_local("mypack", &digest).await);
@@ -668,7 +673,8 @@ mod tests {
             "http://localhost:8080",
             "token",
             tmp.path().to_str().unwrap(),
-        );
+        )
+        .unwrap();
 
         // Create a pack dir with a file
         let pack_dir = tmp.path().join("mypack");
@@ -687,7 +693,8 @@ mod tests {
             "http://localhost:8080",
             "token",
             tmp.path().to_str().unwrap(),
-        );
+        )
+        .unwrap();
         let removed_digest = "a".repeat(64);
         let retained_digest = "b".repeat(64);
         let removed = release_cache_path(tmp.path(), "mypack", &removed_digest).unwrap();
@@ -724,7 +731,8 @@ mod tests {
             "http://localhost:8080",
             "token",
             tmp.path().to_str().unwrap(),
-        );
+        )
+        .unwrap();
 
         let error = transport
             .remove_pack_releases("mypack", std::slice::from_ref(&digest))
@@ -742,7 +750,8 @@ mod tests {
             "http://localhost:8080",
             "token",
             tmp.path().to_str().unwrap(),
-        );
+        )
+        .unwrap();
 
         // Should not error
         transport.remove_pack("nonexistent").await.unwrap();
@@ -755,7 +764,8 @@ mod tests {
             "http://localhost:8080",
             "token",
             tmp.path().to_str().unwrap(),
-        );
+        )
+        .unwrap();
 
         assert!(transport.remove_pack("../escape").await.is_err());
         assert!(
@@ -998,11 +1008,13 @@ mod tests {
 
         let first =
             ApiPackTransport::new(&first_url, "token", first_cache.path().to_str().unwrap())
+                .unwrap()
                 .sync_release("demo", 42, &digest)
                 .await
                 .unwrap();
         let second =
             ApiPackTransport::new(&second_url, "token", second_cache.path().to_str().unwrap())
+                .unwrap()
                 .sync_release("demo", 42, &digest)
                 .await
                 .unwrap();

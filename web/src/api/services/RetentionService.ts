@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ApiResponse_NativeMaintenanceStatus } from "../models/ApiResponse_NativeMaintenanceStatus";
 import type { ApiResponse_RetentionConfig } from "../models/ApiResponse_RetentionConfig";
 import type { RetentionConfig } from "../models/RetentionConfig";
 import type { CancelablePromise } from "../core/CancelablePromise";
@@ -43,7 +44,25 @@ export class RetentionService {
         400: `Invalid retention configuration`,
         401: `Unauthorized`,
         403: `Forbidden`,
+        422: `Malformed retention configuration`,
         500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Inspect partition coverage, DEFAULT backlog, summary invalidations and job cadences.
+   * @returns ApiResponse_NativeMaintenanceStatus Native maintenance observations
+   * @throws ApiError
+   */
+  public static getNativeMaintenanceStatus(): CancelablePromise<ApiResponse_NativeMaintenanceStatus> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/retention-config/native-status",
+      errors: {
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        500: `Internal server error`,
+        503: `Native maintenance observations temporarily unavailable`,
       },
     });
   }

@@ -12,6 +12,7 @@ import {
   formatOwnerScope,
   formatRecordCount,
   getGenerationStateBadge,
+  getRefreshInProgressDetails,
   getNamespaceStatusBadge,
   groupLinesIntoChunks,
   isCacheNotPopulatedError,
@@ -35,6 +36,51 @@ function makeApiError(status: number, body: unknown): ApiError {
     "error",
   );
 }
+
+describe("refresh-in-progress details", () => {
+  it("accepts execution attribution or explicit null from a 409", () => {
+    for (const executionId of [9876543210, null]) {
+      expect(
+        getRefreshInProgressDetails(
+          makeApiError(409, {
+            code: "cache_refresh_in_progress",
+            details: { generation_id: 42, created_by_execution: executionId },
+          }),
+        ),
+      ).toEqual({ generationId: 42, executionId });
+    }
+  });
+
+  it("rejects malformed details and unrelated errors", () => {
+    for (const details of [
+      null,
+      {},
+      { generation_id: "42", created_by_execution: null },
+      { generation_id: 42, created_by_execution: "99" },
+      { generation_id: 42 },
+    ]) {
+      expect(
+        getRefreshInProgressDetails(
+          makeApiError(409, {
+            code: "cache_refresh_in_progress",
+            details,
+          }),
+        ),
+      ).toBeNull();
+    }
+    expect(
+      getRefreshInProgressDetails(
+        makeApiError(400, {
+          code: "cache_refresh_in_progress",
+          details: { generation_id: 42, created_by_execution: null },
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      getRefreshInProgressDetails(new Error("refresh in progress")),
+    ).toBeNull();
+  });
+});
 
 describe("formatBytes", () => {
   it("renders sub-kilobyte sizes in bytes", () => {

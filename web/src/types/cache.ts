@@ -21,6 +21,7 @@ export enum CacheErrorCode {
   NAMESPACE_DELETED = "namespace_deleted",
   QUOTA_EXCEEDED = "cache_quota_exceeded",
   CONFLICT = "cache_conflict",
+  REFRESH_IN_PROGRESS = "cache_refresh_in_progress",
   PRECONDITION_FAILED = "cache_precondition_failed",
   STALE = "cache_stale",
   CURSOR_INVALID = "cache_cursor_invalid",

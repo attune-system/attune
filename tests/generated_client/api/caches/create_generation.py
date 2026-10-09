@@ -122,6 +122,10 @@ def sync_detailed(
     body: CreateCacheGenerationRequest,
 ) -> Response[AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse]:
     """Begin a staging generation.
+    Same-ID retries retain the original upload contract. A different refresh ID
+    follows the namespace's `refresh_concurrency` policy: reuse an unpublished
+    generation, return a conflict, or create in parallel.
+    Execution attribution comes from authentication, never the request body.
 
     Args:
         namespace (str):
@@ -154,6 +158,10 @@ def sync(
     body: CreateCacheGenerationRequest,
 ) -> AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | None:
     """Begin a staging generation.
+    Same-ID retries retain the original upload contract. A different refresh ID
+    follows the namespace's `refresh_concurrency` policy: reuse an unpublished
+    generation, return a conflict, or create in parallel.
+    Execution attribution comes from authentication, never the request body.
 
     Args:
         namespace (str):
@@ -181,6 +189,10 @@ async def asyncio_detailed(
     body: CreateCacheGenerationRequest,
 ) -> Response[AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse]:
     """Begin a staging generation.
+    Same-ID retries retain the original upload contract. A different refresh ID
+    follows the namespace's `refresh_concurrency` policy: reuse an unpublished
+    generation, return a conflict, or create in parallel.
+    Execution attribution comes from authentication, never the request body.
 
     Args:
         namespace (str):
@@ -211,6 +223,10 @@ async def asyncio(
     body: CreateCacheGenerationRequest,
 ) -> AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | None:
     """Begin a staging generation.
+    Same-ID retries retain the original upload contract. A different refresh ID
+    follows the namespace's `refresh_concurrency` policy: reuse an unpublished
+    generation, return a conflict, or create in parallel.
+    Execution attribution comes from authentication, never the request body.
 
     Args:
         namespace (str):

@@ -1,19 +1,25 @@
 //! Analytics over retained PostgreSQL records.
 //!
 //! Dedicated hourly endpoints include buckets whose UTC start is in the inclusive
-//! requested range. Dashboard raw queries use exact half-open source-time ranges.
-//! Both filter source timestamps before grouping so time indexes remain usable.
+//! requested range. Dashboard readers omit a partial first hour and clip the
+//! final hour at the exclusive request end. Raw queries bound source timestamps
+//! before grouping; clean covered full hours use persisted summaries.
 
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use serde::Serialize;
-use sqlx::{Executor, FromRow, PgPool, Postgres};
+use sqlx::{Acquire, Executor, FromRow, PgPool, Postgres};
+
+use super::native_maintenance::{
+    read::{self, AnalyticsRead},
+    SummaryKind,
+};
 
 use crate::{models::ExecutionStatus, Result};
 use serde_json::Value as JsonValue;
 
-/// Read-only analytics. Results reflect retained raw records without refresh jobs.
+/// Read-only analytics over retained records and clean hourly summaries.
 pub struct AnalyticsRepository;
 
 // ---------------------------------------------------------------------------
@@ -1191,184 +1197,65 @@ impl AnalyticsRepository {
         range: &AnalyticsTimeRange,
         kind: DashboardBucketKind,
         primary_refs: Option<&BTreeSet<String>>,
-    ) -> Result<Vec<BucketCountRow>> {
-        // Preserve the former raw-path bucket inclusion: omit a partial first hour,
-        // clip the final hour to `until`, and exclude records exactly at `until`.
+    ) -> Result<AnalyticsRead<Vec<BucketCountRow>>> {
         let (start, _) = range.hourly_source_bounds();
-        let rows = match kind {
-            DashboardBucketKind::ExecutionThroughput => {
-                if let Some(action_refs) = primary_refs {
-                    let action_refs: Vec<String> = action_refs.iter().cloned().collect();
-                    let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
-                        r#"
-                    SELECT
-                        date_trunc('hour', time, 'UTC') AS bucket_start,
-                        entity_ref AS series,
-                        COUNT(*)::bigint AS count
-                    FROM execution_history
-                    WHERE 'status' = ANY(changed_fields)
-                      AND time >= $1
-                      AND time < $2
-                      AND entity_ref = ANY($3::text[])
-                      AND COALESCE(new_values->>'status', 'unknown') = ANY($4::text[])
-                    GROUP BY bucket_start, entity_ref
-                    ORDER BY bucket_start ASC, entity_ref ASC
-                    "#,
-                    )
-                    .bind(start)
-                    .bind(range.until)
-                    .bind(action_refs)
-                    .bind(TERMINAL_EXECUTION_STATUSES)
-                    .fetch_all(pool)
-                    .await?;
-                    rows.into_iter()
-                        .map(|(bucket_start, series, count)| BucketCountRow {
-                            bucket_start,
-                            series,
-                            count,
-                        })
-                        .collect()
-                } else {
-                    let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(
-                        r#"
-                    SELECT
-                        date_trunc('hour', time, 'UTC') AS bucket_start,
-                        COUNT(*)::bigint AS count
-                    FROM execution_history
-                    WHERE 'status' = ANY(changed_fields)
-                      AND time >= $1
-                      AND time < $2
-                      AND COALESCE(new_values->>'status', 'unknown') = ANY($3::text[])
-                    GROUP BY bucket_start
-                    ORDER BY bucket_start ASC
-                    "#,
-                    )
-                    .bind(start)
-                    .bind(range.until)
-                    .bind(TERMINAL_EXECUTION_STATUSES)
-                    .fetch_all(pool)
-                    .await?;
-                    rows.into_iter()
-                        .map(|(bucket_start, count)| BucketCountRow {
-                            bucket_start,
-                            series: "all".to_string(),
-                            count,
-                        })
-                        .collect()
-                }
-            }
-            DashboardBucketKind::ExecutionStatus => {
-                let rows = if let Some(action_refs) = primary_refs {
-                    let action_refs: Vec<String> = action_refs.iter().cloned().collect();
-                    sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
-                        r#"
-                    SELECT
-                        date_trunc('hour', time, 'UTC') AS bucket_start,
-                        COALESCE(new_values->>'status', 'unknown') AS series,
-                        COUNT(*)::bigint AS count
-                    FROM execution_history
-                    WHERE 'status' = ANY(changed_fields)
-                      AND time >= $1
-                      AND time < $2
-                      AND entity_ref = ANY($3::text[])
-                      AND COALESCE(new_values->>'status', 'unknown') = ANY($4::text[])
-                    GROUP BY bucket_start, COALESCE(new_values->>'status', 'unknown')
-                    ORDER BY bucket_start ASC, series ASC
-                    "#,
-                    )
-                    .bind(start)
-                    .bind(range.until)
-                    .bind(action_refs)
-                    .bind(TERMINAL_EXECUTION_STATUSES)
-                    .fetch_all(pool)
-                    .await?
-                } else {
-                    sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
-                        r#"
-                    SELECT
-                        date_trunc('hour', time, 'UTC') AS bucket_start,
-                        COALESCE(new_values->>'status', 'unknown') AS series,
-                        COUNT(*)::bigint AS count
-                    FROM execution_history
-                    WHERE 'status' = ANY(changed_fields)
-                      AND time >= $1
-                      AND time < $2
-                      AND COALESCE(new_values->>'status', 'unknown') = ANY($3::text[])
-                    GROUP BY bucket_start, COALESCE(new_values->>'status', 'unknown')
-                    ORDER BY bucket_start ASC, series ASC
-                    "#,
-                    )
-                    .bind(start)
-                    .bind(range.until)
-                    .bind(TERMINAL_EXECUTION_STATUSES)
-                    .fetch_all(pool)
-                    .await?
-                };
-                rows.into_iter()
-                    .map(|(bucket_start, series, count)| BucketCountRow {
-                        bucket_start,
-                        series,
-                        count,
-                    })
-                    .collect()
-            }
+        let refs = primary_refs.map(|refs| refs.iter().cloned().collect::<Vec<_>>());
+        let (source, statuses, group_refs) = match kind {
             DashboardBucketKind::EventVolume => {
-                if let Some(trigger_refs) = primary_refs {
-                    let trigger_refs: Vec<String> = trigger_refs.iter().cloned().collect();
-                    let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
-                        r#"
-                    SELECT
-                        date_trunc('hour', created, 'UTC') AS bucket_start,
-                        trigger_ref AS series,
-                        COUNT(*)::bigint AS count
-                    FROM event
-                    WHERE created >= $1
-                      AND created < $2
-                      AND trigger_ref = ANY($3::text[])
-                    GROUP BY bucket_start, trigger_ref
-                    ORDER BY bucket_start ASC, trigger_ref ASC
-                    "#,
-                    )
-                    .bind(start)
-                    .bind(range.until)
-                    .bind(trigger_refs)
-                    .fetch_all(pool)
-                    .await?;
-                    rows.into_iter()
-                        .map(|(bucket_start, series, count)| BucketCountRow {
-                            bucket_start,
-                            series,
-                            count,
-                        })
-                        .collect()
-                } else {
-                    let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(
-                        r#"
-                    SELECT
-                        date_trunc('hour', created, 'UTC') AS bucket_start,
-                        COUNT(*)::bigint AS count
-                    FROM event
-                    WHERE created >= $1
-                      AND created < $2
-                    GROUP BY bucket_start
-                    ORDER BY bucket_start ASC
-                    "#,
-                    )
-                    .bind(start)
-                    .bind(range.until)
-                    .fetch_all(pool)
-                    .await?;
-                    rows.into_iter()
-                        .map(|(bucket_start, count)| BucketCountRow {
-                            bucket_start,
-                            series: "all".to_string(),
-                            count,
-                        })
-                        .collect()
-                }
+                (SummaryKind::EventVolume, None, primary_refs.is_some())
             }
+            DashboardBucketKind::ExecutionThroughput => (
+                SummaryKind::ExecutionStatus,
+                Some(
+                    TERMINAL_EXECUTION_STATUSES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                primary_refs.is_some(),
+            ),
+            DashboardBucketKind::ExecutionStatus => (
+                SummaryKind::ExecutionStatus,
+                Some(
+                    TERMINAL_EXECUTION_STATUSES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                false,
+            ),
         };
-        Ok(rows)
+        let result = read::read(
+            pool,
+            source,
+            start,
+            range.until,
+            refs.as_deref(),
+            statuses.as_deref(),
+            group_refs,
+        )
+        .await?;
+        Ok(result.map(|rows| {
+            let mut groups = std::collections::BTreeMap::new();
+            for row in rows {
+                let series = match kind {
+                    DashboardBucketKind::ExecutionStatus => {
+                        row.status.unwrap_or_else(|| "unknown".to_string())
+                    }
+                    _ if group_refs => row.reference.unwrap_or_else(|| "unknown".to_string()),
+                    _ => "all".to_string(),
+                };
+                *groups.entry((row.bucket, series)).or_insert(0i64) += row.count;
+            }
+            groups
+                .into_iter()
+                .map(|((bucket_start, series), count)| BucketCountRow {
+                    bucket_start,
+                    series,
+                    count,
+                })
+                .collect()
+        }))
     }
 
     // =======================================================================
@@ -1378,67 +1265,66 @@ impl AnalyticsRepository {
     /// Get execution status transitions per hour, aggregated across all actions.
     ///
     /// Returns one row per (bucket, new_status) pair, ordered by bucket ascending.
-    pub async fn execution_status_hourly<'e, E>(
-        executor: E,
+    pub async fn execution_status_hourly<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
-    ) -> Result<Vec<ExecutionStatusBucket>>
+    ) -> Result<AnalyticsRead<Vec<ExecutionStatusBucket>>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        let rows = sqlx::query_as::<_, ExecutionStatusBucket>(
-            r#"
-            SELECT
-                date_trunc('hour', time, 'UTC') AS bucket,
-                NULL::text AS action_ref,
-                new_values->>'status' AS new_status,
-                COUNT(*)::bigint AS transition_count
-            FROM execution_history
-            WHERE time >= $1 AND time < $2
-              AND 'status' = ANY(changed_fields)
-            GROUP BY bucket, new_values->>'status'
-            ORDER BY bucket ASC, new_status
-            "#,
+        let result = read::read(
+            acquire,
+            SummaryKind::ExecutionStatus,
+            start,
+            end,
+            None,
+            None,
+            false,
         )
-        .bind(start)
-        .bind(end)
-        .fetch_all(executor)
         .await?;
-
-        Ok(rows)
+        Ok(result.map(|rows| {
+            rows.into_iter()
+                .map(|row| ExecutionStatusBucket {
+                    bucket: row.bucket,
+                    action_ref: row.reference,
+                    new_status: row.status,
+                    transition_count: row.count,
+                })
+                .collect()
+        }))
     }
 
     /// Get execution status transitions per hour for a specific action.
-    pub async fn execution_status_hourly_by_action<'e, E>(
-        executor: E,
+    pub async fn execution_status_hourly_by_action<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
         action_ref: &str,
-    ) -> Result<Vec<ExecutionStatusBucket>>
+    ) -> Result<AnalyticsRead<Vec<ExecutionStatusBucket>>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        let rows = sqlx::query_as::<_, ExecutionStatusBucket>(
-            r#"
-            SELECT
-                date_trunc('hour', time, 'UTC') AS bucket,
-                entity_ref AS action_ref,
-                new_values->>'status' AS new_status,
-                COUNT(*)::bigint AS transition_count
-            FROM execution_history
-            WHERE time >= $1 AND time < $2
-              AND 'status' = ANY(changed_fields) AND entity_ref = $3
-            GROUP BY bucket, entity_ref, new_values->>'status'
-            ORDER BY bucket ASC, new_status
-            "#,
+        let result = read::read(
+            acquire,
+            SummaryKind::ExecutionStatus,
+            start,
+            end,
+            Some(&[action_ref.to_string()]),
+            None,
+            true,
         )
-        .bind(start)
-        .bind(end)
-        .bind(action_ref)
-        .fetch_all(executor)
         .await?;
-
-        Ok(rows)
+        Ok(result.map(|rows| {
+            rows.into_iter()
+                .map(|row| ExecutionStatusBucket {
+                    bucket: row.bucket,
+                    action_ref: row.reference,
+                    new_status: row.status,
+                    transition_count: row.count,
+                })
+                .collect()
+        }))
     }
 
     // =======================================================================
@@ -1446,65 +1332,64 @@ impl AnalyticsRepository {
     // =======================================================================
 
     /// Get execution creation throughput per hour, aggregated across all actions.
-    pub async fn execution_throughput_hourly<'e, E>(
-        executor: E,
+    pub async fn execution_throughput_hourly<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
-    ) -> Result<Vec<ExecutionThroughputBucket>>
+    ) -> Result<AnalyticsRead<Vec<ExecutionThroughputBucket>>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        let rows = sqlx::query_as::<_, ExecutionThroughputBucket>(
-            r#"
-            SELECT
-                date_trunc('hour', time, 'UTC') AS bucket,
-                NULL::text AS action_ref,
-                COUNT(*)::bigint AS execution_count
-            FROM execution_history
-            WHERE time >= $1 AND time < $2
-              AND operation = 'INSERT'
-            GROUP BY bucket
-            ORDER BY bucket ASC
-            "#,
+        let result = read::read(
+            acquire,
+            SummaryKind::ExecutionCreation,
+            start,
+            end,
+            None,
+            None,
+            false,
         )
-        .bind(start)
-        .bind(end)
-        .fetch_all(executor)
         .await?;
-
-        Ok(rows)
+        Ok(result.map(|rows| {
+            rows.into_iter()
+                .map(|row| ExecutionThroughputBucket {
+                    bucket: row.bucket,
+                    action_ref: row.reference,
+                    execution_count: row.count,
+                })
+                .collect()
+        }))
     }
 
     /// Get execution creation throughput per hour for a specific action.
-    pub async fn execution_throughput_hourly_by_action<'e, E>(
-        executor: E,
+    pub async fn execution_throughput_hourly_by_action<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
         action_ref: &str,
-    ) -> Result<Vec<ExecutionThroughputBucket>>
+    ) -> Result<AnalyticsRead<Vec<ExecutionThroughputBucket>>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        let rows = sqlx::query_as::<_, ExecutionThroughputBucket>(
-            r#"
-            SELECT
-                date_trunc('hour', time, 'UTC') AS bucket,
-                entity_ref AS action_ref,
-                COUNT(*)::bigint AS execution_count
-            FROM execution_history
-            WHERE time >= $1 AND time < $2
-              AND operation = 'INSERT' AND entity_ref = $3
-            GROUP BY bucket, entity_ref
-            ORDER BY bucket ASC
-            "#,
+        let result = read::read(
+            acquire,
+            SummaryKind::ExecutionCreation,
+            start,
+            end,
+            Some(&[action_ref.to_string()]),
+            None,
+            true,
         )
-        .bind(start)
-        .bind(end)
-        .bind(action_ref)
-        .fetch_all(executor)
         .await?;
-
-        Ok(rows)
+        Ok(result.map(|rows| {
+            rows.into_iter()
+                .map(|row| ExecutionThroughputBucket {
+                    bucket: row.bucket,
+                    action_ref: row.reference,
+                    execution_count: row.count,
+                })
+                .collect()
+        }))
     }
 
     // =======================================================================
@@ -1512,64 +1397,64 @@ impl AnalyticsRepository {
     // =======================================================================
 
     /// Get event creation volume per hour, aggregated across all triggers.
-    pub async fn event_volume_hourly<'e, E>(
-        executor: E,
+    pub async fn event_volume_hourly<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
-    ) -> Result<Vec<EventVolumeBucket>>
+    ) -> Result<AnalyticsRead<Vec<EventVolumeBucket>>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        let rows = sqlx::query_as::<_, EventVolumeBucket>(
-            r#"
-            SELECT
-                date_trunc('hour', created, 'UTC') AS bucket,
-                NULL::text AS trigger_ref,
-                COUNT(*)::bigint AS event_count
-            FROM event
-            WHERE created >= $1 AND created < $2
-            GROUP BY bucket
-            ORDER BY bucket ASC
-            "#,
+        let result = read::read(
+            acquire,
+            SummaryKind::EventVolume,
+            start,
+            end,
+            None,
+            None,
+            false,
         )
-        .bind(start)
-        .bind(end)
-        .fetch_all(executor)
         .await?;
-
-        Ok(rows)
+        Ok(result.map(|rows| {
+            rows.into_iter()
+                .map(|row| EventVolumeBucket {
+                    bucket: row.bucket,
+                    trigger_ref: row.reference,
+                    event_count: row.count,
+                })
+                .collect()
+        }))
     }
 
     /// Get event creation volume per hour for a specific trigger.
-    pub async fn event_volume_hourly_by_trigger<'e, E>(
-        executor: E,
+    pub async fn event_volume_hourly_by_trigger<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
         trigger_ref: &str,
-    ) -> Result<Vec<EventVolumeBucket>>
+    ) -> Result<AnalyticsRead<Vec<EventVolumeBucket>>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        let rows = sqlx::query_as::<_, EventVolumeBucket>(
-            r#"
-            SELECT
-                date_trunc('hour', created, 'UTC') AS bucket,
-                trigger_ref,
-                COUNT(*)::bigint AS event_count
-            FROM event
-            WHERE created >= $1 AND created < $2
-              AND trigger_ref = $3
-            GROUP BY bucket, trigger_ref
-            ORDER BY bucket ASC
-            "#,
+        let result = read::read(
+            acquire,
+            SummaryKind::EventVolume,
+            start,
+            end,
+            Some(&[trigger_ref.to_string()]),
+            None,
+            true,
         )
-        .bind(start)
-        .bind(end)
-        .bind(trigger_ref)
-        .fetch_all(executor)
         .await?;
-
-        Ok(rows)
+        Ok(result.map(|rows| {
+            rows.into_iter()
+                .map(|row| EventVolumeBucket {
+                    bucket: row.bucket,
+                    trigger_ref: row.reference,
+                    event_count: row.count,
+                })
+                .collect()
+        }))
     }
 
     // =======================================================================
@@ -1577,67 +1462,66 @@ impl AnalyticsRepository {
     // =======================================================================
 
     /// Get worker status transitions per hour, aggregated across all workers.
-    pub async fn worker_status_hourly<'e, E>(
-        executor: E,
+    pub async fn worker_status_hourly<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
-    ) -> Result<Vec<WorkerStatusBucket>>
+    ) -> Result<AnalyticsRead<Vec<WorkerStatusBucket>>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        let rows = sqlx::query_as::<_, WorkerStatusBucket>(
-            r#"
-            SELECT
-                date_trunc('hour', time, 'UTC') AS bucket,
-                NULL::text AS worker_name,
-                new_values->>'status' AS new_status,
-                COUNT(*)::bigint AS transition_count
-            FROM worker_history
-            WHERE time >= $1 AND time < $2
-              AND 'status' = ANY(changed_fields)
-            GROUP BY bucket, new_values->>'status'
-            ORDER BY bucket ASC, new_status
-            "#,
+        let result = read::read(
+            acquire,
+            SummaryKind::WorkerStatus,
+            start,
+            end,
+            None,
+            None,
+            false,
         )
-        .bind(start)
-        .bind(end)
-        .fetch_all(executor)
         .await?;
-
-        Ok(rows)
+        Ok(result.map(|rows| {
+            rows.into_iter()
+                .map(|row| WorkerStatusBucket {
+                    bucket: row.bucket,
+                    worker_name: row.reference,
+                    new_status: row.status,
+                    transition_count: row.count,
+                })
+                .collect()
+        }))
     }
 
     /// Get worker status transitions per hour for a specific worker.
-    pub async fn worker_status_hourly_by_name<'e, E>(
-        executor: E,
+    pub async fn worker_status_hourly_by_name<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
         worker_name: &str,
-    ) -> Result<Vec<WorkerStatusBucket>>
+    ) -> Result<AnalyticsRead<Vec<WorkerStatusBucket>>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        let rows = sqlx::query_as::<_, WorkerStatusBucket>(
-            r#"
-            SELECT
-                date_trunc('hour', time, 'UTC') AS bucket,
-                entity_ref AS worker_name,
-                new_values->>'status' AS new_status,
-                COUNT(*)::bigint AS transition_count
-            FROM worker_history
-            WHERE time >= $1 AND time < $2
-              AND 'status' = ANY(changed_fields) AND entity_ref = $3
-            GROUP BY bucket, entity_ref, new_values->>'status'
-            ORDER BY bucket ASC, new_status
-            "#,
+        let result = read::read(
+            acquire,
+            SummaryKind::WorkerStatus,
+            start,
+            end,
+            Some(&[worker_name.to_string()]),
+            None,
+            true,
         )
-        .bind(start)
-        .bind(end)
-        .bind(worker_name)
-        .fetch_all(executor)
         .await?;
-
-        Ok(rows)
+        Ok(result.map(|rows| {
+            rows.into_iter()
+                .map(|row| WorkerStatusBucket {
+                    bucket: row.bucket,
+                    worker_name: row.reference,
+                    new_status: row.status,
+                    transition_count: row.count,
+                })
+                .collect()
+        }))
     }
 
     // =======================================================================
@@ -1780,59 +1664,48 @@ impl AnalyticsRepository {
     ///
     /// Counts retained history transitions to completed, failed, and timeout.
     /// Failed and timed-out attempts form the failure percentage numerator.
-    pub async fn execution_failure_rate<'e, E>(
-        executor: E,
+    pub async fn execution_failure_rate<'e, A>(
+        acquire: A,
         range: &AnalyticsTimeRange,
-    ) -> Result<FailureRateSummary>
+    ) -> Result<AnalyticsRead<FailureRateSummary>>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        A: Acquire<'e, Database = Postgres>,
     {
         let (start, end) = range.hourly_source_bounds();
-        // Count attempts, not distinct executions. Retries can terminate more than once.
-        let rows = sqlx::query_as::<_, (Option<String>, i64)>(
-            r#"
-            SELECT
-                new_values->>'status' AS new_status,
-                COUNT(*)::bigint AS cnt
-            FROM execution_history
-            WHERE time >= $1 AND time < $2
-              AND 'status' = ANY(changed_fields)
-              AND new_values->>'status' IN ('completed', 'failed', 'timeout')
-            GROUP BY new_values->>'status'
-            "#,
+        let statuses = ["completed", "failed", "timeout"].map(String::from);
+        let result = read::read(
+            acquire,
+            SummaryKind::ExecutionStatus,
+            start,
+            end,
+            None,
+            Some(&statuses),
+            false,
         )
-        .bind(start)
-        .bind(end)
-        .fetch_all(executor)
         .await?;
-
-        let mut completed: i64 = 0;
-        let mut failed: i64 = 0;
-        let mut timeout: i64 = 0;
-
-        for (status, count) in &rows {
-            match status.as_deref() {
-                Some("completed") => completed = *count,
-                Some("failed") => failed = *count,
-                Some("timeout") => timeout = *count,
-                _ => {}
+        Ok(result.map(|rows| {
+            let (mut completed, mut failed, mut timeout) = (0i64, 0i64, 0i64);
+            for row in rows {
+                match row.status.as_deref() {
+                    Some("completed") => completed += row.count,
+                    Some("failed") => failed += row.count,
+                    Some("timeout") => timeout += row.count,
+                    _ => {}
+                }
             }
-        }
-
-        let total_terminal = completed + failed + timeout;
-        let failure_rate_pct = if total_terminal > 0 {
-            ((failed + timeout) as f64 / total_terminal as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        Ok(FailureRateSummary {
-            total_terminal,
-            failed_count: failed,
-            timeout_count: timeout,
-            completed_count: completed,
-            failure_rate_pct,
-        })
+            let total_terminal = completed + failed + timeout;
+            FailureRateSummary {
+                total_terminal,
+                failed_count: failed,
+                timeout_count: timeout,
+                completed_count: completed,
+                failure_rate_pct: if total_terminal > 0 {
+                    (failed + timeout) as f64 / total_terminal as f64 * 100.0
+                } else {
+                    0.0
+                },
+            }
+        }))
     }
 }
 

@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
+from ..models.cache_refresh_concurrency import CacheRefreshConcurrency
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="CacheNamespacePolicyBody")
@@ -26,6 +27,7 @@ class CacheNamespacePolicyBody:
                 required so
                 readers can complete traversal of the prior snapshot after promotion. Example: 2.
             max_staging_generations (int | None | Unset):
+            refresh_concurrency (CacheRefreshConcurrency | None | Unset):
     """
 
     freshness_target_seconds: int | None | Unset = UNSET
@@ -34,6 +36,7 @@ class CacheNamespacePolicyBody:
     max_retained_bytes: int | None | Unset = UNSET
     max_retained_generations: int | None | Unset = UNSET
     max_staging_generations: int | None | Unset = UNSET
+    refresh_concurrency: CacheRefreshConcurrency | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -73,6 +76,14 @@ class CacheNamespacePolicyBody:
         else:
             max_staging_generations = self.max_staging_generations
 
+        refresh_concurrency: None | str | Unset
+        if isinstance(self.refresh_concurrency, Unset):
+            refresh_concurrency = UNSET
+        elif isinstance(self.refresh_concurrency, CacheRefreshConcurrency):
+            refresh_concurrency = self.refresh_concurrency.value
+        else:
+            refresh_concurrency = self.refresh_concurrency
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -88,6 +99,8 @@ class CacheNamespacePolicyBody:
             field_dict["max_retained_generations"] = max_retained_generations
         if max_staging_generations is not UNSET:
             field_dict["max_staging_generations"] = max_staging_generations
+        if refresh_concurrency is not UNSET:
+            field_dict["refresh_concurrency"] = refresh_concurrency
 
         return field_dict
 
@@ -161,6 +174,27 @@ class CacheNamespacePolicyBody:
             d.pop("max_staging_generations", UNSET)
         )
 
+        def _parse_refresh_concurrency(
+            data: object,
+        ) -> CacheRefreshConcurrency | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                refresh_concurrency_type_1 = CacheRefreshConcurrency(data)
+
+                return refresh_concurrency_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CacheRefreshConcurrency | None | Unset, data)
+
+        refresh_concurrency = _parse_refresh_concurrency(
+            d.pop("refresh_concurrency", UNSET)
+        )
+
         cache_namespace_policy_body = cls(
             freshness_target_seconds=freshness_target_seconds,
             max_generation_bytes=max_generation_bytes,
@@ -168,6 +202,7 @@ class CacheNamespacePolicyBody:
             max_retained_bytes=max_retained_bytes,
             max_retained_generations=max_retained_generations,
             max_staging_generations=max_staging_generations,
+            refresh_concurrency=refresh_concurrency,
         )
 
         cache_namespace_policy_body.additional_properties = d

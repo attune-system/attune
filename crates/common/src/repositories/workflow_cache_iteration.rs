@@ -191,6 +191,8 @@ impl WorkflowCacheIterationRepository {
     /// Creates an iteration or returns and locks the existing task iteration.
     /// The unique workflow/task key makes scheduler replay and concurrent entry
     /// dispatch converge on one durable cursor.
+    /// Acquire `CacheTransactionMode::PinMutation` at outer transaction entry,
+    /// before workflow, iteration, or generation rows. Counter locks span calls.
     pub async fn create_or_find_for_update(
         conn: &mut sqlx::PgConnection,
         input: CreateWorkflowCacheIterationInput,
@@ -218,6 +220,7 @@ impl WorkflowCacheIterationRepository {
             })
     }
 
+    /// Caller-owned pin transactions must acquire `PinMutation` before row locks.
     pub async fn create<'e, E>(
         executor: E,
         input: CreateWorkflowCacheIterationInput,

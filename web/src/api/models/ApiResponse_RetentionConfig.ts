@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { CacheRetentionConfig } from "./CacheRetentionConfig";
+import type { NativeMaintenanceConfig } from "./NativeMaintenanceConfig";
 import type { RetentionTargetsConfig } from "./RetentionTargetsConfig";
 /**
  * Standard API response wrapper
@@ -42,6 +43,11 @@ export type ApiResponse_RetentionConfig = {
      * at most batch_size * max_batches_per_target rows per cycle.
      */
     max_batches_per_target?: number;
+    /**
+     * Independent native partition/summary jobs. Persisted and reloaded with
+     * retention settings; raw reads remain available during materialization.
+     */
+    native_maintenance?: NativeMaintenanceConfig;
     /**
      * Per-target retention settings.
      */

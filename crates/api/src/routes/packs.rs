@@ -38,7 +38,7 @@ use attune_common::rbac::{
     Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints, Resource,
 };
 use attune_common::repositories::{
-    cache::CacheNamespaceRepository,
+    cache::{CacheEntryRepository, CacheNamespaceRepository, CacheTransactionMode},
     object_maintenance::ObjectMaintenanceRepository,
     pack::{
         CreatePackInput, PackSearchFilters, PackVisibilityFilter, PackVisibilityScope,
@@ -1009,6 +1009,7 @@ pub async fn delete_pack(
     }
 
     let mut tx = state.db.begin().await?;
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation).await?;
     PackRepository::acquire_mutation_lock(&mut tx, removal_ref).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let locked_pack = PackRepository::find_by_ref(&mut *tx, removal_ref)
@@ -2240,6 +2241,11 @@ async fn register_pack_internal(
     // cross-process advisory lock is released by commit.
     let _projection_guard = state.lock_pack_projection(&pack_ref).await;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
+        &mut tx,
+        attune_common::repositories::cache::CacheTransactionMode::Write,
+    )
+    .await?;
     PackRepository::acquire_mutation_lock(&mut tx, &pack_ref).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let registering_identity = user

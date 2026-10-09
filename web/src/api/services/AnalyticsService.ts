@@ -2,6 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AnalyticsReadMetadata } from "../models/AnalyticsReadMetadata";
+import type { DashboardAnalyticsCoverage } from "../models/DashboardAnalyticsCoverage";
 import type { FailureRateResponse } from "../models/FailureRateResponse";
 import type { TimeSeriesPoint } from "../models/TimeSeriesPoint";
 import type { CancelablePromise } from "../core/CancelablePromise";
@@ -62,6 +64,10 @@ export class AnalyticsService {
        * Execution failure rate summary
        */
       failure_rate: FailureRateResponse;
+      /**
+       * Separate per-metric coverage, because sources can have different holes.
+       */
+      read_coverage: DashboardAnalyticsCoverage;
       /**
        * Time range start
        */
@@ -180,6 +186,7 @@ export class AnalyticsService {
        * Data points: one per bucket (total events created)
        */
       data: Array<TimeSeriesPoint>;
+      read_coverage: AnalyticsReadMetadata;
       /**
        * Time range start
        */
@@ -246,6 +253,7 @@ export class AnalyticsService {
        * Failure rate as a percentage (0.0 – 100.0)
        */
       failure_rate_pct: number;
+      read_coverage: AnalyticsReadMetadata;
       /**
        * Time range start
        */
@@ -312,6 +320,7 @@ export class AnalyticsService {
        * Data points: one per (bucket, status) pair
        */
       data: Array<TimeSeriesPoint>;
+      read_coverage: AnalyticsReadMetadata;
       /**
        * Time range start
        */
@@ -369,6 +378,7 @@ export class AnalyticsService {
        * Data points: one per bucket (total executions created)
        */
       data: Array<TimeSeriesPoint>;
+      read_coverage: AnalyticsReadMetadata;
       /**
        * Time range start
        */
@@ -426,6 +436,7 @@ export class AnalyticsService {
        * Data points: one per (bucket, status) pair
        */
       data: Array<TimeSeriesPoint>;
+      read_coverage: AnalyticsReadMetadata;
       /**
        * Time range start
        */

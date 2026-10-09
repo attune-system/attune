@@ -275,6 +275,11 @@ impl<'a> PackComponentLoader<'a> {
         tx: &mut Transaction<'_, sqlx::Postgres>,
         pack_dir: &Path,
     ) -> Result<PackLoadResult> {
+        crate::repositories::cache::CacheEntryRepository::protect_transaction(
+            tx,
+            crate::repositories::cache::CacheTransactionMode::Write,
+        )
+        .await?;
         let mut loader = TransactionalPackComponentLoader {
             authority: self.authority.clone(),
             connection: tx,

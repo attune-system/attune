@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from ..models.analytics_read_metadata import AnalyticsReadMetadata
+
 
 T = TypeVar("T", bound="GetFailureRateAnalyticsResponse200Data")
 
@@ -19,6 +23,8 @@ class GetFailureRateAnalyticsResponse200Data:
         completed_count (int): Number of transitions to completed Example: 85.
         failed_count (int): Number of transitions to failed, including retry attempts Example: 12.
         failure_rate_pct (float): Failure rate as a percentage (0.0 – 100.0) Example: 15.0.
+        read_coverage (AnalyticsReadMetadata): Coverage describes only this read's source-time bounds, including ledger
+            holes.
         since (datetime.datetime): Time range start
         timeout_count (int): Number of transitions to timeout, including retry attempts Example: 3.
         total_terminal (int): Total transitions to completed, failed, or timeout in the included hours Example: 100.
@@ -28,6 +34,7 @@ class GetFailureRateAnalyticsResponse200Data:
     completed_count: int
     failed_count: int
     failure_rate_pct: float
+    read_coverage: AnalyticsReadMetadata
     since: datetime.datetime
     timeout_count: int
     total_terminal: int
@@ -40,6 +47,8 @@ class GetFailureRateAnalyticsResponse200Data:
         failed_count = self.failed_count
 
         failure_rate_pct = self.failure_rate_pct
+
+        read_coverage = self.read_coverage.to_dict()
 
         since = self.since.isoformat()
 
@@ -56,6 +65,7 @@ class GetFailureRateAnalyticsResponse200Data:
                 "completed_count": completed_count,
                 "failed_count": failed_count,
                 "failure_rate_pct": failure_rate_pct,
+                "read_coverage": read_coverage,
                 "since": since,
                 "timeout_count": timeout_count,
                 "total_terminal": total_terminal,
@@ -67,12 +77,18 @@ class GetFailureRateAnalyticsResponse200Data:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.analytics_read_metadata import (
+            AnalyticsReadMetadata,
+        )
+
         d = dict(src_dict)
         completed_count = d.pop("completed_count")
 
         failed_count = d.pop("failed_count")
 
         failure_rate_pct = d.pop("failure_rate_pct")
+
+        read_coverage = AnalyticsReadMetadata.from_dict(d.pop("read_coverage"))
 
         since = datetime.datetime.fromisoformat(d.pop("since"))
 
@@ -86,6 +102,7 @@ class GetFailureRateAnalyticsResponse200Data:
             completed_count=completed_count,
             failed_count=failed_count,
             failure_rate_pct=failure_rate_pct,
+            read_coverage=read_coverage,
             since=since,
             timeout_count=timeout_count,
             total_terminal=total_terminal,

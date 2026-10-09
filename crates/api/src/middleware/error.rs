@@ -241,6 +241,9 @@ impl From<attune_common::error::Error> for ApiError {
             // A pinned cache snapshot vanished/expired; the caller should
             // restart the scan against the current active generation.
             attune_common::error::Error::CacheSnapshotExpired(msg) => ApiError::Conflict(msg),
+            attune_common::error::Error::CacheRefreshInProgress { .. } => ApiError::Conflict(
+                "cache namespace already has an unpublished generation".to_string(),
+            ),
             // Duplicate external identifiers conflict with generation uniqueness.
             attune_common::error::Error::CacheDuplicateExternalId => ApiError::Conflict(
                 "cache ingest contains duplicate external identifiers".to_string(),
