@@ -194,10 +194,7 @@ export interface DashboardSourceMeta {
 }
 
 export type DashboardFreshnessMode =
-  | "raw_only"
-  | "summary_only"
-  | "summary_plus_raw"
-  | "cache_rawfallback";
+  "raw_only" | "summary_only" | "summary_plus_raw" | "cache_rawfallback";
 
 export interface DashboardReadCoverage {
   mode: DashboardFreshnessMode;

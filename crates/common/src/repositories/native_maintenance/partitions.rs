@@ -50,6 +50,12 @@ impl From<PartitionCycleFailure> for Error {
     }
 }
 
+impl From<Box<PartitionCycleFailure>> for Error {
+    fn from(failure: Box<PartitionCycleFailure>) -> Self {
+        Self::from(*failure)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PartitionExpiryResult {
     /// Metadata count of eligible leaves, never a raw-row count.
@@ -136,11 +142,13 @@ impl PartitionRepository {
         pool: &PgPool,
         config: &NativeMaintenanceConfig,
         now: DateTime<Utc>,
-    ) -> std::result::Result<PartitionCycleResult, PartitionCycleFailure> {
+    ) -> std::result::Result<PartitionCycleResult, Box<PartitionCycleFailure>> {
         let mut result = PartitionCycleResult::default();
-        let failure = |source, partial: &PartitionCycleResult| PartitionCycleFailure {
-            partial: partial.clone(),
-            source,
+        let failure = |source, partial: &PartitionCycleResult| {
+            Box::new(PartitionCycleFailure {
+                partial: partial.clone(),
+                source,
+            })
         };
         validate(config).map_err(|e| failure(e, &result))?;
         if !config.enabled {

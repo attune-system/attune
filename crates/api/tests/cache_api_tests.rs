@@ -878,7 +878,7 @@ async fn execution_refresh_attribution_survives_reuse_and_metadata_reads() -> Re
             &action.r#ref,
             &test_jwt_config(),
             Some(300),
-            &[permission_set.r#ref.clone()],
+            std::slice::from_ref(&permission_set.r#ref),
         )?;
         let response = ctx
             .post(

@@ -1791,7 +1791,7 @@ async fn assert_broker_terminal_advancement_waits_before_rows(
         .fetch_one(&mut *cleanup)
         .await
         .unwrap();
-    let advancement = advance_cache_via_broker(&fixture, &broker, child, status.clone());
+    let advancement = advance_cache_via_broker(&fixture, &broker, child, status);
     let observed = async {
         let advancement_pid = wait_for_mutation_admission(pool, cleanup_pid).await;
         let early_rows: i64 = sqlx::query_scalar(

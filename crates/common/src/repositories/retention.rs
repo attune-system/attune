@@ -452,7 +452,7 @@ impl RetentionRepository {
         max_age_seconds: u64,
         config: &RetentionConfig,
         is_cancelled: impl FnMut() -> bool,
-    ) -> std::result::Result<RetentionTargetResult, RetentionTargetFailure> {
+    ) -> std::result::Result<RetentionTargetResult, Box<RetentionTargetFailure>> {
         Self::run_target_before(
             pool,
             target,
@@ -469,9 +469,9 @@ impl RetentionRepository {
         cutoff: DateTime<Utc>,
         config: &RetentionConfig,
         mut is_cancelled: impl FnMut() -> bool,
-    ) -> std::result::Result<RetentionTargetResult, RetentionTargetFailure> {
-        let failure =
-            |source, result: &RetentionTargetResult, counted: bool| RetentionTargetFailure {
+    ) -> std::result::Result<RetentionTargetResult, Box<RetentionTargetFailure>> {
+        let failure = |source, result: &RetentionTargetResult, counted: bool| {
+            Box::new(RetentionTargetFailure {
                 target,
                 cutoff,
                 candidates: counted.then_some(result.candidates),
@@ -481,7 +481,8 @@ impl RetentionRepository {
                 partitions_dropped: result.partitions_dropped,
                 dry_run: config.dry_run,
                 source,
-            };
+            })
+        };
         let mut result = RetentionTargetResult {
             target,
             cutoff: Some(cutoff),
@@ -888,6 +889,9 @@ mod tests {
             failure.source,
             crate::Error::Database(sqlx::Error::PoolClosed)
         ));
+        assert!(std::error::Error::source(&failure)
+            .unwrap()
+            .is::<crate::Error>());
     }
 
     #[test]

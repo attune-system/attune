@@ -357,8 +357,10 @@ impl SummaryRepository {
                 config,
                 retention_targets,
                 now,
-                per_kind,
-                planning_deadline,
+                SummaryPlanningBudget {
+                    cap: per_kind,
+                    deadline: planning_deadline,
+                },
                 cancellation,
             )
             .await
@@ -577,9 +579,9 @@ async fn statement_budget(tx: &mut Transaction<'_, Postgres>, deadline: Instant)
 /// Drain it before ROLLBACK: otherwise SQLx may return that pending error without
 /// sending ROLLBACK, and Drop only queues cleanup for a later pool operation.
 async fn rollback(mut tx: Transaction<'_, Postgres>) -> Result<()> {
-    if let Err(error) = (&mut *tx).flush().await {
+    if let Err(error) = (*tx).flush().await {
         match error {
-            sqlx::Error::Database(_) => (&mut *tx).flush().await?,
+            sqlx::Error::Database(_) => (*tx).flush().await?,
             other => {
                 // Still attempt explicit rollback on a transport/protocol failure.
                 tx.rollback().await?;
@@ -851,16 +853,21 @@ async fn backfill_head(
     ).bind(kind_parameter(kind)).bind(lower).bind(recent).fetch_optional(&mut **tx).await?)
 }
 
+struct SummaryPlanningBudget {
+    cap: i64,
+    deadline: Instant,
+}
+
 async fn plan(
     pool: &PgPool,
     kind: SummaryKind,
     config: &NativeMaintenanceConfig,
     targets: &RetentionTargetsConfig,
     now: DateTime<Utc>,
-    cap: i64,
-    deadline: Instant,
+    budget: SummaryPlanningBudget,
     cancellation: &CancellationToken,
 ) -> Result<VecDeque<DateTime<Utc>>> {
+    let SummaryPlanningBudget { cap, deadline } = budget;
     let mut tx = begin(pool, kind, config, deadline).await?;
     let work = async {
         let (lower, recent, end) = window(&mut tx, kind, config, targets, now).await?;

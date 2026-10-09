@@ -14,6 +14,8 @@ use attune_common::{
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use tokio_util::sync::CancellationToken;
 
+type SummaryCountRow = (DateTime<Utc>, Option<String>, Option<String>, i64);
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -270,9 +272,9 @@ async fn dense_profile_in(
             };
             let ref_column = match kind { SummaryKind::EventVolume => "trigger_ref", SummaryKind::WorkerStatus => "worker_name", _ => "action_ref" };
             let summary_status = if matches!(kind,SummaryKind::ExecutionStatus|SummaryKind::WorkerStatus) {"new_status"} else {"NULL::text"};
-            let raw: Vec<(DateTime<Utc>,Option<String>,Option<String>,i64)> = sqlx::query_as(&format!("SELECT date_trunc('hour',{},'UTC'),{dimension},{status_column},count(*)::bigint FROM {} WHERE {} >= $1 AND {} < $2 AND {predicate} GROUP BY 1,2,3 ORDER BY 1,2 NULLS LAST,3 NULLS LAST",kind.time_column(),kind.source_table(),kind.time_column(),kind.time_column()))
+            let raw: Vec<SummaryCountRow> = sqlx::query_as(&format!("SELECT date_trunc('hour',{},'UTC'),{dimension},{status_column},count(*)::bigint FROM {} WHERE {} >= $1 AND {} < $2 AND {predicate} GROUP BY 1,2,3 ORDER BY 1,2 NULLS LAST,3 NULLS LAST",kind.time_column(),kind.source_table(),kind.time_column(),kind.time_column()))
                 .bind(start).bind(end+Duration::hours(1)).fetch_all(&pool).await?;
-            let stored: Vec<(DateTime<Utc>,Option<String>,Option<String>,i64)> = sqlx::query_as(&format!("SELECT bucket,{ref_column},{summary_status},{count_column} FROM {} WHERE bucket >= $1 AND bucket < $2 ORDER BY 1,2 NULLS LAST,3 NULLS LAST",kind.summary_table()))
+            let stored: Vec<SummaryCountRow> = sqlx::query_as(&format!("SELECT bucket,{ref_column},{summary_status},{count_column} FROM {} WHERE bucket >= $1 AND bucket < $2 ORDER BY 1,2 NULLS LAST,3 NULLS LAST",kind.summary_table()))
                 .bind(start).bind(end+Duration::hours(1)).fetch_all(&pool).await?;
             if raw != stored { return Err(format!("grouped oracle mismatch {kind:?}").into()); }
             println!("{}",serde_json::json!({"type":"grouped_oracle","kind":kind,"groups":raw.len(),"count":raw.iter().map(|r|r.3).sum::<i64>(),"correct":true}));

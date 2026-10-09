@@ -194,7 +194,9 @@ function normalizeSourceContract(
         typeof payload.authorization_basis === "string"
           ? payload.authorization_basis
           : "dashboards",
-      default_freshness_mode: parseFreshnessMode(payload.default_freshness_mode),
+      default_freshness_mode: parseFreshnessMode(
+        payload.default_freshness_mode,
+      ),
       params: payload.params
         .filter(isObject)
         .map((param) =>

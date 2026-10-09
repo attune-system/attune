@@ -313,13 +313,17 @@ async fn publish(
     Ok(())
 }
 
+struct PinTarget {
+    namespace: i64,
+    generation: i64,
+}
+
 async fn pin(
     pool: &PgPool,
     recorder: &Recorder,
     phase: &str,
     workflow: i64,
-    namespace: i64,
-    generation: i64,
+    target: PinTarget,
     name: &str,
     terminal: bool,
 ) -> Result<i64> {
@@ -333,8 +337,8 @@ async fn pin(
                 CreateWorkflowCacheIterationInput {
                     workflow_execution: workflow,
                     task_name: name.to_owned(),
-                    namespace,
-                    generation,
+                    namespace: target.namespace,
+                    generation: target.generation,
                     page_size: 1000,
                     batch_size: 1000,
                     concurrency: 4,
@@ -638,8 +642,10 @@ async fn metadata_cleanup(
                 recorder,
                 label,
                 workflow,
-                namespace,
-                generation.id,
+                PinTarget {
+                    namespace,
+                    generation: generation.id,
+                },
                 &format!("{label}-{index}"),
                 true,
             )
@@ -813,8 +819,10 @@ async fn workload(
                         recorder,
                         "setup",
                         workflow,
-                        namespace.id,
-                        generation.id,
+                        PinTarget {
+                            namespace: namespace.id,
+                            generation: generation.id,
+                        },
                         &format!("live-{namespace_index}"),
                         false,
                     )
@@ -958,8 +966,10 @@ async fn workload(
                 recorder,
                 "setup",
                 workflow,
-                namespaces[LARGE_NAMESPACES + client],
-                inventory[LARGE_NAMESPACES + client][RETAINED - 1],
+                PinTarget {
+                    namespace: namespaces[LARGE_NAMESPACES + client],
+                    generation: inventory[LARGE_NAMESPACES + client][RETAINED - 1],
+                },
                 &format!("reader-{client}"),
                 false,
             )
