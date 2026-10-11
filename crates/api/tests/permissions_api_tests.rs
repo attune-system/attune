@@ -194,6 +194,7 @@ async fn test_identity_delete_tombstones_owned_caches_before_deletion() {
     let namespace = CacheNamespaceRepository::create_api(
         &ctx.pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::identity(identity_id),
             namespace: format!("identity_delete_{identity_id}"),
             policy: CacheNamespacePolicy::default(),

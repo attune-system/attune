@@ -19,19 +19,22 @@ class CacheMultiLookupResponse:
     """Bounded multi-ID lookup response. Missing IDs are reported explicitly.
 
     Attributes:
-        generation_id (int):
+        generation_id (int | None):
         items (list[CacheEntryResponse]):
         missing_external_ids (list[str]):
+        revision (int | None):
         stale (bool):
     """
 
-    generation_id: int
+    generation_id: int | None
     items: list[CacheEntryResponse]
     missing_external_ids: list[str]
+    revision: int | None
     stale: bool
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        generation_id: int | None
         generation_id = self.generation_id
 
         items = []
@@ -40,6 +43,9 @@ class CacheMultiLookupResponse:
             items.append(items_item)
 
         missing_external_ids = self.missing_external_ids
+
+        revision: int | None
+        revision = self.revision
 
         stale = self.stale
 
@@ -50,6 +56,7 @@ class CacheMultiLookupResponse:
                 "generation_id": generation_id,
                 "items": items,
                 "missing_external_ids": missing_external_ids,
+                "revision": revision,
                 "stale": stale,
             }
         )
@@ -61,7 +68,13 @@ class CacheMultiLookupResponse:
         from ..models.cache_entry_response import CacheEntryResponse
 
         d = dict(src_dict)
-        generation_id = d.pop("generation_id")
+
+        def _parse_generation_id(data: object) -> int | None:
+            if data is None:
+                return data
+            return cast(int | None, data)
+
+        generation_id = _parse_generation_id(d.pop("generation_id"))
 
         items = []
         _items = d.pop("items")
@@ -72,12 +85,20 @@ class CacheMultiLookupResponse:
 
         missing_external_ids = cast(list[str], d.pop("missing_external_ids"))
 
+        def _parse_revision(data: object) -> int | None:
+            if data is None:
+                return data
+            return cast(int | None, data)
+
+        revision = _parse_revision(d.pop("revision"))
+
         stale = d.pop("stale")
 
         cache_multi_lookup_response = cls(
             generation_id=generation_id,
             items=items,
             missing_external_ids=missing_external_ids,
+            revision=revision,
             stale=stale,
         )
 

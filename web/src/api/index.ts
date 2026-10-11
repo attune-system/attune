@@ -68,6 +68,9 @@ export type { ApiResponse_WorkflowResponse } from "./models/ApiResponse_Workflow
 export type { ApiResponse_WorkQueueItemResponse } from "./models/ApiResponse_WorkQueueItemResponse";
 export type { ApiResponse_WorkQueueResponse } from "./models/ApiResponse_WorkQueueResponse";
 export type { AppendProgressRequest } from "./models/AppendProgressRequest";
+export type { ApplyLiveCacheApiResponse } from "./models/ApplyLiveCacheApiResponse";
+export type { ApplyLiveCacheRequest } from "./models/ApplyLiveCacheRequest";
+export type { ApplyLiveCacheResponse } from "./models/ApplyLiveCacheResponse";
 export type { ApplyWorkQueueItemsRequest } from "./models/ApplyWorkQueueItemsRequest";
 export type { ApplyWorkQueueItemsResponse } from "./models/ApplyWorkQueueItemsResponse";
 export { ArtifactBodyState } from "./models/ArtifactBodyState";
@@ -101,6 +104,7 @@ export type { CacheGenerationListApiResponse } from "./models/CacheGenerationLis
 export type { CacheGenerationListResponse } from "./models/CacheGenerationListResponse";
 export type { CacheGenerationResponse } from "./models/CacheGenerationResponse";
 export { CacheGenerationState } from "./models/CacheGenerationState";
+export { CacheMode } from "./models/CacheMode";
 export type { CacheMultiLookupApiResponse } from "./models/CacheMultiLookupApiResponse";
 export type { CacheMultiLookupRequest } from "./models/CacheMultiLookupRequest";
 export type { CacheMultiLookupResponse } from "./models/CacheMultiLookupResponse";

@@ -348,6 +348,9 @@ from .append_progress_request import AppendProgressRequest
 from .append_progress_request_entry import AppendProgressRequestEntry
 from .append_progress_response_200 import AppendProgressResponse200
 from .append_progress_response_200_data import AppendProgressResponse200Data
+from .apply_live_cache_api_response import ApplyLiveCacheApiResponse
+from .apply_live_cache_request import ApplyLiveCacheRequest
+from .apply_live_cache_response import ApplyLiveCacheResponse
 from .apply_work_queue_items_request import ApplyWorkQueueItemsRequest
 from .apply_work_queue_items_request_payload_patch_type_0 import (
     ApplyWorkQueueItemsRequestPayloadPatchType0,
@@ -399,6 +402,7 @@ from .cache_generation_list_api_response import CacheGenerationListApiResponse
 from .cache_generation_list_response import CacheGenerationListResponse
 from .cache_generation_response import CacheGenerationResponse
 from .cache_generation_state import CacheGenerationState
+from .cache_mode import CacheMode
 from .cache_multi_lookup_api_response import CacheMultiLookupApiResponse
 from .cache_multi_lookup_request import CacheMultiLookupRequest
 from .cache_multi_lookup_response import CacheMultiLookupResponse
@@ -1686,6 +1690,9 @@ __all__ = (
     "AppendProgressRequestEntry",
     "AppendProgressResponse200",
     "AppendProgressResponse200Data",
+    "ApplyLiveCacheApiResponse",
+    "ApplyLiveCacheRequest",
+    "ApplyLiveCacheResponse",
     "ApplyWorkQueueItemsRequest",
     "ApplyWorkQueueItemsRequestPayloadPatchType0",
     "ApplyWorkQueueItemsResponse",
@@ -1731,6 +1738,7 @@ __all__ = (
     "CacheGenerationListResponse",
     "CacheGenerationResponse",
     "CacheGenerationState",
+    "CacheMode",
     "CacheMultiLookupApiResponse",
     "CacheMultiLookupRequest",
     "CacheMultiLookupResponse",

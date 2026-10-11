@@ -1,4 +1,4 @@
-use crate::models::CacheRefreshConcurrency;
+use crate::models::{CacheMode, CacheRefreshConcurrency};
 use crate::repositories::cache::{validate_namespace_name, CacheNamespacePolicy};
 use crate::Result;
 use serde::Deserialize;
@@ -16,6 +16,8 @@ pub(crate) enum CacheDefinitionOwnerType {
 pub(crate) struct CacheDefinitionYaml {
     pub r#ref: String,
     pub namespace: String,
+    #[serde(default)]
+    pub mode: CacheMode,
     pub owner_type: CacheDefinitionOwnerType,
     pub owner_ref: String,
     #[serde(default = "default_freshness_target_seconds")]

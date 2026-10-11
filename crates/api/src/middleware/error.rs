@@ -241,6 +241,7 @@ impl From<attune_common::error::Error> for ApiError {
             // A pinned cache snapshot vanished/expired; the caller should
             // restart the scan against the current active generation.
             attune_common::error::Error::CacheSnapshotExpired(msg) => ApiError::Conflict(msg),
+            attune_common::error::Error::CacheModeMismatch(msg) => ApiError::Conflict(msg),
             attune_common::error::Error::CacheRefreshInProgress { .. } => ApiError::Conflict(
                 "cache namespace already has an unpublished generation".to_string(),
             ),

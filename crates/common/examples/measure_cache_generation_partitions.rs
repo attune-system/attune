@@ -773,6 +773,7 @@ async fn workload(
                 CacheNamespaceRepository::create_api_with_policy(
                     pool,
                     CreateCacheNamespaceInput {
+                        mode: Default::default(),
                         owner: CacheOwnerScope::system(),
                         namespace: format!("measure-{namespace_index}"),
                         policy: CacheNamespacePolicy {

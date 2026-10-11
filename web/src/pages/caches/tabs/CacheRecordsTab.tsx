@@ -23,6 +23,7 @@ import {
 interface CacheRecordsTabProps {
   owner: CacheOwnerParams;
   namespaceName: string;
+  live?: boolean;
 }
 
 function EntryValueCell({ entry }: { entry: CacheEntryResponse }) {
@@ -52,6 +53,7 @@ function EntryValueCell({ entry }: { entry: CacheEntryResponse }) {
 export default function CacheRecordsTab({
   owner,
   namespaceName,
+  live = false,
 }: CacheRecordsTabProps) {
   // ── Exact lookup ─────────────────────────────────────────────────────
   const [lookupId, setLookupId] = useState("");
@@ -79,7 +81,7 @@ export default function CacheRecordsTab({
     cursor,
     limit: pageSize,
     requireFresh,
-    enabled: browsing,
+    enabled: browsing && !live,
   });
 
   const scanExpired = isSnapshotExpiredError(scan.error);
@@ -151,7 +153,11 @@ export default function CacheRecordsTab({
         {lookup.isSuccess && (
           <div className="mt-4 rounded-md border border-gray-200 p-3">
             <div className="mb-2 flex items-center gap-2 text-xs text-gray-500">
-              <span>Generation #{lookup.data.data.generation_id}</span>
+              <span>
+                {live
+                  ? `Revision ${lookup.data.data.revision}`
+                  : `Generation #${lookup.data.data.generation_id}`}
+              </span>
               {lookup.data.data.stale && (
                 <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800">
                   stale
@@ -229,8 +235,10 @@ export default function CacheRecordsTab({
         {getMany.isSuccess && (
           <div className="mt-4">
             <div className="mb-2 text-xs text-gray-500">
-              Generation #{getMany.data.data.generation_id} ·{" "}
-              {getMany.data.data.items.length} found ·{" "}
+              {live
+                ? `Revision ${getMany.data.data.revision}`
+                : `Generation #${getMany.data.data.generation_id}`}{" "}
+              · {getMany.data.data.items.length} found ·{" "}
               {getMany.data.data.missing_external_ids.length} missing
             </div>
             <div className="max-h-96 overflow-y-auto rounded-md border border-gray-200">
@@ -268,179 +276,187 @@ export default function CacheRecordsTab({
         )}
       </div>
 
-      <div className="rounded-lg bg-white p-5 shadow">
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500">
-            Cursor-page browsing
-          </h2>
-          <div className="flex items-center gap-3 text-xs text-gray-500">
-            <label className="flex items-center gap-1">
-              <input
-                type="checkbox"
-                checked={requireFresh}
-                onChange={(event) => {
-                  setRequireFresh(event.target.checked);
-                  resolveCurrentGeneration();
-                }}
-              />
-              Require fresh
-            </label>
-            <label className="flex items-center gap-1">
-              Page size
-              <select
-                value={pageSize}
-                onChange={(event) => {
-                  setPageSize(Number(event.target.value));
-                  resolveCurrentGeneration();
-                }}
-                className="rounded border border-gray-300 px-1 py-0.5"
-              >
-                {[25, 50, 100, 250].map((size) => (
-                  <option key={size} value={size}>
-                    {size}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-        </div>
-
-        <p className="mb-3 text-xs text-gray-500">
-          Browses one generation-pinned snapshot at a time. There is no offset
-          paging and no "load all" action — advance one bounded page at a time.
+      {live ? (
+        <p className="text-sm text-gray-500">
+          Live caches cannot be scanned or iterated. Use exact or bounded
+          multi-ID lookups. Mutate records through the API, CLI, or MCP.
         </p>
-
-        {!browsing ? (
-          <button
-            type="button"
-            onClick={startBrowsing}
-            className="rounded-md bg-teal-600 px-4 py-2 text-sm font-medium text-white hover:bg-teal-700"
-          >
-            Start browsing
-          </button>
-        ) : (
-          <>
-            {scan.data?.data && (
-              <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-gray-500">
-                <span>Pinned generation #{scan.data.data.generation_id}</span>
-                {scan.data.data.stale && (
-                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800">
-                    stale
-                  </span>
-                )}
-                {scan.data.data.cursor_expires_at && (
-                  <span>
-                    Cursor expires:{" "}
-                    {formatDateTime(scan.data.data.cursor_expires_at)}
-                  </span>
-                )}
-              </div>
-            )}
-
-            {scan.isLoading && (
-              <p className="text-sm text-gray-500">Loading page…</p>
-            )}
-
-            {scan.isError && scanExpired && (
-              <div className="mb-3 rounded-md border border-amber-300 bg-amber-50 p-3">
-                <div className="flex items-center gap-2 text-sm font-medium text-amber-800">
-                  <AlertTriangle className="h-4 w-4" />
-                  This browsing snapshot has expired.
-                </div>
-                <div className="mt-2 flex gap-3">
-                  <button
-                    type="button"
-                    onClick={restartOnCurrentGeneration}
-                    className="rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
-                  >
-                    Restart on current generation
-                  </button>
-                  <button
-                    type="button"
-                    onClick={startNewBrowse}
-                    className="text-xs font-medium text-gray-600 underline hover:text-gray-800"
-                  >
-                    Start a new browse (latest generation)
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {scan.isError && !scanExpired && (
-              <p className="text-sm text-red-600">
-                {isCacheNotPopulatedError(scan.error)
-                  ? "This namespace has never had a generation published (cache_not_populated)."
-                  : getCacheErrorMessage(scan.error, "Failed to load page")}
-              </p>
-            )}
-
-            {scan.data?.data && scan.data.data.items.length === 0 && (
-              <p className="text-sm text-gray-500">
-                No records in this generation.
-              </p>
-            )}
-
-            {scan.data?.data && scan.data.data.items.length > 0 && (
-              <div className="max-h-[28rem] overflow-y-auto rounded-md border border-gray-200">
-                <table className="min-w-full divide-y divide-gray-200 text-sm">
-                  <thead className="sticky top-0 bg-gray-50">
-                    <tr>
-                      <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-500">
-                        External ID
-                      </th>
-                      <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-500">
-                        Source updated
-                      </th>
-                      <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-500">
-                        Size
-                      </th>
-                      <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-500">
-                        Value
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-100">
-                    {scan.data.data.items.map((entry) => (
-                      <tr key={entry.external_id}>
-                        <td className="px-3 py-2 font-mono">
-                          {entry.external_id}
-                        </td>
-                        <td className="px-3 py-2 text-gray-500">
-                          {formatDateTime(entry.source_updated_at)}
-                        </td>
-                        <td className="px-3 py-2 text-gray-500">
-                          {formatBytes(entry.size_bytes)}
-                        </td>
-                        <td className="px-3 py-2">
-                          <EntryValueCell entry={entry} />
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            <div className="mt-3 flex gap-3">
-              <button
-                type="button"
-                disabled={!scan.data?.data?.next_cursor || scan.isFetching}
-                onClick={nextPage}
-                className="rounded-md bg-teal-600 px-4 py-2 text-sm font-medium text-white hover:bg-teal-700 disabled:cursor-not-allowed disabled:bg-teal-300"
-              >
-                Next page
-              </button>
-              <button
-                type="button"
-                onClick={startNewBrowse}
-                className="rounded-md px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100"
-              >
-                Restart browsing
-              </button>
+      ) : (
+        <div className="rounded-lg bg-white p-5 shadow">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500">
+              Cursor-page browsing
+            </h2>
+            <div className="flex items-center gap-3 text-xs text-gray-500">
+              <label className="flex items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={requireFresh}
+                  onChange={(event) => {
+                    setRequireFresh(event.target.checked);
+                    resolveCurrentGeneration();
+                  }}
+                />
+                Require fresh
+              </label>
+              <label className="flex items-center gap-1">
+                Page size
+                <select
+                  value={pageSize}
+                  onChange={(event) => {
+                    setPageSize(Number(event.target.value));
+                    resolveCurrentGeneration();
+                  }}
+                  className="rounded border border-gray-300 px-1 py-0.5"
+                >
+                  {[25, 50, 100, 250].map((size) => (
+                    <option key={size} value={size}>
+                      {size}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
-          </>
-        )}
-      </div>
+          </div>
+
+          <p className="mb-3 text-xs text-gray-500">
+            Browses one generation-pinned snapshot at a time. There is no offset
+            paging and no "load all" action — advance one bounded page at a
+            time.
+          </p>
+
+          {!browsing ? (
+            <button
+              type="button"
+              onClick={startBrowsing}
+              className="rounded-md bg-teal-600 px-4 py-2 text-sm font-medium text-white hover:bg-teal-700"
+            >
+              Start browsing
+            </button>
+          ) : (
+            <>
+              {scan.data?.data && (
+                <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                  <span>Pinned generation #{scan.data.data.generation_id}</span>
+                  {scan.data.data.stale && (
+                    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800">
+                      stale
+                    </span>
+                  )}
+                  {scan.data.data.cursor_expires_at && (
+                    <span>
+                      Cursor expires:{" "}
+                      {formatDateTime(scan.data.data.cursor_expires_at)}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {scan.isLoading && (
+                <p className="text-sm text-gray-500">Loading page…</p>
+              )}
+
+              {scan.isError && scanExpired && (
+                <div className="mb-3 rounded-md border border-amber-300 bg-amber-50 p-3">
+                  <div className="flex items-center gap-2 text-sm font-medium text-amber-800">
+                    <AlertTriangle className="h-4 w-4" />
+                    This browsing snapshot has expired.
+                  </div>
+                  <div className="mt-2 flex gap-3">
+                    <button
+                      type="button"
+                      onClick={restartOnCurrentGeneration}
+                      className="rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
+                    >
+                      Restart on current generation
+                    </button>
+                    <button
+                      type="button"
+                      onClick={startNewBrowse}
+                      className="text-xs font-medium text-gray-600 underline hover:text-gray-800"
+                    >
+                      Start a new browse (latest generation)
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {scan.isError && !scanExpired && (
+                <p className="text-sm text-red-600">
+                  {isCacheNotPopulatedError(scan.error)
+                    ? "This namespace has never had a generation published (cache_not_populated)."
+                    : getCacheErrorMessage(scan.error, "Failed to load page")}
+                </p>
+              )}
+
+              {scan.data?.data && scan.data.data.items.length === 0 && (
+                <p className="text-sm text-gray-500">
+                  No records in this generation.
+                </p>
+              )}
+
+              {scan.data?.data && scan.data.data.items.length > 0 && (
+                <div className="max-h-[28rem] overflow-y-auto rounded-md border border-gray-200">
+                  <table className="min-w-full divide-y divide-gray-200 text-sm">
+                    <thead className="sticky top-0 bg-gray-50">
+                      <tr>
+                        <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-500">
+                          External ID
+                        </th>
+                        <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-500">
+                          Source updated
+                        </th>
+                        <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-500">
+                          Size
+                        </th>
+                        <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-500">
+                          Value
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {scan.data.data.items.map((entry) => (
+                        <tr key={entry.external_id}>
+                          <td className="px-3 py-2 font-mono">
+                            {entry.external_id}
+                          </td>
+                          <td className="px-3 py-2 text-gray-500">
+                            {formatDateTime(entry.source_updated_at)}
+                          </td>
+                          <td className="px-3 py-2 text-gray-500">
+                            {formatBytes(entry.size_bytes)}
+                          </td>
+                          <td className="px-3 py-2">
+                            <EntryValueCell entry={entry} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div className="mt-3 flex gap-3">
+                <button
+                  type="button"
+                  disabled={!scan.data?.data?.next_cursor || scan.isFetching}
+                  onClick={nextPage}
+                  className="rounded-md bg-teal-600 px-4 py-2 text-sm font-medium text-white hover:bg-teal-700 disabled:cursor-not-allowed disabled:bg-teal-300"
+                >
+                  Next page
+                </button>
+                <button
+                  type="button"
+                  onClick={startNewBrowse}
+                  className="rounded-md px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100"
+                >
+                  Restart browsing
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

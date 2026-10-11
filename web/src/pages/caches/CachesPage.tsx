@@ -296,7 +296,7 @@ export default function CachesPage() {
                       Status
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                      Active generation
+                      Generation / live revision
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
                       Records / bytes
@@ -343,7 +343,16 @@ export default function CachesPage() {
                           </span>
                         </td>
                         <td className="whitespace-nowrap px-6 py-4 text-sm text-gray-900">
-                          {namespace.active_generation ? (
+                          {namespace.mode === "live" ? (
+                            <>
+                              Live revision {namespace.revision}
+                              {namespace.source_revision && (
+                                <div className="text-xs text-gray-500">
+                                  rev: {namespace.source_revision}
+                                </div>
+                              )}
+                            </>
+                          ) : namespace.active_generation ? (
                             <>
                               #{namespace.active_generation}
                               {namespace.source_revision && (

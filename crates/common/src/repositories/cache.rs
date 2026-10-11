@@ -1,7 +1,7 @@
 //! Persistence operations for owner-scoped external data caches.
 //!
-//! Published cache records are immutable. Writers build a staging generation,
-//! optionally clone and apply deltas, seal it, then atomically promote it.
+//! Published snapshots are immutable. Snapshot writers stage, seal and promote;
+//! live writers atomically mutate one durable backing generation by external ID.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
@@ -16,7 +16,7 @@ use crate::{
             CACHE_ENTRY_SELECT_COLUMNS, CACHE_GENERATION_SELECT_COLUMNS,
             CACHE_INGEST_CHUNK_SELECT_COLUMNS, CACHE_NAMESPACE_SELECT_COLUMNS,
         },
-        CacheGenerationState, CacheRefreshConcurrency, Id, OwnerType,
+        CacheGenerationState, CacheMode, CacheRefreshConcurrency, Id, OwnerType,
     },
     rbac::OwnerConstraint,
     Error, Result,
@@ -24,7 +24,9 @@ use crate::{
 
 use super::{Create, FindById, List, Repository};
 
+mod live;
 mod storage;
+pub use live::{ApplyLiveCacheInput, ApplyLiveCacheResult, CacheLiveRepository};
 pub use storage::{CacheStatisticsRefreshOutcome, CacheStorageObservation, CacheStorageRepository};
 
 /// Empty chunks count toward this metadata bound too.
@@ -328,6 +330,7 @@ impl CacheNamespacePolicy {
 
 #[derive(Debug, Clone)]
 pub struct CreateCacheNamespaceInput {
+    pub mode: CacheMode,
     pub owner: CacheOwnerScope,
     pub namespace: String,
     pub policy: CacheNamespacePolicy,
@@ -336,6 +339,7 @@ pub struct CreateCacheNamespaceInput {
 /// Desired state for one namespace declared by a pack cache definition.
 #[derive(Debug, Clone)]
 pub struct ManagedCacheNamespaceDefinition {
+    pub mode: CacheMode,
     pub definition_ref: String,
     pub owner: CacheOwnerScope,
     pub namespace: String,
@@ -473,6 +477,19 @@ impl Create for CacheNamespaceRepository {
 }
 
 impl CacheNamespaceRepository {
+    /// Namespace-before-generation protection for a coherent live read request.
+    pub async fn find_by_id_for_share_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Id,
+    ) -> Result<CacheNamespace> {
+        CacheEntryRepository::protect_transaction(conn, CacheTransactionMode::Read).await?;
+        let query = format!("SELECT {CACHE_NAMESPACE_SELECT_COLUMNS} FROM cache_namespace WHERE id = $1 AND tombstoned_at IS NULL AND retired_at IS NULL FOR SHARE");
+        sqlx::query_as(&query)
+            .bind(id)
+            .fetch_optional(conn)
+            .await?
+            .ok_or_else(|| Error::cache_snapshot_expired("cache namespace is no longer readable"))
+    }
     pub async fn find_by_id_including_retired<'e, E>(
         executor: E,
         id: Id,
@@ -615,9 +632,10 @@ impl CacheNamespaceRepository {
                     || existing.owner_type != definition.owner.owner_type
                     || existing.owner != canonical_owner
                     || existing.namespace != definition.namespace
+                    || existing.mode != definition.mode
                 {
                     return Err(Error::validation(format!(
-                        "cache definition '{}' cannot change its namespace or owner",
+                        "cache definition '{}' cannot change its namespace, owner, or mode",
                         definition.definition_ref
                     )));
                 }
@@ -651,6 +669,7 @@ impl CacheNamespaceRepository {
             }
 
             let input = CreateCacheNamespaceInput {
+                mode: definition.mode,
                 owner: definition.owner.clone(),
                 namespace: definition.namespace.clone(),
                 policy: definition.policy.clone(),
@@ -907,13 +926,13 @@ impl CacheNamespaceRepository {
              OR ($6 = 'unpopulated' AND n.active_generation IS NULL) \
              OR ($6 = 'fresh' AND n.active_generation IS NOT NULL \
                  AND active.id IS NOT NULL \
-                 AND (n.freshness_target_seconds <= 0 OR active.activated IS NULL \
-                      OR active.activated >= NOW() \
+                 AND (n.freshness_target_seconds <= 0 OR COALESCE(n.live_updated_at, active.activated) IS NULL \
+                      OR COALESCE(n.live_updated_at, active.activated) >= NOW() \
                          - n.freshness_target_seconds * INTERVAL '1 second')) \
              OR ($6 = 'stale' AND n.active_generation IS NOT NULL \
                  AND active.id IS NOT NULL AND n.freshness_target_seconds > 0 \
-                 AND active.activated IS NOT NULL \
-                 AND active.activated < NOW() \
+                 AND COALESCE(n.live_updated_at, active.activated) IS NOT NULL \
+                 AND COALESCE(n.live_updated_at, active.activated) < NOW() \
                      - n.freshness_target_seconds * INTERVAL '1 second'))";
 
         match visible_namespaces {
@@ -1474,6 +1493,8 @@ impl CacheGenerationRepository {
             })?;
         ensure_namespace_writable(&namespace)?;
 
+        require_snapshot(&namespace)?;
+
         let existing_query = format!(
             "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation \
              WHERE namespace = $1 AND client_refresh_id = $2 FOR UPDATE"
@@ -1775,6 +1796,7 @@ impl CacheGenerationRepository {
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
         ensure_namespace_writable(&namespace)?;
 
+        require_snapshot(&namespace)?;
         let expectations = requested.unwrap_or(SealCacheGenerationInput {
             expected_chunk_count: generation.expected_chunk_count,
             expected_count: generation.expected_count,
@@ -1958,6 +1980,7 @@ impl CacheGenerationRepository {
             .ok_or_else(|| Error::not_found("cache_namespace", "id", namespace_id.to_string()))?;
         ensure_namespace_writable(&namespace)?;
 
+        require_snapshot(&namespace)?;
         if namespace.active_generation == Some(generation_id) {
             let generation = lock_generation(connection, generation_id)
                 .await?
@@ -2455,31 +2478,8 @@ impl CacheIngestRepository {
         deleted_external_ids: &[String],
         admission: &CacheAdmissionConfig,
     ) -> Result<InsertCacheChunkResult> {
-        let entry_bytes = validate_chunk_input(chunk_index, request_checksum, entries)?;
-        if entries.len().saturating_add(deleted_external_ids.len()) > MAX_INGEST_CHUNK_RECORDS {
-            return Err(Error::validation(
-                "cache ingest chunk record limit exceeded",
-            ));
-        }
-        let mut ids = HashSet::new();
-        for entry in entries {
-            if !ids.insert(entry.external_id.as_str()) {
-                return Err(Error::cache_duplicate_external_id());
-            }
-        }
-        let mut encoded_bytes = entry_bytes;
-        for id in deleted_external_ids {
-            validate_external_id(id)?;
-            if !ids.insert(id.as_str()) {
-                return Err(Error::cache_duplicate_external_id());
-            }
-            encoded_bytes = encoded_bytes
-                .checked_add(id.len())
-                .ok_or_else(|| Error::validation("cache ingest chunk is too large"))?;
-        }
-        if encoded_bytes > MAX_INGEST_CHUNK_BYTES {
-            return Err(Error::validation("cache ingest chunk byte limit exceeded"));
-        }
+        let ids =
+            validate_mutation_input(chunk_index, request_checksum, entries, deleted_external_ids)?;
         CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Ingest).await?;
         // Lock namespace-before-generation (the generation's namespace is
         // immutable) so tombstone, upload, and seal share one lock order and
@@ -2494,6 +2494,7 @@ impl CacheIngestRepository {
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
         ensure_namespace_writable(&namespace)?;
+        require_snapshot(&namespace)?;
         if chunk_index >= generation.expected_chunk_count {
             return Err(Error::validation(
                 "cache ingest chunk index exceeds expected_chunk_count",
@@ -2558,18 +2559,12 @@ impl CacheIngestRepository {
         }
 
         if is_delta {
-            let ids: Vec<&str> = ids.into_iter().collect();
-            // Only IDs cross the SQL connection. Deletes and replacement values
-            // are accounted by statement transition triggers inside PostgreSQL.
-            sqlx::query("DELETE FROM cache_entry WHERE generation = $1 AND external_id = ANY($2)")
-                .bind(generation_id)
-                .bind(ids)
-                .execute(&mut *connection)
-                .await?;
+            replace_entries_conn(connection, generation_id, entries, &ids).await?;
         }
 
         let mut inserted_bytes = 0_i64;
-        for batch in entries.chunks(INGEST_INSERT_BATCH_SIZE) {
+        let append_entries = if is_delta { &[][..] } else { entries };
+        for batch in append_entries.chunks(INGEST_INSERT_BATCH_SIZE) {
             let mut query = QueryBuilder::<Postgres>::new(
                 "INSERT INTO cache_entry \
                  (generation, external_id, value, source_updated_at, source_checksum) ",
@@ -2581,18 +2576,8 @@ impl CacheIngestRepository {
                     .push_bind(entry.source_updated_at)
                     .push_bind(entry.source_checksum.as_deref());
             });
-            let inserted = if is_delta {
-                // Delta totals come from the trigger-maintained usage row; do
-                // not return one SQL result per changed record.
-                query
-                    .build()
-                    .execute(&mut *connection)
-                    .await
-                    .map(|_| Vec::new())
-            } else {
-                query.push(" RETURNING size_bytes");
-                query.build_query_scalar().fetch_all(&mut *connection).await
-            };
+            query.push(" RETURNING size_bytes");
+            let inserted = query.build_query_scalar().fetch_all(&mut *connection).await;
             let inserted: Vec<i64> = match inserted {
                 Ok(rows) => rows,
                 // The only unique constraint reachable by a cache_entry insert
@@ -2885,6 +2870,14 @@ impl CacheEntryRepository {
         }
 
         load_readable_pinned_conn(connection, namespace_id, generation_id).await?;
+        Self::find_generation_many_conn(connection, generation_id, &external_ids).await
+    }
+
+    async fn find_generation_many_conn(
+        connection: &mut sqlx::PgConnection,
+        generation_id: Id,
+        external_ids: &[String],
+    ) -> Result<Vec<CacheEntry>> {
         let response_bytes: i64 = sqlx::query_scalar(
             "WITH requested AS ( \
                  SELECT external_id, MIN(ordinal) AS ordinal \
@@ -3108,6 +3101,12 @@ impl CacheEntryRepository {
             validate_external_id(external_id)?;
         }
 
+        let namespace = CacheNamespaceRepository::find_by_id(&mut *conn, namespace_id)
+            .await?
+            .ok_or_else(|| {
+                Error::cache_snapshot_expired("cache namespace is no longer readable")
+            })?;
+        require_snapshot(&namespace)?;
         let generation = load_readable_pinned_conn(conn, namespace_id, generation_id).await?;
         let query = format!(
             "WITH candidates AS MATERIALIZED ( \
@@ -3164,30 +3163,7 @@ async fn load_readable_pinned(
     namespace_id: Id,
     generation_id: Id,
 ) -> Result<CacheGeneration> {
-    CacheEntryRepository::protect_transaction(tx, CacheTransactionMode::Read).await?;
-    let query = format!(
-        "SELECT {} FROM cache_generation g \
-         JOIN cache_namespace n ON n.id = g.namespace \
-         WHERE n.id = $1 AND g.id = $2 AND n.tombstoned_at IS NULL \
-           AND (g.state = 'active' \
-                OR (g.state = 'retired' AND (g.readable_until > NOW() \
-                     OR EXISTS (SELECT 1 FROM workflow_cache_iteration i \
-                                JOIN workflow_execution w ON w.id = i.workflow_execution \
-                                WHERE i.generation = g.id AND i.state = 'scanning' \
-                                   AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned'))))) \
-         FOR SHARE OF g",
-        qualified_columns("g", CACHE_GENERATION_SELECT_COLUMNS),
-    );
-    let readable = sqlx::query_as::<_, CacheGeneration>(&query)
-        .bind(namespace_id)
-        .bind(generation_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-    readable.ok_or_else(|| {
-        Error::cache_snapshot_expired(format!(
-            "pinned cache generation {generation_id} is no longer readable in namespace {namespace_id}"
-        ))
-    })
+    load_readable_pinned_conn(tx, namespace_id, generation_id).await
 }
 
 async fn load_readable_pinned_conn(
@@ -3196,6 +3172,10 @@ async fn load_readable_pinned_conn(
     generation_id: Id,
 ) -> Result<CacheGeneration> {
     CacheEntryRepository::protect_transaction(conn, CacheTransactionMode::Read).await?;
+    let namespace = CacheNamespaceRepository::find_by_id(&mut *conn, namespace_id)
+        .await?
+        .ok_or_else(|| Error::cache_snapshot_expired("cache namespace is no longer readable"))?;
+    require_snapshot(&namespace)?;
     let query = format!(
         "SELECT {} FROM cache_generation g \
          JOIN cache_namespace n ON n.id = g.namespace \
@@ -3236,8 +3216,8 @@ where
          (owner_type, owner_identity, owner_pack, owner_pack_ref, owner_action, owner_action_ref, \
           owner_sensor, owner_sensor_ref, definition_ref, managing_pack, managing_pack_ref, \
           namespace, freshness_target_seconds, max_records_per_generation, max_generation_bytes, \
-          max_retained_bytes, max_retained_generations, max_staging_generations, refresh_concurrency) \
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+           max_retained_bytes, max_retained_generations, max_staging_generations, refresh_concurrency, mode) \
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
          RETURNING {CACHE_NAMESPACE_SELECT_COLUMNS}"
     );
     sqlx::query_as::<_, CacheNamespace>(&query)
@@ -3260,6 +3240,7 @@ where
         .bind(input.policy.max_retained_generations)
         .bind(input.policy.max_staging_generations)
         .bind(input.policy.refresh_concurrency)
+        .bind(input.mode)
         .fetch_one(executor)
         .await
         .map_err(Into::into)
@@ -3350,6 +3331,15 @@ fn namespace_policy(namespace: &CacheNamespace) -> CacheNamespacePolicy {
     }
 }
 
+fn require_snapshot(namespace: &CacheNamespace) -> Result<()> {
+    if namespace.mode != CacheMode::Snapshot {
+        return Err(Error::CacheModeMismatch(
+            "live caches do not support snapshots, scans, or iteration".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_namespace_name(namespace: &str) -> Result<()> {
     let mut chars = namespace.chars();
     let Some(first) = chars.next() else {
@@ -3373,6 +3363,64 @@ fn validate_external_id(external_id: &str) -> Result<()> {
         return Err(Error::validation(
             "cache external_id must be nonempty and no more than 1024 bytes",
         ));
+    }
+    Ok(())
+}
+
+fn validate_mutation_input<'a>(
+    chunk_index: i32,
+    checksum: &str,
+    entries: &'a [CacheEntryInput],
+    deleted: &'a [String],
+) -> Result<Vec<&'a str>> {
+    let mut bytes = validate_chunk_input(chunk_index, checksum, entries)?;
+    if entries.len().saturating_add(deleted.len()) > MAX_INGEST_CHUNK_RECORDS {
+        return Err(Error::validation("cache mutation record limit exceeded"));
+    }
+    let mut ids = HashSet::new();
+    for entry in entries {
+        if !ids.insert(entry.external_id.as_str()) {
+            return Err(Error::cache_duplicate_external_id());
+        }
+    }
+    for id in deleted {
+        validate_external_id(id)?;
+        if !ids.insert(id.as_str()) {
+            return Err(Error::cache_duplicate_external_id());
+        }
+        bytes = bytes
+            .checked_add(id.len())
+            .ok_or_else(|| Error::validation("cache mutation is too large"))?;
+    }
+    if bytes > MAX_INGEST_CHUNK_BYTES {
+        return Err(Error::validation("cache mutation byte limit exceeded"));
+    }
+    Ok(ids.into_iter().collect())
+}
+
+async fn replace_entries_conn(
+    conn: &mut sqlx::PgConnection,
+    generation: Id,
+    entries: &[CacheEntryInput],
+    affected_ids: &[&str],
+) -> Result<()> {
+    sqlx::query("DELETE FROM cache_entry WHERE generation = $1 AND external_id = ANY($2)")
+        .bind(generation)
+        .bind(affected_ids)
+        .execute(&mut *conn)
+        .await?;
+    for batch in entries.chunks(INGEST_INSERT_BATCH_SIZE) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO cache_entry (generation, external_id, value, source_updated_at, source_checksum) ",
+        );
+        query.push_values(batch, |mut row, entry| {
+            row.push_bind(generation)
+                .push_bind(&entry.external_id)
+                .push_bind(&entry.value)
+                .push_bind(entry.source_updated_at)
+                .push_bind(entry.source_checksum.as_deref());
+        });
+        query.build().execute(&mut *conn).await?;
     }
     Ok(())
 }
@@ -3806,16 +3854,16 @@ fn push_cache_namespace_freshness_clause(
         Some(CacheNamespaceFreshnessFilter::Fresh) => {
             query.push(
                 " AND n.active_generation IS NOT NULL AND active.id IS NOT NULL \
-                 AND (n.freshness_target_seconds <= 0 OR active.activated IS NULL \
-                      OR active.activated >= NOW() \
+                 AND (n.freshness_target_seconds <= 0 OR COALESCE(n.live_updated_at, active.activated) IS NULL \
+                      OR COALESCE(n.live_updated_at, active.activated) >= NOW() \
                          - n.freshness_target_seconds * INTERVAL '1 second')",
             );
         }
         Some(CacheNamespaceFreshnessFilter::Stale) => {
             query.push(
                 " AND n.active_generation IS NOT NULL AND active.id IS NOT NULL \
-                 AND n.freshness_target_seconds > 0 AND active.activated IS NOT NULL \
-                 AND active.activated < NOW() \
+                 AND n.freshness_target_seconds > 0 AND COALESCE(n.live_updated_at, active.activated) IS NOT NULL \
+                 AND COALESCE(n.live_updated_at, active.activated) < NOW() \
                      - n.freshness_target_seconds * INTERVAL '1 second'",
             );
         }

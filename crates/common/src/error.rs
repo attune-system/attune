@@ -70,6 +70,9 @@ pub enum Error {
     #[error("Cache snapshot expired: {0}")]
     CacheSnapshotExpired(String),
 
+    #[error("Cache mode does not support this operation: {0}")]
+    CacheModeMismatch(String),
+
     /// A cache ingest chunk contains external identifiers that already exist
     /// in the target generation. Raw identifiers are intentionally omitted to
     /// avoid leaking caller data.

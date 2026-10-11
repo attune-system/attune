@@ -248,6 +248,228 @@ async fn cache_partition_count(pool: &sqlx::PgPool) -> Result<i64> {
 }
 
 #[tokio::test]
+async fn live_cache_api_mutates_replays_and_rejects_snapshot_operations() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "live_api").await?;
+    let (token, _) = register_user(&ctx, "live_writer", pack_writer_grants(&pack.r#ref)).await?;
+    let created =
+        create_namespace(&ctx, &token, &pack.r#ref, "users", json!({"mode": "live"})).await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await?;
+    assert_eq!(created["data"]["mode"], "live");
+    assert_eq!(created["data"]["revision"], 0);
+    assert!(created["data"]["active_generation"].is_null());
+    let base = "/api/v1/cache/namespaces/users";
+    let batch = json!({"owner_type": "pack", "owner_ref": pack.r#ref,
+        "request_id": "sync-1", "expected_revision": 0,
+        "entries": [{"external_id": "a", "value": {"name": "first"}}, {"external_id": "b", "value": false}],
+        "source_revision": "upstream-1"});
+    let first = ctx
+        .post(
+            &format!("{base}/entries/apply"),
+            batch.clone(),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value = first.json().await?;
+    assert_eq!(first["data"]["revision"], 1);
+    assert_eq!(first["data"]["record_count"], 2);
+    let changed = json!({"owner_type": "pack", "owner_ref": pack.r#ref,
+        "request_id": "sync-2", "expected_revision": 1,
+        "entries": [{"external_id": "a", "value": {"name": "new"}}],
+        "deleted_external_ids": ["b"], "source_revision": "upstream-2"});
+    assert_eq!(
+        ctx.post(&format!("{base}/entries/apply"), changed, Some(&token))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let replay = ctx
+        .post(
+            &format!("{base}/entries/apply"),
+            batch.clone(),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: Value = replay.json().await?;
+    assert_eq!(replay["data"]["revision"], 1);
+    assert_eq!(replay["data"]["replayed"], true);
+    let mut different = batch.clone();
+    different["entries"] = json!([]);
+    assert_eq!(
+        ctx.post(&format!("{base}/entries/apply"), different, Some(&token))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let mut stale = batch;
+    stale["request_id"] = json!("stale");
+    assert_eq!(
+        ctx.post(&format!("{base}/entries/apply"), stale, Some(&token))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let selector = json!({"owner_type": "pack", "owner_ref": pack.r#ref});
+    let mut lookup = selector.clone();
+    lookup["external_ids"] = json!(["a", "b"]);
+    let response = ctx
+        .post(
+            &format!("{base}/entries/lookup-many"),
+            lookup.clone(),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = response.json().await?;
+    assert_eq!(response["data"]["revision"], 2);
+    assert!(response["data"]["generation_id"].is_null());
+    assert_eq!(
+        response["data"]["items"][0]["value"],
+        json!({"name": "new"})
+    );
+    assert_eq!(response["data"]["missing_external_ids"], json!(["b"]));
+    lookup["generation_id"] = json!(1);
+    let pinned = ctx
+        .post(&format!("{base}/entries/lookup-many"), lookup, Some(&token))
+        .await?;
+    assert_eq!(pinned.status(), StatusCode::CONFLICT);
+    for suffix in ["entries", "generations"] {
+        let denied = ctx
+            .get(
+                &format!("{base}/{suffix}?owner_type=pack&owner_ref={}", pack.r#ref),
+                Some(&token),
+            )
+            .await?;
+        assert_eq!(denied.status(), StatusCode::CONFLICT);
+        let denied: Value = denied.json().await?;
+        assert_eq!(denied["code"], "cache_mode_mismatch");
+    }
+    let mut begin = coordination_request(&pack.r#ref, "not-a-snapshot");
+    begin["expected_active_generation_id"] = Value::Null;
+    assert_eq!(
+        ctx.post(&format!("{base}/generations"), begin, Some(&token))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let mut update = selector.clone();
+    update["mode"] = json!("snapshot");
+    assert_eq!(
+        ctx.put(base, update, Some(&token)).await?.status(),
+        StatusCode::CONFLICT
+    );
+    let shown: Value = ctx
+        .get(
+            &format!("{base}?owner_type=pack&owner_ref={}", pack.r#ref),
+            Some(&token),
+        )
+        .await?
+        .json()
+        .await?;
+    assert_eq!(shown["data"]["revision"], 2);
+    assert_eq!(shown["data"]["source_revision"], "upstream-2");
+    assert!(shown["data"]["active_generation"].is_null());
+    let namespace_id = created["data"]["id"].as_i64().unwrap();
+    sqlx::query(
+        "UPDATE cache_namespace SET live_updated_at = NOW() - interval '2 days' WHERE id = $1",
+    )
+    .bind(namespace_id)
+    .execute(&ctx.pool)
+    .await?;
+    let fresh_lookup = json!({"owner_type": "pack", "owner_ref": pack.r#ref,
+        "external_id": "a", "require_fresh": true});
+    assert_eq!(
+        ctx.post(
+            &format!("{base}/entries/lookup"),
+            fresh_lookup.clone(),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let heartbeat = json!({"owner_type": "pack", "owner_ref": pack.r#ref,
+        "request_id": "heartbeat", "expected_revision": 2});
+    assert_eq!(
+        ctx.post(&format!("{base}/entries/apply"), heartbeat, Some(&token))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let fresh: Value = ctx
+        .post(
+            &format!("{base}/entries/lookup"),
+            fresh_lookup,
+            Some(&token),
+        )
+        .await?
+        .json()
+        .await?;
+    assert_eq!(fresh["data"]["revision"], 3);
+    assert_eq!(fresh["data"]["stale"], false);
+    ctx.flush_audit().await?;
+    let events = AuditRepository::search(
+        &ctx.pool,
+        &AuditEventFilters {
+            event_type: Some("cache.live.applied".into()),
+            outcome: Some(AuditOutcome::Success),
+            resource_type: Some("cache_namespace".into()),
+            limit: Some(10),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(events.len(), 4);
+    for event in events {
+        let details = event.details.unwrap();
+        assert!(details.get("revision").is_some());
+        let text = serde_json::to_string(&details)?;
+        assert!(!text.contains("upstream-"));
+        assert!(!text.contains("external_id"));
+        assert!(!text.contains("\"name\""));
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_cache_writes_require_update_permission_and_fail_closed() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "live_authority").await?;
+    let (writer, _) = register_user(&ctx, "live_owner", pack_writer_grants(&pack.r#ref)).await?;
+    create_namespace(&ctx, &writer, &pack.r#ref, "users", json!({"mode": "live"})).await?;
+    let (reader, _) = register_user(
+        &ctx,
+        "live_reader",
+        json!([{"resource": "caches", "actions": ["read"],
+        "constraints": {"owner_types": ["pack"], "owner_refs": [pack.r#ref]}}]),
+    )
+    .await?;
+    let batch = json!({"owner_type": "pack", "owner_ref": pack.r#ref, "request_id": "denied", "expected_revision": 0,
+        "entries": [{"external_id": "a", "value": true}]});
+    for namespace in ["users", "missing"] {
+        let path = format!("/api/v1/cache/namespaces/{namespace}/entries/apply");
+        assert_eq!(
+            ctx.post(&path, batch.clone(), Some(&reader))
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ctx.post(&path, batch.clone(), None).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn partition_cap_preserves_matching_retry_and_reuse_without_extra_storage() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new_with_cache_admission(CacheAdmissionConfig {
@@ -1546,6 +1768,7 @@ async fn pack_managed_namespace_metadata_is_read_only_through_the_api() -> Resul
         pack.id,
         &pack.r#ref,
         &[ManagedCacheNamespaceDefinition {
+            mode: Default::default(),
             definition_ref: definition_ref.clone(),
             owner: CacheOwnerScope::pack(pack.id, Some(pack.r#ref.clone())),
             namespace: "users".to_string(),
@@ -1746,6 +1969,7 @@ async fn cache_list_without_owner_returns_every_accessible_scope() -> Result<()>
         CacheNamespaceRepository::create(
             &ctx.pool,
             CreateCacheNamespaceInput {
+                mode: Default::default(),
                 owner,
                 namespace: namespace.to_string(),
                 policy: CacheNamespacePolicy::default(),

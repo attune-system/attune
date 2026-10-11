@@ -13,9 +13,9 @@ Do not use `key` records as a record cache. Keep them for small configuration
 values and secrets. Add a dedicated, owner-scoped cache model for queryable
 external records such as Salesforce Users.
 
-A **Data Cache** is an Attune-local, reconstructable automation snapshot of
+A **Data Cache** is an Attune-local, reconstructable collection of
 data whose authoritative copy lives elsewhere. It exists so actions, workflow
-tasks, and sensors can repeatedly consume a coherent published snapshot
+tasks, and sensors can repeatedly consume local records
 without overloading or depending on the latency of the source system. A cache
 must be rebuildable from that source or another durable, versioned export.
 
@@ -56,9 +56,9 @@ The design must preserve these invariants:
 - **Canonical ownership:** API-facing owner refs are resolved to canonical
   owner IDs before storage and authorization. Renames or stale denormalized
   refs must not create a second logical owner or bypass an owner constraint.
-- **Coherent reads:** a workload can enumerate all entries from one published
+- **Coherent snapshot reads:** a workload can enumerate all entries from one published
   snapshot even while a newer refresh is being prepared or promoted.
-- **Atomic publication:** a failed or incomplete refresh is never visible, and
+- **Atomic snapshot publication:** a failed or incomplete refresh is never visible, and
   a slow writer cannot replace a newer completed refresh accidentally.
 - **Least privilege:** cache data can contain sensitive business information,
   but it is not a credential store. Access is explicit, scoped, auditable, and
@@ -94,7 +94,86 @@ namespace scan, and retains the ambient secret-injection behavior.
 
 ## Recommended Data Model
 
-Model the cache as an owner-scoped collection with immutable generations.
+### Durable live mode
+
+Create a namespace with `mode: live` to maintain a mutable collection in
+PostgreSQL. The mode cannot change later, including through pack reloads.
+Contents survive service and database restarts. The cache is still derived
+data, not a replacement for its authoritative upstream system.
+
+The first successful batch creates one internal backing generation and LIST
+partition. Later batches reuse it. Live namespace responses hide its storage
+ID, return `active_generation: null`, and expose `revision`, record/byte totals,
+`source_revision`, and `last_refreshed_at`. An unwritten live namespace has
+revision zero and remains `cache_not_populated` until its first batch commits.
+
+`POST /api/v1/cache/namespaces/{namespace}/entries/apply` accepts:
+
+```json
+{
+  "owner_type": "pack",
+  "owner_ref": "salesforce",
+  "request_id": "users-sync-42",
+  "expected_revision": 0,
+  "entries": [{"external_id": "user-1", "value": {"name": "Alex"}}],
+  "deleted_external_ids": ["user-2"],
+  "source_revision": "upstream-cursor-42"
+}
+```
+
+- Upserts replace complete values by `external_id`. Deleting a missing ID is
+  harmless. Duplicate IDs, including an ID in both lists, reject the batch.
+- At most 10,000 changed records and a 4 MiB request body are accepted. Existing
+  per-record, namespace, owner and deployment quotas still apply. The fields
+  `max_records_per_generation` and `max_generation_bytes` cap the live collection;
+  snapshot staging/retention-count policies do not create extra live generations.
+- Record changes, exact byte accounting, revision advancement, the optional
+  upstream cursor, and retry metadata commit atomically. Quota or validation
+  failures roll everything back. Omitted/null `source_revision` retains the
+  current cursor. An empty batch may advance the cursor and freshness timestamp.
+- `expected_revision` is mandatory and must match the current namespace revision.
+  Success increments it once and returns the new revision and collection totals.
+  A conflicting writer gets HTTP 409 and must re-read metadata before deciding
+  whether to recompute its batch. Do not blindly change the revision on an old batch.
+- Retry the same request ID with identical JSON bytes. Matching retries return
+  the original result with `replayed: true`, even if newer batches have committed.
+  Changed content conflicts. Receipts retain at most the last 10,000 batches for
+  up to 24 hours, pruned on writes. The revision guard rejects stale retries after
+  receipt expiry/eviction, rather than reapplying old data.
+- Exact and bounded multi-ID lookups return the current records and `revision`,
+  with `generation_id: null`. Each request is coherent, but separate requests
+  can observe different revisions. Freshness measures the last committed batch.
+  Namespace lists are advisory during concurrent writes; use namespace detail
+  or lookup responses when pairing a revision with current collection metadata.
+- Live caches reject pinned-generation selectors, scans, generation metadata
+  endpoints, begin/clone/seal/promote, and `iterate_cache`. The API returns
+  `cache_mode_mismatch` for incompatible operations. Workflow initialization
+  fails with `live_namespace_not_iterable`, before creating an iteration pin or
+  dispatching record children.
+- Namespace deletion tombstones access immediately and reclaims the partition
+  through existing bounded retention. Normal writes never retire the live backing
+  generation. PostgreSQL still incurs WAL, dead tuples, and vacuum work.
+
+Use `caches:update` for batches and `caches:read` for lookups, subject to the
+same owner/namespace constraints and execution/sensor authority as snapshots.
+Audit details contain totals and revisions, never record values or upstream cursors.
+
+```bash
+attune cache namespace create users --owner-type pack --owner-pack-ref salesforce --mode live
+attune cache entry apply users --owner-type pack --owner-pack-ref salesforce \
+  --request-id users-sync-42 --expected-revision 0 --file changed-users.ndjson \
+  --delete-external-id user-2 --source-revision upstream-cursor-42
+```
+
+The CLI applies one bounded NDJSON batch, not an implicit multi-batch refresh.
+`--file -` reads stdin. MCP exposes `cache_live_apply` with the same fields.
+The web UI offers live namespace creation and ID lookups, and hides snapshot
+refresh/generation tabs and cursor browsing for live namespaces.
+
+### Snapshot storage
+
+Model the cache as an owner-scoped collection. Its immutable `mode` selects
+published snapshots or a durable mutable live collection. Snapshot is the default.
 Use the same owner semantics as keys so a cache can be scoped to a pack,
 action, sensor, identity, or the system. The cache's logical scope is its
 owner, not an arbitrary free-form string.
@@ -106,6 +185,8 @@ cache_namespace
   denormalized owner refs for display/token matching
   optional definition_ref + managing_pack/managing_pack_ref provenance
   namespace
+  mode: snapshot | live -- immutable
+  live_revision, live_updated_at -- live batch progress
   active_generation
   freshness_target_seconds
   max_records_per_generation, max_generation_bytes

@@ -27,6 +27,7 @@ async fn fixture() -> (TestDatabase, i64) {
     let namespace = CacheNamespaceRepository::create_api_with_policy(
         db.pool(),
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::system(),
             namespace: "cleanup-budget".into(),
             policy: CacheNamespacePolicy::default(),

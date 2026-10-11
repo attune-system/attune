@@ -109,6 +109,7 @@ impl Fixture {
         let namespace = CacheNamespaceRepository::create(
             pool,
             CreateCacheNamespaceInput {
+                mode: Default::default(),
                 owner: CacheOwnerScope::system(),
                 namespace: format!("cascade_{}", helpers::unique_test_id()),
                 policy: CacheNamespacePolicy::default(),

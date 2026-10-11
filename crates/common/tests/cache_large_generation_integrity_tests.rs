@@ -433,6 +433,7 @@ async fn verify_large_generation(pool: &PgPool) -> Result<()> {
     let namespace = CacheNamespaceRepository::create(
         pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::system(),
             namespace: "large-integrity".into(),
             policy: CacheNamespacePolicy {

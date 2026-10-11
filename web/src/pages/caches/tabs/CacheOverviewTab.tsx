@@ -40,7 +40,11 @@ export default function CacheOverviewTab({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteNamespace = useDeleteCacheNamespace();
-  const generationsQuery = useCacheGenerations(owner, namespace.namespace);
+  const live = namespace.mode === "live";
+  const generationsQuery = useCacheGenerations(
+    live ? undefined : owner,
+    namespace.namespace,
+  );
 
   const canDelete = hasPermission(user, "caches", "delete");
 
@@ -95,45 +99,54 @@ export default function CacheOverviewTab({
             </p>
           </div>
         )}
-        <PolicyRow
-          label="Refresh concurrency"
-          value={namespace.refresh_concurrency}
-        />
+        <PolicyRow label="Mode" value={namespace.mode} />
+        {!live && (
+          <PolicyRow
+            label="Refresh concurrency"
+            value={namespace.refresh_concurrency}
+          />
+        )}
         <PolicyRow
           label="Freshness target"
           value={formatFreshnessTarget(namespace.freshness_target_seconds)}
         />
         <PolicyRow
-          label="Max records / generation"
+          label={live ? "Max records" : "Max records / generation"}
           value={formatRecordCount(namespace.max_records_per_generation)}
         />
         <PolicyRow
-          label="Max generation bytes"
+          label={live ? "Max collection bytes" : "Max generation bytes"}
           value={formatBytes(namespace.max_generation_bytes)}
         />
         <PolicyRow
           label="Max retained bytes"
           value={formatBytes(namespace.max_retained_bytes)}
         />
-        <PolicyRow
-          label="Max retained generations"
-          value={String(namespace.max_retained_generations)}
-        />
-        <PolicyRow
-          label="Max concurrent staging generations"
-          value={String(namespace.max_staging_generations)}
-        />
+        {!live && (
+          <>
+            <PolicyRow
+              label="Max retained generations"
+              value={String(namespace.max_retained_generations)}
+            />
+            <PolicyRow
+              label="Max concurrent staging generations"
+              value={String(namespace.max_staging_generations)}
+            />
+          </>
+        )}
       </div>
 
       <div className="rounded-lg bg-white p-5 shadow">
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
-          Active generation
+          {live ? "Live collection" : "Active generation"}
         </h2>
         {!namespace.cache_not_populated ? (
           <>
             <div className="mb-3 flex items-center gap-2">
               <span className="font-mono text-sm text-gray-900">
-                #{namespace.active_generation}
+                {live
+                  ? `Revision ${namespace.revision}`
+                  : `#${namespace.active_generation}`}
               </span>
               {namespace.stale && namespace.freshness_target_seconds > 0 && (
                 <span className="inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
@@ -169,8 +182,9 @@ export default function CacheOverviewTab({
           </>
         ) : (
           <p className="text-sm text-gray-500">
-            No generation has been published yet. This namespace is
-            uninitialized — use the Refresh tab to publish the first generation.
+            {live
+              ? "No live batch has committed yet. Apply the first batch through the API, CLI, or MCP."
+              : "No generation has been published yet. Use the Refresh tab to publish the first generation."}
           </p>
         )}
       </div>

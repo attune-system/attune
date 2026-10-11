@@ -29,6 +29,130 @@ fn command_with_output(fixture: &TestFixture, output: &str) -> Command {
 }
 
 #[tokio::test]
+async fn live_namespace_mode_is_sent_when_selected_and_retained_in_metadata() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("token", "refresh");
+    Mock::given(method("POST")).and(path("/api/v1/cache/namespaces"))
+        .and(body_json(json!({"owner_type": "system", "namespace": "users", "mode": "live"})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {
+            "id": 1, "namespace": "users", "owner_type": "system", "mode": "live", "revision": 0, "source_revision": null, "refresh_concurrency": "parallel"}})))
+        .expect(1).mount(&fixture.mock_server).await;
+    let output = command(&fixture)
+        .args([
+            "cache",
+            "namespace",
+            "create",
+            "users",
+            "--owner-type",
+            "system",
+            "--mode",
+            "live",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["mode"], "live");
+    assert_eq!(response["revision"], 0);
+}
+
+#[tokio::test]
+async fn live_apply_accepts_complete_record_upserts_from_stdin() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("token", "refresh");
+    Mock::given(method("POST")).and(path("/api/v1/cache/namespaces/users/entries/apply"))
+        .and(body_json(json!({"owner_type": "system", "request_id": "sync-1", "expected_revision": 0,
+            "entries": [{"external_id": "a", "value": {"name": "Alex"}, "source_updated_at": null, "source_checksum": null}],
+            "deleted_external_ids": [], "source_revision": null})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"revision": 1}})))
+        .expect(1).mount(&fixture.mock_server).await;
+    command(&fixture)
+        .args([
+            "cache",
+            "entry",
+            "apply",
+            "users",
+            "--owner-type",
+            "system",
+            "--request-id",
+            "sync-1",
+            "--expected-revision",
+            "0",
+            "--file",
+            "-",
+        ])
+        .write_stdin("{\"external_id\":\"a\",\"value\":{\"name\":\"Alex\"}}\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"revision\": 1"));
+}
+
+#[tokio::test]
+async fn live_apply_sends_atomic_delta_and_reports_revision() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("token", "refresh");
+    Mock::given(method("POST"))
+        .and(path("/api/v1/cache/namespaces/users/entries/apply"))
+        .and(body_json(json!({"owner_type": "system", "request_id": "sync-2", "expected_revision": 1,
+            "entries": [], "deleted_external_ids": ["removed"], "source_revision": "cursor-2"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "revision": 2, "record_count": 0, "size_bytes": 0, "source_revision": "cursor-2", "replayed": false}})))
+        .expect(1).mount(&fixture.mock_server).await;
+    let output = command(&fixture)
+        .args([
+            "cache",
+            "entry",
+            "apply",
+            "users",
+            "--owner-type",
+            "system",
+            "--request-id",
+            "sync-2",
+            "--expected-revision",
+            "1",
+            "--delete-external-id",
+            "removed",
+            "--source-revision",
+            "cursor-2",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["revision"], 2);
+}
+
+#[tokio::test]
+async fn live_lookup_accepts_revision_without_exposing_backing_generation() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("token", "refresh");
+    Mock::given(method("POST"))
+        .and(path("/api/v1/cache/namespaces/users/entries/lookup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "generation_id": null, "revision": 4, "item": null, "stale": false}})))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    command(&fixture)
+        .args([
+            "cache",
+            "entry",
+            "get",
+            "users",
+            "missing",
+            "--owner-type",
+            "system",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"revision\": 4"));
+}
+
+#[tokio::test]
 async fn generation_show_and_list_display_creator_execution_in_json_and_table() {
     for output in ["json", "table"] {
         for operation in ["show", "list"] {

@@ -17,6 +17,7 @@ use crate::dto::{
         RegisterRequest, TokenLoginRequest, TokenResponse, UpdateCurrentUserRequest,
     },
     cache::{
+        ApplyLiveCacheApiResponse, ApplyLiveCacheRequest, ApplyLiveCacheResponse,
         CacheEntryResponse, CacheEntryUpload, CacheForbiddenResponse, CacheGenerationApiResponse,
         CacheGenerationListApiResponse, CacheGenerationListResponse, CacheGenerationResponse,
         CacheMultiLookupApiResponse, CacheMultiLookupRequest, CacheMultiLookupResponse,
@@ -320,6 +321,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::cache::show_generation,
         crate::routes::cache::lookup_entry,
         crate::routes::cache::lookup_entries,
+        crate::routes::cache::apply_live_entries,
         crate::routes::cache::scan_entries,
         crate::routes::cache::create_generation,
         crate::routes::cache::upload_chunk,
@@ -702,6 +704,9 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
             // Cache DTOs
             CreateCacheNamespaceRequest,
+            ApplyLiveCacheRequest,
+            ApplyLiveCacheResponse,
+            ApplyLiveCacheApiResponse,
             UpdateCacheNamespaceRequest,
             CacheNamespacePolicyBody,
             CacheNamespaceFreshness,

@@ -2,6 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ApplyLiveCacheApiResponse } from "../models/ApplyLiveCacheApiResponse";
+import type { ApplyLiveCacheRequest } from "../models/ApplyLiveCacheRequest";
 import type { CacheGenerationApiResponse } from "../models/CacheGenerationApiResponse";
 import type { CacheGenerationListApiResponse } from "../models/CacheGenerationListApiResponse";
 import type { CacheMultiLookupApiResponse } from "../models/CacheMultiLookupApiResponse";
@@ -274,6 +276,40 @@ export class CachesService {
         404: `Namespace not found`,
         409: `Cache is stale, unpopulated, deleted, or the snapshot expired`,
         500: `Cache scan failed`,
+      },
+    });
+  }
+  /**
+   * Applies one atomic live-cache batch with optimistic concurrency and bounded retries.
+   * @returns ApplyLiveCacheApiResponse Committed batch or identical replay
+   * @throws ApiError
+   */
+  public static applyLiveEntries({
+    namespace,
+    requestBody,
+  }: {
+    /**
+     * Live cache namespace
+     */
+    namespace: string;
+    requestBody: ApplyLiveCacheRequest;
+  }): CancelablePromise<ApplyLiveCacheApiResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/cache/namespaces/{namespace}/entries/apply",
+      path: {
+        namespace: namespace,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid bounded mutation request`,
+        401: `Authentication required`,
+        403: `Namespace is not writable`,
+        404: `Namespace not found`,
+        409: `Mode, revision, retry-content or quota conflict`,
+        500: `Mutation failed`,
+        503: `Cache storage is busy`,
       },
     });
   }

@@ -3196,6 +3196,7 @@ impl TransactionalPackComponentLoader<'_> {
             loaded_refs.push(definition.r#ref.clone());
             let policy = definition.policy();
             definitions.push(ManagedCacheNamespaceDefinition {
+                mode: definition.mode,
                 definition_ref: definition.r#ref,
                 owner,
                 namespace: definition.namespace,

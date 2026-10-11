@@ -2,6 +2,7 @@ import { useState } from "react";
 import { X } from "lucide-react";
 import {
   CacheRefreshConcurrency,
+  CacheMode,
   OwnerType,
   type CacheNamespaceResponse,
 } from "@/api";
@@ -44,6 +45,7 @@ export default function CacheNamespaceCreateModal({
     ownerRef: "",
   });
   const [namespace, setNamespace] = useState("");
+  const [mode, setMode] = useState(CacheMode.SNAPSHOT);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [policy, setPolicy] = useState(DEFAULT_POLICY);
   const [error, setError] = useState<string | null>(null);
@@ -81,6 +83,7 @@ export default function CacheNamespaceCreateModal({
         owner_type: owner.ownerType,
         owner_ref: requiresOwnerRef ? owner.ownerRef : undefined,
         namespace,
+        mode,
         ...policy,
       });
       onCreated(response.data);
@@ -113,6 +116,37 @@ export default function CacheNamespaceCreateModal({
           )}
 
           <OwnerScopeSelector value={owner} onChange={setOwner} />
+          <div>
+            <label
+              htmlFor="cache-mode"
+              className="block text-sm font-medium text-gray-700"
+            >
+              Mode
+            </label>
+            <select
+              id="cache-mode"
+              value={mode}
+              onChange={(event) =>
+                setMode(
+                  event.target.value === CacheMode.LIVE
+                    ? CacheMode.LIVE
+                    : CacheMode.SNAPSHOT,
+                )
+              }
+              className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2"
+            >
+              <option value={CacheMode.SNAPSHOT}>
+                Snapshot, immutable published generations
+              </option>
+              <option value={CacheMode.LIVE}>
+                Live, durable mutable records
+              </option>
+            </select>
+            <p className="mt-1 text-xs text-gray-500">
+              Fixed at creation. Live caches support ID lookups and atomic
+              mutations, not scans or workflow iteration.
+            </p>
+          </div>
 
           <div>
             <label className="block text-sm font-medium text-gray-700">
@@ -131,12 +165,14 @@ export default function CacheNamespaceCreateModal({
             </p>
           </div>
 
-          <CacheRefreshConcurrencySelect
-            value={policy.refresh_concurrency}
-            onChange={(value) =>
-              setPolicy((prev) => ({ ...prev, refresh_concurrency: value }))
-            }
-          />
+          {mode === CacheMode.SNAPSHOT && (
+            <CacheRefreshConcurrencySelect
+              value={policy.refresh_concurrency}
+              onChange={(value) =>
+                setPolicy((prev) => ({ ...prev, refresh_concurrency: value }))
+              }
+            />
+          )}
 
           <div>
             <button
@@ -162,7 +198,11 @@ export default function CacheNamespaceCreateModal({
                 }
               />
               <NumberField
-                label="Max records per generation"
+                label={
+                  mode === CacheMode.LIVE
+                    ? "Max records"
+                    : "Max records per generation"
+                }
                 value={policy.max_records_per_generation}
                 onChange={(value) =>
                   setPolicy((prev) => ({
@@ -172,7 +212,11 @@ export default function CacheNamespaceCreateModal({
                 }
               />
               <NumberField
-                label="Max generation bytes"
+                label={
+                  mode === CacheMode.LIVE
+                    ? "Max collection bytes"
+                    : "Max generation bytes"
+                }
                 value={policy.max_generation_bytes}
                 onChange={(value) =>
                   setPolicy((prev) => ({
@@ -188,27 +232,31 @@ export default function CacheNamespaceCreateModal({
                   setPolicy((prev) => ({ ...prev, max_retained_bytes: value }))
                 }
               />
-              <NumberField
-                label="Max retained generations"
-                min={MIN_RETAINED_GENERATIONS}
-                value={policy.max_retained_generations}
-                onChange={(value) =>
-                  setPolicy((prev) => ({
-                    ...prev,
-                    max_retained_generations: value,
-                  }))
-                }
-              />
-              <NumberField
-                label="Max concurrent staging generations"
-                value={policy.max_staging_generations}
-                onChange={(value) =>
-                  setPolicy((prev) => ({
-                    ...prev,
-                    max_staging_generations: value,
-                  }))
-                }
-              />
+              {mode === CacheMode.SNAPSHOT && (
+                <>
+                  <NumberField
+                    label="Max retained generations"
+                    min={MIN_RETAINED_GENERATIONS}
+                    value={policy.max_retained_generations}
+                    onChange={(value) =>
+                      setPolicy((prev) => ({
+                        ...prev,
+                        max_retained_generations: value,
+                      }))
+                    }
+                  />
+                  <NumberField
+                    label="Max concurrent staging generations"
+                    value={policy.max_staging_generations}
+                    onChange={(value) =>
+                      setPolicy((prev) => ({
+                        ...prev,
+                        max_staging_generations: value,
+                      }))
+                    }
+                  />
+                </>
+              )}
             </div>
           )}
 

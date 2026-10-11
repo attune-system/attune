@@ -47,6 +47,7 @@ use tempfile::TempDir;
 
 fn namespace_input(namespace: String, policy: CacheNamespacePolicy) -> CreateCacheNamespaceInput {
     CreateCacheNamespaceInput {
+        mode: Default::default(),
         owner: CacheOwnerScope::system(),
         namespace,
         policy,
@@ -1870,6 +1871,7 @@ async fn refresh_managed_policy_updates_preserve_existing_generations() {
         .await
         .unwrap();
     let mut definition = ManagedCacheNamespaceDefinition {
+        mode: Default::default(),
         definition_ref: format!("{}.catalog", pack.r#ref),
         owner: CacheOwnerScope::pack(pack.id, Some(pack.r#ref.clone())),
         namespace: "catalog".into(),
@@ -2047,6 +2049,7 @@ async fn owner_constraints_and_canonical_owner_namespace_uniqueness() {
     assert!(CacheNamespaceRepository::create(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: invalid_owner,
             namespace: format!("invalid_{}", unique_test_id()),
             policy: CacheNamespacePolicy::default(),
@@ -3458,12 +3461,14 @@ async fn managed_namespace_admission_is_atomic_and_updates_remain_idempotent() {
         ..CacheAdmissionConfig::default()
     };
     let first_definition = ManagedCacheNamespaceDefinition {
+        mode: Default::default(),
         definition_ref: format!("{}.catalog", first_pack.r#ref),
         owner: CacheOwnerScope::pack(first_pack.id, Some(first_pack.r#ref.clone())),
         namespace: format!("managed_race_a_{}", unique_test_id()),
         policy: CacheNamespacePolicy::default(),
     };
     let second_definition = ManagedCacheNamespaceDefinition {
+        mode: Default::default(),
         definition_ref: format!("{}.catalog", second_pack.r#ref),
         owner: CacheOwnerScope::pack(second_pack.id, Some(second_pack.r#ref.clone())),
         namespace: format!("managed_race_b_{}", unique_test_id()),
@@ -4324,6 +4329,7 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
     let api_namespace = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::pack(pack.id, Some(pack_ref.clone())),
             namespace: "api_catalog".to_string(),
             policy: CacheNamespacePolicy::default(),
@@ -4388,6 +4394,7 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
     let api_action_namespace = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::action(action.id, Some(action_ref.clone())),
             namespace: "api_action".to_string(),
             policy: CacheNamespacePolicy::default(),
@@ -4398,6 +4405,7 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
     let api_sensor_namespace = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::sensor(sensor.id, Some(sensor_ref.clone())),
             namespace: "api_sensor".to_string(),
             policy: CacheNamespacePolicy::default(),
@@ -4500,6 +4508,7 @@ async fn component_retirement_rolls_back_when_retirement_fails() {
     let action_namespace = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::action(action.id, Some(action_ref.clone())),
             namespace: "action_data".to_string(),
             policy: CacheNamespacePolicy::default(),
@@ -4510,6 +4519,7 @@ async fn component_retirement_rolls_back_when_retirement_fails() {
     let sensor_namespace = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::sensor(sensor.id, Some(sensor_ref.clone())),
             namespace: "sensor_data".to_string(),
             policy: CacheNamespacePolicy::default(),
@@ -4603,6 +4613,7 @@ async fn managed_cache_definition_identity_is_immutable() {
         .unwrap();
     let definition_ref = format!("{}.catalog", pack.r#ref);
     let initial = ManagedCacheNamespaceDefinition {
+        mode: Default::default(),
         definition_ref: definition_ref.clone(),
         owner: CacheOwnerScope::pack(pack.id, Some(pack.r#ref.clone())),
         namespace: "catalog".to_string(),
@@ -4695,6 +4706,7 @@ async fn direct_action_and_sensor_deletion_tombstones_owned_caches() {
     let action_namespace = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::action(action.id, Some(action_ref.clone())),
             namespace: "action_data".to_string(),
             policy: CacheNamespacePolicy::default(),
@@ -4705,6 +4717,7 @@ async fn direct_action_and_sensor_deletion_tombstones_owned_caches() {
     let sensor_namespace = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::sensor(sensor.id, Some(sensor_ref.clone())),
             namespace: "sensor_data".to_string(),
             policy: CacheNamespacePolicy::default(),
@@ -4795,6 +4808,7 @@ async fn pack_deletion_tombstones_owned_caches_without_synchronous_drain() {
         pack.id,
         &pack_ref,
         &[ManagedCacheNamespaceDefinition {
+            mode: Default::default(),
             definition_ref: definition_ref.clone(),
             owner: CacheOwnerScope::pack(pack.id, Some(pack_ref.clone())),
             namespace: "managed".to_string(),
@@ -4813,6 +4827,7 @@ async fn pack_deletion_tombstones_owned_caches_without_synchronous_drain() {
     let api_action = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::action(action.id, Some(action_ref.clone())),
             namespace: "api_action".to_string(),
             policy: CacheNamespacePolicy::default(),
@@ -4823,6 +4838,7 @@ async fn pack_deletion_tombstones_owned_caches_without_synchronous_drain() {
     let api_sensor = CacheNamespaceRepository::create_api(
         &pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::sensor(sensor.id, Some(sensor_ref.clone())),
             namespace: "api_sensor".to_string(),
             policy: CacheNamespacePolicy::default(),

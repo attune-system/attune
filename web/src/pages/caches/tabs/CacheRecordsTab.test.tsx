@@ -62,6 +62,24 @@ beforeEach(() => {
 });
 
 describe("CacheRecordsTab", () => {
+  it("keeps ID lookups but disables scans for live caches", () => {
+    render(
+      <CacheRecordsTab
+        owner={{ ownerType: OwnerType.SYSTEM }}
+        namespaceName="users"
+        live
+      />,
+      { wrapper: createWrapper() },
+    );
+    expect(screen.getByRole("button", { name: "Look up" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Start browsing" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/Live caches cannot be scanned or iterated/),
+    ).toBeInTheDocument();
+    expect(scanEntries).not.toHaveBeenCalled();
+  });
   it("refetches current generation after an expired pinned traversal", async () => {
     const user = userEvent.setup();
     scanEntries

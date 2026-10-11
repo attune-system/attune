@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
+from ..models.cache_mode import CacheMode
 from ..models.cache_refresh_concurrency import CacheRefreshConcurrency
 from ..models.owner_type import OwnerType
 from ..types import UNSET, Unset
@@ -30,6 +31,7 @@ class UpdateCacheNamespaceRequest:
                 readers can complete traversal of the prior snapshot after promotion. Example: 2.
             max_staging_generations (int | None | Unset):
             refresh_concurrency (CacheRefreshConcurrency | None | Unset):
+            mode (CacheMode | None | Unset):
             owner_ref (None | str | Unset):
     """
 
@@ -41,6 +43,7 @@ class UpdateCacheNamespaceRequest:
     max_retained_generations: int | None | Unset = UNSET
     max_staging_generations: int | None | Unset = UNSET
     refresh_concurrency: CacheRefreshConcurrency | None | Unset = UNSET
+    mode: CacheMode | None | Unset = UNSET
     owner_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -91,6 +94,14 @@ class UpdateCacheNamespaceRequest:
         else:
             refresh_concurrency = self.refresh_concurrency
 
+        mode: None | str | Unset
+        if isinstance(self.mode, Unset):
+            mode = UNSET
+        elif isinstance(self.mode, CacheMode):
+            mode = self.mode.value
+        else:
+            mode = self.mode
+
         owner_ref: None | str | Unset
         if isinstance(self.owner_ref, Unset):
             owner_ref = UNSET
@@ -118,6 +129,8 @@ class UpdateCacheNamespaceRequest:
             field_dict["max_staging_generations"] = max_staging_generations
         if refresh_concurrency is not UNSET:
             field_dict["refresh_concurrency"] = refresh_concurrency
+        if mode is not UNSET:
+            field_dict["mode"] = mode
         if owner_ref is not UNSET:
             field_dict["owner_ref"] = owner_ref
 
@@ -215,6 +228,23 @@ class UpdateCacheNamespaceRequest:
             d.pop("refresh_concurrency", UNSET)
         )
 
+        def _parse_mode(data: object) -> CacheMode | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                mode_type_1 = CacheMode(data)
+
+                return mode_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CacheMode | None | Unset, data)
+
+        mode = _parse_mode(d.pop("mode", UNSET))
+
         def _parse_owner_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -233,6 +263,7 @@ class UpdateCacheNamespaceRequest:
             max_retained_generations=max_retained_generations,
             max_staging_generations=max_staging_generations,
             refresh_concurrency=refresh_concurrency,
+            mode=mode,
             owner_ref=owner_ref,
         )
 

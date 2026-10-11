@@ -8,7 +8,8 @@ import type { i64 } from "./i64";
  * Point lookup response. `item = None` is an authorized miss.
  */
 export type CachePointLookupResponse = {
-  generation_id: i64;
+  generation_id: null | i64;
   item: null | CacheEntryResponse;
+  revision: number | null;
   stale: boolean;
 };

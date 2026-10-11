@@ -466,7 +466,7 @@ async fn observe_namespace_metrics(
             .saturating_add(1);
         return Ok(());
     };
-    let Some(activated) = active.activated else {
+    let Some(activated) = namespace.live_updated_at.or(active.activated) else {
         summary.namespaces_without_active_generation = summary
             .namespaces_without_active_generation
             .saturating_add(1);
@@ -503,7 +503,7 @@ async fn maybe_emit_freshness_alert(
     let Some(active) = CacheGenerationRepository::find_by_id(ctx.pool, active_id).await? else {
         return Ok(false);
     };
-    let Some(activated) = active.activated else {
+    let Some(activated) = namespace.live_updated_at.or(active.activated) else {
         return Ok(false);
     };
 
@@ -950,6 +950,7 @@ mod tests {
         CacheNamespaceRepository::create(
             pool,
             CreateCacheNamespaceInput {
+                mode: Default::default(),
                 owner: CacheOwnerScope::system(),
                 namespace: format!("ns_{}", unique_test_id()),
                 policy,

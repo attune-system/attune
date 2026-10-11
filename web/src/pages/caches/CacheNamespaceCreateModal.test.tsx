@@ -38,6 +38,31 @@ beforeEach(() => {
 });
 
 describe("CacheNamespaceCreateModal", () => {
+  it("creates a live namespace without snapshot refresh controls", async () => {
+    const user = userEvent.setup();
+    render(
+      <CacheNamespaceCreateModal onClose={vi.fn()} onCreated={vi.fn()} />,
+      { wrapper: createWrapper() },
+    );
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Mode" }),
+      "live",
+    );
+    expect(
+      screen.queryByRole("combobox", { name: "Refresh concurrency" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "System owner" }));
+    await user.type(screen.getByPlaceholderText("e.g. users"), "users");
+    await user.click(screen.getByRole("button", { name: "Create Namespace" }));
+    await waitFor(() =>
+      expect(createNamespace).toHaveBeenCalledWith({
+        requestBody: expect.objectContaining({
+          mode: "live",
+          namespace: "users",
+        }),
+      }),
+    );
+  });
   it.each(Object.values(CacheRefreshConcurrency))(
     "creates with flat %s policy",
     async (mode) => {

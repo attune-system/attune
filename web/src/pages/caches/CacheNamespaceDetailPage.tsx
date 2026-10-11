@@ -36,7 +36,7 @@ export default function CacheNamespaceDetailPage() {
     namespace: string;
   }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const activeTab = (searchParams.get("tab") as TabKey) || "overview";
+  const requestedTab = searchParams.get("tab");
 
   const owner = useMemo(
     () => parseOwnerRouteParams(ownerType, ownerRef),
@@ -63,6 +63,12 @@ export default function CacheNamespaceDetailPage() {
   }
 
   const data = namespaceQuery.data?.data;
+  const live = data?.mode === "live";
+  const tabs = TABS.filter(
+    ({ key }) => !live || key === "overview" || key === "records",
+  );
+  const activeTab =
+    tabs.find(({ key }) => key === requestedTab)?.key ?? "overview";
   const status = data ? computeNamespaceStatus(data) : undefined;
   const badge = status ? getNamespaceStatusBadge(status) : undefined;
 
@@ -106,7 +112,7 @@ export default function CacheNamespaceDetailPage() {
         <>
           <div className="mb-6 border-b border-gray-200">
             <nav className="-mb-px flex space-x-8">
-              {TABS.map(({ key, label, icon: Icon }) => (
+              {tabs.map(({ key, label, icon: Icon }) => (
                 <button
                   key={key}
                   onClick={() => setTab(key)}
@@ -136,7 +142,11 @@ export default function CacheNamespaceDetailPage() {
                 <CacheOverviewTab owner={owner} namespace={data} />
               )}
               {activeTab === "records" && (
-                <CacheRecordsTab owner={owner} namespaceName={namespace} />
+                <CacheRecordsTab
+                  owner={owner}
+                  namespaceName={namespace}
+                  live={live}
+                />
               )}
               {activeTab === "generations" && (
                 <CacheGenerationsTab owner={owner} namespaceName={namespace} />

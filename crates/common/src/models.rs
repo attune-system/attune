@@ -362,6 +362,18 @@ pub mod enums {
         Sensor,
     }
 
+    /// Cache mutation contract, fixed when the namespace is created.
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
+    )]
+    #[sqlx(type_name = "cache_mode_enum", rename_all = "lowercase")]
+    #[serde(rename_all = "lowercase")]
+    pub enum CacheMode {
+        #[default]
+        Snapshot,
+        Live,
+    }
+
     /// Admission behavior when a namespace has an unpublished refresh.
     #[derive(
         Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
@@ -2095,6 +2107,9 @@ pub mod cache {
         pub managing_pack_ref: Option<String>,
         pub namespace: String,
         pub active_generation: Option<Id>,
+        pub mode: CacheMode,
+        pub live_revision: i64,
+        pub live_updated_at: Option<DateTime<Utc>>,
         pub consecutive_refresh_failures: i32,
         pub last_refresh_failure_at: Option<DateTime<Utc>>,
         pub freshness_target_seconds: i64,
@@ -2114,7 +2129,7 @@ pub mod cache {
 
     pub const CACHE_NAMESPACE_SELECT_COLUMNS: &str = "id, owner_type, owner, owner_identity, \
             owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, \
-            definition_ref, managing_pack, managing_pack_ref, namespace, active_generation, \
+            definition_ref, managing_pack, managing_pack_ref, namespace, active_generation, mode, live_revision, live_updated_at, \
             consecutive_refresh_failures, last_refresh_failure_at, \
             freshness_target_seconds, max_records_per_generation, \
             max_generation_bytes, max_retained_bytes, max_retained_generations, max_staging_generations, refresh_concurrency, \

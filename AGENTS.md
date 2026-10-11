@@ -141,7 +141,7 @@ For more detail, use:
 - References such as `execution.parent`, `execution.enforcement`, `workflow_execution.execution`, and `inquiry.created_by_execution` retain the independent-retention semantics in guardrail 7.
 - `event` is immutable after insert.
 - `cache_entry` is LIST-partitioned by generation, with composite key `(generation, id)` and no DEFAULT. Reclamation atomically drops one partition and releases exact usage. Cache/workflow mutations acquire admission before parent protection and metadata/pin rows; use `PinMutation` at outer transaction entry for pin creation or cascades. Ordinary `Read` stays concurrent. For DDL, quotas, and lock ordering, read `docs/plans/cache-generation-partitioning.md`.
-  Clones copy the active snapshot inside PostgreSQL and accept ordered delta chunks only while staging. Published snapshots stay immutable. For clone baselines, signed chunk accounting, and retry contracts, read `docs/KEY_CACHE.md`.
+  Namespace mode is immutable: `snapshot` publishes immutable generations; `live` reuses one durable mutable backing partition and supports revision-guarded ID mutations/lookups, not scans or `iterate_cache`. For clone baselines, live batches, accounting, and retry contracts, read `docs/KEY_CACHE.md`.
 - `enforcement` has a narrow lifecycle and no separate history table.
 - `execution` is mutable and has an `execution_history` table; `worker` and `sensor_process` also have history tracking.
 - History is trigger-driven. If you add mutable `execution`/`worker` columns, keep trigger diffs in sync with `IS DISTINCT FROM` checks.

@@ -76,6 +76,9 @@ pub enum CacheNamespaceCommands {
     Create {
         /// Namespace name
         namespace: String,
+        /// Mutation contract, fixed at creation; defaults to snapshot
+        #[arg(long, value_enum)]
+        mode: Option<CacheModeArg>,
         #[command(flatten)]
         owner: OwnerSelectorArgs,
         #[command(flatten)]
@@ -114,6 +117,29 @@ pub enum CacheNamespaceCommands {
 
 #[derive(Subcommand)]
 pub enum CacheEntryCommands {
+    /// Atomically apply one bounded upsert/delete batch to a durable live cache
+    #[command(
+        after_help = "Examples:\n  attune cache entry apply users --owner-type system --request-id sync-42 --expected-revision 0 --file changes.ndjson\n  attune cache entry apply users --owner-type system --request-id sync-43 --expected-revision 1 --delete-external-id removed-user"
+    )]
+    Apply {
+        namespace: String,
+        #[command(flatten)]
+        owner: OwnerSelectorArgs,
+        /// Stable ID reused only for identical retries
+        #[arg(long)]
+        request_id: String,
+        /// Current namespace revision, zero for the first batch
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        expected_revision: i64,
+        /// NDJSON complete records; '-' reads stdin. At most 10000 changes
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long = "delete-external-id")]
+        deleted_external_ids: Vec<String>,
+        /// Advance the upstream cursor atomically; omission retains it
+        #[arg(long)]
+        source_revision: Option<String>,
+    },
     /// Retrieve one entry from the active generation
     Get {
         /// Namespace name
@@ -542,6 +568,8 @@ impl OptionalOwnerSelectorArgs {
 
 #[derive(Debug, Serialize)]
 struct CreateNamespaceRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<CacheModeArg>,
     #[serde(flatten)]
     owner: OwnerSelectorRequest,
     namespace: String,
@@ -593,6 +621,12 @@ impl NamespacePolicyArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheNamespaceResponse {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    revision: Option<i64>,
+    #[serde(default)]
+    source_revision: Option<String>,
     id: i64,
     refresh_concurrency: CacheRefreshConcurrency,
     owner_type: String,
@@ -635,6 +669,13 @@ struct CacheNamespaceResponse {
     created: Option<String>,
     #[serde(default)]
     updated: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheModeArg {
+    Snapshot,
+    Live,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,14 +791,18 @@ struct EntryPointLookupRequest {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EntryPointLookupResponse {
-    generation_id: i64,
+    generation_id: Option<i64>,
+    #[serde(default)]
+    revision: Option<i64>,
     item: Option<CacheEntryResponse>,
     stale: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EntryLookupResponse {
-    generation_id: i64,
+    generation_id: Option<i64>,
+    #[serde(default)]
+    revision: Option<i64>,
     items: Vec<CacheEntryResponse>,
     missing_external_ids: Vec<String>,
     stale: bool,
@@ -888,10 +933,12 @@ async fn handle_namespace(
         }
         CacheNamespaceCommands::Create {
             namespace,
+            mode,
             owner,
             policy,
         } => {
             let request = CreateNamespaceRequest {
+                mode,
                 owner: owner.request()?,
                 namespace,
                 policy: policy.request(),
@@ -944,6 +991,48 @@ async fn handle_entry(
 ) -> Result<()> {
     let mut client = configured_client(profile, api_url)?;
     match command {
+        CacheEntryCommands::Apply {
+            namespace,
+            owner,
+            request_id,
+            expected_revision,
+            file,
+            deleted_external_ids,
+            source_revision,
+        } => {
+            reject_ndjson(cache_output)?;
+            let entries = if let Some(path) = file {
+                with_reader(&path, |reader| {
+                    let batch = read_record_batch(reader, MAX_UPLOAD_CHUNK_RECORDS)?;
+                    if !read_record_batch(reader, 1)?.records.is_empty() {
+                        anyhow::bail!(
+                            "Live apply exceeds 10000 changes; split input into bounded batches"
+                        );
+                    }
+                    Ok(batch.records)
+                })?
+            } else {
+                Vec::new()
+            };
+            if entries.len().saturating_add(deleted_external_ids.len()) > MAX_UPLOAD_CHUNK_RECORDS {
+                anyhow::bail!("Live apply exceeds 10000 changes; split input into bounded batches");
+            }
+            let request = scoped_payload(
+                &owner,
+                &json!({
+                    "request_id": request_id, "expected_revision": expected_revision,
+                    "entries": entries, "deleted_external_ids": deleted_external_ids,
+                    "source_revision": source_revision,
+                }),
+            )?;
+            let response: JsonValue = client
+                .cache_post(
+                    &format!("{}/entries/apply", namespace_base_path(&namespace)),
+                    &request,
+                )
+                .await?;
+            output::print_output(&response, output_format)
+        }
         CacheEntryCommands::Get {
             namespace,
             external_id,
@@ -1887,6 +1976,8 @@ fn print_namespaces(
                 vec![
                     "Namespace",
                     "Owner",
+                    "Mode",
+                    "Revision",
                     "Active Gen",
                     "Records",
                     "Bytes",
@@ -1898,6 +1989,8 @@ fn print_namespaces(
                 table.add_row(vec![
                     namespace.namespace,
                     owner,
+                    namespace.mode.unwrap_or_else(|| "snapshot".into()),
+                    optional_display(namespace.revision),
                     optional_display(namespace.active_generation),
                     optional_display(namespace.record_count),
                     optional_display(namespace.size_bytes),
@@ -1934,6 +2027,18 @@ fn print_namespace(
                 ("Namespace", namespace.namespace.clone()),
                 ("ID", namespace.id.to_string()),
                 ("Owner", namespace_owner_display(namespace)),
+                (
+                    "Mode",
+                    namespace.mode.clone().unwrap_or_else(|| "snapshot".into()),
+                ),
+                ("Revision", optional_display(namespace.revision)),
+                (
+                    "Source Revision",
+                    namespace
+                        .source_revision
+                        .clone()
+                        .unwrap_or_else(|| "-".into()),
+                ),
                 (
                     "Refresh Concurrency",
                     namespace.refresh_concurrency.as_str().into(),
@@ -2177,13 +2282,18 @@ fn print_entry_lookup_point(
         OutputFormat::Json | OutputFormat::Yaml => output::print_output(response, output_format),
         OutputFormat::Table => match &response.item {
             Some(entry) => {
-                output::print_info(&format!("Generation {}", response.generation_id));
+                output::print_info(&format!(
+                    "Generation {}, revision {}",
+                    optional_display(response.generation_id),
+                    optional_display(response.revision)
+                ));
                 print_entry(entry, output_format, true)
             }
             None => {
                 output::print_info(&format!(
-                    "No cache entry found in generation {}",
-                    response.generation_id
+                    "No cache entry found at generation {}, revision {}",
+                    optional_display(response.generation_id),
+                    optional_display(response.revision)
                 ));
                 Ok(())
             }

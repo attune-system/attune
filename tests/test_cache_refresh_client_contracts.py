@@ -6,7 +6,11 @@ from pathlib import Path
 import httpx
 import pytest
 from generated_client import AuthenticatedClient
-from generated_client.api.caches import create_generation
+from generated_client.api.caches import apply_live_entries, create_generation
+from generated_client.models.apply_live_cache_api_response import ApplyLiveCacheApiResponse
+from generated_client.models.apply_live_cache_request import ApplyLiveCacheRequest
+from generated_client.models.cache_mode import CacheMode
+from generated_client.models.cache_point_lookup_response import CachePointLookupResponse
 from generated_client.models.cache_generation_api_response import (
     CacheGenerationApiResponse,
 )
@@ -23,6 +27,71 @@ from generated_client.models.error_response import ErrorResponse
 from generated_client.types import UNSET
 
 pytestmark = pytest.mark.no_api
+
+
+def test_live_namespace_mode_is_typed_and_snapshot_default_stays_omitted():
+    request = CreateCacheNamespaceRequest.from_dict({
+        "owner_type": "system", "namespace": "users", "mode": "live",
+    })
+    assert request.mode == CacheMode.LIVE
+    assert request.to_dict()["mode"] == "live"
+    request = CreateCacheNamespaceRequest.from_dict({
+        "owner_type": "system", "namespace": "users",
+    })
+    assert request.mode is UNSET
+    assert "mode" not in request.to_dict()
+
+
+@pytest.mark.parametrize("generation_id, revision", [(42, None), (None, 3)])
+def test_lookup_metadata_distinguishes_snapshot_generation_from_live_revision(generation_id, revision):
+    body = {"generation_id": generation_id, "revision": revision, "item": None, "stale": False}
+    response = CachePointLookupResponse.from_dict(body)
+    assert response.generation_id == generation_id
+    assert response.revision == revision
+    assert not response.additional_properties
+    assert response.to_dict() == body
+
+
+@pytest.mark.parametrize("status, replayed", [(200, False), (200, True), (409, False)])
+def test_live_apply_transports_atomic_delta_and_parses_replay_or_conflict(status, replayed):
+    body = {"owner_type": "system", "request_id": "sync-1", "expected_revision": 0,
+            "entries": [{"external_id": "a", "value": {"name": "Alex"}}],
+            "deleted_external_ids": ["b"], "source_revision": "cursor-1"}
+
+    def respond(request):
+        assert request.method == "POST"
+        assert request.url.path == "/api/v1/cache/namespaces/users/entries/apply"
+        assert request.headers["Authorization"] == "Bearer test-token"
+        assert json.loads(request.content) == body
+        if status == 409:
+            return httpx.Response(status, json={"error": "revision conflict", "code": "cache_conflict"})
+        return httpx.Response(status, json={"data": {
+            "revision": 1, "record_count": 1, "size_bytes": 16,
+            "source_revision": "cursor-1", "replayed": replayed,
+        }})
+
+    parsed_request = ApplyLiveCacheRequest.from_dict(body)
+    assert parsed_request.expected_revision == 0
+    assert parsed_request.to_dict() == body
+    with AuthenticatedClient(base_url="http://cache.invalid", token="test-token",
+                             httpx_args={"transport": httpx.MockTransport(respond)}) as client:
+        result = apply_live_entries.sync_detailed("users", client=client, body=parsed_request)
+    assert result.status_code == status
+    if status == 409:
+        assert isinstance(result.parsed, ErrorResponse)
+        assert result.parsed.code == "cache_conflict"
+    else:
+        assert isinstance(result.parsed, ApplyLiveCacheApiResponse)
+        assert result.parsed.data.revision == 1
+        assert result.parsed.data.replayed is replayed
+
+
+def test_openapi_live_mutations_require_revision_and_request_identity():
+    spec = json.loads((Path(__file__).parents[1] / "web" / "openapi.json").read_text())
+    schema = spec["components"]["schemas"]["ApplyLiveCacheRequest"]
+    assert {"request_id", "expected_revision", "owner_type"} <= set(schema["required"])
+    assert "generation_id" not in schema["properties"]
+    assert set(spec["components"]["schemas"]["CacheMode"]["enum"]) == {"live", "snapshot"}
 
 
 def test_partition_creation_deadline_is_a_typed_independent_field():
@@ -70,6 +139,7 @@ def generation_body(execution_id):
     return {
         "generation_id": 42, "namespace_id": 7, "status": "staging",
         "client_refresh_id": "original", "expected_active_generation_id": None,
+        "source_generation_id": None,
         "expected_chunk_count": 0, "expected_record_count": None,
         "expected_size_bytes": None, "record_count": 0, "size_bytes": 0,
         "checksum_algorithm": None, "checksum": None, "source_revision": None,

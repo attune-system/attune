@@ -8,8 +8,9 @@ import type { i64 } from "./i64";
  * Bounded multi-ID lookup response. Missing IDs are reported explicitly.
  */
 export type CacheMultiLookupResponse = {
-  generation_id: i64;
+  generation_id: null | i64;
   items: Array<CacheEntryResponse>;
   missing_external_ids: Array<string>;
+  revision: number | null;
   stale: boolean;
 };

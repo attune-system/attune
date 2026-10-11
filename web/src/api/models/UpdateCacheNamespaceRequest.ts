@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { CacheMode } from "./CacheMode";
 import type { CacheNamespacePolicyBody } from "./CacheNamespacePolicyBody";
 import type { OwnerType } from "./OwnerType";
 /**
@@ -9,6 +10,7 @@ import type { OwnerType } from "./OwnerType";
  * immutable; changing either is a new namespace.
  */
 export type UpdateCacheNamespaceRequest = CacheNamespacePolicyBody & {
+  mode?: null | CacheMode;
   owner_ref?: string | null;
   owner_type: OwnerType;
 };

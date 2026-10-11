@@ -530,6 +530,7 @@ impl McpServer {
             "cache_generation_get" => self.cache_generation_get(args).await,
             "cache_refresh_begin" => self.cache_refresh_begin(args).await,
             "cache_refresh_upload_chunk" => self.cache_refresh_upload_chunk(args).await,
+            "cache_live_apply" => self.cache_live_apply(args).await,
             "cache_refresh_seal" => self.cache_refresh_seal(args).await,
             "cache_refresh_promote" => self.cache_refresh_promote(args).await,
             "cache_refresh_abort" => self.cache_refresh_abort(args).await,
@@ -887,6 +888,45 @@ impl McpServer {
             );
         }
         Ok(response)
+    }
+
+    async fn cache_live_apply(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let owner = cache_owner(args)?;
+        let request_id = required_string(args, "request_id")?;
+        let revision = required_i64(args, "expected_revision")?;
+        if revision < 0 {
+            anyhow::bail!("expected_revision must be nonnegative");
+        }
+        let entries = if args.contains_key("entries") {
+            required_array(args, "entries", 10_000)?
+        } else {
+            Vec::new()
+        };
+        let deleted = if args.contains_key("deleted_external_ids") {
+            required_array(args, "deleted_external_ids", 10_000)?
+        } else {
+            Vec::new()
+        };
+        if entries.len().saturating_add(deleted.len()) > 10_000 {
+            anyhow::bail!("Batch exceeds the 10000-record limit");
+        }
+        if deleted.iter().any(|id| !id.is_string()) {
+            anyhow::bail!("deleted_external_ids must contain strings");
+        }
+        let source_revision = match args.get("source_revision") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => anyhow::bail!("source_revision must be a string"),
+        };
+        let payload = json!({"request_id": request_id, "expected_revision": revision,
+            "entries": entries, "deleted_external_ids": deleted, "source_revision": source_revision});
+        self.client
+            .cache_post(
+                &format!("{}/entries/apply", cache_namespace_path(namespace)),
+                &owner.scoped_payload(payload.as_object().expect("object").clone()),
+            )
+            .await
     }
 
     async fn cache_refresh_upload_chunk(&mut self, args: &Map<String, Value>) -> Result<Value> {
@@ -1284,6 +1324,12 @@ fn tool_defs() -> &'static [ToolDef] {
             input_schema: cache_refresh_upload_schema,
         },
         ToolDef {
+            name: "cache_live_apply",
+            title: "Apply live cache changes",
+            description: "Atomically apply complete-record upserts and deletions keyed by external_id to a durable live cache. Requires expected_revision and a stable request_id for identical retries. Optional source_revision commits with the records. Live caches cannot be scanned or iterated.",
+            input_schema: cache_live_apply_schema,
+        },
+        ToolDef {
             name: "cache_refresh_seal",
             title: "Seal cache refresh",
             description: "Validate a fully uploaded staging generation using begin-time expected metadata. Supply expected_chunk_count when begin was performed by another MCP process.",
@@ -1665,6 +1711,7 @@ fn cache_namespace_schema() -> Value {
 
 fn cache_namespace_policy_schema() -> Value {
     let mut properties = Map::new();
+    properties.insert("mode".to_string(), json!({"type": "string", "enum": ["snapshot", "live"], "description": "Immutable namespace mode. Defaults to snapshot on creation."}));
     properties.insert("namespace".to_string(), json!({ "type": "string" }));
     for field in [
         "freshness_target_seconds",
@@ -1680,6 +1727,33 @@ fn cache_namespace_policy_schema() -> Value {
         );
     }
     cache_schema(properties, &["namespace"])
+}
+
+fn cache_live_apply_schema() -> Value {
+    let mut properties = cache_refresh_upload_schema()["properties"]
+        .as_object()
+        .expect("properties")
+        .clone();
+    properties.remove("generation_id");
+    properties.remove("chunk_index");
+    properties["deleted_external_ids"]["description"] =
+        json!("IDs to delete from the live collection. Missing IDs are harmless.");
+    properties.insert(
+        "request_id".to_string(),
+        json!({"type": "string", "minLength": 1, "maxLength": 1024}),
+    );
+    properties.insert(
+        "expected_revision".to_string(),
+        json!({"type": "integer", "minimum": 0}),
+    );
+    properties.insert(
+        "source_revision".to_string(),
+        json!({"type": "string", "maxLength": 1024}),
+    );
+    cache_schema(
+        properties,
+        &["namespace", "request_id", "expected_revision"],
+    )
 }
 
 fn cache_entry_get_schema() -> Value {
@@ -2071,6 +2145,12 @@ fn cache_policy(args: &Map<String, Value>) -> Result<Map<String, Value>> {
         if let Some(value) = optional_i64(args, field)? {
             policy.insert((*field).to_string(), Value::from(value));
         }
+    }
+    if let Some(mode) = args.get("mode") {
+        if !matches!(mode.as_str(), Some("snapshot" | "live")) {
+            anyhow::bail!("mode must be snapshot or live");
+        }
+        policy.insert("mode".to_string(), mode.clone());
     }
     Ok(policy)
 }
@@ -3328,6 +3408,37 @@ mod tests {
                 request.url
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cache_live_apply_sends_revision_guard_and_no_generation_selector() {
+        let api = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cache/namespaces/users/entries/apply"))
+            .and(body_json(
+                json!({"owner_type": "system", "request_id": "sync-1", "expected_revision": 0,
+                "entries": [], "deleted_external_ids": ["removed"], "source_revision": "cursor-1"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": {"revision": 1, "replayed": false}})),
+            )
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({"owner_type": "system", "namespace": "users",
+            "request_id": "sync-1", "expected_revision": 0, "deleted_external_ids": ["removed"], "source_revision": "cursor-1"})).unwrap();
+        assert_eq!(
+            server.call_tool("cache_live_apply", &args).await.unwrap()["revision"],
+            1
+        );
+        let schema = cache_live_apply_schema();
+        assert!(schema["properties"].get("generation_id").is_none());
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("expected_revision")));
     }
 
     #[tokio::test]

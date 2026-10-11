@@ -27,19 +27,19 @@ use attune_common::{
     audit::{AuditCategory, AuditEventBuilder, AuditOutcome, PendingAuditEvent},
     models::{
         cache::{CacheGeneration, CacheNamespace},
-        CacheGenerationState, Id, OwnerType,
+        CacheGenerationState, CacheMode, Id, OwnerType,
     },
     rbac::{Action, AuthorizationContext, ExecutionScopeConstraint, Grant, Resource},
     repositories::{
         action::ActionRepository,
         cache::{
-            CacheEntryInput, CacheEntryRepository, CacheGenerationRepository,
-            CacheIngestRepository, CacheNamespaceFreshnessFilter, CacheNamespaceGrantFilter,
-            CacheNamespacePolicy, CacheNamespaceReadVisibility, CacheNamespaceRepository,
-            CacheOwnerScope, CacheTransactionMode, CreateCacheGenerationInput,
-            CreateCacheGenerationResult, CreateCacheNamespaceInput, InsertCacheChunkResult,
-            SealCacheGenerationInput, MAX_INGEST_CHUNK_BYTES, MAX_MULTI_LOOKUP_IDS,
-            MAX_SCAN_PAGE_SIZE,
+            ApplyLiveCacheInput, CacheEntryInput, CacheEntryRepository, CacheGenerationRepository,
+            CacheIngestRepository, CacheLiveRepository, CacheNamespaceFreshnessFilter,
+            CacheNamespaceGrantFilter, CacheNamespacePolicy, CacheNamespaceReadVisibility,
+            CacheNamespaceRepository, CacheOwnerScope, CacheTransactionMode,
+            CreateCacheGenerationInput, CreateCacheGenerationResult, CreateCacheNamespaceInput,
+            InsertCacheChunkResult, SealCacheGenerationInput, MAX_INGEST_CHUNK_BYTES,
+            MAX_MULTI_LOOKUP_IDS, MAX_SCAN_PAGE_SIZE,
         },
         pack::PackRepository,
         sensor_admission::SensorAdmissionRepository,
@@ -60,6 +60,7 @@ use crate::{
     authz::{AuthorizationCheck, AuthorizationService, AuthorizationSnapshot},
     dto::{
         cache::{
+            ApplyLiveCacheApiResponse, ApplyLiveCacheRequest, ApplyLiveCacheResponse,
             CacheEntryResponse, CacheForbiddenResponse, CacheGenerationApiResponse,
             CacheGenerationListApiResponse, CacheGenerationListQuery, CacheGenerationListResponse,
             CacheGenerationResponse, CacheMultiLookupApiResponse, CacheMultiLookupRequest,
@@ -202,6 +203,9 @@ impl From<ApiError> for CacheApiError {
 
 impl From<CommonError> for CacheApiError {
     fn from(err: CommonError) -> Self {
+        if let CommonError::CacheModeMismatch(message) = &err {
+            return Self::coded(StatusCode::CONFLICT, "cache_mode_mismatch", message.clone());
+        }
         if let CommonError::Database(error) = &err {
             if matches!(
                 error.as_database_error().and_then(|e| e.code()).as_deref(),
@@ -308,6 +312,7 @@ fn map_write_error(err: CommonError) -> CacheApiError {
             if lowered.contains("tombstoned") {
                 CacheApiError::namespace_deleted()
             } else if lowered.contains("active generation changed")
+                || lowered.contains("revision changed")
                 || lowered.contains("expected_")
                 || lowered.contains("does not match")
             {
@@ -1071,7 +1076,12 @@ fn compute_stale(
     if namespace.freshness_target_seconds <= 0 {
         return false;
     }
-    match generation.activated {
+    let refreshed = if namespace.mode == CacheMode::Live {
+        namespace.live_updated_at
+    } else {
+        generation.activated
+    };
+    match refreshed {
         Some(activated) => (now - activated).num_seconds() > namespace.freshness_target_seconds,
         None => false,
     }
@@ -1089,12 +1099,18 @@ fn namespace_response(
             Some(generation.record_count),
             Some(generation.size_bytes),
             generation.source_revision.clone(),
-            generation.activated,
+            if namespace.mode == CacheMode::Live {
+                namespace.live_updated_at
+            } else {
+                generation.activated
+            },
         ),
         None => (false, None, None, None, None),
     };
 
     CacheNamespaceResponse {
+        mode: namespace.mode,
+        revision: (namespace.mode == CacheMode::Live).then_some(namespace.live_revision),
         id: namespace.id,
         owner_type: namespace.owner_type,
         owner: namespace.owner.clone(),
@@ -1105,7 +1121,11 @@ fn namespace_response(
         definition_ref: namespace.definition_ref.clone(),
         managing_pack_ref: namespace.managing_pack_ref.clone(),
         namespace: namespace.namespace.clone(),
-        active_generation: namespace.active_generation,
+        active_generation: if namespace.mode == CacheMode::Live {
+            None
+        } else {
+            namespace.active_generation
+        },
         freshness_target_seconds: namespace.freshness_target_seconds,
         max_records_per_generation: namespace.max_records_per_generation,
         max_generation_bytes: namespace.max_generation_bytes,
@@ -1131,6 +1151,14 @@ async fn build_namespace_response(
     namespace: &CacheNamespace,
     canonical_owner_ref: Option<&str>,
 ) -> CacheResult<CacheNamespaceResponse> {
+    let refreshed;
+    let namespace = if namespace.mode == CacheMode::Live {
+        refreshed =
+            CacheNamespaceRepository::find_by_id_for_share_conn(connection, namespace.id).await?;
+        &refreshed
+    } else {
+        namespace
+    };
     let active = match namespace.active_generation {
         Some(id) => CacheGenerationRepository::find_by_id(&mut *connection, id).await?,
         None => None,
@@ -1147,6 +1175,8 @@ async fn build_namespace_responses(
     namespaces: &[CacheNamespace],
     canonical_owner_ref: Option<&str>,
 ) -> CacheResult<Vec<CacheNamespaceResponse>> {
+    // List metadata is advisory. Do not hold multiple namespace locks against
+    // managed reconciliation/cascades. Detail and record reads lock one namespace.
     let generation_ids: Vec<Id> = namespaces
         .iter()
         .filter_map(|namespace| namespace.active_generation)
@@ -1461,6 +1491,7 @@ pub async fn create_namespace(
     let created = CacheNamespaceRepository::create_api_with_policy_conn(
         &mut tx,
         CreateCacheNamespaceInput {
+            mode: request.mode,
             owner: scope,
             namespace: namespace.clone(),
             policy,
@@ -1585,6 +1616,11 @@ pub async fn update_namespace(
     .await?;
 
     let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    if request.mode.is_some_and(|mode| mode != record.mode) {
+        return Err(
+            CommonError::CacheModeMismatch("cache namespace mode is immutable".into()).into(),
+        );
+    }
     if record.definition_ref.is_some() {
         return Err(CacheApiError::pack_managed_namespace("updated"));
     }
@@ -1741,6 +1777,7 @@ pub async fn list_generations(
     )
     .await?;
 
+    require_snapshot_namespace(&record)?;
     let (page_size, before) = if let Some(cursor_token) = query.cursor.as_deref() {
         let cursor = decode_generation_cursor(&state.jwt_config.secret, cursor_token)?;
         if cursor.namespace_id != record.id {
@@ -1826,6 +1863,7 @@ pub async fn show_generation(
     )
     .await?;
 
+    require_snapshot_namespace(&record)?;
     let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
@@ -1867,6 +1905,11 @@ async fn resolve_namespace_for_read<'a>(
     let record = CacheNamespaceRepository::resolve(&mut *tx, &scope, &namespace)
         .await?
         .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
+    let record = if record.mode == CacheMode::Live {
+        CacheNamespaceRepository::find_by_id_for_share_conn(&mut tx, record.id).await?
+    } else {
+        record
+    };
     Ok((tx, scope, record))
 }
 
@@ -1888,6 +1931,16 @@ async fn resolve_namespace_for_write(
 // ---------------------------------------------------------------------------
 // Read routes
 // ---------------------------------------------------------------------------
+
+fn require_snapshot_namespace(namespace: &CacheNamespace) -> CacheResult<()> {
+    if namespace.mode == CacheMode::Live {
+        return Err(CommonError::CacheModeMismatch(
+            "live caches do not support snapshots, scans, or iteration".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
 
 /// Point lookup by external id.
 #[utoipa::path(
@@ -1923,6 +1976,11 @@ pub async fn lookup_entry(
     )
     .await?;
 
+    if record.mode == CacheMode::Live && request.generation_id.is_some() {
+        return Err(
+            CommonError::CacheModeMismatch("live lookups cannot pin a generation".into()).into(),
+        );
+    }
     let generation_id = match request.generation_id {
         Some(generation_id) => generation_id,
         None => record
@@ -1940,20 +1998,33 @@ pub async fn lookup_entry(
         return Err(CacheApiError::stale("active cache generation is stale"));
     }
 
-    let entry = CacheEntryRepository::find_pinned_conn(
-        &mut tx,
-        record.id,
-        generation_id,
-        &request.external_id,
-    )
-    .await
-    .map_err(map_read_error)?;
+    let entry = if record.mode == CacheMode::Live {
+        CacheLiveRepository::lookup_many_conn(
+            &mut tx,
+            record.id,
+            std::slice::from_ref(&request.external_id),
+        )
+        .await
+        .map_err(map_read_error)?
+        .into_iter()
+        .next()
+    } else {
+        CacheEntryRepository::find_pinned_conn(
+            &mut tx,
+            record.id,
+            generation_id,
+            &request.external_id,
+        )
+        .await
+        .map_err(map_read_error)?
+    };
     tx.commit().await?;
 
     Ok((
         StatusCode::OK,
         Json(ApiResponse::new(CachePointLookupResponse {
-            generation_id,
+            generation_id: (record.mode == CacheMode::Snapshot).then_some(generation_id),
+            revision: (record.mode == CacheMode::Live).then_some(record.live_revision),
             item: entry.map(CacheEntryResponse::from),
             stale,
         })),
@@ -2004,6 +2075,11 @@ pub async fn lookup_entries(
     )
     .await?;
 
+    if record.mode == CacheMode::Live && request.generation_id.is_some() {
+        return Err(
+            CommonError::CacheModeMismatch("live lookups cannot pin a generation".into()).into(),
+        );
+    }
     let generation_id = match request.generation_id {
         Some(generation_id) => generation_id,
         None => record
@@ -2021,14 +2097,20 @@ pub async fn lookup_entries(
         return Err(CacheApiError::stale("active cache generation is stale"));
     }
 
-    let found = CacheEntryRepository::find_pinned_many_conn(
-        &mut tx,
-        record.id,
-        generation_id,
-        &request.external_ids,
-    )
-    .await
-    .map_err(map_read_error)?;
+    let found = if record.mode == CacheMode::Live {
+        CacheLiveRepository::lookup_many_conn(&mut tx, record.id, &request.external_ids)
+            .await
+            .map_err(map_read_error)?
+    } else {
+        CacheEntryRepository::find_pinned_many_conn(
+            &mut tx,
+            record.id,
+            generation_id,
+            &request.external_ids,
+        )
+        .await
+        .map_err(map_read_error)?
+    };
     tx.commit().await?;
 
     let found_ids: std::collections::HashSet<&str> = found
@@ -2046,7 +2128,8 @@ pub async fn lookup_entries(
     Ok((
         StatusCode::OK,
         Json(ApiResponse::new(CacheMultiLookupResponse {
-            generation_id,
+            generation_id: (record.mode == CacheMode::Snapshot).then_some(generation_id),
+            revision: (record.mode == CacheMode::Live).then_some(record.live_revision),
             items: found.into_iter().map(CacheEntryResponse::from).collect(),
             missing_external_ids: missing,
             stale,
@@ -2065,6 +2148,101 @@ fn map_read_error(err: CommonError) -> CacheApiError {
         CommonError::Validation(message) => CacheApiError::bad_request(message.clone()),
         _ => CacheApiError::from(err),
     }
+}
+
+/// Applies one atomic live-cache batch with optimistic concurrency and bounded retries.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cache/namespaces/{namespace}/entries/apply",
+    operation_id = "apply_live_entries",
+    tag = "caches",
+    request_body = ApplyLiveCacheRequest,
+    params(("namespace" = String, Path, description = "Live cache namespace")),
+    responses(
+        (status = 200, description = "Committed batch or identical replay", body = ApplyLiveCacheApiResponse),
+        (status = 400, description = "Invalid bounded mutation request", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = AuthErrorResponse),
+        (status = 403, description = "Namespace is not writable", body = CacheForbiddenResponse),
+        (status = 404, description = "Namespace not found", body = ErrorResponse),
+        (status = 409, description = "Mode, revision, retry-content or quota conflict", body = ErrorResponse),
+        (status = 503, description = "Cache storage is busy", body = ErrorResponse),
+        (status = 500, description = "Mutation failed", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn apply_live_entries(
+    user: RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    body: Bytes,
+) -> CacheResult<Response> {
+    let request: ApplyLiveCacheRequest = serde_json::from_slice(&body)
+        .map_err(|err| CacheApiError::bad_request(format!("invalid live mutation body: {err}")))?;
+    let namespace = normalize_namespace(&namespace)?;
+    let (authority, owner_ref) = authorize_namespace_action(
+        &state,
+        &user.0,
+        Action::Update,
+        request.owner_type,
+        request.owner_ref.as_deref(),
+        &namespace,
+    )
+    .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Write).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        request.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
+    let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    let entries: Vec<CacheEntryInput> = request
+        .entries
+        .into_iter()
+        .map(|entry| CacheEntryInput {
+            external_id: entry.external_id,
+            value: entry.value,
+            source_updated_at: entry.source_updated_at,
+            source_checksum: entry.source_checksum,
+        })
+        .collect();
+    let checksum = hex_encode(&Sha256::digest(&body));
+    let applied = CacheLiveRepository::apply_conn(
+        &mut tx,
+        ApplyLiveCacheInput {
+            namespace: record.id,
+            request_id: &request.request_id,
+            request_checksum: &checksum,
+            expected_revision: request.expected_revision,
+            entries: &entries,
+            deleted_external_ids: &request.deleted_external_ids,
+            source_revision: request.source_revision.as_deref(),
+        },
+        &state.config.cache_admission,
+    )
+    .await
+    .map_err(map_write_error)?;
+    tx.commit().await?;
+    emit_cache_audit(
+        &state,
+        &user,
+        "cache.live.applied",
+        AuditOutcome::Success,
+        "cache_namespace",
+        Some(record.id),
+        Some(namespace),
+        serde_json::json!({"revision": applied.revision, "record_count": applied.record_count,
+            "size_bytes": applied.size_bytes, "replayed": applied.replayed}),
+    );
+    Ok(Json(ApiResponse::new(ApplyLiveCacheResponse {
+        revision: applied.revision,
+        record_count: applied.record_count,
+        size_bytes: applied.size_bytes,
+        source_revision: applied.source_revision,
+        replayed: applied.replayed,
+    }))
+    .into_response())
 }
 
 /// Generation-pinned cursor scan.
@@ -2101,6 +2279,7 @@ pub async fn scan_entries(
     )
     .await?;
 
+    require_snapshot_namespace(&record)?;
     let secret = &state.jwt_config.secret;
     let now = Utc::now();
 
@@ -2374,6 +2553,7 @@ pub async fn create_generation(
 
     let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
 
+    require_snapshot_namespace(&record)?;
     let expected_chunk_count = i32::try_from(request.expected_chunk_count)
         .map_err(|_| CacheApiError::bad_request("expected_chunk_count is out of range"))?;
 
@@ -2521,6 +2701,7 @@ pub async fn upload_chunk(
     .await?;
 
     let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    require_snapshot_namespace(&record)?;
     let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
@@ -2659,6 +2840,7 @@ pub async fn seal_generation(
     .await?;
 
     let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    require_snapshot_namespace(&record)?;
     let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
@@ -2776,6 +2958,7 @@ pub async fn promote_generation(
     .await?;
 
     let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    require_snapshot_namespace(&record)?;
     let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
@@ -2897,6 +3080,7 @@ pub async fn abandon_generation(
     .await?;
 
     let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    require_snapshot_namespace(&record)?;
     let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
@@ -2993,6 +3177,10 @@ pub fn routes() -> Router<Arc<AppState>> {
                 .delete(delete_namespace),
         )
         .route("/cache/namespaces/{namespace}/entries", get(scan_entries))
+        .route(
+            "/cache/namespaces/{namespace}/entries/apply",
+            post(apply_live_entries).layer(DefaultBodyLimit::max(MAX_INGEST_CHUNK_BYTES)),
+        )
         .route(
             "/cache/namespaces/{namespace}/entries/lookup",
             post(lookup_entry),

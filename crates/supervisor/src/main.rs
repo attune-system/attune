@@ -1878,6 +1878,7 @@ mod tests {
         let namespace = CacheNamespaceRepository::create(
             database.pool(),
             CreateCacheNamespaceInput {
+                mode: Default::default(),
                 owner: CacheOwnerScope::system(),
                 namespace: "owned_failure_audit".to_string(),
                 policy: CacheNamespacePolicy::default(),

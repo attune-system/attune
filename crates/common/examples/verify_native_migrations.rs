@@ -95,6 +95,7 @@ async fn cache_probe(
     let namespace = CacheNamespaceRepository::create_api(
         pool,
         CreateCacheNamespaceInput {
+            mode: Default::default(),
             owner: CacheOwnerScope::system(),
             namespace: "native-install".into(),
             policy: Default::default(),

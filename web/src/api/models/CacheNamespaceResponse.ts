@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { CacheMode } from "./CacheMode";
 import type { CacheRefreshConcurrency } from "./CacheRefreshConcurrency";
 import type { i64 } from "./i64";
 import type { OwnerType } from "./OwnerType";
@@ -38,6 +39,7 @@ export type CacheNamespaceResponse = {
   max_retained_bytes: number;
   max_retained_generations: number;
   max_staging_generations: number;
+  mode: CacheMode;
   namespace: string;
   /**
    * Canonical owner key (`system` or a numeric owner id as text).
@@ -54,6 +56,7 @@ export type CacheNamespaceResponse = {
   record_count: number | null;
   refresh_concurrency: CacheRefreshConcurrency;
   retired_at: string | null;
+  revision: number | null;
   /**
    * Active generation size in bytes, when populated.
    */

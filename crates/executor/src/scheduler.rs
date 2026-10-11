@@ -616,6 +616,7 @@ struct RenderedWorkflowTaskInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheIterationInitializationFailure {
+    LiveNamespace,
     SelectorRendering,
     OwnerResolution,
     NamespaceResolution,
@@ -630,6 +631,7 @@ enum CacheIterationInitializationFailure {
 impl CacheIterationInitializationFailure {
     fn code(self) -> &'static str {
         match self {
+            Self::LiveNamespace => "live_namespace_not_iterable",
             Self::SelectorRendering => "selector_rendering",
             Self::OwnerResolution => "owner_resolution",
             Self::NamespaceResolution => "namespace_resolution",
@@ -4025,6 +4027,11 @@ impl ExecutionScheduler {
                     CacheIterationInitializationFailure::NamespaceResolution,
                 ))?;
 
+        if namespace.mode == attune_common::models::CacheMode::Live {
+            return Err(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::LiveNamespace,
+            ));
+        }
         let generation_id = if let Some(iteration) = existing.as_ref() {
             if iteration.namespace != namespace.id {
                 return Err(CacheIterationInitializationError::Logical(

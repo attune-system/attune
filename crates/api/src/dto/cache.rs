@@ -3,8 +3,8 @@
 //! These types define the OpenAPI-documented HTTP contract consumed by
 //! generated SDKs, the CLI, and the web UI. Cache values are plain business
 //! data returned over the API; they are never secret-injected. Generation and
-//! cursor fields keep paged clients pinned to one immutable snapshot so a
-//! promotion cannot mix pages from different generations.
+//! cursor fields keep paged clients pinned to one immutable snapshot. Live
+//! namespaces expose revision-guarded mutations and ID lookups, not pagination.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 
 use attune_common::models::{
-    cache::CacheEntry, CacheGenerationState, CacheRefreshConcurrency, Id, OwnerType,
+    cache::CacheEntry, CacheGenerationState, CacheMode, CacheRefreshConcurrency, Id, OwnerType,
 };
 
 use crate::{auth::middleware::AuthErrorResponse, middleware::error::ErrorResponse};
@@ -105,6 +105,8 @@ pub struct CacheNamespacePolicyBody {
 /// Create a new owner-scoped cache namespace.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateCacheNamespaceRequest {
+    #[serde(default)]
+    pub mode: CacheMode,
     pub owner_type: OwnerType,
     #[serde(default)]
     pub owner_ref: Option<String>,
@@ -123,6 +125,9 @@ pub struct CreateCacheNamespaceRequest {
 /// immutable; changing either is a new namespace.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateCacheNamespaceRequest {
+    /// Mode is immutable. Only the current mode may be supplied.
+    #[serde(default)]
+    pub mode: Option<CacheMode>,
     pub owner_type: OwnerType,
     #[serde(default)]
     pub owner_ref: Option<String>,
@@ -133,6 +138,9 @@ pub struct UpdateCacheNamespaceRequest {
 /// Namespace metadata and freshness/health summary. Never includes entries.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CacheNamespaceResponse {
+    pub mode: CacheMode,
+    #[schema(required = true, nullable = true)]
+    pub revision: Option<i64>,
     pub id: Id,
     pub owner_type: OwnerType,
     /// Canonical owner key (`system` or a numeric owner id as text).
@@ -306,7 +314,10 @@ pub struct CachePointLookupRequest {
 /// Point lookup response. `item = None` is an authorized miss.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CachePointLookupResponse {
-    pub generation_id: Id,
+    #[schema(required = true, nullable = true)]
+    pub generation_id: Option<Id>,
+    #[schema(required = true, nullable = true)]
+    pub revision: Option<i64>,
     #[schema(required = true, nullable = true)]
     pub item: Option<CacheEntryResponse>,
     pub stale: bool,
@@ -328,7 +339,10 @@ pub struct CacheMultiLookupRequest {
 /// Bounded multi-ID lookup response. Missing IDs are reported explicitly.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CacheMultiLookupResponse {
-    pub generation_id: Id,
+    #[schema(required = true, nullable = true)]
+    pub generation_id: Option<Id>,
+    #[schema(required = true, nullable = true)]
+    pub revision: Option<i64>,
     pub items: Vec<CacheEntryResponse>,
     pub missing_external_ids: Vec<String>,
     pub stale: bool,
@@ -420,6 +434,35 @@ pub struct UploadCacheChunkRequest {
     pub deleted_external_ids: Vec<String>,
 }
 
+/// Atomic mutations to a durable live namespace. No snapshot lifecycle is used.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyLiveCacheRequest {
+    pub owner_type: OwnerType,
+    #[serde(default)]
+    pub owner_ref: Option<String>,
+    pub request_id: String,
+    /// Required optimistic guard. Use zero for the first batch.
+    pub expected_revision: i64,
+    #[serde(default)]
+    pub entries: Vec<CacheEntryUpload>,
+    #[serde(default)]
+    pub deleted_external_ids: Vec<String>,
+    /// Omission or null retains the current upstream cursor.
+    #[serde(default)]
+    pub source_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ApplyLiveCacheResponse {
+    pub revision: i64,
+    pub record_count: i64,
+    pub size_bytes: i64,
+    #[schema(required = true, nullable = true)]
+    pub source_revision: Option<String>,
+    pub replayed: bool,
+}
+
 /// Seal a staging generation into `ready`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct SealCacheGenerationRequest {
@@ -456,6 +499,7 @@ macro_rules! cache_api_response {
 }
 
 cache_api_response!(CacheNamespaceApiResponse, CacheNamespaceResponse);
+cache_api_response!(ApplyLiveCacheApiResponse, ApplyLiveCacheResponse);
 cache_api_response!(CacheNamespaceListApiResponse, CacheNamespaceListResponse);
 cache_api_response!(
     CacheNamespaceDeletionApiResponse,
