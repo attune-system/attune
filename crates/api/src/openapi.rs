@@ -995,12 +995,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 199,
+            path_count, 200,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 261,
+            operation_count, 262,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1010,6 +1010,14 @@ mod tests {
                 .get("/api/v1/retention-config/native-status")
                 .is_some_and(|path| path.get.is_some()),
             "Expected the native-maintenance status GET operation in the OpenAPI spec"
+        );
+
+        assert!(
+            doc.paths
+                .paths
+                .get("/api/v1/cache/namespaces/{namespace}/entries/apply")
+                .is_some_and(|path| path.post.is_some()),
+            "Expected the live-cache mutation POST operation in the OpenAPI spec"
         );
 
         println!("Total API paths: {}", path_count);

@@ -2892,7 +2892,7 @@ impl CacheEntryRepository {
                 AND e.external_id = requested.external_id",
         )
         .bind(generation_id)
-        .bind(&external_ids)
+        .bind(external_ids)
         .fetch_one(&mut *connection)
         .await?;
         ensure_read_budget(
@@ -2914,7 +2914,7 @@ impl CacheEntryRepository {
         );
         let entries = sqlx::query_as::<_, CacheEntry>(&query)
             .bind(generation_id)
-            .bind(&external_ids)
+            .bind(external_ids)
             .fetch_all(&mut *connection)
             .await?;
         Ok(entries)
