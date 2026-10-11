@@ -968,6 +968,157 @@ async fn generation_creation_rejects_client_supplied_execution_attribution() -> 
 }
 
 #[tokio::test]
+async fn cache_clone_delta_api_requires_read_and_preserves_snapshot_publication() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_delta_api").await?;
+    let (token, _) =
+        register_user(&ctx, "cache_delta_writer", pack_writer_grants(&pack.r#ref)).await?;
+    create_namespace(&ctx, &token, &pack.r#ref, "users", json!({}))
+        .await?
+        .assert_status(StatusCode::CREATED);
+    let base = begin_generation(&ctx, &token, &pack.r#ref, "users", "base", 1).await?;
+    upload_chunk(
+        &ctx,
+        &token,
+        &pack.r#ref,
+        "users",
+        base,
+        0,
+        json!([
+            {"external_id": "a", "value": {"name": "original"}},
+            {"external_id": "b", "value": {"name": "removed"}},
+            {"external_id": "d", "value": {"name": "unchanged"}}
+        ]),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+    let generations = "/api/v1/cache/namespaces/users/generations";
+    ctx.post(
+        &format!("{generations}/{base}/seal"),
+        json!({
+            "owner_type": "pack", "owner_ref": pack.r#ref, "expected_chunk_count": 1
+        }),
+        Some(&token),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+    ctx.post(
+        &format!("{generations}/{base}/promote"),
+        json!({
+            "owner_type": "pack", "owner_ref": pack.r#ref, "expected_active_generation_id": null
+        }),
+        Some(&token),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+    let request = json!({
+        "owner_type": "pack", "owner_ref": pack.r#ref, "client_refresh_id": "delta",
+        "source_generation_id": base, "expected_active_generation_id": base,
+        "expected_chunk_count": 2, "expected_record_count": 2, "source_revision": "cursor-next"
+    });
+    let (write_only, _) = register_user(
+        &ctx,
+        "cache_delta_no_read",
+        json!([{
+            "resource": "caches", "actions": ["create", "update"],
+            "constraints": {"owner_types": ["pack"], "owner_refs": [pack.r#ref]}
+        }]),
+    )
+    .await?;
+    ctx.post(generations, request.clone(), Some(&write_only))
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    let response = ctx
+        .post(generations, request.clone(), Some(&token))
+        .await?
+        .assert_status(StatusCode::CREATED);
+    let response: Value = response.json().await?;
+    let cloned = response["data"]["generation_id"].as_i64().unwrap();
+    assert_eq!(response["data"]["source_generation_id"], base);
+    assert_eq!(response["data"]["record_count"], 3);
+    let replay: Value = ctx
+        .post(generations, request, Some(&token))
+        .await?
+        .assert_status(StatusCode::OK)
+        .json()
+        .await?;
+    assert_eq!(replay["data"]["generation_id"], cloned);
+    let chunk = json!({
+        "owner_type": "pack", "owner_ref": pack.r#ref,
+        "entries": [{"external_id": "a", "value": {"name": "changed"}},
+                    {"external_id": "c", "value": {"name": "new"}}],
+        "deleted_external_ids": ["b"]
+    });
+    let chunk_path = format!("{generations}/{cloned}/chunks/0");
+    ctx.put(&chunk_path, chunk.clone(), Some(&token))
+        .await?
+        .assert_status(StatusCode::OK);
+    ctx.put(&chunk_path, chunk, Some(&token))
+        .await?
+        .assert_status(StatusCode::OK);
+    // A deletion-only request does not need an entries field.
+    ctx.put(
+        &format!("{generations}/{cloned}/chunks/1"),
+        json!({
+            "owner_type": "pack", "owner_ref": pack.r#ref, "deleted_external_ids": ["c", "missing"]
+        }),
+        Some(&token),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+    let lookup = "/api/v1/cache/namespaces/users/entries/lookup";
+    let before: Value = ctx
+        .post(
+            lookup,
+            json!({
+                "owner_type": "pack", "owner_ref": pack.r#ref, "external_id": "a"
+            }),
+            Some(&token),
+        )
+        .await?
+        .assert_status(StatusCode::OK)
+        .json()
+        .await?;
+    assert_eq!(before["data"]["generation_id"], base);
+    assert_eq!(before["data"]["item"]["value"]["name"], "original");
+    ctx.post(&format!("{generations}/{cloned}/seal"), json!({
+        "owner_type": "pack", "owner_ref": pack.r#ref, "expected_chunk_count": 2, "expected_record_count": 2
+    }), Some(&token)).await?.assert_status(StatusCode::OK);
+    ctx.post(
+        &format!("{generations}/{cloned}/promote"),
+        json!({
+            "owner_type": "pack", "owner_ref": pack.r#ref, "expected_active_generation_id": base
+        }),
+        Some(&token),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+    for (generation, expected) in [(base, "original"), (cloned, "changed")] {
+        let value: Value = ctx.post(lookup, json!({
+                "owner_type": "pack", "owner_ref": pack.r#ref, "external_id": "a", "generation_id": generation
+        }), Some(&token)).await?.assert_status(StatusCode::OK).json().await?;
+        assert_eq!(value["data"]["generation_id"], generation);
+        assert_eq!(value["data"]["item"]["value"]["name"], expected);
+    }
+    let unchanged: Value = ctx
+        .post(
+            lookup,
+            json!({
+                "owner_type": "pack", "owner_ref": pack.r#ref, "external_id": "d"
+            }),
+            Some(&token),
+        )
+        .await?
+        .assert_status(StatusCode::OK)
+        .json()
+        .await?;
+    assert_eq!(unchanged["data"]["item"]["value"]["name"], "unchanged");
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cache_full_refresh_and_read_lifecycle() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;

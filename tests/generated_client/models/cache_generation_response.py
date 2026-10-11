@@ -39,6 +39,7 @@ class CacheGenerationResponse:
             retired (datetime.datetime | None):
             sealed (datetime.datetime | None):
             size_bytes (int):
+            source_generation_id (int | None):
             source_revision (None | str):
             status (CacheGenerationState): Lifecycle state for an immutable cache generation.
     """
@@ -63,6 +64,7 @@ class CacheGenerationResponse:
     retired: datetime.datetime | None
     sealed: datetime.datetime | None
     size_bytes: int
+    source_generation_id: int | None
     source_revision: None | str
     status: CacheGenerationState
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -136,6 +138,9 @@ class CacheGenerationResponse:
 
         size_bytes = self.size_bytes
 
+        source_generation_id: int | None
+        source_generation_id = self.source_generation_id
+
         source_revision: None | str
         source_revision = self.source_revision
 
@@ -165,6 +170,7 @@ class CacheGenerationResponse:
                 "retired": retired,
                 "sealed": sealed,
                 "size_bytes": size_bytes,
+                "source_generation_id": source_generation_id,
                 "source_revision": source_revision,
                 "status": status,
             }
@@ -327,6 +333,15 @@ class CacheGenerationResponse:
 
         size_bytes = d.pop("size_bytes")
 
+        def _parse_source_generation_id(data: object) -> int | None:
+            if data is None:
+                return data
+            return cast(int | None, data)
+
+        source_generation_id = _parse_source_generation_id(
+            d.pop("source_generation_id")
+        )
+
         def _parse_source_revision(data: object) -> None | str:
             if data is None:
                 return data
@@ -357,6 +372,7 @@ class CacheGenerationResponse:
             retired=retired,
             sealed=sealed,
             size_bytes=size_bytes,
+            source_generation_id=source_generation_id,
             source_revision=source_revision,
             status=status,
         )

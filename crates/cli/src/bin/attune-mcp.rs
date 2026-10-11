@@ -852,30 +852,28 @@ impl McpServer {
         let expected_active_generation_id = expected_active_generation(args)?;
         let expected_record_count = optional_i64(args, "expected_record_count")?;
         let expected_size_bytes = optional_i64(args, "expected_size_bytes")?;
+        let source_generation_id = optional_i64(args, "source_generation_id")?;
+        if source_generation_id.is_some() && source_generation_id != expected_active_generation_id {
+            anyhow::bail!("source_generation_id must match expected_active_generation_id");
+        }
+        let mut payload = json!({
+            "client_refresh_id": optional_string(args, "client_refresh_id")
+                .unwrap_or_else(|| format!("mcp-{}", SystemTime::now()
+                    .duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())),
+            "expected_active_generation_id": expected_active_generation_id,
+            "expected_chunk_count": expected_chunk_count,
+            "expected_record_count": expected_record_count,
+            "expected_size_bytes": expected_size_bytes,
+            "source_revision": optional_string(args, "source_revision"),
+        });
+        if let Some(source) = source_generation_id {
+            payload["source_generation_id"] = json!(source);
+        }
         let response: Value = self
             .client
             .cache_post(
                 &format!("{}/generations", cache_namespace_path(namespace)),
-                &owner.scoped_payload(
-                    json!({
-                        "client_refresh_id": optional_string(args, "client_refresh_id")
-                            .unwrap_or_else(|| format!(
-                                "mcp-{}",
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_nanos()
-                            )),
-                        "expected_active_generation_id": expected_active_generation_id,
-                        "expected_chunk_count": expected_chunk_count,
-                        "expected_record_count": expected_record_count,
-                        "expected_size_bytes": expected_size_bytes,
-                        "source_revision": optional_string(args, "source_revision"),
-                    })
-                    .as_object()
-                    .expect("object")
-                    .clone(),
-                ),
+                &owner.scoped_payload(payload.as_object().expect("object").clone()),
             )
             .await?;
         if let Some(generation_id) = response.get("generation_id").and_then(Value::as_i64) {
@@ -898,23 +896,37 @@ impl McpServer {
         if chunk_index < 0 || chunk_index > i32::MAX as i64 {
             anyhow::bail!("Argument 'chunk_index' must be a nonnegative 32-bit integer");
         }
-        let entries = required_array(args, "entries", 10_000)?;
-        if entries.is_empty() {
-            anyhow::bail!("Argument 'entries' must not be empty");
+        let entries = if args.contains_key("entries") {
+            required_array(args, "entries", 10_000)?
+        } else {
+            Vec::new()
+        };
+        let deleted_external_ids = if args.contains_key("deleted_external_ids") {
+            required_array(args, "deleted_external_ids", 10_000)?
+        } else {
+            Vec::new()
+        };
+        if entries.is_empty() && deleted_external_ids.is_empty() {
+            anyhow::bail!("Provide entries or deleted_external_ids");
+        }
+        if entries.len().saturating_add(deleted_external_ids.len()) > 10_000 {
+            anyhow::bail!("Chunk exceeds the 10000-record limit");
+        }
+        if deleted_external_ids.iter().any(|id| !id.is_string()) {
+            anyhow::bail!("Argument 'deleted_external_ids' must contain strings");
         }
         let owner = cache_owner(args)?;
+        let mut payload = json!({ "entries": entries });
+        if !deleted_external_ids.is_empty() {
+            payload["deleted_external_ids"] = json!(deleted_external_ids);
+        }
         self.client
             .cache_put(
                 &format!(
                     "{}/generations/{generation_id}/chunks/{chunk_index}",
                     cache_namespace_path(namespace)
                 ),
-                &owner.scoped_payload(
-                    json!({ "entries": entries })
-                        .as_object()
-                        .expect("object")
-                        .clone(),
-                ),
+                &owner.scoped_payload(payload.as_object().expect("object").clone()),
             )
             .await
     }
@@ -1262,13 +1274,13 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "cache_refresh_begin",
             title: "Begin cache refresh",
-            description: "Create an idempotent staging generation. Requires explicit cache-write permission.",
+            description: "Create an idempotent staging generation. Optional source_generation_id clones the observed active snapshot inside PostgreSQL and requires cache-read as well as cache-write permission.",
             input_schema: cache_refresh_begin_schema,
         },
         ToolDef {
             name: "cache_refresh_upload_chunk",
             title: "Upload cache refresh chunk",
-            description: "Upload one bounded structured chunk to a staging generation. Requires explicit cache-write permission.",
+            description: "Upload one bounded chunk. Staging clones accept replacements and deletions keyed by external_id; chunk_index tracks order and retries, not record positions. Requires explicit cache-write permission.",
             input_schema: cache_refresh_upload_schema,
         },
         ToolDef {
@@ -1742,6 +1754,10 @@ fn cache_refresh_begin_schema() -> Value {
         json!({ "type": "integer", "minimum": 0 }),
     );
     properties.insert("source_revision".to_string(), json!({ "type": "string" }));
+    properties.insert("source_generation_id".to_string(), json!({
+        "type": "integer", "minimum": 1,
+        "description": "Clone this active snapshot inside PostgreSQL; must match expected_active_generation_id"
+    }));
     properties.insert(
         "expected_active_generation_id".to_string(),
         json!({ "type": "integer" }),
@@ -1784,7 +1800,7 @@ fn cache_refresh_upload_schema() -> Value {
     properties.insert(
         "entries".to_string(),
         json!({
-            "type": "array", "minItems": 1, "maxItems": 10000,
+            "type": "array", "maxItems": 10000,
             "items": {
                 "type": "object",
                 "properties": {
@@ -1798,10 +1814,11 @@ fn cache_refresh_upload_schema() -> Value {
             }
         }),
     );
-    cache_schema(
-        properties,
-        &["namespace", "generation_id", "chunk_index", "entries"],
-    )
+    properties.insert("deleted_external_ids".to_string(), json!({
+        "type": "array", "maxItems": 10000, "items": { "type": "string" },
+        "description": "IDs to delete from a staging clone. Delta chunks must be applied in index order."
+    }));
+    cache_schema(properties, &["namespace", "generation_id", "chunk_index"])
 }
 
 fn cache_refresh_promote_schema() -> Value {
@@ -3311,6 +3328,56 @@ mod tests {
                 request.url
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cache_clone_begin_and_deletion_chunk_transfer_only_metadata_and_ids() {
+        let api = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cache/namespaces/users/generations"))
+            .and(body_json(json!({
+                "owner_type": "system", "client_refresh_id": "delta",
+                "expected_active_generation_id": 41, "source_generation_id": 41,
+                "expected_chunk_count": 1, "expected_record_count": null,
+                "expected_size_bytes": null, "source_revision": null
+            })))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(json!({"data": {"generation_id": 42}})),
+            )
+            .expect(1)
+            .mount(&api)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/api/v1/cache/namespaces/users/generations/42/chunks/0",
+            ))
+            .and(body_json(
+                json!({"owner_type": "system", "entries": [], "deleted_external_ids": ["removed"]}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"generation_id": 42}})),
+            )
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server(api.uri());
+        let begin = serde_json::from_value(json!({
+            "owner_type": "system", "namespace": "users", "client_refresh_id": "delta",
+            "expected_active_generation_id": 41, "source_generation_id": 41, "expected_chunk_count": 1
+        })).unwrap();
+        server
+            .call_tool("cache_refresh_begin", &begin)
+            .await
+            .unwrap();
+        let upload = serde_json::from_value(json!({
+            "owner_type": "system", "namespace": "users", "generation_id": 42,
+            "chunk_index": 0, "deleted_external_ids": ["removed"]
+        }))
+        .unwrap();
+        server
+            .call_tool("cache_refresh_upload_chunk", &upload)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

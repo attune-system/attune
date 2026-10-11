@@ -227,13 +227,14 @@ impl SupervisorService {
                 &self.inner.pool,
                 config.max_summary_invalidations_per_bucket.min(10_000),
                 config.operation_timeout_milliseconds,
+                now,
             )
             .await
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| {
                         let age = row
-                            .oldest_observed_notification
+                            .oldest_eligible_at
                             .map(|time| (now - time).num_seconds())
                             .unwrap_or(0);
                         let problem = !row.count_exact
@@ -343,6 +344,159 @@ mod tests {
         assert_eq!(poll_interval(&config), Duration::from_secs(5));
         config.native_maintenance.enabled = false;
         assert_eq!(poll_interval(&config), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn summary_backlog_alerts_only_for_overdue_eligible_work() {
+        use attune_common::{
+            artifact_transport::VolumeTransport, blob_store::FilesystemBlobStore, config::Config,
+            test_database::TestDatabase,
+        };
+        use chrono::Duration as ChronoDuration;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicI64},
+            Arc,
+        };
+        use tokio::sync::{broadcast, Mutex};
+
+        let mut config = Config::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.test.yaml"
+        ))
+        .unwrap();
+        let db = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.maintenance.monitoring_enabled = true;
+        config.maintenance.alert_limit_per_cycle = 10;
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(crate::SupervisorServiceInner {
+                pool: db.pool().clone(),
+                config,
+                artifact_transport: Arc::new(VolumeTransport::new(
+                    artifacts.path().to_str().unwrap(),
+                )),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(
+                    crate::cache_retention::CacheRetentionState::default(),
+                ),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        sqlx::query("INSERT INTO trigger (ref, label) VALUES ('core.alert', 'Core Alert') ON CONFLICT (ref) DO NOTHING")
+            .execute(db.pool()).await.unwrap();
+        let start = DateTime::parse_from_rfc3339("2045-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query(
+            "INSERT INTO native_summary_invalidation(kind, bucket, created)
+             SELECT kind::native_summary_kind, $1, $2
+             FROM unnest(ARRAY['execution_status', 'execution_creation', 'event_volume']) kind",
+        )
+        .bind(start)
+        .bind(start + ChronoDuration::minutes(1))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // Future-hour volume must not trip the count/lower-bound alert either.
+        sqlx::query(
+            "INSERT INTO native_summary_invalidation(kind, bucket, created)
+             SELECT 'worker_status', $1, $2 FROM generate_series(1, 5)",
+        )
+        .bind(start + ChronoDuration::hours(2))
+        .bind(start + ChronoDuration::minutes(1))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut retention = RetentionConfig::default();
+        retention.native_maintenance.summary_interval_seconds = 300;
+        retention
+            .native_maintenance
+            .max_summary_invalidations_per_bucket = 2;
+
+        // Reproduce notifications that age past ten minutes in an unfinished
+        // hour, then check hour-end and the exact grace-period boundary.
+        for minutes in [59, 60, 70] {
+            service
+                .report_native_status(
+                    MaintenanceJob::Summary,
+                    &retention,
+                    start + ChronoDuration::minutes(minutes),
+                )
+                .await;
+            let alerts: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM event WHERE trigger_ref = 'core.alert'")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(alerts, 0, "unexpected alert at minute {minutes}");
+        }
+
+        // A late write to a completed hour gets its own grace period, rather
+        // than appearing overdue immediately because the source hour is old.
+        sqlx::query(
+            "INSERT INTO native_summary_invalidation(kind, bucket, created)
+             VALUES ('worker_status', $1, $2)",
+        )
+        .bind(start - ChronoDuration::hours(2))
+        .bind(start + ChronoDuration::minutes(69))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        service
+            .report_native_status(
+                MaintenanceJob::Summary,
+                &retention,
+                start + ChronoDuration::minutes(70) + ChronoDuration::seconds(1),
+            )
+            .await;
+        let alerts: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM event WHERE trigger_ref = 'core.alert' ORDER BY id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(alerts.len(), 3, "only overdue eligible kinds should alert");
+        for kind in ["execution_status", "execution_creation", "event_volume"] {
+            let alert = alerts
+                .iter()
+                .find(|alert| alert["component_ref"] == kind)
+                .unwrap();
+            assert_eq!(alert["failure_type"], "summary_backlog");
+            assert_eq!(alert["details"]["notifications_at_least"], 1);
+        }
+
+        for (offset, expected) in [(0, 0), (1, 1)] {
+            service
+                .report_native_status(
+                    MaintenanceJob::Summary,
+                    &retention,
+                    start + ChronoDuration::minutes(79) + ChronoDuration::seconds(offset),
+                )
+                .await;
+            let worker_alerts: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM event WHERE trigger_ref = 'core.alert'
+                 AND payload->>'component_ref' = 'worker_status'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                worker_alerts, expected,
+                "late-write grace at offset {offset}"
+            );
+        }
+        drop(service);
+        db.cleanup().await.unwrap();
     }
 
     #[tokio::test]

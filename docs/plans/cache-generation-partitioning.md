@@ -42,7 +42,11 @@ that deferred analytics optimization has passed.
 - Keep unique bytewise `(generation, external_id)`, value/text limits, the
   generation FK, staging-only INSERT, and entry immutability. The primary key
   replaces the redundant `(generation, id)` index.
-- Reject entry UPDATE and DELETE. Remove routine entry batch cleanup and its
+- Reject entry UPDATE and published-snapshot DELETE. Staging clones can replace
+  or delete records through ordered delta chunks; their statement DELETE trigger
+  subtracts exact usage. Full snapshots remain append-only. See
+  [bulk refresh](../KEY_CACHE.md#bulk-refresh-protocol) for the clone contract.
+  Remove routine entry batch cleanup and its
   DELETE accounting trigger only when guarded partition reclamation is ready.
 - Add `cache_generation_entry_usage`, keyed by generation with a restrictive FK,
   exact nonnegative `record_count` and `physical_bytes`. These count admitted

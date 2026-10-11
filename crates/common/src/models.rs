@@ -2127,6 +2127,8 @@ pub mod cache {
         pub state: CacheGenerationState,
         pub client_refresh_id: String,
         pub expected_active_generation: Option<Id>,
+        /// Historical base snapshot ID; copies do not depend on its retention.
+        pub source_generation: Option<Id>,
         pub expected_chunk_count: i32,
         pub expected_count: Option<i64>,
         pub expected_bytes: Option<i64>,
@@ -2148,7 +2150,7 @@ pub mod cache {
     }
 
     pub const CACHE_GENERATION_SELECT_COLUMNS: &str = "id, namespace, state, client_refresh_id, \
-            expected_active_generation, expected_chunk_count, expected_count, expected_bytes, \
+            expected_active_generation, source_generation, expected_chunk_count, expected_count, expected_bytes, \
             record_count, size_bytes, checksum_algorithm, checksum, source_revision, created_by, created_by_execution, \
             created, sealed, activated, retired, readable_until, failed, failure_reason";
 

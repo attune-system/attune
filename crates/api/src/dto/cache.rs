@@ -215,6 +215,9 @@ pub struct CacheGenerationResponse {
     /// `null` means the namespace was expected to be unpopulated.
     #[schema(required = true, nullable = true)]
     pub expected_active_generation_id: Option<Id>,
+    /// Historical source snapshot for a database-local clone, otherwise null.
+    #[schema(required = true, nullable = true)]
+    pub source_generation_id: Option<Id>,
     pub expected_chunk_count: i32,
     #[schema(required = true, nullable = true)]
     pub expected_record_count: Option<i64>,
@@ -377,6 +380,10 @@ pub struct CreateCacheGenerationRequest {
     /// means this is expected to be the namespace's first publication.
     #[schema(required = true, nullable = true)]
     pub expected_active_generation_id: Option<Id>,
+    /// Clone this active generation inside PostgreSQL and ingest delta chunks.
+    /// Must equal expected_active_generation_id. Omit for a full snapshot.
+    #[serde(default)]
+    pub source_generation_id: Option<Id>,
     /// Declared chunk count for contiguity validation at seal time.
     pub expected_chunk_count: i64,
     #[serde(default)]
@@ -405,7 +412,12 @@ pub struct UploadCacheChunkRequest {
     pub owner_type: OwnerType,
     #[serde(default)]
     pub owner_ref: Option<String>,
+    /// Inserts for a full snapshot, or complete replacement values for a clone.
+    #[serde(default)]
     pub entries: Vec<CacheEntryUpload>,
+    /// Delete these IDs from a staging clone. Missing IDs are harmless.
+    #[serde(default)]
+    pub deleted_external_ids: Vec<String>,
 }
 
 /// Seal a staging generation into `ready`.

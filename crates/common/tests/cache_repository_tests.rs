@@ -85,6 +85,419 @@ fn entries(ids: &[&str]) -> Vec<CacheEntryInput> {
         .collect()
 }
 
+async fn clone_generation(
+    pool: &PgPool,
+    input: &CreateCacheGenerationInput,
+    source: i64,
+    admission: &CacheAdmissionConfig,
+) -> attune_common::Result<CreateCacheGenerationResult> {
+    let mut tx = pool.begin().await?;
+    let result =
+        CacheGenerationRepository::clone_or_get_with_policy_conn(&mut tx, input, source, admission)
+            .await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+async fn delta_chunk(
+    pool: &PgPool,
+    generation: i64,
+    index: i32,
+    checksum: &str,
+    entries: &[CacheEntryInput],
+    deleted: &[String],
+) -> attune_common::Result<InsertCacheChunkResult> {
+    let mut tx = pool.begin().await?;
+    let result = CacheIngestRepository::apply_chunk_with_policy_conn(
+        &mut tx,
+        generation,
+        index,
+        checksum,
+        entries,
+        deleted,
+        &CacheAdmissionConfig::default(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+#[tokio::test]
+async fn cache_clone_delta_lifecycle_keeps_base_immutable_and_accounts_exactly() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("clone_{}", unique_test_id()),
+            CacheNamespacePolicy {
+                max_records_per_generation: 3,
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let base = publish_generation(&pool, namespace.id, "base", &["a", "b", "c"], None).await;
+    let mut input = generation_input(namespace.id, "delta", 2, Some(2));
+    input.expected_active_generation = Some(base.id);
+    let cloned = clone_generation(&pool, &input, base.id, &CacheAdmissionConfig::default())
+        .await
+        .unwrap();
+    let CreateCacheGenerationResult::Created(cloned) = cloned else {
+        panic!("expected clone");
+    };
+    assert_eq!(cloned.source_generation, Some(base.id));
+    assert_eq!(cloned.record_count, 3);
+    assert!(
+        matches!(clone_generation(&pool, &input, base.id, &CacheAdmissionConfig::default()).await.unwrap(),
+        CreateCacheGenerationResult::Existing(existing) if existing.id == cloned.id)
+    );
+    assert!(
+        CacheGenerationRepository::create_or_get(&pool, &input)
+            .await
+            .is_err(),
+        "retry cannot change the refresh mode"
+    );
+
+    assert!(
+        delta_chunk(&pool, cloned.id, 1, "out-of-order", &[], &["c".into()])
+            .await
+            .is_err()
+    );
+    assert!(
+        delta_chunk(&pool, cloned.id, 0, "over-quota", &entries(&["d"]), &[])
+            .await
+            .is_err()
+    );
+    assert!(delta_chunk(
+        &pool,
+        cloned.id,
+        0,
+        "overlap",
+        &entries(&["a"]),
+        &["a".into()]
+    )
+    .await
+    .is_err());
+    let mut changed = entries(&["a", "d"]);
+    changed[0].value = json!({"changed": true, "payload": "replacement"});
+    changed[0].source_checksum = Some("new-checksum".into());
+    changed[0].source_updated_at = Some(Utc::now());
+    delta_chunk(&pool, cloned.id, 0, "change", &changed, &["b".into()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        delta_chunk(&pool, cloned.id, 0, "change", &changed, &["b".into()])
+            .await
+            .unwrap(),
+        InsertCacheChunkResult::Replayed(_)
+    ));
+    assert!(
+        delta_chunk(&pool, cloned.id, 0, "conflicting", &changed, &["b".into()])
+            .await
+            .is_err()
+    );
+    let mut later_change = vec![changed[0].clone()];
+    later_change[0].value = json!({"final": true});
+    delta_chunk(
+        &pool,
+        cloned.id,
+        1,
+        "delete",
+        &later_change,
+        &["c".into(), "missing".into()],
+    )
+    .await
+    .unwrap();
+    let chunks = CacheIngestRepository::list_chunks(&pool, cloned.id)
+        .await
+        .unwrap();
+    assert_eq!(chunks[1].record_count, -1);
+    assert!(chunks[1].size_bytes < 0);
+    let ready = CacheGenerationRepository::seal(&pool, cloned.id)
+        .await
+        .unwrap();
+    assert_eq!(ready.record_count, 2);
+    assert!(
+        delta_chunk(
+            &pool,
+            cloned.id,
+            1,
+            "delete",
+            &later_change,
+            &["c".into(), "missing".into()]
+        )
+        .await
+        .is_ok(),
+        "accepted retry remains harmless after seal"
+    );
+    let source = CacheEntryRepository::find_active(&pool, namespace.id, "a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.value, json!({"id": "a"}));
+    CacheGenerationRepository::promote(
+        &pool,
+        namespace.id,
+        cloned.id,
+        Some(base.id),
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .unwrap();
+    let current = CacheEntryRepository::find_active(&pool, namespace.id, "a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.value, later_change[0].value);
+    assert_eq!(current.source_checksum, changed[0].source_checksum);
+    assert!(CacheEntryRepository::find_active(&pool, namespace.id, "b")
+        .await
+        .unwrap()
+        .is_none());
+
+    let usage: (i64, i64, i64) = sqlx::query_as(
+        "SELECT g.record_count, u.record_count, u.physical_bytes FROM cache_generation g
+         JOIN cache_generation_entry_usage u ON u.generation = g.id WHERE g.id = $1",
+    )
+    .bind(cloned.id)
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    assert_eq!(usage, (2, 2, ready.size_bytes));
+    let (accounted, actual): (i64, i64) = sqlx::query_as(
+        "SELECT physical_bytes, (SELECT SUM(size_bytes)::BIGINT FROM cache_entry)
+         FROM cache_deployment_physical_byte_usage WHERE id = 1",
+    )
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    assert_eq!(accounted, actual);
+
+    // The copied snapshot and create retry survive physical base reclamation.
+    sqlx::query("UPDATE cache_generation SET retired = NOW() - interval '1 hour', readable_until = NOW() - interval '1 minute' WHERE id = $1")
+        .bind(base.id).execute(&*pool).await.unwrap();
+    assert_eq!(reclaim_generation(&pool, base.id).await.unwrap(), 3);
+    assert!(
+        clone_generation(&pool, &input, base.id, &CacheAdmissionConfig::default())
+            .await
+            .is_ok()
+    );
+    assert!(CacheEntryRepository::find_active(&pool, namespace.id, "d")
+        .await
+        .unwrap()
+        .is_some());
+    let usage: (i64, i64, i64) = sqlx::query_as(
+        "SELECT d.physical_bytes, o.physical_bytes, u.physical_bytes
+         FROM cache_deployment_physical_byte_usage d
+         JOIN cache_owner_physical_byte_usage o ON o.owner_type = 'system' AND o.owner = 'system'
+         JOIN cache_generation_entry_usage u ON u.generation = $1 WHERE d.id = 1",
+    )
+    .bind(cloned.id)
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        usage,
+        (ready.size_bytes, ready.size_bytes, ready.size_bytes)
+    );
+    assert!(
+        sqlx::query("DELETE FROM cache_entry WHERE generation = $1")
+            .bind(cloned.id)
+            .execute(&*pool)
+            .await
+            .is_err(),
+        "published clone must remain immutable"
+    );
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_clone_admission_rolls_back_and_zero_delta_clone_can_publish() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("clone_quota_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let base = publish_generation(&pool, namespace.id, "base", &["a"], None).await;
+    let mut input = generation_input(namespace.id, "clone", 0, Some(1));
+    input.expected_active_generation = Some(base.id);
+    let admission = CacheAdmissionConfig {
+        max_physical_bytes: base.size_bytes * 2 - 1,
+        ..Default::default()
+    };
+    assert!(clone_generation(&pool, &input, base.id, &admission)
+        .await
+        .is_err());
+    let partitions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_inherits WHERE inhparent = 'cache_entry'::regclass",
+    )
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    assert_eq!(partitions, 1);
+    // This quota is checked after the database-local copy. Rollback must remove
+    // the attached partition, copied rows, and their charged bytes together.
+    CacheNamespaceRepository::update_policy(
+        &*pool,
+        namespace.id,
+        &CacheNamespacePolicy {
+            max_retained_bytes: base.size_bytes * 2 - 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        clone_generation(&pool, &input, base.id, &CacheAdmissionConfig::default())
+            .await
+            .is_err()
+    );
+    let storage: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM cache_generation),
+                (SELECT COUNT(*) FROM pg_inherits WHERE inhparent = 'cache_entry'::regclass),
+                physical_bytes FROM cache_deployment_physical_byte_usage WHERE id = 1",
+    )
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    assert_eq!(storage, (1, 1, base.size_bytes));
+    CacheNamespaceRepository::update_policy(&*pool, namespace.id, &CacheNamespacePolicy::default())
+        .await
+        .unwrap();
+    let result = clone_generation(&pool, &input, base.id, &CacheAdmissionConfig::default())
+        .await
+        .unwrap();
+    let CreateCacheGenerationResult::Created(cloned) = result else {
+        panic!("expected clone");
+    };
+    assert_eq!(
+        CacheGenerationRepository::seal(&pool, cloned.id)
+            .await
+            .unwrap()
+            .record_count,
+        1
+    );
+    // An empty full snapshot still cannot be turned into a delta generation.
+    let full = create_generation(&pool, namespace.id, "full", 1, None).await;
+    assert!(delta_chunk(&pool, full.id, 0, "delete", &[], &["a".into()])
+        .await
+        .is_err());
+    assert!(
+        clone_generation(&pool, &input, cloned.id, &CacheAdmissionConfig::default())
+            .await
+            .is_err(),
+        "source must match the observed active generation"
+    );
+    CacheGenerationRepository::fail(&pool, cloned.id, "owned test cleanup")
+        .await
+        .unwrap();
+    assert_eq!(reclaim_generation(&pool, cloned.id).await.unwrap(), 1);
+    let baseline_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cache_generation_clone")
+        .fetch_one(&*pool)
+        .await
+        .unwrap();
+    assert_eq!(baseline_rows, 0);
+    let usage: (i64, i64) = sqlx::query_as(
+        "SELECT d.physical_bytes, o.physical_bytes
+         FROM cache_deployment_physical_byte_usage d
+         JOIN cache_owner_physical_byte_usage o ON o.owner_type = 'system' AND o.owner = 'system'
+         WHERE d.id = 1",
+    )
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    assert_eq!(usage, (base.size_bytes, base.size_bytes));
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_clone_rejects_foreign_or_unpublished_sources_and_stale_promotion() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("clone_guard_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let foreign_namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("clone_foreign_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let base = publish_generation(&pool, namespace.id, "base", &["a"], None).await;
+    let foreign = publish_generation(&pool, foreign_namespace.id, "foreign", &["b"], None).await;
+    let unpublished = seal_generation(&pool, namespace.id, "unpublished", &["c"]).await;
+    for source in [foreign.id, unpublished.id] {
+        let mut input = generation_input(namespace.id, format!("invalid-{source}"), 0, None);
+        input.expected_active_generation = Some(source);
+        assert!(
+            clone_generation(&pool, &input, source, &CacheAdmissionConfig::default())
+                .await
+                .is_err()
+        );
+    }
+    let mut input = generation_input(namespace.id, "clone", 0, Some(1));
+    input.expected_active_generation = Some(base.id);
+    let CreateCacheGenerationResult::Created(cloned) =
+        clone_generation(&pool, &input, base.id, &CacheAdmissionConfig::default())
+            .await
+            .unwrap()
+    else {
+        panic!("expected clone");
+    };
+    CacheGenerationRepository::seal(&pool, cloned.id)
+        .await
+        .unwrap();
+    CacheGenerationRepository::promote(
+        &pool,
+        namespace.id,
+        unpublished.id,
+        Some(base.id),
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .unwrap();
+    assert!(CacheGenerationRepository::promote(
+        &pool,
+        namespace.id,
+        cloned.id,
+        Some(base.id),
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .is_err());
+    input.client_refresh_id = "stale-source".into();
+    assert!(
+        clone_generation(&pool, &input, base.id, &CacheAdmissionConfig::default())
+            .await
+            .is_err()
+    );
+    let current = CacheEntryRepository::find_active(&pool, namespace.id, "c")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.generation, unpublished.id);
+    let clone_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cache_generation_clone")
+        .fetch_one(&*pool)
+        .await
+        .unwrap();
+    assert_eq!(clone_rows, 1);
+    pool.cleanup().await.unwrap();
+}
+
 async fn reclaim_generation(pool: &PgPool, generation: i64) -> attune_common::Result<u64> {
     let config = CacheRetentionConfig {
         min_traversal_window_seconds: 0,

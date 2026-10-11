@@ -24,6 +24,7 @@ class CreateCacheGenerationRequest:
         expected_record_count (int | None | Unset):
         expected_size_bytes (int | None | Unset):
         owner_ref (None | str | Unset):
+        source_generation_id (int | None | Unset):
         source_revision (None | str | Unset):
     """
 
@@ -34,6 +35,7 @@ class CreateCacheGenerationRequest:
     expected_record_count: int | None | Unset = UNSET
     expected_size_bytes: int | None | Unset = UNSET
     owner_ref: None | str | Unset = UNSET
+    source_generation_id: int | None | Unset = UNSET
     source_revision: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +66,12 @@ class CreateCacheGenerationRequest:
         else:
             owner_ref = self.owner_ref
 
+        source_generation_id: int | None | Unset
+        if isinstance(self.source_generation_id, Unset):
+            source_generation_id = UNSET
+        else:
+            source_generation_id = self.source_generation_id
+
         source_revision: None | str | Unset
         if isinstance(self.source_revision, Unset):
             source_revision = UNSET
@@ -86,6 +94,8 @@ class CreateCacheGenerationRequest:
             field_dict["expected_size_bytes"] = expected_size_bytes
         if owner_ref is not UNSET:
             field_dict["owner_ref"] = owner_ref
+        if source_generation_id is not UNSET:
+            field_dict["source_generation_id"] = source_generation_id
         if source_revision is not UNSET:
             field_dict["source_revision"] = source_revision
 
@@ -140,6 +150,17 @@ class CreateCacheGenerationRequest:
 
         owner_ref = _parse_owner_ref(d.pop("owner_ref", UNSET))
 
+        def _parse_source_generation_id(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        source_generation_id = _parse_source_generation_id(
+            d.pop("source_generation_id", UNSET)
+        )
+
         def _parse_source_revision(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -157,6 +178,7 @@ class CreateCacheGenerationRequest:
             expected_record_count=expected_record_count,
             expected_size_bytes=expected_size_bytes,
             owner_ref=owner_ref,
+            source_generation_id=source_generation_id,
             source_revision=source_revision,
         )
 

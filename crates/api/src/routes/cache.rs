@@ -1037,6 +1037,7 @@ fn generation_response(generation: &CacheGeneration) -> CacheGenerationResponse 
         status: generation.state,
         client_refresh_id: generation.client_refresh_id.clone(),
         expected_active_generation_id: generation.expected_active_generation,
+        source_generation_id: generation.source_generation,
         expected_chunk_count: generation.expected_chunk_count,
         expected_record_count: generation.expected_count,
         expected_size_bytes: generation.expected_bytes,
@@ -2350,6 +2351,18 @@ pub async fn create_generation(
         &namespace,
     )
     .await?;
+    if request.source_generation_id.is_some() {
+        // Copying existing values is a read as well as a refresh operation.
+        authorize_namespace_action(
+            &state,
+            &user.0,
+            Action::Read,
+            request.owner_type,
+            request.owner_ref.as_deref(),
+            &namespace,
+        )
+        .await?;
+    }
     let mut tx = begin_cache_transaction(&state, &user.0, CacheTransactionMode::Attach).await?;
     let scope = resolve_owner_scope(
         &mut tx,
@@ -2364,24 +2377,35 @@ pub async fn create_generation(
     let expected_chunk_count = i32::try_from(request.expected_chunk_count)
         .map_err(|_| CacheApiError::bad_request("expected_chunk_count is out of range"))?;
 
-    let result = CacheGenerationRepository::create_or_get_with_policy_conn(
-        &mut tx,
-        &CreateCacheGenerationInput {
-            namespace: record.id,
-            client_refresh_id: request.client_refresh_id.clone(),
-            expected_active_generation: request.expected_active_generation_id,
-            expected_chunk_count,
-            expected_count: request.expected_record_count,
-            expected_bytes: request.expected_size_bytes,
-            checksum_algorithm: None,
-            checksum: None,
-            source_revision: request.source_revision.clone(),
-            created_by: user.0.identity_id().ok(),
-            created_by_execution: user.0.execution_id(),
-        },
-        &state.config.cache_admission,
-    )
-    .await;
+    let input = CreateCacheGenerationInput {
+        namespace: record.id,
+        client_refresh_id: request.client_refresh_id.clone(),
+        expected_active_generation: request.expected_active_generation_id,
+        expected_chunk_count,
+        expected_count: request.expected_record_count,
+        expected_bytes: request.expected_size_bytes,
+        checksum_algorithm: None,
+        checksum: None,
+        source_revision: request.source_revision.clone(),
+        created_by: user.0.identity_id().ok(),
+        created_by_execution: user.0.execution_id(),
+    };
+    let result = if let Some(source) = request.source_generation_id {
+        CacheGenerationRepository::clone_or_get_with_policy_conn(
+            &mut tx,
+            &input,
+            source,
+            &state.config.cache_admission,
+        )
+        .await
+    } else {
+        CacheGenerationRepository::create_or_get_with_policy_conn(
+            &mut tx,
+            &input,
+            &state.config.cache_admission,
+        )
+        .await
+    };
     let result = match result {
         Ok(result) => result,
         Err(error) => {
@@ -2422,6 +2446,7 @@ pub async fn create_generation(
                 "generation": generation.id,
                 "client_refresh_id": generation.client_refresh_id,
                 "source_revision": generation.source_revision,
+                "source_generation_id": generation.source_generation,
             }),
         );
     }
@@ -2501,8 +2526,10 @@ pub async fn upload_chunk(
         .filter(|generation| generation.namespace == record.id)
         .ok_or_else(|| CacheApiError::not_found("cache generation not found"))?;
 
-    if request.entries.is_empty() {
-        return Err(CacheApiError::bad_request("chunk entries cannot be empty"));
+    if request.entries.is_empty() && request.deleted_external_ids.is_empty() {
+        return Err(CacheApiError::bad_request(
+            "chunk must contain entries or deletions",
+        ));
     }
 
     let entries: Vec<CacheEntryInput> = request
@@ -2516,12 +2543,13 @@ pub async fn upload_chunk(
         })
         .collect();
 
-    let result = CacheIngestRepository::insert_chunk_with_policy_conn(
+    let result = CacheIngestRepository::apply_chunk_with_policy_conn(
         &mut tx,
         generation.id,
         chunk_index,
         &request_checksum,
         &entries,
+        &request.deleted_external_ids,
         &state.config.cache_admission,
     )
     .await;

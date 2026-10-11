@@ -1,7 +1,7 @@
 //! Persistence operations for owner-scoped external data caches.
 //!
-//! Cache records are never updated in place. Writers build a staging generation,
-//! seal it, then atomically promote it through the namespace pointer.
+//! Published cache records are immutable. Writers build a staging generation,
+//! optionally clone and apply deltas, seal it, then atomically promote it.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
@@ -1440,6 +1440,31 @@ impl CacheGenerationRepository {
         input: &CreateCacheGenerationInput,
         admission: &CacheAdmissionConfig,
     ) -> Result<CreateCacheGenerationResult> {
+        Self::begin_with_source_conn(connection, input, None, admission).await
+    }
+
+    /// Copy the observed active snapshot entirely inside PostgreSQL. Matching
+    /// retries do not copy again, including after the source has been reclaimed.
+    pub async fn clone_or_get_with_policy_conn(
+        connection: &mut sqlx::PgConnection,
+        input: &CreateCacheGenerationInput,
+        source_generation: Id,
+        admission: &CacheAdmissionConfig,
+    ) -> Result<CreateCacheGenerationResult> {
+        if source_generation <= 0 || input.expected_active_generation != Some(source_generation) {
+            return Err(Error::validation(
+                "clone source must match expected_active_generation_id",
+            ));
+        }
+        Self::begin_with_source_conn(connection, input, Some(source_generation), admission).await
+    }
+
+    async fn begin_with_source_conn(
+        connection: &mut sqlx::PgConnection,
+        input: &CreateCacheGenerationInput,
+        source_generation: Option<Id>,
+        admission: &CacheAdmissionConfig,
+    ) -> Result<CreateCacheGenerationResult> {
         validate_generation_input(input)?;
         CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Attach).await?;
         let namespace = lock_namespace(connection, input.namespace)
@@ -1459,7 +1484,9 @@ impl CacheGenerationRepository {
             .fetch_optional(&mut *connection)
             .await?
         {
-            if generation_matches_input(&existing, input) {
+            if generation_matches_input(&existing, input)
+                && existing.source_generation == source_generation
+            {
                 validate_generation_storage(connection, existing.id).await?;
                 return Ok(CreateCacheGenerationResult::Existing(existing));
             }
@@ -1495,6 +1522,31 @@ impl CacheGenerationRepository {
             }
         }
 
+        let source = if let Some(source_id) = source_generation {
+            let source = lock_generation(connection, source_id)
+                .await?
+                .filter(|source| {
+                    source.namespace == namespace.id
+                        && source.state == CacheGenerationState::Active
+                        && namespace.active_generation == Some(source.id)
+                })
+                .ok_or_else(|| {
+                    Error::invalid_state("clone source is not the active namespace generation")
+                })?;
+            validate_generation_storage(connection, source.id).await?;
+            ensure_generation_quota(&namespace, source.record_count, source.size_bytes)?;
+            ensure_physical_byte_admission_with_additional(
+                connection,
+                &namespace,
+                source.size_bytes,
+                admission,
+            )
+            .await?;
+            Some(source)
+        } else {
+            None
+        };
+
         let staging_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM cache_generation \
              WHERE namespace = $1 AND state IN ('staging', 'ready')",
@@ -1526,11 +1578,11 @@ impl CacheGenerationRepository {
             "INSERT INTO cache_generation \
              (namespace, client_refresh_id, expected_active_generation, expected_chunk_count, \
               expected_count, expected_bytes, checksum_algorithm, checksum, source_revision, \
-               created_by, created_by_execution) \
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                created_by, created_by_execution, source_generation) \
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              RETURNING {CACHE_GENERATION_SELECT_COLUMNS}"
         );
-        let generation = sqlx::query_as::<_, CacheGeneration>(&insert)
+        let mut generation = sqlx::query_as::<_, CacheGeneration>(&insert)
             .bind(input.namespace)
             .bind(&input.client_refresh_id)
             .bind(input.expected_active_generation)
@@ -1542,6 +1594,7 @@ impl CacheGenerationRepository {
             .bind(&input.source_revision)
             .bind(input.created_by)
             .bind(input.created_by_execution)
+            .bind(source_generation)
             .fetch_one(&mut *connection)
             .await?;
         let ddl_started = std::time::Instant::now();
@@ -1561,6 +1614,45 @@ impl CacheGenerationRepository {
             "Cache partition creation statement completed"
         );
         creation?;
+        if let Some(source) = source {
+            // Partition pruning restricts the source scan to one snapshot. No
+            // record values are materialized in the caller or returned over SQL.
+            sqlx::query(
+                "INSERT INTO cache_entry (generation, external_id, value, source_updated_at, source_checksum, created)
+                 SELECT $1, external_id, value, source_updated_at, source_checksum, created
+                 FROM cache_entry WHERE generation = $2",
+            )
+            .bind(generation.id)
+            .bind(source.id)
+            .execute(&mut *connection)
+            .await?;
+            let (records, bytes) = generation_entry_usage(connection, generation.id).await?;
+            ensure_generation_quota(&namespace, records, bytes)?;
+            let retained_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM cache_generation WHERE namespace = $1",
+            )
+            .bind(namespace.id)
+            .fetch_one(&mut *connection)
+            .await?;
+            ensure_namespace_storage_quota(
+                &namespace,
+                retained_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| Error::validation("cache namespace byte size overflow"))?,
+            )?;
+            ensure_physical_byte_admission(connection, &namespace, admission).await?;
+            sqlx::query("INSERT INTO cache_generation_clone(generation, record_count, size_bytes) VALUES ($1, $2, $3)")
+                .bind(generation.id).bind(records).bind(bytes).execute(&mut *connection).await?;
+            let query = format!(
+                "UPDATE cache_generation SET record_count = $2, size_bytes = $3 WHERE id = $1 RETURNING {CACHE_GENERATION_SELECT_COLUMNS}"
+            );
+            generation = sqlx::query_as(&query)
+                .bind(generation.id)
+                .bind(records)
+                .bind(bytes)
+                .fetch_one(&mut *connection)
+                .await?;
+        }
         Ok(CreateCacheGenerationResult::Created(generation))
     }
 
@@ -1764,7 +1856,20 @@ impl CacheGenerationRepository {
         .bind(generation_id)
         .fetch_one(&mut *connection)
         .await?;
-        if record_count != chunk_record_count || size_bytes != chunk_size_bytes {
+        let (base_records, base_bytes): (i64, i64) = if generation.source_generation.is_some() {
+            sqlx::query_as(
+                "SELECT record_count, size_bytes FROM cache_generation_clone WHERE generation = $1",
+            )
+            .bind(generation_id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| Error::invalid_state("cache clone baseline is missing"))?
+        } else {
+            (0, 0)
+        };
+        if base_records.checked_add(chunk_record_count) != Some(record_count)
+            || base_bytes.checked_add(chunk_size_bytes) != Some(size_bytes)
+        {
             return Err(Error::validation(
                 "cache generation entries do not match accepted ingest chunk metadata",
             ));
@@ -2267,6 +2372,15 @@ async fn validate_generation_storage(
 
 pub struct CacheIngestRepository;
 
+async fn generation_entry_usage(
+    connection: &mut sqlx::PgConnection,
+    generation_id: Id,
+) -> Result<(i64, i64)> {
+    sqlx::query_as("SELECT record_count, physical_bytes FROM cache_generation_entry_usage WHERE generation = $1")
+        .bind(generation_id).fetch_optional(connection).await?
+        .ok_or_else(|| Error::invalid_state("cache generation entry usage is missing"))
+}
+
 impl CacheIngestRepository {
     /// Atomically accepts an ingest chunk. The same accepted checksum is a
     /// no-op replay; a distinct checksum for that chunk index is a conflict.
@@ -2318,7 +2432,54 @@ impl CacheIngestRepository {
         entries: &[CacheEntryInput],
         admission: &CacheAdmissionConfig,
     ) -> Result<InsertCacheChunkResult> {
-        validate_chunk_input(chunk_index, request_checksum, entries)?;
+        Self::apply_chunk_with_policy_conn(
+            connection,
+            generation_id,
+            chunk_index,
+            request_checksum,
+            entries,
+            &[],
+            admission,
+        )
+        .await
+    }
+
+    /// Clones accept ordered upsert/delete chunks; ordinary snapshots retain
+    /// append-only ingestion. Request digests make identical retries no-ops.
+    pub async fn apply_chunk_with_policy_conn(
+        connection: &mut sqlx::PgConnection,
+        generation_id: Id,
+        chunk_index: i32,
+        request_checksum: &str,
+        entries: &[CacheEntryInput],
+        deleted_external_ids: &[String],
+        admission: &CacheAdmissionConfig,
+    ) -> Result<InsertCacheChunkResult> {
+        let entry_bytes = validate_chunk_input(chunk_index, request_checksum, entries)?;
+        if entries.len().saturating_add(deleted_external_ids.len()) > MAX_INGEST_CHUNK_RECORDS {
+            return Err(Error::validation(
+                "cache ingest chunk record limit exceeded",
+            ));
+        }
+        let mut ids = HashSet::new();
+        for entry in entries {
+            if !ids.insert(entry.external_id.as_str()) {
+                return Err(Error::cache_duplicate_external_id());
+            }
+        }
+        let mut encoded_bytes = entry_bytes;
+        for id in deleted_external_ids {
+            validate_external_id(id)?;
+            if !ids.insert(id.as_str()) {
+                return Err(Error::cache_duplicate_external_id());
+            }
+            encoded_bytes = encoded_bytes
+                .checked_add(id.len())
+                .ok_or_else(|| Error::validation("cache ingest chunk is too large"))?;
+        }
+        if encoded_bytes > MAX_INGEST_CHUNK_BYTES {
+            return Err(Error::validation("cache ingest chunk byte limit exceeded"));
+        }
         CacheEntryRepository::protect_transaction(connection, CacheTransactionMode::Ingest).await?;
         // Lock namespace-before-generation (the generation's namespace is
         // immutable) so tombstone, upload, and seal share one lock order and
@@ -2365,14 +2526,46 @@ impl CacheIngestRepository {
             ));
         }
 
+        let is_delta = generation.source_generation.is_some();
+        if !is_delta && !deleted_external_ids.is_empty() {
+            return Err(Error::validation(
+                "deletions require a cloned cache generation",
+            ));
+        }
+        if is_delta {
+            // Delta order matters when the same record changes more than once.
+            let accepted: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM cache_ingest_chunk WHERE generation = $1")
+                    .bind(generation_id)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if accepted != i64::from(chunk_index) {
+                return Err(Error::invalid_state(
+                    "cache delta chunks must be applied in order from zero",
+                ));
+            }
+        }
+
         let entry_count = i64::try_from(entries.len())
             .map_err(|_| Error::validation("cache ingest chunk is too large"))?;
-        if generation.record_count.saturating_add(entry_count)
-            > namespace.max_records_per_generation
+        if !is_delta
+            && generation.record_count.saturating_add(entry_count)
+                > namespace.max_records_per_generation
         {
             return Err(Error::validation(
                 "cache generation record quota would be exceeded",
             ));
+        }
+
+        if is_delta {
+            let ids: Vec<&str> = ids.into_iter().collect();
+            // Only IDs cross the SQL connection. Deletes and replacement values
+            // are accounted by statement transition triggers inside PostgreSQL.
+            sqlx::query("DELETE FROM cache_entry WHERE generation = $1 AND external_id = ANY($2)")
+                .bind(generation_id)
+                .bind(ids)
+                .execute(&mut *connection)
+                .await?;
         }
 
         let mut inserted_bytes = 0_i64;
@@ -2388,33 +2581,49 @@ impl CacheIngestRepository {
                     .push_bind(entry.source_updated_at)
                     .push_bind(entry.source_checksum.as_deref());
             });
-            query.push(" RETURNING size_bytes");
-            let inserted: Vec<i64> =
-                match query.build_query_scalar().fetch_all(&mut *connection).await {
-                    Ok(rows) => rows,
-                    // The only unique constraint reachable by a cache_entry insert
-                    // is the (generation, external_id) index, so a 23505 here means
-                    // the chunk (or a prior chunk in this generation) repeats an
-                    // external identifier. Surface a typed, ID-free ingestion error.
-                    Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
-                        return Err(Error::cache_duplicate_external_id());
-                    }
-                    Err(err) => return Err(err.into()),
-                };
+            let inserted = if is_delta {
+                // Delta totals come from the trigger-maintained usage row; do
+                // not return one SQL result per changed record.
+                query
+                    .build()
+                    .execute(&mut *connection)
+                    .await
+                    .map(|_| Vec::new())
+            } else {
+                query.push(" RETURNING size_bytes");
+                query.build_query_scalar().fetch_all(&mut *connection).await
+            };
+            let inserted: Vec<i64> = match inserted {
+                Ok(rows) => rows,
+                // The only unique constraint reachable by a cache_entry insert
+                // is the (generation, external_id) index, so a 23505 here means
+                // the chunk (or a prior chunk in this generation) repeats an
+                // external identifier. Surface a typed, ID-free ingestion error.
+                Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+                    return Err(Error::cache_duplicate_external_id());
+                }
+                Err(err) => return Err(err.into()),
+            };
             inserted_bytes = inserted_bytes
                 .checked_add(inserted.into_iter().sum::<i64>())
                 .ok_or_else(|| Error::validation("cache generation byte size overflow"))?;
         }
 
-        let next_size = generation
-            .size_bytes
-            .checked_add(inserted_bytes)
-            .ok_or_else(|| Error::validation("cache generation byte size overflow"))?;
-        ensure_generation_quota(
-            &namespace,
-            generation.record_count.saturating_add(entry_count),
-            next_size,
-        )?;
+        let (next_count, next_size) = if is_delta {
+            generation_entry_usage(connection, generation_id).await?
+        } else {
+            (
+                generation
+                    .record_count
+                    .checked_add(entry_count)
+                    .ok_or_else(|| Error::validation("cache generation record count overflow"))?,
+                generation
+                    .size_bytes
+                    .checked_add(inserted_bytes)
+                    .ok_or_else(|| Error::validation("cache generation byte size overflow"))?,
+            )
+        };
+        ensure_generation_quota(&namespace, next_count, next_size)?;
         let other_generation_bytes: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM cache_generation \
              WHERE namespace = $1 AND id <> $2",
@@ -2437,8 +2646,16 @@ impl CacheIngestRepository {
             .bind(generation_id)
             .bind(chunk_index)
             .bind(request_checksum)
-            .bind(entry_count)
-            .bind(inserted_bytes)
+            .bind(if is_delta {
+                next_count - generation.record_count
+            } else {
+                entry_count
+            })
+            .bind(if is_delta {
+                next_size - generation.size_bytes
+            } else {
+                inserted_bytes
+            })
             .fetch_one(&mut *connection)
             .await?;
 
@@ -2447,7 +2664,7 @@ impl CacheIngestRepository {
              WHERE id = $1 AND state = 'staging'",
         )
         .bind(generation_id)
-        .bind(generation.record_count.saturating_add(entry_count))
+        .bind(next_count)
         .bind(next_size)
         .execute(&mut *connection)
         .await?;
@@ -3231,7 +3448,7 @@ fn validate_chunk_input(
     chunk_index: i32,
     request_checksum: &str,
     entries: &[CacheEntryInput],
-) -> Result<()> {
+) -> Result<usize> {
     if !(0..MAX_INGEST_CHUNKS_PER_GENERATION).contains(&chunk_index) {
         return Err(Error::validation(
             "cache ingest chunk_index must be between 0 and 9999",
@@ -3277,7 +3494,7 @@ fn validate_chunk_input(
             return Err(Error::validation("cache ingest chunk byte limit exceeded"));
         }
     }
-    Ok(())
+    Ok(encoded_bytes)
 }
 
 fn ensure_namespace_writable(namespace: &CacheNamespace) -> Result<()> {

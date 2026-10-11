@@ -196,7 +196,7 @@ pub enum CacheGenerationCommands {
 pub enum CacheRefreshCommands {
     /// Begin an idempotent staging generation
     #[command(
-        after_help = "Examples:\n  attune cache refresh begin users --owner-type system --client-refresh-id sync-42 --expected-chunk-count 1 --expect-empty\n\nWith reuse policy, this can return another producer's generation unchanged. Inspect client_refresh_id and created_by_execution before writing to it."
+        after_help = "Examples:\n  attune cache refresh begin users --owner-type system --client-refresh-id sync-42 --expected-chunk-count 1 --expect-empty\n  attune cache refresh begin users --owner-type system --client-refresh-id delta-43 --expected-active 42 --source-generation 42 --expected-chunk-count 1\n\nWith reuse policy, this can return another producer's generation unchanged. Inspect client_refresh_id, source_generation_id and created_by_execution before writing to it."
     )]
     Begin {
         /// Namespace name
@@ -218,6 +218,9 @@ pub enum CacheRefreshCommands {
         /// Upstream source revision
         #[arg(long)]
         source_revision: Option<String>,
+        /// Clone the observed active snapshot inside PostgreSQL, then upload deltas
+        #[arg(long, requires = "expected_active", conflicts_with = "expect_empty")]
+        source_generation: Option<i64>,
         /// Active generation observed before this refresh began
         #[arg(
             long,
@@ -229,7 +232,10 @@ pub enum CacheRefreshCommands {
         #[arg(long, conflicts_with = "expected_active")]
         expect_empty: bool,
     },
-    /// Upload one bounded newline-delimited JSON chunk
+    /// Upload one bounded chunk. Cloned generations accept upserts and deletions.
+    #[command(
+        after_help = "Examples:\n  attune cache refresh upload users 43 --owner-type system --chunk-index 0 --file changes.ndjson --delete-external-id removed-user\n  attune cache refresh upload users 43 --owner-type system --chunk-index 1 --delete-external-id another-user\n\nApply cloned-generation chunks in order from zero. Each entry supplies a complete replacement value, not a JSON merge patch."
+    )]
     Upload {
         /// Namespace name
         namespace: String,
@@ -241,8 +247,11 @@ pub enum CacheRefreshCommands {
         #[arg(long)]
         chunk_index: i32,
         /// NDJSON file containing at most one bounded chunk, or '-' for stdin
-        #[arg(long)]
-        file: String,
+        #[arg(long, required_unless_present = "deleted_external_ids")]
+        file: Option<String>,
+        /// External ID to delete from a staging clone, repeatable
+        #[arg(long = "delete-external-id")]
+        deleted_external_ids: Vec<String>,
     },
     /// Validate a fully uploaded staging generation
     Seal {
@@ -638,6 +647,7 @@ struct CacheGenerationResponse {
     state: String,
     client_refresh_id: String,
     expected_active_generation_id: Option<i64>,
+    source_generation_id: Option<i64>,
     expected_chunk_count: i32,
     #[serde(rename = "expected_record_count")]
     expected_count: Option<i64>,
@@ -767,6 +777,8 @@ struct CacheScanResponse {
 struct BeginRefreshRequest {
     client_refresh_id: String,
     expected_active_generation_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_generation_id: Option<i64>,
     expected_chunk_count: i32,
     #[serde(
         rename = "expected_record_count",
@@ -795,6 +807,8 @@ struct UploadEntry {
 #[derive(Debug, Serialize)]
 struct UploadChunkRequest {
     entries: Vec<UploadEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    deleted_external_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1076,16 +1090,21 @@ async fn handle_refresh(
             expected_count,
             expected_bytes,
             source_revision,
+            source_generation,
             expected_active,
             expect_empty,
         } => {
             validate_expected_chunk_count(expected_chunk_count)?;
+            if source_generation.is_some() && source_generation != expected_active {
+                anyhow::bail!("--source-generation must match --expected-active");
+            }
             let generation = begin_refresh(
                 &mut client,
                 &namespace,
                 &owner,
                 BeginRefreshRequest {
                     client_refresh_id: client_refresh_id.unwrap_or_else(new_refresh_id),
+                    source_generation_id: source_generation,
                     expected_active_generation_id: expected_active_for_promotion(
                         expected_active,
                         expect_empty,
@@ -1109,21 +1128,29 @@ async fn handle_refresh(
             owner,
             chunk_index,
             file,
+            deleted_external_ids,
         } => {
             if chunk_index < 0 {
                 anyhow::bail!("--chunk-index must be nonnegative");
             }
-            let batch = read_one_chunk(&file, DEFAULT_UPLOAD_CHUNK_RECORDS)?;
-            if batch.records.is_empty() {
-                anyhow::bail!("Upload input contains no records");
+            let entries = match file {
+                Some(file) => read_one_chunk(&file, DEFAULT_UPLOAD_CHUNK_RECORDS)?.records,
+                None => Vec::new(),
+            };
+            if entries.is_empty() && deleted_external_ids.is_empty() {
+                anyhow::bail!("Upload input contains no records or deletions");
             }
-            let response = upload_chunk(
+            if entries.len().saturating_add(deleted_external_ids.len()) > MAX_UPLOAD_CHUNK_RECORDS {
+                anyhow::bail!("Upload exceeds the 10000-record chunk limit");
+            }
+            let response = upload_chunk_with_deletions(
                 &mut client,
                 &namespace,
                 &owner,
                 generation_id,
                 chunk_index,
-                batch.records,
+                entries,
+                deleted_external_ids,
             )
             .await?;
             print_value(&response, output_format)
@@ -1231,6 +1258,7 @@ async fn handle_refresh(
                 &owner,
                 BeginRefreshRequest {
                     client_refresh_id: requested_refresh_id.clone(),
+                    source_generation_id: None,
                     expected_active_generation_id: expected_active,
                     expected_chunk_count: plan.expected_chunk_count,
                     expected_count: plan.expected_count,
@@ -1435,11 +1463,38 @@ async fn upload_chunk(
     chunk_index: i32,
     entries: Vec<UploadEntry>,
 ) -> Result<JsonValue> {
+    upload_chunk_with_deletions(
+        client,
+        namespace,
+        owner,
+        generation_id,
+        chunk_index,
+        entries,
+        Vec::new(),
+    )
+    .await
+}
+
+async fn upload_chunk_with_deletions(
+    client: &mut ApiClient,
+    namespace: &str,
+    owner: &OwnerSelectorArgs,
+    generation_id: i64,
+    chunk_index: i32,
+    entries: Vec<UploadEntry>,
+    deleted_external_ids: Vec<String>,
+) -> Result<JsonValue> {
     let path = format!(
         "{}/generations/{generation_id}/chunks/{chunk_index}",
         namespace_base_path(namespace)
     );
-    let request = scoped_payload(owner, &UploadChunkRequest { entries })?;
+    let request = scoped_payload(
+        owner,
+        &UploadChunkRequest {
+            entries,
+            deleted_external_ids,
+        },
+    )?;
     client.cache_put(&path, &request).await
 }
 

@@ -166,10 +166,15 @@ disabled. The inventories are observations, not one atomic cross-table snapshot.
   They can enclose holes and do not prove continuous clean coverage.
   `coverage_hours` counts ledger entries, including hours dirtied since refresh.
   Notification counts describe appended records, not changed source rows.
-- Supervisor summary-backlog logs use a separate bounded probe per kind, capped
+- Supervisor summary-backlog logs use a separate bounded probe per kind,
+  including notifications for completed UTC hours only, capped
   at `min(max_summary_invalidations_per_bucket, 10000) + 1`. Its
   `notifications_at_least` and `count_exact` describe a lower bound or an exact
   count. `oldest_observed_notification` describes only that probe's sample.
+  `oldest_eligible_at` is the earliest of the sample's eligibility timestamps:
+  the later of notification creation and source hour-end. Age alerts wait more
+  than two summary intervals after eligibility, so unfinished hours and late
+  writes to older hours do not produce premature backlog alerts.
 - Schedule status reports each job's `next_due` and `last_success`. Success can
   mean a bounded attempt completed while more backfill remains.
 - Retention logs and audits report `deleted` as confirmed committed row deletions,

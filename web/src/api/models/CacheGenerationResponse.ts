@@ -32,6 +32,7 @@ export type CacheGenerationResponse = {
   retired: string | null;
   sealed: string | null;
   size_bytes: number;
+  source_generation_id: null | i64;
   source_revision: string | null;
   /**
    * Lifecycle state: `staging`, `ready`, `active`, `retired`, or `failed`.

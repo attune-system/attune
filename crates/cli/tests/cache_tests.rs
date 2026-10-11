@@ -66,7 +66,7 @@ async fn generation_show_and_list_display_creator_execution_in_json_and_table() 
 fn generation(refresh_id: &str, state: &str, execution: Option<i64>) -> Value {
     json!({
         "generation_id": 42, "namespace_id": 1, "status": state,
-        "client_refresh_id": refresh_id, "expected_active_generation_id": null,
+        "client_refresh_id": refresh_id, "expected_active_generation_id": null, "source_generation_id": null,
         "expected_chunk_count": 1, "expected_record_count": 1, "expected_size_bytes": null,
         "record_count": 0, "size_bytes": 0, "checksum_algorithm": null, "checksum": null,
         "source_revision": "original-revision", "created_by": null,
@@ -74,6 +74,77 @@ fn generation(refresh_id: &str, state: &str, execution: Option<i64>) -> Value {
         "sealed": null, "activated": null, "retired": null, "readable_until": null,
         "failed": null, "failure_reason": null
     })
+}
+
+#[tokio::test]
+async fn clone_begin_and_deletion_only_chunk_send_no_existing_values() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("token", "refresh");
+    let mut response = generation("delta", "staging", None);
+    response["source_generation_id"] = json!(41);
+    response["expected_active_generation_id"] = json!(41);
+    Mock::given(method("POST"))
+        .and(path("/api/v1/cache/namespaces/users/generations"))
+        .and(body_json(json!({
+            "owner_type": "system", "client_refresh_id": "delta",
+            "source_generation_id": 41, "expected_active_generation_id": 41,
+            "expected_chunk_count": 1
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": response})))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    let output = command(&fixture)
+        .args([
+            "cache",
+            "refresh",
+            "begin",
+            "users",
+            "--owner-type",
+            "system",
+            "--client-refresh-id",
+            "delta",
+            "--source-generation",
+            "41",
+            "--expected-active",
+            "41",
+            "--expected-chunk-count",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let metadata: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(metadata["source_generation_id"], 41);
+    Mock::given(method("PUT"))
+        .and(path(
+            "/api/v1/cache/namespaces/users/generations/42/chunks/0",
+        ))
+        .and(body_json(
+            json!({"owner_type": "system", "entries": [], "deleted_external_ids": ["removed"]}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": metadata})))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    command(&fixture)
+        .args([
+            "cache",
+            "refresh",
+            "upload",
+            "users",
+            "42",
+            "--owner-type",
+            "system",
+            "--chunk-index",
+            "0",
+            "--delete-external-id",
+            "removed",
+        ])
+        .assert()
+        .success();
 }
 
 #[tokio::test]

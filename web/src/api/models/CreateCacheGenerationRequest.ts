@@ -18,5 +18,6 @@ export type CreateCacheGenerationRequest = {
   expected_size_bytes?: number | null;
   owner_ref?: string | null;
   owner_type: OwnerType;
+  source_generation_id?: null | i64;
   source_revision?: string | null;
 };

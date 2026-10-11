@@ -16,6 +16,8 @@ pub struct SummaryBacklogStatus {
     pub notifications_at_least: i64,
     pub count_exact: bool,
     pub oldest_observed_notification: Option<DateTime<Utc>>,
+    /// Later of notification creation and source hour-end, within the bounded probe.
+    pub oldest_eligible_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -68,12 +70,13 @@ impl MaintenanceScheduleStatus {
 pub struct ScheduleRepository;
 
 impl ScheduleRepository {
-    /// Cap the indexed notification probe per kind and bound the metadata query.
-    /// Do not scan/count the entire append log during a maintenance tick.
+    /// Cap the indexed eligible-notification probe per kind and bound the query.
+    /// Unfinished hours cannot be built yet and are not a maintenance backlog.
     pub async fn summary_backlog_status(
         pool: &PgPool,
         cap: i64,
         timeout_milliseconds: u64,
+        now: DateTime<Utc>,
     ) -> Result<Vec<SummaryBacklogStatus>> {
         if cap <= 0
             || cap == i64::MAX
@@ -93,14 +96,17 @@ impl ScheduleRepository {
         }
         let rows = sqlx::query_as(
             "SELECT k.kind, d.notifications_at_least, d.notifications_at_least <= $1 AS count_exact,
-                 d.oldest_observed_notification
+                  d.oldest_observed_notification, d.oldest_eligible_at
              FROM unnest(enum_range(NULL::native_summary_kind)) AS k(kind)
              CROSS JOIN LATERAL (
-                 SELECT count(*)::bigint AS notifications_at_least, min(n.created) AS oldest_observed_notification
-                 FROM (SELECT created FROM native_summary_invalidation WHERE kind = k.kind
-                       ORDER BY bucket, id LIMIT $1 + 1) n
-             ) d ORDER BY k.kind",
-        ).bind(cap).fetch_all(&mut *tx).await;
+                  SELECT count(*)::bigint AS notifications_at_least,
+                         min(n.created) AS oldest_observed_notification,
+                         min(GREATEST(n.created, n.bucket + interval '1 hour')) AS oldest_eligible_at
+                  FROM (SELECT created, bucket FROM native_summary_invalidation WHERE kind = k.kind
+                        AND bucket < date_trunc('hour', $2::timestamptz, 'UTC')
+                        ORDER BY bucket, id LIMIT $1 + 1) n
+              ) d ORDER BY k.kind",
+        ).bind(cap).bind(now).fetch_all(&mut *tx).await;
         match rows {
             Ok(rows) => {
                 tx.commit().await?;
@@ -362,16 +368,19 @@ mod tests {
             .with_cleanup_on_drop();
         // Each record represents a different committed producer transaction.
         // Multiple notifications for one producer/hour intentionally coalesce.
+        let now = DateTime::parse_from_rfc3339("2040-01-01T12:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         for _ in 0..5 {
             sqlx::query(
-                "INSERT INTO native_summary_invalidation(kind, bucket)
-                         VALUES ('event_volume', date_trunc('hour', now(), 'UTC'))",
+                "INSERT INTO native_summary_invalidation(kind, bucket, created)
+                 VALUES ('event_volume', '2040-01-01T11:00:00Z', '2040-01-01T11:01:00Z')",
             )
             .execute(database.pool())
             .await
             .unwrap();
         }
-        let rows = ScheduleRepository::summary_backlog_status(database.pool(), 2, 1000)
+        let rows = ScheduleRepository::summary_backlog_status(database.pool(), 2, 1000, now)
             .await
             .unwrap();
         assert_eq!(rows.len(), 4);
@@ -382,6 +391,7 @@ mod tests {
         assert_eq!(events.notifications_at_least, 3);
         assert!(!events.count_exact);
         assert!(events.oldest_observed_notification.is_some());
+        assert_eq!(events.oldest_eligible_at, Some(now - Duration::minutes(30)));
         let worker = rows
             .iter()
             .find(|row| row.kind == SummaryKind::WorkerStatus)
@@ -389,5 +399,66 @@ mod tests {
         assert_eq!(worker.notifications_at_least, 0);
         assert!(worker.count_exact);
         database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn summary_observation_excludes_unfinished_hours_and_tracks_eligibility() {
+        use crate::{config::Config, test_database::TestDatabase};
+        let config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let now = DateTime::parse_from_rfc3339("2040-01-01T12:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query(
+            "INSERT INTO native_summary_invalidation(kind, bucket, created)
+             VALUES ('event_volume', '2040-01-01T11:00:00Z', '2040-01-01T11:01:00Z'),
+                    ('worker_status', '2040-01-01T10:00:00Z', '2040-01-01T12:50:00Z')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        // These records exceed the probe cap but are not eligible for building.
+        sqlx::query(
+            "INSERT INTO native_summary_invalidation(kind, bucket, created)
+             SELECT 'event_volume', bucket, '2040-01-01T12:01:00Z'::timestamptz
+             FROM unnest(ARRAY['2040-01-01T12:00:00Z'::timestamptz,
+                              '2040-01-01T13:00:00Z'::timestamptz]) bucket
+             CROSS JOIN generate_series(1, 5)",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let rows = ScheduleRepository::summary_backlog_status(database.pool(), 2, 1000, now)
+            .await
+            .unwrap();
+        database.cleanup().await.unwrap();
+        let events = rows
+            .iter()
+            .find(|row| row.kind == SummaryKind::EventVolume)
+            .unwrap();
+        assert_eq!(events.notifications_at_least, 1);
+        assert!(events.count_exact);
+        assert_eq!(events.oldest_eligible_at, Some(now - Duration::minutes(59)));
+        let worker = rows
+            .iter()
+            .find(|row| row.kind == SummaryKind::WorkerStatus)
+            .unwrap();
+        assert_eq!(worker.notifications_at_least, 1);
+        assert_eq!(worker.oldest_eligible_at, Some(now - Duration::minutes(9)));
+        let execution = rows
+            .iter()
+            .find(|row| row.kind == SummaryKind::ExecutionStatus)
+            .unwrap();
+        assert_eq!(execution.notifications_at_least, 0);
+        assert!(execution.count_exact);
+        assert_eq!(execution.oldest_eligible_at, None);
+        assert_eq!(execution.oldest_observed_notification, None);
     }
 }

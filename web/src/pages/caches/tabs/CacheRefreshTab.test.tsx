@@ -79,6 +79,7 @@ function generation(
     created_by: null,
     created_by_execution: executionId,
     expected_active_generation_id: null,
+    source_generation_id: null,
     expected_chunk_count: 1,
     expected_record_count: 1,
     expected_size_bytes: null,

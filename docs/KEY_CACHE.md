@@ -523,12 +523,81 @@ lease. This prevents an older sync that finishes late from overwriting a newer
 active generation. Any administrative force promotion should be a separate,
 strongly authorized, prominently audited operation.
 
-The initial refresh contract is full-snapshot replacement, not in-place
-upsert of the active generation. If an upstream later provides efficient
-deltas, an optional repository operation may clone the active generation into
-a new staging generation with `INSERT ... SELECT` and then apply bounded delta
-chunks. The clone remains quota-controlled and invisible until sealed and
-promoted.
+Refreshes support full snapshots and database-local clones with delta chunks.
+Neither mode modifies the active generation. To refresh from an upstream delta:
+
+1. Read the active generation's ID and `source_revision`, then obtain upstream
+   changes since that revision, including deletions.
+2. Create a generation with `source_generation_id` equal to
+   `expected_active_generation_id`. Attune copies that active snapshot into a
+   new partition with `INSERT ... SELECT` inside PostgreSQL. No cached values
+   travel from PostgreSQL to the API and back. Cloning requires both cache
+   `create` and `read` permission for the namespace.
+3. Upload numbered chunks in order, starting at zero. `entries` contains complete
+   replacement records, keyed by `external_id`, for inserts or updates.
+   `deleted_external_ids` removes records; deleting a missing ID is harmless.
+   A request can contain only deletions. An ID cannot occur twice or appear in
+   both lists within one chunk. Later chunks may change the same ID again.
+4. Seal and promote normally. Expected record/byte counts describe the final
+   snapshot, while `expected_chunk_count` counts only delta chunks. Zero delta
+   chunks are valid for an unchanged copy. Promotion still rejects a changed
+   active-generation pointer; rebase onto the new snapshot rather than forcing
+   a stale delta through.
+
+Example clone request to `POST /api/v1/cache/namespaces/users/generations`:
+
+```json
+{
+  "owner_type": "system",
+  "client_refresh_id": "users-delta-43",
+  "expected_active_generation_id": 42,
+  "source_generation_id": 42,
+  "expected_chunk_count": 1,
+  "source_revision": "upstream-cursor-next"
+}
+```
+
+Its first chunk can contain:
+
+```json
+{
+  "owner_type": "system",
+  "entries": [{"external_id": "user-1", "value": {"enabled": false}}],
+  "deleted_external_ids": ["user-2"]
+}
+```
+
+The CLI exposes the same protocol:
+
+```bash
+attune cache refresh begin users --owner-type system \
+  --client-refresh-id users-delta-43 --expected-active 42 \
+  --source-generation 42 --expected-chunk-count 1
+attune cache refresh upload users 43 --owner-type system \
+  --chunk-index 0 --file changes.ndjson --delete-external-id user-2
+attune cache refresh seal users 43 --owner-type system --expected-chunk-count 1
+attune cache refresh promote users 43 --owner-type system --expected-active 42
+```
+
+Use the actual generation ID returned by begin, not the example `43`. MCP
+`cache_refresh_begin` accepts `source_generation_id`, and
+`cache_refresh_upload_chunk` accepts `entries` and `deleted_external_ids`.
+With `reuse`, inspect the returned refresh ID and clone source before writing:
+another producer's existing generation retains its own upload contract.
+
+This is a physical database-local copy, not shared storage or a zero-copy table
+clone. It still consumes a full generation's storage and database I/O/WAL and
+uses the existing bounded creation statement deadline. Admission, partition
+creation, copying, baseline accounting, and quota checks commit atomically;
+failure leaves no partial clone. Matching create retries do not copy again.
+The copied generation remains independent if retention later removes its source.
+
+Delta upserts replace rows only in staging clones. Published and ready snapshots
+remain immutable, and ordinary full-snapshot uploads still reject duplicate IDs
+and deletion requests. Statement-level accounting tracks replacements and
+deletions exactly. Internally, accepted delta-chunk record/byte totals are signed
+net changes; seal validates the clone baseline plus those changes against the
+actual partition. Identical chunk retries remain no-ops, including after sealing.
 
 The ingestion API must enforce hard limits before and during upload: maximum
 external-ID bytes, maximum JSON value bytes, records and bytes per chunk,
@@ -539,7 +608,9 @@ identifier bytes, and completion must recheck the authoritative total.
 
 The declared `expected_chunk_count` must be between `0` and `10000`, inclusive.
 The cap applies to creation and sealing. A zero-chunk generation can represent
-an empty snapshot. It does not permit entries without accepted chunks.
+an empty full snapshot or an unchanged clone. Entries in a full snapshot require
+accepted chunks; inherited clone entries are validated against the recorded
+clone baseline.
 
 Checksums are useful only when their bytes are well-defined. Store an algorithm
 and format version. The initial release may omit whole-generation checksums and
