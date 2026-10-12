@@ -178,6 +178,25 @@ impl ApiPackTransport {
             )));
         }
 
+        let candidate_digest = if candidate_access_token.is_some() {
+            let digest = response
+                .headers()
+                .get("x-attune-pack-candidate-sha256")
+                .and_then(|value| value.to_str().ok())
+                .filter(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .ok_or_else(|| {
+                    Error::validation("Candidate archive is missing a valid SHA-256 digest")
+                })?;
+            Some(digest.to_string())
+        } else {
+            None
+        };
+
         let download_dir = Path::new(&self.packs_base_dir).join(".pack-downloads");
         tokio::fs::create_dir_all(&download_dir)
             .await
@@ -219,6 +238,18 @@ impl ApiPackTransport {
             .await
             .map_err(|e| Error::Internal(format!("Failed to flush {subject}: {e}")))?;
         download.sha256 = hasher.finalize().into();
+        if let Some(expected) = candidate_digest {
+            let actual: String = download
+                .sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            if actual != expected {
+                return Err(Error::validation(
+                    "Candidate archive SHA-256 digest mismatch",
+                ));
+            }
+        }
         Ok(download)
     }
 }
@@ -614,6 +645,14 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn spawn_archive_server(archive: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        spawn_download_server(archive, "/api/v1/internal/pack-releases/42/archive", None).await
+    }
+
+    async fn spawn_download_server(
+        archive: Vec<u8>,
+        path: &'static str,
+        candidate_digest: Option<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -631,12 +670,20 @@ mod tests {
                 }
             }
             let request = String::from_utf8(request).unwrap();
-            assert!(request.contains("GET /api/v1/internal/pack-releases/42/archive"));
+            assert!(request.contains(&format!("GET {path}")));
             assert!(request
                 .to_ascii_lowercase()
                 .contains("authorization: bearer token"));
+            if path.contains("pack-installs") {
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("x-attune-pack-candidate-token: attempt-token"));
+            }
+            let digest_header = candidate_digest
+                .map(|digest| format!("X-Attune-Pack-Candidate-Sha256: {digest}\r\n"))
+                .unwrap_or_default();
             let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\n{digest_header}Connection: close\r\n\r\n",
                 archive.len()
             );
             stream.write_all(headers.as_bytes()).await.unwrap();
@@ -644,6 +691,34 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
         (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test]
+    async fn candidate_download_rejects_missing_or_mismatched_digest_before_extraction() {
+        for digest in [None, Some("0".repeat(64))] {
+            let temp = TempDir::new().unwrap();
+            let archive =
+                archive_with_entry("demo/pack.yaml", b"ref: demo\n", tar::EntryType::Regular);
+            let (url, server) =
+                spawn_download_server(archive, "/api/v1/internal/pack-installs/42/archive", digest)
+                    .await;
+            let transport =
+                ApiPackTransport::new(&url, "token", temp.path().to_str().unwrap()).unwrap();
+            let result = transport
+                .sync_pack_test_candidate("demo", 42, Some("attempt-token"))
+                .await;
+            server.await.unwrap();
+            assert!(result.unwrap_err().to_string().contains("digest"));
+            assert!(!temp.path().join(".pack-test-attempts/42/demo").exists());
+            if temp.path().join(".pack-downloads").exists() {
+                assert_eq!(
+                    std::fs::read_dir(temp.path().join(".pack-downloads"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+        }
     }
 
     #[tokio::test]

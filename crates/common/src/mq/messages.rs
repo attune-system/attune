@@ -673,8 +673,9 @@ pub struct PackTestRequestedPayload {
     pub pack_ref: String,
     /// Pack version being tested
     pub pack_version: String,
-    /// Candidate directory under the worker's configured pack root. When set,
-    /// tests run against this staged candidate instead of the active pack.
+    /// API-side staging descriptor. Its presence selects candidate testing;
+    /// workers must download the pinned object by install ID, never read or
+    /// remove this path (it is not shared across replicas).
     #[serde(default)]
     pub candidate_path: Option<String>,
     /// Attempt-scoped secret used only to download this staged candidate.

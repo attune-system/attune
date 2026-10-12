@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, FromRow, PgPool, Postgres};
 
+use super::pack_install::{PACK_INSTALL_ACTIVATION_TTL_SECS, PACK_INSTALL_ACTIVE_TTL_SECS};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, FromRow)]
@@ -123,6 +124,10 @@ impl ObjectMaintenanceRepository {
               eligible_at = $1, updated = NOW() WHERE l.state = 'ready' \
               AND l.updated < $2 \
               AND NOT EXISTS (SELECT 1 FROM pack_release r WHERE r.object_key = l.object_key AND r.provider_version = l.provider_version) \
+              AND NOT EXISTS (SELECT 1 FROM pack_install i WHERE i.candidate_object_key = l.object_key \
+                  AND i.candidate_provider_version = l.provider_version \
+                  AND ((i.status IN ('pending', 'running') AND i.started_at >= NOW() - ($3::bigint * INTERVAL '1 second')) \
+                    OR (i.status = 'activating' AND i.updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')))) \
                AND NOT EXISTS (SELECT 1 FROM artifact_version v WHERE v.object_key = l.object_key AND v.provider_version = l.provider_version) \
                AND NOT EXISTS (SELECT 1 FROM log_segment s WHERE s.object_key = l.object_key AND s.provider_version = l.provider_version) \
                AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
@@ -131,6 +136,8 @@ impl ObjectMaintenanceRepository {
         )
         .bind(eligible_at)
         .bind(upload_cutoff)
+        .bind(PACK_INSTALL_ACTIVE_TTL_SECS)
+        .bind(PACK_INSTALL_ACTIVATION_TTL_SECS)
         .execute(pool)
         .await?;
         Ok(result.rows_affected())
@@ -153,7 +160,12 @@ impl ObjectMaintenanceRepository {
                    state = 'deletion_pending' AND eligible_at < $1 \
                    AND NOT EXISTS (SELECT 1 FROM pack_release r \
                                    WHERE r.object_key = object_maintenance_ledger.object_key \
-                                     AND r.provider_version = object_maintenance_ledger.provider_version) \
+                                      AND r.provider_version = object_maintenance_ledger.provider_version) \
+                    AND NOT EXISTS (SELECT 1 FROM pack_install i \
+                        WHERE i.candidate_object_key = object_maintenance_ledger.object_key \
+                          AND i.candidate_provider_version = object_maintenance_ledger.provider_version \
+                          AND ((i.status IN ('pending', 'running') AND i.started_at >= NOW() - ($3::bigint * INTERVAL '1 second')) \
+                            OR (i.status = 'activating' AND i.updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')))) \
                    AND NOT EXISTS (SELECT 1 FROM artifact_version v \
                                    WHERE v.object_key = object_maintenance_ledger.object_key \
                                      AND v.provider_version = object_maintenance_ledger.provider_version) \
@@ -169,6 +181,8 @@ impl ObjectMaintenanceRepository {
         )
         .bind(retry_cutoff)
         .bind(limit.max(1))
+        .bind(PACK_INSTALL_ACTIVE_TTL_SECS)
+        .bind(PACK_INSTALL_ACTIVATION_TTL_SECS)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -178,11 +192,16 @@ impl ObjectMaintenanceRepository {
     pub async fn exact_reference_exists(pool: &PgPool, key: &str, version: &str) -> Result<bool> {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pack_release WHERE object_key = $1 AND provider_version = $2) \
+             OR EXISTS (SELECT 1 FROM pack_install WHERE candidate_object_key = $1 AND candidate_provider_version = $2 \
+                 AND ((status IN ('pending', 'running') AND started_at >= NOW() - ($3::bigint * INTERVAL '1 second')) \
+                   OR (status = 'activating' AND updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')))) \
              OR EXISTS (SELECT 1 FROM artifact_version WHERE object_key = $1 AND provider_version = $2) \
              OR EXISTS (SELECT 1 FROM log_segment WHERE object_key = $1 AND provider_version = $2)",
         )
         .bind(key)
         .bind(version)
+        .bind(PACK_INSTALL_ACTIVE_TTL_SECS)
+        .bind(PACK_INSTALL_ACTIVATION_TTL_SECS)
         .fetch_one(pool)
         .await
         .map_err(Into::into)

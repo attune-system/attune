@@ -15,7 +15,8 @@ pub struct PackInstallRepository {
 
 const PACK_INSTALL_COLUMNS: &str =
     "id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, \
-    pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, test_execution_id, \
+    pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, \
+    candidate_object_key, candidate_provider_version, candidate_archive_size, candidate_digest, test_execution_id, \
     test_result, error_message, started_at, updated_at, finished_at";
 
 /// Hard upper bound for an unfinished pack-install attempt.
@@ -102,6 +103,38 @@ impl PackInstallRepository {
             .await?;
 
         Ok(record)
+    }
+
+    /// Bind the exact uploaded candidate before publishing any test request.
+    /// This is write-once and cannot change the bytes of a claimed attempt.
+    pub async fn attach_candidate_object(
+        connection: &mut PgConnection,
+        id: Id,
+        object: &crate::blob_store::StoredObject,
+    ) -> Result<bool> {
+        let size = i64::try_from(object.size)
+            .map_err(|_| crate::Error::validation("Pack candidate archive is too large"))?;
+        let digest: String = object
+            .sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let affected = sqlx::query(
+            "UPDATE pack_install SET candidate_object_key = $2, candidate_provider_version = $3, \
+             candidate_archive_size = $4, candidate_digest = $5, updated_at = NOW() \
+             WHERE id = $1 AND status = 'pending' AND candidate_object_key IS NULL \
+               AND started_at >= NOW() - ($6::bigint * INTERVAL '1 second')",
+        )
+        .bind(id)
+        .bind(object.key.as_str())
+        .bind(object.provider_version.as_stored())
+        .bind(size)
+        .bind(digest)
+        .bind(PACK_INSTALL_ACTIVE_TTL_SECS)
+        .execute(connection)
+        .await?
+        .rows_affected();
+        Ok(affected == 1)
     }
 
     /// Claim a pending install for one worker and transition it to running.

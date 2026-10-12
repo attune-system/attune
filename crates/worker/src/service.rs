@@ -2292,32 +2292,15 @@ async fn handle_pack_test(
         }
     }
 
-    let volume_candidate_dir =
-        if payload.candidate_path.is_some() && pack_transport.transport_mode() == "volume" {
-            match resolve_pack_test_dir(packs_base_dir, payload) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    mark_pack_install_failed(db_pool, payload, &error.to_string()).await?;
-                    return Ok(());
-                }
-            }
-        } else {
-            None
-        };
-
     let _candidate_cleanup = payload
         .candidate_path
         .as_ref()
         .map(|_| PackTestCandidateCleanup {
-            files: Some(if pack_transport.transport_mode() == "volume" {
-                volume_candidate_dir
-                    .clone()
-                    .expect("volume candidate was validated")
-            } else {
+            files: Some(
                 packs_base_dir
                     .join(".pack-test-attempts")
-                    .join(payload.pack_install_id.to_string())
-            }),
+                    .join(payload.pack_install_id.to_string()),
+            ),
             runtime: runtime_envs_dir
                 .join(".pack-test-attempts")
                 .join(payload.pack_install_id.to_string()),
@@ -2328,9 +2311,7 @@ async fn handle_pack_test(
         payload.pack_ref, payload.pack_version, payload.pack_install_id
     );
 
-    let pack_dir = if payload.candidate_path.is_some()
-        && pack_transport.transport_mode() != "volume"
-    {
+    let pack_dir = if payload.candidate_path.is_some() {
         match pack_transport
             .sync_pack_test_candidate(
                 &payload.pack_ref,
@@ -2350,8 +2331,6 @@ async fn handle_pack_test(
                 return Ok(());
             }
         }
-    } else if let Some(candidate_dir) = volume_candidate_dir {
-        candidate_dir
     } else {
         // Make sure the active pack files are present locally (API transport).
         if pack_transport.transport_mode() != "volume" {
@@ -2543,31 +2522,6 @@ async fn handle_pack_test(
     Ok(())
 }
 
-fn resolve_pack_test_dir(
-    packs_base_dir: &std::path::Path,
-    payload: &PackTestRequestedPayload,
-) -> Result<PathBuf> {
-    let active_dir = packs_base_dir.join(&payload.pack_ref);
-    let Some(candidate_path) = &payload.candidate_path else {
-        return Ok(active_dir);
-    };
-
-    let candidate_dir = PathBuf::from(candidate_path);
-    let canonical_root = std::fs::canonicalize(packs_base_dir).map_err(|error| {
-        Error::Internal(format!("Failed to resolve configured pack root: {error}"))
-    })?;
-    let canonical_candidate = std::fs::canonicalize(&candidate_dir).map_err(|error| {
-        Error::Internal(format!("Failed to resolve pack test candidate: {error}"))
-    })?;
-    let expected_candidate = canonical_root.join(format!(".pack-test-{}", payload.pack_install_id));
-    if canonical_candidate != expected_candidate {
-        return Err(Error::Internal(format!(
-            "Pack test candidate path is outside the configured pack root: {candidate_path}"
-        )));
-    }
-    Ok(candidate_dir)
-}
-
 /// Mark a pack install record as succeeded.
 async fn mark_pack_install_succeeded(
     db_pool: &PgPool,
@@ -2647,34 +2601,6 @@ mod tests {
             _ => "unknown",
         };
         assert_eq!(status_str, "running");
-    }
-
-    #[test]
-    fn candidate_test_directory_must_stay_under_pack_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let packs = temp.path().join("packs");
-        let candidate = packs.join(".pack-test-1");
-        let wrong_candidate = packs.join(".pack-test-2");
-        std::fs::create_dir_all(&candidate).unwrap();
-        std::fs::create_dir_all(&wrong_candidate).unwrap();
-        let mut payload = PackTestRequestedPayload {
-            pack_install_id: 1,
-            pack_ref: "demo".to_string(),
-            pack_version: "1.0.0".to_string(),
-            candidate_path: Some(candidate.to_string_lossy().to_string()),
-            candidate_access_token: Some("candidate-token".to_string()),
-            trigger_reason: "install".to_string(),
-            required_runtimes: Vec::new(),
-            worker_selector: serde_json::json!({}),
-            worker_tolerations: serde_json::json!([]),
-            worker_affinity: serde_json::json!({}),
-        };
-
-        assert_eq!(resolve_pack_test_dir(&packs, &payload).unwrap(), candidate);
-        payload.candidate_path = Some(wrong_candidate.to_string_lossy().to_string());
-        assert!(resolve_pack_test_dir(&packs, &payload).is_err());
-        payload.candidate_path = Some("/tmp/candidate".to_string());
-        assert!(resolve_pack_test_dir(&packs, &payload).is_err());
     }
 
     #[test]
