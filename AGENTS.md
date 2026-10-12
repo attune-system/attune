@@ -191,6 +191,7 @@ Workflow details live in:
 
 ## Runtime / Execution Rules
 - Worker runtimes come from DB-backed runtime definitions; native runtimes are represented by empty interpreter config.
+- Candidate pack tests always download version-pinned archives from the API's configured object backend, including shared-volume workers. See `docs/deployment/pack-candidate-distribution.md`.
 - The worker/agent sets up isolated environments under `runtime_envs_dir/{pack_ref}/{runtime_name...}`.
 - When runtime versions exist, execution selects the highest available matching version.
 - `ATTUNE_API_TOKEN` is present only when the execution snapshot has non-empty `permission_set_refs`.

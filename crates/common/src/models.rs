@@ -2983,6 +2983,14 @@ pub mod pack_install {
         pub assigned_worker_id: Option<Id>,
         #[serde(skip_serializing)]
         pub candidate_access_token_hash: Option<String>,
+        #[serde(skip_serializing)]
+        pub candidate_object_key: Option<String>,
+        #[serde(skip_serializing)]
+        pub candidate_provider_version: Option<String>,
+        #[serde(skip_serializing)]
+        pub candidate_archive_size: Option<i64>,
+        #[serde(skip_serializing)]
+        pub candidate_digest: Option<String>,
         pub test_execution_id: Option<Id>,
         pub test_result: Option<JsonValue>,
         pub error_message: Option<String>,

@@ -45,7 +45,8 @@ pub trait PackFileTransport: Send + Sync + std::fmt::Debug {
     ) -> Result<PathBuf>;
 
     /// Download a staged pack candidate for a test run without replacing the
-    /// active local pack. Returns the extracted candidate directory.
+    /// active local pack. All modes download from the API's object backend.
+    /// Returns the extracted candidate directory.
     async fn sync_pack_test_candidate(
         &self,
         pack_ref: &str,
@@ -132,7 +133,21 @@ pub fn build_pack_transport_with_worker_token_provider(
     };
 
     match mode {
-        TransportMode::Volume => Ok(Box::new(VolumePackTransport::new(packs_base_dir))),
+        TransportMode::Volume => {
+            let mut transport = VolumePackTransport::new(packs_base_dir);
+            if let (Some(url), Some(provider)) =
+                (api_url.filter(|url| !url.trim().is_empty()), token_provider)
+            {
+                transport = transport.with_candidate_transport(
+                    ApiPackTransport::new_with_worker_token_provider(
+                        url,
+                        provider,
+                        packs_base_dir,
+                    )?,
+                );
+            }
+            Ok(Box::new(transport))
+        }
         TransportMode::Api => {
             validate_api_pack_transport(api_url, token_provider.is_some())?;
             let url = api_url.expect("API URL was validated");

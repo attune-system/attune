@@ -65,37 +65,40 @@ const DIRECT_UPLOAD_SETTLEMENT_GRACE: chrono::Duration = chrono::Duration::minut
 
 type DirectUploadWindow = Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>;
 
-struct SizeLimitedWriter {
-    bytes: Vec<u8>,
+struct SizeLimitedWriter<W> {
+    inner: W,
+    written: usize,
     max_bytes: usize,
 }
 
-impl SizeLimitedWriter {
-    fn new(max_bytes: usize) -> Self {
+impl<W> SizeLimitedWriter<W> {
+    fn new(inner: W, max_bytes: usize) -> Self {
         Self {
-            bytes: Vec::new(),
+            inner,
+            written: 0,
             max_bytes,
         }
     }
 
-    fn into_inner(self) -> Vec<u8> {
-        self.bytes
+    fn into_inner(self) -> W {
+        self.inner
     }
 }
 
-impl std::io::Write for SizeLimitedWriter {
+impl<W: std::io::Write> std::io::Write for SizeLimitedWriter<W> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        if buffer.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+        if buffer.len() > self.max_bytes.saturating_sub(self.written) {
             return Err(std::io::Error::other(
                 "pack candidate archive exceeds configured size limit",
             ));
         }
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
+        let written = self.inner.write(buffer)?;
+        self.written += written;
+        Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.inner.flush()
     }
 }
 
@@ -2932,7 +2935,7 @@ fn map_pack_blob_error(error: BlobStoreError) -> (StatusCode, String) {
     )
 }
 
-/// Stream the staged candidate for a pending pack-install test.
+/// Stream the version-pinned candidate object for an assigned pack-install test.
 #[utoipa::path(
     get,
     path = "/api/v1/internal/pack-installs/{pack_install_id}/archive",
@@ -3016,20 +3019,61 @@ pub(crate) async fn download_pack_install_candidate_archive(
             "Pack install candidate has an invalid pack reference".to_string(),
         )
     })?;
-    let candidate_dir = std::path::Path::new(&state.config.packs_base_dir)
-        .join(format!(".pack-test-{pack_install_id}"));
-    if !candidate_dir.is_dir()
-        || std::fs::symlink_metadata(&candidate_dir)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err((
+    let missing_object = || {
+        (
             StatusCode::NOT_FOUND,
             "Pack install candidate not found".to_string(),
-        ));
-    }
+        )
+    };
+    let key = ObjectKey::new(install.candidate_object_key.ok_or_else(missing_object)?)
+        .map_err(map_pack_blob_error)?;
+    let version = ProviderVersion::from_stored(
+        install
+            .candidate_provider_version
+            .ok_or_else(missing_object)?,
+    )
+    .map_err(map_pack_blob_error)?;
+    let size = u64::try_from(install.candidate_archive_size.ok_or_else(missing_object)?).map_err(
+        |_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid candidate size".into(),
+            )
+        },
+    )?;
+    let digest_hex = install.candidate_digest.ok_or_else(missing_object)?;
+    let digest = decode_hex_digest(&digest_hex)?;
+    let reader = state
+        .blob_store
+        .get_pinned(&key, &version, size, digest, None)
+        .await
+        .map_err(map_pack_blob_error)?;
+    let headers = [
+        (
+            axum::http::header::CONTENT_TYPE,
+            "application/gzip".to_string(),
+        ),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.tar.gz\"", install.pack_ref),
+        ),
+        (header::CONTENT_LENGTH, size.to_string()),
+        (
+            axum::http::HeaderName::from_static("x-attune-pack-candidate-sha256"),
+            digest_hex,
+        ),
+    ];
+    Ok((StatusCode::OK, headers, Body::from_stream(reader)))
+}
 
-    let pack_ref = install.pack_ref;
-    let archive_pack_ref = pack_ref.clone();
+/// Persist the complete candidate in configured blob storage before MQ dispatch.
+/// API replicas only need the database pointer and backend access to serve it.
+pub(crate) async fn publish_pack_install_candidate(
+    state: &AppState,
+    install_id: i64,
+    pack_ref: &str,
+    candidate_dir: &std::path::Path,
+) -> attune_common::Result<()> {
     let max_total_bytes = state
         .config
         .pack_upload
@@ -3049,52 +3093,69 @@ pub(crate) async fn download_pack_install_candidate_archive(
         .saturating_add(u64::from(max_entries).saturating_mul(1024))
         .saturating_add(1024 * 1024)
         .min(usize::MAX as u64) as usize;
-    let tarball = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
-        validate_candidate_archive_source(
-            &candidate_dir,
-            max_entries,
-            max_entry_bytes,
-            max_total_bytes,
-        )?;
-        let encoder = GzEncoder::new(
-            SizeLimitedWriter::new(max_archive_bytes),
-            Compression::fast(),
-        );
-        let mut tar_builder = tar::Builder::new(encoder);
-        tar_builder.follow_symlinks(false);
-        tar_builder.append_dir_all(&archive_pack_ref, &candidate_dir)?;
-        tar_builder.finish()?;
-        Ok(tar_builder.into_inner()?.finish()?.into_inner())
-    })
-    .await
-    .map_err(|error| {
-        warn!(%error, pack_install_id, "Candidate pack archive task panicked");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal error building candidate archive".to_string(),
-        )
-    })?
-    .map_err(|error| {
-        warn!(%error, pack_install_id, "Failed to build pack install candidate archive");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to build candidate archive".to_string(),
-        )
+    let candidate_dir = candidate_dir.to_path_buf();
+    let archive_pack_ref = pack_ref.to_string();
+    let archive =
+        tokio::task::spawn_blocking(move || -> std::io::Result<tempfile::NamedTempFile> {
+            validate_candidate_archive_source(
+                &candidate_dir,
+                max_entries,
+                max_entry_bytes,
+                max_total_bytes,
+            )?;
+            let archive = tempfile::NamedTempFile::new()?;
+            let encoder = flate2::write::GzEncoder::new(
+                SizeLimitedWriter::new(archive, max_archive_bytes),
+                flate2::Compression::fast(),
+            );
+            let mut builder = tar::Builder::new(encoder);
+            builder.follow_symlinks(false);
+            builder.append_dir_all(&archive_pack_ref, &candidate_dir)?;
+            builder.finish()?;
+            Ok(builder.into_inner()?.finish()?.into_inner())
+        })
+        .await
+        .map_err(|error| {
+            attune_common::Error::Internal(format!("Candidate archive task failed: {error}"))
+        })?
+        .map_err(|error| {
+            attune_common::Error::io(format!("Failed to build candidate archive: {error}"))
+        })?;
+    let (size, digest) = hash_file(archive.path()).await.map_err(|error| {
+        attune_common::Error::Internal(format!("Failed to hash candidate archive: {error}"))
     })?;
-    let headers = [
-        (
-            axum::http::header::CONTENT_TYPE,
-            "application/gzip".to_string(),
-        ),
-        (
-            axum::http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}.tar.gz\"", pack_ref),
-        ),
-    ];
-    Ok((StatusCode::OK, headers, tarball))
+    let key = ObjectKey::new(format!(
+        "packs/candidates/{install_id}/{}.tar.gz",
+        uuid::Uuid::new_v4()
+    ))
+    .map_err(|error| attune_common::Error::Internal(error.to_string()))?;
+    ObjectMaintenanceRepository::reserve_upload(&state.db, key.as_str(), "pack").await?;
+    let body = body_from_file(archive.path()).await.map_err(|error| {
+        attune_common::Error::Internal(format!("Failed to read candidate archive: {error}"))
+    })?;
+    let stored = state
+        .blob_store
+        .put(&key, body, digest)
+        .await
+        .map_err(|error| {
+            attune_common::Error::Internal(format!("Failed to store candidate archive: {error}"))
+        })?;
+    let mut tx = state.db.begin().await?;
+    ObjectMaintenanceRepository::record_uploaded(
+        &mut *tx,
+        key.as_str(),
+        stored.provider_version.as_stored(),
+        i64::try_from(size)
+            .map_err(|_| attune_common::Error::validation("Candidate archive is too large"))?,
+    )
+    .await?;
+    if !PackInstallRepository::attach_candidate_object(&mut tx, install_id, &stored).await? {
+        return Err(attune_common::Error::validation(
+            "Pack install candidate is no longer pending",
+        ));
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 fn authorize_pack_candidate_token(
@@ -3773,8 +3834,8 @@ mod tests {
     }
 
     #[test]
-    fn candidate_archive_writer_enforces_its_heap_limit() {
-        let mut writer = SizeLimitedWriter::new(4);
+    fn candidate_archive_writer_enforces_its_compressed_size_limit() {
+        let mut writer = SizeLimitedWriter::new(Vec::new(), 4);
         assert_eq!(writer.write(b"abc").unwrap(), 3);
         assert!(writer.write(b"de").is_err());
         assert_eq!(writer.into_inner(), b"abc");

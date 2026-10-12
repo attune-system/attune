@@ -14,7 +14,7 @@ use attune_common::{
         hash_integration_token,
         jwt::{generate_token, generate_worker_token, validate_token, JwtConfig, TokenType},
     },
-    blob_store::{BlobStore, FilesystemBlobStore, ObjectKey},
+    blob_store::{body_from_file, BlobStore, FilesystemBlobStore, ObjectKey},
     models::{ManagementOrigin, Pack},
     pack_registry::calculate_directory_checksum,
     platform_catalog::ManagedComponentKind,
@@ -1714,25 +1714,111 @@ testing:
         .await?
         .is_none());
 
+    let install = PackInstallRepository::new(ctx.pool.clone())
+        .find_latest_by_pack_ref("register-candidate")
+        .await?
+        .expect("candidate failure must be recorded");
+    assert_eq!(install.status, "failed");
+    assert!(install
+        .error_message
+        .as_deref()
+        .unwrap()
+        .contains("publisher unavailable"));
+    let object = ctx
+        .state
+        .blob_store
+        .head_version(
+            &ObjectKey::new(install.candidate_object_key.unwrap())?,
+            &attune_common::blob_store::ProviderVersion::from_stored(
+                install.candidate_provider_version.unwrap(),
+            )?,
+        )
+        .await?
+        .expect("candidate object must be durable before dispatch");
+    assert_eq!(Some(object.size as i64), install.candidate_archive_size);
+    assert!(!ctx
+        .test_packs_dir
+        .join(format!(".pack-test-{}", install.id))
+        .exists());
+
+    ctx.cleanup().await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn candidate_archive_requires_active_assigned_attempt_credentials() -> Result<()> {
-    let ctx = TestContext::new().await?;
+    let mut ctx = TestContext::new().await?;
+    let backend = ctx.state.blob_store.clone();
+    let result = exercise_candidate_archive_contract(&mut ctx, backend).await;
+    ctx.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and the owned versioned S3 test harness"]
+async fn candidate_archive_distributes_components_across_s3_api_replicas() -> Result<()> {
+    use attune_common::blob_store::{ProviderVersion, S3BlobStore};
+    let endpoint = std::env::var("ATTUNE_TEST_S3_ENDPOINT")?;
+    let bucket = std::env::var("ATTUNE_TEST_S3_BUCKET")?;
+    let owner_prefix = std::env::var("ATTUNE_TEST_S3_PREFIX")?;
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let prefix = format!("{owner_prefix}/pack-candidates/{}", uuid::Uuid::new_v4());
+    let first = std::sync::Arc::new(S3BlobStore::new(
+        &bucket,
+        &region,
+        &prefix,
+        Some(&endpoint),
+        None,
+    )?);
+    let second = std::sync::Arc::new(S3BlobStore::new(
+        &bucket,
+        &region,
+        &prefix,
+        Some(&endpoint),
+        None,
+    )?);
+    first.preflight().await?;
+    second.preflight().await?;
+    let mut ctx = TestContext::new().await?;
+    let mut source = (*ctx.state).clone();
+    source.blob_store = first.clone();
+    ctx.state = std::sync::Arc::new(source);
+    let result = exercise_candidate_archive_contract(&mut ctx, second).await;
+    // Delete only exact versions created in this test's unique object prefix.
+    let cleanup: Result<()> = async {
+        let installs = PackInstallRepository::new(ctx.pool.clone())
+            .list_by_pack_ref("candidate-auth", 10, 0)
+            .await?;
+        for install in installs {
+            if let (Some(key), Some(version)) = (
+                install.candidate_object_key,
+                install.candidate_provider_version,
+            ) {
+                first
+                    .delete(
+                        &ObjectKey::new(key)?,
+                        &ProviderVersion::from_stored(version)?,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    ctx.cleanup().await?;
+    cleanup?;
+    result
+}
+
+async fn exercise_candidate_archive_contract(
+    ctx: &mut TestContext,
+    replica_backend: std::sync::Arc<dyn BlobStore>,
+) -> Result<()> {
     let repo = PackInstallRepository::new(ctx.pool.clone());
     let attempt_secret = "candidate-attempt-secret";
     let install = repo
         .create("candidate-auth", "1.0.0", "install", None, None)
         .await?;
-    repo.claim_worker(
-        install.id,
-        42,
-        Some(&hash_integration_token(attempt_secret)),
-    )
-    .await?
-    .expect("pending attempt should be claimable");
-
     let candidate_dir = ctx
         .test_packs_dir
         .join(format!(".pack-test-{}", install.id));
@@ -1741,6 +1827,54 @@ async fn candidate_archive_requires_active_assigned_attempt_credentials() -> Res
         candidate_dir.join("pack.yaml"),
         "ref: candidate-auth\nversion: 1.0.0\n",
     )?;
+    fs::create_dir(candidate_dir.join("actions"))?;
+    fs::write(
+        candidate_dir.join("actions/echo.py"),
+        "print('candidate')\n",
+    )?;
+    let storage = attune_common::pack_registry::PackStorage::new(&ctx.test_packs_dir);
+    let release = storage.publish_release(&candidate_dir, "candidate-auth", "1.0.0")?;
+    let key = ObjectKey::new(format!("packs/candidates/{}.tar.gz", install.id))?;
+    let (size, digest) = attune_common::blob_store::hash_file(&release.archive_path).await?;
+    let object = ctx
+        .state
+        .blob_store
+        .put(&key, body_from_file(&release.archive_path).await?, digest)
+        .await?;
+    let mut tx = ctx.pool.begin().await?;
+    attune_common::repositories::object_maintenance::ObjectMaintenanceRepository::reserve_upload(
+        &mut *tx,
+        key.as_str(),
+        "pack",
+    )
+    .await?;
+    attune_common::repositories::object_maintenance::ObjectMaintenanceRepository::record_uploaded(
+        &mut *tx,
+        key.as_str(),
+        object.provider_version.as_stored(),
+        size as i64,
+    )
+    .await?;
+    assert!(PackInstallRepository::attach_candidate_object(&mut tx, install.id, &object).await?);
+    assert!(!PackInstallRepository::attach_candidate_object(&mut tx, install.id, &object).await?);
+    tx.commit().await?;
+    repo.claim_worker(
+        install.id,
+        42,
+        Some(&hash_integration_token(attempt_secret)),
+    )
+    .await?
+    .expect("pending attempt should be claimable");
+
+    // Replica B shares only the database and object backend, not staging files.
+    let replica_root = TempDir::new()?;
+    let mut replica = (*ctx.state).clone();
+    replica.blob_store = replica_backend;
+    let mut config = (*replica.config).clone();
+    config.packs_base_dir = replica_root.path().to_string_lossy().into_owned();
+    replica.config = std::sync::Arc::new(config);
+    ctx.app = attune_api::server::Server::new(std::sync::Arc::new(replica)).router();
+    fs::remove_dir_all(&candidate_dir)?;
 
     let jwt = JwtConfig {
         secret: "test-secret-for-testing-only-not-secure".to_string(),
@@ -1766,6 +1900,57 @@ async fn candidate_archive_requires_active_assigned_attempt_credentials() -> Res
     )
     .await?
     .assert_status(axum::http::StatusCode::OK);
+
+    // Exercise both worker modes against replica B; neither may read staging.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let app = ctx.app.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
+    let workers = TempDir::new()?;
+    let downloads: Result<()> = async {
+        for mode in ["api", "volume"] {
+            use attune_common::{
+                artifact_transport::TransportMode, auth::WorkerTokenProvider,
+                pack_transport::build_pack_transport_with_worker_token_provider,
+            };
+            let root = workers.path().join(mode);
+            let mode = if mode == "volume" {
+                TransportMode::Volume
+            } else {
+                TransportMode::Api
+            };
+            let transport = build_pack_transport_with_worker_token_provider(
+                root.to_str().unwrap(),
+                Some(&url),
+                Some(std::sync::Arc::new(WorkerTokenProvider::new(
+                    1,
+                    "42",
+                    jwt.clone(),
+                ))),
+                &mode,
+            )?;
+            let candidate = transport
+                .sync_pack_test_candidate("candidate-auth", install.id, Some(attempt_secret))
+                .await?;
+            assert_eq!(
+                fs::read_to_string(candidate.join("actions/echo.py"))?,
+                "print('candidate')\n"
+            );
+            assert!(candidate.starts_with(root.join(".pack-test-attempts")));
+        }
+        Ok(())
+    }
+    .await;
+    stop_tx.send(()).expect("server shutdown receiver");
+    server.await??;
+    downloads?;
     ctx.get_with_headers(
         &path,
         Some(&wrong_worker),
@@ -1783,6 +1968,49 @@ async fn candidate_archive_requires_active_assigned_attempt_credentials() -> Res
     )
     .await?
     .assert_status(axum::http::StatusCode::NOT_FOUND);
+
+    // A local staging tree without a durable object must never be a fallback.
+    let missing = repo
+        .create("missing-object", "1.0.0", "install", None, None)
+        .await?;
+    repo.claim_worker(
+        missing.id,
+        42,
+        Some(&hash_integration_token(attempt_secret)),
+    )
+    .await?
+    .expect("missing-object attempt is claimable");
+    let local_only = replica_root
+        .path()
+        .join(format!(".pack-test-{}", missing.id));
+    fs::create_dir(&local_only)?;
+    fs::write(
+        local_only.join("pack.yaml"),
+        "ref: missing-object\nversion: 1.0.0\n",
+    )?;
+    ctx.get_with_headers(
+        &format!("/api/v1/internal/pack-installs/{}/archive", missing.id),
+        Some(&assigned_worker),
+        candidate_headers(attempt_secret),
+    )
+    .await?
+    .assert_status(axum::http::StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE pack_install SET started_at = NOW() - INTERVAL '8 hours' WHERE id = $1")
+        .bind(install.id)
+        .execute(&ctx.pool)
+        .await?;
+    ctx.get_with_headers(
+        &path,
+        Some(&assigned_worker),
+        candidate_headers(attempt_secret),
+    )
+    .await?
+    .assert_status(axum::http::StatusCode::NOT_FOUND);
+    sqlx::query("UPDATE pack_install SET started_at = NOW() WHERE id = $1")
+        .bind(install.id)
+        .execute(&ctx.pool)
+        .await?;
 
     repo.finish_running(
         install.id,

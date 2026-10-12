@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
 
-use super::{release_cache_path, PackFileTransport};
+use super::{release_cache_path, ApiPackTransport, PackFileTransport};
 use crate::error::Result;
 use crate::schema::RefValidator;
 use sha2::{Digest, Sha256};
@@ -12,13 +12,22 @@ use sha2::{Digest, Sha256};
 #[derive(Debug)]
 pub struct VolumePackTransport {
     packs_base_dir: String,
+    candidate_transport: Option<ApiPackTransport>,
 }
 
 impl VolumePackTransport {
     pub fn new(packs_base_dir: &str) -> Self {
         Self {
             packs_base_dir: packs_base_dir.to_string(),
+            candidate_transport: None,
         }
+    }
+
+    /// Installed releases may share a volume; candidates always come from the
+    /// API's version-pinned object backend, never an API-local staging path.
+    pub fn with_candidate_transport(mut self, transport: ApiPackTransport) -> Self {
+        self.candidate_transport = Some(transport);
+        self
     }
 }
 
@@ -42,13 +51,17 @@ impl PackFileTransport for VolumePackTransport {
     async fn sync_pack_test_candidate(
         &self,
         pack_ref: &str,
-        _pack_install_id: i64,
-        _candidate_access_token: Option<&str>,
+        pack_install_id: i64,
+        candidate_access_token: Option<&str>,
     ) -> Result<PathBuf> {
-        RefValidator::validate_pack_ref(pack_ref)?;
-        Err(crate::error::Error::Internal(
-            "Candidate pack synchronization is only available through API transport".to_string(),
-        ))
+        let transport = self.candidate_transport.as_ref().ok_or_else(|| {
+            crate::Error::configuration(
+                "Pack candidates require ATTUNE_API_URL and a worker token even with volume transport",
+            )
+        })?;
+        transport
+            .sync_pack_test_candidate(pack_ref, pack_install_id, candidate_access_token)
+            .await
     }
 
     async fn remove_pack(&self, pack_ref: &str) -> Result<()> {
@@ -99,6 +112,22 @@ fn release_archive_matches(pack_path: &std::path::Path, expected_digest: &str) -
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn candidate_requires_object_download_even_when_local_staging_exists() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join(".pack-test-42");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("pack.yaml"), "ref: demo").unwrap();
+        let transport = VolumePackTransport::new(tmp.path().to_str().unwrap());
+        assert!(transport
+            .sync_pack_test_candidate("demo", 42, Some("attempt-token"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("ATTUNE_API_URL"));
+        assert!(candidate.exists());
+    }
 
     #[tokio::test]
     async fn test_volume_transport_is_pack_local() {

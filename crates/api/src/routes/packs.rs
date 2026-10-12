@@ -1361,6 +1361,29 @@ async fn dispatch_and_track_pack_tests(
     };
     let candidate_dir = candidate_path.as_ref().map(std::path::PathBuf::from);
 
+    if let Some(candidate_dir) = &candidate_dir {
+        if let Err(error) = super::internal_files::publish_pack_install_candidate(
+            state,
+            install.id,
+            pack_ref,
+            candidate_dir,
+        )
+        .await
+        {
+            let message = format!("Failed to store pack test candidate: {error}");
+            let install = PackInstallRepository::new(state.db.clone())
+                .finish_pending(install.id, message.clone())
+                .await
+                .ok()
+                .flatten();
+            let _ = std::fs::remove_dir_all(candidate_dir);
+            return PackTestDispatchOutcome::Failed {
+                error: ApiError::InternalServerError(message),
+                install,
+            };
+        }
+    }
+
     // Publish the test request; the executor selects a capable worker.
     let Some(publisher) = state.get_publisher().await else {
         // No message queue available — record the failure so the finalizer can
