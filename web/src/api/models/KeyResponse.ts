@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { i64 } from "./i64";
 import type { OwnerType } from "./OwnerType";
+import type { Value } from "./Value";
 /**
  * Full key response with all details (value redacted in list views)
  */
@@ -56,6 +57,8 @@ export type KeyResponse = {
    * Unique reference identifier
    */
   ref: string;
+  schema_binding?: null | Value;
+  schema_digest?: string | null;
   /**
    * Last update timestamp
    */
@@ -64,4 +67,5 @@ export type KeyResponse = {
    * JSON value, or null when the caller cannot read and decrypt encrypted material.
    */
   value: any;
+  value_schema?: null | Value;
 };

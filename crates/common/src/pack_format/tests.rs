@@ -896,6 +896,25 @@ fn rejects_invalid_launches_and_flat_schemas() {
 }
 
 #[test]
+fn archive_checks_authored_and_metadata_schema_names_with_the_same_compiler() {
+    for field in [
+        "parameters",
+        "param_schema",
+        "output",
+        "output_schema",
+        "out_schema",
+    ] {
+        let (dir, options) = fixture();
+        put(&options.source, "actions/native.yaml", format!("ref: demo.native\nrunner_type: native\nlaunch: {{type: native, artifact: tool}}\n{field}:\n  value:\n    type: integer\n    default: invalid\n"));
+        let error = build(&options, &dir.path().join("bad.gz"), Limits::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("schema.invalid_definition"),
+            "{field}: {error}"
+        );
+    }
+}
+
+#[test]
 fn jars_helpers_unused_artifacts_and_reserved_paths_fail_closed() {
     for bytes in [jar(false, false), jar(true, true), b"not a zip".to_vec()] {
         let (dir, options) = fixture();

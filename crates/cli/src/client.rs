@@ -39,7 +39,7 @@ pub struct ApiError {
     #[serde(default)]
     pub code: Option<String>,
     #[serde(default)]
-    pub _details: Option<serde_json::Value>,
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,77 @@ pub struct ApiError {
 pub struct ApiRequestError {
     pub status: StatusCode,
     message: String,
+    pub code: Option<String>,
+    pub details: Option<serde_json::Value>,
+    pub request_id: Option<String>,
+}
+
+impl ApiRequestError {
+    pub fn from_response(status: StatusCode, request_id: Option<&str>, body: &str) -> Self {
+        let parsed = serde_json::from_str::<ApiError>(body).ok();
+        Self {
+            status,
+            message: api_error_message("API error", status, request_id, body),
+            code: parsed.as_ref().and_then(|error| error.code.clone()),
+            details: parsed.and_then(|error| error.details),
+            request_id: request_id.map(str::to_string),
+        }
+    }
+
+    pub fn envelope(&self) -> serde_json::Value {
+        serde_json::json!({ "error": self.message, "code": self.code, "details": self.details,
+            "status": self.status.as_u16(), "request_id": self.request_id })
+    }
+}
+
+pub fn format_deployment_details(details: &serde_json::Value) -> String {
+    let Ok(details) = serde_json::from_value::<
+        attune_common::pack_registry::diagnostics::DeploymentDetails,
+    >(details.clone()) else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    if let Some(reference) = &details.pack_ref {
+        lines.push(format!(
+            "Pack '{reference}'{}",
+            details
+                .version
+                .as_ref()
+                .map(|version| format!(" {version}"))
+                .unwrap_or_default()
+        ));
+    }
+    lines.push(format!("Stage: {}", details.stage.replace('_', " ")));
+    lines.push(match details.outcome.as_str() {
+        "active_release_unchanged" => "The active release is unchanged.".into(),
+        "activation_committed_projection_unavailable" => "Activation committed, but the filesystem projection is unavailable. Ask the operator to reconcile pack storage.".into(),
+        "activation_committed" => "Activation committed. Check install status before retrying.".into(),
+        "activation_committed_cleanup_failed" => "Activation committed and the projection is available, but storage cleanup failed. Ask the operator to clean up pack storage.".into(),
+        "deployed" => "Deployment completed.".into(),
+        "deployed_with_warnings" => "Deployment completed with warnings.".into(),
+        _ => "Deployment outcome is unknown. Check install status before retrying.".into(),
+    });
+    for diagnostic in details.diagnostics {
+        let mut location = diagnostic.path.unwrap_or_default();
+        if let Some(path) = diagnostic.metadata_path {
+            if !path.is_empty() {
+                location.push_str(&format!(" at {path}"));
+            }
+        }
+        if let Some(line) = diagnostic.line {
+            location.push_str(&format!(" line {line}"));
+        }
+        lines.push(format!("{location}: {}", diagnostic.message));
+        if let Some(hint) = diagnostic.hint {
+            lines.push(hint);
+        }
+    }
+    if let Some(id) = details.install_id {
+        lines.push(format!(
+            "Install {id}. Check /api/v1/packs/install/{id} before retrying."
+        ));
+    }
+    lines.join("\n")
 }
 
 fn build_http_client(timeout: Duration) -> HttpClient {
@@ -54,6 +125,7 @@ fn build_http_client(timeout: Duration) -> HttpClient {
     match builder.build() {
         Ok(client) => client,
         Err(err) => {
+            tracing::debug!(error = %err, "Default API TLS initialization failed; trying bundled root certificates");
             let certs = webpki_root_certs::TLS_SERVER_ROOT_CERTS
                 .iter()
                 .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
@@ -64,13 +136,20 @@ fn build_http_client(timeout: Duration) -> HttpClient {
                 .timeout(timeout)
                 .tls_certs_only(certs)
                 .build()
-                .unwrap_or_else(|fallback_err| {
-                    panic!(
-                        "Failed to build HTTP client. default builder error: {err:?}; bundled-root fallback error: {fallback_err:?}"
-                    )
-                })
+                .unwrap_or_else(|_| panic!("Could not initialize API TLS. Check certificate configuration; no request was sent."))
         }
     }
+}
+
+fn request_transport_error(error: reqwest::Error) -> anyhow::Error {
+    let message = if error.is_timeout() {
+        "The API request timed out. Deployment outcome is unknown; check pack/install status before retrying."
+    } else if error.is_connect() {
+        "Could not connect to the API. Check the configured API URL, DNS, proxy, and TLS settings. Check deployment status before retrying."
+    } else {
+        "The API request did not complete. Check API availability and pack/install status before retrying; deployment outcome may be unknown."
+    };
+    anyhow::Error::from(error.without_url()).context(message)
 }
 
 fn parse_json_response<T: DeserializeOwned>(
@@ -82,12 +161,11 @@ fn parse_json_response<T: DeserializeOwned>(
     let mut deserializer = serde_json::Deserializer::from_str(body);
     serde_path_to_error::deserialize(&mut deserializer).map_err(|err| {
         anyhow::anyhow!(
-            "{} ({}{}) at JSON path '{}': {}",
+            "{} ({}{}) at JSON path '{}': response does not match the expected API schema. Check CLI/API versions; this is not a pack YAML validation error.",
             description,
             status,
             format_request_id(request_id),
-            err.path(),
-            err.inner()
+            err.path()
         )
     })
 }
@@ -115,16 +193,71 @@ fn api_error_message(
             .code
             .map(|code| format!(", code {code}"))
             .unwrap_or_default();
-        format!(
+        let message = format!(
             "{label} ({status}{code}{}): {}",
             format_request_id(request_id),
             api_error.error
-        )
+        );
+        let diagnostics = api_error
+            .details
+            .as_ref()
+            .map(format_deployment_details)
+            .unwrap_or_default();
+        if diagnostics.is_empty() {
+            message
+        } else {
+            format!("{message}\n{diagnostics}")
+        }
     } else {
         format!(
             "{label} ({status}{}): response did not contain a valid API error",
             format_request_id(request_id)
         )
+    }
+}
+
+#[cfg(test)]
+mod deployment_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_success_responses_do_not_quote_values() {
+        let error = parse_json_response::<ApiResponse<Vec<i64>>>(
+            r#"{"data":["SECRET_CANARY"]}"#,
+            "Invalid API response",
+            StatusCode::OK,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("data[0]"));
+        assert!(error
+            .to_string()
+            .contains("not a pack YAML validation error"));
+        assert!(!error.to_string().contains("SECRET_CANARY"));
+    }
+
+    #[test]
+    fn details_survive_text_and_machine_readable_output() {
+        let body = serde_json::json!({"error": "Pack metadata is invalid", "code": "PACK_METADATA_INVALID", "details": {
+            "stage": "metadata_validation", "outcome": "active_release_unchanged", "install_id": 42,
+            "diagnostics": [{"severity": "error", "code": "action.timeout_invalid", "path": "actions/send.yaml",
+                "metadata_path": "/timeout_seconds", "message": "Timeout must be positive", "hint": "Use seconds"}]
+        }});
+        let error = ApiRequestError::from_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("request-42"),
+            &body.to_string(),
+        );
+        assert!(error
+            .to_string()
+            .contains("actions/send.yaml at /timeout_seconds"));
+        assert!(error.to_string().contains("Use seconds"));
+        assert!(error.to_string().contains("Install 42"));
+        assert_eq!(
+            error.envelope()["details"]["diagnostics"][0]["metadata_path"],
+            "/timeout_seconds"
+        );
+        assert_eq!(error.envelope()["request_id"], "request-42");
     }
 }
 
@@ -337,7 +470,7 @@ impl ApiClient {
     {
         // First attempt
         let req = self.attach_body(self.build_request(method.clone(), path), body);
-        let response = req.send().await.context("Failed to send request to API")?;
+        let response = req.send().await.map_err(request_transport_error)?;
 
         if response.status() == StatusCode::UNAUTHORIZED
             && self.refresh_token.is_some()
@@ -345,10 +478,7 @@ impl ApiClient {
         {
             // Retry with new token
             let req = self.attach_body(self.build_request(method, path), body);
-            let response = req
-                .send()
-                .await
-                .context("Failed to send request to API (retry)")?;
+            let response = req.send().await.map_err(request_transport_error)?;
             return self.handle_response(response).await;
         }
 
@@ -431,11 +561,7 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            Err(ApiRequestError {
-                status,
-                message: api_error_message("API error", status, request_id.as_deref(), &error_text),
-            }
-            .into())
+            Err(ApiRequestError::from_response(status, request_id.as_deref(), &error_text).into())
         }
     }
 
@@ -551,11 +677,7 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            Err(ApiRequestError {
-                status,
-                message: api_error_message("API error", status, request_id.as_deref(), &error_text),
-            }
-            .into())
+            Err(ApiRequestError::from_response(status, request_id.as_deref(), &error_text).into())
         }
     }
 
@@ -885,10 +1007,7 @@ impl ApiClient {
 
         // First attempt
         let req = build_multipart_request(self, &file_bytes)?;
-        let response = req
-            .send()
-            .await
-            .context("Failed to send multipart request to API")?;
+        let response = req.send().await.map_err(request_transport_error)?;
 
         if response.status() == StatusCode::UNAUTHORIZED
             && self.refresh_token.is_some()
@@ -896,10 +1015,7 @@ impl ApiClient {
         {
             // Retry with new token
             let req = build_multipart_request(self, &file_bytes)?;
-            let response = req
-                .send()
-                .await
-                .context("Failed to send multipart request to API (retry)")?;
+            let response = req.send().await.map_err(request_transport_error)?;
             return self.handle_response(response).await;
         }
 

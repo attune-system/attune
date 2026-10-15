@@ -17,7 +17,13 @@ if TYPE_CHECKING:
     from ..models.enforcement_response_config_type_0 import (
         EnforcementResponseConfigType0,
     )
+    from ..models.enforcement_response_input_contract_type_0 import (
+        EnforcementResponseInputContractType0,
+    )
     from ..models.enforcement_response_payload import EnforcementResponsePayload
+    from ..models.enforcement_response_payload_contract_type_0 import (
+        EnforcementResponsePayloadContractType0,
+    )
 
 
 T = TypeVar("T", bound="EnforcementResponse")
@@ -38,6 +44,10 @@ class EnforcementResponse:
         status (EnforcementStatus):
         trigger_ref (str): Trigger reference Example: system.error_event.
         event (int | None | Unset):
+        input_contract (EnforcementResponseInputContractType0 | None | Unset): Stored action input contract, without
+            static executable metadata.
+        payload_contract (EnforcementResponsePayloadContractType0 | None | Unset): Original event payload contract, when
+            its admission record is retained.
         resolved_at (datetime.datetime | None | Unset): Timestamp when the enforcement was resolved (status changed from
             created to processed/disabled) Example: 2024-01-13T10:30:01Z.
         rule (int | None | Unset):
@@ -55,6 +65,8 @@ class EnforcementResponse:
     status: EnforcementStatus
     trigger_ref: str
     event: int | None | Unset = UNSET
+    input_contract: EnforcementResponseInputContractType0 | None | Unset = UNSET
+    payload_contract: EnforcementResponsePayloadContractType0 | None | Unset = UNSET
     resolved_at: datetime.datetime | None | Unset = UNSET
     rule: int | None | Unset = UNSET
     trace_tag: None | str | Unset = UNSET
@@ -63,6 +75,12 @@ class EnforcementResponse:
     def to_dict(self) -> dict[str, Any]:
         from ..models.enforcement_response_config_type_0 import (
             EnforcementResponseConfigType0,
+        )
+        from ..models.enforcement_response_input_contract_type_0 import (
+            EnforcementResponseInputContractType0,
+        )
+        from ..models.enforcement_response_payload_contract_type_0 import (
+            EnforcementResponsePayloadContractType0,
         )
 
         condition = self.condition.value
@@ -92,6 +110,22 @@ class EnforcementResponse:
             event = UNSET
         else:
             event = self.event
+
+        input_contract: dict[str, Any] | None | Unset
+        if isinstance(self.input_contract, Unset):
+            input_contract = UNSET
+        elif isinstance(self.input_contract, EnforcementResponseInputContractType0):
+            input_contract = self.input_contract.to_dict()
+        else:
+            input_contract = self.input_contract
+
+        payload_contract: dict[str, Any] | None | Unset
+        if isinstance(self.payload_contract, Unset):
+            payload_contract = UNSET
+        elif isinstance(self.payload_contract, EnforcementResponsePayloadContractType0):
+            payload_contract = self.payload_contract.to_dict()
+        else:
+            payload_contract = self.payload_contract
 
         resolved_at: None | str | Unset
         if isinstance(self.resolved_at, Unset):
@@ -130,6 +164,10 @@ class EnforcementResponse:
         )
         if event is not UNSET:
             field_dict["event"] = event
+        if input_contract is not UNSET:
+            field_dict["input_contract"] = input_contract
+        if payload_contract is not UNSET:
+            field_dict["payload_contract"] = payload_contract
         if resolved_at is not UNSET:
             field_dict["resolved_at"] = resolved_at
         if rule is not UNSET:
@@ -147,8 +185,14 @@ class EnforcementResponse:
         from ..models.enforcement_response_config_type_0 import (
             EnforcementResponseConfigType0,
         )
+        from ..models.enforcement_response_input_contract_type_0 import (
+            EnforcementResponseInputContractType0,
+        )
         from ..models.enforcement_response_payload import (
             EnforcementResponsePayload,
+        )
+        from ..models.enforcement_response_payload_contract_type_0 import (
+            EnforcementResponsePayloadContractType0,
         )
 
         d = dict(src_dict)
@@ -191,6 +235,48 @@ class EnforcementResponse:
             return cast(int | None | Unset, data)
 
         event = _parse_event(d.pop("event", UNSET))
+
+        def _parse_input_contract(
+            data: object,
+        ) -> EnforcementResponseInputContractType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                input_contract_type_0 = EnforcementResponseInputContractType0.from_dict(
+                    data
+                )
+
+                return input_contract_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(EnforcementResponseInputContractType0 | None | Unset, data)
+
+        input_contract = _parse_input_contract(d.pop("input_contract", UNSET))
+
+        def _parse_payload_contract(
+            data: object,
+        ) -> EnforcementResponsePayloadContractType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                payload_contract_type_0 = (
+                    EnforcementResponsePayloadContractType0.from_dict(data)
+                )
+
+                return payload_contract_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(EnforcementResponsePayloadContractType0 | None | Unset, data)
+
+        payload_contract = _parse_payload_contract(d.pop("payload_contract", UNSET))
 
         def _parse_resolved_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -238,6 +324,8 @@ class EnforcementResponse:
             status=status,
             trigger_ref=trigger_ref,
             event=event,
+            input_contract=input_contract,
+            payload_contract=payload_contract,
             resolved_at=resolved_at,
             rule=rule,
             trace_tag=trace_tag,

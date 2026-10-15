@@ -969,18 +969,79 @@ pub struct ArtifactsConfig {
     pub sensor_log_max_files: u32,
 }
 
-/// Configuration for pack file transport.
+/// Configuration for pack file transport and publication policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PacksConfig {
     /// Transport mode: "auto" for local compatibility, "volume", or "api".
     #[serde(default)]
     pub transport: crate::artifact_transport::TransportMode,
+
+    /// Policy for accepting a new digest under an existing pack version.
+    #[serde(default)]
+    pub republish: PackRepublishConfig,
 }
 
 impl Default for PacksConfig {
     fn default() -> Self {
         Self {
             transport: crate::artifact_transport::TransportMode::Auto,
+            republish: PackRepublishConfig::default(),
+        }
+    }
+}
+
+impl PacksConfig {
+    pub fn allows_version_republish(&self, version: &str) -> bool {
+        self.republish.allows_version_republish(version)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackRepublishMode {
+    #[default]
+    Off,
+    On,
+    Suffix,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackRepublishConfig {
+    /// Off rejects new digests; on allows them for any valid semantic version.
+    pub mode: PackRepublishMode,
+    /// Suffix mode matches this literal, case-sensitive version ending.
+    pub suffix: String,
+}
+
+impl Default for PackRepublishConfig {
+    fn default() -> Self {
+        Self {
+            mode: PackRepublishMode::Off,
+            suffix: "-dev".to_string(),
+        }
+    }
+}
+
+impl PackRepublishConfig {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.suffix.is_empty() || self.suffix.chars().any(char::is_whitespace) {
+            return Err(crate::Error::configuration(
+                "packs.republish.suffix must be non-empty and contain no whitespace",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn allows_version_republish(&self, version: &str) -> bool {
+        if semver::Version::parse(version).is_err() {
+            return false;
+        }
+        match self.mode {
+            PackRepublishMode::Off => false,
+            PackRepublishMode::On => true,
+            PackRepublishMode::Suffix => self.validate().is_ok() && version.ends_with(&self.suffix),
         }
     }
 }
@@ -2299,6 +2360,7 @@ impl Config {
 
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
+        self.packs.republish.validate()?;
         if let Some(worker) = &self.worker {
             crate::child_process_environment::validate_passthrough_env(&worker.passthrough_env)?;
         }
@@ -3031,6 +3093,149 @@ mod tests {
         let sensor: SensorConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(sensor.notifier_ws_url.is_none());
         assert!(!sensor.allow_insecure_notifier_ws);
+    }
+
+    #[test]
+    fn pack_republish_defaults_to_off_with_dev_suffix() {
+        let partial: PacksConfig = serde_json::from_value(serde_json::json!({
+            "transport": "volume"
+        }))
+        .unwrap();
+        let nested: PacksConfig = serde_json::from_value(serde_json::json!({
+            "republish": {}
+        }))
+        .unwrap();
+        for config in [PacksConfig::default(), partial, nested] {
+            assert_eq!(config.republish.mode, PackRepublishMode::Off);
+            assert_eq!(config.republish.suffix, "-dev");
+            assert!(!config.allows_version_republish("1.2.3-dev"));
+            assert!(!config.allows_version_republish("1.2.3"));
+        }
+    }
+
+    #[test]
+    fn pack_republish_suffix_matches_literal_version_endings() {
+        let config: PacksConfig = serde_json::from_value(serde_json::json!({
+            "republish": {"mode": "suffix"}
+        }))
+        .unwrap();
+        for version in [
+            "0.0.0-dev",
+            "1.2.3-dev",
+            "10.20.30-dev",
+            "1.2.3-alpha-dev",
+            "1.2.3+build-dev",
+        ] {
+            assert!(config.allows_version_republish(version), "{version}");
+        }
+        for version in [
+            "1.2.3",
+            "1.2.3-rc",
+            "1.2.3-dev.1",
+            "1.2.3-DEV",
+            "1.2.3-dev+build",
+            "01.2.3-dev",
+            "1.2-dev",
+            "v1.2.3-dev",
+            "1.2.3-dev ",
+            "not-a-version-dev",
+        ] {
+            assert!(!config.allows_version_republish(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn pack_republish_supports_custom_suffixes() {
+        let config: PacksConfig = serde_json::from_value(serde_json::json!({
+            "republish": {"mode": "suffix", "suffix": "-snapshot"}
+        }))
+        .unwrap();
+        assert!(config.allows_version_republish("1.2.3-snapshot"));
+        assert!(config.allows_version_republish("1.2.3-alpha-snapshot"));
+        for version in ["1.2.3-dev", "1.2.3", "1.2.3-SNAPSHOT", "1.2.3-snapshot.1"] {
+            assert!(!config.allows_version_republish(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn pack_republish_on_allows_any_valid_semantic_version() {
+        let config: PacksConfig = serde_json::from_value(serde_json::json!({
+            "republish": {"mode": "on"}
+        }))
+        .unwrap();
+        for version in ["1.2.3", "1.2.3-rc", "1.2.3-dev", "1.2.3+build"] {
+            assert!(config.allows_version_republish(version), "{version}");
+        }
+        for version in ["", "1.2", "01.2.3-dev", "v1.2.3", "not-a-version"] {
+            assert!(!config.allows_version_republish(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn pack_republish_environment_overrides_mode_and_suffix() {
+        #[derive(Deserialize)]
+        struct Probe {
+            packs: PacksConfig,
+        }
+        for (mode, allowed) in [("off", false), ("on", true), ("suffix", true)] {
+            let source = attune_environment_source().source(Some(
+                [
+                    (
+                        "ATTUNE__PACKS__REPUBLISH__MODE".to_string(),
+                        mode.to_string(),
+                    ),
+                    (
+                        "ATTUNE__PACKS__REPUBLISH__SUFFIX".to_string(),
+                        "-snapshot".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            let probe: Probe = config_crate::Config::builder()
+                .add_source(source)
+                .build()
+                .unwrap()
+                .try_deserialize()
+                .unwrap();
+            assert_eq!(probe.packs.republish.suffix, "-snapshot");
+            assert_eq!(
+                probe.packs.allows_version_republish("1.2.3-snapshot"),
+                allowed
+            );
+            assert_eq!(
+                probe.packs.allows_version_republish("1.2.3-dev"),
+                mode == "on"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_republish_rejects_invalid_configuration() {
+        for republish in [
+            serde_json::json!({"mode": "invalid"}),
+            serde_json::json!({"mode": true}),
+            serde_json::json!({"mode": "suffix", "sufix": "-dev"}),
+        ] {
+            assert!(serde_json::from_value::<PacksConfig>(serde_json::json!({
+                "republish": republish
+            }))
+            .is_err());
+        }
+        assert!(serde_json::from_value::<PacksConfig>(serde_json::json!({
+            "allow_dev_version_republish": true
+        }))
+        .is_err());
+        for suffix in ["", " ", "-dev ", "-dev\n"] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "security": {"enable_auth": false},
+                "packs": {"republish": {"mode": "suffix", "suffix": suffix}}
+            }))
+            .unwrap();
+            assert!(!config.packs.allows_version_republish("1.2.3-dev"));
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("packs.republish.suffix"));
+        }
     }
 
     #[test]

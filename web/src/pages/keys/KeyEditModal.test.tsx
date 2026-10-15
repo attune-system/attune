@@ -20,6 +20,8 @@ const keyData: {
     ref: string;
     updated: string;
     value: unknown;
+    value_schema?: unknown;
+    schema_binding?: unknown;
   };
 } = {
   data: {
@@ -51,9 +53,50 @@ beforeEach(() => {
   updateKey.mockReset();
   keyData.data.encrypted = true;
   keyData.data.value = originalValue;
+  keyData.data.value_schema = undefined;
+  keyData.data.schema_binding = undefined;
 });
 
 describe("KeyEditModal", () => {
+  it("replaces a schema-bound value under the retained contract without selecting newer types", async () => {
+    keyData.data.value_schema = {
+      type: "object",
+      properties: {
+        token: { type: "string", secret: true },
+        enabled: { type: "boolean" },
+      },
+    };
+    keyData.data.schema_binding = {
+      annotated_schema: keyData.data.value_schema,
+    };
+    const user = userEvent.setup();
+    render(<KeyEditModal keyRef="system.oauth_credential" onClose={vi.fn()} />);
+    await user.click(
+      screen.getByRole("button", {
+        name: "Replace complete value with schema controls",
+      }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Create object value" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Add token" }));
+    fireEvent.change(screen.getByLabelText("/token"), {
+      target: { value: "replacement-fixture" },
+    });
+    expect(screen.getByLabelText("/token")).toHaveAttribute("type", "password");
+    await user.click(screen.getByRole("button", { name: "Add enabled" }));
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() =>
+      expect(updateKey).toHaveBeenCalledWith({
+        ref: "system.oauth_credential",
+        data: {
+          name: undefined,
+          value: { token: "replacement-fixture", enabled: false },
+          encrypted: undefined,
+        },
+      }),
+    );
+  });
   it("displays structured key values as formatted JSON", async () => {
     render(<KeyEditModal keyRef="oauth_credential" onClose={vi.fn()} />);
 
@@ -108,7 +151,7 @@ describe("KeyEditModal", () => {
     });
   });
 
-  it("includes the typed value when only encryption changes", async () => {
+  it("lets the server authorize preserved material when only encryption changes", async () => {
     const user = userEvent.setup();
     render(<KeyEditModal keyRef="oauth_credential" onClose={vi.fn()} />);
 
@@ -124,7 +167,7 @@ describe("KeyEditModal", () => {
         ref: "oauth_credential",
         data: {
           name: undefined,
-          value: originalValue,
+          value: undefined,
           encrypted: false,
         },
       });

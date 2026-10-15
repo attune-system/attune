@@ -12,7 +12,6 @@ use std::sync::Arc;
 use validator::Validate;
 
 use attune_common::{
-    inquiry_options::validate_response_options,
     inquiry_response_handle::issue_inquiry_response_handle,
     models::{execution::Execution, inquiry::Inquiry},
     rbac::{Action as RbacAction, AuthorizationContext, Grant, Resource},
@@ -99,7 +98,8 @@ pub async fn list_inquiries(
     path = "/api/v1/inquiries/{id}",
     tag = "inquiries",
     params(
-        ("id" = i64, Path, description = "Inquiry ID")
+        ("id" = i64, Path, description = "Inquiry ID"),
+        crate::dto::inquiry::InquiryDetailQuery
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -113,6 +113,7 @@ pub async fn get_inquiry(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(query): Query<crate::dto::inquiry::InquiryDetailQuery>,
 ) -> ApiResult<impl IntoResponse> {
     let inquiry = InquiryRepository::find_by_id(&state.db, id)
         .await?
@@ -130,7 +131,55 @@ pub async fn get_inquiry(
     let vis_ctx = visibility.as_visibility_context();
     let mut enrichment =
         load_inquiry_enrichment(&state, &vis_ctx, std::slice::from_ref(&inquiry)).await?;
-    let mut response = InquiryResponse::from(inquiry);
+    let mut response = InquiryResponse::from(inquiry.clone());
+    if let Some(stored) =
+        attune_common::repositories::inquiry_schema::InquirySchemaRepository::find(&state.db, id)
+            .await?
+    {
+        response.response_schema = stored.binding.response_schema.clone();
+        response.schema_binding = Some(serde_json::to_value(&stored.binding).map_err(|_| {
+            ApiError::InternalServerError("Invalid inquiry rendering contract".into())
+        })?);
+    }
+    if query.include_secret_values {
+        authorize_inquiry_secret_access(&state, &user, &inquiry).await?;
+        response.response = crate::secret_disclosure::reveal_authorized(
+            &state,
+            &user,
+            response.response,
+            attune_common::secret_values::ENTITY_INQUIRY_RESPONSE,
+            id,
+        )
+        .await?;
+        let options = serde_json::to_value(&response.response_options).map_err(|_| {
+            ApiError::InternalServerError("Invalid inquiry response options".into())
+        })?;
+        let options = crate::secret_disclosure::reveal_authorized(
+            &state,
+            &user,
+            Some(options),
+            attune_common::secret_values::ENTITY_INQUIRY_OPTIONS,
+            id,
+        )
+        .await?;
+        response.response_options = serde_json::from_value(
+            options.unwrap_or_else(|| serde_json::json!([])),
+        )
+        .map_err(|_| ApiError::InternalServerError("Invalid inquiry response options".into()))?;
+        state.audit_emitter.emit(
+            attune_common::audit::AuditEventBuilder::new(
+                attune_common::audit::AuditCategory::Api,
+                attune_common::audit::event_type::inquiry::SECRET_VALUES_DISCLOSED,
+                attune_common::audit::AuditOutcome::Success,
+            )
+            .actor_identity(user.identity_id().map_err(|_| {
+                ApiError::Unauthorized("Invalid inquiry disclosure identity".into())
+            })?)
+            .resource("inquiry")
+            .resource_id(id)
+            .build(),
+        );
+    }
     let response_id = response.id;
     apply_response_enrichment(&mut response, enrichment.remove(&response_id));
     if !decision.execution_visible {
@@ -281,7 +330,10 @@ pub async fn create_inquiry(
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
     request.validate()?;
-    validate_response_options(request.response_schema.as_ref(), &request.response_options)?;
+    attune_common::inquiry_options::validate_bound_response_options(
+        None,
+        &request.response_options,
+    )?;
 
     if user.claims.token_type != TokenType::Execution {
         return Err(ApiError::Forbidden(
@@ -327,9 +379,15 @@ pub async fn create_inquiry(
         timeout_seconds: request.timeout_seconds,
     };
 
-    let mut conn = state.db.acquire().await?;
+    let mut transaction = state.db.begin().await?;
     let inquiry =
-        InquiryRepository::create_workflow_inquiry_idempotent(&mut conn, inquiry_input).await?;
+        attune_common::repositories::inquiry_schema::InquirySchemaRepository::create_workflow(
+            &mut transaction,
+            inquiry_input,
+            encryption_key,
+        )
+        .await?;
+    transaction.commit().await?;
 
     let response_options = inquiry
         .response_options
@@ -419,16 +477,26 @@ pub async fn respond_to_inquiry(
     let responded_by = user.0.identity_id().map_err(|_| {
         ApiError::Forbidden("Cannot record response: caller has no resolvable identity".to_string())
     })?;
-    let updated_inquiry = crate::inquiry_response::submit_inquiry_response(
-        &state,
-        crate::inquiry_response::InquiryResponseSubmission::Human {
-            inquiry_id: id,
-            response: request.response,
-            identity_id: responded_by,
-            execution_id: user.0.execution_id(),
-        },
-    )
-    .await?;
+    let submission = match request {
+        InquiryRespondRequest::Response(request) => {
+            crate::inquiry_response::InquiryResponseSubmission::Human {
+                inquiry_id: id,
+                response: request.response,
+                identity_id: responded_by,
+                execution_id: user.0.execution_id(),
+            }
+        }
+        InquiryRespondRequest::Option(request) => {
+            crate::inquiry_response::InquiryResponseSubmission::HumanOption {
+                inquiry_id: id,
+                option_ref: request.option_ref,
+                identity_id: responded_by,
+                execution_id: user.0.execution_id(),
+            }
+        }
+    };
+    let updated_inquiry =
+        crate::inquiry_response::submit_inquiry_response(&state, submission).await?;
 
     let response = ApiResponse::with_message(
         redact_inquiry_response(
@@ -443,10 +511,101 @@ pub async fn respond_to_inquiry(
 
 const REDACTED_CREATED_BY_EXECUTION_ID: i64 = 0;
 
+/// Inquiry authority uses fresh attributes even if a parent consumer's access
+/// metadata is cached. Batched origins share this same identity boundary.
+pub(crate) async fn inquiry_authorization_caller(
+    db: &sqlx::PgPool,
+    user: &AuthenticatedUser,
+) -> ApiResult<AuthorizationContext> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "Inquiries are only available to access or execution identities".into(),
+        ));
+    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+    let attributes = IdentityRepository::find_attributes_by_id(db, identity_id)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("Identity not found".into()))?;
+    let mut caller = AuthorizationContext::new(identity_id);
+    caller.identity_attributes = match attributes {
+        serde_json::Value::Object(map) => map.into_iter().collect(),
+        _ => HashMap::new(),
+    };
+    Ok(caller)
+}
+
+pub(crate) fn inquiry_disclosure_scope_allows(
+    inquiry: &attune_common::repositories::inquiry::InquiryDisclosureRow,
+    creator: Option<&attune_common::repositories::execution::ExecutionAuthorizationRow>,
+    caller: &AuthorizationContext,
+    grants: &[Grant],
+) -> bool {
+    let participant = inquiry.assigned_to == Some(caller.identity_id)
+        || creator.and_then(|row| row.executor) == Some(caller.identity_id);
+    (participant || inquiry_action_allowed(inquiry.id, creator, caller, grants, RbacAction::Read))
+        && inquiry_action_allowed(inquiry.id, creator, caller, grants, RbacAction::Decrypt)
+}
+
+fn inquiry_action_allowed(
+    inquiry: i64,
+    creator: Option<&attune_common::repositories::execution::ExecutionAuthorizationRow>,
+    caller: &AuthorizationContext,
+    grants: &[Grant],
+    action: RbacAction,
+) -> bool {
+    let mut ctx = caller.clone();
+    ctx.target_id = Some(inquiry);
+    ctx.target_ref = Some(format!("inquiry:{inquiry}"));
+    if let Some(creator) = creator {
+        ctx.pack_ref = creator
+            .action_ref
+            .split_once('.')
+            .map(|(pack, _)| pack.to_string());
+        ctx.owner_identity_id = creator.executor;
+        ctx.execution_owner_identity_id = creator.executor;
+    }
+    AuthorizationService::is_allowed(grants, Resource::Inquiries, action, &ctx)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct InquiryAccessDecision {
     content_visible: bool,
     execution_visible: bool,
+}
+
+pub(crate) async fn authorize_inquiry_secret_access(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    inquiry: &attune_common::models::inquiry::Inquiry,
+) -> ApiResult<()> {
+    let mut visibility = InquiryVisibilityEvaluator::new(state, user).await?;
+    if !visibility.evaluate(inquiry).await?.content_visible {
+        return Err(ApiError::NotFound("Inquiry is not visible".into()));
+    }
+    let creator = visibility
+        .linked_execution(inquiry.created_by_execution)
+        .await?;
+    if !visibility.inquiry_action_with_scope(inquiry, creator.as_ref(), RbacAction::Decrypt) {
+        return Err(ApiError::Forbidden(
+            "Inquiry plaintext requires explicit decrypt authority".into(),
+        ));
+    }
+    if attune_common::repositories::inquiry_schema::InquirySchemaRepository::find(
+        &state.db, inquiry.id,
+    )
+    .await?
+    .is_none()
+    {
+        return Err(ApiError::Forbidden(
+            "Inquiry disclosure requires its original schema binding".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Evaluates per-identity inquiry visibility for single-item endpoints
@@ -469,33 +628,14 @@ struct InquiryVisibilityEvaluator {
 
 impl InquiryVisibilityEvaluator {
     async fn new(state: &Arc<AppState>, user: &AuthenticatedUser) -> ApiResult<Self> {
-        if !matches!(
-            user.claims.token_type,
-            TokenType::Access | TokenType::Execution
-        ) {
-            return Err(ApiError::Forbidden(
-                "Inquiries are only available to access or execution identities".to_string(),
-            ));
-        }
-
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let identity = IdentityRepository::find_by_id(&state.db, identity_id)
-            .await?
-            .ok_or_else(|| ApiError::Unauthorized("Identity not found".to_string()))?;
-
-        let identity_attributes = match identity.attributes {
-            serde_json::Value::Object(map) => map.into_iter().collect(),
-            _ => HashMap::new(),
-        };
+        let caller = inquiry_authorization_caller(&state.db, user).await?;
 
         let grants = state.authorization_service().effective_grants(user).await?;
 
         Ok(Self {
             state: state.clone(),
-            identity_id,
-            identity_attributes,
+            identity_id: caller.identity_id,
+            identity_attributes: caller.identity_attributes,
             grants,
             execution_cache: HashMap::new(),
             ancestor_cache: HashMap::new(),
@@ -583,20 +723,20 @@ impl InquiryVisibilityEvaluator {
         inquiry: &attune_common::models::inquiry::Inquiry,
         execution: Option<&attune_common::models::execution::Execution>,
     ) -> bool {
-        let mut ctx = AuthorizationContext::new(self.identity_id);
-        ctx.identity_attributes = self.identity_attributes.clone();
-        ctx.target_id = Some(inquiry.id);
-        ctx.target_ref = Some(format!("inquiry:{}", inquiry.id));
-        if let Some(execution) = execution {
-            ctx.pack_ref = execution
-                .action_ref
-                .split_once('.')
-                .map(|(pack, _)| pack.to_string());
-            ctx.owner_identity_id = execution.executor;
-            ctx.execution_owner_identity_id = execution.executor;
-        }
+        self.inquiry_action_with_scope(inquiry, execution, RbacAction::Read)
+    }
 
-        AuthorizationService::is_allowed(&self.grants, Resource::Inquiries, RbacAction::Read, &ctx)
+    fn inquiry_action_with_scope(
+        &self,
+        inquiry: &attune_common::models::inquiry::Inquiry,
+        execution: Option<&attune_common::models::execution::Execution>,
+        action: RbacAction,
+    ) -> bool {
+        let mut caller = AuthorizationContext::new(self.identity_id);
+        caller.identity_attributes = self.identity_attributes.clone();
+        let creator =
+            execution.map(attune_common::repositories::execution::ExecutionAuthorizationRow::from);
+        inquiry_action_allowed(inquiry.id, creator.as_ref(), &caller, &self.grants, action)
     }
 
     async fn execution_readable(

@@ -3,8 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { usePacks } from "@/hooks/usePacks";
 import { useCreateRuntime, useUpdateRuntime } from "@/hooks/useRuntimes";
 import {
-  NullableJsonPatch,
-  NullableStringPatch,
+  type NullableJsonPatch,
   type PackSummary,
   type RuntimeResponse,
 } from "@/api";
@@ -155,15 +154,18 @@ export default function RuntimeForm({
       if (isEditing && initialData) {
         const installationPatch =
           installation.trim().length > 0 && parsedInstallation !== null
-            ? { op: NullableJsonPatch.op.SET, value: parsedInstallation }
-            : null;
+            ? ({
+                op: "set",
+                value: parsedInstallation,
+              } satisfies NullableJsonPatch)
+            : ({ op: "clear" } satisfies NullableJsonPatch);
 
         await updateRuntime.mutateAsync({
           ref: initialData.ref,
           data: {
             description: description.trim()
-              ? { op: NullableStringPatch.op.SET, value: description.trim() }
-              : null,
+              ? { op: "set", value: description.trim() }
+              : { op: "clear" },
             name: name.trim(),
             distributions: parsedDistributions,
             installation: installationPatch,
@@ -252,8 +254,9 @@ export default function RuntimeForm({
             </label>
             <select
               value={packRef}
+              disabled={isEditing}
               onChange={(e) => setPackRef(e.target.value)}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm disabled:bg-gray-100"
             >
               <option value="">No pack</option>
               {packs.map((pack: PackSummary) => (

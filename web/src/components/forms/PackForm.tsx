@@ -1,9 +1,11 @@
-import { useState, useEffect, useRef } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useCreatePack, useUpdatePack } from "@/hooks/usePacks";
-import { PackDescriptionPatch, type PackResponse } from "@/api";
+import type { PackResponse, UpdatePackRequest } from "@/api";
 import { labelToRef } from "@/lib/format-utils";
-import SchemaBuilder from "@/components/common/SchemaBuilder";
+import SchemaBuilder, {
+  type FlatSchema,
+} from "@/components/common/SchemaBuilder";
 import ParamSchemaForm, {
   type ParamSchema,
 } from "@/components/common/ParamSchemaForm";
@@ -12,25 +14,16 @@ import { RotateCcw } from "lucide-react";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonValue = any;
 
-/** A single property definition within a flat schema object */
-interface SchemaPropertyDef {
-  type?: string;
-  description?: string;
-  required?: boolean;
-  secret?: boolean;
-  default?: JsonValue;
-  minimum?: number;
-  maximum?: number;
-  [key: string]: unknown;
-}
-
-/** The flat schema format: each key is a parameter name mapped to its definition */
-type FlatSchema = Record<string, SchemaPropertyDef>;
-
 interface PackFormProps {
   pack?: PackResponse;
   onSuccess?: () => void;
   onCancel?: () => void;
+}
+
+function containsRedaction(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  if ("$attune_secret" in value && value.$attune_secret === true) return true;
+  return Object.values(value).some(containsRedaction);
 }
 
 export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
@@ -70,44 +63,10 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
     typeof confSchema === "object" &&
     Object.keys(confSchema).length > 0;
 
-  // Track previous confSchema to detect changes without re-running on every render
-  const prevConfSchemaRef = useRef(confSchema);
-
-  // Sync config values when schema changes (for ad-hoc packs only)
-  /* eslint-disable react-hooks/set-state-in-effect -- intentional sync of dependent state */
-  useEffect(() => {
-    // Only sync when confSchema actually changed
-    if (prevConfSchemaRef.current === confSchema) return;
-    prevConfSchemaRef.current = confSchema;
-
-    if (!isStandard && hasSchemaProperties) {
-      // Get current schema property names (flat format: keys are parameter names)
-      const schemaKeys = Object.keys(confSchema);
-
-      // Create new config with only keys that exist in schema
-      const syncedConfig: Record<string, JsonValue> = {};
-      schemaKeys.forEach((key) => {
-        if (configValues[key] !== undefined) {
-          // Preserve existing value
-          syncedConfig[key] = configValues[key];
-        } else {
-          // Use default from schema if available
-          const defaultValue = confSchema[key]?.default;
-          if (defaultValue !== undefined) {
-            syncedConfig[key] = defaultValue;
-          }
-        }
-      });
-
-      // Only update if there's a difference
-      const currentKeys = Object.keys(configValues).sort().join(",");
-      const syncedKeys = Object.keys(syncedConfig).sort().join(",");
-      if (currentKeys !== syncedKeys) {
-        setConfigValues(syncedConfig);
-      }
-    }
-  }, [confSchema, isStandard, hasSchemaProperties, configValues]);
-  /* eslint-enable react-hooks/set-state-in-effect */
+  const schemaChanged =
+    JSON.stringify(confSchema) !== JSON.stringify(initialConfSchema);
+  const configChanged =
+    JSON.stringify(configValues) !== JSON.stringify(initialConfig);
 
   const validateForm = (): boolean => {
     const newErrors: Record<string, string> = {};
@@ -152,6 +111,13 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (configChanged && containsRedaction(configValues)) {
+      setErrors({
+        config:
+          "Replace every redacted field before submitting a complete configuration. Untouched configuration stays encrypted on the server.",
+      });
+      return;
+    }
 
     if (!validateForm()) {
       return;
@@ -174,16 +140,16 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
         const updateData = {
           label: label.trim(),
           description: description.trim()
-            ? { op: PackDescriptionPatch.op.SET, value: description.trim() }
-            : ({ op: "clear" } as unknown as PackDescriptionPatch),
+            ? { op: "set", value: description.trim() }
+            : { op: "clear" },
           version: version.trim(),
-          conf_schema: parsedConfSchema,
-          config: configValues,
+          ...(schemaChanged ? { conf_schema: parsedConfSchema } : {}),
+          ...(configChanged ? { config: configValues } : {}),
           meta: parsedMeta,
           tags: tagsList,
           runtime_deps: depsList,
           is_standard: isStandard,
-        };
+        } satisfies UpdatePackRequest;
         await updatePack.mutateAsync({ ref: pack!.ref, data: updateData });
         if (onSuccess) {
           onSuccess();
@@ -608,10 +574,20 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
             </div>
             <ParamSchemaForm
               schema={confSchema as unknown as ParamSchema}
+              contract={
+                !schemaChanged
+                  ? (pack?.config_schema_binding ?? undefined)
+                  : undefined
+              }
               values={configValues}
               onChange={setConfigValues}
               errors={errors}
             />
+            {errors.config && (
+              <p role="alert" className="text-sm text-red-600">
+                {errors.config}
+              </p>
+            )}
           </div>
         )}
       </div>

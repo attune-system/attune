@@ -6,7 +6,7 @@ use crate::{
     delegation::DelegationAuthority,
     models::{Id, Key, OwnerType},
     rbac::{Action, AuthorizationContext, Grant, Resource},
-    repositories::key::KeyRepository,
+    repositories::{key::KeyRepository, FindById},
     secret_provenance::KeyOrigin,
     Error, Result,
 };
@@ -122,13 +122,49 @@ pub async fn authorize_parameter_key_origins(
     identity_id: Option<Id>,
     secrets: &[crate::secret_values::StoredSecretValue],
 ) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    authorize_parameter_key_origins_with_conn(&mut connection, identity_id, secrets).await
+}
+
+pub async fn authorize_execution_parameter_key_origins(
+    pool: &sqlx::PgPool,
+    execution: i64,
+    identity: Option<Id>,
+    secrets: &[crate::secret_values::StoredSecretValue],
+) -> Result<()> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    let mut connection = pool.acquire().await?;
+    let authority =
+        crate::repositories::rule_authority::RuleAuthorityRepository::execution_input_authority(
+            &mut connection,
+            execution,
+            identity,
+        )
+        .await?;
+    let mut visited = std::collections::BTreeSet::new();
+    for secret in secrets {
+        check_parameter_origins(&mut connection, authority.as_ref(), secret, &mut visited, 0)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn authorize_parameter_key_origins_with_conn(
+    connection: &mut sqlx::PgConnection,
+    identity_id: Option<Id>,
+    secrets: &[crate::secret_values::StoredSecretValue],
+) -> Result<()> {
     let authority = match identity_id {
-        Some(identity_id) => Some(DelegationAuthority::load(pool, identity_id).await?),
+        Some(identity_id) => {
+            Some(DelegationAuthority::load_for_share(connection, identity_id).await?)
+        }
         None => None,
     };
     for secret in secrets {
         check_parameter_origins(
-            pool,
+            connection,
             authority.as_ref(),
             secret,
             &mut std::collections::BTreeSet::new(),
@@ -140,7 +176,7 @@ pub async fn authorize_parameter_key_origins(
 }
 
 fn check_parameter_origins<'a>(
-    pool: &'a sqlx::PgPool,
+    connection: &'a mut sqlx::PgConnection,
     authority: Option<&'a DelegationAuthority>,
     secret: &'a crate::secret_values::StoredSecretValue,
     visited: &'a mut std::collections::BTreeSet<(String, Id, String)>,
@@ -171,6 +207,11 @@ fn check_parameter_origins<'a>(
                         return Err(denied());
                     }
                 }
+                SecretOrigin::QueueItem { .. } => {
+                    // Caller-supplied queue material can pass through batches
+                    // without granting API or Key rights. Disclosure separately
+                    // requires the recorded queue's read/decrypt grants.
+                }
                 SecretOrigin::Entity {
                     entity_type,
                     entity_id,
@@ -180,16 +221,74 @@ fn check_parameter_origins<'a>(
                         entity_type.as_str(),
                         crate::secret_values::ENTITY_EXECUTION_CONFIG
                             | crate::secret_values::ENTITY_EXECUTION_RESULT
+                            | crate::secret_values::ENTITY_INQUIRY_OPTIONS
+                            | crate::secret_values::ENTITY_INQUIRY_RESPONSE
+                            | crate::secret_values::ENTITY_EVENT_PAYLOAD
+                            | crate::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_CONFIG
+                            | crate::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_RULE_CONFIG
+                            | crate::repositories::sensor_schema::ENTITY_SENSOR_RULE_DELIVERY_CONFIG
+                            | crate::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION
                     ) || !visited.insert((entity_type.clone(), entity_id, path.clone()))
                     {
                         return Err(denied());
                     }
-                    let parents = crate::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(pool, &entity_type, entity_id).await?;
+                    let parents = crate::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(&mut *connection, &entity_type, entity_id).await?;
+                    if entity_type == crate::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION {
+                        let revision = crate::repositories::component_configuration::ComponentConfigurationRepository::find(&mut *connection, entity_id)
+                            .await?.ok_or_else(denied)?;
+                        if !crate::repositories::component_configuration::ComponentConfigurationRepository::owner_survives(connection, &revision).await? {return Err(denied());}
+                        let authority = authority.ok_or_else(denied)?;
+                        let mut context = AuthorizationContext::new(authority.identity_id);
+                        context.target_id = Some(revision.owner_id);
+                        context.target_ref = Some(revision.owner_ref);
+                        context.pack_ref = Some(revision.pack_ref);
+                        let (resource, read) = if revision.owner_kind == "pack" {(Resource::Packs, Action::Read)} else {(Resource::Triggers, Action::Update)};
+                        for action in [read, Action::Decrypt] {if !authority.allows(resource, action, context.clone()) {return Err(denied());}}
+                    }
+                    if entity_type
+                        == crate::repositories::sensor_schema::ENTITY_SENSOR_RULE_DELIVERY_CONFIG
+                    {
+                        let (generation, _, _, _) = crate::repositories::sensor_schema::SensorSchemaRepository::find_delivery_owner(&mut *connection, entity_id)
+                            .await?.ok_or_else(denied)?;
+                        crate::repositories::sensor_schema::SensorSchemaRepository::find_by_binding_id(&mut *connection, generation).await?.ok_or_else(denied)?;
+                    }
+                    if matches!(entity_type.as_str(),
+                        crate::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_CONFIG
+                        | crate::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_RULE_CONFIG)
+                    {
+                        crate::repositories::sensor_schema::SensorSchemaRepository::find_by_binding_id(&mut *connection, entity_id)
+                            .await?.ok_or_else(denied)?;
+                    }
+                    if entity_type == crate::secret_values::ENTITY_EVENT_PAYLOAD {
+                        let owner = crate::repositories::event::EventRepository::find_by_id(
+                            &mut *connection,
+                            entity_id,
+                        )
+                        .await?
+                        .ok_or_else(denied)?;
+                        let binding =
+                            crate::repositories::event_schema::EventSchemaRepository::find(
+                                &mut *connection,
+                                entity_id,
+                            )
+                            .await?
+                            .ok_or_else(denied)?;
+                        if !binding.matches_owner(&owner) {
+                            return Err(denied());
+                        }
+                    }
                     let parent = parents
                         .iter()
                         .find(|parent| parent.json_path == path)
                         .ok_or_else(denied)?;
-                    check_parameter_origins(pool, authority, parent, visited, depth + 1).await?;
+                    check_parameter_origins(
+                        &mut *connection,
+                        authority,
+                        parent,
+                        visited,
+                        depth + 1,
+                    )
+                    .await?;
                     visited.remove(&(entity_type, entity_id, path));
                 }
                 SecretOrigin::Local { source_kind, .. } => {

@@ -72,6 +72,83 @@ pub struct IntegrationAccessProvenance {
 }
 
 impl Claims {
+    /// Parse recorded pack authority without downgrading malformed pack claims
+    /// to human delegation. The surrounding execution metadata must agree.
+    pub fn admitted_execution_credential(
+        &self,
+    ) -> Result<Option<crate::repositories::runtime_authority::RuntimeCredentialBinding>, JwtError>
+    {
+        let Some(metadata) = &self.metadata else {
+            return Ok(None);
+        };
+        let source = metadata
+            .get("authority_source")
+            .and_then(serde_json::Value::as_str);
+        let recorded = metadata.get("runtime_authority");
+        if metadata.get("authority_source").is_some()
+            && !matches!(source, Some("pack" | "human_delegation"))
+        {
+            return Err(JwtError::Invalid);
+        }
+        if source != Some("pack") && recorded.is_none() {
+            return Ok(None);
+        }
+        if self.token_type != TokenType::Execution || source != Some("pack") {
+            return Err(JwtError::Invalid);
+        }
+        let binding: crate::repositories::runtime_authority::RuntimeCredentialBinding =
+            serde_json::from_value(recorded.cloned().ok_or(JwtError::Invalid)?)
+                .map_err(|_| JwtError::Invalid)?;
+        if binding.execution_id <= 0
+            || binding.admission_id <= 0
+            || binding.sponsor_identity_id <= 0
+            || binding.attempt.is_nil()
+            || self.sub.parse::<i64>().ok() != Some(binding.sponsor_identity_id)
+            || metadata
+                .get("execution_id")
+                .and_then(serde_json::Value::as_i64)
+                != Some(binding.execution_id)
+            || metadata
+                .get("action_ref")
+                .and_then(serde_json::Value::as_str)
+                != Some(binding.action_ref.as_str())
+        {
+            return Err(JwtError::Invalid);
+        }
+        Ok(Some(binding))
+    }
+
+    pub fn admitted_permission_set_refs(&self) -> Result<Vec<String>, JwtError> {
+        if self.admitted_execution_credential()?.is_none() {
+            return Err(JwtError::Invalid);
+        }
+        let refs = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("permission_set_refs"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or(JwtError::Invalid)?;
+        let mut selected = Vec::new();
+        for reference in refs {
+            let reference = reference.as_str().ok_or(JwtError::Invalid)?;
+            if reference != STANDARD_EXECUTION_ACCESS_REF {
+                crate::schema::RefValidator::validate_component_ref(reference)
+                    .map_err(|_| JwtError::Invalid)?;
+            }
+            selected.push(reference.to_string());
+        }
+        let canonical: Vec<_> = selected
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if canonical.is_empty() || canonical != selected {
+            return Err(JwtError::Invalid);
+        }
+        Ok(selected)
+    }
+
     fn sensor_metadata_str(&self, key: &str) -> Result<&str, JwtError> {
         if self.token_type != TokenType::Sensor {
             return Err(JwtError::Invalid);
@@ -595,6 +672,7 @@ pub fn generate_execution_token_with_permission_sets_and_standard_access(
     let metadata = serde_json::json!({
         "execution_id": execution_id,
         "action_ref": action_ref,
+        "authority_source": "human_delegation",
         "permission_set_refs": permission_set_refs,
         "standard_access_action_refs": standard_access_action_refs,
         "standard_access_pack_refs": standard_access_pack_refs,
@@ -616,6 +694,51 @@ pub fn generate_execution_token_with_permission_sets_and_standard_access(
         &EncodingKey::from_secret(config.secret.as_bytes()),
     )
     .map_err(|e| JwtError::EncodeError(e.to_string()))
+}
+
+/// Mint only from an already persisted runtime admission and current attempt.
+/// The signing caller must use the record's selected refs, not human IAM refs.
+pub fn generate_admitted_execution_token(
+    binding: &crate::repositories::runtime_authority::RuntimeCredentialBinding,
+    selected_refs: &[String],
+    config: &JwtConfig,
+    ttl_seconds: Option<i64>,
+) -> Result<String, JwtError> {
+    let now = Utc::now();
+    let ttl = ttl_seconds.unwrap_or(360);
+    if ttl <= 0 {
+        return Err(JwtError::Invalid);
+    }
+    let expires = chrono::Duration::try_seconds(ttl)
+        .and_then(|ttl| now.checked_add_signed(ttl))
+        .ok_or(JwtError::Invalid)?;
+    let selected_refs: Vec<_> = selected_refs
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let claims = Claims {
+        sub: binding.sponsor_identity_id.to_string(),
+        login: format!("execution:{}", binding.execution_id),
+        iat: now.timestamp(),
+        exp: expires.timestamp(),
+        token_type: TokenType::Execution,
+        scope: Some("execution".into()),
+        metadata: Some(serde_json::json!({
+            "authority_source": "pack", "runtime_authority": binding,
+            "execution_id": binding.execution_id, "action_ref": binding.action_ref,
+            "permission_set_refs": selected_refs,
+        })),
+    };
+    claims.admitted_execution_credential()?;
+    claims.admitted_permission_set_refs()?;
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(config.secret.as_bytes()),
+    )
+    .map_err(|error| JwtError::EncodeError(error.to_string()))
 }
 
 /// Validate and decode a JWT token
@@ -655,6 +778,66 @@ mod tests {
             access_token_expiration: 3600,
             refresh_token_expiration: 604800,
         }
+    }
+
+    #[test]
+    fn recorded_execution_tokens_bind_subject_attempt_and_selection_without_human_iam() {
+        let config = test_config();
+        let binding = crate::repositories::runtime_authority::RuntimeCredentialBinding {
+            execution_id: 11,
+            admission_id: 22,
+            sponsor_identity_id: 33,
+            action_ref: "example.run".into(),
+            attempt: Uuid::new_v4(),
+        };
+        let token = generate_admitted_execution_token(
+            &binding,
+            &["standard".into(), "example.events".into()],
+            &config,
+            Some(60),
+        )
+        .unwrap();
+        let claims = validate_token(&token, &config).unwrap();
+        assert_eq!(
+            claims.admitted_execution_credential().unwrap(),
+            Some(binding.clone())
+        );
+        assert_eq!(
+            claims.admitted_permission_set_refs().unwrap(),
+            vec!["example.events", "standard"]
+        );
+        assert_eq!(claims.sub, "33");
+        let mut wrong_subject = claims.clone();
+        wrong_subject.sub = "44".into();
+        assert!(wrong_subject.admitted_execution_credential().is_err());
+        let mut downgraded = claims.clone();
+        downgraded.metadata.as_mut().unwrap()["authority_source"] =
+            serde_json::json!("human_delegation");
+        assert!(downgraded.admitted_execution_credential().is_err());
+        let mut missing = claims;
+        missing
+            .metadata
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_authority");
+        assert!(missing.admitted_execution_credential().is_err());
+        assert!(generate_admitted_execution_token(&binding, &[], &config, Some(60)).is_err());
+        assert!(generate_admitted_execution_token(
+            &binding,
+            &["standard".into()],
+            &config,
+            Some(0)
+        )
+        .is_err());
+        assert!(generate_admitted_execution_token(
+            &binding,
+            &["standard".into()],
+            &config,
+            Some(i64::MAX)
+        )
+        .is_err());
     }
 
     #[test]

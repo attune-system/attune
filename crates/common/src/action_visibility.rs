@@ -64,7 +64,7 @@ pub fn ensure_action_reference_allowed(
 
     let referencing_pack = referencing_pack_ref.unwrap_or("<no pack>");
     Err(Error::validation(format!(
-        "{} '{}' in pack '{}' cannot reference action '{}' because the action is {:?} to pack '{}'",
+        "{} '{}' in pack '{}' cannot reference action '{}' because the action is {} to pack '{}'",
         component_kind,
         component_ref,
         referencing_pack,
@@ -87,7 +87,7 @@ pub fn ensure_trigger_reference_allowed(
     let referencing_pack = referencing_pack_ref.unwrap_or("<no pack>");
     let owner_pack = trigger.pack_ref.as_deref().unwrap_or("<no pack>");
     Err(Error::validation(format!(
-        "{} '{}' in pack '{}' cannot subscribe to trigger '{}' because the trigger is {:?} to pack '{}'",
+        "{} '{}' in pack '{}' cannot subscribe to trigger '{}' because the trigger is {} to pack '{}'",
         component_kind,
         component_ref,
         referencing_pack,
@@ -110,7 +110,7 @@ pub fn ensure_queue_reference_allowed(
     let referencing_pack = referencing_pack_ref.unwrap_or("<no pack>");
     let owner_pack = queue.pack_ref.as_deref().unwrap_or("<no pack>");
     Err(Error::validation(format!(
-        "{} '{}' in pack '{}' cannot target queue '{}' because the queue is {:?} to pack '{}'",
+        "{} '{}' in pack '{}' cannot target queue '{}' because the queue is {} to pack '{}'",
         component_kind,
         component_ref,
         referencing_pack,
@@ -126,6 +126,28 @@ pub fn collect_workflow_action_refs(workflow: &WorkflowDefinition) -> Vec<String
         collect_task_action_refs(task, &mut refs);
     }
     refs.into_iter().collect()
+}
+
+/// Retain each use location even when a target appears in multiple tasks.
+pub fn collect_workflow_action_uses(workflow: &WorkflowDefinition) -> Vec<(String, String)> {
+    fn visit(tasks: &[Task], base: &str, uses: &mut Vec<(String, String)>) {
+        for (index, task) in tasks.iter().enumerate() {
+            let path = format!("{base}/tasks/{index}");
+            if let Some(action) = task
+                .action
+                .as_deref()
+                .filter(|action| !action.trim().is_empty())
+            {
+                uses.push((action.trim().into(), format!("{path}/action")));
+            }
+            if let Some(tasks) = &task.tasks {
+                visit(tasks, &path, uses);
+            }
+        }
+    }
+    let mut uses = Vec::new();
+    visit(&workflow.tasks, "", &mut uses);
+    uses
 }
 
 fn collect_task_action_refs(task: &Task, refs: &mut BTreeSet<String>) {
@@ -205,6 +227,7 @@ mod tests {
             enabled_override: None,
             param_schema: None,
             out_schema: None,
+            event_config_schema: None,
             webhook_enabled: false,
             webhook_key: None,
             webhook_config: None,

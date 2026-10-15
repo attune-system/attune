@@ -28,20 +28,46 @@ impl PackRetentionRepository {
         limit: i64,
     ) -> Result<PackRetentionResult> {
         let mut tx = pool.begin().await?;
+        super::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx).await?;
+        // Retained runtime owners keep historical authority even after completion
+        // or revocation. Only dormant revisions outside the rollback window can go.
+        sqlx::query(
+            "WITH ranked AS ( \
+                 SELECT id, row_number() OVER (PARTITION BY pack ORDER BY inactive_since DESC, id DESC) AS position \
+                 FROM pack_release WHERE inactive_since IS NOT NULL \
+             ), dormant AS ( \
+                 SELECT p.id FROM pack_runtime_policy_revision p \
+                 JOIN pack_release r ON r.id = p.release JOIN ranked x ON x.id = r.id \
+                 WHERE r.inactive_since < $1 AND x.position > $2 \
+                   AND NOT EXISTS (SELECT 1 FROM pack active WHERE active.active_release = r.id) \
+                   AND NOT EXISTS (SELECT 1 FROM pack_runtime_policy_current c WHERE c.revision = p.id) \
+                   AND NOT EXISTS (SELECT 1 FROM runtime_authority_admission a WHERE a.policy_revision = p.id) \
+                 ORDER BY p.id FOR UPDATE OF p SKIP LOCKED LIMIT $3 \
+             ) DELETE FROM pack_runtime_policy_revision p USING dormant d WHERE p.id = d.id",
+        )
+        .bind(rollback_cutoff)
+        .bind(newest_inactive.max(0))
+        .bind(limit.max(1))
+        .execute(&mut *tx)
+        .await?;
         let candidate_ids: Vec<i64> = sqlx::query_scalar(
             "WITH ranked AS ( \
                  SELECT r.id, row_number() OVER (PARTITION BY r.pack ORDER BY r.inactive_since DESC, r.id DESC) AS position \
                  FROM pack_release r WHERE r.inactive_since IS NOT NULL \
              ) SELECT r.id FROM pack_release r JOIN ranked x ON x.id = r.id \
                  WHERE r.inactive_since < $1 AND x.position > $2 \
-                   AND NOT EXISTS (SELECT 1 FROM pack p WHERE p.active_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM pack p WHERE p.active_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM runtime_authority_release_dependency d WHERE d.release = r.id) \
                    AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.pack_release = r.id) \
                    AND NOT EXISTS (SELECT 1 FROM enforcement e WHERE e.pack_release = r.id) \
                    AND NOT EXISTS (SELECT 1 FROM work_queue_item q WHERE q.pack_release = r.id) \
-                    AND NOT EXISTS (SELECT 1 FROM sensor_workload s WHERE s.pack_release = r.id) \
+                     AND NOT EXISTS (SELECT 1 FROM sensor_workload s WHERE s.pack_release = r.id) \
+                     AND NOT EXISTS (SELECT 1 FROM sensor_generation_schema_binding b WHERE (b.binding->'executable'->'release'->>'id')::BIGINT = r.id) \
                     AND NOT EXISTS (SELECT 1 FROM execution e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
                     AND NOT EXISTS (SELECT 1 FROM enforcement e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
                     AND NOT EXISTS (SELECT 1 FROM work_queue_item q CROSS JOIN LATERAL jsonb_each(COALESCE(q.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM runtime_schema_binding b CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions', '{}'::jsonb)) child WHERE (child.value->'executable_snapshot'->'release'->>'id')::BIGINT = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM runtime_schema_binding b CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions', '{}'::jsonb)) child CROSS JOIN LATERAL jsonb_each(COALESCE(child.value->'executable_snapshot'->'pack_executables', '{}'::jsonb)) nested WHERE (nested.value->'release'->>'id')::BIGINT = r.id) \
                     AND NOT EXISTS (SELECT 1 FROM runtime c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
                     AND NOT EXISTS (SELECT 1 FROM runtime_version c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
                     AND NOT EXISTS (SELECT 1 FROM permission_set c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
@@ -64,13 +90,17 @@ impl PackRetentionRepository {
         let deleted_content: Vec<PackReleaseContent> = sqlx::query_as(
             "DELETE FROM pack_release r WHERE r.id = ANY($1) \
                AND NOT EXISTS (SELECT 1 FROM pack p WHERE p.active_release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM runtime_authority_release_dependency d WHERE d.release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.pack_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM enforcement e WHERE e.pack_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM work_queue_item q WHERE q.pack_release = r.id) \
-               AND NOT EXISTS (SELECT 1 FROM sensor_workload s WHERE s.pack_release = r.id) \
+                AND NOT EXISTS (SELECT 1 FROM sensor_workload s WHERE s.pack_release = r.id) \
+                AND NOT EXISTS (SELECT 1 FROM sensor_generation_schema_binding b WHERE (b.binding->'executable'->'release'->>'id')::BIGINT = r.id) \
                AND NOT EXISTS (SELECT 1 FROM execution e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
                AND NOT EXISTS (SELECT 1 FROM enforcement e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
                AND NOT EXISTS (SELECT 1 FROM work_queue_item q CROSS JOIN LATERAL jsonb_each(COALESCE(q.executable_snapshot->'pack_executables', '{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM runtime_schema_binding b CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions', '{}'::jsonb)) child WHERE (child.value->'executable_snapshot'->'release'->>'id')::BIGINT = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM runtime_schema_binding b CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions', '{}'::jsonb)) child CROSS JOIN LATERAL jsonb_each(COALESCE(child.value->'executable_snapshot'->'pack_executables', '{}'::jsonb)) nested WHERE (nested.value->'release'->>'id')::BIGINT = r.id) \
                AND NOT EXISTS (SELECT 1 FROM runtime c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM runtime_version c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM permission_set c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \

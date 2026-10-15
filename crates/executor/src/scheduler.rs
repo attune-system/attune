@@ -59,8 +59,7 @@ use attune_common::{
         worker_matches_all_placements, worker_taints_from_capabilities, WorkerPlacement,
     },
     secret_values::{
-        merge_schema_secret_redactions, prepare_secret_values, redacted_paths,
-        restore_secret_values, validate_secret_destination_paths, JsonPointer, RenderedJson,
+        prepare_secret_values, redacted_paths, restore_secret_values, JsonPointer, RenderedJson,
         SecretPathSource, SecretSource, SecretValueInput, ENTITY_EXECUTION_CONFIG,
         ENTITY_EXECUTION_RESULT,
     },
@@ -270,6 +269,53 @@ fn apply_param_defaults(params: JsonValue, param_schema: &Option<JsonValue>) -> 
     JsonValue::Object(obj)
 }
 
+async fn workflow_parameters_for_execution<'e, E>(
+    executor: E,
+    execution_id: i64,
+    parameters: JsonValue,
+    legacy_schema: &Option<JsonValue>,
+) -> Result<JsonValue>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    use attune_common::repositories::schema_contract::{BindingOwner, SchemaContractRepository};
+    if let Some(binding) = SchemaContractRepository::find_with_executor(
+        executor,
+        BindingOwner::Execution,
+        execution_id,
+    )
+    .await?
+    {
+        validate_bound_workflow_parameters(parameters, &binding)
+    } else {
+        Ok(apply_param_defaults(parameters, legacy_schema))
+    }
+}
+
+fn validate_bound_workflow_parameters(
+    parameters: JsonValue,
+    binding: &attune_common::repositories::schema_contract::ActionSchemaBinding,
+) -> Result<JsonValue> {
+    // Defaults/rendering were completed before persistence. Rebuilding a
+    // workflow validates restored plaintext under the same input contract.
+    attune_common::value_schema::CompiledContract::new(&binding.input)?.validate(&parameters)?;
+    Ok(parameters)
+}
+
+fn workflow_action_ref(template: &str, context: &WorkflowContext) -> Result<String> {
+    let rendered = context.render_json_with_sensitivity(&serde_json::json!(template))?;
+    if !rendered.secret_paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Workflow action selectors cannot contain secret values"
+        ));
+    }
+    let action_ref = rendered.value.as_str().ok_or_else(|| {
+        anyhow::anyhow!("Workflow action template must resolve to a component ref")
+    })?;
+    attune_common::schema::RefValidator::validate_component_ref(action_ref)?;
+    Ok(action_ref.to_owned())
+}
+
 /// Evaluate a workflow's `output_map` (if any) against the current
 /// `WorkflowContext`, producing a JSON object whose keys are the user-defined
 /// output names and whose values are the rendered template results.
@@ -365,6 +411,58 @@ fn build_workflow_result_payload(
             "succeeded": true,
         }),
     }
+}
+
+fn prepare_bound_workflow_output(
+    output: Option<&attune_common::value_schema::Contract>,
+    rendered: RenderedJson,
+) -> Result<(JsonValue, Vec<SecretValueInput>)> {
+    let mut result = build_workflow_result_payload(true, None, Some(rendered.value));
+    let Some(output) = output else {
+        return Ok(attune_common::secret_values::redact_secret_path_sources(
+            result,
+            &rendered.secret_path_sources,
+        ));
+    };
+    let contract = attune_common::value_schema::CompiledContract::new(output)?;
+    if let Err(error) = contract.validate(&result) {
+        result["output_validation_warning"] =
+            serde_json::json!({"code": error.code, "path": error.path});
+        if contract.declares_secrets() {
+            let mut origins = attune_common::secret_provenance::SecretProvenance::default();
+            for source in &rendered.secret_path_sources {
+                origins.merge(source.source.provenance());
+            }
+            if origins.origins.is_empty() {
+                origins.merge(
+                    SecretSource::ParameterSchema {
+                        path: String::new(),
+                    }
+                    .provenance(),
+                );
+            }
+            return Ok(attune_common::secret_values::redact_secret_path_sources(
+                result,
+                &[SecretPathSource {
+                    path: String::new(),
+                    source: SecretSource::Bound(origins),
+                }],
+            ));
+        }
+    }
+    if !contract.declares_secrets() {
+        return Ok(attune_common::secret_values::redact_secret_path_sources(
+            result,
+            &rendered.secret_path_sources,
+        ));
+    }
+    Ok(
+        attune_common::secret_values::merge_contract_secret_redactions(
+            result,
+            &rendered.secret_path_sources,
+            &contract,
+        )?,
+    )
 }
 
 fn workflow_result_view(result: &JsonValue) -> JsonValue {
@@ -1153,7 +1251,14 @@ impl ExecutionScheduler {
         // This mirrors what `process_workflow_execution` does for workflows
         // so that non-workflow executions also get missing parameters filled
         // in from the action's declared defaults.
-        let execution_config = {
+        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+            pool, attune_common::repositories::schema_contract::BindingOwner::Execution, execution.id,
+        ).await?;
+        let execution_config = if binding.is_some() {
+            // Stored parameters may contain encrypted markers. Do not traverse
+            // or default them again using a current schema.
+            execution.config.clone()
+        } else {
             let raw_config = execution.config.clone();
             let params = extract_workflow_params(&raw_config);
             let params_with_defaults = apply_param_defaults(params, &action.param_schema);
@@ -1594,6 +1699,10 @@ impl ExecutionScheduler {
                 CacheTransactionMode::PinMutation,
             )
             .await?;
+            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+                &mut transaction,
+            )
+            .await?;
             logger
                 .log_with_conn(
                     &mut transaction,
@@ -1661,7 +1770,13 @@ impl ExecutionScheduler {
         )
         .await?;
         let workflow_params = extract_workflow_params(&Some(restored_execution_config));
-        let workflow_params = apply_param_defaults(workflow_params, &workflow_def.param_schema);
+        let workflow_params = workflow_parameters_for_execution(
+            pool,
+            execution.id,
+            workflow_params,
+            &workflow_def.param_schema,
+        )
+        .await?;
         let mut wf_ctx = WorkflowContext::new(
             workflow_params,
             definition
@@ -1676,8 +1791,13 @@ impl ExecutionScheduler {
         );
         Self::mark_workflow_parameter_secret_sources(&wf_ctx, execution);
         wf_ctx.set_template_origin("workflow", &execution.action_ref);
-        Self::populate_workflow_pack_config(&mut *pool.acquire().await?, execution, &mut wf_ctx)
-            .await?;
+        Self::populate_workflow_pack_config(
+            &mut *pool.acquire().await?,
+            execution,
+            &mut wf_ctx,
+            encryption_key,
+        )
+        .await?;
 
         // For each entry-point task, create a child execution and dispatch it
         for entry_task_name in &graph.entry_points {
@@ -1838,6 +1958,10 @@ impl ExecutionScheduler {
             CacheTransactionMode::PinMutation,
         )
         .await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+            &mut transaction,
+        )
+        .await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(*workflow_execution_id)
             .execute(&mut *transaction)
@@ -1970,7 +2094,7 @@ impl ExecutionScheduler {
         parent_execution: &Execution,
         parent_execution_config: &JsonValue,
         task_node: &crate::workflow::graph::TaskNode,
-        task_action: &Action,
+        binding: &attune_common::repositories::schema_contract::ActionSchemaBinding,
         wf_ctx: &WorkflowContext,
     ) -> Result<RenderedWorkflowTaskInput> {
         let rendered =
@@ -2004,50 +2128,36 @@ impl ExecutionScheduler {
                     },
                 });
             }
-            parent_execution_config.clone()
+            if parent_execution.config.is_none() && parent_execution_config.is_null() {
+                serde_json::json!({})
+            } else {
+                parent_execution_config.clone()
+            }
         };
 
         let secret_paths = secret_path_sources
             .iter()
             .map(|source| source.path.clone())
             .collect::<Vec<_>>();
-        validate_secret_destination_paths(task_action.param_schema.as_ref(), &secret_paths)?;
-        let (redacted_input, secret_inputs) = merge_schema_secret_redactions(
-            rendered_value,
-            &secret_path_sources,
-            task_action.param_schema.as_ref(),
-        );
+        let contract = attune_common::value_schema::CompiledContract::new(&binding.input)?;
+        let rendered_value = contract.apply_defaults(&rendered_value)?;
+        contract.validate(&rendered_value)?;
+        attune_common::secret_values::validate_contract_secret_destination_paths(
+            &rendered_value,
+            &contract,
+            &secret_paths,
+        )?;
+        let (redacted_input, secret_inputs) =
+            attune_common::secret_values::merge_contract_secret_redactions(
+                rendered_value,
+                &secret_path_sources,
+                &contract,
+            )?;
 
         Ok(RenderedWorkflowTaskInput {
             value: redacted_input,
             secret_inputs,
         })
-    }
-
-    async fn persist_execution_config_secrets(
-        pool: &PgPool,
-        encryption_key: Option<&str>,
-        child_execution_id: i64,
-        secret_inputs: Vec<SecretValueInput>,
-    ) -> Result<()> {
-        if secret_inputs.is_empty() {
-            return Ok(());
-        }
-
-        let encryption_key = encryption_key.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot store secret workflow execution parameters without security.encryption_key"
-            )
-        })?;
-        let prepared = prepare_secret_values(secret_inputs, encryption_key)?;
-        ExecutionSecretValueRepository::upsert_many(
-            pool,
-            ENTITY_EXECUTION_CONFIG,
-            child_execution_id,
-            &prepared,
-        )
-        .await?;
-        Ok(())
     }
 
     async fn persist_execution_config_secrets_with_conn(
@@ -2148,6 +2258,37 @@ impl ExecutionScheduler {
         Ok((restored, sources))
     }
 
+    async fn resolve_child_task_input(
+        conn: &mut PgConnection,
+        parent: &Execution,
+        task: &crate::workflow::graph::TaskNode,
+        snapshot: &attune_common::models::ExecutionExecutableSnapshot,
+        context: &WorkflowContext,
+        encryption_key: Option<&str>,
+    ) -> Result<(
+        attune_common::repositories::schema_contract::ActionSchemaBinding,
+        RenderedWorkflowTaskInput,
+    )> {
+        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::workflow_child_binding(
+            &mut *conn, parent.id, snapshot,
+        ).await?;
+        let config = Self::restore_secret_entity(
+            &mut *conn,
+            encryption_key,
+            ENTITY_EXECUTION_CONFIG,
+            parent.id,
+            parent.config.clone().unwrap_or(JsonValue::Null),
+        )
+        .await?;
+        // Reuse graph admission on this connection. A queued exclusive cleanup
+        // lock can block a second connection's shared lock behind our own lock.
+        let context =
+            Self::bind_workflow_task_keys(&mut *conn, parent, task, context, encryption_key)
+                .await?;
+        let rendered = Self::render_workflow_task_input(parent, &config, task, &binding, &context)?;
+        Ok((binding, rendered))
+    }
+
     async fn bind_workflow_task_keys(
         conn: &mut PgConnection,
         parent: &Execution,
@@ -2160,16 +2301,15 @@ impl ExecutionScheduler {
             "workflow_task",
             &format!("{}/tasks/{}", parent.action_ref, task.name),
         );
-        Self::populate_workflow_pack_config(&mut *conn, parent, &mut context).await?;
+        Self::populate_workflow_pack_config(&mut *conn, parent, &mut context, encryption_key)
+            .await?;
         let refs = context.referenced_key_refs(&task.input)?;
         if !refs.is_empty() {
             let identity = parent.executor.ok_or_else(|| {
                 anyhow::anyhow!("Key resolution requires an explicit workflow executor")
             })?;
-            let authority = attune_common::delegation::DelegationAuthority::load_for_share(
-                &mut *conn, identity,
-            )
-            .await?;
+            let authority = attune_common::repositories::rule_authority::RuleAuthorityRepository::execution_input_authority(
+                &mut *conn, parent.id, Some(identity)).await?.ok_or_else(|| anyhow::anyhow!("Workflow input authority is unavailable"))?;
             let keys = attune_common::key_access::resolve_explicit_keys(
                 &mut *conn,
                 &authority,
@@ -2186,6 +2326,7 @@ impl ExecutionScheduler {
         conn: &mut PgConnection,
         parent: &Execution,
         context: &mut WorkflowContext,
+        encryption_key: Option<&str>,
     ) -> Result<()> {
         if let Some(action) = parent
             .executable_snapshot
@@ -2198,9 +2339,15 @@ impl ExecutionScheduler {
             )
             .await?
             {
-                let paths =
-                    attune_common::secret_values::secret_paths_from_schema(Some(&pack.conf_schema));
-                context.set_pack_config_with_secret_paths(pack.config, Some(pack.r#ref), &paths);
+                let authority = attune_common::repositories::rule_authority::RuleAuthorityRepository::execution_input_authority(
+                    &mut *conn, parent.id, parent.executor).await?;
+                let (values, paths, revision) = attune_common::repositories::component_configuration::ComponentConfigurationRepository::pack_template_values(
+                    conn, &pack, authority.as_ref(), encryption_key).await?;
+                if let Some(revision) = revision {
+                    context.set_bound_pack_config(values, revision, &paths);
+                } else {
+                    context.set_pack_config(values);
+                }
             }
         }
         Ok(())
@@ -2659,6 +2806,13 @@ impl ExecutionScheduler {
         parent: &Execution,
         action_ref: &str,
     ) -> Result<ExecutionExecutableSnapshot> {
+        if let Some(binding) = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+            pool, attune_common::repositories::schema_contract::BindingOwner::Execution, parent.id,
+        ).await? {
+            if let Some(selected) = binding.static_actions.get(action_ref) {
+                return serde_json::from_value(selected.executable_snapshot.clone()).map_err(Into::into);
+            }
+        }
         if let Some(snapshot) = Self::same_release_workflow_task_snapshot(parent, action_ref) {
             return Ok(snapshot);
         }
@@ -2675,6 +2829,13 @@ impl ExecutionScheduler {
         parent: &Execution,
         action_ref: &str,
     ) -> Result<ExecutionExecutableSnapshot> {
+        if let Some(binding) = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+            &mut *conn, attune_common::repositories::schema_contract::BindingOwner::Execution, parent.id,
+        ).await? {
+            if let Some(selected) = binding.static_actions.get(action_ref) {
+                return serde_json::from_value(selected.executable_snapshot.clone()).map_err(Into::into);
+            }
+        }
         if let Some(snapshot) = Self::same_release_workflow_task_snapshot(parent, action_ref) {
             return Ok(snapshot);
         }
@@ -2706,7 +2867,7 @@ impl ExecutionScheduler {
         triggered_by: Option<&str>,
     ) -> Result<()> {
         let action_ref: String = match &task_node.action {
-            Some(a) => a.clone(),
+            Some(a) => workflow_action_ref(a, wf_ctx)?,
             None => {
                 warn!(
                     "Workflow task '{}' has no action reference, skipping",
@@ -2764,29 +2925,16 @@ impl ExecutionScheduler {
         // -----------------------------------------------------------------
         // Render task input templates through the WorkflowContext
         // -----------------------------------------------------------------
-        let parent_execution_config = Self::restore_secret_entity(
-            pool,
-            encryption_key,
-            ENTITY_EXECUTION_CONFIG,
-            parent_execution.id,
-            parent_execution.config.clone().unwrap_or(JsonValue::Null),
-        )
-        .await?;
-        let task_context = Self::bind_workflow_task_keys(
-            &mut *pool.acquire().await?,
+        let mut child_transaction = pool.begin().await?;
+        let (child_binding, rendered_input) = Self::resolve_child_task_input(
+            &mut child_transaction,
             parent_execution,
             task_node,
+            &task_snapshot,
             wf_ctx,
             encryption_key,
         )
         .await?;
-        let rendered_input = Self::render_workflow_task_input(
-            parent_execution,
-            &parent_execution_config,
-            task_node,
-            &task_action,
-            &task_context,
-        )?;
         let task_config = if rendered_input.value.is_object()
             && !rendered_input.value.as_object().unwrap().is_empty()
         {
@@ -2830,56 +2978,66 @@ impl ExecutionScheduler {
 
         // Create child execution record, or reuse an existing one if another
         // scheduler/advance path already dispatched this workflow task.
-        let child_execution_result = ExecutionRepository::create_workflow_task_if_absent_pinned(
-            pool,
-            CreateExecutionInput {
-                action: Some(task_action.id),
-                action_ref: action_ref.clone(),
-                config: task_config,
-                env_vars: parent_execution.env_vars.clone(),
-                parent: Some(parent_execution.id),
-                enforcement: parent_execution.enforcement,
-                executor: parent_execution.executor,
-                permission_set_refs,
-                artifact_retention_policy: parent_execution
-                    .artifact_retention_policy
-                    .or(task_action.artifact_retention_policy),
-                artifact_retention_limit: parent_execution
-                    .artifact_retention_limit
-                    .or(task_action.artifact_retention_limit),
-                worker_selector,
-                worker_tolerations,
-                worker_affinity,
-                worker: None,
-                status: ExecutionStatus::Requested,
-                trace_tag: Self::workflow_task_trace_tag(task_node, parent_execution, wf_ctx)?,
-                timeout_seconds: Some(
-                    task_timeout_seconds
-                        .map(|seconds| seconds as i32)
-                        .or(task_action.timeout_seconds)
-                        .unwrap_or(
-                            attune_common::config::app_default_execution_timeout_seconds() as i32,
-                        ),
-                ),
-                result: None,
-                workflow_task: Some(workflow_task),
-            },
-            &task_snapshot,
-            *workflow_execution_id,
-            &task_node.name,
-            None,
-        )
-        .await?;
+        let child_execution_result =
+            ExecutionRepository::create_workflow_task_if_absent_pinned_with_conn(
+                &mut child_transaction,
+                CreateExecutionInput {
+                    action: Some(task_action.id),
+                    action_ref: action_ref.clone(),
+                    config: task_config,
+                    env_vars: parent_execution.env_vars.clone(),
+                    parent: Some(parent_execution.id),
+                    enforcement: parent_execution.enforcement,
+                    executor: parent_execution.executor,
+                    permission_set_refs,
+                    artifact_retention_policy: parent_execution
+                        .artifact_retention_policy
+                        .or(task_action.artifact_retention_policy),
+                    artifact_retention_limit: parent_execution
+                        .artifact_retention_limit
+                        .or(task_action.artifact_retention_limit),
+                    worker_selector,
+                    worker_tolerations,
+                    worker_affinity,
+                    worker: None,
+                    status: ExecutionStatus::Requested,
+                    trace_tag: Self::workflow_task_trace_tag(task_node, parent_execution, wf_ctx)?,
+                    timeout_seconds: Some(
+                        task_timeout_seconds
+                            .map(|seconds| seconds as i32)
+                            .or(task_action.timeout_seconds)
+                            .unwrap_or(
+                                attune_common::config::app_default_execution_timeout_seconds()
+                                    as i32,
+                            ),
+                    ),
+                    result: None,
+                    workflow_task: Some(workflow_task),
+                },
+                &task_snapshot,
+                *workflow_execution_id,
+                &task_node.name,
+                None,
+            )
+            .await?;
         let child_execution = child_execution_result.execution;
         if child_execution_result.created {
-            Self::persist_execution_config_secrets(
-                pool,
+            attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                &mut child_transaction,
+                attune_common::repositories::schema_contract::BindingOwner::Execution,
+                child_execution.id,
+                &child_binding,
+            )
+            .await?;
+            Self::persist_execution_config_secrets_with_conn(
+                &mut child_transaction,
                 encryption_key,
                 child_execution.id,
                 rendered_input.secret_inputs,
             )
             .await?;
         }
+        child_transaction.commit().await?;
 
         if child_execution_result.created {
             info!(
@@ -3005,8 +3163,20 @@ impl ExecutionScheduler {
         retry_metadata.timed_out = false;
 
         let original_execution = execution.original_execution.unwrap_or(execution.id);
+        let mut retry_transaction = pool.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+            &mut retry_transaction,
+        )
+        .await?;
+        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
+            &mut retry_transaction,
+            attune_common::repositories::schema_contract::BindingOwner::Execution,
+            execution.id,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Retry source is missing its schema binding"))?;
         let retry_execution = ExecutionRepository::create_retry(
-            pool,
+            &mut *retry_transaction,
             CreateExecutionInput {
                 action: execution.action,
                 action_ref: execution.action_ref.clone(),
@@ -3040,6 +3210,28 @@ impl ExecutionScheduler {
             original_execution,
         )
         .await?;
+        attune_common::repositories::rule_authority::RuleAuthorityRepository::copy_execution(
+            &mut retry_transaction,
+            execution.id,
+            retry_execution.id,
+        )
+        .await?;
+        attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+            &mut retry_transaction,
+            attune_common::repositories::schema_contract::BindingOwner::Execution,
+            retry_execution.id,
+            &binding,
+        )
+        .await?;
+        ExecutionSecretValueRepository::copy_entity(
+            &mut *retry_transaction,
+            ENTITY_EXECUTION_CONFIG,
+            execution.id,
+            ENTITY_EXECUTION_CONFIG,
+            retry_execution.id,
+        )
+        .await?;
+        retry_transaction.commit().await?;
 
         info!(
             "Scheduled retry execution {} for workflow task '{}' after {}s ({}/{})",
@@ -3148,6 +3340,15 @@ impl ExecutionScheduler {
                             &task_node.name,
                             snapshot,
                         );
+                        Self::restore_inquiry_wait_context(
+                            &mut *conn,
+                            &mut target_context,
+                            target,
+                            &task_node.name,
+                            parent_execution.executor,
+                            encryption_key,
+                        )
+                        .await?;
                     }
                     return Self::dispatch_workflow_task_with_conn(
                         conn,
@@ -3200,6 +3401,15 @@ impl ExecutionScheduler {
             let mut target_context = wf_ctx.clone();
             if let Some(snapshot) = wait.result {
                 Self::set_task_wait_context(&mut target_context, target, &task_node.name, snapshot);
+                Self::restore_inquiry_wait_context(
+                    &mut *conn,
+                    &mut target_context,
+                    target,
+                    &task_node.name,
+                    parent_execution.executor,
+                    encryption_key,
+                )
+                .await?;
             }
             return Self::dispatch_workflow_task_with_conn(
                 conn,
@@ -3226,6 +3436,15 @@ impl ExecutionScheduler {
                     &task_node.name,
                     snapshot.clone(),
                 );
+                Self::restore_inquiry_wait_context(
+                    &mut *conn,
+                    &mut target_context,
+                    target,
+                    &task_node.name,
+                    parent_execution.executor,
+                    encryption_key,
+                )
+                .await?;
                 Self::dispatch_workflow_task_with_conn(
                     conn,
                     round_robin_counter,
@@ -3377,6 +3596,8 @@ impl ExecutionScheduler {
         conn: &mut PgConnection,
         workflow_execution_id: i64,
         wf_ctx: &mut WorkflowContext,
+        executor: Option<i64>,
+        encryption_key: Option<&str>,
     ) -> Result<()> {
         let waits =
             WorkflowTaskWaitRepository::list_for_workflow(&mut *conn, workflow_execution_id)
@@ -3407,15 +3628,102 @@ impl ExecutionScheduler {
                             "timeout_at": inquiry.timeout_at,
                         }),
                     );
+                    Self::restore_inquiry_wait_context(
+                        &mut *conn,
+                        wf_ctx,
+                        target,
+                        &wait.task_name,
+                        executor,
+                        encryption_key,
+                    )
+                    .await?;
                     continue;
                 }
             }
             if wait.state != WorkflowTaskWaitState::Waiting {
                 if let Some(snapshot) = wait.result {
                     Self::set_task_wait_context(wf_ctx, target, &wait.task_name, snapshot);
+                    Self::restore_inquiry_wait_context(
+                        &mut *conn,
+                        wf_ctx,
+                        target,
+                        &wait.task_name,
+                        executor,
+                        encryption_key,
+                    )
+                    .await?;
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn restore_inquiry_wait_context(
+        connection: &mut PgConnection,
+        context: &mut WorkflowContext,
+        target: WorkflowTaskWaitTarget,
+        task_name: &str,
+        executor: Option<i64>,
+        encryption_key: Option<&str>,
+    ) -> Result<()> {
+        let WorkflowTaskWaitTarget::Inquiry(id) = target else {
+            return Ok(());
+        };
+        let Some(inquiry) = InquiryRepository::find_by_id(&mut *connection, id).await? else {
+            return Err(anyhow::anyhow!(
+                "Inquiry source is unavailable for workflow delivery"
+            ));
+        };
+        if inquiry.status != InquiryStatus::Responded {
+            return Ok(());
+        }
+        let stored = attune_common::repositories::inquiry_schema::InquirySchemaRepository::find(
+            &mut *connection,
+            id,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Inquiry is missing its original response contract"))?;
+        let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+            &mut *connection,
+            attune_common::secret_values::ENTITY_INQUIRY_RESPONSE,
+            id,
+        )
+        .await?;
+        let response = inquiry.response.unwrap_or(JsonValue::Null);
+        let response = if secrets.is_empty() {
+            response
+        } else {
+            attune_common::key_access::authorize_parameter_key_origins_with_conn(
+                &mut *connection,
+                executor,
+                &secrets,
+            )
+            .await?;
+            restore_secret_values(
+                response,
+                &secrets,
+                encryption_key
+                    .ok_or_else(|| anyhow::anyhow!("Inquiry response encryption is unavailable"))?,
+            )?
+        };
+        attune_common::value_schema::CompiledContract::new(&stored.binding.contract)?
+            .validate(&response)?;
+        context.set_inquiry(task_name, serde_json::json!({
+            "id": inquiry.id, "status": inquiry.status, "response": response, "assigned_to": inquiry.assigned_to,
+            "responded_by": inquiry.responded_by, "responded_at": inquiry.responded_at, "timeout_at": inquiry.timeout_at,
+        }));
+        let paths = secrets
+            .iter()
+            .map(|secret| secret.json_path.clone())
+            .collect::<Vec<_>>();
+        context.mark_secret_pointer_paths(
+            &format!("inquiry.{task_name}.response"),
+            &paths,
+            |path| SecretSource::InquiryResponse {
+                inquiry_id: id,
+                path: path.clone(),
+            },
+        );
         Ok(())
     }
 
@@ -3556,7 +3864,7 @@ impl ExecutionScheduler {
         pending_completions: &mut Vec<PendingExecutionCompleted>,
     ) -> Result<()> {
         let action_ref: String = match &task_node.action {
-            Some(a) => a.clone(),
+            Some(a) => workflow_action_ref(a, wf_ctx)?,
             None => {
                 warn!(
                     "Workflow task '{}' has no action reference, skipping",
@@ -3622,11 +3930,14 @@ impl ExecutionScheduler {
             encryption_key,
         )
         .await?;
+        let child_binding = attune_common::repositories::schema_contract::SchemaContractRepository::workflow_child_binding(
+            &mut *conn, parent_execution.id, &task_snapshot,
+        ).await?;
         let rendered_input = Self::render_workflow_task_input(
             parent_execution,
             &parent_execution_config,
             task_node,
-            &task_action,
+            &child_binding,
             &task_context,
         )?;
         let task_config: Option<JsonValue> = if rendered_input.value.is_object()
@@ -3713,6 +4024,13 @@ impl ExecutionScheduler {
             .await?;
         let child_execution = child_execution_result.execution;
         if child_execution_result.created {
+            attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                &mut *conn,
+                attune_common::repositories::schema_contract::BindingOwner::Execution,
+                child_execution.id,
+                &child_binding,
+            )
+            .await?;
             Self::persist_execution_config_secrets_with_conn(
                 &mut *conn,
                 encryption_key,
@@ -3766,6 +4084,8 @@ impl ExecutionScheduler {
     ) -> Result<()> {
         let mut tx = pool.begin().await?;
         CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+            .await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await?;
         let mut pending_messages = Vec::new();
         let mut pending_completions = Vec::new();
@@ -4170,6 +4490,18 @@ impl ExecutionScheduler {
         )
         .await?;
         let execution = result.execution;
+        if result.created {
+            let binding = attune_common::repositories::schema_contract::SchemaContractRepository::workflow_child_binding(
+                &mut *conn, parent_execution.id, task_snapshot,
+            ).await?;
+            attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                &mut *conn,
+                attune_common::repositories::schema_contract::BindingOwner::Execution,
+                execution.id,
+                &binding,
+            )
+            .await?;
+        }
         pending_completions.push(PendingExecutionCompleted {
             execution_id: execution.id,
             action_id: task_action.id,
@@ -4300,11 +4632,14 @@ impl ExecutionScheduler {
             )
             .await?;
             let batch_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
+            let child_binding = attune_common::repositories::schema_contract::SchemaContractRepository::workflow_child_binding(
+                &mut *conn, parent_execution.id, task_snapshot,
+            ).await?;
             let rendered_input = Self::render_workflow_task_input(
                 parent_execution,
                 &parent_execution_config,
                 task_node,
-                task_action,
+                &child_binding,
                 &item_ctx,
             )?;
             let task_config = if rendered_input.value.is_object()
@@ -4395,6 +4730,13 @@ impl ExecutionScheduler {
                 .await?;
             if child_result.created {
                 created_batches += 1;
+                attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                    &mut *conn,
+                    attune_common::repositories::schema_contract::BindingOwner::Execution,
+                    child_result.execution.id,
+                    &child_binding,
+                )
+                .await?;
                 Self::persist_execution_config_secrets_with_conn(
                     &mut *conn,
                     encryption_key,
@@ -4564,8 +4906,12 @@ impl ExecutionScheduler {
                 task_node.batch_size,
                 array_source,
             ));
+            let mut child_transaction = pool.begin().await?;
+            let child_binding = attune_common::repositories::schema_contract::SchemaContractRepository::workflow_child_binding(
+                &mut child_transaction, parent_execution.id, task_snapshot,
+            ).await?;
             let item_ctx = Self::bind_workflow_task_keys(
-                &mut *pool.acquire().await?,
+                &mut *child_transaction,
                 parent_execution,
                 task_node,
                 &item_ctx,
@@ -4585,7 +4931,7 @@ impl ExecutionScheduler {
                 parent_execution,
                 &parent_execution_config,
                 task_node,
-                task_action,
+                &child_binding,
                 &item_ctx,
             )?;
 
@@ -4632,8 +4978,8 @@ impl ExecutionScheduler {
             };
 
             let child_execution_result =
-                ExecutionRepository::create_workflow_task_if_absent_pinned(
-                    pool,
+                ExecutionRepository::create_workflow_task_if_absent_pinned_with_conn(
+                    &mut child_transaction,
                     CreateExecutionInput {
                         action: Some(task_action.id),
                         action_ref: action_ref.to_string(),
@@ -4679,14 +5025,22 @@ impl ExecutionScheduler {
                 .await?;
             let child_execution = child_execution_result.execution;
             if child_execution_result.created {
-                Self::persist_execution_config_secrets(
-                    pool,
+                attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                    &mut child_transaction,
+                    attune_common::repositories::schema_contract::BindingOwner::Execution,
+                    child_execution.id,
+                    &child_binding,
+                )
+                .await?;
+                Self::persist_execution_config_secrets_with_conn(
+                    &mut child_transaction,
                     encryption_key,
                     child_execution.id,
                     rendered_input.secret_inputs,
                 )
                 .await?;
             }
+            child_transaction.commit().await?;
 
             if child_execution_result.created {
                 info!(
@@ -4839,11 +5193,14 @@ impl ExecutionScheduler {
                 parent_execution.config.clone().unwrap_or(JsonValue::Null),
             )
             .await?;
+            let child_binding = attune_common::repositories::schema_contract::SchemaContractRepository::workflow_child_binding(
+                &mut *conn, parent_execution.id, task_snapshot,
+            ).await?;
             let rendered_input = Self::render_workflow_task_input(
                 parent_execution,
                 &parent_execution_config,
                 task_node,
-                task_action,
+                &child_binding,
                 &item_ctx,
             )?;
 
@@ -4935,6 +5292,13 @@ impl ExecutionScheduler {
                 .await?;
             let child_execution = child_execution_result.execution;
             if child_execution_result.created {
+                attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                    &mut *conn,
+                    attune_common::repositories::schema_contract::BindingOwner::Execution,
+                    child_execution.id,
+                    &child_binding,
+                )
+                .await?;
                 Self::persist_execution_config_secrets_with_conn(
                     &mut *conn,
                     encryption_key,
@@ -5364,6 +5728,10 @@ impl ExecutionScheduler {
                 CacheTransactionMode::PinMutation,
             )
             .await?;
+            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+                &mut transaction,
+            )
+            .await?;
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
                 .bind(wait.workflow_execution)
                 .execute(&mut *transaction)
@@ -5531,10 +5899,13 @@ impl ExecutionScheduler {
                 .await?;
                 task_results.insert(metadata.task_name.clone(), workflow_result_view(&result));
             }
-            let parameters = apply_param_defaults(
+            let parameters = workflow_parameters_for_execution(
+                &mut *transaction,
+                parent_execution.id,
                 extract_workflow_params(&Some(restored_parent_config)),
                 &workflow_def.param_schema,
-            );
+            )
+            .await?;
             let stored_variables = Self::restore_workflow_variables(
                 &mut transaction,
                 encryption_key,
@@ -5545,8 +5916,13 @@ impl ExecutionScheduler {
             let mut wf_ctx =
                 WorkflowContext::rebuild(parameters, &stored_variables.0, task_results);
             wf_ctx.set_template_origin("workflow", &parent_execution.action_ref);
-            Self::populate_workflow_pack_config(&mut transaction, &parent_execution, &mut wf_ctx)
-                .await?;
+            Self::populate_workflow_pack_config(
+                &mut transaction,
+                &parent_execution,
+                &mut wf_ctx,
+                encryption_key,
+            )
+            .await?;
             for (path, source) in stored_variables.1 {
                 wf_ctx.mark_secret_pointer_paths("workflow", &[path], |_| source.clone());
             }
@@ -5556,8 +5932,14 @@ impl ExecutionScheduler {
                 &child_executions,
                 workflow_execution.id,
             );
-            Self::populate_task_wait_context(&mut transaction, workflow_execution.id, &mut wf_ctx)
-                .await?;
+            Self::populate_task_wait_context(
+                &mut transaction,
+                workflow_execution.id,
+                &mut wf_ctx,
+                parent_execution.executor,
+                encryption_key,
+            )
+            .await?;
 
             let mut pending_messages = Vec::new();
             let mut pending_completions = Vec::new();
@@ -5650,6 +6032,10 @@ impl ExecutionScheduler {
             CacheEntryRepository::protect_transaction(
                 &mut lock_conn,
                 CacheTransactionMode::PinMutation,
+            )
+            .await?;
+            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+                &mut lock_conn,
             )
             .await?;
 
@@ -6229,7 +6615,13 @@ impl ExecutionScheduler {
         // results so that successor task inputs can be rendered.
         // -----------------------------------------------------------------
         let workflow_params = extract_workflow_params(&Some(restored_parent_config));
-        let workflow_params = apply_param_defaults(workflow_params, &workflow_def.param_schema);
+        let workflow_params = workflow_parameters_for_execution(
+            &mut *conn,
+            parent_execution.id,
+            workflow_params,
+            &workflow_def.param_schema,
+        )
+        .await?;
 
         let stored_variables = Self::restore_workflow_variables(
             &mut *conn,
@@ -6241,11 +6633,24 @@ impl ExecutionScheduler {
         let mut wf_ctx =
             WorkflowContext::rebuild(workflow_params, &stored_variables.0, task_results_map);
         wf_ctx.set_template_origin("workflow", &parent_execution.action_ref);
-        Self::populate_workflow_pack_config(&mut *conn, &parent_execution, &mut wf_ctx).await?;
+        Self::populate_workflow_pack_config(
+            &mut *conn,
+            &parent_execution,
+            &mut wf_ctx,
+            encryption_key,
+        )
+        .await?;
         for (path, source) in stored_variables.1 {
             wf_ctx.mark_secret_pointer_paths("workflow", &[path], |_| source.clone());
         }
-        Self::populate_task_wait_context(&mut *conn, workflow_execution_id, &mut wf_ctx).await?;
+        Self::populate_task_wait_context(
+            &mut *conn,
+            workflow_execution_id,
+            &mut wf_ctx,
+            parent_execution.executor,
+            encryption_key,
+        )
+        .await?;
         Self::mark_workflow_parameter_secret_sources(&wf_ctx, &parent_execution);
         Self::mark_workflow_task_result_secret_sources(
             &wf_ctx,
@@ -6698,23 +7103,32 @@ impl ExecutionScheduler {
             } else {
                 None
             };
-            let output_map_result = if let Some(rendered) = output_map_result {
-                let (value, secrets) = attune_common::secret_values::redact_secret_path_sources(
-                    rendered.value,
-                    &rendered.secret_path_sources,
-                );
-                if !secrets.is_empty() {
+            let output_map_result = if !has_failures {
+                let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+                    &mut *conn, attune_common::repositories::schema_contract::BindingOwner::Execution, parent_execution.id,
+                ).await?.ok_or_else(|| anyhow::anyhow!("Workflow is missing its output schema binding"))?;
+                let (value, secrets) = prepare_bound_workflow_output(
+                    binding.output.as_ref(),
+                    output_map_result.unwrap_or_else(|| RenderedJson::plain(serde_json::json!({}))),
+                )?;
+                if value.get("output_validation_warning").is_some() {
+                    warn!(execution_id = parent_execution.id, "Workflow output did not conform to its stored schema; successful status retained");
+                }
+                let prepared = if !secrets.is_empty() {
                     let key = encryption_key.ok_or_else(|| {
                         anyhow::anyhow!("Workflow output encryption is not configured")
                     })?;
-                    ExecutionSecretValueRepository::upsert_many_with_conn(
-                        &mut *conn,
-                        ENTITY_EXECUTION_RESULT,
-                        parent_execution.id,
-                        &prepare_secret_values(secrets, key)?,
-                    )
-                    .await?;
-                }
+                    prepare_secret_values(secrets, key)?
+                } else {
+                    Vec::new()
+                };
+                ExecutionSecretValueRepository::replace_entity_with_conn(
+                    &mut *conn,
+                    ENTITY_EXECUTION_RESULT,
+                    parent_execution.id,
+                    &prepared,
+                )
+                .await?;
                 Some(value)
             } else {
                 None
@@ -8054,6 +8468,86 @@ impl ExecutionScheduler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bound_workflow_outputs_keep_top_level_shape_and_redact_declared_secrets() {
+        let contract = attune_common::value_schema::compile_inline("test.workflow", attune_common::value_schema::SchemaContext::FlatDocument,
+            &serde_json::json!({"token": {"type": "string", "secret": true}, "count": {"type": "integer"}})).unwrap();
+        let (value, secrets) = prepare_bound_workflow_output(
+            Some(&contract),
+            RenderedJson::plain(serde_json::json!({"token": "workflow-private", "count": 1})),
+        )
+        .unwrap();
+        assert_eq!(value["succeeded"], true);
+        assert_eq!(value["count"], 1);
+        assert!(attune_common::secret_values::is_redaction_marker(
+            &value["token"]
+        ));
+        assert_eq!(secrets[0].json_path, "/token");
+        assert!(value.get("data").is_none());
+        let (value, secrets) = prepare_bound_workflow_output(
+            Some(&contract),
+            RenderedJson::plain(
+                serde_json::json!({"token": "workflow-private", "count": "invalid"}),
+            ),
+        )
+        .unwrap();
+        assert!(attune_common::secret_values::is_redaction_marker(&value));
+        assert_eq!(secrets[0].json_path, "");
+        assert_eq!(secrets[0].value["succeeded"], true);
+        assert!(secrets[0].value.get("output_validation_warning").is_some());
+        let (value, _) = prepare_bound_workflow_output(
+            None,
+            RenderedJson::plain(serde_json::json!({"count": "unrestricted"})),
+        )
+        .unwrap();
+        assert_eq!(value["count"], "unrestricted");
+    }
+
+    #[test]
+    fn bound_workflow_parameters_are_validated_without_new_defaults() {
+        use attune_common::value_schema::{
+            compile, Limits, RegistryView, SchemaContext, SourceIdentity,
+        };
+        let source = SourceIdentity::Released {
+            component_ref: "demo.action".into(),
+            release_id: 1,
+            release_digest: "a".repeat(64),
+        };
+        let input = compile(
+            source.clone(),
+            SchemaContext::FlatDocument,
+            &serde_json::json!({
+                "optional": {"type": "string", "default": "bound-default"},
+                "value": {"type": "integer", "required": true}
+            }),
+            &RegistryView::new(),
+            Limits::default(),
+        )
+        .unwrap();
+        let output = compile(
+            source,
+            SchemaContext::FlatDocument,
+            &serde_json::json!({}),
+            &RegistryView::new(),
+            Limits::default(),
+        )
+        .unwrap();
+        let binding = attune_common::repositories::schema_contract::ActionSchemaBinding {
+            input,
+            output: Some(output),
+            static_actions: Default::default(),
+        };
+        let parameters = serde_json::json!({"value": 7});
+        assert_eq!(
+            super::validate_bound_workflow_parameters(parameters.clone(), &binding).unwrap(),
+            parameters
+        );
+        assert!(super::validate_bound_workflow_parameters(
+            serde_json::json!({"value": "invalid"}),
+            &binding
+        )
+        .is_err());
+    }
     use super::*;
     use crate::workflow::graph::TaskNode;
     use attune_common::workflow::TaskType;
@@ -8097,6 +8591,39 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/cache_partition_ordering/mod.rs"
     ));
+
+    async fn create_bound_fixture_execution(
+        pool: &PgPool,
+        mut input: CreateExecutionInput,
+        snapshot: &ExecutionExecutableSnapshot,
+    ) -> Result<Execution> {
+        use attune_common::repositories::schema_contract::{
+            BindingOwner, SchemaContractRepository,
+        };
+        let mut transaction = pool.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+            &mut transaction,
+        )
+        .await?;
+        let binding =
+            SchemaContractRepository::materialize_action(&mut transaction, snapshot).await?;
+        let compiled = attune_common::value_schema::CompiledContract::new(&binding.input)?;
+        let values =
+            compiled.apply_defaults(input.config.as_ref().unwrap_or(&serde_json::json!({})))?;
+        compiled.validate(&values)?;
+        input.config = Some(values);
+        let execution =
+            ExecutionRepository::create_pinned(&mut *transaction, input, snapshot).await?;
+        SchemaContractRepository::attach(
+            &mut transaction,
+            BindingOwner::Execution,
+            execution.id,
+            &binding,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(execution)
+    }
 
     struct InquirySchedulerFixture {
         database: TestDatabase,
@@ -8364,7 +8891,7 @@ tasks:
                 },
                 pack_executables: pack_executables.clone(),
             };
-            let parent = ExecutionRepository::create_pinned(
+            let parent = create_bound_fixture_execution(
                 pool,
                 CreateExecutionInput {
                     action: Some(workflow_action.id),
@@ -8395,7 +8922,7 @@ tasks:
                 executable: executable(&request_action),
                 pack_executables,
             };
-            let request = ExecutionRepository::create_pinned(
+            let request = create_bound_fixture_execution(
                 pool,
                 CreateExecutionInput {
                     action: Some(request_action.id),
@@ -8503,7 +9030,7 @@ tasks:
                 .executable_snapshot
                 .as_ref()
                 .expect("request has executable snapshot");
-            ExecutionRepository::create_pinned(
+            create_bound_fixture_execution(
                 self.database.pool(),
                 CreateExecutionInput {
                     action: self.request.action,
@@ -8636,6 +9163,110 @@ tasks:
     }
 
     #[tokio::test]
+    async fn empty_workflow_child_input_uses_empty_map_for_absent_parent_config() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let pool = fixture.database.pool();
+        let mut task = fixture.guarded_task.clone();
+        task.input = serde_json::json!({});
+        let snapshot = ExecutionScheduler::workflow_task_snapshot(
+            pool,
+            &fixture.parent,
+            task.action.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::workflow_child_binding(
+            &mut tx, fixture.parent.id, &snapshot).await.unwrap();
+        let mut parent = fixture.parent.clone();
+        parent.config = None;
+        let absent = ExecutionScheduler::render_workflow_task_input(
+            &parent,
+            &JsonValue::Null,
+            &task,
+            &binding,
+            &fixture.context,
+        );
+        parent.config = Some(JsonValue::Null);
+        let explicit_null = ExecutionScheduler::render_workflow_task_input(
+            &parent,
+            &JsonValue::Null,
+            &task,
+            &binding,
+            &fixture.context,
+        );
+        tx.rollback().await.unwrap();
+        fixture.database.cleanup().await.unwrap();
+        assert_eq!(
+            absent
+                .expect("absent flat parameters are an empty map")
+                .value,
+            serde_json::json!({})
+        );
+        assert!(
+            explicit_null.is_err(),
+            "explicit null must still fail flat-object validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_input_resolution_does_not_wait_for_queued_schema_reclamation() {
+        use attune_common::repositories::schema_type::SchemaTypeRepository;
+        let fixture = InquirySchedulerFixture::create().await;
+        let pool = fixture.database.pool();
+        let task = &fixture.guarded_task;
+        let snapshot = ExecutionScheduler::workflow_task_snapshot(
+            pool,
+            &fixture.parent,
+            task.action.as_deref().expect("fixture task action"),
+        )
+        .await
+        .unwrap();
+        let mut child = pool.begin().await.unwrap();
+        SchemaTypeRepository::lock_selection(&mut child)
+            .await
+            .unwrap();
+        let mut cleanup = pool.begin().await.unwrap();
+        let cleanup_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *cleanup)
+            .await
+            .unwrap();
+        let cleanup_task = tokio::spawn(async move {
+            SchemaTypeRepository::lock_reclamation(&mut cleanup)
+                .await
+                .unwrap();
+            cleanup.rollback().await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)")
+                    .bind(cleanup_pid).fetch_one(pool).await.unwrap();
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("reclamation must be queued behind child admission");
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(5),
+            ExecutionScheduler::resolve_child_task_input(
+                &mut child,
+                &fixture.parent,
+                task,
+                &snapshot,
+                &fixture.context,
+                None,
+            ),
+        )
+        .await;
+        child.rollback().await.unwrap();
+        cleanup_task.await.unwrap();
+        fixture.database.cleanup().await.unwrap();
+        resolved
+            .expect("child input resolution must reuse its admitted connection")
+            .expect("resolve fixture task input");
+    }
+
+    #[tokio::test]
     async fn rendered_workflow_permissions_cannot_exceed_executor_authority_in_single_or_fanout_tasks(
     ) {
         use attune_common::repositories::identity::{
@@ -8674,7 +9305,7 @@ tasks:
             .as_ref()
             .expect("parent snapshot");
         let parameters = serde_json::json!({"refs":["fixture.sensitive"], "items":[{"refs":["fixture.sensitive"]}]});
-        let parent = ExecutionRepository::create_pinned(
+        let parent = create_bound_fixture_execution(
             pool,
             CreateExecutionInput {
                 action: fixture.parent.action,

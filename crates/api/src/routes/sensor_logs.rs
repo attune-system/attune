@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use attune_common::blob_store::{
-    body_from_file, BlobReader, ByteRange, ObjectKey, ProviderVersion,
+    body_from_file, BlobReader, BlobStoreError, ByteRange, ObjectKey, ProviderVersion,
 };
 use futures::{stream, StreamExt, TryStreamExt};
 
@@ -151,7 +151,7 @@ pub(crate) async fn get_sensor_log(
     );
 
     if let Some(tail) = query.tail.filter(|tail| *tail > 0) {
-        let content = read_sensor_log_tail(&state, artifact.id, &sensor_ref, &stream, tail).await?;
+        let content = read_sensor_log_tail(&state, &user, artifact.id, &sensor_ref, tail).await?;
         return Ok((
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             Body::from(content),
@@ -159,7 +159,7 @@ pub(crate) async fn get_sensor_log(
             .into_response());
     }
 
-    let reader = stream_sensor_log(&state, artifact.id, &sensor_ref, &stream).await?;
+    let reader = stream_sensor_log(&state, &user, artifact.id, &sensor_ref).await?;
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         Body::from_stream(reader),
@@ -185,10 +185,10 @@ async fn ensure_visible_sensor(
 }
 
 async fn stream_sensor_log(
-    state: &AppState,
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
     artifact_id: i64,
     sensor_ref: &str,
-    stream: &str,
 ) -> ApiResult<BlobReader> {
     let mut versions = ArtifactVersionRepository::list_by_artifact(&state.db, artifact_id).await?;
     versions.retain(|version| version.file_path.is_some());
@@ -196,40 +196,93 @@ async fn stream_sensor_log(
 
     let mut readers = Vec::new();
     for version in versions {
-        if let Some(log_stream) =
+        crate::secret_disclosure::authorize_sensor_runtime_log(state, user, version.id, sensor_ref)
+            .await?;
+        let reader = if let Some(log_stream) =
             LogStreamRepository::find_by_artifact_version(&state.db, version.id).await?
         {
-            readers.push(
+            Some(
                 super::internal_files::stream_log_stream(state, log_stream.id, None)
                     .await
                     .map_err(|error| ApiError::InternalServerError(error.to_string()))?,
-            );
+            )
         } else if let Some(file_path) = version.file_path {
             let path = std::path::Path::new(&state.config.artifacts_dir).join(file_path);
             match body_from_file(&path).await {
-                Ok(reader) => readers.push(reader),
+                Ok(reader) => Some(reader),
                 Err(error) => {
-                    warn!(path = %path.display(), %error, "Skipping unreadable sensor log")
+                    warn!(path = %path.display(), %error, "Skipping unreadable sensor log");
+                    None
                 }
             }
-        }
-    }
-
-    if readers.is_empty() {
-        let path = legacy_sensor_log_path(&state.config.artifacts_dir, sensor_ref, stream);
-        if let Ok(reader) = body_from_file(&path).await {
-            readers.push(reader);
+        } else {
+            None
+        };
+        if let Some(reader) = reader {
+            readers.push(guard_sensor_log_reader(
+                state.clone(),
+                user.clone(),
+                version.id,
+                sensor_ref.to_owned(),
+                reader,
+            ));
         }
     }
 
     Ok(stream::iter(readers).flatten().boxed())
 }
 
+fn guard_sensor_log_reader(
+    state: Arc<AppState>,
+    user: AuthenticatedUser,
+    version: i64,
+    sensor_ref: String,
+    reader: BlobReader,
+) -> BlobReader {
+    stream::try_unfold(reader, move |mut reader| {
+        let state = state.clone();
+        let user = user.clone();
+        let sensor_ref = sensor_ref.clone();
+        async move {
+            let Some(chunk) = reader.next().await else {
+                return Ok(None);
+            };
+            let chunk = chunk?;
+            // Read bytes before checking authority. SDK reads record their origins
+            // before returning plaintext, so a new log chunk cannot race ahead of
+            // the corresponding disclosure check.
+            let allowed = async {
+                if user.claims.exp <= chrono::Utc::now().timestamp() {
+                    return Err(ApiError::Forbidden(
+                        "Log stream credentials have expired".into(),
+                    ));
+                }
+                ensure_visible_sensor(&state, &user, &sensor_ref).await?;
+                crate::secret_disclosure::authorize_sensor_runtime_log(
+                    &state,
+                    &user,
+                    version,
+                    &sensor_ref,
+                )
+                .await
+            }
+            .await;
+            if allowed.is_err() {
+                return Err(BlobStoreError::Interrupted(
+                    "Sensor log disclosure authority is unavailable".into(),
+                ));
+            }
+            Ok(Some((chunk, reader)))
+        }
+    })
+    .boxed()
+}
+
 async fn read_sensor_log_tail(
-    state: &AppState,
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
     artifact_id: i64,
     sensor_ref: &str,
-    stream_name: &str,
     tail: usize,
 ) -> ApiResult<String> {
     let versions = ArtifactVersionRepository::list_by_artifact(&state.db, artifact_id).await?;
@@ -241,6 +294,8 @@ async fn read_sensor_log_tail(
         if bytes >= SENSOR_LOG_TAIL_MAX_BYTES || newlines > tail {
             break;
         }
+        crate::secret_disclosure::authorize_sensor_runtime_log(state, user, version.id, sensor_ref)
+            .await?;
         let remaining = SENSOR_LOG_TAIL_MAX_BYTES - bytes;
         let chunk = if let Some(log_stream) =
             LogStreamRepository::find_by_artifact_version(&state.db, version.id).await?
@@ -255,6 +310,9 @@ async fn read_sensor_log_tail(
         } else {
             Vec::new()
         };
+        crate::secret_disclosure::authorize_sensor_runtime_log(state, user, version.id, sensor_ref)
+            .await?;
+        ensure_visible_sensor(state, user, sensor_ref).await?;
         bytes += chunk.len();
         newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
         if !chunk.is_empty() {
@@ -262,15 +320,6 @@ async fn read_sensor_log_tail(
         }
     }
 
-    if newest_chunks.is_empty() {
-        newest_chunks.push(
-            read_file_tail(
-                &legacy_sensor_log_path(&state.config.artifacts_dir, sensor_ref, stream_name),
-                SENSOR_LOG_TAIL_MAX_BYTES,
-            )
-            .await?,
-        );
-    }
     newest_chunks.reverse();
     let content = newest_chunks.concat();
     let text = String::from_utf8_lossy(&content);
@@ -357,15 +406,4 @@ async fn read_file_tail(path: &std::path::Path, max_bytes: usize) -> ApiResult<V
         .await
         .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
     Ok(bytes)
-}
-
-fn legacy_sensor_log_path(
-    artifacts_dir: &str,
-    sensor_ref: &str,
-    stream: &str,
-) -> std::path::PathBuf {
-    std::path::Path::new(artifacts_dir)
-        .join("sensors")
-        .join(sensor_ref)
-        .join(format!("{stream}.log"))
 }

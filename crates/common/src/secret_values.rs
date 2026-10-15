@@ -12,6 +12,9 @@ pub const ENTITY_WORKFLOW_VARIABLES: &str = "workflow_variables";
 pub const ENTITY_ENFORCEMENT_CONFIG: &str = "enforcement_config";
 pub const ENTITY_EVENT_PAYLOAD: &str = "event_payload";
 pub const ENTITY_EVENT_CONFIG: &str = "event_config";
+pub const ENTITY_QUEUE_ITEM_PAYLOAD: &str = "queue_item_payload";
+pub const ENTITY_INQUIRY_OPTIONS: &str = "inquiry_options";
+pub const ENTITY_INQUIRY_RESPONSE: &str = "inquiry_response";
 
 pub type JsonPointer = String;
 
@@ -34,7 +37,17 @@ pub enum SecretSource {
         execution_id: i64,
         path: JsonPointer,
     },
+    InquiryResponse {
+        inquiry_id: i64,
+        path: JsonPointer,
+    },
+    EventPayload {
+        event_id: i64,
+        path: JsonPointer,
+    },
     QueueItem {
+        queue_id: i64,
+        pack_ref: Option<String>,
         queue_ref: Option<String>,
         item_id: Option<i64>,
         path: JsonPointer,
@@ -70,6 +83,38 @@ impl SecretSource {
                 }],
                 templates: Vec::new(),
             },
+            SecretSource::InquiryResponse { inquiry_id, path } => SecretProvenance {
+                origins: vec![SecretOrigin::Entity {
+                    entity_type: ENTITY_INQUIRY_RESPONSE.into(),
+                    entity_id: *inquiry_id,
+                    path: path.clone(),
+                }],
+                templates: Vec::new(),
+            },
+            SecretSource::EventPayload { event_id, path } => SecretProvenance {
+                origins: vec![SecretOrigin::Entity {
+                    entity_type: ENTITY_EVENT_PAYLOAD.into(),
+                    entity_id: *event_id,
+                    path: path.clone(),
+                }],
+                templates: Vec::new(),
+            },
+            SecretSource::QueueItem {
+                queue_id,
+                queue_ref: Some(queue_ref),
+                pack_ref,
+                item_id: Some(item_id),
+                path,
+            } => SecretProvenance {
+                origins: vec![SecretOrigin::QueueItem {
+                    queue_id: *queue_id,
+                    queue_ref: queue_ref.clone(),
+                    pack_ref: pack_ref.clone(),
+                    item_id: *item_id,
+                    path: path.clone(),
+                }],
+                templates: Vec::new(),
+            },
             _ => SecretProvenance {
                 origins: vec![SecretOrigin::Local {
                     source_kind: self.source_kind().into(),
@@ -87,6 +132,8 @@ impl SecretSource {
             SecretSource::Keystore { .. } => "keystore",
             SecretSource::ExecutionResult { .. } => "execution_result",
             SecretSource::WorkflowParameter { .. } => "workflow_parameter",
+            SecretSource::InquiryResponse { .. } => "inquiry_response",
+            SecretSource::EventPayload { .. } => "event_payload",
             SecretSource::QueueItem { .. } => "queue_item",
             SecretSource::ParameterSchema { .. } => "parameter_schema",
             SecretSource::TriggerSchema { .. } => "trigger_schema",
@@ -110,10 +157,15 @@ impl SecretSource {
             SecretSource::WorkflowParameter { execution_id, path } => {
                 Some(format!("{execution_id}:{path}"))
             }
+            SecretSource::InquiryResponse { inquiry_id, path } => {
+                Some(format!("{inquiry_id}:{path}"))
+            }
+            SecretSource::EventPayload { event_id, path } => Some(format!("{event_id}:{path}")),
             SecretSource::QueueItem {
                 queue_ref,
                 item_id,
                 path,
+                ..
             } => Some(format!(
                 "{}:{}:{path}",
                 queue_ref.as_deref().unwrap_or(""),
@@ -194,6 +246,29 @@ pub fn is_redaction_marker(value: &JsonValue) -> bool {
     value
         .as_object()
         .is_some_and(|obj| obj.get("$attune_secret").and_then(JsonValue::as_bool) == Some(true))
+}
+
+/// Metadata-only responses must never expose an unbound author's configuration.
+/// A retained revision can replace this conservative projection at the API boundary.
+pub fn configuration_metadata_projection(
+    reference: &str,
+    schema: &JsonValue,
+    value: JsonValue,
+) -> JsonValue {
+    let contract = crate::value_schema::compile_inline(
+        reference,
+        crate::value_schema::SchemaContext::FlatDocument,
+        schema,
+    );
+    let Ok(contract) = contract else {
+        return redaction_marker();
+    };
+    let Ok(compiled) = crate::value_schema::CompiledContract::new(&contract) else {
+        return redaction_marker();
+    };
+    merge_contract_secret_redactions(value, &[], &compiled)
+        .map(|(public, _)| public)
+        .unwrap_or_else(|_| redaction_marker())
 }
 
 pub fn redact_secret_parameters(
@@ -314,7 +389,10 @@ fn provenance_for_path(
     let mut provenance = SecretProvenance::default();
     for source in sources
         .iter()
-        .filter(|source| pointer_suffix(&source.path, path).is_some())
+        .filter(|source| {
+            pointer_suffix(&source.path, path).is_some()
+                || pointer_suffix(path, &source.path).is_some()
+        })
         .map(|source| &source.source)
     {
         let next = match source {
@@ -348,10 +426,216 @@ fn provenance_for_path(
     provenance
 }
 
+/// Output conformance is advisory. Secrets are not: malformed sensitive output
+/// is encrypted as a whole rather than trusting traversal of an invalid shape.
+pub fn redact_bound_action_result(
+    mut result: JsonValue,
+    output: Option<&crate::value_schema::Contract>,
+    format: crate::models::OutputFormat,
+    execution_id: i64,
+    parameter_secret_paths: &[String],
+    runtime_key_origins: &[crate::secret_provenance::KeyOrigin],
+) -> Result<(JsonValue, Vec<SecretValueInput>)> {
+    use crate::secret_provenance::{SecretOrigin, SecretProvenance};
+    use crate::value_schema::{CompiledContract, ErrorCode, SchemaError};
+    let contract = output
+        .map(CompiledContract::new)
+        .transpose()
+        .map_err(|error| Error::validation(format!("Invalid bound output contract: {error}")))?;
+    let declared_sensitive = contract
+        .as_ref()
+        .is_some_and(CompiledContract::declares_secrets);
+    let inherited = SecretProvenance {
+        origins: parameter_secret_paths
+            .iter()
+            .map(|path| SecretOrigin::Entity {
+                entity_type: ENTITY_EXECUTION_CONFIG.into(),
+                entity_id: execution_id,
+                path: path.clone(),
+            })
+            .chain(runtime_key_origins.iter().cloned().map(SecretOrigin::Key))
+            .collect(),
+        templates: Vec::new(),
+    };
+    let local_origin = |path: &str| {
+        if inherited.origins.is_empty() {
+            SecretSource::ParameterSchema { path: path.into() }.provenance()
+        } else {
+            inherited.clone()
+        }
+    };
+    let mut secrets = Vec::new();
+    if let Some(contract) = &contract {
+        let absent = JsonValue::Null;
+        let data = result.get("data").unwrap_or(&absent);
+        let validation = if format == crate::models::OutputFormat::Jsonl {
+            match data.as_array() {
+                Some(records) if records.len() <= output.unwrap().limits.max_literal_checks => {
+                    records
+                        .iter()
+                        .try_for_each(|record| contract.validate(record))
+                }
+                Some(_) => Err(SchemaError {
+                    code: ErrorCode::ResourceLimit,
+                    path: "/data".into(),
+                    source_ref: None,
+                    reference_chain: Vec::new(),
+                }),
+                None => Err(SchemaError {
+                    code: ErrorCode::InvalidValue,
+                    path: "/data".into(),
+                    source_ref: None,
+                    reference_chain: Vec::new(),
+                }),
+            }
+        } else {
+            contract.validate(data)
+        };
+        let invalid = validation.is_err();
+        if result.get("succeeded") == Some(&JsonValue::Bool(true)) {
+            if let Err(error) = validation {
+                result["output_validation_warning"] =
+                    serde_json::json!({"code": error.code, "path": error.path});
+            }
+        }
+        if let Some(data) = result.get("data").filter(|_| declared_sensitive).cloned() {
+            if declared_sensitive && invalid {
+                secrets.push(SecretValueInput {
+                    json_path: "/data".into(),
+                    value: data,
+                    source_kind: "provenance".into(),
+                    source_ref: Some(
+                        serde_json::to_string(&local_origin("/data"))
+                            .expect("serializable provenance"),
+                    ),
+                });
+                result["data"] = redaction_marker();
+            } else {
+                let redact_record = |value: JsonValue,
+                                     prefix: &str|
+                 -> Result<(JsonValue, Vec<SecretValueInput>)> {
+                    let (value, mut inputs) =
+                        merge_contract_secret_redactions(value, &[], contract)?;
+                    for input in &mut inputs {
+                        input.json_path = format!("{prefix}{}", input.json_path);
+                        if !inherited.origins.is_empty() {
+                            input.source_ref = Some(
+                                serde_json::to_string(&inherited).expect("serializable provenance"),
+                            );
+                        }
+                    }
+                    Ok((value, inputs))
+                };
+                if format == crate::models::OutputFormat::Jsonl {
+                    if let Some(records) = data.as_array() {
+                        let mut redacted = Vec::with_capacity(records.len());
+                        for (index, record) in records.iter().enumerate() {
+                            let (value, inputs) =
+                                redact_record(record.clone(), &format!("/data/{index}"))?;
+                            redacted.push(value);
+                            secrets.extend(inputs);
+                        }
+                        result["data"] = JsonValue::Array(redacted);
+                    }
+                } else {
+                    let (value, inputs) = redact_record(data, "/data")?;
+                    result["data"] = value;
+                    secrets.extend(inputs);
+                }
+            }
+        }
+    }
+    // The queue acknowledgement is a duplicate of structured action output.
+    // It cannot bypass encryption when the original path was sensitive.
+    let acknowledgement_paths = secrets
+        .iter()
+        .filter_map(|input| {
+            if input.json_path == "/data" {
+                Some(("/queue_ack".to_string(), input.source_ref.clone()))
+            } else {
+                pointer_suffix("/data/queue_ack", &input.json_path)
+                    .map(|suffix| (format!("/queue_ack{suffix}"), input.source_ref.clone()))
+            }
+        })
+        .collect::<Vec<_>>();
+    for (path, source_ref) in acknowledgement_paths {
+        if let Some(value) = result.pointer(&path).cloned() {
+            secrets.push(SecretValueInput {
+                json_path: path.clone(),
+                value,
+                source_kind: "provenance".into(),
+                source_ref,
+            });
+            set_at_pointer(&mut result, &path, redaction_marker());
+        }
+    }
+    if declared_sensitive || !inherited.origins.is_empty() {
+        for path in ["/stdout", "/error"] {
+            if let Some(value) = result
+                .pointer(path)
+                .filter(|value| !value.is_null() && !is_redaction_marker(value))
+                .cloned()
+            {
+                secrets.push(SecretValueInput {
+                    json_path: path.into(),
+                    value,
+                    source_kind: "provenance".into(),
+                    source_ref: Some(
+                        serde_json::to_string(&local_origin(path))
+                            .expect("serializable provenance"),
+                    ),
+                });
+                set_at_pointer(&mut result, path, redaction_marker());
+            }
+        }
+    }
+    Ok((result, secrets))
+}
+
 pub fn merge_schema_secret_redactions(
     value: JsonValue,
     existing_sources: &[SecretPathSource],
     schema: Option<&JsonValue>,
+) -> (JsonValue, Vec<SecretValueInput>) {
+    merge_secret_redactions(value, existing_sources, secret_paths_from_schema(schema))
+}
+
+/// Contract traversal includes inherited annotations, composition, and concrete
+/// array paths. Provenance merging is the same as for existing explicit sources.
+pub fn merge_contract_secret_redactions(
+    value: JsonValue,
+    existing_sources: &[SecretPathSource],
+    contract: &crate::value_schema::CompiledContract,
+) -> Result<(JsonValue, Vec<SecretValueInput>)> {
+    let paths = contract
+        .secret_paths(&value)
+        .map_err(|error| Error::validation(format!("Invalid bound secret traversal: {error}")))?;
+    Ok(merge_secret_redactions(value, existing_sources, paths))
+}
+
+pub fn validate_contract_secret_destination_paths(
+    value: &JsonValue,
+    contract: &crate::value_schema::CompiledContract,
+    secret_paths: &[JsonPointer],
+) -> Result<()> {
+    let allowed = contract
+        .secret_paths(value)
+        .map_err(|error| Error::validation(format!("Invalid bound secret traversal: {error}")))?;
+    if secret_paths
+        .iter()
+        .any(|path| !path_allowed_by_secret_schema(path, &allowed))
+    {
+        return Err(Error::validation(
+            "Secret value cannot be assigned to a non-secret parameter path",
+        ));
+    }
+    Ok(())
+}
+
+fn merge_secret_redactions(
+    value: JsonValue,
+    existing_sources: &[SecretPathSource],
+    schema_paths: Vec<String>,
 ) -> (JsonValue, Vec<SecretValueInput>) {
     let mut path_sources = existing_sources.to_vec();
     let existing_paths = existing_sources
@@ -359,7 +643,7 @@ pub fn merge_schema_secret_redactions(
         .map(|source| source.path.as_str())
         .collect::<BTreeSet<_>>();
 
-    for path in secret_paths_from_schema(schema) {
+    for path in schema_paths {
         if !existing_paths.contains(path.as_str()) {
             path_sources.push(SecretPathSource {
                 source: SecretSource::ParameterSchema { path: path.clone() },
@@ -482,10 +766,9 @@ pub fn restore_secret_values(
     for secret in secrets {
         if let Some(expected_hash) = &secret.encryption_key_hash {
             if expected_hash != &actual_hash {
-                return Err(Error::encryption(format!(
-                    "Encryption key hash mismatch for secret path '{}'",
-                    secret.json_path
-                )));
+                return Err(Error::encryption(
+                    "Encryption key does not match stored secret values",
+                ));
             }
         }
         let value = crypto::decrypt_json(&secret.encrypted_value, encryption_key)?;
@@ -647,6 +930,29 @@ fn unescape_pointer_segment(segment: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configuration_metadata_never_discloses_unbound_or_unresolved_secrets() {
+        let projection = super::configuration_metadata_projection(
+            "test.pack",
+            &serde_json::json!({
+                "credentials":{"type":"array","items":{"type":"object","properties":{"token":{"type":"string","secret":true}}}},
+                "count":{"type":"integer"}
+            }),
+            serde_json::json!({"credentials":[{"token":"metadata-fixture"}],"count":0}),
+        );
+        assert!(!projection.to_string().contains("metadata-fixture"));
+        assert_eq!(projection["count"], 0);
+        assert!(super::is_redaction_marker(
+            &projection["credentials"][0]["token"]
+        ));
+        assert!(super::is_redaction_marker(
+            &super::configuration_metadata_projection(
+                "test.pack",
+                &serde_json::json!({"value":{"type":"external.secret"}}),
+                serde_json::json!({"value":"unresolved-fixture"})
+            )
+        ));
+    }
     use super::*;
 
     #[test]
@@ -719,6 +1025,192 @@ mod tests {
             redact_action_result(json!({"stdout":"public status"}), None, 42, &[]);
         assert_eq!(public["stdout"], "public status");
         assert!(secrets.is_empty());
+    }
+
+    #[test]
+    fn bound_output_warnings_do_not_fail_execution_or_expose_malformed_secrets() {
+        let schema = json!({"token": {"type": "string", "secret": true}, "count": {"type": "integer", "required": true}});
+        let contract = crate::value_schema::compile_inline(
+            "demo.action",
+            crate::value_schema::SchemaContext::FlatDocument,
+            &schema,
+        )
+        .unwrap();
+        let (result, inputs) = redact_bound_action_result(
+            json!({
+                "succeeded": true, "data": {"token": "fixture-private", "count": "invalid"},
+                "queue_ack": {"token": "fixture-private"}, "stdout": "fixture-private"
+            }),
+            Some(&contract),
+            crate::models::OutputFormat::Json,
+            42,
+            &["/password".into()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result["succeeded"], true);
+        assert!(result.get("output_validation_warning").is_some());
+        assert!(is_redaction_marker(&result["data"]));
+        assert!(is_redaction_marker(&result["queue_ack"]));
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("fixture-private"));
+        assert!(inputs.iter().any(|input| input.json_path == "/data"));
+    }
+
+    #[test]
+    fn sdk_key_reads_protect_raw_output_and_bind_marked_output_to_every_key() {
+        use crate::{
+            models::{OutputFormat, OwnerType},
+            secret_provenance::{KeyOrigin, SecretOrigin, SecretProvenance},
+        };
+        let origins = [
+            KeyOrigin {
+                key_id: 17,
+                key_ref: "pack.demo.credential".into(),
+                owner_type: OwnerType::Pack,
+                owner_identity: None,
+                owner_ref: Some("demo".into()),
+                encrypted: true,
+            },
+            KeyOrigin {
+                key_id: 18,
+                key_ref: "system.second".into(),
+                owner_type: OwnerType::System,
+                owner_identity: None,
+                owner_ref: None,
+                encrypted: false,
+            },
+        ];
+        let contract = crate::value_schema::compile_inline(
+            "demo.run",
+            crate::value_schema::SchemaContext::FlatDocument,
+            &json!({"token": {"type": "string", "secret": true}}),
+        )
+        .unwrap();
+        let (redacted, inputs) = redact_bound_action_result(
+            json!({"succeeded":true, "data":{"token":"sdk-private"}, "stdout":"sdk-private", "error":"sdk-private"}),
+            Some(&contract), OutputFormat::Json, 42, &[], &origins,
+        ).unwrap();
+        assert!(!redacted.to_string().contains("sdk-private"));
+        assert_eq!(inputs.len(), 3);
+        for input in inputs {
+            let provenance: SecretProvenance =
+                serde_json::from_str(input.source_ref.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                provenance.origins,
+                origins
+                    .iter()
+                    .cloned()
+                    .map(SecretOrigin::Key)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let (redacted, inputs) = redact_bound_action_result(
+            json!({"data":"unmarked code output", "stdout":"sdk-private", "error":"sdk-private"}),
+            None,
+            OutputFormat::Text,
+            42,
+            &[],
+            &origins,
+        )
+        .unwrap();
+        assert!(is_redaction_marker(&redacted["stdout"]));
+        assert!(is_redaction_marker(&redacted["error"]));
+        assert_eq!(inputs.len(), 2);
+        // Arbitrary unmarked application data remains the pack-code trust boundary.
+        assert_eq!(redacted["data"], "unmarked code output");
+    }
+
+    #[test]
+    fn bound_jsonl_validates_and_redacts_each_record_and_schema_less_outputs_stay_unrestricted() {
+        let schema = json!({"token": {"type": "string", "secret": true}});
+        let contract = crate::value_schema::compile_inline(
+            "demo.action",
+            crate::value_schema::SchemaContext::FlatDocument,
+            &schema,
+        )
+        .unwrap();
+        let (result, inputs) = redact_bound_action_result(
+            json!({"succeeded": true, "data": [{"token": "a"}, {"token": "b"}]}),
+            Some(&contract),
+            crate::models::OutputFormat::Jsonl,
+            42,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(result.get("output_validation_warning").is_none());
+        assert!(is_redaction_marker(&result["data"][0]["token"]));
+        assert!(inputs
+            .iter()
+            .any(|input| input.json_path == "/data/1/token"));
+        let (result, inputs) = redact_bound_action_result(
+            json!({"succeeded": true, "data": "free-form text"}),
+            None,
+            crate::models::OutputFormat::Text,
+            42,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(result.get("output_validation_warning").is_none());
+        assert!(inputs.is_empty());
+        assert_eq!(result["data"], "free-form text");
+    }
+
+    #[test]
+    fn contract_parent_redaction_preserves_nested_key_origins_and_array_paths() {
+        use crate::{
+            models::OwnerType,
+            secret_provenance::{KeyOrigin, SecretOrigin, SecretProvenance},
+        };
+        let schema = json!({
+            "credentials": {"type": "object", "secret": true},
+            "tokens": {"type": "array", "items": {"type": "string", "secret": true}}
+        });
+        let binding = crate::value_schema::compile_inline(
+            "demo.action",
+            crate::value_schema::SchemaContext::FlatDocument,
+            &schema,
+        )
+        .unwrap();
+        let contract = crate::value_schema::CompiledContract::new(&binding).unwrap();
+        let origin = KeyOrigin {
+            key_id: 42,
+            key_ref: "system.token".into(),
+            owner_type: OwnerType::System,
+            owner_identity: None,
+            owner_ref: None,
+            encrypted: true,
+        };
+        let sources = vec![SecretPathSource {
+            path: "/credentials/password".into(),
+            source: SecretSource::Bound(SecretProvenance::key(origin.clone())),
+        }];
+        let value =
+            json!({"credentials": {"password": "fixture-secret"}, "tokens": ["fixture-token"]});
+        validate_contract_secret_destination_paths(
+            &value,
+            &contract,
+            &["/credentials/password".into(), "/tokens/0".into()],
+        )
+        .unwrap();
+        assert!(
+            validate_contract_secret_destination_paths(&value, &contract, &["/public".into()])
+                .is_err()
+        );
+        let (redacted, inputs) =
+            merge_contract_secret_redactions(value, &sources, &contract).unwrap();
+        assert!(is_redaction_marker(&redacted["credentials"]));
+        assert!(is_redaction_marker(&redacted["tokens"][0]));
+        let parent = inputs
+            .iter()
+            .find(|input| input.json_path == "/credentials")
+            .unwrap();
+        let provenance: SecretProvenance =
+            serde_json::from_str(parent.source_ref.as_ref().unwrap()).unwrap();
+        assert!(provenance.origins.contains(&SecretOrigin::Key(origin)));
     }
 
     #[test]

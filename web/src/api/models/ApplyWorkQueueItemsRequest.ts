@@ -6,7 +6,7 @@ import type { WorkQueueItemBulkOperation } from "./WorkQueueItemBulkOperation";
 import type { WorkQueueItemJsonPathSelector } from "./WorkQueueItemJsonPathSelector";
 export type ApplyWorkQueueItemsRequest = {
   operation: WorkQueueItemBulkOperation;
-  payload_patch: any | null;
+  payload_patch: Record<string, any> | null;
   preview_limit?: number;
   priority?: number | null;
   selector: WorkQueueItemJsonPathSelector;

@@ -15,6 +15,7 @@ import type { DownloadPacksRequest } from "../models/DownloadPacksRequest";
 import type { GetPackDependenciesRequest } from "../models/GetPackDependenciesRequest";
 import type { i64 } from "../models/i64";
 import type { InstallPackRequest } from "../models/InstallPackRequest";
+import type { PackDiagnostic } from "../models/PackDiagnostic";
 import type { PackIndexEntry } from "../models/PackIndexEntry";
 import type { PackInstallProvenance } from "../models/PackInstallProvenance";
 import type { PackRegistryIndexSummary } from "../models/PackRegistryIndexSummary";
@@ -315,6 +316,7 @@ export class PacksService {
        * Pack configuration
        */
       config: Record<string, any>;
+      config_schema_binding?: null | Value;
       /**
        * Creation timestamp
        */
@@ -479,6 +481,10 @@ export class PacksService {
         401: `Unauthorized`,
         403: `Forbidden`,
         404: `Pack or local source not found`,
+        409: `Pack or activation conflict`,
+        422: `Invalid metadata or failed candidate tests`,
+        500: `Deployment service failure`,
+        503: `Retryable database failure`,
       },
     });
   }
@@ -523,8 +529,12 @@ export class PacksService {
       body: requestBody,
       mediaType: "application/json",
       errors: {
-        400: `Invalid request or tests failed`,
-        409: `Pack already exists`,
+        400: `Invalid request or YAML syntax`,
+        403: `Deployment permission denied`,
+        409: `Pack or activation conflict`,
+        422: `Invalid metadata or failed candidate tests`,
+        500: `Deployment service failure`,
+        503: `Retryable database failure`,
       },
     });
   }
@@ -616,6 +626,7 @@ export class PacksService {
      * Response for pack install/register operations with test results
      */
     data: {
+      diagnostics?: Array<PackDiagnostic>;
       /**
        * ID of the pack install tracking record, present when tests were dispatched.
        */
@@ -658,11 +669,13 @@ export class PacksService {
    */
   public static getPack({
     ref,
+    includeSecretValues,
   }: {
     /**
      * Pack reference identifier
      */
     ref: string;
+    includeSecretValues?: boolean;
   }): CancelablePromise<{
     /**
      * Response DTO for pack information
@@ -680,6 +693,7 @@ export class PacksService {
        * Pack configuration
        */
       config: Record<string, any>;
+      config_schema_binding?: null | Value;
       /**
        * Creation timestamp
        */
@@ -755,6 +769,9 @@ export class PacksService {
       path: {
         ref: ref,
       },
+      query: {
+        include_secret_values: includeSecretValues,
+      },
       errors: {
         404: `Pack not found`,
       },
@@ -791,6 +808,7 @@ export class PacksService {
        * Pack configuration
        */
       config: Record<string, any>;
+      config_schema_binding?: null | Value;
       /**
        * Creation timestamp
        */
@@ -1038,6 +1056,7 @@ export class PacksService {
      * Response for pack install/register operations with test results
      */
     data: {
+      diagnostics?: Array<PackDiagnostic>;
       /**
        * ID of the pack install tracking record, present when tests were dispatched.
        */

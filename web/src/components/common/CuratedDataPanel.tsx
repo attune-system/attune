@@ -16,7 +16,8 @@ function stringifyValue(value: unknown): string {
 }
 
 function displayType(schema?: ParamSchemaProperty, value?: unknown): string {
-  if (schema?.type) return schema.type;
+  if (schema?.type)
+    return Array.isArray(schema.type) ? schema.type.join(" | ") : schema.type;
   if (Array.isArray(value)) return "array";
   if (value === null) return "null";
   return typeof value === "undefined" ? "unknown" : typeof value;
@@ -95,7 +96,7 @@ export function SchemaValueRows({
                 <span className="rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
                   {displayType(field, value)}
                 </span>
-                {field.required && (
+                {field.required === true && (
                   <span className="rounded bg-blue-50 px-2 py-0.5 text-xs text-blue-700">
                     required
                   </span>

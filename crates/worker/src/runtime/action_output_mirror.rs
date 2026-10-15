@@ -1,7 +1,6 @@
 use attune_common::models::OutputFormat;
-use attune_common::secret_values::{
-    is_redaction_marker, redact_secret_parameters, secret_paths_from_schema,
-};
+use attune_common::secret_values::{is_redaction_marker, merge_contract_secret_redactions};
+use attune_common::value_schema::{CompiledContract, Contract};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -11,7 +10,7 @@ pub(super) struct ActionOutputMirrorInput<'a> {
     pub stdout: &'a str,
     pub stderr: &'a str,
     pub output_format: OutputFormat,
-    pub out_schema: Option<&'a Value>,
+    pub out_schema: Option<&'a Contract>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub logs_incomplete: bool,
@@ -53,15 +52,27 @@ pub(super) enum ActionOutputMirrorDecision {
     Suppressed(ActionOutputMirrorSuppression),
 }
 
-pub(super) fn action_output_requires_delayed_mirror(out_schema: Option<&Value>) -> bool {
-    !secret_paths_from_schema(out_schema).is_empty()
+pub(super) fn action_output_requires_delayed_mirror(out_schema: Option<&Contract>) -> bool {
+    out_schema.is_some_and(|schema| {
+        CompiledContract::new(schema)
+            .map(|contract| contract.declares_secrets())
+            .unwrap_or(true)
+    })
 }
 
 pub(super) fn safe_action_output_mirror(
     input: ActionOutputMirrorInput<'_>,
 ) -> ActionOutputMirrorDecision {
-    let secret_paths = secret_paths_from_schema(input.out_schema);
-    if secret_paths.is_empty() {
+    let contract = match input.out_schema.map(CompiledContract::new).transpose() {
+        Ok(Some(contract)) => contract,
+        Ok(None) => return ActionOutputMirrorDecision::Live,
+        Err(_) => {
+            return ActionOutputMirrorDecision::Suppressed(
+                ActionOutputMirrorSuppression::OutputParseFailed,
+            )
+        }
+    };
+    if !contract.declares_secrets() {
         return ActionOutputMirrorDecision::Live;
     }
     if !input.mirror_stdout && !input.mirror_stderr {
@@ -92,18 +103,34 @@ pub(super) fn safe_action_output_mirror(
         );
     };
     let mut found_paths = BTreeSet::new();
-    for record in parsed.records_mut() {
-        let (mut redacted, secrets) = redact_secret_parameters(record.clone(), input.out_schema);
+    let records = parsed.records_mut();
+    if records.len() > input.out_schema.unwrap().limits.max_literal_checks {
+        return ActionOutputMirrorDecision::Suppressed(
+            ActionOutputMirrorSuppression::IncompleteCapture,
+        );
+    }
+    for record in records {
+        if contract.validate(record).is_err() {
+            return ActionOutputMirrorDecision::Suppressed(
+                ActionOutputMirrorSuppression::OutputParseFailed,
+            );
+        }
+        let (mut redacted, secrets) =
+            match merge_contract_secret_redactions(record.clone(), &[], &contract) {
+                Ok(result) => result,
+                Err(_) => {
+                    return ActionOutputMirrorDecision::Suppressed(
+                        ActionOutputMirrorSuppression::SecretValuesUnavailable,
+                    )
+                }
+            };
         replace_redaction_markers(&mut redacted);
         *record = redacted;
         for secret in secrets {
             found_paths.insert(secret.json_path);
         }
     }
-    if secret_paths
-        .iter()
-        .any(|path| !found_paths.contains(path.as_str()))
-    {
+    if found_paths.is_empty() {
         return ActionOutputMirrorDecision::Suppressed(
             ActionOutputMirrorSuppression::SecretValuesUnavailable,
         );
@@ -229,6 +256,12 @@ mod tests {
         let schema = json!({
             "token": {"type": "string", "secret": true}
         });
+        let schema = attune_common::value_schema::compile_inline(
+            "test.action",
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            &schema,
+        )
+        .unwrap();
 
         let decision = safe_action_output_mirror(ActionOutputMirrorInput {
             stdout: &format!("{{\"token\":\"{secret}\",\"status\":\"ok\"}}\n"),
@@ -261,11 +294,17 @@ mod tests {
         mirror_stdout: bool,
         mirror_stderr: bool,
     ) -> ActionOutputMirrorDecision {
+        let schema = attune_common::value_schema::compile_inline(
+            "test.action",
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            schema,
+        )
+        .unwrap();
         safe_action_output_mirror(ActionOutputMirrorInput {
             stdout,
             stderr,
             output_format: format,
-            out_schema: Some(schema),
+            out_schema: Some(&schema),
             stdout_truncated: false,
             stderr_truncated: false,
             logs_incomplete: false,
@@ -327,13 +366,13 @@ mod tests {
     }
 
     #[test]
-    fn json_reserializes_unicode_escapes_and_exponent_numbers_after_redaction() {
+    fn json_reserializes_unicode_escapes_and_numeric_text_after_redaction() {
         let schema = json!({
             "token": {"type": "string", "secret": true},
-            "count": {"type": "number", "secret": true}
+            "count": {"type": "string", "secret": true}
         });
         let decision = mirror(
-            r#"{"token":"\u0073\u0065\u0063\u0072\u0065\u0074","count":1e3,"public":"ok"}"#,
+            r#"{"token":"\u0073\u0065\u0063\u0072\u0065\u0074","count":"1e3","public":"ok"}"#,
             "",
             OutputFormat::Json,
             &schema,
@@ -365,7 +404,7 @@ mod tests {
     "token": "object-secret"
   },
   "codes": [
-    1e3,
+    "1e3",
     "array-secret"
   ],
   "public": true
@@ -393,12 +432,12 @@ mod tests {
     fn json_prefix_and_stderr_are_redacted_wholesale() {
         let schema = json!({
             "token": {"type": "string", "secret": true},
-            "count": {"type": "number", "secret": true}
+            "count": {"type": "string", "secret": true}
         });
         let stdout = concat!(
             r#"{"message":"saw snowman \u2603","count":1e3}"#,
             "\n\n",
-            r#"{"token":"snowman \u2603","count":1e3}"#,
+            r#"{"token":"snowman \u2603","count":"1e3"}"#,
         );
         let stderr = concat!(
             r#"{"message":"failed for snowman \u2603","count":1e3}"#,
@@ -416,8 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn alternate_json_numbers_in_diagnostics_are_redacted_wholesale() {
-        let schema = json!({"count": {"type": "number", "secret": true}});
+    fn malformed_numeric_secret_output_suppresses_mirroring() {
+        let schema = json!({"count": {"type": "string", "secret": true}});
         let stdout = concat!(
             r#"{"integer":1e3,"decimal":1000.0,"public":7}"#,
             "\n",
@@ -426,13 +465,11 @@ mod tests {
         let stderr = r#"{"upper":1E+3,"decimal":1000.0,"public":7}"#;
 
         let decision = mirror(stdout, stderr, OutputFormat::Json, &schema, true, true);
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        assert_eq!(content.stderr.as_deref(), Some(REDACTION));
         assert_eq!(
-            content.stdout.as_deref(),
-            Some("[REDACTED]\n{\"count\":\"[REDACTED]\"}")
+            decision,
+            ActionOutputMirrorDecision::Suppressed(
+                ActionOutputMirrorSuppression::OutputParseFailed
+            )
         );
     }
 
@@ -496,13 +533,14 @@ mod tests {
     }
 
     #[test]
-    fn yaml_alternate_scalar_forms_are_redacted_before_reserialization() {
+    fn yaml_numeric_text_is_redacted_before_reserialization() {
         let schema = json!({
-            "hex": {"type": "number", "secret": true},
-            "underscored": {"type": "number", "secret": true}
+            "hex": {"type": "string", "secret": true},
+            // YAML 1.2 can preserve underscored scalars as strings.
+            "underscored": {"type": "string", "secret": true}
         });
         let decision = mirror(
-            "hex: 0x2A\nunderscored: 1_000\npublic: ok\n",
+            "hex: '0x2A'\nunderscored: 1_000\npublic: ok\n",
             "hex=42, underscored=1000, public diagnostic\n",
             OutputFormat::Yaml,
             &schema,
@@ -550,6 +588,12 @@ mod tests {
     #[test]
     fn truncated_or_incomplete_capture_fails_closed() {
         let schema = json!({"token": {"type": "string", "secret": true}});
+        let schema = attune_common::value_schema::compile_inline(
+            "test.action",
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            &schema,
+        )
+        .unwrap();
         let base = || ActionOutputMirrorInput {
             stdout: r#"{"token":"secret"}"#,
             stderr: "secret",
@@ -602,10 +646,10 @@ mod tests {
     }
 
     #[test]
-    fn non_string_secret_diagnostics_are_redacted_wholesale() {
+    fn malformed_scalar_and_nested_secret_outputs_suppress_mirroring() {
         let schema = json!({
-            "number": {"type": "number", "secret": true},
-            "flag": {"type": "boolean", "secret": true},
+            "number": {"type": "string", "secret": true},
+            "flag": {"type": "string", "secret": true},
             "object": {"type": "object", "secret": true},
             "array": {"type": "array", "secret": true}
         });
@@ -613,15 +657,12 @@ mod tests {
         let stderr =
             r#"7319 true {"key":"object-leaf"} object-leaf ["array-leaf",8821] array-leaf 8821"#;
         let decision = mirror(stdout, stderr, OutputFormat::Json, &schema, true, true);
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        assert_eq!(content.stderr.as_deref(), Some(REDACTION));
-        let stdout: Value = serde_json::from_str(content.stdout.as_deref().unwrap()).unwrap();
-        assert_eq!(stdout["number"], REDACTION);
-        assert_eq!(stdout["flag"], REDACTION);
-        assert_eq!(stdout["object"], REDACTION);
-        assert_eq!(stdout["array"], REDACTION);
+        assert_eq!(
+            decision,
+            ActionOutputMirrorDecision::Suppressed(
+                ActionOutputMirrorSuppression::OutputParseFailed
+            )
+        );
     }
 
     #[test]

@@ -106,6 +106,7 @@ export interface WorkQueueItemResponse {
   priority: number;
   status: WorkQueueItemStatus;
   payload: JsonValue;
+  schema_binding?: unknown;
   metadata: JsonValue;
   enqueue_source: string;
   requested_by_identity?: number | null;

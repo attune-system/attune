@@ -8,7 +8,7 @@ import ExecuteActionModal from "./ExecuteActionModal";
 
 vi.mock("@/contexts/AuthContext", () => ({
   useAuth: () => ({
-    user: { assigned_permission_set_refs: ["core.admin"] },
+    user: { assigned_permission_set_refs: [] },
   }),
 }));
 
@@ -42,6 +42,60 @@ afterEach(() => {
 });
 
 describe("ExecuteActionModal", () => {
+  it.each([
+    {
+      name: "action defaults",
+      initialRefs: undefined,
+      expectedRefs: undefined,
+    },
+    { name: "explicit token opt-out", initialRefs: [], expectedRefs: [] },
+    {
+      name: "explicit rerun refs",
+      initialRefs: ["local.emitter"],
+      expectedRefs: ["local.emitter"],
+    },
+  ])(
+    "preserves $name without personal permission-set membership",
+    async ({ initialRefs, expectedRefs }) => {
+      let submitted: unknown;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>(async (_input, init) => {
+          if (typeof init?.body === "string") submitted = JSON.parse(init.body);
+          return new Response(JSON.stringify({ data: { id: 42 } }), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          });
+        }),
+      );
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ExecuteActionModal
+              action={{
+                ...action,
+                default_execution_permission_set_refs: ["local.emitter"],
+              }}
+              initialPermissionSetRefs={initialRefs}
+              onClose={vi.fn()}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Execute" }));
+      await waitFor(() => {
+        expect(submitted).toHaveProperty("action_ref", action.ref);
+        if (expectedRefs === undefined)
+          expect(submitted).not.toHaveProperty("permission_set_refs");
+        else
+          expect(submitted).toHaveProperty("permission_set_refs", expectedRefs);
+      });
+    },
+  );
+
   it("shows a visible warning and blocks reserved environment names", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

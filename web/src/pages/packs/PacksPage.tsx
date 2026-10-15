@@ -33,8 +33,8 @@ import PackReleaseHistory from "@/components/packs/PackReleaseHistory";
 import RetiredPackComponents from "@/components/packs/RetiredPackComponents";
 import PlatformCatalogStatus from "@/components/packs/PlatformCatalogStatus";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type JsonValue = any;
+import { ContractValueRows } from "@/components/common/ContractDataCard";
+import { SchemaValueRows } from "@/components/common/CuratedDataPanel";
 
 export default function PacksPage() {
   const { ref } = useParams<{ ref?: string }>();
@@ -424,6 +424,12 @@ function PackDetail({ packRef }: { packRef: string }) {
             )}
           </div>
           <div className="flex gap-2">
+            <Link
+              to={`/packs/${encodeURIComponent(packRef)}/approvals`}
+              className="px-4 py-2 border rounded hover:bg-gray-100"
+            >
+              External approvals
+            </Link>
             {canConfigurePacks && (
               <Link
                 to={`/packs/${packRef}/edit`}
@@ -726,153 +732,27 @@ function PackDetail({ packRef }: { packRef: string }) {
 function PackConfiguration({ pack }: { pack: PackResponse | undefined }) {
   if (!pack) return null;
 
-  const confSchema = pack.conf_schema || {};
-  const config = pack.config || {};
-  const properties =
-    confSchema && typeof confSchema === "object" && !Array.isArray(confSchema)
-      ? confSchema.properties || {}
-      : {};
-  const configEntries =
-    config && typeof config === "object" && !Array.isArray(config)
-      ? Object.entries(config)
-      : [];
-  const entryKeys = Array.from(
-    new Set([...Object.keys(properties), ...configEntries.map(([key]) => key)]),
-  ).sort((left, right) => left.localeCompare(right));
-
   return (
     <div className="bg-white shadow rounded-lg p-6">
       <div className="flex items-center gap-2 mb-4">
         <Settings className="w-5 h-5 text-gray-600" />
         <h2 className="text-xl font-semibold">Pack Config</h2>
       </div>
-      {entryKeys.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-gray-300 bg-gray-50 px-4 py-6 text-sm text-gray-500">
-          No pack configuration is currently set.
-        </div>
+      {pack.config_schema_binding ? (
+        <ContractValueRows
+          contract={pack.config_schema_binding}
+          values={pack.config}
+          emptyMessage="No pack configuration is currently set."
+          maskSecrets
+        />
       ) : (
-        <div className="space-y-4">
-          {entryKeys.map((key) => {
-            const schema = properties[key] as JsonValue;
-            const value = config[key];
-            const hasValue = value !== undefined && value !== null;
-            const displayValue = hasValue ? value : schema?.default;
-            const isUsingDefault = !hasValue && schema?.default !== undefined;
-
-            return (
-              <div
-                key={key}
-                className="border-b border-gray-200 pb-4 last:border-0 last:pb-0"
-              >
-                <div className="flex items-start justify-between">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2">
-                      <dt className="text-sm font-medium text-gray-900 font-mono">
-                        {key}
-                      </dt>
-                      {schema?.type && (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
-                          {schema.type}
-                        </span>
-                      )}
-                      {isUsingDefault && (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800">
-                          default
-                        </span>
-                      )}
-                    </div>
-                    {schema?.description && (
-                      <p className="mt-1 text-sm text-gray-600">
-                        {schema.description}
-                      </p>
-                    )}
-                  </div>
-                  <dd className="ml-4 text-sm text-right">
-                    <ConfigValue value={displayValue} type={schema?.type} />
-                  </dd>
-                </div>
-                {schema?.minimum !== undefined &&
-                  schema?.maximum !== undefined && (
-                    <p className="mt-1 text-xs text-gray-500">
-                      Range: {schema.minimum} - {schema.maximum}
-                    </p>
-                  )}
-              </div>
-            );
-          })}
-        </div>
+        <SchemaValueRows
+          schema={pack.conf_schema}
+          values={pack.config}
+          emptyMessage="No pack configuration is currently set."
+          maskSecrets
+        />
       )}
     </div>
   );
-}
-
-// Helper component to render config values based on type
-function ConfigValue({ value, type }: { value: JsonValue; type?: string }) {
-  if (value === undefined || value === null) {
-    return <span className="text-gray-400 italic">not set</span>;
-  }
-
-  switch (type) {
-    case "boolean":
-      return (
-        <span
-          className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
-            value ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-800"
-          }`}
-        >
-          {value ? "✓ true" : "✗ false"}
-        </span>
-      );
-    case "integer":
-    case "number":
-      return <span className="font-mono text-gray-900">{value}</span>;
-    case "string":
-      if (typeof value === "string" && value.length > 50) {
-        return (
-          <span className="text-gray-900 text-xs break-all max-w-xs block">
-            {value}
-          </span>
-        );
-      }
-      return <span className="text-gray-900">{String(value)}</span>;
-    case "array":
-      if (Array.isArray(value)) {
-        return (
-          <span className="text-gray-900 text-xs">[{value.length} items]</span>
-        );
-      }
-      return <span className="text-gray-900">{JSON.stringify(value)}</span>;
-    case "object":
-      if (typeof value === "object") {
-        return (
-          <span className="text-gray-900 text-xs">
-            {"{" + Object.keys(value).length + " keys}"}
-          </span>
-        );
-      }
-      return <span className="text-gray-900">{JSON.stringify(value)}</span>;
-    default:
-      // For unknown types, try to display intelligently
-      if (typeof value === "boolean") {
-        return (
-          <span
-            className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
-              value
-                ? "bg-green-100 text-green-800"
-                : "bg-gray-100 text-gray-800"
-            }`}
-          >
-            {value ? "✓ true" : "✗ false"}
-          </span>
-        );
-      }
-      if (typeof value === "object") {
-        return (
-          <pre className="text-xs text-gray-900 max-w-xs overflow-auto">
-            {JSON.stringify(value, null, 2)}
-          </pre>
-        );
-      }
-      return <span className="text-gray-900">{String(value)}</span>;
-  }
 }

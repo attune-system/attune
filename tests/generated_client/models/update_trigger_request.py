@@ -4,21 +4,16 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 from typing_extensions import Self
 
 from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.trigger_json_patch_type_0 import TriggerJsonPatchType0
+    from ..models.trigger_json_patch_type_1 import TriggerJsonPatchType1
     from ..models.trigger_string_patch_type_0 import TriggerStringPatchType0
     from ..models.trigger_string_patch_type_1 import TriggerStringPatchType1
-    from ..models.update_trigger_request_out_schema_type_0 import (
-        UpdateTriggerRequestOutSchemaType0,
-    )
-    from ..models.update_trigger_request_param_schema_type_0 import (
-        UpdateTriggerRequestParamSchemaType0,
-    )
 
 
 T = TypeVar("T", bound="UpdateTriggerRequest")
@@ -29,53 +24,43 @@ class UpdateTriggerRequest:
     """Request DTO for updating a trigger
 
     Attributes:
-        out_schema (None | UpdateTriggerRequestOutSchemaType0): Output schema
-        param_schema (None | UpdateTriggerRequestParamSchemaType0): Parameter schema (StackStorm-style with inline
-            required/secret)
         description (None | TriggerStringPatchType0 | TriggerStringPatchType1 | Unset):
         enabled (bool | None | Unset): Whether the trigger is enabled Example: True.
+        event_config_schema (None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset):
         label (None | str | Unset): Human-readable label Example: Webhook Trigger (Updated).
+        out_schema (None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset):
+        param_schema (None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset):
         reference_allowed_pack_refs (list[str] | None | Unset): Replace the restricted visibility allow-list. Example:
             ['incident_response', 'deployments'].
         reference_visibility (ActionReferenceVisibility | None | Unset):
     """
 
-    out_schema: None | UpdateTriggerRequestOutSchemaType0
-    param_schema: None | UpdateTriggerRequestParamSchemaType0
     description: None | TriggerStringPatchType0 | TriggerStringPatchType1 | Unset = (
         UNSET
     )
     enabled: bool | None | Unset = UNSET
+    event_config_schema: (
+        None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset
+    ) = UNSET
     label: None | str | Unset = UNSET
+    out_schema: None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset = UNSET
+    param_schema: None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset = UNSET
     reference_allowed_pack_refs: list[str] | None | Unset = UNSET
     reference_visibility: ActionReferenceVisibility | None | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.trigger_json_patch_type_0 import (
+            TriggerJsonPatchType0,
+        )
+        from ..models.trigger_json_patch_type_1 import (
+            TriggerJsonPatchType1,
+        )
         from ..models.trigger_string_patch_type_0 import (
             TriggerStringPatchType0,
         )
         from ..models.trigger_string_patch_type_1 import (
             TriggerStringPatchType1,
         )
-        from ..models.update_trigger_request_out_schema_type_0 import (
-            UpdateTriggerRequestOutSchemaType0,
-        )
-        from ..models.update_trigger_request_param_schema_type_0 import (
-            UpdateTriggerRequestParamSchemaType0,
-        )
-
-        out_schema: dict[str, Any] | None
-        if isinstance(self.out_schema, UpdateTriggerRequestOutSchemaType0):
-            out_schema = self.out_schema.to_dict()
-        else:
-            out_schema = self.out_schema
-
-        param_schema: dict[str, Any] | None
-        if isinstance(self.param_schema, UpdateTriggerRequestParamSchemaType0):
-            param_schema = self.param_schema.to_dict()
-        else:
-            param_schema = self.param_schema
 
         description: dict[str, Any] | None | Unset
         if isinstance(self.description, Unset):
@@ -93,11 +78,41 @@ class UpdateTriggerRequest:
         else:
             enabled = self.enabled
 
+        event_config_schema: dict[str, Any] | None | Unset
+        if isinstance(self.event_config_schema, Unset):
+            event_config_schema = UNSET
+        elif isinstance(self.event_config_schema, TriggerJsonPatchType0) or isinstance(
+            self.event_config_schema, TriggerJsonPatchType1
+        ):
+            event_config_schema = self.event_config_schema.to_dict()
+        else:
+            event_config_schema = self.event_config_schema
+
         label: None | str | Unset
         if isinstance(self.label, Unset):
             label = UNSET
         else:
             label = self.label
+
+        out_schema: dict[str, Any] | None | Unset
+        if isinstance(self.out_schema, Unset):
+            out_schema = UNSET
+        elif isinstance(self.out_schema, TriggerJsonPatchType0) or isinstance(
+            self.out_schema, TriggerJsonPatchType1
+        ):
+            out_schema = self.out_schema.to_dict()
+        else:
+            out_schema = self.out_schema
+
+        param_schema: dict[str, Any] | None | Unset
+        if isinstance(self.param_schema, Unset):
+            param_schema = UNSET
+        elif isinstance(self.param_schema, TriggerJsonPatchType0) or isinstance(
+            self.param_schema, TriggerJsonPatchType1
+        ):
+            param_schema = self.param_schema.to_dict()
+        else:
+            param_schema = self.param_schema
 
         reference_allowed_pack_refs: list[str] | None | Unset
         if isinstance(self.reference_allowed_pack_refs, Unset):
@@ -117,19 +132,20 @@ class UpdateTriggerRequest:
             reference_visibility = self.reference_visibility
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "out_schema": out_schema,
-                "param_schema": param_schema,
-            }
-        )
+
+        field_dict.update({})
         if description is not UNSET:
             field_dict["description"] = description
         if enabled is not UNSET:
             field_dict["enabled"] = enabled
+        if event_config_schema is not UNSET:
+            field_dict["event_config_schema"] = event_config_schema
         if label is not UNSET:
             field_dict["label"] = label
+        if out_schema is not UNSET:
+            field_dict["out_schema"] = out_schema
+        if param_schema is not UNSET:
+            field_dict["param_schema"] = param_schema
         if reference_allowed_pack_refs is not UNSET:
             field_dict["reference_allowed_pack_refs"] = reference_allowed_pack_refs
         if reference_visibility is not UNSET:
@@ -139,56 +155,20 @@ class UpdateTriggerRequest:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.trigger_json_patch_type_0 import (
+            TriggerJsonPatchType0,
+        )
+        from ..models.trigger_json_patch_type_1 import (
+            TriggerJsonPatchType1,
+        )
         from ..models.trigger_string_patch_type_0 import (
             TriggerStringPatchType0,
         )
         from ..models.trigger_string_patch_type_1 import (
             TriggerStringPatchType1,
         )
-        from ..models.update_trigger_request_out_schema_type_0 import (
-            UpdateTriggerRequestOutSchemaType0,
-        )
-        from ..models.update_trigger_request_param_schema_type_0 import (
-            UpdateTriggerRequestParamSchemaType0,
-        )
 
         d = dict(src_dict)
-
-        def _parse_out_schema(
-            data: object,
-        ) -> None | UpdateTriggerRequestOutSchemaType0:
-            if data is None:
-                return data
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                out_schema_type_0 = UpdateTriggerRequestOutSchemaType0.from_dict(data)
-
-                return out_schema_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(None | UpdateTriggerRequestOutSchemaType0, data)
-
-        out_schema = _parse_out_schema(d.pop("out_schema"))
-
-        def _parse_param_schema(
-            data: object,
-        ) -> None | UpdateTriggerRequestParamSchemaType0:
-            if data is None:
-                return data
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                param_schema_type_0 = UpdateTriggerRequestParamSchemaType0.from_dict(
-                    data
-                )
-
-                return param_schema_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(None | UpdateTriggerRequestParamSchemaType0, data)
-
-        param_schema = _parse_param_schema(d.pop("param_schema"))
 
         def _parse_description(
             data: object,
@@ -232,6 +212,41 @@ class UpdateTriggerRequest:
 
         enabled = _parse_enabled(d.pop("enabled", UNSET))
 
+        def _parse_event_config_schema(
+            data: object,
+        ) -> None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_trigger_json_patch_type_0 = (
+                    TriggerJsonPatchType0.from_dict(data)
+                )
+
+                return componentsschemas_trigger_json_patch_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_trigger_json_patch_type_1 = (
+                    TriggerJsonPatchType1.from_dict(data)
+                )
+
+                return componentsschemas_trigger_json_patch_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset, data
+            )
+
+        event_config_schema = _parse_event_config_schema(
+            d.pop("event_config_schema", UNSET)
+        )
+
         def _parse_label(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -240,6 +255,72 @@ class UpdateTriggerRequest:
             return cast(None | str | Unset, data)
 
         label = _parse_label(d.pop("label", UNSET))
+
+        def _parse_out_schema(
+            data: object,
+        ) -> None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_trigger_json_patch_type_0 = (
+                    TriggerJsonPatchType0.from_dict(data)
+                )
+
+                return componentsschemas_trigger_json_patch_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_trigger_json_patch_type_1 = (
+                    TriggerJsonPatchType1.from_dict(data)
+                )
+
+                return componentsschemas_trigger_json_patch_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset, data
+            )
+
+        out_schema = _parse_out_schema(d.pop("out_schema", UNSET))
+
+        def _parse_param_schema(
+            data: object,
+        ) -> None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_trigger_json_patch_type_0 = (
+                    TriggerJsonPatchType0.from_dict(data)
+                )
+
+                return componentsschemas_trigger_json_patch_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_trigger_json_patch_type_1 = (
+                    TriggerJsonPatchType1.from_dict(data)
+                )
+
+                return componentsschemas_trigger_json_patch_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                None | TriggerJsonPatchType0 | TriggerJsonPatchType1 | Unset, data
+            )
+
+        param_schema = _parse_param_schema(d.pop("param_schema", UNSET))
 
         def _parse_reference_allowed_pack_refs(
             data: object,
@@ -284,30 +365,14 @@ class UpdateTriggerRequest:
         )
 
         update_trigger_request = cls(
-            out_schema=out_schema,
-            param_schema=param_schema,
             description=description,
             enabled=enabled,
+            event_config_schema=event_config_schema,
             label=label,
+            out_schema=out_schema,
+            param_schema=param_schema,
             reference_allowed_pack_refs=reference_allowed_pack_refs,
             reference_visibility=reference_visibility,
         )
 
-        update_trigger_request.additional_properties = d
         return update_trigger_request
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

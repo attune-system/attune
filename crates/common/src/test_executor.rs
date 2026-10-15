@@ -48,11 +48,16 @@ impl TestConfig {
             ));
         }
         let mut total_timeout = 60_u64;
-        for runner in self.runners.values() {
+        for (name, runner) in &self.runners {
             let timeout = runner.timeout.unwrap_or(300);
             if !(1..=3600).contains(&timeout) {
-                return Err(Error::validation(
-                    "testing runner timeouts must be between 1 and 3600 seconds",
+                return Err(crate::pack_registry::diagnostics::metadata_error(
+                    "pack.yaml",
+                    &format!(
+                        "/testing/runners{}/timeout",
+                        crate::pack_registry::diagnostics::pointer(name)
+                    ),
+                    "Runner timeout must be between 1 and 3600 seconds",
                 ));
             }
             total_timeout = total_timeout.saturating_add(timeout);
@@ -272,11 +277,9 @@ impl TestExecutor {
         // Resolve entry point path
         let entry_point = pack_dir.join(&runner_config.entry_point);
         if !entry_point.exists() {
-            return Err(Error::not_found(
-                "test_entry_point",
-                "path",
-                entry_point.display().to_string(),
-            ));
+            return Err(crate::pack_registry::diagnostics::metadata_error("pack.yaml",
+                &format!("/testing/runners{}/entry_point", crate::pack_registry::diagnostics::pointer(runner_name)),
+                "Test entrypoint is missing. Add the declared file to the pack or adjust entry_point."));
         }
 
         // Determine command based on runner type

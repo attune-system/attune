@@ -1,7 +1,8 @@
 # Simple Echo Action for Testing
 # Echoes the input message back to verify action execution
 
-name: echo
+ref: test_pack.echo
+label: Echo
 description: "Echo a message back - simple test action"
 enabled: true
 runner_type: python
@@ -27,17 +28,15 @@ parameters:
     required: false
     default: false
 
-entry_point: actions/echo.py
+entry_point: echo.py
 
 output_schema:
-  type: object
-  properties:
-    message:
-      type: string
-      description: "The echoed message"
-    timestamp:
-      type: string
-      description: "Timestamp when the message was echoed"
-    execution_time:
-      type: number
-      description: "Time taken to execute in seconds"
+  message:
+    type: string
+    description: "The echoed message"
+  timestamp:
+    type: string
+    description: "Timestamp when the message was echoed"
+  execution_time:
+    type: number
+    description: "Time taken to execute in seconds"

@@ -7,6 +7,7 @@ import ParamSchemaForm, {
   validateParamSchema,
 } from "@/components/common/ParamSchemaForm";
 import { SchemaValueRows } from "@/components/common/CuratedDataPanel";
+import { ContractValueRows } from "@/components/common/ContractDataCard";
 import { useAuth } from "@/contexts/AuthContext";
 import { useInquiry, useRespondToInquiry } from "@/hooks/useInquiries";
 
@@ -103,6 +104,12 @@ export default function InquiryDetailPage() {
     inquiry.status === "pending" &&
     (inquiry.assigned_to == null || inquiry.assigned_to === user?.id);
   const responseSchema: ParamSchema = inquiry.response_schema ?? {};
+  const boundResponseContract: unknown =
+    typeof inquiry.schema_binding === "object" &&
+    inquiry.schema_binding !== null &&
+    "contract" in inquiry.schema_binding
+      ? inquiry.schema_binding.contract
+      : undefined;
   const hasResponseSchema = Object.keys(responseSchema).length > 0;
   const mutationError = responseError(respond.error);
 
@@ -224,12 +231,21 @@ export default function InquiryDetailPage() {
           <section className="rounded-lg bg-white p-6 shadow">
             <h2 className="text-lg font-semibold text-gray-900">Response</h2>
             <div className="mt-3">
-              <SchemaValueRows
-                schema={inquiry.response_schema}
-                values={inquiry.response}
-                emptyMessage="No response fields were provided."
-                maskSecrets
-              />
+              {boundResponseContract ? (
+                <ContractValueRows
+                  contract={boundResponseContract}
+                  values={inquiry.response}
+                  emptyMessage="No response fields were provided."
+                  maskSecrets
+                />
+              ) : (
+                <SchemaValueRows
+                  schema={inquiry.response_schema}
+                  values={inquiry.response}
+                  emptyMessage="No response fields were provided."
+                  maskSecrets
+                />
+              )}
             </div>
           </section>
         )}
@@ -255,9 +271,7 @@ export default function InquiryDetailPage() {
                       key={option.ref}
                       type="button"
                       disabled={respond.isPending}
-                      onClick={() =>
-                        respond.mutate({ response: option.response })
-                      }
+                      onClick={() => respond.mutate({ option_ref: option.ref })}
                       className={`rounded-md border px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60 ${optionClasses[option.style]}`}
                     >
                       {option.label}
@@ -270,6 +284,7 @@ export default function InquiryDetailPage() {
                 <div className="mt-5 border-t border-gray-200 pt-5">
                   <ParamSchemaForm
                     schema={responseSchema}
+                    contract={boundResponseContract}
                     values={responseValues}
                     onChange={setResponseValues}
                     errors={validationErrors}

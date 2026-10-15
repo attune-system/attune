@@ -5,12 +5,17 @@
 import type { LogRetentionLimitPatch } from "./LogRetentionLimitPatch";
 import type { LogRetentionPolicyPatch } from "./LogRetentionPolicyPatch";
 import type { WorkerAffinity } from "./WorkerAffinity";
+import type { WorkerToleration } from "./WorkerToleration";
 /**
  * Request DTO for updating a sensor
  */
 export type UpdateSensorRequest = {
   artifact_retention_limit?: null | LogRetentionLimitPatch;
   artifact_retention_policy?: null | LogRetentionPolicyPatch;
+  /**
+   * Complete replacement configuration. Omit to preserve the current encrypted revision.
+   */
+  config?: Record<string, any> | null;
   /**
    * Sensor description
    */
@@ -32,14 +37,14 @@ export type UpdateSensorRequest = {
   /**
    * Parameter schema (StackStorm-style with inline required/secret)
    */
-  param_schema?: any | null;
+  param_schema?: Record<string, any> | null;
   worker_affinity?: null | WorkerAffinity;
   /**
    * Worker labels required for this sensor process.
    */
-  worker_selector?: any | null;
+  worker_selector?: Record<string, any> | null;
   /**
    * Worker taints tolerated by this sensor process.
    */
-  worker_tolerations?: any[] | null;
+  worker_tolerations?: Array<WorkerToleration> | null;
 };

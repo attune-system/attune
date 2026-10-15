@@ -401,6 +401,31 @@ impl PartitionRepository {
             })?;
             result.partitions_dropped += i64::from(dropped);
         }
+        if table == ManagedTable::Event && !result.cancelled && Instant::now() < deadline {
+            let mut tx = bounded_transaction(pool, &remaining_config(config, deadline))
+                .await
+                .map_err(|e| failure(e, Some(result.candidates), result.partitions_dropped))?;
+            if let Err(source) =
+                crate::repositories::event_schema::EventSchemaRepository::cleanup_orphans(
+                    &mut tx,
+                    config.default_repair_row_limit,
+                    cutoff,
+                )
+                .await
+            {
+                tx.rollback().await.map_err(|e| {
+                    failure(e.into(), Some(result.candidates), result.partitions_dropped)
+                })?;
+                return Err(failure(
+                    source,
+                    Some(result.candidates),
+                    result.partitions_dropped,
+                ));
+            }
+            tx.commit().await.map_err(|e| {
+                failure(e.into(), Some(result.candidates), result.partitions_dropped)
+            })?;
+        }
         Ok(result)
     }
 

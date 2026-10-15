@@ -43,7 +43,7 @@ use attune_common::system_alert::{emit_core_alert, SystemAlert};
 use attune_common::version_matching::select_best_version;
 use chrono::{DateTime, Utc};
 
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
@@ -52,9 +52,9 @@ use std::io::SeekFrom;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 #[cfg(test)]
 use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -79,6 +79,26 @@ const SENSOR_RECONCILIATION_MAX_ATTEMPTS: u32 = 3;
 const SENSOR_RECONCILIATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const STDERR_EXCERPT_MAX_BYTES: u64 = 16 * 1024;
 const STDERR_EXCERPT_MAX_LINES: usize = 80;
+
+async fn deliver_sensor_bootstrap(
+    child: &mut Child,
+    bootstrap: &[u8],
+    deadline: Duration,
+) -> Result<()> {
+    let delivery = async {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Sensor stdin is unavailable"))?;
+        stdin.write_all(bootstrap).await?;
+        stdin.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    match tokio::time::timeout(deadline, delivery).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(anyhow!("Sensor bootstrap delivery failed or timed out")),
+    }
+}
 
 fn existing_command_env(cmd: &Command, key: &str) -> Option<String> {
     cmd.as_std().get_envs().find_map(|(env_key, value)| {
@@ -191,6 +211,7 @@ fn collect_sensor_token_trigger_types(triggers: &[Trigger]) -> Vec<String> {
     trigger_types
 }
 
+#[cfg(test)]
 fn collect_sensor_token_permission_set_refs(
     sensor_ref: &str,
     config: Option<&serde_json::Value>,
@@ -494,8 +515,8 @@ async fn read_sensor_stderr_excerpt_from_artifacts_dir(
 async fn read_sensor_stderr_excerpt_from_transport(
     transport: &dyn ArtifactFileTransport,
     sensor_ref: &str,
+    relative_path: &str,
 ) -> Option<String> {
-    let relative_path = format!("sensors/{}/stderr.log", sensor_ref);
     let size = match transport.file_size(&relative_path).await {
         Ok(Some(size)) => size,
         Err(e) => {
@@ -511,7 +532,7 @@ async fn read_sensor_stderr_excerpt_from_transport(
         Ok(None) => return None,
     };
     let start = size.saturating_sub(STDERR_EXCERPT_MAX_BYTES);
-    let mut reader = match transport.open_reader(&relative_path, start).await {
+    let reader = match transport.open_reader(relative_path, start).await {
         Ok(reader) => reader,
         Err(e) => {
             debug!(
@@ -525,7 +546,11 @@ async fn read_sensor_stderr_excerpt_from_transport(
         }
     };
     let mut bytes = Vec::with_capacity((size - start) as usize);
-    if let Err(e) = reader.read_to_end(&mut bytes).await {
+    if let Err(e) = reader
+        .take(STDERR_EXCERPT_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .await
+    {
         warn!(
             "Failed to read stderr excerpt for sensor {} from {} transport: {}",
             sensor_ref,
@@ -616,6 +641,7 @@ pub struct SensorManager {
 }
 
 pub struct SensorManagerConfig {
+    pub encryption_key: Option<String>,
     pub child_environment: ChildProcessEnvironment,
     pub api_url: String,
     pub worker_token_provider: Option<Arc<WorkerTokenProvider>>,
@@ -654,6 +680,8 @@ struct ExitedSensorProcess {
 struct SensorTokenRotation {
     cancelled: AtomicBool,
     notify: Notify,
+    generation_binding: AtomicI64,
+    sensitive_logs: AtomicBool,
 }
 
 impl SensorTokenRotation {
@@ -684,6 +712,7 @@ fn remove_if_identity<T>(
 }
 
 struct SensorManagerInner {
+    encryption_key: Option<String>,
     child_environment: ChildProcessEnvironment,
     db: PgPool,
     sensors: Arc<RwLock<HashMap<Id, SensorInstance>>>,
@@ -735,6 +764,7 @@ impl SensorManager {
 
         Self {
             inner: Arc::new(SensorManagerInner {
+                encryption_key: config.encryption_key,
                 child_environment: config.child_environment,
                 db,
                 sensors: Arc::new(RwLock::new(HashMap::new())),
@@ -1149,21 +1179,34 @@ impl SensorManager {
             }
         };
         let definition_updated = sensor.updated;
-        let executable_snapshot = workload
-            .executable_snapshot
-            .clone()
-            .map(serde_json::from_value::<attune_common::models::SensorExecutableSnapshot>)
-            .transpose()?;
-        let sensor = executable_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.sensor.clone())
-            .unwrap_or(sensor);
+        let mut connection = self.inner.db.acquire().await?;
+        let (binding_id, binding, public_config) =
+            attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+                &mut *connection,
+                workload.workload_id,
+                workload.generation,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("Sensor generation binding is unavailable"))?;
+        let config =
+            attune_common::repositories::sensor_schema::SensorSchemaRepository::restore_config(
+                &mut connection,
+                binding_id,
+                &binding,
+                public_config,
+                self.inner.encryption_key.as_deref(),
+            )
+            .await?;
+        drop(connection);
+        let mut sensor = binding.executable.sensor.clone();
+        sensor.config = Some(config);
+        let token_trigger_types = binding.triggers.keys().cloned().collect();
+        let executable_snapshot = Some(binding.executable);
 
         let started = match timeout(
             SENSOR_STARTUP_TIMEOUT,
             self.start_standalone_sensor(
                 sensor.clone(),
-                enabled_triggers,
                 token_trigger_types,
                 reset_failure_count,
                 workload.clone(),
@@ -1232,7 +1275,6 @@ impl SensorManager {
     async fn start_standalone_sensor(
         &self,
         sensor: Sensor,
-        triggers: Vec<Trigger>,
         token_trigger_types: Vec<String>,
         reset_failure_count: bool,
         workload: OwnedSensorWorkload,
@@ -1250,10 +1292,11 @@ impl SensorManager {
             sensor_ref: sensor.r#ref.clone(),
             pack_ref: pack_ref.clone(),
             trigger_types: token_trigger_types,
-            permission_set_refs: collect_sensor_token_permission_set_refs(
-                &sensor.r#ref,
-                sensor.config.as_ref(),
-            )?,
+            permission_set_refs: executable_snapshot
+                .as_ref()
+                .ok_or_else(|| anyhow!("Sensor executable snapshot is unavailable"))?
+                .cache_permission_set_refs
+                .clone(),
             workload_fence: workload.fence(),
         };
 
@@ -1407,39 +1450,42 @@ impl SensorManager {
             "Resolved sensor runtime"
         );
 
-        // Fetch trigger instances (enabled rules with their trigger params) for ALL triggers
-        info!(
-            "About to fetch trigger instances for sensor {} ({} trigger(s))",
-            sensor.r#ref,
-            triggers.len()
-        );
-        let mut trigger_instances = Vec::new();
-        for trig in &triggers {
-            match self.fetch_trigger_instances(trig.id).await {
-                Ok(instances) => {
-                    info!(
-                        "Fetched {} trigger instance(s) for trigger {} (sensor {})",
-                        instances.len(),
-                        trig.r#ref,
-                        sensor.r#ref
-                    );
-                    trigger_instances.extend(instances);
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to fetch trigger instances for trigger {} (sensor {}): {}",
-                        trig.r#ref, sensor.r#ref, e
-                    );
-                    return Err(e);
-                }
-            }
-        }
+        // Initial rule values are pinned at admission, not refetched after token
+        // provisioning or runtime setup.
+        let (binding_id, generation_binding, _) =
+            attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+                &self.inner.db,
+                workload.workload_id,
+                workload.generation,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("Sensor generation binding is unavailable"))?;
+        let sensitive_logs = generation_binding.requires_protected_logs()?;
+        let mut connection = self.inner.db.acquire().await?;
+        let trigger_instances = attune_common::repositories::sensor_schema::SensorSchemaRepository::restore_initial_rules(
+            &mut connection, binding_id, &generation_binding, self.inner.encryption_key.as_deref()).await?;
+        drop(connection);
 
-        let trigger_instances_json = serde_json::to_string(&trigger_instances)
-            .map_err(|e| anyhow!("Failed to serialize trigger instances: {}", e))?;
-        let sensor_config_json =
-            serde_json::to_string(sensor.config.as_ref().unwrap_or(&serde_json::Value::Null))
-                .map_err(|e| anyhow!("Failed to serialize sensor config: {}", e))?;
+        // Rule-instance parameters can contain secrets too. Both value sections
+        // use one stdin bootstrap, never environment variables.
+        let config = sensor
+            .config
+            .clone()
+            .filter(|value| !value.is_null())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !config.is_object() {
+            return Err(anyhow!("Sensor configuration must be a flat object"));
+        }
+        let bootstrap = serde_json::to_vec(&serde_json::json!({
+            "config": config,
+            "triggers": trigger_instances,
+        }))
+        .map_err(|_| anyhow!("Failed to encode sensor bootstrap"))?;
+        if bootstrap.len() > 32 * 1024 * 1024 {
+            return Err(anyhow!(
+                "Sensor bootstrap exceeds its 32 MiB delivery limit"
+            ));
+        }
         let trigger_types_json = serde_json::to_string(&token_scope.trigger_types)
             .map_err(|e| anyhow!("Failed to serialize sensor trigger types: {}", e))?;
         info!(
@@ -1514,8 +1560,6 @@ impl SensorManager {
                 "ATTUNE_SENSOR_ASSIGNMENT_GENERATION",
                 workload.generation.to_string(),
             )
-            .env("ATTUNE_SENSOR_TRIGGERS", &trigger_instances_json)
-            .env("ATTUNE_SENSOR_CONFIG_JSON", &sensor_config_json)
             .env("ATTUNE_SENSOR_TRIGGER_TYPES", &trigger_types_json)
             .env(
                 "ATTUNE_ARTIFACTS_DIR",
@@ -1530,12 +1574,14 @@ impl SensorManager {
         );
 
         apply_runtime_env_vars(&mut cmd, &exec_config, &pack_dir, env_dir_opt);
+        cmd.env_remove("ATTUNE_SENSOR_TRIGGERS")
+            .env_remove("ATTUNE_SENSOR_CONFIG_JSON");
         configure_sensor_process(&mut cmd)
             .map_err(|e| anyhow!("Failed to configure sensor process: {}", e))?;
         cmd.kill_on_drop(true);
 
         let mut child = cmd
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1563,10 +1609,11 @@ impl SensorManager {
 
         // Artifact-backed logs remain authoritative. Optional structured mirroring
         // makes the same output available to container log collectors.
-        let log_config = self
+        let mut log_config = self
             .inner
             .sensor_log_config
             .with_retention_overrides(sensor.log_retention_policy, sensor.log_retention_limit);
+        log_config.generation_binding_id = Some(binding_id);
         // Register sensor log artifacts in DB before the log tasks start so
         // written segments can be associated with artifact versions.
         let log_artifacts = crate::sensor_log::register_sensor_log_artifacts(
@@ -1589,8 +1636,8 @@ impl SensorManager {
                     assignment_generation: workload.generation,
                     process_id: child.id(),
                 },
-                self.inner.mirror_runtime_stdout_to_stdio,
-                self.inner.mirror_runtime_stderr_to_stdio,
+                self.inner.mirror_runtime_stdout_to_stdio && !sensitive_logs,
+                self.inner.mirror_runtime_stderr_to_stdio && !sensitive_logs,
             );
 
         let stdout_handle = crate::sensor_log::spawn_stdout_log_task(
@@ -1612,11 +1659,25 @@ impl SensorManager {
             stderr_mirror_source,
         );
 
+        // Start output readers before writing a potentially large bootstrap so
+        // startup logging cannot deadlock the stdin/stdout pipes.
+        if deliver_sensor_bootstrap(&mut child, &bootstrap, Duration::from_secs(30))
+            .await
+            .is_err()
+        {
+            drop(startup_process_guard);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+            return Err(anyhow!("Sensor bootstrap delivery failed or timed out"));
+        }
+
         self.persist_sensor_process_started(&sensor, child.id(), reset_failure_count)
             .await;
         startup_process_guard.disarm();
 
-        Ok(SensorInstance::new_standalone(
+        let instance = SensorInstance::new_standalone(
             sensor,
             child,
             (stdout_handle, stderr_handle),
@@ -1624,7 +1685,16 @@ impl SensorManager {
             workload,
             pack_revision,
             definition_updated,
-        ))
+        );
+        instance
+            .token_rotation
+            .generation_binding
+            .store(binding_id, Ordering::Release);
+        instance
+            .token_rotation
+            .sensitive_logs
+            .store(sensitive_logs, Ordering::Release);
+        Ok(instance)
     }
 
     async fn ensure_required_pack_local(
@@ -1701,7 +1771,7 @@ impl SensorManager {
             ));
         }
 
-        match SensorWorkloadAdmissionRepository::acquire(
+        match SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
             &self.inner.db,
             AcquireSensorWorkloadInput {
                 sensor_id,
@@ -1709,6 +1779,7 @@ impl SensorManager {
                 worker_instance: self.inner.worker_instance,
                 lease_seconds: SENSOR_WORKLOAD_STARTUP_LEASE_SECONDS,
             },
+            self.inner.encryption_key.as_deref(),
         )
         .await?
         {
@@ -1829,10 +1900,43 @@ impl SensorManager {
         }
     }
 
-    async fn read_sensor_stderr_excerpt(&self, sensor_ref: &str) -> Option<String> {
+    async fn read_sensor_stderr_excerpt(
+        &self,
+        sensor_ref: &str,
+        expected_binding: i64,
+    ) -> Option<String> {
+        use attune_common::repositories::sensor_schema::SensorSchemaRepository;
+        use attune_common::repositories::{
+            artifact::{ArtifactRepository, ArtifactVersionRepository},
+            FindByRef,
+        };
+        let artifact =
+            ArtifactRepository::find_by_ref(&self.inner.db, &format!("sensor.{sensor_ref}.stderr"))
+                .await
+                .ok()??;
+        let version = ArtifactVersionRepository::find_latest(&self.inner.db, artifact.id)
+            .await
+            .ok()??;
+        let (binding_id, _) =
+            SensorSchemaRepository::find_log_generation(&self.inner.db, version.id)
+                .await
+                .ok()??;
+        if binding_id != expected_binding {
+            return None;
+        }
+        let (binding, _) = SensorSchemaRepository::find_by_binding_id(&self.inner.db, binding_id)
+            .await
+            .ok()??;
+        if binding.requires_protected_logs().ok()? {
+            return Some(
+                "Sensor diagnostics are protected; inspect its authorized runtime logs".into(),
+            );
+        }
+        let path = version.file_path.as_deref()?;
         read_sensor_stderr_excerpt_from_transport(
             self.inner.artifact_transport.as_ref(),
             sensor_ref,
+            path,
         )
         .await
     }
@@ -2262,54 +2366,6 @@ impl SensorManager {
         .await?;
 
         Ok(count)
-    }
-
-    /// Fetch trigger instances (enabled rules with their trigger params) for a trigger
-    async fn fetch_trigger_instances(&self, trigger_id: Id) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT r.*, t.ref AS trigger_ref
-            FROM rule r
-            JOIN trigger t ON t.id = r.trigger
-            WHERE r.trigger = $1
-              AND r.effective_enabled
-              AND t.effective_enabled
-              AND r.retired_at IS NULL
-              AND t.retired_at IS NULL
-            "#,
-        )
-        .bind(trigger_id)
-        .fetch_all(&self.inner.db)
-        .await?;
-
-        info!("Fetched {} rows from rule table", rows.len());
-
-        // Convert to the format expected by timer sensor
-        let trigger_instances: Vec<serde_json::Value> = rows
-            .into_iter()
-            .map(|row| {
-                let id: i64 = row.try_get("id").unwrap_or(0);
-                let ref_str: String = row.try_get("ref").unwrap_or_default();
-                let trigger_params: serde_json::Value = row
-                    .try_get("trigger_params")
-                    .unwrap_or(serde_json::json!({}));
-                let trigger_ref: String = row.try_get("trigger_ref").unwrap_or_default();
-
-                info!(
-                    "Rule ID: {}, Ref: {}, Trigger: {}, Params: {}",
-                    id, ref_str, trigger_ref, trigger_params
-                );
-
-                serde_json::json!({
-                    "id": id,
-                    "ref": ref_str,
-                    "trigger_ref": trigger_ref,
-                    "config": trigger_params
-                })
-            })
-            .collect();
-
-        Ok(trigger_instances)
     }
 
     fn schedule_sensor_token_rotation(
@@ -2787,7 +2843,22 @@ impl SensorManager {
         let backoff_delay = sensor_restart_backoff_delay(current_failure_count);
         let next_restart_at = Utc::now() + duration_to_chrono(backoff_delay);
         self.sync_sensor_file_artifacts(&exited.sensor).await;
-        let stderr_excerpt = self.read_sensor_stderr_excerpt(&exited.sensor.r#ref).await;
+        let stderr_excerpt = if exited
+            .instance_identity
+            .sensitive_logs
+            .load(Ordering::Acquire)
+        {
+            Some("Sensor diagnostics are protected; inspect its authorized runtime logs".into())
+        } else {
+            self.read_sensor_stderr_excerpt(
+                &exited.sensor.r#ref,
+                exited
+                    .instance_identity
+                    .generation_binding
+                    .load(Ordering::Acquire),
+            )
+            .await
+        };
 
         let process = match SensorProcessRepository::mark_failed_or_backoff(
             &self.inner.db,
@@ -2969,13 +3040,13 @@ impl SensorManager {
         &self,
         sensor: Sensor,
         identity: Arc<SensorTokenRotation>,
-        error_message: String,
+        _error_message: String,
     ) {
         let worker_id = self.inner.worker_id.load(Ordering::SeqCst);
         if worker_id <= 0 {
             warn!(
                 "Cannot persist restart failure for sensor {} because worker_id is unset: {}",
-                sensor.r#ref, error_message
+                sensor.r#ref, "protected startup diagnostics"
             );
             return;
         }
@@ -3010,7 +3081,8 @@ impl SensorManager {
         .unwrap_or(1);
         let backoff_delay = sensor_restart_backoff_delay(next_failure_count);
         let next_restart_at = Utc::now() + duration_to_chrono(backoff_delay);
-        let stderr_excerpt = Some(format!("restart failed: {}", error_message));
+        let stderr_excerpt =
+            Some("Sensor restart failed; inspect its authorized runtime logs".to_string());
 
         let process = match SensorProcessRepository::mark_failed_or_backoff(
             &self.inner.db,
@@ -3874,6 +3946,94 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn sensor_bootstrap_survives_full_output_pipes_and_restarts_with_stdin_eof() {
+        use tokio::io::AsyncReadExt;
+        let root = tempfile::TempDir::new().unwrap();
+        let script = root.path().join("bootstrap.sh");
+        std::fs::write(&script,"#!/bin/sh\ntest -z \"${ATTUNE_SENSOR_CONFIG+x}\" || exit 41\nhead -c 131072 /dev/zero >&2\ncat\n").unwrap();
+        let environment = ChildProcessEnvironment::capture(&[]).unwrap();
+        let mut config = RuntimeExecutionConfig::default();
+        config.interpreter.binary = "/bin/sh".into();
+        let bootstrap = serde_json::to_vec(&serde_json::json!({
+            "config":{"token":"stdin-secret-fixture".repeat(16384)},
+            "triggers":[{"rule_ref":"fixture.rule","parameters":{"token":"rule-secret-fixture"}}]
+        }))
+        .unwrap();
+        for _ in 0..2 {
+            let (_, mut command) = build_sensor_command(
+                script.to_str().unwrap(),
+                false,
+                &config,
+                root.path(),
+                None,
+                &environment,
+            );
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = command.spawn().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+            let output = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            });
+            let diagnostics = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            });
+            let delivery =
+                deliver_sensor_bootstrap(&mut child, &bootstrap, Duration::from_secs(5)).await;
+            if delivery.is_err() {
+                child.kill().await.unwrap();
+            }
+            let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            if status.is_err() {
+                child.kill().await.unwrap();
+                child.wait().await.unwrap();
+            }
+            let received = output.await.unwrap();
+            let logs = diagnostics.await.unwrap();
+            assert!(delivery.is_ok());
+            assert!(status.unwrap().unwrap().success());
+            // Do not use assert_eq on secret-bearing buffers: failure output must stay safe.
+            assert!(
+                received == bootstrap,
+                "Sensor bootstrap changed during delivery"
+            );
+            assert_eq!(logs.len(), 131072);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_sensor_bootstrap_times_out_without_disclosing_input() {
+        let environment = ChildProcessEnvironment::capture(&[]).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        environment.apply(command.as_std_mut());
+        command
+            .arg("60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let bootstrap = b"secret-fixture".repeat(131072);
+        let result =
+            deliver_sensor_bootstrap(&mut child, &bootstrap, Duration::from_millis(100)).await;
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        let error = result.unwrap_err().to_string();
+        assert_eq!(error, "Sensor bootstrap delivery failed or timed out");
+        assert!(child.stdin.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn sensor_processes_and_install_hooks_do_not_inherit_service_credentials() {
         const TEST_NAME: &str = "sensor_manager::tests::sensor_processes_and_install_hooks_do_not_inherit_service_credentials";
         const MARKER: &str = "ATTUNE_SENSOR_ENVIRONMENT_TEST_CHILD";
@@ -4045,6 +4205,7 @@ mod tests {
             enabled,
             enabled_override: None,
             param_schema: None,
+            event_config_schema: None,
             out_schema: None,
             webhook_enabled: false,
             webhook_key: None,

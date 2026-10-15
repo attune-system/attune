@@ -288,6 +288,25 @@ impl WorkflowContext {
     }
 
     /// Set the keystore secrets (accessible as `keystore.<key>`).
+    pub fn set_bound_pack_config(
+        &mut self,
+        config: JsonValue,
+        revision: i64,
+        secret_paths: &[JsonPointer],
+    ) {
+        self.set_pack_config(config);
+        for path in secret_paths {
+            self.mark_secret_source_path(&format!("config{}", pointer_to_expression_suffix(path)),
+                SecretSource::Bound(attune_common::secret_provenance::SecretProvenance {
+                    origins: vec![attune_common::secret_provenance::SecretOrigin::Entity {
+                        entity_type: attune_common::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION.into(),
+                        entity_id: revision, path: path.clone(),
+                    }], templates: Vec::new(),
+                }));
+        }
+    }
+
+    /// Set the keystore secrets (accessible as `keystore.<key>`).
     #[allow(dead_code)] // Part of complete context API; used in tests
     pub fn set_keystore(&mut self, secrets: JsonValue) {
         self.keystore = Arc::new(secrets);

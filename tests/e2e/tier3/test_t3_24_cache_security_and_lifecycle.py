@@ -88,6 +88,7 @@ def test_cache_identity_execution_and_sensor_scopes_do_not_disclose_payloads(
     assert other_pack["ref"] == other_pack_ref
     restricted = authorized = None
     restricted_identity = authorized_identity = None
+    sensor_log_assignment = None
     sentinel = high_entropy_sentinel()
     try:
         with cache_namespace(
@@ -324,6 +325,14 @@ def test_cache_identity_execution_and_sensor_scopes_do_not_disclose_payloads(
             )
             assert sensor_rule["enabled"] is True
             sensor_ref = f"{pack_ref}.cache_reader"
+            identity = client.get("/auth/me")
+            assert identity.status_code == 200
+            assignment = client.post("/api/v1/permissions/assignments", json={
+                "identity_id": identity.json()["data"]["id"],
+                "permission_set_ref": f"{pack_ref}.cache_sensor_log_reader",
+            })
+            assert assignment.status_code == 201
+            sensor_log_assignment = assignment.json()["data"]["id"]
             sensor_log = ""
 
             def sensor_probe_logged() -> bool:
@@ -354,6 +363,9 @@ def test_cache_identity_execution_and_sensor_scopes_do_not_disclose_payloads(
                 f"cache payload leaked into audit/service error metadata: {owner_assertion}"
             )
     finally:
+        if sensor_log_assignment is not None:
+            response = client.delete(f"/api/v1/permissions/assignments/{sensor_log_assignment}")
+            assert response.status_code in (200, 404)
         if restricted is not None:
             restricted.logout()
         if authorized is not None:

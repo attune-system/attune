@@ -56,7 +56,7 @@ export class WorkflowsService {
       /**
        * Output schema
        */
-      out_schema: any | null;
+      out_schema: Record<string, any> | null;
       /**
        * Pack ID
        */
@@ -68,7 +68,7 @@ export class WorkflowsService {
       /**
        * Parameter schema (StackStorm-style with inline required/secret)
        */
-      param_schema: any | null;
+      param_schema: Record<string, any> | null;
       /**
        * Unique reference identifier
        */
@@ -228,7 +228,7 @@ export class WorkflowsService {
       /**
        * Output schema
        */
-      out_schema: any | null;
+      out_schema: Record<string, any> | null;
       /**
        * Pack ID
        */
@@ -240,7 +240,7 @@ export class WorkflowsService {
       /**
        * Parameter schema (StackStorm-style with inline required/secret)
        */
-      param_schema: any | null;
+      param_schema: Record<string, any> | null;
       /**
        * Unique reference identifier
        */
@@ -316,7 +316,7 @@ export class WorkflowsService {
       /**
        * Output schema
        */
-      out_schema: any | null;
+      out_schema: Record<string, any> | null;
       /**
        * Pack ID
        */
@@ -328,7 +328,7 @@ export class WorkflowsService {
       /**
        * Parameter schema (StackStorm-style with inline required/secret)
        */
-      param_schema: any | null;
+      param_schema: Record<string, any> | null;
       /**
        * Unique reference identifier
        */
@@ -405,7 +405,7 @@ export class WorkflowsService {
       /**
        * Output schema
        */
-      out_schema: any | null;
+      out_schema: Record<string, any> | null;
       /**
        * Pack ID
        */
@@ -417,7 +417,7 @@ export class WorkflowsService {
       /**
        * Parameter schema (StackStorm-style with inline required/secret)
        */
-      param_schema: any | null;
+      param_schema: Record<string, any> | null;
       /**
        * Unique reference identifier
        */
@@ -521,7 +521,7 @@ export class WorkflowsService {
       /**
        * Output schema
        */
-      out_schema: any | null;
+      out_schema: Record<string, any> | null;
       /**
        * Pack ID
        */
@@ -533,7 +533,7 @@ export class WorkflowsService {
       /**
        * Parameter schema (StackStorm-style with inline required/secret)
        */
-      param_schema: any | null;
+      param_schema: Record<string, any> | null;
       /**
        * Unique reference identifier
        */

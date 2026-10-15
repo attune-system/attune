@@ -95,7 +95,7 @@ function QueueSchemaPreview({
             <span className="rounded bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700">
               {field.type || "string"}
             </span>
-            {field.required && (
+            {field.required === true && (
               <span className="rounded bg-red-50 px-2 py-0.5 text-[11px] font-medium text-red-700">
                 Required
               </span>

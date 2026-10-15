@@ -5,14 +5,9 @@
 import type { Value } from "./Value";
 export type ArtifactJsonPatch =
   | {
-      op: ArtifactJsonPatch.op;
+      op: "set";
       value: Value;
     }
   | {
-      op: ArtifactJsonPatch.op;
+      op: "clear";
     };
-export namespace ArtifactJsonPatch {
-  export enum op {
-    SET = "set",
-  }
-}

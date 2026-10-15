@@ -50,6 +50,7 @@ class ApiResponseInquiryResponseData:
         responded_by (int | None | Unset):
         responded_by_display_name (None | str | Unset):
         responded_by_login (None | str | Unset):
+        schema_binding (Any | None | Unset):
         timeout_at (datetime.datetime | None | Unset): When the inquiry expires Example: 2024-01-13T11:30:00Z.
         workflow_action_ref (None | str | Unset):
         workflow_execution (int | None | Unset):
@@ -77,6 +78,7 @@ class ApiResponseInquiryResponseData:
     responded_by: int | None | Unset = UNSET
     responded_by_display_name: None | str | Unset = UNSET
     responded_by_login: None | str | Unset = UNSET
+    schema_binding: Any | None | Unset = UNSET
     timeout_at: datetime.datetime | None | Unset = UNSET
     workflow_action_ref: None | str | Unset = UNSET
     workflow_execution: int | None | Unset = UNSET
@@ -186,6 +188,12 @@ class ApiResponseInquiryResponseData:
         else:
             responded_by_login = self.responded_by_login
 
+        schema_binding: Any | None | Unset
+        if isinstance(self.schema_binding, Unset):
+            schema_binding = UNSET
+        else:
+            schema_binding = self.schema_binding
+
         timeout_at: None | str | Unset
         if isinstance(self.timeout_at, Unset):
             timeout_at = UNSET
@@ -259,6 +267,8 @@ class ApiResponseInquiryResponseData:
             field_dict["responded_by_display_name"] = responded_by_display_name
         if responded_by_login is not UNSET:
             field_dict["responded_by_login"] = responded_by_login
+        if schema_binding is not UNSET:
+            field_dict["schema_binding"] = schema_binding
         if timeout_at is not UNSET:
             field_dict["timeout_at"] = timeout_at
         if workflow_action_ref is not UNSET:
@@ -454,6 +464,15 @@ class ApiResponseInquiryResponseData:
             d.pop("responded_by_login", UNSET)
         )
 
+        def _parse_schema_binding(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        schema_binding = _parse_schema_binding(d.pop("schema_binding", UNSET))
+
         def _parse_timeout_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
                 return data
@@ -544,6 +563,7 @@ class ApiResponseInquiryResponseData:
             responded_by=responded_by,
             responded_by_display_name=responded_by_display_name,
             responded_by_login=responded_by_login,
+            schema_binding=schema_binding,
             timeout_at=timeout_at,
             workflow_action_ref=workflow_action_ref,
             workflow_execution=workflow_execution,

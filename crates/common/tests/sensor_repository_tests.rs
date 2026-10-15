@@ -8,7 +8,7 @@ mod helpers;
 use attune_common::{
     repositories::{
         trigger::{CreateSensorInput, SensorRepository, UpdateSensorInput},
-        Create, Delete, FindById, FindByRef, List, Patch, Update,
+        Delete, FindById, FindByRef, List, Patch,
     },
     Error,
 };
@@ -83,18 +83,8 @@ async fn test_create_sensor_with_param_schema() {
         .unwrap();
 
     let param_schema = json!({
-        "type": "object",
-        "properties": {
-            "interval": {
-                "type": "integer",
-                "minimum": 1
-            },
-            "endpoint": {
-                "type": "string",
-                "format": "uri"
-            }
-        },
-        "required": ["interval"]
+        "interval": {"type": "integer", "minimum": 1, "required": true},
+        "endpoint": {"type": "string", "format": "uri"}
     });
 
     let sensor = SensorFixture::new_unique(
@@ -291,7 +281,7 @@ async fn test_create_sensor_invalid_pack_fails() {
 
     let result = SensorRepository::create(&pool, input).await;
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), Error::Database(_)));
+    assert!(matches!(result.unwrap_err(), Error::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -810,13 +800,7 @@ async fn test_update_param_schema() {
     .unwrap();
 
     let new_schema = json!({
-        "type": "object",
-        "properties": {
-            "timeout": {
-                "type": "integer",
-                "minimum": 0
-            }
-        }
+        "timeout": {"type": "integer", "minimum": 0}
     });
 
     let input = UpdateSensorInput {
@@ -866,7 +850,7 @@ async fn test_update_multiple_fields() {
         description: Some(Patch::Set("Updated multiple fields".to_string())),
         entrypoint: Some("sensors/multi.py".to_string()),
         enabled: Some(false),
-        param_schema: Some(Patch::Set(json!({"type": "object"}))),
+        param_schema: Some(Patch::Set(json!({}))),
         ..Default::default()
     };
 
@@ -881,7 +865,7 @@ async fn test_update_multiple_fields() {
     );
     assert_eq!(updated.entrypoint, "sensors/multi.py");
     assert!(!updated.enabled);
-    assert_eq!(updated.param_schema, Some(json!({"type": "object"})));
+    assert_eq!(updated.param_schema, Some(json!({})));
 }
 
 #[tokio::test]
@@ -1074,6 +1058,7 @@ async fn test_delete_sensor_nullifies_trigger_sensor_ref() {
         description: None,
         enabled: None,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: Some(attune_common::repositories::Patch::Set(sensor.id)),
         sensor_ref: Some(attune_common::repositories::Patch::Set(
@@ -1486,16 +1471,12 @@ async fn test_param_schema_complex_structure() {
         .unwrap();
 
     let complex_schema = json!({
-        "type": "object",
-        "properties": {
             "connection": {
-                "type": "object",
-                "properties": {
-                    "host": { "type": "string" },
-                    "port": { "type": "integer" },
-                    "ssl": { "type": "boolean" }
-                },
-                "required": ["host", "port"]
+                "$defs": {"settings": {"type": "object", "properties": {
+                    "host": {"type": "string"}, "port": {"type": "integer"}, "ssl": {"type": "boolean"}
+                }, "required": ["host", "port"]}},
+                "$ref": "#/connection/$defs/settings",
+                "required": true
             },
             "filters": {
                 "type": "array",
@@ -1511,10 +1492,9 @@ async fn test_param_schema_complex_structure() {
             "poll_interval": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 3600
+                "maximum": 3600,
+                "required": true
             }
-        },
-        "required": ["connection", "poll_interval"]
     });
 
     let sensor = SensorFixture::new_unique(
@@ -1571,7 +1551,7 @@ async fn test_param_schema_can_be_null() {
     assert_eq!(sensor.param_schema, None);
 
     // Update to add schema
-    let schema = json!({"type": "object"});
+    let schema = json!({});
     let input = UpdateSensorInput {
         param_schema: Some(Patch::Set(schema.clone())),
         ..Default::default()

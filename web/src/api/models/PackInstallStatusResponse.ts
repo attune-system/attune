@@ -11,6 +11,7 @@ export type PackInstallStatusResponse = {
    * Policy applied to metadata omitted by this release.
    */
   absent_metadata_policy: AbsentMetadataPolicy;
+  diagnostic_details?: any;
   /**
    * Failure detail, when the install failed
    */

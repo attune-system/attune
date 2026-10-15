@@ -17,7 +17,7 @@ export type CreateArtifactRequest = {
   /**
    * Initial structured data (for progress-type artifacts or metadata)
    */
-  data?: any | null;
+  data?: Record<string, any> | null;
   /**
    * Optional description
    */

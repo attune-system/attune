@@ -4,14 +4,9 @@
 /* eslint-disable */
 export type PackDescriptionPatch =
   | {
-      op: PackDescriptionPatch.op;
+      op: "set";
       value: string;
     }
   | {
-      op: PackDescriptionPatch.op;
+      op: "clear";
     };
-export namespace PackDescriptionPatch {
-  export enum op {
-    SET = "set",
-  }
-}

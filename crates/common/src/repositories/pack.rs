@@ -11,7 +11,7 @@ use sqlx::{Acquire, Executor, Postgres, QueryBuilder};
 
 use super::{
     cache::{CacheEntryRepository, CacheTransactionMode},
-    text_search_patterns, Create, FindById, FindByRef, List, Pagination, Patch, Repository, Update,
+    text_search_patterns, FindById, FindByRef, List, Pagination, Patch, Repository,
 };
 
 /// Repository for Pack operations
@@ -24,6 +24,7 @@ struct PackDeletionState {
     enforcements: bool,
     work_queue_items: bool,
     sensor_workloads: bool,
+    static_actions: bool,
     deleted: bool,
 }
 
@@ -45,6 +46,9 @@ impl PackDeletionState {
         }
         if self.sensor_workloads {
             blockers.push("active sensor workloads");
+        }
+        if self.static_actions {
+            blockers.push("admitted workflow task contracts");
         }
 
         if blockers.is_empty() {
@@ -69,11 +73,18 @@ const PACK_DELETION_QUERY: &str = r#"
                 SELECT 1 FROM execution e
                 JOIN locked_releases r ON r.id = e.pack_release
                 WHERE e.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')
+            ) OR EXISTS (
+                SELECT 1 FROM runtime_input_authority a JOIN execution e ON a.owner_kind = 'execution' AND a.owner_id = e.id
+                WHERE (a.authority->>'pack_id')::BIGINT IN (SELECT id FROM locked_pack)
+                  AND e.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')
             ) AS executions,
             EXISTS(
                 SELECT 1 FROM enforcement e
                 JOIN locked_releases r ON r.id = e.pack_release
                 WHERE e.status = 'created'
+            ) OR EXISTS (
+                SELECT 1 FROM runtime_input_authority a JOIN enforcement e ON a.owner_kind = 'enforcement' AND a.owner_id = e.id
+                WHERE (a.authority->>'pack_id')::BIGINT IN (SELECT id FROM locked_pack) AND e.status = 'created'
             ) AS enforcements,
             EXISTS(
                 SELECT 1 FROM work_queue_item item
@@ -86,12 +97,30 @@ const PACK_DELETION_QUERY: &str = r#"
                 JOIN sensor_workload_assignment assignment ON assignment.workload = workload.id
                 WHERE assignment.worker IS NOT NULL
                   AND assignment.lease_expires_at > clock_timestamp()
-            ) AS sensor_workloads
+            ) AS sensor_workloads,
+            EXISTS(
+                SELECT 1 FROM runtime_schema_binding b
+                CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions', '{}'::jsonb)) child
+                WHERE (
+                    (child.value->'executable_snapshot'->'release'->>'id')::BIGINT IN (SELECT id FROM locked_releases)
+                    OR EXISTS(
+                        SELECT 1 FROM jsonb_each(COALESCE(child.value->'executable_snapshot'->'pack_executables', '{}'::jsonb)) nested
+                        WHERE (nested.value->'release'->>'id')::BIGINT IN (SELECT id FROM locked_releases)
+                    )
+                ) AND (
+                    b.entity_kind = 'execution' AND EXISTS(
+                        SELECT 1 FROM execution e WHERE e.id = b.entity_id
+                        AND e.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')
+                    ) OR b.entity_kind = 'enforcement' AND EXISTS(
+                        SELECT 1 FROM enforcement e WHERE e.id = b.entity_id AND e.status = 'created'
+                    )
+                )
+            ) AS static_actions
     ), deleted AS (
         DELETE FROM pack
         WHERE id = $1
           AND $2
-          AND NOT (SELECT executions OR enforcements OR work_queue_items OR sensor_workloads FROM blockers)
+          AND NOT (SELECT executions OR enforcements OR work_queue_items OR sensor_workloads OR static_actions FROM blockers)
         RETURNING id
     )
     SELECT
@@ -100,6 +129,7 @@ const PACK_DELETION_QUERY: &str = r#"
         enforcements,
         work_queue_items,
         sensor_workloads,
+        static_actions,
         EXISTS(SELECT 1 FROM deleted) AS deleted
     FROM blockers
 "#;
@@ -194,11 +224,121 @@ impl List for PackRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Create for PackRepository {
-    type CreateInput = CreatePackInput;
+impl PackRepository {
+    /// Deployment validates against files in the candidate release, not the
+    /// previously active registry. The caller retains the activation transaction.
+    pub async fn create_for_deployment(
+        connection: &mut sqlx::PgConnection,
+        input: CreatePackInput,
+        source: &std::path::Path,
+        policy: crate::models::AbsentMetadataPolicy,
+    ) -> Result<Pack> {
+        let mut transaction = sqlx::Connection::begin(connection).await?;
+        let pack = Self::create_row(&mut *transaction, input).await?;
+        Self::validate_deployment_schema(&mut transaction, &pack, source, policy).await?;
+        transaction.commit().await?;
+        Ok(pack)
+    }
 
-    async fn create<'e, E>(executor: E, input: Self::CreateInput) -> Result<Self::Entity>
+    pub async fn update_for_deployment(
+        connection: &mut sqlx::PgConnection,
+        id: i64,
+        input: UpdatePackInput,
+        source: &std::path::Path,
+        policy: crate::models::AbsentMetadataPolicy,
+    ) -> Result<Pack> {
+        let mut transaction = sqlx::Connection::begin(connection).await?;
+        super::schema_type::SchemaTypeRepository::lock_graph(&mut transaction, id).await?;
+        let pack = Self::update_row(&mut *transaction, id, input).await?;
+        Self::validate_deployment_schema(&mut transaction, &pack, source, policy).await?;
+        transaction.commit().await?;
+        Ok(pack)
+    }
+
+    async fn validate_deployment_schema(
+        connection: &mut sqlx::PgConnection,
+        pack: &Pack,
+        source: &std::path::Path,
+        policy: crate::models::AbsentMetadataPolicy,
+    ) -> Result<()> {
+        let plan = crate::pack_registry::schema_types::preflight(
+            connection,
+            pack.id,
+            &pack.r#ref,
+            source,
+            policy,
+        )
+        .await?;
+        crate::value_schema::compile(
+            crate::value_schema::SourceIdentity::Authoring {
+                component_ref: pack.r#ref.clone(),
+            },
+            crate::value_schema::SchemaContext::FlatDocument,
+            &pack.conf_schema,
+            &plan.registry,
+            crate::value_schema::Limits::default(),
+        )
+        .map_err(|error| {
+            Error::validation(format!(
+                "Invalid candidate pack configuration schema: {error}"
+            ))
+        })?;
+        super::schema_type::SchemaTypeRepository::replace_consumer_references(
+            connection,
+            pack.id,
+            "pack",
+            &pack.r#ref,
+            &[("conf_schema", Some(&pack.conf_schema))],
+        )
+        .await
+    }
+
+    pub fn create<'a, 'c, A>(
+        executor: A,
+        mut input: CreatePackInput,
+    ) -> impl std::future::Future<Output = Result<Pack>> + Send + 'a
+    where
+        A: sqlx::Acquire<'c, Database = Postgres> + Send + 'a,
+    {
+        async move {
+            let mut connection = executor.acquire().await?;
+            let mut transaction = sqlx::Connection::begin(&mut *connection).await?;
+            super::schema_type::SchemaTypeRepository::lock_selection(&mut transaction).await?;
+            let schema = std::mem::replace(&mut input.conf_schema, serde_json::json!({}));
+            let pack = Self::create_row(&mut *transaction, input).await?;
+            super::schema_contract::SchemaContractRepository::compile_owned_assignment(
+                &mut transaction,
+                crate::value_schema::SourceIdentity::Authoring {
+                    component_ref: pack.r#ref.clone(),
+                },
+                crate::value_schema::SchemaContext::FlatDocument,
+                &schema,
+                &pack,
+            )
+            .await?;
+            let pack = Self::update_row(
+                &mut *transaction,
+                pack.id,
+                UpdatePackInput {
+                    conf_schema: Some(schema),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            super::schema_type::SchemaTypeRepository::replace_consumer_references(
+                &mut transaction,
+                pack.id,
+                "pack",
+                &pack.r#ref,
+                &[("conf_schema", Some(&pack.conf_schema))],
+            )
+            .await?;
+            transaction.commit().await?;
+            Ok(pack)
+        }
+    }
+
+    async fn create_row<'e, E>(executor: E, input: CreatePackInput) -> Result<Pack>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -244,11 +384,49 @@ impl Create for PackRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Update for PackRepository {
-    type UpdateInput = UpdatePackInput;
+impl PackRepository {
+    pub fn update<'a, 'c, A>(
+        executor: A,
+        id: i64,
+        input: UpdatePackInput,
+    ) -> impl std::future::Future<Output = Result<Pack>> + Send + 'a
+    where
+        A: sqlx::Acquire<'c, Database = Postgres> + Send + 'a,
+    {
+        async move {
+            let mut connection = executor.acquire().await?;
+            let mut transaction = sqlx::Connection::begin(&mut *connection).await?;
+            super::schema_type::SchemaTypeRepository::lock_selection(&mut transaction).await?;
+            sqlx::query("SELECT id FROM pack WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+            let pack = Self::get_by_id(&mut *transaction, id).await?;
+            super::schema_contract::SchemaContractRepository::compile_owned_assignment(
+                &mut transaction,
+                crate::value_schema::SourceIdentity::Authoring {
+                    component_ref: pack.r#ref.clone(),
+                },
+                crate::value_schema::SchemaContext::FlatDocument,
+                input.conf_schema.as_ref().unwrap_or(&pack.conf_schema),
+                &pack,
+            )
+            .await?;
+            let pack = Self::update_row(&mut *transaction, id, input).await?;
+            super::schema_type::SchemaTypeRepository::replace_consumer_references(
+                &mut transaction,
+                pack.id,
+                "pack",
+                &pack.r#ref,
+                &[("conf_schema", Some(&pack.conf_schema))],
+            )
+            .await?;
+            transaction.commit().await?;
+            Ok(pack)
+        }
+    }
 
-    async fn update<'e, E>(executor: E, id: i64, input: Self::UpdateInput) -> Result<Self::Entity>
+    async fn update_row<'e, E>(executor: E, id: i64, input: UpdatePackInput) -> Result<Pack>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -385,6 +563,18 @@ impl Update for PackRepository {
 }
 
 impl PackRepository {
+    pub async fn find_by_ref_for_share(
+        connection: &mut sqlx::PgConnection,
+        reference: &str,
+    ) -> Result<Option<Pack>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {PACK_COLUMNS} FROM pack WHERE ref = $1 FOR SHARE"
+        ))
+        .bind(reference)
+        .fetch_optional(connection)
+        .await?)
+    }
+
     /// Deletes a pack in a parent-first transaction, including workflow cascades.
     /// Existing transactions use a savepoint. Callers performing earlier pack,
     /// release or cache mutations must acquire pin-mutation protection at outer
@@ -399,6 +589,8 @@ impl PackRepository {
             CacheTransactionMode::PinMutation,
         )
         .await?;
+        super::schema_type::SchemaTypeRepository::protect_omissions(&mut transaction, id, &[])
+            .await?;
         let state = sqlx::query_as::<_, PackDeletionState>(PACK_DELETION_QUERY)
             .bind(id)
             .bind(true)

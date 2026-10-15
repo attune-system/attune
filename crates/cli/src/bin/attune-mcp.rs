@@ -443,6 +443,52 @@ impl McpServer {
                     .await
             }
             "workflows_list" => self.list_catalog_path("/workflows", args).await,
+            "schema_types_list" => {
+                let path = optional_string(args, "pack_ref")
+                    .map(|pack| format!("/packs/{}/schema-types", encode_path(&pack)))
+                    .unwrap_or_else(|| "/schema-types".into());
+                let page = optional_i64(args, "page")?.unwrap_or(1);
+                let page_size = optional_i64(args, "page_size")?.unwrap_or(50);
+                anyhow::ensure!(
+                    page >= 1 && (1..=100).contains(&page_size),
+                    "page must be positive and page_size must be between 1 and 100"
+                );
+                let mut path = format!("{path}?page={page}&page_size={page_size}");
+                if let Some(query) = optional_string(args, "q") {
+                    path.push_str(&format!("&q={}", urlencoding::encode(&query)));
+                }
+                self.client
+                    .get_paginated_response::<Value>(&path)
+                    .await
+                    .and_then(|response| serde_json::to_value(response).map_err(Into::into))
+            }
+            "schema_types_get" | "schema_types_inspect" => {
+                let type_ref = required_string(args, "ref")?;
+                let suffix = if tool_name == "schema_types_inspect" {
+                    "/inspect"
+                } else {
+                    ""
+                };
+                self.client
+                    .get::<Value>(&format!("/schema-types/{}{suffix}", encode_path(type_ref)))
+                    .await
+            }
+            "schema_types_preview" => {
+                let context = required_string(args, "context")?;
+                anyhow::ensure!(
+                    matches!(context, "flat_document" | "single_value"),
+                    "context must be flat_document or single_value"
+                );
+                let schema = args
+                    .get("schema")
+                    .ok_or_else(|| anyhow!("Missing required argument 'schema'"))?;
+                self.client
+                    .post::<Value, _>(
+                        "/schema-types/preview",
+                        &json!({"context": context, "schema": schema}),
+                    )
+                    .await
+            }
             "workflows_get" => {
                 let workflow_ref = required_string(args, "ref")?;
                 self.client
@@ -450,6 +496,61 @@ impl McpServer {
                     .await
             }
             "packs_list" => self.list_catalog_path("/packs", args).await,
+            "pack_approvals_list" => {
+                let reference = required_string(args, "ref")?;
+                let path = format!("/packs/{}/external-approvals", encode_path(reference));
+                self.list_catalog_path(&path, args).await
+            }
+            "pack_approvals_get" => {
+                let reference = required_string(args, "ref")?;
+                let id = required_i64(args, "id")?;
+                anyhow::ensure!(id > 0, "Approval ID must be positive");
+                self.client
+                    .get::<Value>(&format!(
+                        "/packs/{}/external-approvals/{id}",
+                        encode_path(reference)
+                    ))
+                    .await
+            }
+            "pack_approvals_issue" | "pack_approvals_replace" => {
+                let reference = required_string(args, "ref")?;
+                let grants = required_array(args, "grants", 256)?;
+                anyhow::ensure!(!grants.is_empty(), "Approval grants must be nonempty");
+                let body = json!({"grants": grants, "expires_at": args.get("expires_at").cloned().unwrap_or(Value::Null)});
+                let path = if tool_name == "pack_approvals_replace" {
+                    anyhow::ensure!(
+                        optional_bool(args, "confirm_revocation")? == Some(true),
+                        "Replacing an approval requires confirm_revocation=true"
+                    );
+                    let id = required_i64(args, "id")?;
+                    anyhow::ensure!(id > 0, "Approval ID must be positive");
+                    format!(
+                        "/packs/{}/external-approvals/{id}/replace",
+                        encode_path(reference)
+                    )
+                } else {
+                    format!("/packs/{}/external-approvals", encode_path(reference))
+                };
+                self.client.post::<Value, _>(&path, &body).await
+            }
+            "pack_approvals_revoke" => {
+                let reference = required_string(args, "ref")?;
+                let id = required_i64(args, "id")?;
+                anyhow::ensure!(id > 0, "Approval ID must be positive");
+                anyhow::ensure!(
+                    optional_bool(args, "confirm_revocation")? == Some(true),
+                    "Revoking an approval requires confirm_revocation=true"
+                );
+                self.client
+                    .post::<Value, _>(
+                        &format!(
+                            "/packs/{}/external-approvals/{id}/revoke",
+                            encode_path(reference)
+                        ),
+                        &json!({}),
+                    )
+                    .await
+            }
             "packs_get" => {
                 let pack_ref = required_string(args, "ref")?;
                 self.client
@@ -1216,6 +1317,17 @@ fn tool_defs() -> &'static [ToolDef] {
             input_schema: pagination_schema,
         },
         ToolDef {
+            name: "schema_types_list", title: "List named schemas",
+            description: "List a bounded page of installed non-sensitive type schemas. Authentication is sufficient; this grants no Key or execution rights.",
+            input_schema: || json!({"type": "object", "properties": {"pack_ref": {"type": "string"}, "q": {"type": "string"}, "page": {"type": "integer", "minimum": 1}, "page_size": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": false}),
+        },
+        ToolDef { name: "schema_types_get", title: "Get named schema", description: "Fetch the original installed type definition, preserving authored references.", input_schema: ref_schema },
+        ToolDef { name: "schema_types_inspect", title: "Inspect named schema", description: "Fetch a self-contained resolved rendering graph and selected immutable revisions.", input_schema: ref_schema },
+        ToolDef {
+            name: "schema_types_preview", title: "Preview value schema", description: "Compile an authenticated authoring preview. It does not select a runtime binding or authorize values.",
+            input_schema: || json!({"type": "object", "properties": {"context": {"enum": ["flat_document", "single_value"]}, "schema": {"type": ["object", "boolean"]}}, "required": ["context", "schema"], "additionalProperties": false}),
+        },
+        ToolDef {
             name: "workflows_get",
             title: "Get workflow",
             description: "Fetch a single workflow definition by ref.",
@@ -1227,6 +1339,11 @@ fn tool_defs() -> &'static [ToolDef] {
             description: "List installed Attune packs visible to the authenticated user.",
             input_schema: pagination_schema,
         },
+        ToolDef { name: "pack_approvals_list", title: "List external approvals", description: "List a bounded page of a pack's fixed external approvals, including expired/revoked records. Requires an access token and pack read permission.", input_schema: pack_actions_schema },
+        ToolDef { name: "pack_approvals_get", title: "Inspect external approval", description: "Inspect fixed scope, issuer attribution, expiry and explicit revocation. Human issuer inactivity does not revoke runtime approval.", input_schema: pack_approval_id_schema },
+        ToolDef { name: "pack_approvals_issue", title: "Issue external approval", description: "Issue fixed external grants after current issuer authority validation. No personal IAM assignment is created. Requires an access token.", input_schema: pack_approval_issue_schema },
+        ToolDef { name: "pack_approvals_replace", title: "Replace external approval", description: "Issue a new fixed approval and revoke its predecessor atomically. Requires confirm_revocation=true. Existing runs do not automatically acquire the new approval.", input_schema: pack_approval_replace_schema },
+        ToolDef { name: "pack_approvals_revoke", title: "Revoke external approval", description: "Explicitly revoke runtime authority, idempotently. Requires confirm_revocation=true; disabling human login is separate.", input_schema: pack_approval_revoke_schema },
         ToolDef {
             name: "packs_get",
             title: "Get pack",
@@ -1348,6 +1465,32 @@ fn tool_defs() -> &'static [ToolDef] {
             input_schema: cache_generation_schema,
         },
     ]
+}
+
+fn pack_approval_id_schema() -> Value {
+    json!({"type": "object", "properties": {"ref": {"type": "string"}, "id": {"type": "integer", "minimum": 1}}, "required": ["ref", "id"], "additionalProperties": false})
+}
+
+fn pack_approval_issue_schema() -> Value {
+    json!({"type": "object", "properties": {
+        "ref": {"type": "string"}, "grants": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "object"}},
+        "expires_at": {"type": ["string", "null"], "format": "date-time"}
+    }, "required": ["ref", "grants"], "additionalProperties": false})
+}
+
+fn pack_approval_replace_schema() -> Value {
+    let mut schema = pack_approval_issue_schema();
+    schema["properties"]["id"] = json!({"type": "integer", "minimum": 1});
+    schema["properties"]["confirm_revocation"] = json!({"type": "boolean", "const": true});
+    schema["required"] = json!(["ref", "id", "grants", "confirm_revocation"]);
+    schema
+}
+
+fn pack_approval_revoke_schema() -> Value {
+    let mut schema = pack_approval_id_schema();
+    schema["properties"]["confirm_revocation"] = json!({"type": "boolean", "const": true});
+    schema["required"] = json!(["ref", "id", "confirm_revocation"]);
+    schema
 }
 
 fn info_schema() -> Value {
@@ -2772,6 +2915,54 @@ mod tests {
         let respond = inquiry_respond_schema();
         assert_eq!(respond["oneOf"].as_array().map(Vec::len), Some(2));
         assert_eq!(respond["properties"]["response"]["type"], "object");
+    }
+
+    #[test]
+    fn pack_approval_mutations_require_explicit_revocation_confirmation() {
+        for schema in [
+            pack_approval_replace_schema(),
+            pack_approval_revoke_schema(),
+        ] {
+            assert_eq!(schema["properties"]["confirm_revocation"]["const"], true);
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("confirm_revocation")));
+            assert_eq!(schema["additionalProperties"], false);
+        }
+        assert_eq!(
+            pack_approval_issue_schema()["properties"]["grants"]["maxItems"],
+            256
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_approval_tools_use_pack_scoped_endpoints_and_confirmation() {
+        let api = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/packs/example/external-approvals/42/revoke"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": {"id": 42, "active": false}})),
+            )
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server(api.uri());
+        let unconfirmed = serde_json::from_value(json!({"ref": "example", "id": 42})).unwrap();
+        assert!(server
+            .call_tool("pack_approvals_revoke", &unconfirmed)
+            .await
+            .is_err());
+        let confirmed =
+            serde_json::from_value(json!({"ref": "example", "id": 42, "confirm_revocation": true}))
+                .unwrap();
+        server
+            .call_tool("pack_approvals_revoke", &confirmed)
+            .await
+            .unwrap();
+        let requests = api.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]

@@ -34,6 +34,11 @@ pub struct EventResponse {
     #[schema(value_type = Object, example = json!({"url": "/webhook", "method": "POST"}))]
     pub payload: Option<JsonDict>,
 
+    /// Immutable admission contracts used to render historical event sections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object, nullable = true)]
+    pub schema_binding: Option<JsonValue>,
+
     /// Source ID (sensor that generated this event)
     #[schema(example = 1)]
     pub source: Option<Id>,
@@ -68,6 +73,7 @@ impl From<Event> for EventResponse {
             trigger_ref: event.trigger_ref,
             config: event.config,
             payload: event.payload,
+            schema_binding: None,
             source: event.source,
             source_ref: event.source_ref,
             rule: event.rule,
@@ -231,6 +237,16 @@ pub struct EnforcementResponse {
     #[schema(value_type = Object, nullable = true)]
     pub config: Option<JsonDict>,
 
+    /// Stored action input contract, without static executable metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object, nullable = true)]
+    pub input_contract: Option<JsonValue>,
+
+    /// Original event payload contract, when its admission record is retained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object, nullable = true)]
+    pub payload_contract: Option<JsonValue>,
+
     /// Event ID that triggered this enforcement
     #[schema(example = 1)]
     pub event: Option<Id>,
@@ -273,6 +289,8 @@ impl From<Enforcement> for EnforcementResponse {
             rule_ref: enforcement.rule_ref,
             trigger_ref: enforcement.trigger_ref,
             config: enforcement.config,
+            input_contract: None,
+            payload_contract: None,
             event: enforcement.event,
             status: enforcement.status,
             payload: enforcement.payload,

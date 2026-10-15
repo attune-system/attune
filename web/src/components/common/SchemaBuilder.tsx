@@ -1,24 +1,14 @@
 import { useState, useEffect, useCallback } from "react";
 import { Plus, Trash2, ChevronDown, ChevronRight, Code } from "lucide-react";
+import SchemaTypePicker from "./SchemaTypePicker";
+import {
+  isFlatSchema,
+  isStringArray,
+  type FlatSchema,
+  type SchemaPropertyDef,
+} from "@/lib/flat-schema";
 
-/** A single property definition within a flat schema object */
-interface SchemaPropertyDef {
-  type?: string;
-  description?: string;
-  required?: boolean;
-  secret?: boolean;
-  default?: unknown;
-  minimum?: number;
-  maximum?: number;
-  minLength?: number;
-  maxLength?: number;
-  pattern?: string;
-  enum?: string[];
-  [key: string]: unknown;
-}
-
-/** The flat schema format: each key is a parameter name mapped to its definition */
-type FlatSchema = Record<string, SchemaPropertyDef>;
+export type { FlatSchema } from "@/lib/flat-schema";
 
 interface SchemaProperty {
   name: string;
@@ -33,6 +23,7 @@ interface SchemaProperty {
   maxLength?: number;
   pattern?: string;
   enum?: string[];
+  authored: SchemaPropertyDef;
 }
 
 interface SchemaBuilderProps {
@@ -45,14 +36,49 @@ interface SchemaBuilderProps {
   disabled?: boolean;
 }
 
-const PROPERTY_TYPES = [
-  { value: "string", label: "String" },
-  { value: "number", label: "Number" },
-  { value: "integer", label: "Integer" },
-  { value: "boolean", label: "Boolean" },
-  { value: "array", label: "Array" },
-  { value: "object", label: "Object" },
-];
+function preservedDefinition(property: SchemaProperty): SchemaPropertyDef {
+  const definition = { ...property.authored };
+  if (property.description !== (property.authored.description ?? ""))
+    delete definition.description;
+  if (property.secret !== (property.authored.secret === true))
+    delete definition.secret;
+  if (
+    property.default !==
+    (property.authored.default === undefined
+      ? undefined
+      : JSON.stringify(property.authored.default))
+  )
+    delete definition.default;
+  if (
+    !Array.isArray(definition.required) &&
+    property.required !== (property.authored.required === true)
+  )
+    delete definition.required;
+  // A local ref or primitive union has no editable scalar type. Do not invent
+  // a string sibling when another property or annotation changes.
+  if (typeof property.authored.type === "string")
+    definition.type = property.type;
+  if (property.type === "string") {
+    if (property.minLength !== property.authored.minLength)
+      delete definition.minLength;
+    if (property.maxLength !== property.authored.maxLength)
+      delete definition.maxLength;
+    if (property.pattern !== property.authored.pattern)
+      delete definition.pattern;
+    if (
+      isStringArray(definition.enum) &&
+      property.enum !== property.authored.enum
+    )
+      delete definition.enum;
+  }
+  if (["number", "integer"].includes(property.type)) {
+    if (property.minimum !== property.authored.minimum)
+      delete definition.minimum;
+    if (property.maximum !== property.authored.maximum)
+      delete definition.maximum;
+  }
+  return definition;
+}
 
 export default function SchemaBuilder({
   value,
@@ -80,10 +106,10 @@ export default function SchemaBuilder({
 
     Object.entries(value).forEach(([name, propDef]) => {
       if (propDef && typeof propDef === "object" && !Array.isArray(propDef)) {
-        const def = propDef as SchemaPropertyDef;
+        const def = propDef;
         props.push({
           name,
-          type: def.type || "string",
+          type: typeof def.type === "string" ? def.type : "json",
           description: def.description || "",
           required: def.required === true,
           secret: def.secret === true,
@@ -94,7 +120,8 @@ export default function SchemaBuilder({
           minLength: def.minLength,
           maxLength: def.maxLength,
           pattern: def.pattern,
-          enum: def.enum,
+          enum: isStringArray(def.enum) ? def.enum : undefined,
+          authored: def,
         });
       }
     });
@@ -116,7 +143,7 @@ export default function SchemaBuilder({
 
     properties.forEach((prop) => {
       const propSchema: SchemaPropertyDef = {
-        type: prop.type,
+        ...preservedDefinition(prop),
       };
 
       if (prop.description) {
@@ -184,7 +211,7 @@ export default function SchemaBuilder({
 
     props.forEach((prop) => {
       const propSchema: SchemaPropertyDef = {
-        type: prop.type,
+        ...preservedDefinition(prop),
       };
 
       if (prop.description) {
@@ -232,6 +259,7 @@ export default function SchemaBuilder({
       description: "",
       required: false,
       secret: false,
+      authored: { type: "string" },
     };
     const newIndex = properties.length;
     handlePropertiesChange([...properties, newProp]);
@@ -276,8 +304,8 @@ export default function SchemaBuilder({
     setRawJsonError("");
 
     try {
-      const parsed = JSON.parse(newJson);
-      if (typeof parsed !== "object" || Array.isArray(parsed)) {
+      const parsed: unknown = JSON.parse(newJson);
+      if (!isFlatSchema(parsed)) {
         setRawJsonError("Schema must be a JSON object");
         return;
       }
@@ -289,10 +317,10 @@ export default function SchemaBuilder({
 
       Object.entries(parsed).forEach(([name, propDef]) => {
         if (propDef && typeof propDef === "object" && !Array.isArray(propDef)) {
-          const def = propDef as SchemaPropertyDef;
+          const def = propDef;
           props.push({
             name,
-            type: def.type || "string",
+            type: typeof def.type === "string" ? def.type : "json",
             description: def.description || "",
             required: def.required === true,
             secret: def.secret === true,
@@ -305,7 +333,8 @@ export default function SchemaBuilder({
             minLength: def.minLength,
             maxLength: def.maxLength,
             pattern: def.pattern,
-            enum: def.enum,
+            enum: isStringArray(def.enum) ? def.enum : undefined,
+            authored: def,
           });
         }
       });
@@ -453,22 +482,16 @@ export default function SchemaBuilder({
                             <label className="block text-xs font-medium text-gray-700 mb-1">
                               Type
                             </label>
-                            <select
+                            <SchemaTypePicker
                               value={prop.type}
-                              onChange={(e) =>
-                                updateProperty(index, { type: e.target.value })
+                              onChange={(type) =>
+                                updateProperty(index, { type })
                               }
-                              disabled={disabled}
-                              className={`w-full px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-                                disabled ? "bg-gray-100 cursor-not-allowed" : ""
-                              }`}
-                            >
-                              {PROPERTY_TYPES.map((type) => (
-                                <option key={type.value} value={type.value}>
-                                  {type.label}
-                                </option>
-                              ))}
-                            </select>
+                              disabled={
+                                disabled ||
+                                typeof prop.authored.type !== "string"
+                              }
+                            />
                           </div>
 
                           {/* Description */}
@@ -543,6 +566,15 @@ export default function SchemaBuilder({
                               </label>
                             </div>
                           </div>
+
+                          {prop.secret && (
+                            <p className="text-xs text-gray-600">
+                              Secret values must be text or nested lists/objects
+                              with text leaves. Const, enum, defaults, and
+                              examples are not allowed here or in secret
+                              descendants, including referenced types.
+                            </p>
+                          )}
 
                           {/* Default value */}
                           <div>

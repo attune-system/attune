@@ -22,7 +22,52 @@ pub struct ExecutionSecretValue {
 
 pub struct ExecutionSecretValueRepository;
 
+/// Authorization reads recorded origins, never ciphertext or encryption keys.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SecretProvenanceRow {
+    pub entity_type: String,
+    pub entity_id: Id,
+    pub json_path: String,
+    pub source_kind: String,
+    pub source_ref: Option<String>,
+}
+
 impl ExecutionSecretValueRepository {
+    pub async fn find_provenance_by_entities<'e, E>(
+        executor: E,
+        entity_types: &[&str],
+        entity_ids: &[Id],
+    ) -> Result<Vec<SecretProvenanceRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(
+            "SELECT entity_type, entity_id, json_path, source_kind, source_ref \
+             FROM execution_secret_value WHERE entity_type = ANY($1) AND entity_id = ANY($2) \
+             ORDER BY entity_type, entity_id, json_path",
+        )
+        .bind(entity_types)
+        .bind(entity_ids)
+        .fetch_all(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Replace a mutable value's complete encrypted projection in its owning
+    /// transaction. Removing a secret field must also remove its old ciphertext.
+    pub async fn replace_entity_with_conn(
+        connection: &mut PgConnection,
+        entity_type: &str,
+        entity_id: Id,
+        values: &[PreparedSecretValue],
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM execution_secret_value WHERE entity_type = $1 AND entity_id = $2")
+            .bind(entity_type)
+            .bind(entity_id)
+            .execute(&mut *connection)
+            .await?;
+        Self::upsert_many_with_conn(connection, entity_type, entity_id, values).await
+    }
     pub async fn upsert_many<'e, E>(
         executor: E,
         entity_type: &str,

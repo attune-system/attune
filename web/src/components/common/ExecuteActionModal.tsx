@@ -61,7 +61,7 @@ export default function ExecuteActionModal({
     // Include all initial parameters - even those not in the schema
     // so users can see exactly what was run before
     for (const [key, value] of Object.entries(initialParameters)) {
-      if (value !== undefined && value !== null) {
+      if (value !== undefined) {
         values[key] = value;
       }
     }
@@ -77,6 +77,7 @@ export default function ExecuteActionModal({
   const [parameters, setParameters] =
     useState<Record<string, JsonValue>>(buildInitialValues);
   const [paramErrors, setParamErrors] = useState<Record<string, string>>({});
+  const [previewDigest, setPreviewDigest] = useState<string | undefined>();
   const [envVars, setEnvVars] = useState<Array<{ key: string; value: string }>>(
     [{ key: "", value: "" }],
   );
@@ -88,19 +89,9 @@ export default function ExecuteActionModal({
   const defaultPermissionSetRefs =
     action.default_execution_permission_set_refs ?? [];
   const hasDefaultPermissionSets = defaultPermissionSetRefs.length > 0;
-  const canUseDefaultPermissionSets =
-    hasDefaultPermissionSets &&
-    (isCoreAdmin ||
-      defaultPermissionSetRefs.every(
-        (ref) =>
-          ref === STANDARD_EXECUTION_ACCESS_REF ||
-          assignedPermissionSetRefs.includes(ref),
-      ));
   const initialPermissionMode: PermissionOverrideMode =
     initialPermissionSetRefs === undefined
-      ? canUseDefaultPermissionSets
-        ? "default"
-        : "none"
+      ? "default"
       : initialPermissionSetRefs.length > 0
         ? "custom"
         : "none";
@@ -143,9 +134,8 @@ export default function ExecuteActionModal({
         : [
             STANDARD_EXECUTION_ACCESS_REF,
             ...assignedPermissionSetRefs,
-            ...selectedPermissionSetRefs.filter(
-              (ref) => ref === STANDARD_EXECUTION_ACCESS_REF,
-            ),
+            ...defaultPermissionSetRefs,
+            ...selectedPermissionSetRefs,
           ],
     ),
   ).sort((a, b) => a.localeCompare(b));
@@ -230,7 +220,15 @@ export default function ExecuteActionModal({
       queryClient.invalidateQueries({ queryKey: ["executions"] });
       onClose();
       if (data?.data?.id) {
-        navigate(`/executions/${data.data.id}`);
+        const acceptedDigest: unknown = data.data.schema_binding?.input_digest;
+        navigate(`/executions/${data.data.id}`, {
+          state: {
+            schemaPreviewMismatch:
+              previewDigest !== undefined &&
+              typeof acceptedDigest === "string" &&
+              previewDigest !== acceptedDigest,
+          },
+        });
       }
     },
   });
@@ -295,7 +293,9 @@ export default function ExecuteActionModal({
 
   const permissionSummary = (() => {
     if (permissionMode === "default") {
-      return `Action default: ${defaultPermissionSetRefs.join(", ")}`;
+      return hasDefaultPermissionSets
+        ? `Action default: ${defaultPermissionSetRefs.join(", ")}`
+        : "Action default: no execution API token";
     }
 
     if (permissionMode === "none") {
@@ -362,6 +362,7 @@ export default function ExecuteActionModal({
             Parameters
           </h4>
           <ParamSchemaForm
+            onPreviewDigest={setPreviewDigest}
             schema={paramSchema}
             values={parameters}
             onChange={setParameters}
@@ -457,28 +458,25 @@ export default function ExecuteActionModal({
                 execution. Without permission sets, no execution API token is
                 issued.
               </p>
-              {hasDefaultPermissionSets && (
-                <label className="flex items-start gap-2 text-sm">
-                  <input
-                    type="radio"
-                    name="permission-mode"
-                    checked={permissionMode === "default"}
-                    onChange={() => setPermissionMode("default")}
-                    disabled={!canUseDefaultPermissionSets}
-                    className="mt-1"
-                  />
-                  <span>
-                    <span className="font-medium text-gray-900">
-                      Use action default
-                    </span>
-                    <span className="block text-xs text-gray-500">
-                      {canUseDefaultPermissionSets
-                        ? defaultPermissionSetRefs.join(", ")
-                        : `${defaultPermissionSetRefs.join(", ")} (not assignable by your account)`}
-                    </span>
+              <label className="flex items-start gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="permission-mode"
+                  checked={permissionMode === "default"}
+                  onChange={() => setPermissionMode("default")}
+                  className="mt-1"
+                />
+                <span>
+                  <span className="font-medium text-gray-900">
+                    Use action default
                   </span>
-                </label>
-              )}
+                  <span className="block text-xs text-gray-500">
+                    {hasDefaultPermissionSets
+                      ? defaultPermissionSetRefs.join(", ")
+                      : "This action has no default token access."}
+                  </span>
+                </span>
+              </label>
               <label className="flex items-start gap-2 text-sm">
                 <input
                   type="radio"
@@ -512,9 +510,9 @@ export default function ExecuteActionModal({
                       Specify permission sets
                     </span>
                     <span className="block text-xs text-gray-500">
-                      {isCoreAdmin
-                        ? "core.admin can assign any permission set."
-                        : "You can assign standard access and permission sets assigned to you."}
+                      Select action defaults, previous selections, or delegated
+                      permission sets. The server validates the requested
+                      access.
                     </span>
                   </span>
                 </label>

@@ -21,6 +21,7 @@ const PacksPage = lazy(() => import("@/pages/packs/PacksPage"));
 const PackCreatePage = lazy(() => import("@/pages/packs/PackCreatePage"));
 const PackInstallPage = lazy(() => import("@/pages/packs/PackInstallPage"));
 const PackEditPage = lazy(() => import("@/pages/packs/PackEditPage"));
+const PackApprovalsPage = lazy(() => import("@/pages/packs/PackApprovalsPage"));
 const PackTestDetailPage = lazy(
   () => import("@/pages/packs/PackTestDetailPage"),
 );
@@ -144,6 +145,10 @@ function App() {
                   />
                   <Route path="packs/:ref" element={<PacksPage />} />
                   <Route path="packs/:ref/edit" element={<PackEditPage />} />
+                  <Route
+                    path="packs/:ref/approvals"
+                    element={<PackApprovalsPage />}
+                  />
                   <Route path="actions" element={<ActionsPage />} />
                   <Route path="runtimes" element={<RuntimesPage />} />
                   <Route path="runtimes/new" element={<RuntimesPage />} />

@@ -118,7 +118,7 @@ export class InternalService {
     });
   }
   /**
-   * Stream the staged candidate for a pending pack-install test.
+   * Stream the version-pinned candidate object for an assigned pack-install test.
    * @returns any Candidate pack archive
    * @throws ApiError
    */

@@ -33,7 +33,6 @@ use crate::{
         ApiResponse,
     },
     middleware::{ApiError, ApiResult},
-    routes::events::redact_event_parts_for_trigger,
     routes::triggers::can_access_trigger_api,
     state::AppState,
     webhook_security,
@@ -732,12 +731,21 @@ pub async fn receive_webhook(
         config["hmac_verified"] = serde_json::Value::Bool(hmac_verified.unwrap_or(false));
     }
 
-    let redacted = redact_event_parts_for_trigger(
-        &trigger.r#ref,
-        trigger.param_schema.as_ref(),
-        Some(payload.payload),
-        Some(config),
-    );
+    let mut tx = state.db.begin().await?;
+    let (current_trigger, binding) =
+        attune_common::repositories::event_schema::EventSchemaRepository::materialize_current(
+            &mut tx, trigger.id, true,
+        )
+        .await?;
+    if !current_trigger.webhook_enabled
+        || current_trigger.webhook_key.as_deref() != Some(webhook_key.as_str())
+        || current_trigger.webhook_config != trigger.webhook_config
+    {
+        return Err(ApiError::Unauthorized(
+            "Webhook is no longer active".to_string(),
+        ));
+    }
+    let redacted = binding.prepare(Some(payload.payload), Some(config))?;
     let prepared_payload_secrets =
         prepare_webhook_secret_values(&state, redacted.payload_secrets).await?;
     let prepared_config_secrets =
@@ -756,7 +764,6 @@ pub async fn receive_webhook(
         rule_ref: None,
     };
 
-    let mut tx = state.db.begin().await?;
     let event = EventRepository::create(&mut *tx, event_input)
         .await
         .map_err(|e| {
@@ -777,6 +784,10 @@ pub async fn receive_webhook(
             ));
             ApiError::InternalServerError(e.to_string())
         })?;
+    attune_common::repositories::event_schema::EventSchemaRepository::attach(
+        &mut tx, event.id, &binding,
+    )
+    .await?;
     if !prepared_payload_secrets.is_empty() {
         ExecutionSecretValueRepository::upsert_many_with_conn(
             &mut tx,

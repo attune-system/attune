@@ -35,7 +35,7 @@ export type ApiResponse_AuditEventResponse = {
     /**
      * Optional cascade chain (rule_id, enforcement_id, execution_id, …).
      */
-    correlation_chain: any | null;
+    correlation_chain: Record<string, any> | null;
     /**
      * Event creation timestamp.
      */
@@ -43,7 +43,7 @@ export type ApiResponse_AuditEventResponse = {
     /**
      * Event-specific structured metadata. Secrets are redacted.
      */
-    details: any | null;
+    details: Record<string, any> | null;
     /**
      * Request duration in milliseconds.
      */

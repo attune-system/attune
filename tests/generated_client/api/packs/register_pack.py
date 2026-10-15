@@ -6,7 +6,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.api_response_pack_install_response import ApiResponsePackInstallResponse
-from ...models.api_response_string import ApiResponseString
+from ...models.error_response import ErrorResponse
 from ...models.register_pack_request import RegisterPackRequest
 from ...types import Response
 
@@ -32,21 +32,41 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ApiResponsePackInstallResponse | ApiResponseString | None:
+) -> ApiResponsePackInstallResponse | ErrorResponse | None:
     if response.status_code == 201:
         response_201 = ApiResponsePackInstallResponse.from_dict(response.json())
 
         return response_201
 
     if response.status_code == 400:
-        response_400 = ApiResponseString.from_dict(response.json())
+        response_400 = ErrorResponse.from_dict(response.json())
 
         return response_400
 
+    if response.status_code == 403:
+        response_403 = ErrorResponse.from_dict(response.json())
+
+        return response_403
+
     if response.status_code == 409:
-        response_409 = ApiResponseString.from_dict(response.json())
+        response_409 = ErrorResponse.from_dict(response.json())
 
         return response_409
+
+    if response.status_code == 422:
+        response_422 = ErrorResponse.from_dict(response.json())
+
+        return response_422
+
+    if response.status_code == 500:
+        response_500 = ErrorResponse.from_dict(response.json())
+
+        return response_500
+
+    if response.status_code == 503:
+        response_503 = ErrorResponse.from_dict(response.json())
+
+        return response_503
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -56,7 +76,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
+) -> Response[ApiResponsePackInstallResponse | ErrorResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -69,7 +89,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: RegisterPackRequest,
-) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
+) -> Response[ApiResponsePackInstallResponse | ErrorResponse]:
     """Register a pack from local filesystem
 
     Args:
@@ -80,7 +100,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ApiResponsePackInstallResponse | ApiResponseString]
+        Response[ApiResponsePackInstallResponse | ErrorResponse]
     """
 
     kwargs = _get_kwargs(
@@ -98,7 +118,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: RegisterPackRequest,
-) -> ApiResponsePackInstallResponse | ApiResponseString | None:
+) -> ApiResponsePackInstallResponse | ErrorResponse | None:
     """Register a pack from local filesystem
 
     Args:
@@ -109,7 +129,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ApiResponsePackInstallResponse | ApiResponseString
+        ApiResponsePackInstallResponse | ErrorResponse
     """
 
     return sync_detailed(
@@ -122,7 +142,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: RegisterPackRequest,
-) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
+) -> Response[ApiResponsePackInstallResponse | ErrorResponse]:
     """Register a pack from local filesystem
 
     Args:
@@ -133,7 +153,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ApiResponsePackInstallResponse | ApiResponseString]
+        Response[ApiResponsePackInstallResponse | ErrorResponse]
     """
 
     kwargs = _get_kwargs(
@@ -149,7 +169,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: RegisterPackRequest,
-) -> ApiResponsePackInstallResponse | ApiResponseString | None:
+) -> ApiResponsePackInstallResponse | ErrorResponse | None:
     """Register a pack from local filesystem
 
     Args:
@@ -160,7 +180,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ApiResponsePackInstallResponse | ApiResponseString
+        ApiResponsePackInstallResponse | ErrorResponse
     """
 
     return (

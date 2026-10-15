@@ -50,6 +50,8 @@ services:
       RABBITMQ_DEFAULT_VHOST: attune_${ATTUNE_E2E_RUN_ID:?run-integration-tests.sh must set ATTUNE_E2E_RUN_ID}
   supervisor:
     container_name: !reset null
+    environment:
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
   api:
     container_name: !reset null
     ports: !reset []

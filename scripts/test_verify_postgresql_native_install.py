@@ -342,6 +342,9 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("SELECT(kind,bucket,transaction_origin,xmin)", db.statement)
         self.assertNotIn("UPDATE(payload)", db.statement)
         self.assertNotIn("GRANT SELECT ON native_summary_state", db.statement)
+        self.assertIn("GRANT SELECT,INSERT ON runtime_input_authority TO native_writer", db.statement)
+        self.assertNotIn("UPDATE ON runtime_input_authority", db.statement)
+        self.assertNotIn("DELETE ON runtime_input_authority", db.statement)
 
     def test_sqlx_driver_uses_real_runtime_migrator(self):
         driver = (install.ROOT / "crates/common/examples/verify_native_migrations.rs").read_text()

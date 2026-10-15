@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ApiResponse_RuntimeApprovalResponse } from "../models/ApiResponse_RuntimeApprovalResponse";
 import type { CreateIdentityRequest } from "../models/CreateIdentityRequest";
 import type { CreateIdentityRoleAssignmentRequest } from "../models/CreateIdentityRoleAssignmentRequest";
 import type { CreateIntegrationTokenRequest } from "../models/CreateIntegrationTokenRequest";
@@ -9,9 +10,11 @@ import type { CreatePermissionAssignmentRequest } from "../models/CreatePermissi
 import type { CreatePermissionSetRoleAssignmentRequest } from "../models/CreatePermissionSetRoleAssignmentRequest";
 import type { IdentityRoleAssignmentResponse } from "../models/IdentityRoleAssignmentResponse";
 import type { IntegrationTokenResponse } from "../models/IntegrationTokenResponse";
+import type { IssueRuntimeApprovalRequest } from "../models/IssueRuntimeApprovalRequest";
 import type { ManagementOriginKind } from "../models/ManagementOriginKind";
 import type { PaginatedResponse_IdentitySummary } from "../models/PaginatedResponse_IdentitySummary";
 import type { PaginatedResponse_PermissionBindingResponse } from "../models/PaginatedResponse_PermissionBindingResponse";
+import type { PaginatedResponse_RuntimeApprovalResponse } from "../models/PaginatedResponse_RuntimeApprovalResponse";
 import type { PermissionAssignmentResponse } from "../models/PermissionAssignmentResponse";
 import type { PermissionSetRoleAssignmentResponse } from "../models/PermissionSetRoleAssignmentResponse";
 import type { PermissionSetSummary } from "../models/PermissionSetSummary";
@@ -577,6 +580,122 @@ export class PermissionsService {
       },
       errors: {
         404: `Identity not found`,
+      },
+    });
+  }
+  /**
+   * @returns PaginatedResponse_RuntimeApprovalResponse Fixed external approvals, including revoked and expired records
+   * @throws ApiError
+   */
+  public static listRuntimeApprovals({
+    packRef,
+    page,
+    pageSize,
+  }: {
+    packRef: string;
+    /**
+     * Page number (1-based)
+     */
+    page?: number;
+    /**
+     * Number of items per page
+     */
+    pageSize?: number;
+  }): CancelablePromise<PaginatedResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{pack_ref}/external-approvals",
+      path: {
+        pack_ref: packRef,
+      },
+      query: {
+        page: page,
+        page_size: pageSize,
+      },
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse External approval issued after current authority validation
+   * @throws ApiError
+   */
+  public static issueRuntimeApproval({
+    packRef,
+    requestBody,
+  }: {
+    packRef: string;
+    requestBody: IssueRuntimeApprovalRequest;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/{pack_ref}/external-approvals",
+      path: {
+        pack_ref: packRef,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse Immutable external approval
+   * @throws ApiError
+   */
+  public static getRuntimeApproval({
+    packRef,
+    id,
+  }: {
+    packRef: string;
+    id: number;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{pack_ref}/external-approvals/{id}",
+      path: {
+        pack_ref: packRef,
+        id: id,
+      },
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse New approval issued and predecessor explicitly revoked atomically
+   * @throws ApiError
+   */
+  public static replaceRuntimeApproval({
+    packRef,
+    id,
+    requestBody,
+  }: {
+    packRef: string;
+    id: number;
+    requestBody: IssueRuntimeApprovalRequest;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/{pack_ref}/external-approvals/{id}/replace",
+      path: {
+        pack_ref: packRef,
+        id: id,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse Approval explicitly revoked
+   * @throws ApiError
+   */
+  public static revokeRuntimeApproval({
+    packRef,
+    id,
+  }: {
+    packRef: string;
+    id: number;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/{pack_ref}/external-approvals/{id}/revoke",
+      path: {
+        pack_ref: packRef,
+        id: id,
       },
     });
   }

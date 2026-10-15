@@ -97,6 +97,19 @@ pub struct RestoreRuleInput {
 /// Repository for Rule operations
 pub struct RuleRepository;
 
+impl RuleRepository {
+    pub async fn find_disclosure_refs<'e, E>(executor: E, ids: &[i64]) -> Result<Vec<(i64, String)>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as("SELECT id, ref FROM rule WHERE id = ANY($1) AND retired_at IS NULL")
+            .bind(ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+}
+
 impl Repository for RuleRepository {
     type Entity = Rule;
 

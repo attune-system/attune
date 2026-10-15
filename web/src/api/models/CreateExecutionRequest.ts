@@ -20,16 +20,16 @@ export type CreateExecutionRequest = {
   /**
    * Environment overrides for this execution. ATTUNE_ names are reserved for internal use.
    */
-  env_vars?: any | null;
+  env_vars?: Record<string, string> | null;
   /**
    * Execution parameters/configuration
    */
-  parameters?: any | null;
+  parameters?: Record<string, any> | null;
   /**
    * Permission set refs to apply to this execution's API token. Omit to use
    * the action default. Provide an empty array to force no API token.
    */
-  permission_set_refs?: any[] | null;
+  permission_set_refs?: Array<string> | null;
   /**
    * Execution timeout override in seconds. Omit to inherit the action default
    * (or the app-level `default_execution_timeout_seconds` when the action has
@@ -40,15 +40,15 @@ export type CreateExecutionRequest = {
    * Worker affinity override. Omit to inherit the action default; provide
    * `{}` to explicitly clear affinity requirements/preferences.
    */
-  worker_affinity?: any | null;
+  worker_affinity?: Record<string, any> | null;
   /**
    * Worker label selector override. Omit to inherit the action default;
    * provide `{}` to explicitly clear selector requirements.
    */
-  worker_selector?: any | null;
+  worker_selector?: Record<string, any> | null;
   /**
    * Worker taint tolerations override. Omit to inherit the action default;
    * provide `[]` to explicitly clear tolerations.
    */
-  worker_tolerations?: any[] | null;
+  worker_tolerations?: Array<Record<string, any>> | null;
 };

@@ -9,13 +9,21 @@ from ...client import AuthenticatedClient, Client
 from ...models.api_response_work_queue_item_response import (
     ApiResponseWorkQueueItemResponse,
 )
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     ref: str,
     item_id: int,
+    *,
+    decrypt: bool | Unset = UNSET,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    params["decrypt"] = decrypt
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -23,6 +31,7 @@ def _get_kwargs(
             ref=quote(str(ref), safe=""),
             item_id=quote(str(item_id), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -66,11 +75,13 @@ def sync_detailed(
     item_id: int,
     *,
     client: AuthenticatedClient,
+    decrypt: bool | Unset = UNSET,
 ) -> Response[Any | ApiResponseWorkQueueItemResponse]:
     """
     Args:
         ref (str):
         item_id (int):
+        decrypt (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -83,6 +94,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         ref=ref,
         item_id=item_id,
+        decrypt=decrypt,
     )
 
     response = client.get_httpx_client().request(
@@ -97,11 +109,13 @@ def sync(
     item_id: int,
     *,
     client: AuthenticatedClient,
+    decrypt: bool | Unset = UNSET,
 ) -> Any | ApiResponseWorkQueueItemResponse | None:
     """
     Args:
         ref (str):
         item_id (int):
+        decrypt (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -115,6 +129,7 @@ def sync(
         ref=ref,
         item_id=item_id,
         client=client,
+        decrypt=decrypt,
     ).parsed
 
 
@@ -123,11 +138,13 @@ async def asyncio_detailed(
     item_id: int,
     *,
     client: AuthenticatedClient,
+    decrypt: bool | Unset = UNSET,
 ) -> Response[Any | ApiResponseWorkQueueItemResponse]:
     """
     Args:
         ref (str):
         item_id (int):
+        decrypt (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -140,6 +157,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         ref=ref,
         item_id=item_id,
+        decrypt=decrypt,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -152,11 +170,13 @@ async def asyncio(
     item_id: int,
     *,
     client: AuthenticatedClient,
+    decrypt: bool | Unset = UNSET,
 ) -> Any | ApiResponseWorkQueueItemResponse | None:
     """
     Args:
         ref (str):
         item_id (int):
+        decrypt (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -171,5 +191,6 @@ async def asyncio(
             ref=ref,
             item_id=item_id,
             client=client,
+            decrypt=decrypt,
         )
     ).parsed

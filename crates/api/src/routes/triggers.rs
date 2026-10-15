@@ -35,7 +35,7 @@ use attune_common::{
             SensorRepository, SensorSearchFilters, SensorVisibilityFilter, TriggerRepository,
             TriggerSearchFilters, TriggerVisibilityFilter, UpdateSensorInput, UpdateTriggerInput,
         },
-        Create, Delete, FindByRef, Patch, Update,
+        Delete, FindByRef, Patch,
     },
 };
 
@@ -351,6 +351,32 @@ pub(crate) async fn can_access_sensor_api(
             .next()
             .is_some(),
     )
+}
+
+async fn authorize_sensor_configuration_decrypt(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    sensor: &SensorModel,
+) -> ApiResult<()> {
+    let identity = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid sensor configuration identity".into()))?;
+    let mut context = AuthorizationContext::new(identity);
+    context.target_id = Some(sensor.id);
+    context.target_ref = Some(sensor.r#ref.clone());
+    context.pack_ref = sensor.pack_ref.clone();
+    state
+        .authorization_service()
+        .authorize(
+            user,
+            crate::authz::AuthorizationCheck {
+                resource: Resource::Triggers,
+                action: Action::Decrypt,
+                context,
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 /// Row-visibility scope for sensor reads, reduced from a bounded set of RBAC
@@ -796,6 +822,7 @@ pub async fn create_trigger(
         enabled: request.enabled,
         param_schema: request.param_schema,
         out_schema: request.out_schema,
+        event_config_schema: request.event_config_schema,
         sensor: None,
         sensor_ref: None,
         is_adhoc: true, // Triggers created via API are ad-hoc (not from pack installation)
@@ -884,6 +911,10 @@ pub async fn update_trigger(
             TriggerJsonPatch::Clear => Patch::Clear,
         }),
         out_schema: request.out_schema.map(|patch| match patch {
+            TriggerJsonPatch::Set(value) => Patch::Set(value),
+            TriggerJsonPatch::Clear => Patch::Clear,
+        }),
+        event_config_schema: request.event_config_schema.map(|patch| match patch {
             TriggerJsonPatch::Set(value) => Patch::Set(value),
             TriggerJsonPatch::Clear => Patch::Clear,
         }),
@@ -1231,7 +1262,8 @@ pub async fn list_sensors_by_trigger(
     path = "/api/v1/sensors/{ref}",
     tag = "sensors",
     params(
-        ("ref" = String, Path, description = "Sensor reference")
+        ("ref" = String, Path, description = "Sensor reference"),
+        crate::dto::pack::PackDetailQuery
     ),
     responses(
         (status = 200, description = "Sensor details", body = ApiResponse<SensorResponse>),
@@ -1243,6 +1275,7 @@ pub async fn get_sensor(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(sensor_ref): Path<String>,
+    Query(query): Query<crate::dto::pack::PackDetailQuery>,
 ) -> ApiResult<impl IntoResponse> {
     let sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
         .await?
@@ -1254,7 +1287,31 @@ pub async fn get_sensor(
         )));
     }
 
-    let response = ApiResponse::new(SensorResponse::from(sensor));
+    let mut response = SensorResponse::from(sensor.clone());
+    let configuration = attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(&state.db, "sensor", sensor.id).await?;
+    if let Some(revision) = &configuration {
+        revision.contract()?;
+        response.config = Some(revision.config.clone());
+        response.config_schema_binding = Some(revision.contract.clone());
+    }
+    if query.include_secret_values {
+        authorize_sensor_configuration_decrypt(&state, &user, &sensor).await?;
+        let revision = configuration.ok_or_else(|| {
+            ApiError::Forbidden("Sensor configuration requires its original binding".into())
+        })?;
+        let mut connection = state.db.acquire().await?;
+        attune_common::repositories::component_configuration::ComponentConfigurationRepository::restore(&mut connection, &revision,
+            state.config.security.encryption_key.as_deref()).await?;
+        response.config = crate::secret_disclosure::reveal_authorized(
+            &state,
+            &user,
+            Some(revision.config),
+            attune_common::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION,
+            revision.id,
+        )
+        .await?;
+    }
+    let response = ApiResponse::new(response);
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -1337,7 +1394,13 @@ pub async fn create_sensor(
         log_retention_limit: request.log_retention_limit,
     };
 
-    let sensor = SensorRepository::create(&state.db, sensor_input).await?;
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
+    let mut sensor = SensorRepository::create(&mut *tx, sensor_input).await?;
+    let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_sensor(
+        &mut tx, &sensor, sensor.config.as_ref(), state.config.security.encryption_key.as_deref()).await?;
+    sensor.config = Some(revision.config);
+    tx.commit().await?;
 
     let response =
         ApiResponse::with_message(SensorResponse::from(sensor), "Sensor created successfully");
@@ -1363,13 +1426,14 @@ pub async fn create_sensor(
 )]
 pub async fn update_sensor(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(sensor_ref): Path<String>,
     Json(request): Json<UpdateSensorRequest>,
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
     request.validate()?;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let placement_changed = request.worker_selector.is_some()
         || request.worker_tolerations.is_some()
@@ -1379,6 +1443,22 @@ pub async fn update_sensor(
     let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
+    if !can_access_sensor_api(&state, &user, &existing_sensor).await? {
+        return Err(ApiError::Forbidden(
+            "Sensor update is not authorized".into(),
+        ));
+    }
+    let configuration_changed = request.param_schema.is_some() || request.config.is_some();
+    let supplied_config = request.config.clone();
+    if request.param_schema.is_some()
+        && supplied_config.is_none()
+        && existing_sensor
+            .config
+            .as_ref()
+            .is_some_and(|config| !attune_common::secret_values::redacted_paths(config).is_empty())
+    {
+        authorize_sensor_configuration_decrypt(&state, &user, &existing_sensor).await?;
+    }
 
     // Create update input
     let update_input = UpdateSensorInput {
@@ -1393,7 +1473,7 @@ pub async fn update_sensor(
             SensorJsonPatch::Set(value) => Patch::Set(value),
             SensorJsonPatch::Clear => Patch::Clear,
         }),
-        config: None,
+        config: request.config,
         worker_selector: request
             .worker_selector
             .map(|value| serde_json::to_value(value).unwrap_or_else(|_| json!({}))),
@@ -1421,7 +1501,12 @@ pub async fn update_sensor(
         }),
     };
 
-    let sensor = SensorRepository::update(&mut *tx, existing_sensor.id, update_input).await?;
+    let mut sensor = SensorRepository::update(&mut *tx, existing_sensor.id, update_input).await?;
+    if configuration_changed {
+        let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_sensor(
+            &mut tx, &sensor, supplied_config.as_ref(), state.config.security.encryption_key.as_deref()).await?;
+        sensor.config = Some(revision.config);
+    }
     if placement_changed || (!existing_sensor.enabled && sensor.enabled) {
         let requirement = if sensor.enabled {
             SensorAdmissionRequirement::Live

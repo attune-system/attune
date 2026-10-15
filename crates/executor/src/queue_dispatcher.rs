@@ -33,9 +33,8 @@ use attune_common::{
         Create, FindById, FindByRef, Update,
     },
     secret_values::{
-        merge_schema_secret_redactions, prepare_secret_values, secret_paths_from_schema,
-        validate_secret_destination_paths, JsonPointer, RenderedJson, SecretPathSource,
-        SecretSource, ENTITY_EXECUTION_CONFIG,
+        prepare_secret_values, JsonPointer, RenderedJson, SecretPathSource, SecretSource,
+        ENTITY_EXECUTION_CONFIG,
     },
     trace_tag::normalize_trace_tag,
 };
@@ -73,7 +72,6 @@ struct ResolvedQueueContext {
     parsed_config: WorkQueueConfig,
     pack_config: JsonValue,
     pack_ref: Option<String>,
-    pack_secret_paths: Vec<JsonPointer>,
     concurrency: u32,
     batch_size: u32,
     inter_execution_delay_seconds: u32,
@@ -458,10 +456,6 @@ impl WorkQueueDispatcher {
                 .map(|pack| pack.config.clone())
                 .unwrap_or(JsonValue::Null),
             pack_ref: pack.as_ref().map(|pack| pack.r#ref.clone()),
-            pack_secret_paths: pack
-                .as_ref()
-                .map(|pack| secret_paths_from_schema(Some(&pack.conf_schema)))
-                .unwrap_or_default(),
             concurrency,
             batch_size,
             inter_execution_delay_seconds,
@@ -601,7 +595,9 @@ impl WorkQueueDispatcher {
                 .unwrap_or_else(|_| chrono::Duration::hours(24));
 
         let mut tx = pool.begin().await?;
-        let items = WorkQueueItemRepository::lease_next_batch(
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
+        let mut items = WorkQueueItemRepository::lease_next_batch(
             &mut *tx,
             LeaseWorkQueueItemsInput {
                 queue: queue.id,
@@ -622,6 +618,40 @@ impl WorkQueueDispatcher {
         if items.is_empty() {
             tx.commit().await?;
             return Ok(None);
+        }
+        for item in &mut items {
+            let admitted = item.payload_binding()?;
+            let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *tx,
+                attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD,
+                item.id,
+            )
+            .await?;
+            if !secrets.is_empty() {
+                // Enqueue accepts literal caller-supplied payloads, not key
+                // resolution. Local encrypted values may flow through an
+                // unattributed batch without granting Key or API authority.
+                for secret in &secrets {
+                    let provenance: attune_common::secret_provenance::SecretProvenance = secret
+                        .source_ref
+                        .as_deref()
+                        .and_then(|body| serde_json::from_str(body).ok())
+                        .ok_or_else(|| anyhow!("Queue payload provenance is unavailable"))?;
+                    if secret.source_kind != "provenance" || provenance.origins.is_empty()
+                        || provenance.origins.iter().any(|origin| !matches!(origin, attune_common::secret_provenance::SecretOrigin::Local { source_kind, .. } if source_kind == "parameter_schema" || source_kind == "queue_item")) {
+                        return Err(anyhow!("Queue payload origins cannot establish delivery authority"));
+                    }
+                }
+                let encryption_key = encryption_key
+                    .ok_or_else(|| anyhow!("Queue payload encryption key is unavailable"))?;
+                item.payload = attune_common::secret_values::restore_secret_values(
+                    item.payload.clone(),
+                    &secrets,
+                    encryption_key,
+                )?;
+            }
+            attune_common::value_schema::CompiledContract::new(&admitted.contract)?
+                .validate(&item.payload)?;
         }
 
         let dispatch_snapshot: attune_common::models::ExecutionExecutableSnapshot = items[0]
@@ -645,19 +675,41 @@ impl WorkQueueDispatcher {
             ));
         }
         let dispatch_action = &dispatch_snapshot.executable.action;
+        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(&mut tx, &dispatch_snapshot).await?;
+        let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)?;
 
         let executor_identity = {
             let mut iter = items.iter().map(|item| item.requested_by_identity);
             let first = iter.next().flatten();
             first.filter(|id| iter.all(|other| other == Some(*id)))
         };
+        let (pack_config, pack_secret_paths, pack_revision) = if let Some(reference) =
+            &context.pack_ref
+        {
+            let pack = PackRepository::find_by_ref(&mut *tx, reference)
+                .await?
+                .ok_or_else(|| anyhow!("Queue configuration owner is unavailable"))?;
+            let authority = match executor_identity {
+                Some(identity) => Some(
+                    attune_common::delegation::DelegationAuthority::load_for_share(
+                        &mut tx, identity,
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
+            attune_common::repositories::component_configuration::ComponentConfigurationRepository::pack_template_values(
+                &mut tx,&pack,authority.as_ref(),encryption_key).await?
+        } else {
+            (JsonValue::Null, Vec::new(), None)
+        };
         let key_context = Self::build_action_params_context(
             queue,
             &context.parsed_config,
-            &context.pack_config,
+            &pack_config,
             &items,
             None,
-        );
+        )?;
         let key_refs = key_context.referenced_key_refs(&queue.action_params)?;
         let keys = if key_refs.is_empty() {
             std::collections::BTreeMap::new()
@@ -680,21 +732,26 @@ impl WorkQueueDispatcher {
         let rendered_config = Self::build_execution_config(
             queue,
             &context.parsed_config,
-            &context.pack_config,
+            &pack_config,
             context.pack_ref.clone(),
-            &context.pack_secret_paths,
+            &pack_secret_paths,
+            pack_revision,
             &items,
             keys,
         )?;
-        validate_secret_destination_paths(
-            dispatch_action.param_schema.as_ref(),
+        let config_with_defaults = input_contract.apply_defaults(&rendered_config.value)?;
+        input_contract.validate(&config_with_defaults)?;
+        attune_common::secret_values::validate_contract_secret_destination_paths(
+            &config_with_defaults,
+            &input_contract,
             &rendered_config.secret_paths,
         )?;
-        let (execution_config, secret_inputs) = merge_schema_secret_redactions(
-            rendered_config.value,
-            &rendered_config.secret_path_sources,
-            dispatch_action.param_schema.as_ref(),
-        );
+        let (execution_config, secret_inputs) =
+            attune_common::secret_values::merge_contract_secret_redactions(
+                config_with_defaults,
+                &rendered_config.secret_path_sources,
+                &input_contract,
+            )?;
         let prepared_secrets = if secret_inputs.is_empty() {
             Vec::new()
         } else {
@@ -762,6 +819,13 @@ impl WorkQueueDispatcher {
             &dispatch_snapshot,
         )
         .await?;
+        attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+            &mut tx,
+            attune_common::repositories::schema_contract::BindingOwner::Execution,
+            execution.id,
+            &binding,
+        )
+        .await?;
         if !prepared_secrets.is_empty() {
             ExecutionSecretValueRepository::upsert_many_with_conn(
                 &mut tx,
@@ -809,6 +873,7 @@ impl WorkQueueDispatcher {
         pack_config: &JsonValue,
         pack_ref: Option<String>,
         pack_secret_paths: &[JsonPointer],
+        pack_revision: Option<i64>,
         items: &[WorkQueueItem],
         keys: std::collections::BTreeMap<String, attune_common::key_access::ResolvedKey>,
     ) -> Result<RenderedJson> {
@@ -828,12 +893,20 @@ impl WorkQueueDispatcher {
         }
 
         let context =
-            Self::build_action_params_context(queue, parsed_config, pack_config, items, None);
+            Self::build_action_params_context(queue, parsed_config, pack_config, items, None)?;
         let mut context = context;
         context.set_template_origin("queue", &queue.r#ref);
         context.set_resolved_keys(keys);
-        context.set_pack_config_with_secret_paths(pack_config.clone(), pack_ref, pack_secret_paths);
-        Self::mark_queue_item_secret_paths(&context, queue, items);
+        if let Some(revision) = pack_revision {
+            context.set_bound_pack_config(pack_config.clone(), revision, pack_secret_paths);
+        } else {
+            context.set_pack_config_with_secret_paths(
+                pack_config.clone(),
+                pack_ref,
+                pack_secret_paths,
+            );
+        }
+        Self::mark_queue_item_secret_paths(&context, queue, items)?;
         let rendered = context
             .render_json_with_sensitivity(&queue.action_params)
             .map_err(|error| {
@@ -858,12 +931,12 @@ impl WorkQueueDispatcher {
         queue: &WorkQueue,
         items: &[WorkQueueItem],
     ) -> Result<RenderedJson> {
-        let item_secret_paths = secret_paths_from_schema(Some(&queue.item_schema));
         match queue.batch_mode {
             attune_common::models::WorkQueueBatchMode::Single => {
                 let item = items
                     .first()
                     .ok_or_else(|| anyhow!("single-item queue dispatch had no leased item"))?;
+                let item_secret_paths = item.payload_secret_paths()?;
                 let value = if item.payload.is_object() {
                     item.payload.clone()
                 } else {
@@ -878,6 +951,8 @@ impl WorkQueueDispatcher {
                             format!("/item{path}")
                         },
                         source: SecretSource::QueueItem {
+                            queue_id: queue.id,
+                            pack_ref: queue.pack_ref.clone(),
                             queue_ref: Some(queue.r#ref.clone()),
                             item_id: Some(item.id),
                             path: path.clone(),
@@ -895,10 +970,13 @@ impl WorkQueueDispatcher {
                 });
                 let mut secret_path_sources = Vec::new();
                 for (idx, item) in items.iter().enumerate() {
+                    let item_secret_paths = item.payload_secret_paths()?;
                     for path in &item_secret_paths {
                         secret_path_sources.push(SecretPathSource {
                             path: format!("/items/{idx}{path}"),
                             source: SecretSource::QueueItem {
+                                queue_id: queue.id,
+                                pack_ref: queue.pack_ref.clone(),
                                 queue_ref: Some(queue.r#ref.clone()),
                                 item_id: Some(item.id),
                                 path: path.clone(),
@@ -920,7 +998,7 @@ impl WorkQueueDispatcher {
         pack_config: &JsonValue,
         items: &[WorkQueueItem],
         dispatch_id: Option<i64>,
-    ) -> WorkflowContext {
+    ) -> Result<WorkflowContext> {
         let mut context = WorkflowContext::new(JsonValue::Null, HashMap::new());
         context.set_pack_config(pack_config.clone());
         context.set_var(
@@ -937,7 +1015,7 @@ impl WorkQueueDispatcher {
         );
         if queue.batch_mode == attune_common::models::WorkQueueBatchMode::Single {
             if let Some(item) = items.first() {
-                let item_secret_paths = secret_paths_from_schema(Some(&queue.item_schema));
+                let item_secret_paths = item.payload_secret_paths()?;
                 if item_secret_paths.is_empty() {
                     context.set_current_item(item.payload.clone(), 0);
                 } else {
@@ -946,6 +1024,8 @@ impl WorkQueueDispatcher {
                         0,
                         &item_secret_paths,
                         |path| SecretSource::QueueItem {
+                            queue_id: queue.id,
+                            pack_ref: queue.pack_ref.clone(),
                             queue_ref: Some(queue.r#ref.clone()),
                             item_id: Some(item.id),
                             path: path.clone(),
@@ -955,24 +1035,22 @@ impl WorkQueueDispatcher {
                 context.set_var("queue_item", Self::build_queue_item_context(item));
             }
         }
-        context
+        Ok(context)
     }
 
     fn mark_queue_item_secret_paths(
         context: &WorkflowContext,
         queue: &WorkQueue,
         items: &[WorkQueueItem],
-    ) {
-        let item_secret_paths = secret_paths_from_schema(Some(&queue.item_schema));
-        if item_secret_paths.is_empty() {
-            return;
-        }
-
+    ) -> Result<()> {
         for (idx, item) in items.iter().enumerate() {
+            let item_secret_paths = item.payload_secret_paths()?;
             context.mark_secret_pointer_paths(
                 &format!("items.{idx}"),
                 &item_secret_paths,
                 |path| SecretSource::QueueItem {
+                    queue_id: queue.id,
+                    pack_ref: queue.pack_ref.clone(),
                     queue_ref: Some(queue.r#ref.clone()),
                     item_id: Some(item.id),
                     path: path.clone(),
@@ -982,6 +1060,8 @@ impl WorkQueueDispatcher {
                 &format!("queue_items.{idx}.payload"),
                 &item_secret_paths,
                 |path| SecretSource::QueueItem {
+                    queue_id: queue.id,
+                    pack_ref: queue.pack_ref.clone(),
                     queue_ref: Some(queue.r#ref.clone()),
                     item_id: Some(item.id),
                     path: path.clone(),
@@ -992,6 +1072,8 @@ impl WorkQueueDispatcher {
                     "queue_item.payload",
                     &item_secret_paths,
                     |path| SecretSource::QueueItem {
+                        queue_id: queue.id,
+                        pack_ref: queue.pack_ref.clone(),
                         queue_ref: Some(queue.r#ref.clone()),
                         item_id: Some(item.id),
                         path: path.clone(),
@@ -999,6 +1081,7 @@ impl WorkQueueDispatcher {
                 );
             }
         }
+        Ok(())
     }
 
     fn build_queue_item_context(item: &WorkQueueItem) -> JsonValue {
@@ -1061,16 +1144,20 @@ impl WorkQueueDispatcher {
                 pack_config,
                 items,
                 dispatch_id,
-            );
+            )?;
+            Self::mark_queue_item_secret_paths(&context, queue, items)?;
             let rendered = context
-                .render_json(&JsonValue::String(template.clone()))
+                .render_json_with_sensitivity(&JsonValue::String(template.clone()))
                 .with_context(|| {
                     format!(
                         "failed to render trace_tag_template for queue '{}'",
                         queue.r#ref
                     )
                 })?;
-            let rendered_string = match rendered {
+            if !rendered.secret_paths.is_empty() {
+                return Err(anyhow!("Queue trace tags cannot contain secret values"));
+            }
+            let rendered_string = match rendered.value {
                 JsonValue::Null => String::new(),
                 JsonValue::String(value) => value,
                 other => other.to_string(),
@@ -1313,6 +1400,24 @@ mod tests {
     }
 
     fn sample_item(id: i64, priority: i32, payload: JsonValue) -> WorkQueueItem {
+        let schema = json!({});
+        let contract = attune_common::value_schema::compile(
+            attune_common::value_schema::SourceIdentity::Assigned {
+                component_ref: "core.inbox".into(),
+                assignment_id: Uuid::new_v4(),
+            },
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            &schema,
+            &attune_common::value_schema::RegistryView::new(),
+            attune_common::value_schema::Limits::default(),
+        )
+        .unwrap();
+        let schema_binding =
+            serde_json::to_value(attune_common::value_schema::ValueSchemaBinding {
+                authored_schema: schema,
+                contract,
+            })
+            .unwrap();
         WorkQueueItem {
             id,
             queue: 1,
@@ -1324,6 +1429,7 @@ mod tests {
             priority,
             status: WorkQueueItemStatus::Queued,
             payload,
+            schema_binding: Some(schema_binding),
             metadata: json!({"source": "test"}),
             enqueue_source: "test".to_string(),
             requested_by_identity: None,
@@ -1386,6 +1492,7 @@ mod tests {
             &JsonValue::Null,
             None,
             &[],
+            None,
             &items,
             Default::default(),
         )
@@ -1420,6 +1527,7 @@ mod tests {
             &JsonValue::Null,
             None,
             &[],
+            None,
             &[item],
             Default::default(),
         )
@@ -1454,6 +1562,7 @@ mod tests {
             &json!({"region": "us-east-1"}),
             None,
             &[],
+            None,
             &[item],
             Default::default(),
         )
@@ -1467,6 +1576,32 @@ mod tests {
                 "region": "us-east-1"
             })
         );
+    }
+
+    #[test]
+    fn queue_pack_templates_record_the_configuration_revision_instead_of_mutable_schema_origins() {
+        let queue = sample_queue(
+            WorkQueueBatchMode::Single,
+            json!({"token":"{{ config.token }}"}),
+            json!({}),
+        );
+        let parsed = serde_json::from_value(queue.config.clone()).unwrap();
+        let item = sample_item(42, 1, json!({}));
+        let rendered = WorkQueueDispatcher::build_execution_config(
+            &queue,
+            &parsed,
+            &json!({"token":"queue-config-fixture"}),
+            Some("test.pack".into()),
+            &["/token".into()],
+            Some(19),
+            &[item],
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(rendered.value["token"], "queue-config-fixture");
+        assert!(rendered.secret_path_sources.iter().any(|source| source.path == "/token" && source.source.provenance().origins.iter().any(|origin|
+            matches!(origin,attune_common::secret_provenance::SecretOrigin::Entity {entity_type,entity_id,path}
+                if entity_type == attune_common::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION && *entity_id == 19 && path == "/token"))));
     }
 
     #[test]
@@ -1741,6 +1876,7 @@ mod tests {
             &JsonValue::Null,
             None,
             &[],
+            None,
             &items,
             Default::default(),
         )

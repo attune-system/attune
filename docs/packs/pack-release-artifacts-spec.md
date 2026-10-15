@@ -634,9 +634,69 @@ Three digests have distinct meanings:
 - File digests are SHA-256 values in the release manifest.
 - The optional source revision records provenance and is not release identity.
 
-One pack ref and semantic version MUST identify one release digest. Publishing
-different bytes under the same ref and version fails. `force` does not bypass
-this rule.
+One pack ref and semantic version MUST identify one release digest, except when
+the configured republishing policy below allows otherwise. Publishing different
+bytes under the same ref and version otherwise fails. `force` does not bypass
+this policy.
+
+### Republishing policy
+
+An administrator MAY configure `packs.republish` in a lower environment to
+publish changed pack bytes without incrementing the version. It has three modes:
+
+| Mode | New digest under an existing version |
+|---|---|
+| `off` | Reject. This is the default and MUST be used in higher environments. |
+| `on` | Allow for any valid semantic version, including stable releases. |
+| `suffix` | Allow only if the valid semantic version ends with the configured suffix. |
+
+The suffix defaults to `-dev`. The local development configuration uses suffix
+mode explicitly:
+
+```yaml
+packs:
+  republish:
+    mode: suffix
+    suffix: "-dev"
+```
+
+The environment overrides are `ATTUNE__PACKS__REPUBLISH__MODE=off|on|suffix`
+and `ATTUNE__PACKS__REPUBLISH__SUFFIX=-dev`. All API replicas MUST use the same
+policy. Changing it requires restarting the API. Clients MUST NOT be able to
+override it through an upload parameter or `force`. This replaces the earlier
+`packs.allow_dev_version_republish` boolean, which is no longer accepted.
+
+Suffix matching MUST be literal and case-sensitive over the full version
+string, not a regex or glob. With `-dev`, `1.2.3-dev`, `1.2.3-alpha-dev`, and
+`1.2.3+build-dev` qualify. `1.2.3`, `1.2.3-rc`, `1.2.3-dev.1`, `1.2.3-DEV`,
+and `1.2.3-dev+build` do not. A custom suffix such as `-snapshot` admits
+`1.2.3-snapshot` instead. Empty suffixes and suffixes containing whitespace MUST
+fail configuration validation. Unknown modes MUST also fail validation.
+Invalid semantic versions never qualify, including in `on` mode.
+
+When the policy permits it, upload, registration, and installation MAY accept a
+new digest for an existing pack ref and qualifying version. Existing replacement
+authorization and `force` requirements still apply. This bypasses only the
+one-version-to-one-digest conflict check, not semantic version validation,
+compatibility checks, registry checksums, signatures, archive or file digest
+verification, or release cache protection. Production index publishers MUST
+continue to enforce immutable version-to-digest bindings.
+
+Every changed upload MUST create a separate immutable release ID,
+archive digest, object, and executable snapshot. Activation selects that release
+for new work. Existing execution, enforcement, queue, workflow, and sensor pins
+MUST retain their original release IDs and digests. Never overwrite an existing
+release, rewrite its digest, or relabel changed bytes with an old digest.
+Byte-identical republication MUST reuse the existing release even when several
+digests have been published for that version.
+
+Switching to `off`, or changing the suffix to exclude a version, rejects new
+digests under that already published version. It does not delete retained
+releases, invalidate existing pins, or prevent reuse of an already retained
+byte-identical release. A first publication remains allowed under the normal
+policy. This setting is not a blanket ban on prerelease versions.
+
+### Release pins
 
 Executions, enforcements, queue items, and sensor workloads continue to pin a
 pack release. Executable snapshots add the selected artifact variant and file
@@ -1376,7 +1436,8 @@ The system fails closed in these cases:
   defined by the install state machine or the execution scheduling deadline.
 - A Java launch has an invalid main class or classpath outside the release.
 - A pack attempts to replace platform-owned metadata.
-- A version already maps to another digest.
+- A version already maps to another digest and the configured republishing
+  policy does not allow a new digest for that version.
 - A required candidate smoke test fails.
 
 Retries follow the install state machine. Status records the current stage,

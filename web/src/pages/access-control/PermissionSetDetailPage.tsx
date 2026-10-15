@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { toJsonValue } from "@/lib/json-value";
 import { useParams, Link } from "react-router-dom";
 import {
   ArrowLeft,
@@ -502,7 +503,7 @@ export default function PermissionSetDetailPage() {
         data: {
           label: permissionSet.label ?? null,
           description: permissionSet.description ?? null,
-          grants,
+          grants: toJsonValue(grants),
         },
       });
       setIsEditingGrants(false);

@@ -38,9 +38,3 @@ describe("AnalyticsWidgets deterministic transforms", () => {
     expect(model.maxTotal).toBe(6);
   });
 });
-
-describe.skip("Dashboard data endpoint contract rendering", () => {
-  it("renders partial/forbidden/error states distinctly", () => {
-    // Blocked: dashboard data endpoint/source envelopes are not implemented yet.
-  });
-});

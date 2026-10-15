@@ -166,12 +166,7 @@ impl RetryManager {
                 should_retry: false,
                 reason: None,
                 backoff_delay: None,
-                retry_count: execution
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.get("retry_count"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32,
+                retry_count: execution.retry_count,
                 max_retries: 0,
             });
         }
@@ -187,19 +182,8 @@ impl RetryManager {
             });
         }
 
-        // Get retry metadata from execution config
-        let config = execution.config.as_ref();
-        let retry_count = config
-            .and_then(|c| c.get("retry_count"))
-            .and_then(|v: &serde_json::Value| v.as_i64())
-            .unwrap_or(0) as i32;
-        let max_retries = config
-            .and_then(|c| c.get("max_retries"))
-            .and_then(|v: &serde_json::Value| v.as_i64())
-            .unwrap_or(0) as i32;
-        let _original_execution = config
-            .and_then(|c| c.get("original_execution"))
-            .and_then(|v: &serde_json::Value| v.as_i64());
+        let retry_count = execution.retry_count;
+        let max_retries = execution.max_retries.unwrap_or(0);
 
         // Check if retries are exhausted
         if max_retries == 0 || retry_count >= max_retries {
@@ -267,35 +251,15 @@ impl RetryManager {
             .await?
             .ok_or_else(|| Error::not_found("Execution", "id", execution_id.to_string()))?;
 
-        // Get retry metadata
-        let config = original.config.as_ref();
-        let retry_count = config
-            .and_then(|c| c.get("retry_count"))
-            .and_then(|v: &serde_json::Value| v.as_i64())
-            .unwrap_or(0) as i32;
-        let max_retries = config
-            .and_then(|c| c.get("max_retries"))
-            .and_then(|v: &serde_json::Value| v.as_i64())
-            .unwrap_or(0) as i32;
-        let original_execution_id = config
-            .and_then(|c| c.get("original_execution"))
-            .and_then(|v: &serde_json::Value| v.as_i64())
-            .unwrap_or(execution_id);
-
-        // Create retry config
-        let mut retry_config = original.config.clone().unwrap_or_else(|| json!({}));
-        retry_config["retry_count"] = json!(retry_count + 1);
-        retry_config["max_retries"] = json!(max_retries);
-        retry_config["original_execution"] = json!(original_execution_id);
-        retry_config["retry_reason"] = json!(reason.as_str());
-        retry_config["retry_of"] = json!(execution_id);
-        retry_config["retry_at"] = json!(Utc::now().to_rfc3339());
+        let retry_count = original.retry_count;
+        let max_retries = original.max_retries.unwrap_or(0);
+        let original_execution_id = original.original_execution.unwrap_or(execution_id);
 
         // Create new execution (reusing original parameters)
         let retry_execution = CreateExecutionInput {
             action: original.action,
             action_ref: original.action_ref.clone(),
-            config: Some(retry_config),
+            config: original.config.clone(),
             env_vars: original.env_vars.clone(),
             parent: original.parent,
             enforcement: original.enforcement,
@@ -323,8 +287,20 @@ impl RetryManager {
                 original.id
             ))
         })?;
+        let mut transaction = self.pool.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+            &mut transaction,
+        )
+        .await?;
+        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
+            &mut transaction,
+            attune_common::repositories::schema_contract::BindingOwner::Execution,
+            original.id,
+        )
+        .await?
+        .ok_or_else(|| Error::validation("Retry source is missing its schema binding"))?;
         let created = ExecutionRepository::create_retry(
-            &self.pool,
+            &mut *transaction,
             retry_execution,
             snapshot,
             retry_count + 1,
@@ -333,14 +309,28 @@ impl RetryManager {
             original_execution_id,
         )
         .await?;
+        attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+            &mut transaction,
+            attune_common::repositories::schema_contract::BindingOwner::Execution,
+            created.id,
+            &binding,
+        )
+        .await?;
+        attune_common::repositories::rule_authority::RuleAuthorityRepository::copy_execution(
+            &mut transaction,
+            original.id,
+            created.id,
+        )
+        .await?;
         ExecutionSecretValueRepository::copy_entity(
-            &self.pool,
+            &mut *transaction,
             ENTITY_EXECUTION_CONFIG,
             original.id,
             ENTITY_EXECUTION_CONFIG,
             created.id,
         )
         .await?;
+        transaction.commit().await?;
 
         info!(
             "Created retry execution {} for original {} (attempt {}/{})",

@@ -48,10 +48,10 @@ use attune_common::repositories::{
     pack_release::CreatePackReleaseInput,
     pack_retention::PackRetentionRepository,
     work_queue::WorkQueueRepository,
-    ActionRepository, ComponentLifecycleRepository, Create, Delete, FindById, FindByRef,
-    HealthRepository, List, PackInstallRepository, PackRegistryIndexRepository,
-    PackReleaseRepository, PackRepository, PackTestRepository, Patch, RuleRepository,
-    SensorAdmissionRepository, SensorRepository, TriggerRepository, Update,
+    ActionRepository, ComponentLifecycleRepository, Delete, FindById, FindByRef, HealthRepository,
+    List, PackInstallRepository, PackRegistryIndexRepository, PackReleaseRepository,
+    PackRepository, PackTestRepository, Patch, RuleRepository, SensorAdmissionRepository,
+    SensorRepository, TriggerRepository,
 };
 use attune_common::runtime_cache::{
     pack_runtime_environment_relative_paths, stage_pack_runtime_environment_removal,
@@ -107,6 +107,9 @@ struct PackRegistrationInput {
 }
 
 struct RegisteredPack {
+    pack: Pack,
+    components: crate::dto::pack::ComponentCounts,
+    diagnostics: Vec<attune_common::pack_check::PackDiagnostic>,
     id: i64,
     test_install: Option<PackInstall>,
     tests_skipped: bool,
@@ -322,7 +325,8 @@ pub async fn list_packs(
     path = "/api/v1/packs/{ref}",
     tag = "packs",
     params(
-        ("ref" = String, Path, description = "Pack reference identifier")
+        ("ref" = String, Path, description = "Pack reference identifier"),
+        crate::dto::pack::PackDetailQuery
     ),
     responses(
         (status = 200, description = "Pack details", body = inline(ApiResponse<PackResponse>)),
@@ -334,6 +338,7 @@ pub async fn get_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
+    Query(query): Query<crate::dto::pack::PackDetailQuery>,
 ) -> ApiResult<impl IntoResponse> {
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
@@ -353,7 +358,41 @@ pub async fn get_pack(
         }
     }
 
-    let mut response = PackResponse::from(pack);
+    let mut response = PackResponse::from(pack.clone());
+    let configuration = attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(&state.db, "pack", pack.id).await?;
+    if let Some(revision) = &configuration {
+        revision.contract()?;
+        response.config = revision.config.clone();
+        response.config_schema_binding = Some(revision.contract.clone());
+    }
+    if query.include_secret_values {
+        let identity_id = user
+            .identity_id()
+            .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+        let grants = state
+            .authorization_service()
+            .effective_grants(&user)
+            .await?;
+        if !pack_action_allowed(&grants, Action::Read, identity_id, &pack)
+            || !pack_action_allowed(&grants, Action::Decrypt, identity_id, &pack)
+        {
+            return Err(ApiError::Forbidden(
+                "Pack configuration disclosure requires read and decrypt authority".into(),
+            ));
+        }
+        if let Some(revision) = configuration {
+            let mut connection = state.db.acquire().await?;
+            attune_common::repositories::component_configuration::ComponentConfigurationRepository::restore(
+                &mut connection, &revision, state.config.security.encryption_key.as_deref()).await?;
+            response.config = crate::secret_disclosure::reveal_authorized(&state, &user, Some(revision.config),
+                attune_common::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION, revision.id).await?
+                .ok_or_else(|| ApiError::Forbidden("Pack configuration is unavailable".into()))?;
+        } else {
+            return Err(ApiError::Forbidden(
+                "Pack configuration requires its original binding".into(),
+            ));
+        }
+    }
     response.action_count =
         Some(ActionRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
     response.trigger_count =
@@ -655,7 +694,11 @@ pub async fn create_pack(
     };
 
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
     let mut pack = PackRepository::create(&mut *tx, pack_input).await?;
+    let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
+        &mut tx, &pack, Some(&pack.config), state.config.security.encryption_key.as_deref()).await?;
+    pack.config = revision.config;
     pack = PackRepository::update_worker_placement(
         &mut *tx,
         pack.id,
@@ -779,6 +822,7 @@ pub async fn update_pack(
 
     let authorized_pack_id = existing_pack.id;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref)
         .await?
@@ -809,6 +853,17 @@ pub async fn update_pack(
         || request.worker_affinity.is_some();
 
     // Create update input
+    let configuration_changed = request.config.is_some() || request.conf_schema.is_some();
+    let supplied_config = request.config.clone();
+    if request.conf_schema.is_some() && request.config.is_none()
+        && attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(&mut *tx, "pack", existing_pack.id)
+            .await?.is_some_and(|revision| revision.config != existing_pack.config || attune_common::secret_values::redacted_paths(&revision.config).len() > 0) {
+        for action in [Action::Read, Action::Decrypt] {
+            if !pack_action_allowed(&grants, action, identity_id, &existing_pack) {
+                return Err(ApiError::Forbidden("Rebinding preserved pack configuration requires read and decrypt authority".into()));
+            }
+        }
+    }
     let update_input = UpdatePackInput {
         label: request.label,
         description: request.description.map(|patch| match patch {
@@ -826,7 +881,12 @@ pub async fn update_pack(
         installers: None,
     };
 
-    let pack = PackRepository::update(&mut *tx, existing_pack.id, update_input).await?;
+    let mut pack = PackRepository::update(&mut *tx, existing_pack.id, update_input).await?;
+    if configuration_changed {
+        let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
+            &mut tx, &pack, supplied_config.as_ref(), state.config.security.encryption_key.as_deref()).await?;
+        pack.config = revision.config;
+    }
     let pack = if placement_changed {
         PackRepository::update_worker_placement(
             &mut *tx,
@@ -1524,6 +1584,48 @@ async fn wait_for_pack_test(
     }
 }
 
+async fn candidate_test_failure(state: &AppState, install: &PackInstall) -> ApiError {
+    use attune_common::pack_registry::diagnostics::{pointer, DeploymentDetails};
+    let mut diagnostics = Vec::new();
+    if let Ok(Some(result)) = pack_install_test_result(Some(install)) {
+        for suite in result.test_suites.iter().filter(|suite| {
+            suite.failed > 0
+                || suite
+                    .test_cases
+                    .iter()
+                    .any(|case| case.status == attune_common::models::pack_test::TestStatus::Error)
+        }) {
+            diagnostics.push(attune_common::pack_check::PackDiagnostic::at("pack.yaml", format!("/testing/runners{}", pointer(&suite.name)),
+                format!("Test runner '{}' did not pass. Inspect this install's test_result for suite details and captured output.", suite.name)));
+        }
+    }
+    if diagnostics.is_empty() {
+        diagnostics.push(attune_common::pack_check::PackDiagnostic::at("pack.yaml", "/testing", "Candidate tests could not complete successfully. Check worker admission, candidate distribution, runtime setup, and the install record."));
+    }
+    let details = DeploymentDetails::new("test_execution", diagnostics);
+    let error = ApiError::Deployment {
+        source: Box::new(ApiError::UnprocessableEntity(
+            "Candidate tests did not pass; the active release is unchanged.".into(),
+        )),
+        details: Box::new(details),
+    }
+    .in_deployment(
+        "test_execution",
+        &install.pack_ref,
+        &install.pack_version,
+        Some(install.id),
+    );
+    if let Some(details) = error.deployment_details() {
+        if let Err(record_error) = PackInstallRepository::new(state.db.clone())
+            .record_diagnostics(install.id, details, Some(error.message()), false)
+            .await
+        {
+            tracing::warn!(install_id=install.id, %record_error, "Could not persist candidate test diagnostics");
+        }
+    }
+    error
+}
+
 /// Upload and register a pack from a tar.gz archive (multipart/form-data)
 ///
 /// The archive should be a gzipped tar containing the pack directory at its root
@@ -1548,21 +1650,32 @@ async fn wait_for_pack_test(
 pub async fn upload_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_pack_registry_action(&state, &user, Action::Install).await?;
+    authorize_pack_install_preflight(&state, &user).await?;
 
+    let mut multipart = multipart.map_err(|_| {
+        ApiError::BadRequest(
+            "Invalid pack upload. Use multipart/form-data with a 'pack' archive field.".into(),
+        )
+    })?;
     let mut pack_archive: Option<tempfile::NamedTempFile> = None;
     let mut force = false;
     let mut skip_tests = false;
     let mut absent_metadata_policy = AbsentMetadataPolicy::Remove;
 
     // Parse multipart fields
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("Multipart error: {}", e)))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::PayloadTooLarge(
+                "Pack upload exceeds the configured upload limit. Reduce archive size.".into(),
+            )
+        } else {
+            ApiError::BadRequest(
+                "Invalid multipart pack upload. Check archive and form fields.".into(),
+            )
+        }
+    })? {
         match field.name() {
             Some("pack") => {
                 pack_archive = Some(
@@ -1573,13 +1686,27 @@ pub async fn upload_pack(
                 let val = field.text().await.map_err(|e| {
                     ApiError::BadRequest(format!("Failed to read force field: {}", e))
                 })?;
-                force = val.trim().eq_ignore_ascii_case("true");
+                force = val
+                    .trim()
+                    .to_ascii_lowercase()
+                    .parse::<bool>()
+                    .map_err(|_| {
+                        ApiError::BadRequest("Multipart field 'force' must be true or false".into())
+                    })?;
             }
             Some("skip_tests") => {
                 let val = field.text().await.map_err(|e| {
                     ApiError::BadRequest(format!("Failed to read skip_tests field: {}", e))
                 })?;
-                skip_tests = val.trim().eq_ignore_ascii_case("true");
+                skip_tests = val
+                    .trim()
+                    .to_ascii_lowercase()
+                    .parse::<bool>()
+                    .map_err(|_| {
+                        ApiError::BadRequest(
+                            "Multipart field 'skip_tests' must be true or false".into(),
+                        )
+                    })?;
             }
             Some("absent_metadata_policy") => {
                 let value = field.text().await.map_err(|e| {
@@ -1591,10 +1718,8 @@ pub async fn upload_pack(
                     "remove" => AbsentMetadataPolicy::Remove,
                     "disable" => AbsentMetadataPolicy::Disable,
                     "retain" => AbsentMetadataPolicy::Retain,
-                    other => {
-                        return Err(ApiError::BadRequest(format!(
-                            "Invalid absent_metadata_policy '{other}'"
-                        )))
+                    _ => {
+                        return Err(ApiError::BadRequest("Multipart field 'absent_metadata_policy' must be remove, disable, or retain".into()))
                     }
                 };
             }
@@ -1635,7 +1760,7 @@ pub async fn upload_pack(
             temp_extract_dir.path(),
             &state.config.pack_upload,
         )
-        .map_err(|e| ApiError::BadRequest(format!("Failed to extract pack archive: {}", e)))?;
+        .map_err(ApiError::from)?;
     }
 
     // Find pack.yaml — it may be at the root or inside a single subdirectory
@@ -1652,8 +1777,13 @@ pub async fn upload_pack(
     let pack_yaml_path = pack_root.join("pack.yaml");
     let pack_yaml_content = std::fs::read_to_string(&pack_yaml_path)
         .map_err(|e| ApiError::InternalServerError(format!("Failed to read pack.yaml: {}", e)))?;
-    let pack_yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&pack_yaml_content)
-        .map_err(|e| ApiError::BadRequest(format!("Failed to parse pack.yaml: {}", e)))?;
+    let pack_yaml: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&pack_yaml_content).map_err(|e| {
+            ApiError::from(attune_common::pack_registry::diagnostics::yaml_error(
+                "pack.yaml",
+                &e,
+            ))
+        })?;
     let pack_ref = pack_yaml
         .get("ref")
         .and_then(|v| v.as_str())
@@ -1694,11 +1824,7 @@ pub async fn upload_pack(
     .await?;
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, registered_pack.id)
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("Pack with ID {} not found", registered_pack.id))
-        })?;
+    let pack = registered_pack.pack.clone();
 
     emit_pack_audit(
         &state,
@@ -1716,6 +1842,7 @@ pub async fn upload_pack(
     let test_result = pack_install_test_result(registered_pack.test_install.as_ref())?;
     let response = ApiResponse::with_message(
         PackInstallResponse {
+            diagnostics: registered_pack.diagnostics,
             pack: PackResponse::from(pack),
             test_result,
             tests_skipped: registered_pack.tests_skipped,
@@ -1748,14 +1875,13 @@ fn safe_unpack<R: std::io::Read>(
     archive: &mut tar::Archive<R>,
     dest: &std::path::Path,
     cfg: &attune_common::config::PackUploadConfig,
-) -> Result<(), String> {
+) -> attune_common::Result<()> {
     let limits = attune_common::pack_registry::SafeExtractionLimits {
         max_entries: cfg.max_file_count(),
         max_entry_bytes: cfg.max_per_entry_size_bytes(),
         max_total_bytes: cfg.max_extracted_size_bytes(),
     };
     attune_common::pack_registry::extract_tar_archive(archive, dest, limits)
-        .map_err(|error| error.to_string())
 }
 
 /// Walk the extracted directory and find the directory that contains `pack.yaml`.
@@ -1787,20 +1913,26 @@ fn find_pack_root(base: &std::path::Path) -> Option<PathBuf> {
     request_body = RegisterPackRequest,
     responses(
         (status = 201, description = "Pack registered successfully", body = ApiResponse<PackInstallResponse>),
-        (status = 400, description = "Invalid request or tests failed", body = ApiResponse<String>),
-        (status = 409, description = "Pack already exists", body = ApiResponse<String>),
+        (status = 400, description = "Invalid request or YAML syntax", body = crate::middleware::error::ErrorResponse),
+        (status = 403, description = "Deployment permission denied", body = crate::middleware::error::ErrorResponse),
+        (status = 409, description = "Pack or activation conflict", body = crate::middleware::error::ErrorResponse),
+        (status = 422, description = "Invalid metadata or failed candidate tests", body = crate::middleware::error::ErrorResponse),
+        (status = 500, description = "Deployment service failure", body = crate::middleware::error::ErrorResponse),
+        (status = 503, description = "Retryable database failure", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn register_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
-    Json(request): Json<crate::dto::pack::RegisterPackRequest>,
+    super::pack_request::PackJson(request): super::pack_request::PackJson<
+        crate::dto::pack::RegisterPackRequest,
+    >,
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
     request.validate()?;
 
-    authorize_pack_registry_action(&state, &user, Action::Install).await?;
+    authorize_pack_install_preflight(&state, &user).await?;
     // Call internal registration logic
     let registered_pack = register_pack_internal(
         state.clone(),
@@ -1818,11 +1950,7 @@ pub async fn register_pack(
     .await?;
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, registered_pack.id)
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("Pack with ID {} not found", registered_pack.id))
-        })?;
+    let pack = registered_pack.pack.clone();
 
     emit_pack_audit(
         &state,
@@ -1840,6 +1968,7 @@ pub async fn register_pack(
     let test_result = pack_install_test_result(registered_pack.test_install.as_ref())?;
     let response = ApiResponse::with_message(
         PackInstallResponse {
+            diagnostics: registered_pack.diagnostics,
             pack: PackResponse::from(pack),
             test_result,
             tests_skipped: registered_pack.tests_skipped,
@@ -1871,6 +2000,7 @@ async fn authorize_pack_delegation(
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
     let authority =
         attune_common::delegation::DelegationAuthority::load(&state.db, identity_id).await?;
+    require_candidate_install_authority(&authority, pack_ref)?;
     let plan = attune_common::pack_registry::permissions::PackPermissionPlan::read(path, pack_ref)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let mut connection = state.db.acquire().await?;
@@ -1916,8 +2046,8 @@ async fn register_pack_internal(
     let pack_yaml_content = fs::read_to_string(&pack_yaml_path)
         .map_err(|e| ApiError::InternalServerError(format!("Failed to read pack.yaml: {}", e)))?;
 
-    let pack_yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&pack_yaml_content)
-        .map_err(|e| ApiError::InternalServerError(format!("Failed to parse pack.yaml: {}", e)))?;
+    let pack_yaml = attune_common::pack_registry::diagnostics::read_manifest(&source_pack_path)?;
+    let mut metadata_diagnostics = Vec::new();
 
     // Extract pack metadata
     let pack_ref = pack_yaml
@@ -1929,7 +2059,7 @@ async fn register_pack_internal(
         .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
 
     let label = pack_yaml
-        .get("name")
+        .get("label")
         .and_then(|v| v.as_str())
         .unwrap_or(&pack_ref)
         .to_string();
@@ -1947,15 +2077,15 @@ async fn register_pack_internal(
 
     // Extract common metadata fields used for both create and update
     let conf_schema = pack_yaml
-        .get("config_schema")
+        .get("conf_schema")
         .and_then(|v| serde_json::to_value(v).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     let meta = pack_yaml
-        .get("metadata")
+        .get("meta")
         .and_then(|v| serde_json::to_value(v).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     let tags: Vec<String> = pack_yaml
-        .get("keywords")
+        .get("tags")
         .and_then(|v| v.as_sequence())
         .map(|seq| {
             seq.iter()
@@ -2053,6 +2183,14 @@ async fn register_pack_internal(
         &pack_ref,
     )
     .await?;
+    metadata_diagnostics.extend(
+        attune_common::pack_registry::diagnostics::validate_metadata(
+            replacement
+                .as_ref()
+                .expect("registration source was staged")
+                .staged_path(),
+        )?,
+    );
 
     // Test a private copy before changing active files or database rows.
     let mut test_install = None;
@@ -2110,21 +2248,31 @@ async fn register_pack_internal(
                 test_install = Some(terminal.clone());
                 if terminal.status != PackInstallStatus::Activating.as_str() && !force {
                     let _ = std::fs::remove_dir_all(&candidate_path);
-                    return Err(ApiError::BadRequest(format!(
-                        "Candidate pack tests failed: {}",
-                        terminal
-                            .error_message
-                            .unwrap_or_else(|| { "worker reported a failed test run".to_string() })
-                    )));
+                    return Err(candidate_test_failure(&state, &terminal).await);
+                }
+                if terminal.status == "failed" && force {
+                    if terminal.test_result.is_none() {
+                        return Err(candidate_test_failure(&state, &terminal).await);
+                    }
+                    test_install = PackInstallRepository::new(state.db.clone())
+                        .begin_test_override_activation(terminal.id)
+                        .await?;
+                    if test_install.is_none() {
+                        return Err(ApiError::Conflict(
+                            "Candidate test override could not begin activation".into(),
+                        ));
+                    }
                 }
                 let _ = std::fs::remove_dir_all(&candidate_path);
             }
             PackTestDispatchOutcome::Failed { error, install } => {
                 let _ = std::fs::remove_dir_all(&candidate_path);
-                test_install = install;
-                if !force {
-                    return Err(error);
-                }
+                return Err(error.in_deployment(
+                    "test_preflight",
+                    &pack_ref,
+                    &version,
+                    install.as_ref().map(|record| record.id),
+                ));
             }
             PackTestDispatchOutcome::Skipped => {
                 tests_skipped = true;
@@ -2175,17 +2323,18 @@ async fn register_pack_internal(
     let mut activation_guard = active_install_id
         .map(|install_id| PackActivationFailureGuard::new(state.db.clone(), install_id));
 
+    let mut committed = false;
+    let mut projection_ready = false;
+    let mut committed_release_id = None;
+    let activation_result = async {
+
     let release_source = replacement
         .as_ref()
         .expect("registration source was staged")
         .staged_path();
     let published_release = storage
         .publish_release(release_source, &pack_ref, &version)
-        .map_err(|error| {
-            ApiError::InternalServerError(format!(
-                "Failed to publish immutable pack release: {error}"
-            ))
-        })?;
+        .map_err(|error| ApiError::from(error).in_deployment("release_publication", &pack_ref, &version, active_install_id))?;
 
     let authorized_existing = PackRepository::find_by_ref(&state.db, &pack_ref).await?;
     if let Some(existing) = &authorized_existing {
@@ -2279,6 +2428,7 @@ async fn register_pack_internal(
         registering_identity,
     )
     .await?;
+    require_candidate_install_authority(&registration_authority, &pack_ref)?;
     attune_common::pack_registry::permissions::PackPermissionPlan::read(
         &published_release.pack_path,
         &pack_ref,
@@ -2321,7 +2471,8 @@ async fn register_pack_internal(
             installers,
         };
 
-        let pack = PackRepository::update(&mut *tx, existing.id, update_input).await?;
+        let pack = PackRepository::update_for_deployment(&mut tx, existing.id, update_input,
+            &published_release.pack_path, absent_metadata_policy).await?;
         PackRepository::update_worker_placement(
             &mut *tx,
             pack.id,
@@ -2352,7 +2503,8 @@ async fn register_pack_internal(
                 .unwrap_or_else(|| serde_json::json!({})),
         };
 
-        let pack = PackRepository::create(&mut *tx, pack_input).await?;
+        let pack = PackRepository::create_for_deployment(&mut tx, pack_input,
+            &published_release.pack_path, absent_metadata_policy).await?;
         PackRepository::update_worker_placement(
             &mut *tx,
             pack.id,
@@ -2365,7 +2517,7 @@ async fn register_pack_internal(
 
     let pack =
         PackRepository::set_registered_identity(&mut tx, pack.id, registering_identity).await?;
-    let release = PackReleaseRepository::create_or_get(
+    let release = PackReleaseRepository::create_or_get_with_policy(
         &mut tx,
         CreatePackReleaseInput {
             pack: pack.id,
@@ -2384,6 +2536,7 @@ async fn register_pack_internal(
                 ))
             })?,
         },
+        &state.config.packs,
     )
     .await?;
 
@@ -2398,7 +2551,7 @@ async fn register_pack_internal(
             pack.id,
             &pack.r#ref,
             &state.config.cache_admission,
-            registration_authority,
+            registration_authority.clone(),
         )
         .with_absent_metadata_policy(absent_metadata_policy);
         match component_loader
@@ -2406,12 +2559,15 @@ async fn register_pack_internal(
             .await
         {
             Ok(load_result) => {
-                if load_result.rules_skipped > 0 {
-                    return Err(ApiError::UnprocessableEntity(format!(
-                        "Pack rule validation failed: {}",
-                        serde_json::to_string(&load_result.warnings)
-                            .unwrap_or_else(|_| "one or more rules were skipped".to_string())
-                    )));
+                metadata_diagnostics.retain(|diagnostic| diagnostic.code != "schema.external_reference_unverified");
+                if load_result.total_skipped() > load_result.caches_skipped {
+                    let diagnostics = load_result.warnings.iter().map(|warning| attune_common::pack_check::PackDiagnostic {
+                        code: "component.skipped".into(), message: warning.clone(), ..Default::default()
+                    }).collect();
+                    return Err(ApiError::Deployment {
+                        source: Box::new(ApiError::UnprocessableEntity("Pack components were rejected. Correct the listed metadata before deploying.".into())),
+                        details: Box::new(attune_common::pack_registry::diagnostics::DeploymentDetails::new("component_loading", diagnostics)),
+                    });
                 }
                 tracing::info!(
                     "Pack '{}' components loaded: {} created, {} updated, {} skipped, {} removed, {} warnings \
@@ -2429,20 +2585,14 @@ async fn register_pack_internal(
                     load_result.sensors_loaded, load_result.sensors_updated,
                     load_result.caches_loaded, load_result.caches_updated, load_result.caches_skipped,
                 );
-                for warning in &load_result.warnings {
-                    tracing::warn!("Pack component warning: {}", warning);
-                }
+                metadata_diagnostics.extend(load_result.warnings.iter().map(|warning| attune_common::pack_check::PackDiagnostic {
+                    severity: attune_common::pack_check::PackDiagnosticSeverity::Warning,
+                    code: "component.warning".into(), message: warning.clone(), ..Default::default()
+                }));
                 load_result.projections
             }
             Err(e) => {
-                if matches!(e, attune_common::Error::PermissionDenied(_)) {
-                    return Err(e.into());
-                }
-                let message = format!(
-                    "Pack registration failed while loading components for '{}': {}",
-                    pack.r#ref, e
-                );
-                return Err(ApiError::BadRequest(message));
+                return Err(ApiError::from(e));
             }
         }
     };
@@ -2453,10 +2603,21 @@ async fn register_pack_internal(
     )
     .await?;
     if !admission_failures.is_empty() {
-        return Err(ApiError::UnprocessableEntity(
-            serde_json::to_string(&admission_failures)
-                .unwrap_or_else(|_| "Pack contains incompatible managed-sensor rules".to_string()),
-        ));
+        let pack_source = &pack_path;
+        let diagnostics = admission_failures.iter().flat_map(|failure| failure.rule_refs.iter().map(move |reference| {
+            let path = attune_common::pack_registry::diagnostics::source_for_ref(pack_source, "rules", reference);
+            attune_common::pack_check::PackDiagnostic {
+                code: "sensor.admission_failed".into(), message: failure.message.clone(),
+                metadata_path: path.as_ref().map(|_| "/sensor_worker_selector".into()), path,
+                component_kind: Some("rule".into()), component_ref: Some(reference.clone()),
+                hint: Some("Check this rule's sensor placement and its trigger's managed sensor. For a preserved rule not declared in this release, update its stored rule configuration.".into()),
+                ..Default::default()
+            }
+        })).collect();
+        return Err(ApiError::Deployment {
+            source: Box::new(ApiError::UnprocessableEntity("Pack contains incompatible managed-sensor rules. Correct the listed placement conflicts.".into())),
+            details: Box::new(attune_common::pack_registry::diagnostics::DeploymentDetails::new("sensor_admission", diagnostics)),
+        });
     }
     if let Some(mut metadata) = installation_metadata {
         metadata.installed_by = Some(registering_identity);
@@ -2475,6 +2636,13 @@ async fn register_pack_internal(
         .await?;
     }
     PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, &projections).await?;
+    attune_common::repositories::rule_authority::RuleAuthorityRepository::capture_deployment(
+        &mut tx, pack.id,
+    )
+    .await?;
+    attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_deployment(
+        &mut tx, pack.id, state.config.security.encryption_key.as_deref(), &registration_authority).await
+        .map_err(|error| ApiError::from(error).in_deployment("configuration_binding", &pack_ref, &version, active_install_id))?;
     if let Some(install_id) = active_install_id {
         test_install = Some(
             PackInstallRepository::finish_activation_in_transaction(&mut tx, install_id, pack.id)
@@ -2487,15 +2655,19 @@ async fn register_pack_internal(
                 })?,
         );
     }
+    // Assemble the authoritative response while failures can still roll back.
+    pack_install_test_result(test_install.as_ref())?;
+    let pack = PackRepository::find_by_id(&mut *tx, pack.id).await?
+        .ok_or_else(|| ApiError::NotFound("Pack disappeared during activation".into()))?;
     tx.commit().await?;
-    if let Some(guard) = activation_guard.as_mut() {
-        guard.disarm();
-    }
+    committed = true;
+    committed_release_id = Some(release.id);
     active_replacement.publish_fail_closed().map_err(|error| {
         ApiError::InternalServerError(format!(
             "Database activation committed but the active pack projection could not be published: {error}"
         ))
     })?;
+    projection_ready = true;
     active_replacement.commit().map_err(|error| {
         ApiError::InternalServerError(format!("Failed to finalize pack activation: {error}"))
     })?;
@@ -2536,6 +2708,11 @@ async fn register_pack_internal(
                 );
             }
             Err(e) => {
+                metadata_diagnostics.push(attune_common::pack_check::PackDiagnostic {
+                    severity: attune_common::pack_check::PackDiagnosticSeverity::Warning,
+                    code: "runtime.prewarm_not_dispatched".into(),
+                    message: "The release was activated, but runtime prewarming could not be dispatched. Workers will sync content lazily on first execution. Ask the operator to check broker availability.".into(), ..Default::default()
+                });
                 tracing::warn!(
                     "Failed to publish pack.registered event for pack '{}': {}. \
                      Workers will sync pack content lazily on first execution.",
@@ -2549,10 +2726,144 @@ async fn register_pack_internal(
     publish_pack_metadata_change(&state, &pack, "registered", pack.updated).await;
 
     Ok(RegisteredPack {
+        pack: pack.clone(),
+        components: crate::dto::pack::ComponentCounts {
+            actions: projections.actions.len(), sensors: projections.sensors.len(), triggers: projections.triggers.len(),
+            rules: projections.rules.len(), workflows: projections.workflows.len(), policies: projections.policies.len(),
+        },
+        diagnostics: metadata_diagnostics.clone(),
         id: pack.id,
         test_install,
         tests_skipped,
     })
+    }.await;
+    match activation_result {
+        Ok(mut registered) => {
+            if let Some(guard) = activation_guard.as_mut() {
+                guard.disarm();
+            }
+            if tests_skipped && activation_install_id.is_none() {
+                registered
+                    .diagnostics
+                    .push(attune_common::pack_check::PackDiagnostic {
+                    severity: attune_common::pack_check::PackDiagnosticSeverity::Warning,
+                    code: "testing.skipped".into(),
+                    path: Some("pack.yaml".into()),
+                    metadata_path: Some("/testing".into()),
+                    message:
+                        "Candidate tests were skipped; deployment does not prove runtime readiness."
+                            .into(),
+                    ..Default::default()
+                });
+            }
+            if registered.test_install.as_ref().is_some_and(|install| {
+                install
+                    .test_result
+                    .as_ref()
+                    .and_then(|result| result.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("failed")
+            }) {
+                registered.diagnostics.push(attune_common::pack_check::PackDiagnostic {
+                    severity: attune_common::pack_check::PackDiagnosticSeverity::Warning,
+                    code: "testing.overridden".into(), path: Some("pack.yaml".into()), metadata_path: Some("/testing".into()),
+                    message: "The release was activated despite candidate test failure because force was requested.".into(), ..Default::default()
+                });
+            }
+            if let Some(install) = registered.test_install.as_mut() {
+                let mut details = attune_common::pack_registry::diagnostics::DeploymentDetails::new(
+                    "activation",
+                    registered.diagnostics.clone(),
+                );
+                details.outcome = if registered.diagnostics.is_empty() {
+                    "deployed"
+                } else {
+                    "deployed_with_warnings"
+                }
+                .into();
+                details.pack_ref = Some(pack_ref.clone());
+                details.version = Some(version.clone());
+                details.install_id = Some(install.id);
+                details.release_id = committed_release_id;
+                PackInstallRepository::new(state.db.clone())
+                    .record_diagnostics(install.id, &details, None, true)
+                    .await
+                    .map_err(|error| {
+                        let mut error = ApiError::from(error).in_deployment(
+                            "history_recording",
+                            &pack_ref,
+                            &version,
+                            Some(install.id),
+                        );
+                        if let ApiError::Deployment { details, .. } = &mut error {
+                            details.outcome = "activation_committed".into();
+                        }
+                        error
+                    })?;
+                install.status = "succeeded".into();
+                install.diagnostic_details = serde_json::to_value(details).ok();
+            }
+            if let Some(guard) = activation_guard.as_mut() {
+                guard.disarm();
+            }
+            Ok(registered)
+        }
+        Err(error) => {
+            let mut error = error.in_deployment(
+                if committed {
+                    if projection_ready {
+                        "projection_finalization"
+                    } else {
+                        "projection_publication"
+                    }
+                } else {
+                    "activation"
+                },
+                &pack_ref,
+                &version,
+                active_install_id,
+            );
+            if let ApiError::Deployment { source, details } = &mut error {
+                if committed {
+                    details.release_id = committed_release_id;
+                    if projection_ready {
+                        details.outcome = "activation_committed_cleanup_failed".into();
+                        *source = Box::new(ApiError::InternalServerError("The release was activated and its filesystem projection is available, but storage finalization failed. Ask the operator to clean up pack storage; do not blindly reinstall.".into()));
+                    } else {
+                        details.outcome = "activation_committed_projection_unavailable".into();
+                        *source = Box::new(ApiError::InternalServerError("The database release was activated, but its filesystem projection is unavailable. Ask the operator to reconcile pack storage; do not blindly reinstall.".into()));
+                    }
+                }
+            }
+            if let Some(id) = active_install_id {
+                let repository = PackInstallRepository::new(state.db.clone());
+                if !committed {
+                    if let Err(record_error) = repository
+                        .finish_activation(
+                            id,
+                            PackInstallStatus::Failed,
+                            Some(error.message().into()),
+                        )
+                        .await
+                    {
+                        tracing::warn!(install_id=id, %record_error, "Could not persist activation failure");
+                    }
+                }
+                if let Some(details) = error.deployment_details() {
+                    if let Err(record_error) = repository
+                        .record_diagnostics(id, details, Some(error.message()), committed)
+                        .await
+                    {
+                        tracing::warn!(install_id=id, %record_error, "Could not persist deployment diagnostics");
+                    }
+                }
+                if let Some(guard) = activation_guard.as_mut() {
+                    guard.disarm();
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn authorize_pack_registry_action(
@@ -2575,6 +2886,40 @@ async fn authorize_pack_registry_action(
             },
         )
         .await?;
+    Ok(())
+}
+
+/// Before source ingestion the target is unknown. This only authorizes staging;
+/// candidate scope is checked before tests and again in the activation transaction.
+async fn authorize_pack_install_preflight(
+    state: &AppState,
+    user: &crate::auth::middleware::AuthenticatedUser,
+) -> ApiResult<()> {
+    require_pack_access_token(&user.claims.token_type)?;
+    let grants = state.authorization_service().effective_grants(user).await?;
+    if grants
+        .iter()
+        .any(|grant| grant.resource == Resource::Packs && grant.actions.contains(&Action::Install))
+    {
+        return Ok(());
+    }
+    authorize_pack_registry_action(state, user, Action::Install).await
+}
+
+fn require_candidate_install_authority(
+    authority: &attune_common::delegation::DelegationAuthority,
+    pack_ref: &str,
+) -> ApiResult<()> {
+    attune_common::schema::RefValidator::validate_pack_ref(pack_ref)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let mut context = AuthorizationContext::new(authority.identity_id);
+    context.target_ref = Some(pack_ref.into());
+    context.pack_ref = Some(pack_ref.into());
+    if !authority.allows(Resource::Packs, Action::Install, context) {
+        return Err(ApiError::Forbidden(
+            "Not authorized to install the candidate pack".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -3466,23 +3811,27 @@ pub async fn get_indexed_pack(
         (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
         (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
         (status = 404, description = "Pack or local source not found", body = crate::middleware::error::ErrorResponse),
+        (status = 409, description = "Pack or activation conflict", body = crate::middleware::error::ErrorResponse),
+        (status = 422, description = "Invalid metadata or failed candidate tests", body = crate::middleware::error::ErrorResponse),
+        (status = 500, description = "Deployment service failure", body = crate::middleware::error::ErrorResponse),
+        (status = 503, description = "Retryable database failure", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn install_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
-    Json(request): Json<crate::dto::pack::InstallPackRequest>,
+    super::pack_request::PackJson(request): super::pack_request::PackJson<
+        crate::dto::pack::InstallPackRequest,
+    >,
 ) -> ApiResult<(
     StatusCode,
     Json<crate::dto::ApiResponse<PackInstallResponse>>,
 )> {
-    use attune_common::pack_registry::{
-        calculate_directory_checksum, DependencyValidator, PackInstaller, PackStorage,
-    };
+    use attune_common::pack_registry::{calculate_directory_checksum, PackInstaller, PackStorage};
     use attune_common::repositories::List;
 
-    authorize_pack_registry_action(&state, &user, Action::Install).await?;
+    authorize_pack_install_preflight(&state, &user).await?;
 
     // Get user ID early to avoid borrow issues
     let user_id = user.identity_id().ok();
@@ -3557,15 +3906,18 @@ pub async fn install_pack(
 
     // Install the pack (to temporary location)
     let installed = match registry_resolution.as_ref() {
-        Some(resolution) => {
-            installer
-                .install_resolved_registry_pack(
-                    resolution.entry.clone(),
-                    resolution.registry_url.clone(),
-                )
-                .await?
-        }
-        None => installer.install(source.clone()).await?,
+        Some(resolution) => installer
+            .install_resolved_registry_pack(
+                resolution.entry.clone(),
+                resolution.registry_url.clone(),
+            )
+            .await
+            .map_err(|error| {
+                ApiError::from(error).in_deployment("source_download", "", "", None)
+            })?,
+        None => installer.install(source.clone()).await.map_err(|error| {
+            ApiError::from(error).in_deployment("source_download", "", "", None)
+        })?,
     };
     let mut temporary_install_cleanup = TemporaryInstallCleanup::new(&temp_dir, &installed.path);
 
@@ -3594,29 +3946,24 @@ pub async fn install_pack(
 
         let pack_yaml: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&pack_yaml_content).map_err(|e| {
-                ApiError::InternalServerError(format!("Failed to parse pack.yaml: {}", e))
+                ApiError::from(attune_common::pack_registry::diagnostics::yaml_error(
+                    "pack.yaml",
+                    &e,
+                ))
             })?;
 
-        let mut validator = DependencyValidator::new();
+        attune_common::pack_registry::diagnostics::validate_metadata(&installed.path)?;
 
         // Extract runtime dependencies from pack.yaml
-        let mut runtime_deps: Vec<String> = Vec::new();
-
-        if let Some(python_version) = pack_yaml.get("python").and_then(|v| v.as_str()) {
-            runtime_deps.push(format!("python3>={}", python_version));
-        }
-
-        if let Some(nodejs_version) = pack_yaml.get("nodejs").and_then(|v| v.as_str()) {
-            runtime_deps.push(format!("nodejs>={}", nodejs_version));
-        }
+        // Interpreter availability belongs to worker admission, not the API host.
 
         // Extract pack dependencies (ref, version)
-        let pack_deps: Vec<(String, String)> = pack_yaml
+        let declarations: Vec<String> = pack_yaml
             .get("dependencies")
             .and_then(|v| v.as_sequence())
             .map(|seq| {
                 seq.iter()
-                    .filter_map(|v| v.as_str().map(|s| (s.to_string(), "*".to_string())))
+                    .filter_map(|v| v.as_str().map(str::to_string))
                     .collect()
             })
             .unwrap_or_default();
@@ -3628,28 +3975,23 @@ pub async fn install_pack(
             .map(|p| (p.r#ref, p.version))
             .collect();
 
-        match validator
-            .validate(&runtime_deps, &pack_deps, &installed_packs)
-            .await
-        {
-            Ok(validation) => {
-                if !validation.valid {
-                    tracing::warn!("Pack dependency validation failed: {:?}", validation.errors);
-
-                    // Return validation errors to user
-                    return Err(ApiError::BadRequest(format!(
-                        "Pack dependency validation failed:\n  - {}",
-                        validation.errors.join("\n  - ")
-                    )));
-                }
-                tracing::info!("All dependencies validated successfully");
-            }
-            Err(e) => {
-                tracing::error!("Dependency validation error: {}", e);
-                return Err(ApiError::InternalServerError(format!(
-                    "Failed to validate dependencies: {}",
-                    e
-                )));
+        for (index, declaration) in declarations.iter().enumerate() {
+            let (reference, requirement) =
+                declaration.split_once('@').unwrap_or((declaration, "*"));
+            let requirement = semver::VersionReq::parse(requirement).map_err(|_| {
+                ApiError::from(attune_common::pack_registry::diagnostics::metadata_error(
+                    "pack.yaml",
+                    &format!("/dependencies/{index}"),
+                    "Invalid dependency version constraint",
+                ))
+            })?;
+            if !installed_packs
+                .get(reference)
+                .and_then(|version| semver::Version::parse(version).ok())
+                .is_some_and(|version| requirement.matches(&version))
+            {
+                return Err(attune_common::pack_registry::diagnostics::metadata_error("pack.yaml", &format!("/dependencies/{index}"),
+                    format!("Required pack '{reference}' is missing or its installed version does not satisfy '{requirement}'. Install a matching dependency release.")).into());
             }
         }
     } else {
@@ -3665,7 +4007,10 @@ pub async fn install_pack(
             ApiError::InternalServerError(format!("Failed to read pack.yaml: {}", e))
         })?;
         let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to parse pack.yaml: {}", e))
+            ApiError::from(attune_common::pack_registry::diagnostics::yaml_error(
+                "pack.yaml",
+                &e,
+            ))
         })?;
         let pack_ref = yaml
             .get("ref")
@@ -3792,12 +4137,18 @@ pub async fn install_pack(
                 if terminal.status != PackInstallStatus::Activating.as_str() {
                     let _ = std::fs::remove_dir_all(&candidate_path);
                     if !request.force {
-                        return Err(ApiError::BadRequest(format!(
-                            "Candidate pack tests failed: {}",
-                            terminal.error_message.unwrap_or_else(|| {
-                                "worker reported a failed test run".to_string()
-                            })
-                        )));
+                        return Err(candidate_test_failure(&state, &terminal).await);
+                    }
+                    if terminal.test_result.is_none() {
+                        return Err(candidate_test_failure(&state, &terminal).await);
+                    }
+                    test_install = PackInstallRepository::new(state.db.clone())
+                        .begin_test_override_activation(terminal.id)
+                        .await?;
+                    if test_install.is_none() {
+                        return Err(ApiError::Conflict(
+                            "Candidate test override could not begin activation".into(),
+                        ));
                     }
                     activation_replacement
                 } else {
@@ -3807,11 +4158,12 @@ pub async fn install_pack(
             }
             PackTestDispatchOutcome::Failed { error, install } => {
                 let _ = std::fs::remove_dir_all(&candidate_path);
-                if !request.force {
-                    return Err(error);
-                }
-                test_install = install;
-                activation_replacement
+                return Err(error.in_deployment(
+                    "test_preflight",
+                    &pack_ref_for_storage,
+                    &pack_version_for_storage,
+                    install.as_ref().map(|record| record.id),
+                ));
             }
             PackTestDispatchOutcome::Skipped => {
                 tests_skipped = true;
@@ -3891,6 +4243,9 @@ pub async fn install_pack(
                 test_install = registered_pack.test_install;
             }
             RegisteredPack {
+                pack: registered_pack.pack,
+                components: registered_pack.components,
+                diagnostics: registered_pack.diagnostics,
                 id: registered_pack.id,
                 test_install: None,
                 tests_skipped: registered_pack.tests_skipped,
@@ -3916,11 +4271,7 @@ pub async fn install_pack(
     };
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, registered_pack.id)
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("Pack with ID {} not found", registered_pack.id))
-        })?;
+    let pack = registered_pack.pack.clone();
     if let Some(install) = test_install.as_mut() {
         if install.status == PackInstallStatus::Activating.as_str() {
             *install = PackInstallRepository::new(state.db.clone())
@@ -3957,6 +4308,7 @@ pub async fn install_pack(
 
     let parsed_test_result = pack_install_test_result(test_install.as_ref())?;
     let response = PackInstallResponse {
+        diagnostics: registered_pack.diagnostics,
         pack: PackResponse::from(pack),
         test_result: parsed_test_result,
         tests_skipped,
@@ -4487,6 +4839,7 @@ pub async fn test_pack(
     );
 
     let response = PackInstallResponse {
+        diagnostics: Vec::new(),
         pack: PackResponse::from(pack),
         test_result: None,
         tests_skipped: false,
@@ -4706,7 +5059,7 @@ pub async fn get_pack_test(
 pub async fn download_packs(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
-    Json(request): Json<DownloadPacksRequest>,
+    super::pack_request::PackJson(request): super::pack_request::PackJson<DownloadPacksRequest>,
 ) -> ApiResult<Json<ApiResponse<DownloadPacksResponse>>> {
     use attune_common::pack_registry::PackInstaller;
 
@@ -4728,12 +5081,23 @@ pub async fn download_packs(
     let mut failed = Vec::new();
 
     for source in &request.packs {
-        let pack_source = detect_pack_source(source, request.ref_spec.as_deref(), true)?;
+        let pack_source = match detect_pack_source(source, request.ref_spec.as_deref(), true) {
+            Ok(source) => source,
+            Err(error) => {
+                failed.push(crate::dto::pack::FailedPack {
+                    source: source.clone(),
+                    error: error.to_string(),
+                    details: error.response_body().details,
+                });
+                continue;
+            }
+        };
         if matches!(
             pack_source,
             attune_common::pack_registry::PackSource::Registry { .. }
         ) {
             failed.push(crate::dto::pack::FailedPack {
+                details: None,
                 source: source.clone(),
                 error: "Registry references must use /api/v1/packs/install so identity, authorization, and verified provenance remain bound to registration".to_string(),
             });
@@ -4743,19 +5107,17 @@ pub async fn download_packs(
 
         match installer.install(pack_source).await {
             Ok(installed) => {
-                // Read pack.yaml
-                let pack_yaml_path = installed.path.join("pack.yaml");
-                if let Ok(content) = std::fs::read_to_string(&pack_yaml_path) {
-                    if let Ok(yaml) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content) {
+                match attune_common::pack_registry::diagnostics::read_manifest(&installed.path) {
+                    Ok(yaml) => {
                         let pack_ref = yaml
                             .get("ref")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
+                            .expect("validated manifest ref")
                             .to_string();
                         let pack_version = yaml
                             .get("version")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("0.0.0")
+                            .expect("validated manifest version")
                             .to_string();
 
                         downloaded.push(crate::dto::pack::DownloadedPack {
@@ -4768,10 +5130,19 @@ pub async fn download_packs(
                             checksum: installed.checksum,
                         });
                     }
+                    Err(error) => {
+                        let error = ApiError::from(error);
+                        failed.push(crate::dto::pack::FailedPack {
+                            source: source.clone(),
+                            error: error.to_string(),
+                            details: error.response_body().details,
+                        });
+                    }
                 }
             }
             Err(e) => {
                 failed.push(crate::dto::pack::FailedPack {
+                    details: None,
                     source: source.clone(),
                     error: e.to_string(),
                 });
@@ -4954,7 +5325,7 @@ pub async fn get_pack_dependencies(
 pub async fn build_pack_envs(
     State(_state): State<Arc<AppState>>,
     RequireAuth(_user): RequireAuth,
-    Json(request): Json<BuildPackEnvsRequest>,
+    super::pack_request::PackJson(request): super::pack_request::PackJson<BuildPackEnvsRequest>,
 ) -> ApiResult<Json<ApiResponse<BuildPackEnvsResponse>>> {
     use std::path::Path;
     use std::process::Command;
@@ -4962,8 +5333,8 @@ pub async fn build_pack_envs(
     let start = std::time::Instant::now();
     let mut built_environments = Vec::new();
     let mut failed_environments = Vec::new();
-    let mut python_envs_built = 0;
-    let mut nodejs_envs_built = 0;
+    let python_envs_built = 0;
+    let nodejs_envs_built = 0;
 
     for pack_path in &request.pack_paths {
         let pack_path_obj = Path::new(pack_path);
@@ -5024,7 +5395,11 @@ pub async fn build_pack_envs(
 
                 if requirements_file.exists() {
                     // Check if Python is available
-                    match Command::new("python3").arg("--version").output() {
+                    match Command::new("python3")
+                        .env_clear()
+                        .arg("--version")
+                        .output()
+                    {
                         Ok(output) if output.status.success() => {
                             let version_str = String::from_utf8_lossy(&output.stdout);
                             let venv_path = pack_path_obj.join("venv");
@@ -5044,14 +5419,13 @@ pub async fn build_pack_envs(
                                 package_count: 0, // Would count from pip freeze in production
                                 python_version: version_str.trim().to_string(),
                             });
-                            python_envs_built += 1;
                         }
                         _ => {
                             failed_environments.push(crate::dto::pack::FailedEnvironment {
                                 pack_ref: pack_ref.clone(),
                                 pack_path: pack_path.clone(),
                                 runtime: "python".to_string(),
-                                error: "Python 3 not available in system".to_string(),
+                                error: "Python 3 was not detected on the API host. Worker runtime availability has not been checked.".to_string(),
                             });
                             has_error = true;
                         }
@@ -5067,7 +5441,7 @@ pub async fn build_pack_envs(
 
                 if package_file.exists() {
                     // Check if Node.js is available
-                    match Command::new("node").arg("--version").output() {
+                    match Command::new("node").env_clear().arg("--version").output() {
                         Ok(output) if output.status.success() => {
                             let version_str = String::from_utf8_lossy(&output.stdout);
                             let node_modules = pack_path_obj.join("node_modules");
@@ -5087,14 +5461,13 @@ pub async fn build_pack_envs(
                                 package_count: 0, // Would count from package.json in production
                                 nodejs_version: version_str.trim().to_string(),
                             });
-                            nodejs_envs_built += 1;
                         }
                         _ => {
                             failed_environments.push(crate::dto::pack::FailedEnvironment {
                                 pack_ref: pack_ref.clone(),
                                 pack_path: pack_path.clone(),
                                 runtime: "nodejs".to_string(),
-                                error: "Node.js not available in system".to_string(),
+                                error: "Node.js was not detected on the API host. Worker runtime availability has not been checked.".to_string(),
                             });
                             has_error = true;
                         }
@@ -5120,6 +5493,8 @@ pub async fn build_pack_envs(
     let failure_count = failed_environments.len();
 
     let response = BuildPackEnvsResponse {
+        detection_only: true,
+        message: "No environments were built. This endpoint only detects API-host interpreters; worker-owned runtime setup occurs during candidate tests and action execution.".into(),
         built_environments,
         failed_environments,
         summary: crate::dto::pack::BuildSummary {
@@ -5150,14 +5525,14 @@ pub async fn build_pack_envs(
 pub async fn register_packs_batch(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
-    Json(request): Json<RegisterPacksRequest>,
+    super::pack_request::PackJson(request): super::pack_request::PackJson<RegisterPacksRequest>,
 ) -> ApiResult<Json<ApiResponse<RegisterPacksResponse>>> {
-    authorize_pack_registry_action(&state, &user, Action::Install).await?;
+    authorize_pack_install_preflight(&state, &user).await?;
 
     let start = std::time::Instant::now();
     let mut registered = Vec::new();
     let mut failed = Vec::new();
-    let total_components = 0;
+    let mut total_components = 0;
     for pack_path in &request.pack_paths {
         // Call the existing register_pack_internal function
         let register_req = crate::dto::pack::RegisterPackRequest {
@@ -5185,61 +5560,101 @@ pub async fn register_packs_batch(
             Ok(registered_pack) => {
                 let pack_id = registered_pack.id;
                 // Fetch pack details
-                if let Ok(Some(pack)) = PackRepository::find_by_id(&state.db, pack_id).await {
+                let followup: ApiResult<_> = async {
+                    let pack = registered_pack.pack.clone();
                     let parsed_test_result =
                         pack_install_test_result(registered_pack.test_install.as_ref())?;
-                    let test_result =
-                        parsed_test_result.map(|result| crate::dto::pack::TestResult {
-                            status: result.status,
-                            total_tests: result.total_tests.max(0) as usize,
-                            passed: result.passed.max(0) as usize,
-                            failed: result.failed.max(0) as usize,
+                    Ok((pack, parsed_test_result))
+                }
+                .await;
+                match followup {
+                    Ok((pack, parsed_test_result)) => {
+                        let test_result =
+                            parsed_test_result.map(|result| crate::dto::pack::TestResult {
+                                status: result.status,
+                                total_tests: result.total_tests.max(0) as usize,
+                                passed: result.passed.max(0) as usize,
+                                failed: result.failed.max(0) as usize,
+                            });
+                        let install_id = registered_pack
+                            .test_install
+                            .as_ref()
+                            .map(|install| install.id);
+                        let install_status = registered_pack
+                            .test_install
+                            .as_ref()
+                            .map(|install| install.status.clone());
+                        let validation_errors = registered_pack
+                            .test_install
+                            .as_ref()
+                            .filter(|install| install.status == "failed")
+                            .and_then(|install| install.error_message.clone())
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        let counts = &registered_pack.components;
+                        total_components += counts.actions
+                            + counts.sensors
+                            + counts.triggers
+                            + counts.rules
+                            + counts.workflows
+                            + counts.policies;
+                        registered.push(crate::dto::pack::RegisteredPack {
+                            diagnostics: registered_pack.diagnostics,
+                            pack_ref: pack.r#ref.clone(),
+                            pack_id,
+                            pack_version: pack.version.clone(),
+                            storage_path: format!("{}/{}", state.config.packs_base_dir, pack.r#ref),
+                            components_registered: registered_pack.components,
+                            test_result,
+                            install_id,
+                            install_status,
+                            validation_results: crate::dto::pack::ValidationResults {
+                                valid: validation_errors.is_empty(),
+                                errors: validation_errors,
+                            },
                         });
-                    let install_id = registered_pack
-                        .test_install
-                        .as_ref()
-                        .map(|install| install.id);
-                    let install_status = registered_pack
-                        .test_install
-                        .as_ref()
-                        .map(|install| install.status.clone());
-                    let validation_errors = registered_pack
-                        .test_install
-                        .as_ref()
-                        .filter(|install| install.status == "failed")
-                        .and_then(|install| install.error_message.clone())
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    // Count components (simplified)
-                    registered.push(crate::dto::pack::RegisteredPack {
-                        pack_ref: pack.r#ref.clone(),
-                        pack_id,
-                        pack_version: pack.version.clone(),
-                        storage_path: format!("{}/{}", state.config.packs_base_dir, pack.r#ref),
-                        components_registered: crate::dto::pack::ComponentCounts {
-                            actions: 0,
-                            sensors: 0,
-                            triggers: 0,
-                            rules: 0,
-                            workflows: 0,
-                            policies: 0,
-                        },
-                        test_result,
-                        install_id,
-                        install_status,
-                        validation_results: crate::dto::pack::ValidationResults {
-                            valid: validation_errors.is_empty(),
-                            errors: validation_errors,
-                        },
-                    });
+                    }
+                    Err(error) => {
+                        let mut error = error.in_deployment(
+                            "response_assembly",
+                            "unknown",
+                            "unknown",
+                            registered_pack
+                                .test_install
+                                .as_ref()
+                                .map(|install| install.id),
+                        );
+                        if let ApiError::Deployment { details, .. } = &mut error {
+                            details.outcome = "activation_committed".into();
+                        }
+                        failed.push(crate::dto::pack::FailedPackRegistration {
+                            pack_ref: "unknown".into(), pack_path: pack_path.clone(),
+                            error: "Pack activation committed, but its response could not be assembled. Check install status before retrying.".into(),
+                            error_stage: "response_assembly".into(), details: error.response_body().details,
+                        });
+                    }
                 }
             }
             Err(e) => {
                 failed.push(crate::dto::pack::FailedPackRegistration {
-                    pack_ref: "unknown".to_string(),
+                    pack_ref: attune_common::pack_registry::diagnostics::read_manifest(
+                        std::path::Path::new(pack_path),
+                    )
+                    .ok()
+                    .and_then(|manifest| {
+                        manifest
+                            .get("ref")
+                            .and_then(serde_yaml_ng::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "unknown".into()),
                     pack_path: pack_path.clone(),
                     error: e.to_string(),
-                    error_stage: "registration".to_string(),
+                    error_stage: e
+                        .deployment_details()
+                        .map(|details| details.stage.clone())
+                        .unwrap_or_else(|| "registration".into()),
+                    details: e.response_body().details,
                 });
             }
         }
@@ -6269,7 +6684,7 @@ mod tests {
         archive.set_unpack_xattrs(false);
         archive.set_preserve_permissions(false);
         archive.set_preserve_mtime(false);
-        safe_unpack(&mut archive, dir.path(), cfg)?;
+        safe_unpack(&mut archive, dir.path(), cfg).map_err(|error| error.to_string())?;
         Ok(dir)
     }
 
@@ -6282,6 +6697,37 @@ mod tests {
         let dir = unpack_bytes(&bytes, &PackUploadConfig::default()).unwrap();
         assert!(dir.path().join("pack.yaml").exists());
         assert!(dir.path().join("actions/echo.sh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_unpack_preserves_sanitized_executable_intent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let files = [
+            ("pack.yaml", b"ref: test\n".as_slice(), 0o7666, 0o644),
+            ("sensors/launcher", b"#!/bin/sh\n".as_slice(), 0o4755, 0o755),
+            ("sensors/bin/native", b"\x7fELF\0".as_slice(), 0o2711, 0o755),
+        ];
+        let bytes = build_tar(|builder| {
+            for (path, data, mode, _) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(mode);
+                builder.append_data(&mut header, path, data).unwrap();
+            }
+        });
+        let dir = unpack_bytes(&bytes, &PackUploadConfig::default()).unwrap();
+
+        for (path, data, _, expected_mode) in files {
+            let target = dir.path().join(path);
+            assert_eq!(std::fs::read(&target).unwrap(), data);
+            assert_eq!(
+                std::fs::metadata(target).unwrap().permissions().mode() & 0o7777,
+                expected_mode,
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -6316,7 +6762,12 @@ mod tests {
             b.append_link(&mut h, "evil-link", "/etc/passwd").unwrap();
         });
         let err = unpack_bytes(&bytes, &PackUploadConfig::default()).unwrap_err();
-        assert!(err.contains("Symlink"), "unexpected error: {}", err);
+        assert!(
+            err.contains("forbidden symbolic link"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(err.contains("evil-link"), "missing archive member: {}", err);
     }
 
     #[test]
@@ -6329,7 +6780,12 @@ mod tests {
             b.append_link(&mut h, "evil-hard", "pack.yaml").unwrap();
         });
         let err = unpack_bytes(&bytes, &PackUploadConfig::default()).unwrap_err();
-        assert!(err.contains("Link"), "unexpected error: {}", err);
+        assert!(
+            err.contains("forbidden hard link"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(err.contains("evil-hard"), "missing archive member: {}", err);
     }
 
     #[test]
@@ -6407,7 +6863,9 @@ mod tests {
             &gz_bytes[..],
         )));
         archive.set_overwrite(false);
-        let err = safe_unpack(&mut archive, dir.path(), &cfg).unwrap_err();
+        let err = safe_unpack(&mut archive, dir.path(), &cfg)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("total extracted size") || err.contains("per-entry size limit"),
             "unexpected error: {}",

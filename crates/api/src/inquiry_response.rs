@@ -32,13 +32,18 @@ use crate::{
     authz::AuthorizationCheck,
     middleware::{ApiError, ApiResult},
     state::AppState,
-    validation::validate_inquiry_response,
 };
 
 pub enum InquiryResponseSubmission {
     Human {
         inquiry_id: Id,
         response: JsonDict,
+        identity_id: Id,
+        execution_id: Option<Id>,
+    },
+    HumanOption {
+        inquiry_id: Id,
+        option_ref: String,
         identity_id: Id,
         execution_id: Option<Id>,
     },
@@ -63,7 +68,8 @@ pub async fn submit_inquiry_response(
     let mut callback_delivery_id = None;
     let mut callback_selection = None;
     let (inquiry_id, option_index) = match &submission {
-        InquiryResponseSubmission::Human { inquiry_id, .. } => (*inquiry_id, None),
+        InquiryResponseSubmission::Human { inquiry_id, .. }
+        | InquiryResponseSubmission::HumanOption { inquiry_id, .. } => (*inquiry_id, None),
         InquiryResponseSubmission::CallbackAdapter { delivery_id } => {
             let encryption_key = encryption_key.ok_or_else(|| {
                 ApiError::InternalServerError(
@@ -138,6 +144,11 @@ pub async fn submit_inquiry_response(
 
     let actor = match &submission {
         InquiryResponseSubmission::Human {
+            identity_id,
+            execution_id,
+            ..
+        }
+        | InquiryResponseSubmission::HumanOption {
             identity_id,
             execution_id,
             ..
@@ -285,19 +296,110 @@ pub async fn submit_inquiry_response(
         _ => {}
     }
 
+    let selected_index =
+        if let InquiryResponseSubmission::HumanOption { option_ref, .. } = &submission {
+            Some(
+                inquiry
+                    .response_options
+                    .iter()
+                    .position(|option| option.r#ref == *option_ref)
+                    .ok_or_else(|| {
+                        ApiError::NotFound("Inquiry response option was not found".into())
+                    })?,
+            )
+        } else {
+            option_index.map(usize::from)
+        };
+    let mut inherited = attune_common::secret_provenance::SecretProvenance::default();
     let response = match submission {
         InquiryResponseSubmission::Human { response, .. } => response,
-        InquiryResponseSubmission::CallbackAdapter { .. } => inquiry
-            .response_options
-            .get(usize::from(
-                option_index.expect("callback selection was resolved"),
-            ))
-            .map(|option| option.response.clone())
-            .ok_or_else(|| {
-                ApiError::NotFound("Inquiry response handle was not found".to_string())
-            })?,
+        InquiryResponseSubmission::CallbackAdapter { .. }
+        | InquiryResponseSubmission::HumanOption { .. } => {
+            let index = selected_index.expect("option selection was resolved");
+            let secrets = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *transaction, attune_common::secret_values::ENTITY_INQUIRY_OPTIONS, inquiry_id,
+            ).await?;
+            let options = serde_json::to_value(&inquiry.response_options).map_err(|_| {
+                ApiError::InternalServerError("Invalid stored inquiry response options".into())
+            })?;
+            let options = if secrets.is_empty() {
+                options
+            } else {
+                attune_common::secret_values::restore_secret_values(
+                    options,
+                    &secrets,
+                    encryption_key.ok_or_else(|| {
+                        ApiError::InternalServerError(
+                            "Inquiry option encryption key is unavailable".into(),
+                        )
+                    })?,
+                )?
+            };
+            for secret in secrets
+                .iter()
+                .filter(|secret| secret.json_path.starts_with(&format!("/{index}/response/")))
+            {
+                let provenance = secret
+                    .source_ref
+                    .as_deref()
+                    .and_then(|body| serde_json::from_str(body).ok())
+                    .filter(
+                        |provenance: &attune_common::secret_provenance::SecretProvenance| {
+                            !provenance.origins.is_empty()
+                        },
+                    )
+                    .ok_or_else(|| {
+                        ApiError::Forbidden("Inquiry option origins are unavailable".into())
+                    })?;
+                if secret.source_kind != "provenance" {
+                    return Err(ApiError::Forbidden(
+                        "Inquiry option origins are unavailable".into(),
+                    ));
+                }
+                inherited.merge(provenance);
+            }
+            options
+                .get(index)
+                .and_then(|option| option.get("response"))
+                .cloned()
+                .ok_or_else(|| ApiError::NotFound("Inquiry response handle was not found".into()))?
+        }
     };
-    validate_inquiry_response(inquiry_id, inquiry.response_schema.as_ref(), &response)?;
+    if let Some(execution_id) = actor.execution_id {
+        let secrets = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+            &mut *transaction, attune_common::secret_values::ENTITY_EXECUTION_CONFIG, execution_id,
+        ).await?;
+        for secret in secrets {
+            inherited
+                .origins
+                .push(attune_common::secret_provenance::SecretOrigin::Entity {
+                    entity_type: attune_common::secret_values::ENTITY_EXECUTION_CONFIG.into(),
+                    entity_id: execution_id,
+                    path: secret.json_path,
+                });
+        }
+    }
+    let stored = attune_common::repositories::inquiry_schema::InquirySchemaRepository::find(
+        &mut *transaction,
+        inquiry_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::Conflict("Inquiry is missing its original response-schema binding".into())
+    })?;
+    let (response, inputs) = stored.binding.prepare_response(&response, &inherited)?;
+    let prepared = if inputs.is_empty() {
+        Vec::new()
+    } else {
+        attune_common::secret_values::prepare_secret_values(
+            inputs,
+            encryption_key.ok_or_else(|| {
+                ApiError::InternalServerError(
+                    "Inquiry response encryption key is unavailable".into(),
+                )
+            })?,
+        )?
+    };
     let updated = InquiryRepository::respond_pending(
         &mut *transaction,
         inquiry_id,
@@ -309,6 +411,9 @@ pub async fn submit_inquiry_response(
     .ok_or_else(|| {
         ApiError::Conflict("Inquiry is no longer pending or has timed out".to_string())
     })?;
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
+        &mut transaction, attune_common::secret_values::ENTITY_INQUIRY_RESPONSE, inquiry_id, &prepared,
+    ).await?;
     if let Some(delivery_id) = callback_delivery_id {
         if !InquiryCallbackDeliveryRepository::mark_accepted(
             &mut transaction,

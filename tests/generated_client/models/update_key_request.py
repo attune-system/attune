@@ -20,12 +20,18 @@ class UpdateKeyRequest:
         encrypted (bool | None | Unset): Update encryption status (re-encrypts if changing from false to true) Example:
             True.
         name (None | str | Unset): Update the human-readable name Example: GitHub API Token (Updated).
+        rebind_schema (bool | Unset): Explicitly select current installed named revisions and revalidate.
+        schema_digest (None | str | Unset):
         value (Any | Unset): Update the secret value. Can be a string, object, array, number, or boolean.
+        value_schema (Any | None | Unset):
     """
 
     encrypted: bool | None | Unset = UNSET
     name: None | str | Unset = UNSET
+    rebind_schema: bool | Unset = UNSET
+    schema_digest: None | str | Unset = UNSET
     value: Any | Unset = UNSET
+    value_schema: Any | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -41,7 +47,21 @@ class UpdateKeyRequest:
         else:
             name = self.name
 
+        rebind_schema = self.rebind_schema
+
+        schema_digest: None | str | Unset
+        if isinstance(self.schema_digest, Unset):
+            schema_digest = UNSET
+        else:
+            schema_digest = self.schema_digest
+
         value = self.value
+
+        value_schema: Any | None | Unset
+        if isinstance(self.value_schema, Unset):
+            value_schema = UNSET
+        else:
+            value_schema = self.value_schema
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -50,8 +70,14 @@ class UpdateKeyRequest:
             field_dict["encrypted"] = encrypted
         if name is not UNSET:
             field_dict["name"] = name
+        if rebind_schema is not UNSET:
+            field_dict["rebind_schema"] = rebind_schema
+        if schema_digest is not UNSET:
+            field_dict["schema_digest"] = schema_digest
         if value is not UNSET:
             field_dict["value"] = value
+        if value_schema is not UNSET:
+            field_dict["value_schema"] = value_schema
 
         return field_dict
 
@@ -77,12 +103,35 @@ class UpdateKeyRequest:
 
         name = _parse_name(d.pop("name", UNSET))
 
+        rebind_schema = d.pop("rebind_schema", UNSET)
+
+        def _parse_schema_digest(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        schema_digest = _parse_schema_digest(d.pop("schema_digest", UNSET))
+
         value = d.pop("value", UNSET)
+
+        def _parse_value_schema(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        value_schema = _parse_value_schema(d.pop("value_schema", UNSET))
 
         update_key_request = cls(
             encrypted=encrypted,
             name=name,
+            rebind_schema=rebind_schema,
+            schema_digest=schema_digest,
             value=value,
+            value_schema=value_schema,
         )
 
         update_key_request.additional_properties = d

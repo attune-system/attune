@@ -14,6 +14,9 @@ if TYPE_CHECKING:
     from ..models.log_retention_limit_patch_type_1 import LogRetentionLimitPatchType1
     from ..models.log_retention_policy_patch_type_0 import LogRetentionPolicyPatchType0
     from ..models.log_retention_policy_patch_type_1 import LogRetentionPolicyPatchType1
+    from ..models.update_sensor_request_config_type_0 import (
+        UpdateSensorRequestConfigType0,
+    )
     from ..models.update_sensor_request_param_schema_type_0 import (
         UpdateSensorRequestParamSchemaType0,
     )
@@ -34,6 +37,8 @@ class UpdateSensorRequest:
     Attributes:
         artifact_retention_limit (LogRetentionLimitPatchType0 | LogRetentionLimitPatchType1 | None | Unset):
         artifact_retention_policy (LogRetentionPolicyPatchType0 | LogRetentionPolicyPatchType1 | None | Unset):
+        config (None | Unset | UpdateSensorRequestConfigType0): Complete replacement configuration. Omit to preserve the
+            current encrypted revision.
         description (None | str | Unset): Sensor description Example: Enhanced CPU monitoring with alerts.
         enabled (bool | None | Unset): Whether the sensor is enabled Example: False.
         entrypoint (None | str | Unset): Entry point for sensor execution Example:
@@ -55,6 +60,7 @@ class UpdateSensorRequest:
     artifact_retention_policy: (
         LogRetentionPolicyPatchType0 | LogRetentionPolicyPatchType1 | None | Unset
     ) = UNSET
+    config: None | Unset | UpdateSensorRequestConfigType0 = UNSET
     description: None | str | Unset = UNSET
     enabled: bool | None | Unset = UNSET
     entrypoint: None | str | Unset = UNSET
@@ -84,6 +90,9 @@ class UpdateSensorRequest:
         from ..models.log_retention_policy_patch_type_1 import (
             LogRetentionPolicyPatchType1,
         )
+        from ..models.update_sensor_request_config_type_0 import (
+            UpdateSensorRequestConfigType0,
+        )
         from ..models.update_sensor_request_param_schema_type_0 import (
             UpdateSensorRequestParamSchemaType0,
         )
@@ -111,6 +120,14 @@ class UpdateSensorRequest:
             artifact_retention_policy = self.artifact_retention_policy.to_dict()
         else:
             artifact_retention_policy = self.artifact_retention_policy
+
+        config: dict[str, Any] | None | Unset
+        if isinstance(self.config, Unset):
+            config = UNSET
+        elif isinstance(self.config, UpdateSensorRequestConfigType0):
+            config = self.config.to_dict()
+        else:
+            config = self.config
 
         description: None | str | Unset
         if isinstance(self.description, Unset):
@@ -201,6 +218,8 @@ class UpdateSensorRequest:
             field_dict["artifact_retention_limit"] = artifact_retention_limit
         if artifact_retention_policy is not UNSET:
             field_dict["artifact_retention_policy"] = artifact_retention_policy
+        if config is not UNSET:
+            field_dict["config"] = config
         if description is not UNSET:
             field_dict["description"] = description
         if enabled is not UNSET:
@@ -237,6 +256,9 @@ class UpdateSensorRequest:
         )
         from ..models.log_retention_policy_patch_type_1 import (
             LogRetentionPolicyPatchType1,
+        )
+        from ..models.update_sensor_request_config_type_0 import (
+            UpdateSensorRequestConfigType0,
         )
         from ..models.update_sensor_request_param_schema_type_0 import (
             UpdateSensorRequestParamSchemaType0,
@@ -326,6 +348,25 @@ class UpdateSensorRequest:
         artifact_retention_policy = _parse_artifact_retention_policy(
             d.pop("artifact_retention_policy", UNSET)
         )
+
+        def _parse_config(
+            data: object,
+        ) -> None | Unset | UpdateSensorRequestConfigType0:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                config_type_0 = UpdateSensorRequestConfigType0.from_dict(data)
+
+                return config_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | Unset | UpdateSensorRequestConfigType0, data)
+
+        config = _parse_config(d.pop("config", UNSET))
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -531,6 +572,7 @@ class UpdateSensorRequest:
         update_sensor_request = cls(
             artifact_retention_limit=artifact_retention_limit,
             artifact_retention_policy=artifact_retention_policy,
+            config=config,
             description=description,
             enabled=enabled,
             entrypoint=entrypoint,

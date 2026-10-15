@@ -159,6 +159,119 @@ pub const SELECT_COLUMNS: &str = "\
 
 pub struct ExecutionRepository;
 
+/// The fields required by execution visibility and runtime-log authorization.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExecutionAuthorizationRow {
+    pub id: Id,
+    pub action_ref: String,
+    pub parent: Option<Id>,
+    pub executor: Option<Id>,
+}
+
+/// Rooted visibility and the first 64 ancestor owners for one requested row.
+/// A dangling parent stops the lineage at the last surviving execution.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExecutionLineageRow {
+    pub execution_id: Id,
+    pub anchor_id: Id,
+    pub anchor_action_ref: String,
+    pub ancestor_identity_ids: Vec<Id>,
+    pub cyclic: bool,
+}
+
+const AUTHORIZATION_LINEAGE_SELECT: &str = "WITH RECURSIVE lineage AS ( \
+    SELECT id AS execution_id, id, parent, action_ref, executor, 0 AS depth \
+    FROM execution WHERE id = ANY($1) \
+    UNION ALL \
+    SELECT l.execution_id, p.id, p.parent, p.action_ref, p.executor, l.depth + 1 \
+    FROM execution p JOIN lineage l ON l.parent = p.id \
+    ) CYCLE id SET cyclic USING visited, owners AS ( \
+    SELECT execution_id, BOOL_OR(cyclic) AS cyclic, \
+    COALESCE(ARRAY_AGG(DISTINCT executor ORDER BY executor) \
+    FILTER (WHERE depth BETWEEN 1 AND 64 AND executor IS NOT NULL), ARRAY[]::BIGINT[]) AS ancestor_identity_ids \
+    FROM lineage GROUP BY execution_id) \
+    SELECT DISTINCT ON (l.execution_id) l.execution_id, l.id AS anchor_id, \
+    l.action_ref AS anchor_action_ref, o.ancestor_identity_ids, o.cyclic \
+    FROM lineage l JOIN owners o USING (execution_id) ORDER BY l.execution_id, l.depth DESC";
+
+impl From<&Execution> for ExecutionAuthorizationRow {
+    fn from(execution: &Execution) -> Self {
+        Self {
+            id: execution.id,
+            action_ref: execution.action_ref.clone(),
+            parent: execution.parent,
+            executor: execution.executor,
+        }
+    }
+}
+
+impl ExecutionRepository {
+    /// Mutation scopes use at most 64 parents and do not resolve a read anchor.
+    /// Deduplicate cyclic owners as the original bounded parent walk did.
+    pub async fn find_ancestor_identity_ids<'e, E>(executor: E, parent: Id) -> Result<Vec<Id>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar(
+            "WITH RECURSIVE ancestors AS ( \
+                SELECT id, parent, executor, 1 AS depth FROM execution WHERE id = $1 \
+                UNION ALL \
+                SELECT p.id, p.parent, p.executor, a.depth + 1 \
+                FROM execution p JOIN ancestors a ON a.parent = p.id WHERE a.depth < 64 \
+             ) SELECT DISTINCT executor FROM ancestors WHERE executor IS NOT NULL ORDER BY executor",
+        )
+        .bind(parent).fetch_all(executor).await.map_err(Into::into)
+    }
+
+    pub async fn find_authorization_lineages<'e, E>(
+        executor: E,
+        ids: &[Id],
+    ) -> Result<Vec<ExecutionLineageRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        // The visibility anchor has no depth cutoff in the existing contract.
+        // Only owner/descendant scoping stops after 64 parents. CYCLE terminates
+        // malformed ancestry instead of letting the recursive anchor query hang.
+        sqlx::query_as(AUTHORIZATION_LINEAGE_SELECT)
+            .bind(ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Diagnostic over the same SELECT and binds as the authorization reader.
+    pub async fn explain_authorization_lineages<'e, E>(
+        executor: E,
+        ids: &[Id],
+    ) -> Result<serde_json::Value>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar(&format!(
+            "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) {AUTHORIZATION_LINEAGE_SELECT}"
+        ))
+        .bind(ids)
+        .fetch_one(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_authorization_rows<'e, E>(
+        executor: E,
+        ids: &[Id],
+    ) -> Result<Vec<ExecutionAuthorizationRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as("SELECT id, action_ref, parent, executor FROM execution WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+}
+
 impl Repository for ExecutionRepository {
     type Entity = Execution;
     fn table_name() -> &'static str {

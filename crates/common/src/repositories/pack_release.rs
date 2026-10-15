@@ -1,6 +1,6 @@
 //! Repository operations for immutable pack releases.
 
-use crate::models::PackRelease;
+use crate::{config::PacksConfig, models::PackRelease};
 use crate::{Error, Result};
 use sqlx::{Executor, Postgres, Transaction};
 
@@ -68,13 +68,15 @@ impl PackReleaseRepository {
             .await?)
     }
 
+    /// Find the newest retained release for a version. Use release IDs or
+    /// digests to select a particular publication when republishing is allowed.
     pub async fn find_by_pack_version(
         transaction: &mut Transaction<'_, Postgres>,
         pack: i64,
         version: &str,
     ) -> Result<Option<PackRelease>> {
         let query = format!(
-            "SELECT {PACK_RELEASE_COLUMNS} FROM pack_release WHERE pack = $1 AND version = $2"
+            "SELECT {PACK_RELEASE_COLUMNS} FROM pack_release WHERE pack = $1 AND version = $2 ORDER BY id DESC LIMIT 1"
         );
         Ok(sqlx::query_as(&query)
             .bind(pack)
@@ -88,10 +90,34 @@ impl PackReleaseRepository {
         transaction: &mut Transaction<'_, Postgres>,
         input: CreatePackReleaseInput,
     ) -> Result<PackRelease> {
-        if let Some(existing) =
-            Self::find_by_pack_version(transaction, input.pack, &input.version).await?
-        {
-            if existing.digest != input.digest {
+        Self::create_or_get_with_policy(transaction, input, &PacksConfig::default()).await
+    }
+
+    /// The configured policy may allow multiple immutable releases per version.
+    /// Reuse an identical release even after republishing is disabled.
+    pub async fn create_or_get_with_policy(
+        transaction: &mut Transaction<'_, Postgres>,
+        input: CreatePackReleaseInput,
+        policy: &PacksConfig,
+    ) -> Result<PackRelease> {
+        // Serialize the version check and insert, including callers outside the API.
+        sqlx::query("SELECT id FROM pack WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(input.pack)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| Error::not_found("pack", "id", input.pack.to_string()))?;
+        let query = format!(
+            "SELECT {PACK_RELEASE_COLUMNS} FROM pack_release WHERE pack = $1 AND version = $2 \
+             ORDER BY (digest = $3) DESC, id DESC LIMIT 1"
+        );
+        let existing: Option<PackRelease> = sqlx::query_as(&query)
+            .bind(input.pack)
+            .bind(&input.version)
+            .bind(&input.digest)
+            .fetch_optional(&mut **transaction)
+            .await?;
+        if let Some(existing) = existing {
+            if existing.digest != input.digest && !policy.allows_version_republish(&input.version) {
                 return Err(Error::already_exists(
                     "Pack release",
                     "version",
@@ -101,18 +127,20 @@ impl PackReleaseRepository {
                     ),
                 ));
             }
-            let query = format!(
-                "UPDATE pack_release SET object_key = $2, provider_version = $3, archive_size = $4 \
-                 WHERE id = $1 RETURNING {PACK_RELEASE_COLUMNS}"
-            );
-            return sqlx::query_as(&query)
-                .bind(existing.id)
-                .bind(input.object_key)
-                .bind(input.provider_version)
-                .bind(input.archive_size)
-                .fetch_one(&mut **transaction)
-                .await
-                .map_err(Into::into);
+            if existing.digest == input.digest {
+                let query = format!(
+                    "UPDATE pack_release SET object_key = $2, provider_version = $3, archive_size = $4 \
+                     WHERE id = $1 RETURNING {PACK_RELEASE_COLUMNS}"
+                );
+                return sqlx::query_as(&query)
+                    .bind(existing.id)
+                    .bind(input.object_key)
+                    .bind(input.provider_version)
+                    .bind(input.archive_size)
+                    .fetch_one(&mut **transaction)
+                    .await
+                    .map_err(Into::into);
+            }
         }
 
         let query = format!(
@@ -184,6 +212,8 @@ impl PackReleaseRepository {
             projections,
         )
         .await?;
+        super::schema_type::SchemaTypeRepository::capture_release(transaction, pack, release)
+            .await?;
         super::executable_snapshot::ExecutableSnapshotRepository::capture_present(
             transaction,
             release,

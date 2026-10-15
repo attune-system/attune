@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { RetentionPolicyType } from "./RetentionPolicyType";
+import type { Value } from "./Value";
 import type { WorkerAffinity } from "./WorkerAffinity";
 import type { WorkerToleration } from "./WorkerToleration";
 /**
@@ -14,6 +15,8 @@ export type SensorResponse = {
    */
   artifact_retention_limit?: number | null;
   artifact_retention_policy?: null | RetentionPolicyType;
+  config?: null | Value;
+  config_schema_binding?: null | Value;
   /**
    * Creation timestamp
    */
@@ -54,7 +57,7 @@ export type SensorResponse = {
   /**
    * Parameter schema (StackStorm-style with inline required/secret)
    */
-  param_schema: any | null;
+  param_schema: Record<string, any> | null;
   /**
    * Unique reference identifier
    */

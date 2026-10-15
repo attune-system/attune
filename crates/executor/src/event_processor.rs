@@ -5,7 +5,7 @@
 //! creates enforcement records for rules that match.
 
 use anyhow::Result;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -26,9 +26,8 @@ use attune_common::{
         FindById, FindByRef, List,
     },
     secret_values::{
-        merge_schema_secret_redactions, prepare_secret_values, redacted_paths,
-        restore_secret_values, secret_paths_from_schema, validate_secret_destination_paths,
-        RenderedJson, ENTITY_ENFORCEMENT_CONFIG, ENTITY_EVENT_PAYLOAD,
+        prepare_secret_values, redacted_paths, restore_secret_values, RenderedJson,
+        ENTITY_ENFORCEMENT_CONFIG, ENTITY_EVENT_PAYLOAD,
     },
     template_resolver::{resolve_templates_with_sensitivity, TemplateContext},
     workflow::expression::{eval_expression, is_truthy, EvalContext, EvalResult},
@@ -37,6 +36,167 @@ use std::time::Duration;
 
 struct EventConditionContext {
     event: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attune_common::{
+        config::Config,
+        event_schema::EventSchemaBinding,
+        repositories::{
+            event::CreateEventInput, event_schema::EventSchemaRepository, pack::CreatePackInput,
+            schema_type::SchemaTypeRepository, Create,
+        },
+        test_database::TestDatabase,
+    };
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn rule_rendering_finishes_while_graph_reclamation_waits() -> Result<()> {
+        let config = Config::load_from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config.test.yaml")
+                .to_str()
+                .unwrap(),
+        )?;
+        let database = TestDatabase::create(&config.database).await?;
+        let pool = database.pool();
+        let pack = PackRepository::create(
+            pool,
+            CreatePackInput {
+                r#ref: "graph_renderer".into(),
+                label: "Graph Renderer".into(),
+                description: None,
+                version: "1.0.0".into(),
+                conf_schema: json!({"region":{"type":"string"}}),
+                config: json!({"region":"fixture-region"}),
+                meta: json!({}),
+                tags: vec![],
+                runtime_deps: vec![],
+                dependencies: vec![],
+                is_standard: false,
+                installers: json!({}),
+            },
+        )
+        .await?;
+        let mut setup = pool.begin().await?;
+        let event = EventRepository::create(
+            &mut *setup,
+            CreateEventInput {
+                trigger: None,
+                trigger_ref: "graph_renderer.input".into(),
+                config: None,
+                payload: Some(json!({"message":"fixture-message"})),
+                trace_tag: None,
+                source: None,
+                source_ref: None,
+                rule: None,
+                rule_ref: None,
+            },
+        )
+        .await?;
+        EventSchemaRepository::attach(
+            &mut setup,
+            event.id,
+            &EventSchemaBinding {
+                trigger_id: None,
+                trigger_ref: event.trigger_ref.clone(),
+                payload: None,
+                config: None,
+                webhook: false,
+            },
+        )
+        .await?;
+        setup.commit().await?;
+        let now = chrono::Utc::now();
+        let rule = Rule {
+            id: 1,
+            r#ref: "graph_renderer.rule".into(),
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            label: "Graph Renderer Rule".into(),
+            description: None,
+            action: None,
+            action_ref: "graph_renderer.action".into(),
+            trigger: None,
+            trigger_ref: event.trigger_ref.clone(),
+            conditions: json!({}),
+            action_params: json!({}),
+            trigger_params: json!({}),
+            sensor_worker_selector: json!({}),
+            sensor_worker_tolerations: json!([]),
+            sensor_worker_affinity: json!({}),
+            trace_tag_template: None,
+            permission_set_refs: None,
+            enabled: true,
+            enabled_override: None,
+            is_adhoc: true,
+            owner_identity: Some(1),
+            retired_at: None,
+            created: now,
+            updated: now,
+        };
+        let authority =
+            attune_common::delegation::DelegationAuthority::new(1, Default::default(), vec![]);
+        let mut admission = pool.begin().await?;
+        SchemaTypeRepository::lock_selection(&mut admission).await?;
+        let writer_pool = pool.clone();
+        let (ready, pending) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let mut transaction = writer_pool.begin().await?;
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *transaction)
+                .await?;
+            let _ = ready.send(pid);
+            SchemaTypeRepository::lock_reclamation(&mut transaction).await?;
+            transaction.commit().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let pid = pending.await?;
+        let queued = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
+                ).bind(pid).fetch_one(pool).await?;
+                if waiting {return Ok::<_, sqlx::Error>(());}
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        let parameters =
+            json!({"region":"{{ pack.config.region }}", "message":"{{ event.payload.message }}"});
+        let rendered = if queued.as_ref().is_ok_and(|ready| ready.is_ok()) {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    EventProcessor::resolve_action_params(
+                        &mut admission,
+                        &None,
+                        &rule,
+                        &event,
+                        event.payload.as_ref().unwrap(),
+                        &authority,
+                        &parameters,
+                    ),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        admission.rollback().await?;
+        tokio::time::timeout(Duration::from_secs(5), writer).await???;
+        database.cleanup().await?;
+        queued??;
+        let rendered = rendered.unwrap().expect(
+            "Rule rendering must not reacquire graph admission through a second connection",
+        )?;
+        assert_eq!(
+            rendered.value,
+            json!({"region":"fixture-region","message":"fixture-message"})
+        );
+        Ok(())
+    }
 }
 
 impl EvalContext for EventConditionContext {
@@ -325,6 +485,8 @@ impl EventProcessor {
         event: &Event,
     ) -> Result<()> {
         let mut tx = pool.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
         let rule = RuleRepository::find_by_id_for_share(&mut tx, rule.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Rule is no longer active"))?;
@@ -334,6 +496,20 @@ impl EventProcessor {
         let authority =
             attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
                 .await?;
+        let input_snapshot =
+            attune_common::repositories::rule_authority::RuleAuthorityRepository::current(
+                &mut tx, &rule,
+            )
+            .await?;
+        if !rule.is_adhoc && input_snapshot.is_none() {
+            return Err(anyhow::anyhow!(
+                "Deployed rule input authority is unavailable; redeploy its pack"
+            ));
+        }
+        let input_authority = match &input_snapshot {
+            Some(snapshot) => snapshot.input_authority(&mut tx).await?,
+            None => authority.clone(),
+        };
         // Evaluate rule conditions
         let conditions_pass = Self::evaluate_conditions(&rule, event)?;
 
@@ -362,14 +538,9 @@ impl EventProcessor {
             .cloned()
             .unwrap_or_else(serde_json::Map::new);
 
-        // Resolve action parameters using the template resolver, then move
-        // parameters marked `secret: true` into encrypted per-enforcement rows.
-        let rendered_params =
-            Self::resolve_action_params(pool, encryption_key, &rule, event, &payload, &authority)
-                .await?;
         let action = match rule.action {
-            Some(action_id) => ActionRepository::find_by_id(pool, action_id).await?,
-            None => ActionRepository::find_by_ref(pool, &rule.action_ref).await?,
+            Some(action_id) => ActionRepository::find_by_id(&mut *tx, action_id).await?,
+            None => ActionRepository::find_by_ref(&mut *tx, &rule.action_ref).await?,
         }
         .ok_or_else(|| anyhow::anyhow!("Action '{}' not found", rule.action_ref))?;
         if !action.enabled || action.retired_at.is_some() {
@@ -379,20 +550,49 @@ impl EventProcessor {
             );
             return Ok(());
         }
+        // Select code and contracts before defaults, rendering, or secret
+        // persistence. Execution handoff inherits this choice rather than
+        // resolving external revisions a second time.
+        let snapshot = attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
+            &mut *tx, action.id,
+        ).await?;
+        let action = &snapshot.executable.action;
+        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+        let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)?;
+        input_contract.validate_rule_secret_templates(&rule.action_params)?;
+        let parameters = if rule.action_params.is_null() {
+            serde_json::json!({})
+        } else {
+            rule.action_params.clone()
+        };
+        let parameters = input_contract.apply_defaults(&parameters)?;
+        let rendered_params = Self::resolve_action_params(
+            &mut tx,
+            encryption_key,
+            &rule,
+            event,
+            &payload,
+            &input_authority,
+            &parameters,
+        )
+        .await?;
+        input_contract.validate(&rendered_params.value)?;
         let refs = rule
             .permission_set_refs
             .as_deref()
             .unwrap_or(&action.default_execution_permission_set_refs);
         authority.require_refs_for_share(&mut tx, refs).await?;
-        validate_secret_destination_paths(
-            action.param_schema.as_ref(),
+        attune_common::secret_values::validate_contract_secret_destination_paths(
+            &rendered_params.value,
+            &input_contract,
             &rendered_params.secret_paths,
         )?;
-        let (redacted_params, secret_inputs) = merge_schema_secret_redactions(
-            rendered_params.value,
-            &rendered_params.secret_path_sources,
-            action.param_schema.as_ref(),
-        );
+        let (redacted_params, secret_inputs) =
+            attune_common::secret_values::merge_contract_secret_redactions(
+                rendered_params.value,
+                &rendered_params.secret_path_sources,
+                &input_contract,
+            )?;
         let redacted_params = redacted_params
             .as_object()
             .cloned()
@@ -420,11 +620,6 @@ impl EventProcessor {
             conditions: rule.conditions.clone(),
         };
 
-        let snapshot = attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
-            pool,
-            action.id,
-        )
-        .await?;
         let enforcement_result = EnforcementRepository::create_or_get_by_rule_event_pinned(
             &mut tx,
             create_input,
@@ -432,6 +627,18 @@ impl EventProcessor {
         )
         .await?;
         let enforcement = enforcement_result.enforcement;
+        if enforcement_result.created {
+            if let Some(snapshot) = &input_snapshot {
+                attune_common::repositories::rule_authority::RuleAuthorityRepository::attach_runtime(&mut tx, "enforcement", enforcement.id, snapshot).await?;
+            }
+            attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                &mut tx,
+                attune_common::repositories::schema_contract::BindingOwner::Enforcement,
+                enforcement.id,
+                &binding,
+            )
+            .await?;
+        }
         if enforcement_result.created && !prepared_secrets.is_empty() {
             ExecutionSecretValueRepository::upsert_many_with_conn(
                 &mut tx,
@@ -641,47 +848,45 @@ impl EventProcessor {
     /// `{{ event.created }}`, `{{ pack.config.* }}`, and `{{ system.* }}` references
     /// in the rule's `action_params` with values from the event and context.
     async fn resolve_action_params(
-        pool: &PgPool,
+        connection: &mut PgConnection,
         encryption_key: &Option<String>,
         rule: &Rule,
         event: &Event,
         event_payload: &serde_json::Value,
         authority: &attune_common::delegation::DelegationAuthority,
+        action_params: &serde_json::Value,
     ) -> Result<RenderedJson> {
-        let action_params = &rule.action_params;
-
         // If there are no action params, return empty
         if action_params.is_null() || action_params.as_object().is_none_or(|o| o.is_empty()) {
             return Ok(RenderedJson::plain(serde_json::json!({})));
         }
 
         // Load pack config from database for pack.config.* resolution
-        let (pack_ref, pack_config, pack_secret_paths) = match PackRepository::find_by_id(
-            pool, rule.pack,
+        let (pack_config, pack_secret_paths, pack_revision) = match PackRepository::find_by_id(
+            &mut *connection, rule.pack,
         )
         .await
         {
-            Ok(Some(pack)) => (
-                Some(pack.r#ref),
-                pack.config,
-                secret_paths_from_schema(Some(&pack.conf_schema)),
-            ),
+            Ok(Some(pack)) => {
+                attune_common::repositories::component_configuration::ComponentConfigurationRepository::pack_template_values(
+                    connection, &pack, Some(authority), encryption_key.as_deref()).await?
+            }
             Ok(None) => {
                 warn!(
                     "Pack {} not found for rule {} — pack.config.* templates will resolve to null",
                     rule.pack, rule.r#ref
                 );
-                (None, serde_json::json!({}), Vec::new())
+                (serde_json::json!({}), Vec::new(), None)
             }
             Err(e) => {
                 warn!("Failed to load pack {} for rule {}: {} — pack.config.* templates will resolve to null", rule.pack, rule.r#ref, e);
-                (None, serde_json::json!({}), Vec::new())
+                (serde_json::json!({}), Vec::new(), None)
             }
         };
 
         let event_payload_secret_paths = redacted_paths(event_payload);
         let event_payload_for_templates = Self::restore_event_payload_for_templates(
-            pool,
+            connection,
             encryption_key,
             event.id,
             event_payload.clone(),
@@ -703,12 +908,13 @@ impl EventProcessor {
         .with_event_id(event.id)
         .with_event_trigger(&event.trigger_ref)
         .with_event_created(&event.created.to_rfc3339())
-        .with_event_payload_secret_paths(
-            Some(event.trigger_ref.clone()),
-            event_payload_secret_paths,
-        )
-        .with_pack_config_secret_paths(pack_ref, pack_secret_paths)
+        .with_event_payload_secret_paths(event.id, event_payload_secret_paths)
         .with_origin("rule", &rule.r#ref);
+        let context = if let Some(revision) = pack_revision {
+            context.with_bound_pack_config_secret_paths(revision, pack_secret_paths)
+        } else {
+            context
+        };
 
         let expressions = attune_common::template_resolver::referenced_keystore_expressions(
             action_params,
@@ -719,7 +925,7 @@ impl EventProcessor {
         } else {
             let refs = expressions.values().cloned().collect::<Vec<_>>();
             let keys = attune_common::key_access::resolve_explicit_keys(
-                pool,
+                &mut *connection,
                 authority,
                 &refs,
                 encryption_key.as_deref(),
@@ -738,26 +944,33 @@ impl EventProcessor {
     }
 
     async fn restore_event_payload_for_templates(
-        pool: &PgPool,
+        connection: &mut PgConnection,
         encryption_key: &Option<String>,
         event_id: i64,
         event_payload: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-            pool,
+            &mut *connection,
             ENTITY_EVENT_PAYLOAD,
             event_id,
         )
         .await?;
-        if secrets.is_empty() {
-            return Ok(event_payload);
-        }
-
-        let encryption_key = encryption_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot restore event payload secrets for rule templates without security.encryption_key"
-            )
-        })?;
-        restore_secret_values(event_payload, &secrets, encryption_key).map_err(Into::into)
+        let restored = if secrets.is_empty() {
+            event_payload
+        } else {
+            let encryption_key = encryption_key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot restore event payload secrets for rule templates without security.encryption_key"
+                )
+            })?;
+            restore_secret_values(event_payload, &secrets, encryption_key)?
+        };
+        let binding = attune_common::repositories::event_schema::EventSchemaRepository::find(
+            connection, event_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Rule event is missing its admission schema binding"))?;
+        binding.validate_payload_restored(Some(&restored))?;
+        Ok(restored)
     }
 }

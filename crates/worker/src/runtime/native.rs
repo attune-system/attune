@@ -57,7 +57,7 @@ impl NativeRuntime {
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
         output_format: OutputFormat,
-        out_schema: Option<&serde_json::Value>,
+        out_schema: Option<&attune_common::value_schema::Contract>,
         _stdout_log_path: Option<&Path>,
         _stderr_log_path: Option<&Path>,
         stdout_log_writer: Option<BoundedLogFileWriter>,
@@ -531,9 +531,16 @@ mod tests {
         context.code_path = Some(path);
         context.runtime_name = Some("native".to_string());
         context.output_format = OutputFormat::Text;
-        context.out_schema = Some(json!({
-            "token": {"type": "string", "secret": true}
-        }));
+        context.out_schema = Some(
+            attune_common::value_schema::compile_inline(
+                "test.native",
+                attune_common::value_schema::SchemaContext::FlatDocument,
+                &json!({
+                    "token": {"type": "string", "secret": true}
+                }),
+            )
+            .unwrap(),
+        );
         context.stdout_log_writer = Some(
             BoundedLogFileWriter::from_shared_file_writer(writer, 1024, true, 1_000)
                 .with_mirror_source(Some(source)),

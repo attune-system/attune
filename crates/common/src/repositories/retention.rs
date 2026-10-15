@@ -636,6 +636,21 @@ impl RetentionRepository {
                         return Err(failure(source.into(), &result, true));
                     }
                 };
+                if target == RetentionTarget::Events {
+                    if let Err(source) =
+                        super::event_schema::EventSchemaRepository::cleanup_orphans(
+                            &mut tx,
+                            config.batch_size,
+                            cutoff,
+                        )
+                        .await
+                    {
+                        tx.rollback()
+                            .await
+                            .map_err(|e| failure(e.into(), &result, true))?;
+                        return Err(failure(source, &result, true));
+                    }
+                }
                 tx.commit()
                     .await
                     .map_err(|e| failure(e.into(), &result, true))?;

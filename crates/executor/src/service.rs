@@ -451,6 +451,7 @@ impl ExecutorService {
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
             Arc::new(manager_consumer),
+            self.inner.config.security.encryption_key.clone(),
         );
         handles.push(tokio::spawn(async move { execution_manager.start().await }));
 

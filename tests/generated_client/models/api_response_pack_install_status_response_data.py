@@ -27,6 +27,7 @@ class ApiResponsePackInstallStatusResponseData:
         started_at (datetime.datetime): When installation activities started
         status (str): pending, running, activating, succeeded, failed, or rolled_back
         trigger_reason (str): Why the install was triggered (install, update, manual, validation)
+        diagnostic_details (Any | Unset):
         error_message (None | str | Unset): Failure detail, when the install failed
         finished_at (datetime.datetime | None | Unset): When the install reached a terminal state
         test_execution_id (int | None | Unset): ID of the pack_test_execution row produced by the run, when available
@@ -40,6 +41,7 @@ class ApiResponsePackInstallStatusResponseData:
     started_at: datetime.datetime
     status: str
     trigger_reason: str
+    diagnostic_details: Any | Unset = UNSET
     error_message: None | str | Unset = UNSET
     finished_at: datetime.datetime | None | Unset = UNSET
     test_execution_id: int | None | Unset = UNSET
@@ -60,6 +62,8 @@ class ApiResponsePackInstallStatusResponseData:
         status = self.status
 
         trigger_reason = self.trigger_reason
+
+        diagnostic_details = self.diagnostic_details
 
         error_message: None | str | Unset
         if isinstance(self.error_message, Unset):
@@ -96,6 +100,8 @@ class ApiResponsePackInstallStatusResponseData:
                 "trigger_reason": trigger_reason,
             }
         )
+        if diagnostic_details is not UNSET:
+            field_dict["diagnostic_details"] = diagnostic_details
         if error_message is not UNSET:
             field_dict["error_message"] = error_message
         if finished_at is not UNSET:
@@ -123,6 +129,8 @@ class ApiResponsePackInstallStatusResponseData:
         status = d.pop("status")
 
         trigger_reason = d.pop("trigger_reason")
+
+        diagnostic_details = d.pop("diagnostic_details", UNSET)
 
         def _parse_error_message(data: object) -> None | str | Unset:
             if data is None:
@@ -169,6 +177,7 @@ class ApiResponsePackInstallStatusResponseData:
             started_at=started_at,
             status=status,
             trigger_reason=trigger_reason,
+            diagnostic_details=diagnostic_details,
             error_message=error_message,
             finished_at=finished_at,
             test_execution_id=test_execution_id,

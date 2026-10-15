@@ -295,6 +295,19 @@ impl AuthorizationService {
         &self,
         user: &AuthenticatedUser,
     ) -> Result<Option<AuthorizationSnapshot>, ApiError> {
+        if user
+            .claims
+            .admitted_execution_credential()
+            .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
+            .is_some()
+        {
+            // Never flatten a recorded pack envelope into mutable named IAM
+            // grants. Consumers must perform target-aware transaction checks.
+            return Err(ApiError::Forbidden(
+                "This resource consumer has not been converted to recorded runtime authority"
+                    .into(),
+            ));
+        }
         // Sensor and Refresh tokens have dedicated scope checks elsewhere and
         // are not subject to identity-based RBAC.
         //
@@ -575,6 +588,16 @@ impl AuthorizationService {
         user: &AuthenticatedUser,
         identity_id: i64,
     ) -> Result<Vec<Grant>, ApiError> {
+        if user
+            .claims
+            .admitted_execution_credential()
+            .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
+            .is_some()
+        {
+            return Err(ApiError::Forbidden(
+                "Recorded runtime authority requires target-aware matching".into(),
+            ));
+        }
         match user.claims.token_type {
             TokenType::Access => self.load_effective_grants(identity_id).await,
             TokenType::Execution => {

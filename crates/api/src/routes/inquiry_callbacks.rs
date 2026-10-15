@@ -122,7 +122,20 @@ async fn receive_sensor_callback(
             "Pinned sensor callback metadata does not match the workload".to_string(),
         ));
     }
-    let adapters = sensor_inquiry_callback_adapters(snapshot.sensor.config.as_ref())
+    // Admission stores configuration separately from executable metadata so the
+    // immutable snapshot cannot contain delivered credentials. Adapter settings
+    // are public control metadata from this fenced generation, not live values.
+    let (_, _, generation_config) =
+        attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+            &mut *tx,
+            fence.workload_id,
+            fence.generation,
+        )
+        .await?
+        .ok_or_else(|| {
+            ApiError::Forbidden("Sensor callback configuration is unavailable".to_string())
+        })?;
+    let adapters = sensor_inquiry_callback_adapters(Some(&generation_config))
         .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
     let adapter = adapters
         .get(&adapter_ref)

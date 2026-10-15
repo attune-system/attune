@@ -16,9 +16,6 @@ if TYPE_CHECKING:
     from ..models.create_runtime_request_execution_config import (
         CreateRuntimeRequestExecutionConfig,
     )
-    from ..models.create_runtime_request_installation_type_0 import (
-        CreateRuntimeRequestInstallationType0,
-    )
 
 
 T = TypeVar("T", bound="CreateRuntimeRequest")
@@ -36,7 +33,7 @@ class CreateRuntimeRequest:
         distributions (CreateRuntimeRequestDistributions | Unset): Distribution metadata used for verification and
             platform support
         execution_config (CreateRuntimeRequestExecutionConfig | Unset): Runtime execution configuration
-        installation (CreateRuntimeRequestInstallationType0 | None | Unset): Optional installation metadata
+        installation (Any | None | Unset):
         pack_ref (None | str | Unset): Optional pack reference this runtime belongs to Example: core.
     """
 
@@ -45,15 +42,11 @@ class CreateRuntimeRequest:
     description: None | str | Unset = UNSET
     distributions: CreateRuntimeRequestDistributions | Unset = UNSET
     execution_config: CreateRuntimeRequestExecutionConfig | Unset = UNSET
-    installation: CreateRuntimeRequestInstallationType0 | None | Unset = UNSET
+    installation: Any | None | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.create_runtime_request_installation_type_0 import (
-            CreateRuntimeRequestInstallationType0,
-        )
-
         name = self.name
 
         ref = self.ref
@@ -72,11 +65,9 @@ class CreateRuntimeRequest:
         if not isinstance(self.execution_config, Unset):
             execution_config = self.execution_config.to_dict()
 
-        installation: dict[str, Any] | None | Unset
+        installation: Any | None | Unset
         if isinstance(self.installation, Unset):
             installation = UNSET
-        elif isinstance(self.installation, CreateRuntimeRequestInstallationType0):
-            installation = self.installation.to_dict()
         else:
             installation = self.installation
 
@@ -115,9 +106,6 @@ class CreateRuntimeRequest:
         from ..models.create_runtime_request_execution_config import (
             CreateRuntimeRequestExecutionConfig,
         )
-        from ..models.create_runtime_request_installation_type_0 import (
-            CreateRuntimeRequestInstallationType0,
-        )
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -149,24 +137,12 @@ class CreateRuntimeRequest:
                 _execution_config
             )
 
-        def _parse_installation(
-            data: object,
-        ) -> CreateRuntimeRequestInstallationType0 | None | Unset:
+        def _parse_installation(data: object) -> Any | None | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
                 return data
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                installation_type_0 = CreateRuntimeRequestInstallationType0.from_dict(
-                    data
-                )
-
-                return installation_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(CreateRuntimeRequestInstallationType0 | None | Unset, data)
+            return cast(Any | None | Unset, data)
 
         installation = _parse_installation(d.pop("installation", UNSET))
 

@@ -348,7 +348,7 @@ pub async fn execute_streaming_cancellable(
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
     output_format: OutputFormat,
-    out_schema: Option<&serde_json::Value>,
+    out_schema: Option<&attune_common::value_schema::Contract>,
     cancel_token: Option<CancellationToken>,
     _stdout_log_path: Option<&Path>,
     _stderr_log_path: Option<&Path>,

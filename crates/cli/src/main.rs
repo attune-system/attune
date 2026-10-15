@@ -234,6 +234,15 @@ async fn main() {
             )
             .await
         }
+        Commands::SchemaType { command } => {
+            commands::schema_type::handle_schema_type_command(
+                &cli.profile,
+                command,
+                &cli.api_url,
+                output_format,
+            )
+            .await
+        }
         Commands::Sensor { command } => {
             commands::sensor::handle_sensor_command(
                 &cli.profile,
@@ -296,7 +305,19 @@ async fn main() {
         if e.is::<attune_cli::wait::WatchCancelled>() {
             process::exit(130);
         }
-        eprintln!("Error: {}", e);
+        if output_format == output::OutputFormat::Table {
+            eprintln!("Error: {e}");
+        } else {
+            let envelope = e
+                .downcast_ref::<attune_cli::client::ApiRequestError>()
+                .map(|error| error.envelope())
+                .unwrap_or_else(
+                    || serde_json::json!({"error": e.to_string(), "code": "COMMAND_FAILED"}),
+                );
+            if let Err(error) = output::print_output(&envelope, output_format) {
+                eprintln!("Could not render command failure: {error}");
+            }
+        }
         process::exit(1);
     }
 }

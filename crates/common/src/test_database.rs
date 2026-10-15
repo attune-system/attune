@@ -215,6 +215,21 @@ impl Deref for TestDatabase {
     }
 }
 
+impl<'p> sqlx::Acquire<'p> for &'p TestDatabase {
+    type Database = Postgres;
+    type Connection = sqlx::pool::PoolConnection<Postgres>;
+
+    fn acquire(self) -> BoxFuture<'p, std::result::Result<Self::Connection, sqlx::Error>> {
+        sqlx::Acquire::acquire(self.pool())
+    }
+
+    fn begin(
+        self,
+    ) -> BoxFuture<'p, std::result::Result<sqlx::Transaction<'p, Postgres>, sqlx::Error>> {
+        sqlx::Acquire::begin(self.pool())
+    }
+}
+
 impl<'p> Executor<'p> for &'p TestDatabase {
     type Database = Postgres;
 

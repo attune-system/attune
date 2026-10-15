@@ -50,6 +50,7 @@ class WorkQueueItemResponse:
         requested_by_enforcement (int | None | Unset):
         requested_by_execution (int | None | Unset):
         requested_by_identity (int | None | Unset):
+        schema_binding (Any | None | Unset):
         trace_tag (None | str | Unset):  Example: core.timer.1234.
     """
 
@@ -73,6 +74,7 @@ class WorkQueueItemResponse:
     requested_by_enforcement: int | None | Unset = UNSET
     requested_by_execution: int | None | Unset = UNSET
     requested_by_identity: int | None | Unset = UNSET
+    schema_binding: Any | None | Unset = UNSET
     trace_tag: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -164,6 +166,12 @@ class WorkQueueItemResponse:
         else:
             requested_by_identity = self.requested_by_identity
 
+        schema_binding: Any | None | Unset
+        if isinstance(self.schema_binding, Unset):
+            schema_binding = UNSET
+        else:
+            schema_binding = self.schema_binding
+
         trace_tag: None | str | Unset
         if isinstance(self.trace_tag, Unset):
             trace_tag = UNSET
@@ -203,6 +211,8 @@ class WorkQueueItemResponse:
             field_dict["requested_by_execution"] = requested_by_execution
         if requested_by_identity is not UNSET:
             field_dict["requested_by_identity"] = requested_by_identity
+        if schema_binding is not UNSET:
+            field_dict["schema_binding"] = schema_binding
         if trace_tag is not UNSET:
             field_dict["trace_tag"] = trace_tag
 
@@ -368,6 +378,15 @@ class WorkQueueItemResponse:
             d.pop("requested_by_identity", UNSET)
         )
 
+        def _parse_schema_binding(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        schema_binding = _parse_schema_binding(d.pop("schema_binding", UNSET))
+
         def _parse_trace_tag(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -398,6 +417,7 @@ class WorkQueueItemResponse:
             requested_by_enforcement=requested_by_enforcement,
             requested_by_execution=requested_by_execution,
             requested_by_identity=requested_by_identity,
+            schema_binding=schema_binding,
             trace_tag=trace_tag,
         )
 

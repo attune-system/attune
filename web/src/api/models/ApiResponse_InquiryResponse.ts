@@ -5,6 +5,7 @@
 import type { i64 } from "./i64";
 import type { InquiryResponseOption } from "./InquiryResponseOption";
 import type { InquiryStatus } from "./InquiryStatus";
+import type { Value } from "./Value";
 /**
  * Standard API response wrapper
  */
@@ -45,7 +46,7 @@ export type ApiResponse_InquiryResponse = {
     /**
      * Response data provided by the user
      */
-    response: any | null;
+    response: Record<string, any> | null;
     /**
      * Fixed responses that provider controls may select.
      */
@@ -53,7 +54,8 @@ export type ApiResponse_InquiryResponse = {
     /**
      * Attune flat schema for expected response fields
      */
-    response_schema: any | null;
+    response_schema: Record<string, any> | null;
+    schema_binding?: null | Value;
     /**
      * Current status of the inquiry
      */

@@ -69,16 +69,26 @@ pub fn extract_tar_archive<R: Read>(
     {
         let mut entry =
             entry.map_err(|error| Error::validation(format!("Invalid TAR entry: {error}")))?;
-        state.next_entry()?;
         let kind = entry.header().entry_type();
-        if !kind.is_file() && !kind.is_dir() {
-            return Err(Error::validation(format!(
-                "Archive contains forbidden link or special entry type: {kind:?}"
-            )));
-        }
         let path = entry
             .path()
-            .map_err(|error| Error::validation(format!("Invalid archive path: {error}")))?;
+            .map_err(|_| Error::validation("Invalid archive member path"))?
+            .into_owned();
+        let member = display_member(&path);
+        state
+            .next_entry()
+            .map_err(|error| archive_error(error, &member))?;
+        if !kind.is_file() && !kind.is_dir() {
+            let description = match kind.as_byte() {
+                b'1' => "hard link",
+                b'2' => "symbolic link",
+                b'3' => "character device",
+                b'4' => "block device",
+                b'6' => "FIFO",
+                _ => "unsupported special entry",
+            };
+            return Err(archive_error(Error::validation(format!("Archive contains a forbidden {description}. Remove this member and rebuild the archive.")), &member));
+        }
         let declared_size = entry
             .header()
             .size()
@@ -96,15 +106,26 @@ pub fn extract_tar_archive<R: Read>(
             create_safe_directories(dest, &relative)?;
             continue;
         }
-        let relative = validate_relative_path(&path)?;
+        let relative =
+            validate_relative_path(&path).map_err(|error| archive_error(error, &member))?;
         let target = safe_target(dest, &relative)?;
-        state.check_declared_size(declared_size)?;
+        let executable = entry
+            .header()
+            .mode()
+            .map_err(|error| Error::validation(format!("Invalid entry mode: {error}")))?
+            & 0o111
+            != 0;
+        state
+            .check_declared_size(declared_size)
+            .map_err(|error| archive_error(error, &member))?;
         create_safe_parent(dest, &relative)?;
         let written = write_bounded(
             &mut entry,
             &target,
             limits.max_entry_bytes.min(state.remaining_bytes()),
-        )?;
+            executable,
+        )
+        .map_err(|error| archive_error(error, &member))?;
         state.add_bytes(written)?;
     }
     Ok(())
@@ -121,15 +142,16 @@ pub fn extract_zip<R: Read + Seek>(
     let mut state = ExtractionState::new(limits);
 
     for index in 0..archive.len() {
-        state.next_entry()?;
         let mut entry = archive
             .by_index(index)
             .map_err(|error| Error::validation(format!("Invalid ZIP entry: {error}")))?;
         let mode_type = entry.unix_mode().unwrap_or(0) & 0o170000;
+        let member = display_member(Path::new(entry.name()));
+        state
+            .next_entry()
+            .map_err(|error| archive_error(error, &member))?;
         if mode_type != 0 && mode_type != 0o040000 && mode_type != 0o100000 {
-            return Err(Error::validation(
-                "ZIP archive contains a symlink or special file",
-            ));
+            return Err(archive_error(Error::validation("ZIP archive contains a symlink or special file. Remove this member and rebuild the archive."), &member));
         }
         let path = Path::new(entry.name());
         let is_directory = entry.is_dir() || mode_type == 0o040000;
@@ -148,12 +170,16 @@ pub fn extract_zip<R: Read + Seek>(
         }
         let relative = validate_relative_path(path)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- The archive entry is parsed only as input to strict relative-component validation before destination joining.
         let target = safe_target(dest, &relative)?;
-        state.check_declared_size(entry.size())?;
+        let executable = entry.unix_mode().unwrap_or(0) & 0o111 != 0;
+        state
+            .check_declared_size(entry.size())
+            .map_err(|error| archive_error(error, &member))?;
         create_safe_parent(dest, &relative)?;
         let written = write_bounded(
             &mut entry,
             &target,
             limits.max_entry_bytes.min(state.remaining_bytes()),
+            executable,
         )?;
         state.add_bytes(written)?;
     }
@@ -260,7 +286,12 @@ fn create_safe_directories(dest: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_bounded(reader: &mut impl Read, target: &Path, max_bytes: u64) -> Result<u64> {
+fn write_bounded(
+    reader: &mut impl Read,
+    target: &Path,
+    max_bytes: u64,
+    _executable: bool,
+) -> Result<u64> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -285,6 +316,20 @@ fn write_bounded(reader: &mut impl Read, target: &Path, max_bytes: u64) -> Resul
     writer
         .flush()
         .map_err(|error| Error::io(format!("Failed to flush extracted file: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Keep only executable intent, never archive ownership or privileged bits.
+        // Use the open handle so permission changes cannot follow a replaced path.
+        let mode = if _executable { 0o755 } else { 0o644 };
+        writer
+            .get_ref()
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|error| {
+                Error::io(format!("Failed to set extracted file permissions: {error}"))
+            })?;
+    }
     Ok(written)
 }
 
@@ -292,6 +337,22 @@ struct ExtractionState {
     limits: SafeExtractionLimits,
     entries: u32,
     bytes: u64,
+}
+
+fn display_member(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .take(240)
+        .flat_map(char::escape_default)
+        .collect()
+}
+
+fn archive_error(error: Error, member: &str) -> Error {
+    let mut error = super::diagnostics::located(error, member, "");
+    if let Error::Deployment { details, .. } = &mut error {
+        details.stage = "archive_extraction".into();
+    }
+    error
 }
 
 impl ExtractionState {
@@ -305,20 +366,23 @@ impl ExtractionState {
     fn next_entry(&mut self) -> Result<()> {
         self.entries = self.entries.saturating_add(1);
         if self.entries > self.limits.max_entries {
-            return Err(Error::validation("Archive contains too many entries"));
+            return Err(Error::validation(format!(
+                "Archive contains too many entries: {} exceeds the allowed {}",
+                self.entries, self.limits.max_entries
+            )));
         }
         Ok(())
     }
     fn check_declared_size(&self, size: u64) -> Result<()> {
         if size > self.limits.max_entry_bytes {
-            return Err(Error::validation(
-                "Archive entry exceeds the per-entry extracted size limit",
-            ));
+            return Err(Error::validation(format!("Archive entry exceeds the per-entry extracted size limit: {size} bytes exceeds {} bytes", self.limits.max_entry_bytes)));
         }
         if self.bytes.saturating_add(size) > self.limits.max_total_bytes {
-            return Err(Error::validation(
-                "Archive exceeds the total extracted size limit",
-            ));
+            return Err(Error::validation(format!(
+                "Archive exceeds the total extracted size limit: {} bytes exceeds {} bytes",
+                self.bytes.saturating_add(size),
+                self.limits.max_total_bytes
+            )));
         }
         Ok(())
     }
@@ -379,6 +443,190 @@ mod tests {
             .unwrap();
         writer.write_all(data).unwrap();
         writer.finish().unwrap().into_inner()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_preserves_only_executable_intent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let files = [
+            ("sensors/launcher", b"#!/bin/sh\n".as_slice(), 0o755, 0o755),
+            (
+                "sensors/bin/native",
+                b"\x7fELF\0\x01".as_slice(),
+                0o711,
+                0o755,
+            ),
+            ("other-execute", b"run".as_slice(), 0o001, 0o755),
+            ("privileged-execute", b"run".as_slice(), 0o7777, 0o755),
+            ("pack.yaml", b"ref: demo".as_slice(), 0o644, 0o644),
+            ("privileged-data", b"data".as_slice(), 0o7666, 0o644),
+            ("unreadable-data", b"data".as_slice(), 0o000, 0o644),
+        ];
+        for (path, data, mode, _) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(mode);
+            builder.append_data(&mut header, path, data).unwrap();
+        }
+        let dest = tempfile::tempdir().unwrap();
+        extract_tar(
+            Cursor::new(builder.into_inner().unwrap()),
+            dest.path(),
+            SafeExtractionLimits::default(),
+        )
+        .unwrap();
+
+        for (path, data, _, expected_mode) in files {
+            let target = dest.path().join(path);
+            assert_eq!(fs::read(&target).unwrap(), data);
+            assert_eq!(
+                fs::metadata(target).unwrap().permissions().mode() & 0o7777,
+                expected_mode,
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_preserves_only_executable_intent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let files = [
+            ("sensors/launcher", 0o755, 0o755),
+            ("sensors/bin/native", 0o711, 0o755),
+            ("other-execute", 0o001, 0o755),
+            ("privileged-execute", 0o7777, 0o755),
+            ("pack.yaml", 0o644, 0o644),
+            ("privileged-data", 0o7666, 0o644),
+            ("unreadable-data", 0o000, 0o644),
+        ];
+        for (path, mode, _) in files {
+            writer
+                .start_file(
+                    path,
+                    zip::write::SimpleFileOptions::default().unix_permissions(mode),
+                )
+                .unwrap();
+            writer.write_all(b"contents").unwrap();
+        }
+        let mut bytes = writer.finish().unwrap().into_inner();
+        // ZipWriter masks privileged bits, so inject the source modes into
+        // central-directory attributes to test sanitization of untrusted ZIPs.
+        let headers: Vec<_> = bytes
+            .windows(4)
+            .enumerate()
+            .filter_map(|(offset, window)| (window == b"\x50\x4b\x01\x02").then_some(offset))
+            .collect();
+        assert_eq!(headers.len(), files.len());
+        for (offset, (_, mode, _)) in headers.into_iter().zip(files) {
+            bytes[offset + 5] = 3; // Unix creator OS.
+            bytes[offset + 38..offset + 42]
+                .copy_from_slice(&((0o100000_u32 | mode) << 16).to_le_bytes());
+        }
+        let dest = tempfile::tempdir().unwrap();
+        extract_zip(
+            Cursor::new(bytes),
+            dest.path(),
+            SafeExtractionLimits::default(),
+        )
+        .unwrap();
+
+        for (path, _, expected_mode) in files {
+            let target = dest.path().join(path);
+            assert_eq!(fs::read(&target).unwrap(), b"contents");
+            assert_eq!(
+                fs::metadata(target).unwrap().permissions().mode() & 0o7777,
+                expected_mode,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_and_zip_reject_duplicate_files() {
+        let mut builder = tar::Builder::new(Vec::new());
+        for contents in [b"first".as_slice(), b"second".as_slice()] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            builder.append_data(&mut header, "run", contents).unwrap();
+        }
+        let dest = tempfile::tempdir().unwrap();
+        let error = extract_tar(
+            Cursor::new(builder.into_inner().unwrap()),
+            dest.path(),
+            SafeExtractionLimits::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(fs::read(dest.path().join("run")).unwrap(), b"first");
+
+        // Construct colliding normalized paths; ZipWriter rejects identical names.
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, contents) in [
+            ("run", b"first".as_slice()),
+            ("./run", b"second".as_slice()),
+        ] {
+            writer
+                .start_file(
+                    path,
+                    zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+                )
+                .unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        let dest = tempfile::tempdir().unwrap();
+        let error = extract_zip(
+            Cursor::new(writer.finish().unwrap().into_inner()),
+            dest.path(),
+            SafeExtractionLimits::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(fs::read(dest.path().join("run")).unwrap(), b"first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_ignores_restrictive_and_privileged_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o000, 0o7777] {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut directory = tar::Header::new_gnu();
+            directory.set_entry_type(tar::EntryType::Directory);
+            directory.set_size(0);
+            directory.set_mode(mode);
+            builder
+                .append_data(&mut directory, "nested", std::io::empty())
+                .unwrap();
+            let mut file = tar::Header::new_gnu();
+            file.set_size(4);
+            file.set_mode(0o755);
+            builder
+                .append_data(&mut file, "nested/run", b"data".as_slice())
+                .unwrap();
+            let dest = tempfile::tempdir().unwrap();
+            extract_tar(
+                Cursor::new(builder.into_inner().unwrap()),
+                dest.path(),
+                SafeExtractionLimits::default(),
+            )
+            .unwrap();
+
+            let permissions = fs::metadata(dest.path().join("nested"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(permissions & 0o700, 0o700);
+            assert_eq!(permissions & 0o7000, 0);
+            assert_eq!(fs::read(dest.path().join("nested/run")).unwrap(), b"data");
+        }
     }
 
     #[test]

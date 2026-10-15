@@ -48,7 +48,7 @@ use attune_common::{
             CreateWorkflowDefinitionInput, CreateWorkflowExecutionInput,
             WorkflowDefinitionRepository, WorkflowExecutionRepository,
         },
-        Create, Delete, FindById, Update,
+        Create, Delete, FindById,
     },
 };
 use axum::http::StatusCode;
@@ -293,6 +293,85 @@ async fn create_inquiry(
 
 fn respond_body() -> serde_json::Value {
     json!({ "response": { "approved": true } })
+}
+
+#[tokio::test]
+async fn secret_options_are_selectable_without_plaintext_access_and_require_explicit_decrypt(
+) -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let creator = create_identity(&ctx.pool, "secret_inquiry_creator").await?;
+    let assignee = create_identity(&ctx.pool, "secret_inquiry_assignee").await?;
+    let (_pack, action) = setup_pack_action(&ctx.pool, "secret_options").await?;
+    let child = create_workflow_child_execution(&ctx.pool, &action, creator.id, "unused").await?;
+    let token = generate_access_token(assignee.id, &assignee.login, &jwt_config())?;
+    let mut transaction = ctx.pool.begin().await?;
+    let inquiry = attune_common::repositories::inquiry_schema::InquirySchemaRepository::create_workflow(&mut transaction,
+        CreateWorkflowInquiryInput { created_by_execution: child.id, purpose: "protected-choice".into(), prompt: "Approve?".into(),
+            response_schema: Some(json!({"token": {"type": "string", "secret": true}, "approved": {"type": "boolean", "required": true}})),
+            response_options: vec![InquiryResponseOption { r#ref: "approve".into(), label: "Approve".into(), style: InquiryResponseOptionStyle::Positive,
+                response: json!({"token": "private-inquiry-fixture", "approved": true}) }], assigned_to: Some(assignee.id), timeout_seconds: None },
+        ctx.state.config.security.encryption_key.as_deref().expect("test encryption key")).await?;
+    transaction.commit().await?;
+    let path = format!("/api/v1/inquiries/{}", inquiry.id);
+    let detail = ctx.get(&path, Some(&token)).await?;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let body: serde_json::Value = detail.json().await?;
+    assert!(!serde_json::to_string(&body)?.contains("private-inquiry-fixture"));
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &body["data"]["response_options"][0]["response"]["token"]
+    ));
+    assert_eq!(
+        ctx.get(&format!("{path}?include_secret_values=true"), Some(&token))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = ctx
+        .post(
+            &format!("{path}/respond"),
+            json!({"option_ref": "approve"}),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &body["data"]["response"]["token"]
+    ));
+    let stored = InquiryRepository::find_by_id(&ctx.pool, inquiry.id)
+        .await?
+        .unwrap();
+    assert!(!serde_json::to_string(&stored.response)?.contains("private-inquiry-fixture"));
+    let permissions = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "test.inquiry_secret_decrypt".into(),
+            pack: None,
+            pack_ref: None,
+            label: Some("Inquiry decrypt".into()),
+            description: None,
+            grants: json!([{"resource": "inquiries", "actions": ["decrypt"]}]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: assignee.id,
+            permset: permissions.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(assignee.id).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    let detail = ctx
+        .get(&format!("{path}?include_secret_values=true"), Some(&token))
+        .await?;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let body: serde_json::Value = detail.json().await?;
+    assert_eq!(body["data"]["response"]["token"], "private-inquiry-fixture");
+    ctx.cleanup().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -740,6 +819,24 @@ async fn setup_callback_response_fixture(
     let owned = SensorWorkloadRepository::begin_process(&ctx.pool, lease)
         .await?
         .expect("owned callback workload");
+    let mut admission = ctx.pool.begin().await?;
+    attune_common::repositories::sensor_schema::SensorSchemaRepository::admit(
+        &mut admission,
+        &owned,
+        ctx.state.config.security.encryption_key.as_deref(),
+    )
+    .await?;
+    admission.commit().await?;
+    let (_, binding, config) =
+        attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+            &ctx.pool,
+            owned.workload_id,
+            owned.generation,
+        )
+        .await?
+        .expect("callback generation configuration");
+    assert!(binding.executable.sensor.config.is_none());
+    assert_eq!(config, callback_sensor_config(true));
     let encrypted_payload = encrypt_json(
         &json!({
             "provider": "slack",

@@ -1,8 +1,10 @@
 //! Integration tests for workflow API endpoints
 
 use attune_common::repositories::{
+    action::ActionRepository,
+    executable_snapshot::ExecutableSnapshotRepository,
     workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
-    Create,
+    FindByRef,
 };
 use axum::http::StatusCode;
 use serde_json::{json, Value};
@@ -25,6 +27,7 @@ async fn test_create_workflow_success() {
     // Create a pack first
     let pack_name = unique_pack_name();
     let pack = create_test_pack(&ctx.pool, &pack_name).await.unwrap();
+    activate_test_pack_release(&ctx.pool, &pack).await.unwrap();
     let action_ref = format!("{}.echo", pack.r#ref);
     let workflow_ref = format!("{}.test_workflow", pack.r#ref);
     create_test_action(&ctx.pool, pack.id, &pack.r#ref, &action_ref)
@@ -67,6 +70,15 @@ async fn test_create_workflow_success() {
     assert_eq!(body["data"]["label"], "Test Workflow");
     assert_eq!(body["data"]["version"], "1.0.0");
     assert!(body["data"]["tags"].as_array().unwrap().len() == 2);
+    let action = ActionRepository::find_by_ref(&ctx.pool, &workflow_ref)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(action.is_adhoc);
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&ctx.pool, action.id)
+        .await
+        .unwrap();
+    assert!(snapshot.executable.workflow_definition.is_some());
 }
 
 #[tokio::test]
@@ -79,7 +91,7 @@ async fn test_create_workflow_duplicate_ref() {
 
     // Create workflow directly in DB
     let input = CreateWorkflowDefinitionInput {
-        r#ref: "test-pack.existing_workflow".to_string(),
+        r#ref: format!("{}.existing_workflow", pack.r#ref),
         pack: pack.id,
         pack_ref: pack.r#ref.clone(),
         label: "Existing Workflow".to_string(),
@@ -99,7 +111,7 @@ async fn test_create_workflow_duplicate_ref() {
         .post(
             "/api/v1/workflows",
             json!({
-                "ref": "test-pack.existing_workflow",
+                "ref": format!("{}.existing_workflow", pack.r#ref),
                 "pack_ref": pack.r#ref,
                 "label": "Duplicate Workflow",
                 "version": "1.0.0",
@@ -358,7 +370,7 @@ async fn test_update_workflow() {
     let pack_name = unique_pack_name();
     let pack = create_test_pack(&ctx.pool, &pack_name).await.unwrap();
     let input = CreateWorkflowDefinitionInput {
-        r#ref: "test-pack.update_test".to_string(),
+        r#ref: format!("{}.update_test", pack.r#ref),
         pack: pack.id,
         pack_ref: pack.r#ref.clone(),
         label: "Original Label".to_string(),
@@ -376,7 +388,7 @@ async fn test_update_workflow() {
     // Update workflow via API
     let response = ctx
         .put(
-            "/api/v1/workflows/test-pack.update_test",
+            &format!("/api/v1/workflows/{}.update_test", pack.r#ref),
             json!({
                 "label": "Updated Label",
                 "description": "Updated description",
@@ -421,7 +433,7 @@ async fn test_delete_workflow() {
     let pack_name = unique_pack_name();
     let pack = create_test_pack(&ctx.pool, &pack_name).await.unwrap();
     let input = CreateWorkflowDefinitionInput {
-        r#ref: "test-pack.delete_test".to_string(),
+        r#ref: format!("{}.delete_test", pack.r#ref),
         pack: pack.id,
         pack_ref: pack.r#ref.clone(),
         label: "To Be Deleted".to_string(),
@@ -438,7 +450,10 @@ async fn test_delete_workflow() {
 
     // Delete workflow via API
     let response = ctx
-        .delete("/api/v1/workflows/test-pack.delete_test", ctx.token())
+        .delete(
+            &format!("/api/v1/workflows/{}.delete_test", pack.r#ref),
+            ctx.token(),
+        )
         .await
         .unwrap();
 
@@ -446,7 +461,10 @@ async fn test_delete_workflow() {
 
     // Verify it's deleted
     let response = ctx
-        .get("/api/v1/workflows/test-pack.delete_test", ctx.token())
+        .get(
+            &format!("/api/v1/workflows/{}.delete_test", pack.r#ref),
+            ctx.token(),
+        )
         .await
         .unwrap();
 

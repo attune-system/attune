@@ -395,8 +395,12 @@ def create_database(server, protocol, name, owned):
 
 def provision_writers(db):
     # These are later-provisioned roles, not default grants on every new table.
+    # Execution INSERT inherits recorded input authority through an invoker
+    # trigger even when no source authority exists. The probe writer needs only
+    # the SELECT/INSERT used by that trigger, not permission to edit bindings.
     db.sql("""GRANT USAGE ON SCHEMA attune TO native_writer,native_observer;
       GRANT SELECT,INSERT,UPDATE ON execution TO native_writer;
+      GRANT SELECT,INSERT ON runtime_input_authority TO native_writer;
       GRANT INSERT ON event,audit_event,execution_history,worker_history TO native_writer;
       GRANT SELECT(id) ON event,audit_event TO native_writer;
       GRANT USAGE ON SEQUENCE event_id_seq,audit_event_id_seq,execution_id_seq TO native_writer;

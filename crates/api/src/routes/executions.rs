@@ -50,8 +50,7 @@ use attune_common::scheduling::{
     parse_worker_affinity, parse_worker_selector, parse_worker_tolerations,
 };
 use attune_common::secret_values::{
-    prepare_secret_values, redact_secret_parameters, redacted_paths, ENTITY_EXECUTION_CONFIG,
-    ENTITY_EXECUTION_RESULT,
+    prepare_secret_values, redacted_paths, ENTITY_EXECUTION_CONFIG, ENTITY_EXECUTION_RESULT,
 };
 use attune_common::trace_tag::manual_trace_tag;
 use attune_common::workflow::{CancellationPolicy, WorkflowDefinition};
@@ -192,6 +191,19 @@ pub async fn create_execution(
         _ => user.identity_id().ok(),
     };
 
+    // Selection is server-owned. Keep code, contracts, parameters, and encrypted
+    // values in one creation transaction; requests have no revision selector.
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+    let action = &snapshot.executable.action;
+    let binding =
+        attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(
+            &mut tx, &snapshot,
+        )
+        .await?;
+    let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid input contract: {error}")))?;
     let permission_set_refs = request
         .permission_set_refs
         .clone()
@@ -274,8 +286,18 @@ pub async fn create_execution(
         .parameters
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
+    let raw_config = input_contract
+        .apply_defaults(&raw_config)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid execution parameters: {error}")))?;
+    input_contract
+        .validate(&raw_config)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid execution parameters: {error}")))?;
     let (redacted_config, secret_inputs) =
-        redact_secret_parameters(raw_config, action.param_schema.as_ref());
+        attune_common::secret_values::merge_contract_secret_redactions(
+            raw_config,
+            &[],
+            &input_contract,
+        )?;
     let config_for_storage = if redacted_config.is_null()
         || redacted_config
             .as_object()
@@ -332,16 +354,23 @@ pub async fn create_execution(
     };
 
     // Insert into database
-    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&state.db, action.id).await?;
     let created_execution =
-        ExecutionRepository::create_pinned(&state.db, execution_input, &snapshot).await?;
-    ExecutionSecretValueRepository::upsert_many(
-        &state.db,
+        ExecutionRepository::create_pinned(&mut *tx, execution_input, &snapshot).await?;
+    attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+        &mut tx,
+        attune_common::repositories::schema_contract::BindingOwner::Execution,
+        created_execution.id,
+        &binding,
+    )
+    .await?;
+    ExecutionSecretValueRepository::upsert_many_with_conn(
+        &mut tx,
         ENTITY_EXECUTION_CONFIG,
         created_execution.id,
         &prepared_secrets,
     )
     .await?;
+    tx.commit().await?;
 
     // Publish ExecutionRequested message to queue
     let payload = ExecutionRequestedPayload {
@@ -365,7 +394,10 @@ pub async fn create_execution(
         })?;
     }
 
-    let response = ExecutionResponse::from(created_execution);
+    let mut response = ExecutionResponse::from(created_execution);
+    response.schema_binding = Some(
+        serde_json::json!({"input_digest":binding.input.semantic_digest().map_err(|_| ApiError::InternalServerError("Invalid execution rendering contract".into()))?,"input":binding.input,"output":binding.output}),
+    );
 
     // Audit: explicit semantic event for manual execution requests so the
     // audit log shows *what* action was kicked off, not just "POST /api/v1/
@@ -1073,6 +1105,19 @@ pub async fn get_execution(
     };
 
     let mut response = ExecutionResponse::from(execution.clone());
+    if let Some(binding) =
+        attune_common::repositories::schema_contract::SchemaContractRepository::find(
+            &mut *state.db.acquire().await?,
+            attune_common::repositories::schema_contract::BindingOwner::Execution,
+            execution.id,
+        )
+        .await?
+    {
+        binding.validate()?;
+        response.schema_binding = Some(
+            serde_json::json!({"input_digest":binding.input.semantic_digest().map_err(|_| ApiError::InternalServerError("Invalid execution rendering contract".into()))?,"input":binding.input,"output":binding.output}),
+        );
+    }
     if query.include_secret_values {
         response.config = crate::secret_disclosure::reveal_authorized(
             &state,
@@ -3080,7 +3125,7 @@ fn complete_utf8_prefix_len(bytes: &[u8], sealed: bool) -> usize {
     }
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 struct ExecutionVisibilityAnchorRow {
     id: i64,
     action_ref: String,
@@ -3092,44 +3137,118 @@ struct ExecutionVisibilityAnchorRow {
 /// once for each of the tree anchor and the ancestor-executor chain.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExecutionVisibilityCache {
-    anchor: Option<ExecutionVisibilityAnchorRow>,
-    ancestor_ids: Option<Vec<i64>>,
+    lineages: HashMap<i64, Option<attune_common::repositories::execution::ExecutionLineageRow>>,
+    ancestor_owners: HashMap<i64, Vec<i64>>,
+    public_actions: HashMap<String, bool>,
 }
 
-async fn execution_visibility_anchor(
-    db: &sqlx::PgPool,
-    execution: &attune_common::models::Execution,
-) -> Result<ExecutionVisibilityAnchorRow, ApiError> {
-    if execution.parent.is_none() {
-        return Ok(ExecutionVisibilityAnchorRow {
-            id: execution.id,
-            action_ref: execution.action_ref.clone(),
-        });
+impl ExecutionVisibilityCache {
+    pub(crate) async fn load_public_actions(
+        &mut self,
+        db: &sqlx::PgPool,
+        refs: &[String],
+    ) -> Result<(), ApiError> {
+        let mut missing = refs
+            .iter()
+            .filter(|reference| !self.public_actions.contains_key(*reference))
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing.dedup();
+        for batch in missing.chunks(64) {
+            let rows = ActionRepository::find_disclosure_visibility(db, batch).await?;
+            for reference in batch {
+                self.public_actions.insert(reference.clone(), false);
+            }
+            for (reference, visibility) in rows {
+                self.public_actions
+                    .insert(reference, visibility == ActionReferenceVisibility::Public);
+            }
+        }
+        Ok(())
     }
 
-    sqlx::query_as::<_, ExecutionVisibilityAnchorRow>(
-        r#"
-        WITH RECURSIVE lineage AS (
-            SELECT id, parent, action_ref, 0 AS depth
-            FROM execution
-            WHERE id = $1
+    async fn public_action(
+        &mut self,
+        db: &sqlx::PgPool,
+        reference: &str,
+    ) -> Result<bool, ApiError> {
+        self.load_public_actions(db, &[reference.to_string()])
+            .await?;
+        Ok(self.public_actions.get(reference).copied().unwrap_or(false))
+    }
+    async fn ancestors(
+        &mut self,
+        db: &sqlx::PgPool,
+        execution: &attune_common::repositories::execution::ExecutionAuthorizationRow,
+    ) -> Result<Vec<i64>, ApiError> {
+        let Some(parent) = execution.parent else {
+            return Ok(Vec::new());
+        };
+        if let Some(Some(row)) = self.lineages.get(&execution.id) {
+            return Ok(row.ancestor_identity_ids.clone());
+        }
+        if let Some(ids) = self.ancestor_owners.get(&execution.id) {
+            return Ok(ids.clone());
+        }
+        let ids = ExecutionRepository::find_ancestor_identity_ids(db, parent).await?;
+        self.ancestor_owners.insert(execution.id, ids.clone());
+        Ok(ids)
+    }
 
-            UNION ALL
+    pub(crate) async fn load(&mut self, db: &sqlx::PgPool, ids: &[i64]) -> Result<(), ApiError> {
+        let mut missing = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.lineages.contains_key(id))
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing.dedup();
+        for batch in missing.chunks(64) {
+            let rows = ExecutionRepository::find_authorization_lineages(db, batch).await?;
+            for id in batch {
+                self.lineages.insert(*id, None);
+            }
+            for row in rows {
+                self.lineages.insert(row.execution_id, Some(row));
+            }
+        }
+        let refs = ids
+            .iter()
+            .filter_map(|id| self.lineages.get(id).and_then(Option::as_ref))
+            .map(|row| row.anchor_action_ref.clone())
+            .collect::<Vec<_>>();
+        self.load_public_actions(db, &refs).await?;
+        Ok(())
+    }
 
-            SELECT p.id, p.parent, p.action_ref, lineage.depth + 1
-            FROM execution p
-            INNER JOIN lineage ON lineage.parent = p.id
-        )
-        SELECT id, action_ref
-        FROM lineage
-        ORDER BY depth DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(execution.id)
-    .fetch_one(db)
-    .await
-    .map_err(Into::into)
+    async fn resolve(
+        &mut self,
+        db: &sqlx::PgPool,
+        execution: &attune_common::repositories::execution::ExecutionAuthorizationRow,
+    ) -> Result<attune_common::repositories::execution::ExecutionLineageRow, ApiError> {
+        if execution.parent.is_none() {
+            return Ok(
+                attune_common::repositories::execution::ExecutionLineageRow {
+                    execution_id: execution.id,
+                    anchor_id: execution.id,
+                    anchor_action_ref: execution.action_ref.clone(),
+                    ancestor_identity_ids: Vec::new(),
+                    cyclic: false,
+                },
+            );
+        }
+        self.load(db, &[execution.id]).await?;
+        let row = self
+            .lineages
+            .get(&execution.id)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| ApiError::NotFound("Execution ancestry is unavailable".into()))?;
+        if row.cyclic {
+            return Err(ApiError::Forbidden("Execution ancestry is cyclic".into()));
+        }
+        Ok(row.clone())
+    }
 }
 
 async fn authorize_execution_log_stream(
@@ -3168,6 +3287,25 @@ pub(crate) async fn authorize_execution_access(
     snapshot: Option<&AuthorizationSnapshot>,
     visibility_cache: &mut ExecutionVisibilityCache,
 ) -> Result<(), ApiError> {
+    authorize_execution_projection(
+        state,
+        user,
+        &attune_common::repositories::execution::ExecutionAuthorizationRow::from(execution),
+        action,
+        snapshot,
+        visibility_cache,
+    )
+    .await
+}
+
+pub(crate) async fn authorize_execution_projection(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    execution: &attune_common::repositories::execution::ExecutionAuthorizationRow,
+    action: Action,
+    snapshot: Option<&AuthorizationSnapshot>,
+    visibility_cache: &mut ExecutionVisibilityCache,
+) -> Result<(), ApiError> {
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
@@ -3178,19 +3316,23 @@ pub(crate) async fn authorize_execution_access(
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let mut ctx = AuthorizationContext::new(identity_id);
-    let anchor = if matches!(action, Action::Read | Action::Decrypt) {
-        if let Some(anchor) = visibility_cache.anchor.as_ref() {
-            anchor.clone()
-        } else {
-            let anchor = execution_visibility_anchor(&state.db, execution).await?;
-            visibility_cache.anchor = Some(anchor.clone());
-            anchor
-        }
+    let (anchor, ancestor_ids) = if matches!(action, Action::Read | Action::Decrypt) {
+        let lineage = visibility_cache.resolve(&state.db, execution).await?;
+        (
+            ExecutionVisibilityAnchorRow {
+                id: lineage.anchor_id,
+                action_ref: lineage.anchor_action_ref,
+            },
+            lineage.ancestor_identity_ids,
+        )
     } else {
-        ExecutionVisibilityAnchorRow {
-            id: execution.id,
-            action_ref: execution.action_ref.clone(),
-        }
+        (
+            ExecutionVisibilityAnchorRow {
+                id: execution.id,
+                action_ref: execution.action_ref.clone(),
+            },
+            visibility_cache.ancestors(&state.db, execution).await?,
+        )
     };
 
     ctx.target_id = Some(anchor.id);
@@ -3211,14 +3353,7 @@ pub(crate) async fn authorize_execution_access(
     // "descendants" for every workflow the identity happens to own.
     ctx.owner_identity_id = execution.executor;
     ctx.execution_owner_identity_id = execution.executor;
-    ctx.execution_ancestor_identity_ids = if let Some(ids) = visibility_cache.ancestor_ids.as_ref()
-    {
-        ids.clone()
-    } else {
-        let ids = execution_ancestor_identity_ids(&state.db, execution.parent).await?;
-        visibility_cache.ancestor_ids = Some(ids.clone());
-        ids
-    };
+    ctx.execution_ancestor_identity_ids = ancestor_ids;
 
     let authz = state.authorization_service();
     let check = AuthorizationCheck {
@@ -3237,46 +3372,14 @@ pub(crate) async fn authorize_execution_access(
 
     if matches!(action, Action::Read)
         && user.claims.token_type == TokenType::Access
-        && execution_anchor_is_public_action(&state.db, &anchor.action_ref).await?
+        && visibility_cache
+            .public_action(&state.db, &anchor.action_ref)
+            .await?
     {
         return Ok(());
     }
 
     authz_result
-}
-
-async fn execution_anchor_is_public_action(
-    db: &sqlx::PgPool,
-    action_ref: &str,
-) -> Result<bool, ApiError> {
-    let Some(action) = ActionRepository::find_by_ref(db, action_ref).await? else {
-        return Ok(false);
-    };
-    Ok(action.reference_visibility == ActionReferenceVisibility::Public)
-}
-
-async fn execution_ancestor_identity_ids(
-    db: &sqlx::PgPool,
-    mut parent_id: Option<i64>,
-) -> Result<Vec<i64>, ApiError> {
-    let mut identities = Vec::new();
-    let mut guard = 0;
-    while let Some(id) = parent_id {
-        guard += 1;
-        if guard > 64 {
-            break;
-        }
-        let Some(parent) = ExecutionRepository::find_by_id(db, id).await? else {
-            break;
-        };
-        if let Some(executor) = parent.executor {
-            identities.push(executor);
-        }
-        parent_id = parent.parent;
-    }
-    identities.sort_unstable();
-    identities.dedup();
-    Ok(identities)
 }
 
 fn emit_execution_secret_disclosure_audit(

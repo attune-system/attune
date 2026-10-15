@@ -7,14 +7,9 @@
  */
 export type RuntimeVersionConstraintPatch =
   | {
-      op: RuntimeVersionConstraintPatch.op;
+      op: "set";
       value: string;
     }
   | {
-      op: RuntimeVersionConstraintPatch.op;
+      op: "clear";
     };
-export namespace RuntimeVersionConstraintPatch {
-  export enum op {
-    SET = "set",
-  }
-}

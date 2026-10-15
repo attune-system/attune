@@ -63,8 +63,19 @@ Reference that set in each action's `default_execution_permission_set_refs`, or 
 The registering identity must hold enough authority to attach the set.
 Existing scoped `keys:read` grants also permit this operation.
 
-For a managed sensor, grant operation access to the attributed pack installer.
-The signer also checks the sensor's current workload fence and its profile allowlist.
+For a managed sensor, declare explicit named signing permission refs:
+
+```yaml
+config:
+  signing_permission_set_refs: [sales.signer_use]
+```
+
+The referenced permission set must grant Key `use` for the signing key. Deployment
+checks the registrar's authority and captures the narrowed `use` grants in the
+sensor's executable release. The signer checks the admitted generation, current
+workload fence, and operator profile allowlist. It does not recheck the installer's
+identity. `standard` grants no signing authority, and the signing refs do not
+authorize plaintext Key reads or decryption.
 
 ## Request an assertion from action code
 

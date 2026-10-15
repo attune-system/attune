@@ -36,7 +36,7 @@ use attune_common::{
             UpdateWorkQueueItemInput, WorkQueueItemJsonPathSelector, WorkQueueItemRepository,
             WorkQueueItemSearchFilters, WorkQueueRepository, WorkQueueSearchFilters,
         },
-        Create, Delete, FindById, FindByRef, Patch, Update,
+        Delete, FindById, FindByRef, Patch,
     },
     trace_tag::{manual_trace_tag, normalize_trace_tag},
 };
@@ -60,7 +60,6 @@ use crate::{
     },
     middleware::{ApiError, ApiResult},
     state::AppState,
-    validation::validate_queue_item_payload,
 };
 
 const API_ENQUEUE_SOURCE: &str = "api";
@@ -654,7 +653,8 @@ pub async fn list_queue_items(
     tag = "queues",
     params(
         ("ref" = String, Path, description = "Queue reference identifier"),
-        ("item_id" = i64, Path, description = "Queue item identifier")
+        ("item_id" = i64, Path, description = "Queue item identifier"),
+        crate::dto::work_queue::WorkQueueItemDetailQuery
     ),
     responses(
         (status = 200, description = "Queue item detail", body = ApiResponse<WorkQueueItemResponse>),
@@ -667,6 +667,7 @@ pub async fn get_queue_item(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path((queue_ref, item_id)): Path<(String, i64)>,
+    Query(query): Query<crate::dto::work_queue::WorkQueueItemDetailQuery>,
 ) -> ApiResult<impl IntoResponse> {
     let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
         .await?
@@ -675,9 +676,21 @@ pub async fn get_queue_item(
     authorize_queue_item_action(&state, &user, RbacAction::Read, &queue).await?;
     ensure_queue_item_visibility(&state, &user, RbacAction::Read, &queue).await?;
 
-    let item = WorkQueueItemRepository::find_by_queue_and_id(&state.db, queue.id, item_id)
+    let mut transaction = state.db.begin().await?;
+    let mut item = WorkQueueItemRepository::find_by_id_for_update(&mut transaction, item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Queue item '{}' not found", item_id)))?;
+    if item.queue != queue.id {
+        return Err(ApiError::NotFound(
+            "Queue item does not belong to this queue".into(),
+        ));
+    }
+    if query.decrypt {
+        authorize_queue_item_action(&state, &user, RbacAction::Decrypt, &queue).await?;
+        item.payload =
+            restore_queue_payload(&state, &user, &mut transaction, &queue, &item).await?;
+    }
+    transaction.commit().await?;
     let response = queue_item_response_with_execution_visibility(&state, &user, item).await?;
 
     Ok((StatusCode::OK, Json(ApiResponse::new(response))))
@@ -728,6 +741,7 @@ pub async fn enqueue_queue_item(
     };
     let mut transaction = state.db.begin().await?;
     let result = enqueue_queue_item_in_transaction(
+        &state,
         &mut transaction,
         &queue,
         &user,
@@ -801,6 +815,7 @@ pub async fn bulk_enqueue_queue_items(
     for item in request.items {
         results.push(
             enqueue_queue_item_in_transaction(
+                &state,
                 &mut transaction,
                 &queue,
                 &user,
@@ -972,7 +987,7 @@ pub async fn apply_queue_items_by_selector(
                 .payload_patch
                 .as_ref()
                 .expect("payload_patch is validated for patch operations");
-            apply_payload_patch_to_selected_items(&state, &queue, &selector, patch).await?
+            apply_payload_patch_to_selected_items(&state, &user, &queue, &selector, patch).await?
         }
     };
 
@@ -1036,22 +1051,33 @@ pub async fn update_queue_item(
     authorize_queue_item_action(&state, &user, RbacAction::Update, &queue).await?;
     ensure_queue_item_visibility(&state, &user, RbacAction::Update, &queue).await?;
 
-    let item = WorkQueueItemRepository::find_by_queue_and_id(&state.db, queue.id, item_id)
+    let mut transaction = state.db.begin().await?;
+    let item = WorkQueueItemRepository::find_by_id_for_update(&mut transaction, item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Queue item '{}' not found", item_id)))?;
 
+    if item.queue != queue.id {
+        return Err(ApiError::NotFound(
+            "Queue item does not belong to this queue".into(),
+        ));
+    }
     if !WorkQueueItemRepository::is_mutable_pending_status(item.status) {
         return Err(ApiError::Conflict(
             "Only queued or retry queue items can be updated".to_string(),
         ));
     }
 
-    if let Some(payload) = &request.payload {
-        validate_queue_item_payload(&queue, payload)?;
-    }
+    let prepared_payload = request
+        .payload
+        .as_ref()
+        .map(|payload| {
+            let binding = admitted_item_schema(&item)?;
+            prepare_queue_payload(&state, &binding, payload)
+        })
+        .transpose()?;
 
     let updated = WorkQueueItemRepository::update_if_statuses(
-        &state.db,
+        &mut *transaction,
         item.id,
         WorkQueueItemRepository::mutable_pending_statuses(),
         UpdateWorkQueueItemInput {
@@ -1060,7 +1086,9 @@ pub async fn update_queue_item(
                 NullableStringPatch::Clear => Patch::Clear,
             }),
             priority: request.priority,
-            payload: request.payload,
+            payload: prepared_payload
+                .as_ref()
+                .map(|(payload, _)| payload.clone()),
             metadata: request.metadata,
             ..Default::default()
         },
@@ -1069,6 +1097,12 @@ pub async fn update_queue_item(
     .ok_or_else(|| {
         ApiError::Conflict("Queue item is no longer in a mutable pending state".to_string())
     })?;
+    if let Some((_, secrets)) = prepared_payload {
+        attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
+            &mut transaction, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
+        ).await?;
+    }
+    transaction.commit().await?;
 
     Ok((
         StatusCode::OK,
@@ -1183,6 +1217,78 @@ struct EnqueueQueueItemResult {
     created: bool,
 }
 
+fn admitted_item_schema(
+    item: &attune_common::models::WorkQueueItem,
+) -> ApiResult<attune_common::value_schema::ValueSchemaBinding> {
+    Ok(item.payload_binding()?)
+}
+
+fn prepare_queue_payload(
+    state: &AppState,
+    binding: &attune_common::value_schema::ValueSchemaBinding,
+    payload: &JsonValue,
+) -> ApiResult<(
+    JsonValue,
+    Vec<attune_common::secret_values::PreparedSecretValue>,
+)> {
+    let contract = attune_common::value_schema::CompiledContract::new(&binding.contract)
+        .map_err(|_| ApiError::InternalServerError("Invalid queue payload contract".into()))?;
+    let payload = contract
+        .apply_defaults(payload)
+        .map_err(|error| ApiError::ValidationError(format!("Invalid queue payload: {error}")))?;
+    contract
+        .validate(&payload)
+        .map_err(|error| ApiError::ValidationError(format!("Invalid queue payload: {error}")))?;
+    let (redacted, inputs) =
+        attune_common::secret_values::merge_contract_secret_redactions(payload, &[], &contract)?;
+    let prepared = if inputs.is_empty() {
+        Vec::new()
+    } else {
+        let encryption_key = state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .ok_or_else(|| {
+                ApiError::InternalServerError(
+                    "Secret queue payloads require an encryption key".into(),
+                )
+            })?;
+        attune_common::secret_values::prepare_secret_values(inputs, encryption_key)?
+    };
+    Ok((redacted, prepared))
+}
+
+async fn restore_queue_payload(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    connection: &mut PgConnection,
+    queue: &WorkQueue,
+    item: &attune_common::models::WorkQueueItem,
+) -> ApiResult<JsonValue> {
+    let secrets = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+        &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id,
+    ).await?;
+    if secrets.is_empty() {
+        return Ok(item.payload.clone());
+    }
+    authorize_queue_item_action(state, user, RbacAction::Read, queue).await?;
+    authorize_queue_item_action(state, user, RbacAction::Decrypt, queue).await?;
+    let encryption_key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError("Queue payload encryption key is unavailable".into())
+        })?;
+    Ok(attune_common::secret_values::restore_secret_values(
+        item.payload.clone(),
+        &secrets,
+        encryption_key,
+    )?)
+}
+
 async fn inherited_enqueue_trace_tag(
     state: &AppState,
     requested_by_execution: Option<i64>,
@@ -1197,6 +1303,7 @@ async fn inherited_enqueue_trace_tag(
 }
 
 async fn enqueue_queue_item_in_transaction(
+    state: &Arc<AppState>,
     connection: &mut PgConnection,
     queue: &WorkQueue,
     user: &AuthenticatedUser,
@@ -1204,6 +1311,21 @@ async fn enqueue_queue_item_in_transaction(
     inherited_trace_tag: Option<&str>,
     request: EnqueueWorkQueueItemRequest,
 ) -> ApiResult<EnqueueQueueItemResult> {
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+        &mut *connection,
+    )
+    .await?;
+    let current = WorkQueueRepository::find_by_id_for_share(&mut *connection, queue.id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Queue is no longer installed".into()))?;
+    let queue = &current;
+    authorize_queue_item_action(state, user, RbacAction::Create, queue).await?;
+    ensure_queue_item_visibility(state, user, RbacAction::Create, queue).await?;
+    if !queue.accepting_new_items || queue.retired_at.is_some() {
+        return Err(ApiError::Conflict(
+            "Queue is not accepting new items".into(),
+        ));
+    }
     let requested_by_execution = user.execution_id();
     let create_priority = request.priority.unwrap_or(queue.default_priority);
     let mutable_statuses = WorkQueueItemRepository::mutable_pending_statuses();
@@ -1253,27 +1375,36 @@ async fn enqueue_queue_item_in_transaction(
                         )));
                     }
                     attune_common::models::WorkQueueUpdateStrategy::Replace => {
-                        validate_queue_item_payload(queue, &request.payload)?;
-                        WorkQueueItemRepository::update_if_statuses(
+                        let binding = admitted_item_schema(&existing)?;
+                        let (payload, secrets) = prepare_queue_payload(state, &binding, &request.payload)?;
+                        let updated = WorkQueueItemRepository::update_if_statuses(
                             &mut *connection,
                             existing.id,
                             mutable_statuses,
                             UpdateWorkQueueItemInput {
                                 priority: Some(create_priority),
-                                payload: Some(request.payload.clone()),
+                                payload: Some(payload),
                                 metadata: Some(request.metadata.clone()),
                                 trace_tag: source_trace_patch.clone(),
                                 ..Default::default()
                             },
                         )
-                        .await?
+                        .await?;
+                        if updated.is_some() {
+                            attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
+                                &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, existing.id, &secrets,
+                            ).await?;
+                        }
+                        updated
                     }
                     attune_common::models::WorkQueueUpdateStrategy::MergePatch => {
-                        let merged_payload = merge_patch_value(existing.payload, &request.payload);
-                        validate_queue_item_payload(queue, &merged_payload)?;
+                        let binding = admitted_item_schema(&existing)?;
+                        let original = restore_queue_payload(state, user, &mut *connection, queue, &existing).await?;
+                        let merged_payload = merge_patch_value(original, &request.payload);
+                        let (merged_payload, secrets) = prepare_queue_payload(state, &binding, &merged_payload)?;
                         let merged_metadata =
                             merge_patch_value(existing.metadata, &request.metadata);
-                        WorkQueueItemRepository::update_if_statuses(
+                        let updated = WorkQueueItemRepository::update_if_statuses(
                             &mut *connection,
                             existing.id,
                             mutable_statuses,
@@ -1285,7 +1416,13 @@ async fn enqueue_queue_item_in_transaction(
                                 ..Default::default()
                             },
                         )
-                        .await?
+                        .await?;
+                        if updated.is_some() {
+                            attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
+                                &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, existing.id, &secrets,
+                            ).await?;
+                        }
+                        updated
                     }
                 }
                 .ok_or_else(|| {
@@ -1302,7 +1439,37 @@ async fn enqueue_queue_item_in_transaction(
         }
     }
 
-    validate_queue_item_payload(queue, &request.payload)?;
+    let source = WorkQueueRepository::item_schema_source(&mut *connection, queue.id).await?;
+    let contract = if matches!(
+        source,
+        attune_common::value_schema::SourceIdentity::Released { .. }
+    ) {
+        attune_common::repositories::schema_contract::SchemaContractRepository::materialize(
+            &mut *connection,
+            source,
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            &queue.item_schema,
+        )
+        .await?
+    } else if let Some(pack) = queue.pack {
+        let pack = PackRepository::get_by_id(&mut *connection, pack).await?;
+        attune_common::repositories::schema_contract::SchemaContractRepository::compile_owned_assignment(
+            &mut *connection, source, attune_common::value_schema::SchemaContext::FlatDocument, &queue.item_schema, &pack,
+        ).await?
+    } else {
+        attune_common::repositories::schema_contract::SchemaContractRepository::materialize_unowned(
+            &mut *connection,
+            source,
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            &queue.item_schema,
+        )
+        .await?
+    };
+    let binding = attune_common::value_schema::ValueSchemaBinding {
+        authored_schema: queue.item_schema.clone(),
+        contract,
+    };
+    let (payload, secrets) = prepare_queue_payload(state, &binding, &request.payload)?;
     let snapshot = if let Some(action_id) = queue.dispatch_action {
         attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
             &mut *connection,
@@ -1316,7 +1483,7 @@ async fn enqueue_queue_item_in_transaction(
         )
         .await?
     };
-    let item = WorkQueueItemRepository::enqueue_pinned(
+    let item = WorkQueueItemRepository::create_bound_pinned(
         &mut *connection,
         CreateWorkQueueItemInput {
             queue: queue.id,
@@ -1324,7 +1491,7 @@ async fn enqueue_queue_item_in_transaction(
             item_key: request.item_key,
             priority: create_priority,
             status: attune_common::models::WorkQueueItemStatus::Queued,
-            payload: request.payload,
+            payload,
             metadata: request.metadata,
             trace_tag: source_trace_tag,
             enqueue_source: API_ENQUEUE_SOURCE.to_string(),
@@ -1339,8 +1506,12 @@ async fn enqueue_queue_item_in_transaction(
             ack_summary: None,
         },
         &snapshot,
+        &binding,
     )
     .await?;
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
+        &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
+    ).await?;
 
     Ok(EnqueueQueueItemResult {
         item,
@@ -2175,6 +2346,7 @@ fn validate_bulk_apply_request(request: &ApplyWorkQueueItemsRequest) -> Result<(
 
 async fn apply_payload_patch_to_selected_items(
     state: &Arc<AppState>,
+    user: &AuthenticatedUser,
     queue: &attune_common::models::WorkQueue,
     selector: &WorkQueueItemJsonPathSelector,
     patch: &JsonValue,
@@ -2186,13 +2358,15 @@ async fn apply_payload_patch_to_selected_items(
 
     let mut updates = Vec::with_capacity(selected.len());
     for item in selected {
-        let merged_payload = merge_patch_value(item.payload, patch);
-        validate_queue_item_payload(queue, &merged_payload)?;
-        updates.push((item.id, merged_payload));
+        let binding = admitted_item_schema(&item)?;
+        let original = restore_queue_payload(state, user, &mut tx, queue, &item).await?;
+        let merged_payload = merge_patch_value(original, patch);
+        let (payload, secrets) = prepare_queue_payload(state, &binding, &merged_payload)?;
+        updates.push((item.id, payload, secrets));
     }
 
     let mut affected_count = 0_u64;
-    for (item_id, merged_payload) in updates {
+    for (item_id, merged_payload, secrets) in updates {
         let updated = WorkQueueItemRepository::update_if_statuses(
             &mut *tx,
             item_id,
@@ -2204,6 +2378,9 @@ async fn apply_payload_patch_to_selected_items(
         )
         .await?;
         if updated.is_some() {
+            attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
+                &mut tx, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item_id, &secrets,
+            ).await?;
             affected_count += 1;
         }
     }

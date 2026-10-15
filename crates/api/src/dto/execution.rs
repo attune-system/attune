@@ -19,6 +19,7 @@ const MAX_WORKFLOW_CACHE_ITERATION_ERROR_SUMMARY_CHARS: usize = 1024;
 
 /// Request DTO for creating a manual execution
 #[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateExecutionRequest {
     /// Action reference to execute
     #[schema(example = "slack.post_message")]
@@ -173,6 +174,10 @@ pub struct ExecutionResponse {
     /// Execution result/output
     #[schema(value_type = Object, example = json!({"message_id": "1234567890.123456"}))]
     pub result: Option<JsonValue>,
+
+    /// Immutable admitted input/output contracts, excluding executable task metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_binding: Option<JsonValue>,
 
     /// ID of the original execution if this execution is a retry.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -498,6 +503,7 @@ impl From<attune_common::models::execution::Execution> for ExecutionResponse {
                 .result
                 .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null)),
             original_execution: execution.original_execution,
+            schema_binding: None,
             started_at: execution.started_at,
             workflow_task: execution.workflow_task,
             created: execution.created,
@@ -561,6 +567,26 @@ fn default_per_page() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_execution_has_no_contract_or_release_selector() {
+        for field in [
+            "contract_id",
+            "binding_digest",
+            "schema_binding",
+            "type_revision",
+            "pack_release",
+        ] {
+            let mut request = serde_json::json!({"action_ref": "test.action"});
+            request[field] = serde_json::json!("older-contract");
+            assert!(
+                serde_json::from_value::<super::CreateExecutionRequest>(request).is_err(),
+                "{field}"
+            );
+        }
+        assert!(serde_json::from_value::<super::CreateExecutionRequest>(serde_json::json!({
+            "action_ref": "test.action", "parameters": {"contract_id": "ordinary-action-parameter"}
+        })).is_ok());
+    }
     use super::*;
 
     #[test]

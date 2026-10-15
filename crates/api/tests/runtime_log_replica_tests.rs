@@ -38,7 +38,7 @@ use attune_common::{
             IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository,
         },
         log_stream::LogStreamRepository,
-        Create,
+        Create, FindByRef,
     },
     test_database::TestDatabase,
 };
@@ -410,10 +410,43 @@ impl Harness {
         &self,
         action_ref: &str,
     ) -> Result<attune_common::models::execution::Execution> {
-        Ok(ExecutionRepository::create(
-            self.database.pool(),
+        use attune_common::repositories::{
+            action::ActionRepository,
+            component_lifecycle::PackProjectionIds,
+            executable_snapshot::ExecutableSnapshotRepository,
+            schema_contract::{BindingOwner, SchemaContractRepository},
+        };
+        let pool = self.database.pool();
+        let action = match ActionRepository::find_by_ref(pool, action_ref).await? {
+            Some(action) => action,
+            None => {
+                let pack_ref = action_ref
+                    .split_once('.')
+                    .ok_or("fixture action ref is missing its pack")?
+                    .0;
+                let pack = helpers::create_test_pack(pool, pack_ref).await?;
+                let action =
+                    helpers::create_test_action(pool, pack.id, pack_ref, action_ref).await?;
+                helpers::activate_test_pack_release_with_projections(
+                    pool,
+                    &pack,
+                    &PackProjectionIds {
+                        actions: vec![action.id],
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                action
+            }
+        };
+        let mut tx = pool.begin().await?;
+        let snapshot =
+            ExecutableSnapshotRepository::resolve_for_action_ref(&mut *tx, action_ref).await?;
+        let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+        let execution = ExecutionRepository::create_pinned(
+            &mut *tx,
             CreateExecutionInput {
-                action: None,
+                action: Some(action.id),
                 action_ref: action_ref.to_string(),
                 config: None,
                 env_vars: None,
@@ -433,8 +466,13 @@ impl Harness {
                 workflow_task: None,
                 timeout_seconds: None,
             },
+            &snapshot,
         )
-        .await?)
+        .await?;
+        SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
+            .await?;
+        tx.commit().await?;
+        Ok(execution)
     }
 
     async fn fixture_version(
@@ -833,6 +871,172 @@ async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
         .exists());
     drop(reader);
 
+    harness.stop().await
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires PostgreSQL and versioned S3 storage"]
+async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames() -> Result<()> {
+    use attune_common::{
+        crypto,
+        repositories::{
+            execution_secret_value::ExecutionSecretValueRepository,
+            identity::UpdatePermissionSetInput,
+            key::{CreateKeyInput, KeyRepository},
+            Update,
+        },
+        secret_provenance::SecretProvenance,
+        secret_values::{prepare_secret_values, SecretValueInput, ENTITY_EXECUTION_CONFIG},
+    };
+    let harness = Harness::start(&[true, true]).await?;
+    let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
+    let encryption = harness.replicas[0]
+        .state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or("fixture encryption key missing")?;
+    let key = KeyRepository::create(
+        harness.database.pool(),
+        CreateKeyInput {
+            local_ref: "object_stream_origin".into(),
+            owner_type: OwnerType::Identity,
+            owner_identity: Some(harness.execution_identity),
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Object stream fixture origin".into(),
+            encrypted: true,
+            encryption_key_hash: Some(crypto::hash_encryption_key(encryption)),
+            value: crypto::encrypt_json(&serde_json::json!("owned input fixture"), encryption)?,
+        },
+    )
+    .await?;
+    let provenance = SecretProvenance::key(attune_common::key_access::key_origin(&key));
+    let secrets = prepare_secret_values(
+        vec![SecretValueInput {
+            json_path: "/private".into(),
+            value: serde_json::json!("owned input fixture"),
+            source_kind: "provenance".into(),
+            source_ref: Some(serde_json::to_string(&provenance)?),
+        }],
+        encryption,
+    )?;
+    ExecutionSecretValueRepository::upsert_many(
+        harness.database.pool(),
+        ENTITY_EXECUTION_CONFIG,
+        fixture.execution_id,
+        &secrets,
+    )
+    .await?;
+    let identity = IdentityRepository::create(
+        harness.database.pool(),
+        CreateIdentityInput {
+            login: "object-stream-origin-reader".into(),
+            display_name: None,
+            password_hash: None,
+            attributes: serde_json::json!({}),
+        },
+    )
+    .await?;
+    let base = vec![
+        serde_json::json!({"resource":"artifacts","actions":["read"],"constraints":{"ids":[fixture.artifact_id]}}),
+        serde_json::json!({"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[fixture.execution_id]}}),
+    ];
+    let mut allowed = base.clone();
+    allowed.push(serde_json::json!({"resource":"keys","actions":["read","decrypt"],"constraints":{"refs":[key.r#ref]}}));
+    let permissions = PermissionSetRepository::create(
+        harness.database.pool(),
+        CreatePermissionSetInput {
+            r#ref: "fixture.object_stream_origin".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: serde_json::json!(allowed),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        harness.database.pool(),
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: permissions.id,
+        },
+    )
+    .await?;
+    let token = generate_access_token(identity.id, &identity.login, &harness.jwt)?;
+    let client = reqwest::Client::new();
+    let mut reader =
+        Box::pin(open_artifact_stream(&client, &harness.replicas[1], &fixture, &token).await?);
+    assert_eq!(
+        put_segment(
+            &client,
+            &harness.replicas[0],
+            &fixture,
+            0,
+            b"permitted frame",
+            &harness.worker_token
+        )
+        .await?,
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        next_data_event(&mut reader, Duration::from_secs(5))
+            .await?
+            .data,
+        "permitted frame"
+    );
+
+    let mut revoked = base;
+    revoked.push(serde_json::json!({"resource":"keys","actions":["read"],"constraints":{"refs":[key.r#ref]}}));
+    PermissionSetRepository::update(
+        harness.database.pool(),
+        permissions.id,
+        UpdatePermissionSetInput {
+            grants: Some(serde_json::json!(revoked)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    assert_eq!(
+        put_segment(
+            &client,
+            &harness.replicas[0],
+            &fixture,
+            1,
+            b"revoked frame must not arrive",
+            &harness.worker_token
+        )
+        .await?,
+        reqwest::StatusCode::CREATED
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = reader
+                .next()
+                .await
+                .ok_or("stream ended without a revocation signal")??;
+            assert!(
+                !matches!(event.event.as_str(), "content" | "append"),
+                "object data crossed a revoked origin boundary"
+            );
+            if event.event == "error" {
+                let error: serde_json::Value = serde_json::from_str(&event.data)?;
+                assert_eq!(error["code"], "artifact_stream_access_revoked");
+                break;
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await??;
+    drop(reader);
     harness.stop().await
 }
 
@@ -1542,16 +1746,26 @@ async fn bounded_runtime_log_load_report() -> Result<()> {
     let (peak_open, peak_active, peak_streams) = sampler.await?;
     let calls_after = postgres_statement_calls(harness.database.pool()).await?;
     latencies.sort_unstable();
-    let leaked_streams: u64 = harness
-        .replicas
-        .iter()
-        .map(|replica| {
-            metric(
-                &replica.state.execution_log_streams.render_metrics(),
-                "attune_execution_log_streams_active",
-            )
-        })
-        .sum();
+    let leaked_streams = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut retry = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            let active: u64 = harness
+                .replicas
+                .iter()
+                .map(|replica| {
+                    metric(
+                        &replica.state.execution_log_streams.render_metrics(),
+                        "attune_execution_log_streams_active",
+                    )
+                })
+                .sum();
+            if active == 0 {
+                return active;
+            }
+            retry.tick().await;
+        }
+    })
+    .await?;
     let statement_calls = calls_after.saturating_sub(calls_before);
     let report = LoadReport {
         schema_version: 2,
@@ -1571,5 +1785,14 @@ async fn bounded_runtime_log_load_report() -> Result<()> {
         leaked_active_streams: leaked_streams,
     };
     println!("{}", serde_json::to_string(&report)?);
-    harness.stop().await
+    harness.stop().await?;
+    if let Some(path) = std::env::var_os("ATTUNE_LOG_LOAD_REPORT") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        writeln!(file, "{}", serde_json::to_string_pretty(&report)?)?;
+    }
+    Ok(())
 }

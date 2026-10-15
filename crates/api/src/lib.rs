@@ -4,9 +4,11 @@
 //! including the server, routing, authentication, and state management.
 //! It is primarily used by the binary target and integration tests.
 
+mod artifact_reads;
 pub mod auth;
 pub mod authz;
 pub mod dashboard_data;
+mod disclosure_records;
 pub mod dto;
 pub mod execution_log_streams;
 mod http_range;

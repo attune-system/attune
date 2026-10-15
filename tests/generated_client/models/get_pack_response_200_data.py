@@ -43,6 +43,7 @@ class GetPackResponse200Data:
         worker_selector (Any):
         worker_tolerations (Any):
         action_count (int | None | Unset): Number of actions registered for this pack Example: 12.
+        config_schema_binding (Any | None | Unset):
         description (None | str | Unset): Pack description Example: Integration with Slack for messaging and
             notifications.
         rule_count (int | None | Unset): Number of rules registered for this pack Example: 5.
@@ -67,6 +68,7 @@ class GetPackResponse200Data:
     worker_selector: Any
     worker_tolerations: Any
     action_count: int | None | Unset = UNSET
+    config_schema_binding: Any | None | Unset = UNSET
     description: None | str | Unset = UNSET
     rule_count: int | None | Unset = UNSET
     sensor_count: int | None | Unset = UNSET
@@ -111,6 +113,12 @@ class GetPackResponse200Data:
             action_count = UNSET
         else:
             action_count = self.action_count
+
+        config_schema_binding: Any | None | Unset
+        if isinstance(self.config_schema_binding, Unset):
+            config_schema_binding = UNSET
+        else:
+            config_schema_binding = self.config_schema_binding
 
         description: None | str | Unset
         if isinstance(self.description, Unset):
@@ -160,6 +168,8 @@ class GetPackResponse200Data:
         )
         if action_count is not UNSET:
             field_dict["action_count"] = action_count
+        if config_schema_binding is not UNSET:
+            field_dict["config_schema_binding"] = config_schema_binding
         if description is not UNSET:
             field_dict["description"] = description
         if rule_count is not UNSET:
@@ -225,6 +235,17 @@ class GetPackResponse200Data:
 
         action_count = _parse_action_count(d.pop("action_count", UNSET))
 
+        def _parse_config_schema_binding(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        config_schema_binding = _parse_config_schema_binding(
+            d.pop("config_schema_binding", UNSET)
+        )
+
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -279,6 +300,7 @@ class GetPackResponse200Data:
             worker_selector=worker_selector,
             worker_tolerations=worker_tolerations,
             action_count=action_count,
+            config_schema_binding=config_schema_binding,
             description=description,
             rule_count=rule_count,
             sensor_count=sensor_count,

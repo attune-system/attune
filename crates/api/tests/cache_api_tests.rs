@@ -2196,6 +2196,7 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Resu
             description: None,
             enabled: true,
             param_schema: None,
+            event_config_schema: None,
             out_schema: None,
             sensor: Some(sensor.id),
             sensor_ref: Some(sensor_ref.clone()),
@@ -2252,6 +2253,18 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Resu
         AcquireSensorWorkloadOutcome::Acquired(workload) => workload,
         AcquireSensorWorkloadOutcome::HeldByOther(_) => panic!("test workload is already held"),
     };
+    let workload = SensorWorkloadRepository::begin_process(&ctx.pool, workload)
+        .await?
+        .context("start sensor workload generation")?;
+    let mut tx = ctx.pool.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+    attune_common::repositories::sensor_schema::SensorSchemaRepository::admit(
+        &mut tx,
+        &workload,
+        ctx.state.config.security.encryption_key.as_deref(),
+    )
+    .await?;
+    tx.commit().await?;
     let worker_token = generate_worker_token_with_instance(
         1,
         &worker.id.to_string(),

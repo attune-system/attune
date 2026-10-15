@@ -22,7 +22,7 @@ export type InternalCreateSensorTokenRequest = {
    * Explicit cache permission-set refs (required, though it may be empty,
    * for worker/service callers).
    */
-  permission_set_refs?: any[] | null;
+  permission_set_refs?: Array<string> | null;
   /**
    * Sensor reference (required for worker/service callers)
    */
@@ -30,7 +30,7 @@ export type InternalCreateSensorTokenRequest = {
   /**
    * List of trigger types this sensor can create events for (required for worker/service callers)
    */
-  trigger_types?: any[] | null;
+  trigger_types?: Array<string> | null;
   /**
    * Optional TTL in seconds (default: 86400 = 24 hours, max: 259200 = 72 hours)
    */

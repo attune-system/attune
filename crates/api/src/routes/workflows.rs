@@ -18,7 +18,7 @@ use attune_common::repositories::{
         CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput, WorkflowDefinitionRepository,
         WorkflowSearchFilters,
     },
-    Create, FindByRef, Patch, Update,
+    FindByRef, Patch,
 };
 use attune_common::{
     action_visibility::{collect_workflow_action_refs, ensure_action_reference_allowed},
@@ -901,7 +901,7 @@ async fn create_companion_action(
         worker_affinity: serde_json::json!({}),
         param_schema: param_schema.cloned(),
         out_schema: out_schema.cloned(),
-        is_adhoc: false,
+        is_adhoc: true, // API-authored workflows are not pack release projections.
         accesses_mcp: false,
         default_execution_permission_set_refs: Vec::new(),
         reference_visibility,

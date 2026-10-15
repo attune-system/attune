@@ -2,12 +2,10 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { InquiryLiteralResponseRequest } from "./InquiryLiteralResponseRequest";
+import type { InquiryOptionResponseRequest } from "./InquiryOptionResponseRequest";
 /**
  * Request to respond to an inquiry (user-facing endpoint)
  */
-export type InquiryRespondRequest = {
-  /**
-   * Response data conforming to the inquiry's response_schema
-   */
-  response: Record<string, any>;
-};
+export type InquiryRespondRequest =
+  InquiryLiteralResponseRequest | InquiryOptionResponseRequest;

@@ -42,7 +42,7 @@ use attune_common::repositories::runtime_version::RuntimeVersionRepository;
 use attune_common::repositories::{Create, FindById, FindByRef, Update};
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::secret_values::{
-    prepare_secret_values, redact_action_result, ENTITY_EXECUTION_RESULT,
+    prepare_secret_values, redact_bound_action_result, ENTITY_EXECUTION_RESULT,
 };
 use attune_common::version_matching::{matches_constraint, select_best_version};
 use std::path::PathBuf as StdPathBuf;
@@ -749,16 +749,23 @@ impl ActionExecutor {
         } else {
             None
         };
+        let binding = self.schema_binding(execution.id).await?;
+        let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)
+            .map_err(|error| {
+                Error::Validation(format!("Invalid stored input contract: {error}"))
+            })?;
+        input_contract
+            .validate(restored_config.as_ref().unwrap_or(&serde_json::json!({})))
+            .map_err(|error| {
+                Error::Validation(format!("Bound input validation failed: {error}"))
+            })?;
 
         if let Some(config) = &restored_config {
             if let JsonValue::Object(map) = config {
-                let mut parameter_keys = map.keys().cloned().collect::<Vec<_>>();
-                parameter_keys.sort();
                 debug!(
-                    "Execution {} config restored (parameter_count: {}, parameter_keys: {:?})",
+                    "Execution {} config restored (parameter_count: {})",
                     execution.id,
-                    parameter_keys.len(),
-                    parameter_keys,
+                    map.len(),
                 );
                 for (key, value) in map {
                     parameters.insert(key.clone(), value.clone());
@@ -1057,7 +1064,7 @@ impl ActionExecutor {
             parameter_delivery: action.parameter_delivery,
             parameter_format: action.parameter_format,
             output_format: action.output_format,
-            out_schema: action.out_schema.clone(),
+            out_schema: binding.output,
             cancel_token: None,
         };
 
@@ -1361,6 +1368,16 @@ impl ActionExecutor {
         execution: &Execution,
         action: &Action,
     ) -> Result<ExecutionLogArtifacts> {
+        let binding = self.schema_binding(execution.id).await?;
+        let mut connection = self.pool.acquire().await?;
+        let sdk_key_access = attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(
+            &mut connection, execution.id,
+        ).await?.is_some_and(|admission| admission.authority.may_read_key_material());
+        drop(connection);
+        let sensitive_inputs = attune_common::value_schema::CompiledContract::new(&binding.input)
+            .map_err(|error| Error::Validation(format!("Invalid stored input contract: {error}")))?
+            .declares_secrets()
+            || sdk_key_access;
         let (stdout_mirror_source, stderr_mirror_source) =
             attune_common::runtime_log_mirror::select_mirror_sources(
                 attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
@@ -1373,8 +1390,8 @@ impl ActionExecutor {
                     worker_name: self.worker_name.clone(),
                     worker_instance: self.worker_instance,
                 },
-                self.mirror_runtime_stdout_to_stdio,
-                self.mirror_runtime_stderr_to_stdio,
+                self.mirror_runtime_stdout_to_stdio && !sensitive_inputs,
+                self.mirror_runtime_stderr_to_stdio && !sensitive_inputs,
             );
         let retention = self.effective_action_log_retention(action);
         let backend = if self.transport.transport_mode() == "volume" {
@@ -1857,12 +1874,25 @@ impl ActionExecutor {
             .into_iter()
             .map(|secret| secret.json_path)
             .collect::<Vec<_>>();
-        let (result_data, secret_inputs) = redact_action_result(
+        let binding = self.schema_binding(execution_id).await?;
+        let mut runtime_origins = attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(
+            &self.pool, &[execution_id],
+        ).await?;
+        let runtime_origins = runtime_origins.remove(&execution_id).unwrap_or_default();
+        let (result_data, secret_inputs) = redact_bound_action_result(
             result_data,
-            action.out_schema.as_ref(),
+            binding.output.as_ref(),
+            action.output_format,
             execution_id,
             &paths,
-        );
+            &runtime_origins,
+        )?;
+        if result_data.get("output_validation_warning").is_some() {
+            warn!(
+                execution_id,
+                "Action output did not conform to its stored schema; successful status retained"
+            );
+        }
         if secret_inputs.is_empty() {
             return Ok(result_data);
         }
@@ -1881,6 +1911,24 @@ impl ActionExecutor {
         .await?;
 
         Ok(result_data)
+    }
+
+    async fn schema_binding(
+        &self,
+        execution_id: i64,
+    ) -> Result<attune_common::repositories::schema_contract::ActionSchemaBinding> {
+        use attune_common::repositories::schema_contract::{
+            BindingOwner, SchemaContractRepository,
+        };
+        SchemaContractRepository::find_with_executor(
+            &self.pool,
+            BindingOwner::Execution,
+            execution_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            Error::Validation("Execution is missing its immutable schema binding".into())
+        })
     }
 
     /// Handle failed execution

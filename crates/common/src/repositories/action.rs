@@ -58,6 +58,19 @@ pub struct ActionSearchResult {
 /// Repository for Action operations
 pub struct ActionRepository;
 
+impl ActionRepository {
+    pub async fn find_disclosure_visibility<'e, E>(
+        executor: E,
+        refs: &[String],
+    ) -> Result<Vec<(String, crate::models::enums::ActionReferenceVisibility)>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as("SELECT ref, reference_visibility FROM action WHERE ref = ANY($1) AND retired_at IS NULL")
+            .bind(refs).fetch_all(executor).await.map_err(Into::into)
+    }
+}
+
 fn validate_version_constraint(field_name: &str, constraint: &str) -> Result<()> {
     parse_constraint(constraint).map_err(|e| {
         Error::validation(format!("Invalid {} '{}': {}", field_name, constraint, e))
@@ -253,11 +266,17 @@ impl List for ActionRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Create for ActionRepository {
-    type CreateInput = CreateActionInput;
+super::schema_consumer::schema_consumer_repository!(
+    ActionRepository,
+    CreateActionInput,
+    UpdateActionInput,
+    "action",
+    value_patch,
+    [param_schema, out_schema]
+);
 
-    async fn create<'e, E>(executor: E, input: Self::CreateInput) -> Result<Self::Entity>
+impl ActionRepository {
+    async fn create_row<'e, E>(executor: E, input: CreateActionInput) -> Result<Action>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -350,11 +369,8 @@ impl Create for ActionRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Update for ActionRepository {
-    type UpdateInput = UpdateActionInput;
-
-    async fn update<'e, E>(executor: E, id: i64, input: Self::UpdateInput) -> Result<Self::Entity>
+impl ActionRepository {
+    async fn update_row<'e, E>(executor: E, id: i64, input: UpdateActionInput) -> Result<Action>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -670,12 +686,7 @@ impl Delete for ActionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query("DELETE FROM action WHERE id = $1")
-            .bind(id)
-            .execute(executor)
-            .await?;
-
-        Ok(result.rows_affected() > 0)
+        super::schema_type::SchemaTypeRepository::delete_consumer_row(executor, "action", id).await
     }
 }
 

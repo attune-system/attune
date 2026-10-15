@@ -1,0 +1,37 @@
+version: "1.0.0"
+vars:
+  start_time: null
+  task_count: 3
+tasks:
+  - name: task_start
+    action: test_pack.echo
+    input:
+      message: "{{ parameters.workflow_message }}"
+      delay: 0
+      fail: false
+    next:
+      - when: "{{ succeeded() }}"
+        publish:
+          - start_time: "{{ result().timestamp }}"
+        do: [task_wait]
+  - name: task_wait
+    action: test_pack.echo
+    input:
+      message: "Waiting {{ parameters.workflow_delay }} seconds..."
+      delay: "{{ parameters.workflow_delay }}"
+      fail: false
+    next:
+      - when: "{{ succeeded() }}"
+        do: [task_complete]
+  - name: task_complete
+    action: test_pack.echo
+    input:
+      message: "Workflow completed successfully! Started at {{ workflow.start_time }}"
+      delay: 0
+      fail: false
+output_map:
+  workflow_result: "{{ task.task_complete.message }}"
+  total_tasks: "{{ workflow.task_count }}"
+  start_time: "{{ workflow.start_time }}"
+  end_time: "{{ task.task_complete.timestamp }}"
+  all_tasks_succeeded: "{{ task.task_complete.success }}"

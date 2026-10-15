@@ -19,6 +19,11 @@ pub enum AbsentMetadataPolicyArg {
 
 #[derive(Subcommand)]
 pub enum PackCommands {
+    /// Inspect and control fixed external runtime approvals for a pack
+    Approval {
+        #[command(subcommand)]
+        command: super::pack_approval::ApprovalCommands,
+    },
     /// Build, verify, and inspect canonical release archives offline
     Release {
         #[command(subcommand)]
@@ -355,6 +360,8 @@ struct Pack {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PackInstallResponse {
+    #[serde(default)]
+    diagnostics: Vec<attune_common::pack_check::PackDiagnostic>,
     pack: Pack,
     test_result: Option<serde_json::Value>,
     tests_skipped: bool,
@@ -369,6 +376,8 @@ struct PackInstallResponse {
 /// Status payload returned by `GET /packs/{ref}/install/latest`.
 #[derive(Debug, Serialize, Deserialize)]
 struct PackInstallStatus {
+    #[serde(default)]
+    diagnostic_details: Option<serde_json::Value>,
     install_id: i64,
     pack_ref: String,
     pack_version: String,
@@ -482,6 +491,8 @@ struct RegisterPackRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UploadPackResponse {
+    #[serde(default)]
+    diagnostics: Vec<attune_common::pack_check::PackDiagnostic>,
     pack: Pack,
     #[serde(default)]
     test_result: Option<serde_json::Value>,
@@ -511,6 +522,9 @@ pub async fn handle_pack_command(
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
+        PackCommands::Approval { command } => {
+            super::pack_approval::handle(profile, api_url, command, output_format).await
+        }
         PackCommands::Release { command } => {
             super::pack_release::handle(command, output_format).await
         }
@@ -1008,7 +1022,11 @@ async fn handle_install(
         anyhow::bail!("--registry-id cannot be combined with --no-registry");
     }
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config_with_timeout(
+        &config,
+        api_url,
+        std::time::Duration::from_secs(8 * 60 * 60),
+    );
 
     // Detect source type
     let source_type = detect_source_type(&source, ref_spec.as_deref(), no_registry);
@@ -1035,6 +1053,7 @@ async fn handle_install(
     // Note: Progress reporting will be added when API supports streaming
     // For now, we show a simple message during the potentially long operation
     let mut response: PackInstallResponse = client.post("/packs/install", &request).await?;
+    print_deployment_warnings(&response.diagnostics, output_format);
 
     if let Some(status) = poll_pack_install(
         &mut client,
@@ -1086,11 +1105,35 @@ async fn handle_install(
     Ok(())
 }
 
+fn print_deployment_warnings(
+    diagnostics: &[attune_common::pack_check::PackDiagnostic],
+    format: OutputFormat,
+) {
+    if format != OutputFormat::Table {
+        return;
+    }
+    for diagnostic in diagnostics {
+        output::print_warning(&format!(
+            "{}{}: {}",
+            diagnostic.path.as_deref().unwrap_or("pack"),
+            diagnostic
+                .metadata_path
+                .as_ref()
+                .map(|path| format!(" at {path}"))
+                .unwrap_or_default(),
+            diagnostic.message
+        ));
+        if let Some(hint) = &diagnostic.hint {
+            output::print_info(hint);
+        }
+    }
+}
+
 /// Poll the pack install status endpoint until the worker-completed test run
 /// reaches a terminal state, printing progress in table mode.
 async fn poll_pack_install(
     client: &mut ApiClient,
-    _pack_ref: &str,
+    pack_ref: &str,
     install_id: Option<i64>,
     output_format: OutputFormat,
 ) -> Result<Option<PackInstallStatus>> {
@@ -1099,7 +1142,9 @@ async fn poll_pack_install(
     };
 
     if output_format == OutputFormat::Table {
-        output::print_info(&format!("  Running pack tests (install {install_id})..."));
+        output::print_info(&format!(
+            "  Tracking pack deployment (install {install_id})..."
+        ));
     }
     let started = std::time::Instant::now();
     let final_status = loop {
@@ -1112,10 +1157,7 @@ async fn poll_pack_install(
             break Some(status);
         }
         if started.elapsed() > std::time::Duration::from_secs(300) {
-            if output_format == OutputFormat::Table {
-                output::print_error("  Timed out waiting for pack tests to complete");
-            }
-            return Ok(None);
+            anyhow::bail!("Timed out waiting for pack '{pack_ref}' installation. Outcome is unknown. Check /api/v1/packs/install/{install_id} before retrying.");
         }
     };
 
@@ -1123,6 +1165,7 @@ async fn poll_pack_install(
         return Ok(None);
     };
     let status_for_response = PackInstallStatus {
+        diagnostic_details: status.diagnostic_details.clone(),
         install_id: status.install_id,
         pack_ref: status.pack_ref.clone(),
         pack_version: status.pack_version.clone(),
@@ -1134,11 +1177,24 @@ async fn poll_pack_install(
         started_at: status.started_at.clone(),
         finished_at: status.finished_at.clone(),
     };
+    if status.status != "succeeded" || status.error_message.is_some() {
+        let message = status
+            .error_message
+            .as_deref()
+            .unwrap_or("Pack deployment failed; the candidate was not activated");
+        let body = serde_json::json!({"error": message, "code": "PACK_DEPLOYMENT_FAILED", "details": status.diagnostic_details});
+        return Err(crate::client::ApiRequestError::from_response(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            &body.to_string(),
+        )
+        .into());
+    }
     if output_format != OutputFormat::Table {
         return Ok(Some(status_for_response));
     }
     match status.status.as_str() {
-        "succeeded" => output::print_success("  ✓ Pack tests passed"),
+        "succeeded" => output::print_success("  Pack deployment completed"),
         "rolled_back" => {
             output::print_error("  ✗ Pack tests failed and the new pack install was rolled back")
         }
@@ -1156,7 +1212,7 @@ async fn poll_pack_install(
         ) {
             let passed = result.get("passed").and_then(|v| v.as_u64()).unwrap_or(0);
             let total = result
-                .get("total_tests")
+                .get("totalTests")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             output::print_info(&format!("  Tests: {passed}/{total} passed"));
@@ -1276,7 +1332,11 @@ async fn handle_upload(
     }
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config_with_timeout(
+        &config,
+        api_url,
+        std::time::Duration::from_secs(8 * 60 * 60),
+    );
 
     let mut extra_fields = Vec::new();
     if force {
@@ -1304,6 +1364,7 @@ async fn handle_upload(
             extra_fields,
         )
         .await?;
+    print_deployment_warnings(&response.diagnostics, output_format);
 
     if let Some(status) = poll_pack_install(
         &mut client,
@@ -1415,7 +1476,11 @@ async fn handle_register(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config_with_timeout(
+        &config,
+        api_url,
+        std::time::Duration::from_secs(8 * 60 * 60),
+    );
 
     // Warn if the path looks like a local filesystem path that the API server
     // probably can't see (i.e. not a known container mount point).
@@ -1444,6 +1509,7 @@ async fn handle_register(
     };
 
     let mut response: PackInstallResponse = client.post("/packs/register", &request).await?;
+    print_deployment_warnings(&response.diagnostics, output_format);
 
     if let Some(status) = poll_pack_install(
         &mut client,

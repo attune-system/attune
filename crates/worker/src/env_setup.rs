@@ -1468,7 +1468,6 @@ mod tests {
     async fn equal_pack_refs_in_separate_databases_do_not_share_metadata() {
         use attune_common::config::Config;
         use attune_common::repositories::pack::CreatePackInput;
-        use attune_common::repositories::Create;
         use attune_common::test_database::TestDatabase;
 
         let config_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.test.yaml");

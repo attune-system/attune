@@ -23,6 +23,9 @@ import {
   type ArtifactType,
 } from "@/hooks/useArtifacts";
 import { useArtifactStream } from "@/hooks/useArtifactStream";
+import { useArtifactLivePage } from "@/hooks/useArtifactLivePage";
+import LiveStreamControl from "@/components/common/LiveStreamControl";
+import Pagination from "./Pagination";
 import { formatJsonValue } from "@/lib/format-utils";
 import { OpenAPI } from "@/api/core/OpenAPI";
 
@@ -527,10 +530,26 @@ function ProgressDetail({
 // Main Panel
 // ============================================================================
 
-export default function ExecutionArtifactsPanel({
+export default function ExecutionArtifactsPanel(
+  props: ExecutionArtifactsPanelProps,
+) {
+  return <ExecutionArtifactsView key={props.executionId} {...props} />;
+}
+
+function ExecutionArtifactsView({
   executionId,
   isRunning = false,
 }: ExecutionArtifactsPanelProps) {
+  const [page, setPage] = useState(1);
+  const pageSize = 20;
+  const [paused, setPaused] = useState(false);
+  useArtifactLivePage({
+    scope: "execution",
+    id: executionId,
+    page,
+    setPage,
+    paused,
+  });
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [previewProgressId, setPreviewProgressId] = useState<number | null>(
     null,
@@ -542,31 +561,23 @@ export default function ExecutionArtifactsPanel({
   // Subscribe to real-time artifact notifications for this execution.
   // WebSocket-driven cache invalidation replaces most of the polling need,
   // but we keep polling as a fallback (staleTime/refetchInterval in the hook).
-  useArtifactStream({ executionId, enabled: isRunning });
+  const { isConnected } = useArtifactStream({ executionId, paused });
 
   const { data, isLoading, error } = useExecutionArtifacts(
     executionId,
     isRunning,
+    { page, perPage: pageSize },
+    paused,
   );
 
   const artifacts: ArtifactSummary[] = useMemo(() => {
-    return data?.data ?? [];
+    return data?.items ?? [];
   }, [data]);
 
-  const summary = useMemo(() => {
-    const total = artifacts.length;
-    const files = artifacts.filter((a) =>
-      ["file_text", "file_binary", "file_image", "file_datatable"].includes(
-        a.type,
-      ),
-    ).length;
-    const progress = artifacts.filter((a) => a.type === "progress").length;
-    const other = total - files - progress;
-    return { total, files, progress, other };
-  }, [artifacts]);
+  const total = data?.pagination.total_items ?? artifacts.length;
 
   // Don't render anything if there are no artifacts and we're not loading
-  if (!isLoading && artifacts.length === 0 && !error) {
+  if (!isLoading && total === 0 && page === 1 && !error) {
     return null;
   }
 
@@ -578,7 +589,7 @@ export default function ExecutionArtifactsPanel({
           <Package className="h-4 w-4 text-indigo-500" />
           <h2 className="text-lg font-semibold">Artifacts</h2>
           {!isLoading && (
-            <span className="text-xs text-gray-500">({summary.total})</span>
+            <span className="text-xs text-gray-500">({total})</span>
           )}
           {isRunning && (
             <div className="flex items-center gap-1.5 text-xs text-blue-600">
@@ -587,6 +598,14 @@ export default function ExecutionArtifactsPanel({
             </div>
           )}
         </div>
+        <LiveStreamControl
+          paused={paused}
+          onTogglePaused={() => setPaused((value) => !value)}
+          connected={isConnected}
+          maxItems={pageSize}
+          itemLabel="artifacts"
+          showRetentionHint={false}
+        />
       </div>
 
       {/* Content */}
@@ -708,6 +727,20 @@ export default function ExecutionArtifactsPanel({
             })}
           </div>
         )}
+
+        {data && !error && (
+          <Pagination
+            page={page}
+            setPage={setPage}
+            pageSize={pageSize}
+            itemCount={artifacts.length}
+            total={total}
+            itemLabel="artifacts"
+          />
+        )}
+        <p className="mt-3 text-xs text-gray-500">
+          Live refreshes and resuming updates return to page one.
+        </p>
 
         {/* Preview modals */}
         {previewProgressId != null && (

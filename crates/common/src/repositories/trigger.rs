@@ -9,14 +9,12 @@ use crate::{Error, Result};
 use serde_json::Value as JsonValue;
 use sqlx::{Executor, PgConnection, Postgres, QueryBuilder};
 
-use super::{
-    text_search_patterns, Create, Delete, FindById, FindByRef, List, Patch, Repository, Update,
-};
+use super::{text_search_patterns, Delete, FindById, FindByRef, List, Patch, Repository};
 
 /// Columns selected in all Trigger queries. Must match the `Trigger` model's `FromRow` fields.
 pub const TRIGGER_COLUMNS: &str =
     "id, ref, pack, pack_ref, label, description, effective_enabled AS enabled, enabled_override, \
-    param_schema, out_schema, webhook_enabled, webhook_key, webhook_config, \
+    param_schema, out_schema, event_config_schema, webhook_enabled, webhook_key, webhook_config, \
     sensor, sensor_ref, is_adhoc, reference_visibility, reference_allowed_pack_refs, \
     retired_at, created, updated";
 
@@ -185,7 +183,7 @@ impl Repository for TriggerRepository {
     type Entity = Trigger;
 
     fn table_name() -> &'static str {
-        "triggers"
+        "trigger"
     }
 }
 
@@ -200,6 +198,7 @@ pub struct CreateTriggerInput {
     pub enabled: bool,
     pub param_schema: Option<JsonSchema>,
     pub out_schema: Option<JsonSchema>,
+    pub event_config_schema: Option<JsonSchema>,
     pub sensor: Option<Id>,
     pub sensor_ref: Option<String>,
     pub is_adhoc: bool,
@@ -215,6 +214,7 @@ pub struct UpdateTriggerInput {
     pub enabled: Option<bool>,
     pub param_schema: Option<Patch<JsonSchema>>,
     pub out_schema: Option<Patch<JsonSchema>>,
+    pub event_config_schema: Option<Patch<JsonSchema>>,
     pub sensor: Option<Patch<Id>>,
     pub sensor_ref: Option<Patch<String>>,
     pub reference_visibility: Option<ActionReferenceVisibility>,
@@ -301,11 +301,17 @@ impl List for TriggerRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Create for TriggerRepository {
-    type CreateInput = CreateTriggerInput;
+super::schema_consumer::schema_consumer_repository!(
+    TriggerRepository,
+    CreateTriggerInput,
+    UpdateTriggerInput,
+    "trigger",
+    nullable_patch,
+    [param_schema, out_schema, event_config_schema]
+);
 
-    async fn create<'e, E>(executor: E, input: Self::CreateInput) -> Result<Self::Entity>
+impl TriggerRepository {
+    async fn create_row<'e, E>(executor: E, input: CreateTriggerInput) -> Result<Trigger>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -318,10 +324,10 @@ impl Create for TriggerRepository {
             r#"
             INSERT INTO trigger (ref, pack, pack_ref, label, description, enabled,
                                  param_schema, out_schema, sensor, sensor_ref, is_adhoc,
-                                 reference_visibility, reference_allowed_pack_refs)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                 reference_visibility, reference_allowed_pack_refs, event_config_schema)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id, ref, pack, pack_ref, label, description, effective_enabled AS enabled, enabled_override,
-                      param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
+                      param_schema, out_schema, event_config_schema, webhook_enabled, webhook_key, webhook_config,
                       sensor, sensor_ref, is_adhoc, reference_visibility, reference_allowed_pack_refs,
                       retired_at, created, updated
             "#,
@@ -339,6 +345,7 @@ impl Create for TriggerRepository {
         .bind(input.is_adhoc)
         .bind(input.reference_visibility)
         .bind(&input.reference_allowed_pack_refs)
+        .bind(&input.event_config_schema)
         .fetch_one(executor)
         .await
         .map_err(|e| {
@@ -355,11 +362,8 @@ impl Create for TriggerRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Update for TriggerRepository {
-    type UpdateInput = UpdateTriggerInput;
-
-    async fn update<'e, E>(executor: E, id: i64, input: Self::UpdateInput) -> Result<Self::Entity>
+impl TriggerRepository {
+    async fn update_row<'e, E>(executor: E, id: i64, input: UpdateTriggerInput) -> Result<Trigger>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -430,6 +434,18 @@ impl Update for TriggerRepository {
             }
             query.push("out_schema = ");
             match out_schema {
+                Patch::Set(value) => query.push_bind(value),
+                Patch::Clear => query.push_bind(Option::<JsonSchema>::None),
+            };
+            has_updates = true;
+        }
+
+        if let Some(schema) = &input.event_config_schema {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("event_config_schema = ");
+            match schema {
                 Patch::Set(value) => query.push_bind(value),
                 Patch::Clear => query.push_bind(Option::<JsonSchema>::None),
             };
@@ -510,16 +526,23 @@ impl Delete for TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query("DELETE FROM trigger WHERE id = $1")
-            .bind(id)
-            .execute(executor)
-            .await?;
-
-        Ok(result.rows_affected() > 0)
+        super::schema_type::SchemaTypeRepository::delete_consumer_row(executor, "trigger", id).await
     }
 }
 
 impl TriggerRepository {
+    pub async fn find_by_id_for_share(
+        connection: &mut sqlx::PgConnection,
+        id: Id,
+    ) -> Result<Option<Trigger>> {
+        sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM trigger WHERE id = $1 AND retired_at IS NULL FOR SHARE"
+        ))
+        .bind(id)
+        .fetch_optional(connection)
+        .await
+        .map_err(Into::into)
+    }
     pub async fn find_by_id_including_retired<'e, E>(executor: E, id: Id) -> Result<Option<Trigger>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
@@ -1110,11 +1133,17 @@ impl List for SensorRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Create for SensorRepository {
-    type CreateInput = CreateSensorInput;
+super::schema_consumer::schema_consumer_repository!(
+    SensorRepository,
+    CreateSensorInput,
+    UpdateSensorInput,
+    "sensor",
+    nullable_patch,
+    [param_schema]
+);
 
-    async fn create<'e, E>(executor: E, input: Self::CreateInput) -> Result<Self::Entity>
+impl SensorRepository {
+    async fn create_row<'e, E>(executor: E, input: CreateSensorInput) -> Result<Sensor>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -1162,11 +1191,8 @@ impl Create for SensorRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Update for SensorRepository {
-    type UpdateInput = UpdateSensorInput;
-
-    async fn update<'e, E>(executor: E, id: i64, input: Self::UpdateInput) -> Result<Self::Entity>
+impl SensorRepository {
+    async fn update_row<'e, E>(executor: E, id: i64, input: UpdateSensorInput) -> Result<Sensor>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -1369,12 +1395,7 @@ impl Delete for SensorRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query("DELETE FROM sensor WHERE id = $1")
-            .bind(id)
-            .execute(executor)
-            .await?;
-
-        Ok(result.rows_affected() > 0)
+        super::schema_type::SchemaTypeRepository::delete_consumer_row(executor, "sensor", id).await
     }
 }
 
@@ -1396,6 +1417,13 @@ fn push_sensor_visibility_predicate(
 }
 
 impl SensorRepository {
+    pub async fn find_by_id_for_share(
+        connection: &mut sqlx::PgConnection,
+        id: Id,
+    ) -> Result<Option<Sensor>> {
+        sqlx::query_as::<_, Sensor>(&format!("SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE id = $1 AND retired_at IS NULL FOR SHARE"))
+            .bind(id).fetch_optional(connection).await.map_err(Into::into)
+    }
     pub async fn find_by_id_for_update(conn: &mut PgConnection, id: Id) -> Result<Option<Sensor>> {
         sqlx::query_as::<_, Sensor>(&format!(
             "SELECT {SENSOR_SELECT_COLUMNS} FROM sensor WHERE id = $1 FOR UPDATE"

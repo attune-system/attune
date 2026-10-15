@@ -7,6 +7,7 @@ import type { ExecutionResponse } from "../models/ExecutionResponse";
 import type { ExecutionStatus } from "../models/ExecutionStatus";
 import type { PaginatedResponse_ExecutionSummary } from "../models/PaginatedResponse_ExecutionSummary";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
+import type { Value } from "../models/Value";
 import type { WorkflowCacheIterationState } from "../models/WorkflowCacheIterationState";
 import type { WorkflowTaskWaitKind } from "../models/WorkflowTaskWaitKind";
 import type { WorkflowTaskWaitState } from "../models/WorkflowTaskWaitState";
@@ -332,6 +333,7 @@ export class ExecutionsService {
        * Execution result/output
        */
       result: Record<string, any>;
+      schema_binding?: null | Value;
       /**
        * When the execution actually started running (worker picked it up).
        * Null if the execution hasn't started running yet.
@@ -360,19 +362,19 @@ export class ExecutionsService {
       /**
        * Worker affinity override stored on the execution, if any.
        */
-      worker_affinity?: any | null;
+      worker_affinity?: Record<string, any> | null;
       /**
        * Worker selector override stored on the execution, if any.
        */
-      worker_selector?: any | null;
+      worker_selector?: Record<string, any> | null;
       /**
        * Worker tolerations override stored on the execution, if any.
        */
-      worker_tolerations?: any[] | null;
+      worker_tolerations?: Array<Record<string, any>> | null;
       /**
        * Workflow task metadata (only populated for workflow task executions)
        */
-      workflow_task?: any | null;
+      workflow_task?: Record<string, any> | null;
     };
     /**
      * Optional message
@@ -470,6 +472,7 @@ export class ExecutionsService {
        * Execution result/output
        */
       result: Record<string, any>;
+      schema_binding?: null | Value;
       /**
        * When the execution actually started running (worker picked it up).
        * Null if the execution hasn't started running yet.
@@ -498,19 +501,19 @@ export class ExecutionsService {
       /**
        * Worker affinity override stored on the execution, if any.
        */
-      worker_affinity?: any | null;
+      worker_affinity?: Record<string, any> | null;
       /**
        * Worker selector override stored on the execution, if any.
        */
-      worker_selector?: any | null;
+      worker_selector?: Record<string, any> | null;
       /**
        * Worker tolerations override stored on the execution, if any.
        */
-      worker_tolerations?: any[] | null;
+      worker_tolerations?: Array<Record<string, any>> | null;
       /**
        * Workflow task metadata (only populated for workflow task executions)
        */
-      workflow_task?: any | null;
+      workflow_task?: Record<string, any> | null;
     };
     /**
      * Optional message

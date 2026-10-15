@@ -1,9 +1,10 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   useEntityNotifications,
   type Notification,
 } from "@/contexts/WebSocketContext";
+import { scheduleArtifactRefresh } from "@/lib/artifact-refresh";
 
 interface UseArtifactStreamOptions {
   /**
@@ -74,6 +75,14 @@ interface ArtifactNotificationPayload {
 export function useArtifactStream(options: UseArtifactStreamOptions = {}) {
   const { artifactId, executionId, enabled = true, paused = false } = options;
   const queryClient = useQueryClient();
+  const active = useRef(enabled && !paused);
+  useEffect(() => {
+    active.current = enabled && !paused;
+    return () => {
+      active.current = false;
+    };
+  }, [enabled, paused]);
+  const shouldRefresh = useCallback(() => active.current, []);
 
   const handleNotification = useCallback(
     (raw: Notification) => {
@@ -98,27 +107,27 @@ export function useArtifactStream(options: UseArtifactStreamOptions = {}) {
       const artifactExecution = payload?.execution;
 
       // Refresh artifact list caches so list pages pick up created/updated artifacts.
-      queryClient.invalidateQueries({
-        queryKey: ["artifacts", "list"],
-        exact: false,
-      });
+      scheduleArtifactRefresh(
+        queryClient,
+        ["artifacts", "list"],
+        shouldRefresh,
+      );
 
       // Invalidate the specific artifact query (used by ProgressDetail, TextFileDetail)
-      queryClient.invalidateQueries({
-        queryKey: ["artifacts", updatedArtifactId],
-      });
-
-      // Artifact update notifications can represent newly-created versions
-      // or size/finalization changes, so refresh the versions table too.
-      queryClient.invalidateQueries({
-        queryKey: ["artifacts", updatedArtifactId, "versions"],
-      });
+      // This prefix includes the artifact's version queries.
+      scheduleArtifactRefresh(
+        queryClient,
+        ["artifacts", updatedArtifactId],
+        shouldRefresh,
+      );
 
       // Invalidate the execution artifacts list query
       if (artifactExecution) {
-        queryClient.invalidateQueries({
-          queryKey: ["artifacts", "execution", artifactExecution],
-        });
+        scheduleArtifactRefresh(
+          queryClient,
+          ["artifacts", "execution", artifactExecution],
+          shouldRefresh,
+        );
       }
 
       // For progress artifacts, also update cached data directly with the
@@ -139,7 +148,7 @@ export function useArtifactStream(options: UseArtifactStreamOptions = {}) {
         );
       }
     },
-    [artifactId, executionId, paused, queryClient],
+    [artifactId, executionId, paused, queryClient, shouldRefresh],
   );
 
   const { connected } = useEntityNotifications(

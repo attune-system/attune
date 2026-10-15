@@ -7,7 +7,7 @@ mod helpers;
 
 use attune_common::repositories::pack::{self, PackRepository};
 use attune_common::repositories::{
-    Create, FindById, FindByRef, List, PackInstallRepository, Pagination, Patch, Update,
+    FindById, FindByRef, List, PackInstallRepository, Pagination, Patch,
 };
 use attune_common::{models::PackInstallStatus, Error};
 use helpers::*;

@@ -7,10 +7,55 @@ mod helpers;
 
 use attune_common::repositories::{
     action::{ActionRepository, CreateActionInput, UpdateActionInput},
-    Create, Delete, FindById, FindByRef, List, PackRepository, Update,
+    Delete, FindById, FindByRef, List, PackRepository,
 };
 use helpers::*;
 use serde_json::json;
+
+#[tokio::test]
+async fn inline_schema_validation_precedes_action_create_and_update() {
+    let mut tx = create_test_transaction().await.unwrap();
+    let pack = PackFixture::new_unique("schema_guard")
+        .create(&mut *tx)
+        .await
+        .unwrap();
+    let malformed = json!({"count":{"type":"integer","default":"wrong type"}});
+    let rejected =
+        ActionFixture::new_unique(pack.id, &pack.r#ref, "rejected").with_param_schema(malformed);
+    let rejected_ref = rejected.r#ref.clone();
+    assert!(rejected.create(&mut *tx).await.is_err());
+    assert!(ActionRepository::find_by_ref(&mut *tx, &rejected_ref)
+        .await
+        .unwrap()
+        .is_none());
+    let valid = json!({"count":{"type":"integer","required":true,"default":5}});
+    let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "valid")
+        .with_param_schema(valid.clone())
+        .create(&mut *tx)
+        .await
+        .unwrap();
+    let error = ActionRepository::update(
+        &mut *tx,
+        action.id,
+        UpdateActionInput {
+            label: Some("Must not persist".into()),
+            out_schema: Some(json!({"token":{"type":"string","secret":true,
+            "default":"private-schema-fixture"}})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("private-schema-fixture"));
+    let unchanged = ActionRepository::find_by_id(&mut *tx, action.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.label, action.label);
+    assert_eq!(unchanged.param_schema, Some(valid));
+    assert!(unchanged.out_schema.is_none());
+    tx.rollback().await.unwrap();
+}
 
 #[tokio::test]
 async fn test_create_action() {
@@ -48,16 +93,10 @@ async fn test_create_action_with_optional_fields() {
         .with_description("Action with all optional fields")
         .with_entrypoint("custom.py")
         .with_param_schema(json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"}
-            }
+            "name": {"type": "string"}
         }))
         .with_out_schema(json!({
-            "type": "object",
-            "properties": {
-                "result": {"type": "string"}
-            }
+            "result": {"type": "string"}
         }))
         .create(&mut *tx)
         .await
@@ -408,20 +447,13 @@ async fn test_action_with_json_schemas() {
         .unwrap();
 
     let param_schema = json!({
-        "type": "object",
-        "properties": {
-            "input": {"type": "string"},
-            "count": {"type": "integer"}
-        },
-        "required": ["input"]
+        "input": {"type": "string", "required": true},
+        "count": {"type": "integer"}
     });
 
     let out_schema = json!({
-        "type": "object",
-        "properties": {
-            "output": {"type": "string"},
-            "status": {"type": "string"}
-        }
+        "output": {"type": "string"},
+        "status": {"type": "string"}
     });
 
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "schema_action")

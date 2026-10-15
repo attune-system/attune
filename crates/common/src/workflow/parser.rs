@@ -67,7 +67,7 @@ pub enum ParseError {
 
 impl From<validator::ValidationErrors> for ParseError {
     fn from(errors: validator::ValidationErrors) -> Self {
-        ParseError::ValidationError(format!("{}", errors))
+        ParseError::ValidationError(crate::error::validation_message(&errors))
     }
 }
 
@@ -107,10 +107,10 @@ pub struct WorkflowDefinition {
     #[validate(length(min = 1, max = 50))]
     pub version: String,
 
-    /// Input parameter schema (JSON Schema)
+    /// Flat input parameter schema. If action metadata also declares it, the bodies must match.
     pub parameters: Option<JsonValue>,
 
-    /// Output schema (JSON Schema)
+    /// Flat output schema. If action metadata also declares it, the bodies must match.
     pub output: Option<JsonValue>,
 
     /// Workflow-scoped variables with initial values
@@ -709,7 +709,18 @@ pub fn parse_workflow_yaml(yaml: &str) -> ParseResult<WorkflowDefinition> {
         return Err(ParseError::ValidationError(errors.join("; ")));
     }
     // Parse YAML
-    let mut workflow: WorkflowDefinition = serde_yaml_ng::from_value(raw)?;
+    let mut workflow: WorkflowDefinition =
+        crate::pack_registry::diagnostics::decode_yaml_value("workflow metadata", "", raw)
+            .map_err(|error| match error {
+                crate::Error::Deployment { details, .. } => {
+                    let diagnostic = details.diagnostics.into_iter().next().unwrap_or_default();
+                    ParseError::InvalidField {
+                        field: diagnostic.metadata_path.unwrap_or_default(),
+                        reason: diagnostic.message,
+                    }
+                }
+                _ => ParseError::ValidationError("Invalid workflow metadata field types".into()),
+            })?;
 
     // Normalize legacy transitions into `next` arrays
     normalize_all_transitions(&mut workflow);

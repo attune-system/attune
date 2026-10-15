@@ -14,9 +14,14 @@ export type BuildPackEnvsResponse = {
    */
   built_environments: Array<BuiltEnvironment>;
   /**
+   * This endpoint detects API-host interpreters only; it does not build worker environments.
+   */
+  detection_only: boolean;
+  /**
    * Failed environment builds
    */
   failed_environments: Array<FailedEnvironment>;
+  message: string;
   /**
    * Summary statistics
    */

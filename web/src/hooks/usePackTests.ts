@@ -77,21 +77,18 @@ export function usePackInstallStatus(
   return useQuery({
     queryKey: ["pack-install", resolvedInstallId],
     queryFn: async () => {
-      try {
-        return await PacksService.getPackInstall({
-          id: resolvedInstallId as number,
-        });
-      } catch (error) {
-        if (error instanceof ApiError && error.status === 404) {
-          return { data: null };
-        }
-        throw error;
-      }
+      if (resolvedInstallId === undefined) return { data: null };
+      // A missing known attempt is an error, not an indefinitely pending install.
+      return PacksService.getPackInstall({ id: resolvedInstallId });
     },
     enabled: !!resolvedInstallId && enabled,
     refetchInterval: (query) => {
       const status = query.state.data?.data?.status;
-      return status === "pending" || status === "running" ? 2000 : false;
+      return status === "pending" ||
+        status === "running" ||
+        status === "activating"
+        ? 2000
+        : false;
     },
   });
 }

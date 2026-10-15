@@ -23,6 +23,7 @@ export type ApiResponse_PackResponse = {
      * Pack configuration
      */
     config: Record<string, any>;
+    config_schema_binding?: null | Value;
     /**
      * Creation timestamp
      */

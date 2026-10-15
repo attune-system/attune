@@ -5,14 +5,9 @@
 import type { RetentionPolicyType } from "./RetentionPolicyType";
 export type LogRetentionPolicyPatch =
   | {
-      op: LogRetentionPolicyPatch.op;
+      op: "set";
       value: RetentionPolicyType;
     }
   | {
-      op: LogRetentionPolicyPatch.op;
+      op: "clear";
     };
-export namespace LogRetentionPolicyPatch {
-  export enum op {
-    SET = "set",
-  }
-}

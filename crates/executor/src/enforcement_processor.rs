@@ -331,57 +331,63 @@ impl EnforcementProcessor {
         rule: &Rule,
     ) -> Result<bool> {
         let mut tx = pool.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
         let rule = RuleRepository::find_by_id_for_share(&mut tx, rule.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Enforcement rule is no longer active"))?;
-        let executor_identity = rule
-            .owner_identity
-            .ok_or_else(|| anyhow::anyhow!("Rule execution requires an explicit owner identity"))?;
+        let input_snapshot =
+            attune_common::repositories::rule_authority::RuleAuthorityRepository::runtime(
+                &mut tx,
+                "enforcement",
+                enforcement.id,
+            )
+            .await?;
+        let executor_identity = match &input_snapshot {
+            Some(snapshot) => {
+                snapshot.input_authority(&mut tx).await?;
+                snapshot.identity_id
+            }
+            None => {
+                if !rule.is_adhoc {
+                    bail!("Deployed enforcement input authority is unavailable");
+                }
+                rule.owner_identity.ok_or_else(|| {
+                    anyhow::anyhow!("Rule execution requires an explicit owner identity")
+                })?
+            }
+        };
         let authority = attune_common::delegation::DelegationAuthority::load_for_share(
             &mut tx,
             executor_identity,
         )
         .await?;
-        // Extract action ID — should_create_execution already verified it's Some,
-        // but guard defensively here as well.
-        let action_id = match rule.action {
-            Some(id) => id,
-            None => {
-                error!(
-                    "Rule {} has no action ID (deleted?), cannot create execution for enforcement {}",
-                    rule.id, enforcement.id
-                );
-                bail!(
-                    "Rule {} references a deleted action (action_ref: {})",
-                    rule.id,
-                    rule.action_ref
-                );
-            }
-        };
+        let snapshot: attune_common::models::ExecutionExecutableSnapshot =
+            match enforcement.executable_snapshot.clone() {
+                Some(snapshot) => serde_json::from_value(snapshot)?,
+                None => bail!("Enforcement is missing its immutable executable snapshot"),
+            };
+        let action_id = snapshot.executable.action.id;
 
         info!(
             "Creating execution for enforcement: {}, rule: {}, action: {}",
             enforcement.id, rule.id, action_id
         );
 
-        let action_ref = &rule.action_ref;
-        let snapshot = match enforcement.executable_snapshot.clone() {
-            Some(snapshot) => serde_json::from_value(snapshot)?,
-            None => attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
-                pool,
-                action_id,
-            )
-            .await?,
-        };
+        let action_ref = &snapshot.executable.action.r#ref;
         let action = Some(snapshot.executable.action.clone());
         let action_default_permission_set_refs = action
             .as_ref()
             .map(|action| action.default_execution_permission_set_refs.clone())
             .unwrap_or_default();
-        let permission_set_refs = rule
-            .permission_set_refs
-            .clone()
-            .unwrap_or(action_default_permission_set_refs);
+        let permission_set_refs = input_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.execution_permission_set_refs.clone())
+            .unwrap_or_else(|| {
+                rule.permission_set_refs
+                    .clone()
+                    .unwrap_or(action_default_permission_set_refs)
+            });
         authority
             .require_refs_for_share(&mut tx, &permission_set_refs)
             .await?;
@@ -433,6 +439,12 @@ impl EnforcementProcessor {
         .await?;
         let execution = execution_result.execution;
         if execution_result.created {
+            let inherited = attune_common::repositories::schema_contract::SchemaContractRepository::inherit_enforcement(
+                &mut tx, enforcement.id, execution.id,
+            ).await?;
+            if !inherited {
+                bail!("Enforcement is missing its immutable schema binding");
+            }
             ExecutionSecretValueRepository::copy_entity(
                 &mut *tx,
                 ENTITY_ENFORCEMENT_CONFIG,

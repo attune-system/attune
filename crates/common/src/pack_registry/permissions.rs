@@ -17,49 +17,83 @@ use super::loader::{read_yaml_files, resolve_workflow_path};
 
 #[derive(Default)]
 pub struct PackPermissionPlan {
+    definition_sources: BTreeMap<String, String>,
     definitions: BTreeMap<String, Vec<Grant>>,
     action_defaults: BTreeMap<String, Vec<String>>,
     uses: Vec<PermissionUse>,
 }
 
 struct PermissionUse {
+    source_file: String,
+    metadata_path: String,
     refs: Option<Vec<String>>,
     action: Option<String>,
     cache_only: bool,
+    signing_only: bool,
+    input_only: bool,
 }
 
 impl PackPermissionPlan {
     pub fn read(pack_dir: &Path, pack_ref: &str) -> Result<Self> {
         let mut plan = Self::default();
-        for (_, content) in files(&pack_dir.join("permission_sets"))? {
-            let data = parse(&content)?;
+        for (name, content) in files(&pack_dir.join("permission_sets"))? {
+            let file = format!("permission_sets/{name}");
+            let data = parse(&content, &file)?;
             let reference = data["ref"]
                 .as_str()
                 .ok_or_else(|| Error::validation("Permission set definition requires ref"))?
                 .to_string();
-            let grants: Vec<Grant> = serde_json::from_value(
+            let grants_value = serde_yaml_ng::to_value(
                 data.get("grants")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new())),
-            )?;
-            validate_grants(&grants)?;
+            )
+            .map_err(|_| {
+                super::diagnostics::metadata_error(
+                    &file,
+                    "/grants",
+                    "Grant definitions must contain supported metadata values",
+                )
+            })?;
+            let grants: Vec<Grant> =
+                super::diagnostics::decode_yaml_value(&file, "/grants", grants_value)?;
+            validate_grants(&grants)
+                .map_err(|error| super::diagnostics::located(error, &file, "/grants"))?;
+            plan.definition_sources
+                .insert(reference.clone(), file.clone());
             if plan.definitions.insert(reference, grants).is_some() {
-                return Err(Error::validation("Duplicate permission set definition"));
+                return Err(super::diagnostics::metadata_error(
+                    &file,
+                    "/ref",
+                    "Duplicate permission set definition",
+                ));
             }
         }
         let actions_dir = pack_dir.join("actions");
-        for (_, content) in files(&actions_dir)? {
-            let data = parse(&content)?;
-            let refs = literal_refs(data.get("default_execution_permission_set_refs"), false)?
+        for (name, content) in files(&actions_dir)? {
+            let file = format!("actions/{name}");
+            let data = parse(&content, &file)?;
+            let refs = literal_refs(data.get("default_execution_permission_set_refs"), false)
+                .map_err(|error| {
+                    super::diagnostics::located(
+                        error,
+                        &file,
+                        "/default_execution_permission_set_refs",
+                    )
+                })?
                 .unwrap_or_default();
             if let Some(reference) = data["ref"].as_str() {
                 plan.action_defaults
                     .insert(qualify(reference, pack_ref), refs.clone());
             }
             plan.uses.push(PermissionUse {
+                source_file: file.clone(),
+                metadata_path: "/default_execution_permission_set_refs".into(),
                 refs: Some(refs),
                 action: None,
                 cache_only: false,
+                signing_only: false,
+                input_only: false,
             });
             if let Some(workflow_file) = data["workflow_file"].as_str() {
                 let path = resolve_workflow_path(&actions_dir, workflow_file)?;
@@ -68,20 +102,50 @@ impl PackPermissionPlan {
                         &parse(
                             &std::fs::read_to_string(path)
                                 .map_err(|error| Error::io(error.to_string()))?,
+                            &format!("actions/{workflow_file}"),
                         )?,
                         pack_ref,
+                        &format!("actions/{workflow_file}"),
+                        "",
                     )?;
                 }
             }
         }
         for folder in ["rules", "queues"] {
-            for (_, content) in files(&pack_dir.join(folder))? {
-                let data = parse(&content)?;
+            for (name, content) in files(&pack_dir.join(folder))? {
+                let file = format!("{folder}/{name}");
+                let data = parse(&content, &file)?;
+                if folder == "rules" {
+                    if let Some(refs) = literal_refs(data.get("input_permission_set_refs"), false)
+                        .map_err(|error| {
+                        super::diagnostics::located(error, &file, "/input_permission_set_refs")
+                    })? {
+                        if refs.iter().any(|reference| reference == "standard") {
+                            return Err(super::diagnostics::metadata_error(
+                                &file,
+                                "/input_permission_set_refs",
+                                "Rule input reads require explicit named permission sets",
+                            ));
+                        }
+                        plan.uses.push(PermissionUse {
+                            source_file: file.clone(),
+                            metadata_path: "/input_permission_set_refs".into(),
+                            refs: Some(refs),
+                            action: None,
+                            cache_only: false,
+                            signing_only: false,
+                            input_only: true,
+                        });
+                    }
+                }
                 let refs = literal_refs(
                     data.get("permission_set_refs")
                         .or_else(|| data.get("permission_set_ref")),
                     false,
-                )?;
+                )
+                .map_err(|error| {
+                    super::diagnostics::located(error, &file, "/permission_set_refs")
+                })?;
                 let action = data
                     .get("action_ref")
                     .or_else(|| data.get("dispatch_action"))
@@ -89,14 +153,19 @@ impl PackPermissionPlan {
                     .and_then(Value::as_str)
                     .map(|reference| qualify(reference, pack_ref));
                 plan.uses.push(PermissionUse {
+                    source_file: file.clone(),
+                    metadata_path: "/permission_set_refs".into(),
                     refs,
                     action,
                     cache_only: false,
+                    signing_only: false,
+                    input_only: false,
                 });
             }
         }
-        for (_, content) in files(&pack_dir.join("sensors"))? {
-            let data = parse(&content)?;
+        for (name, content) in files(&pack_dir.join("sensors"))? {
+            let file = format!("sensors/{name}");
+            let data = parse(&content, &file)?;
             let refs = literal_refs(
                 data.get("config")
                     .and_then(|config| config.get("cache_permission_set_refs")),
@@ -104,22 +173,93 @@ impl PackPermissionPlan {
             )?;
             if refs.is_some() {
                 plan.uses.push(PermissionUse {
+                    source_file: file.clone(),
+                    metadata_path: "/config/cache_permission_set_refs".into(),
                     refs,
                     action: None,
                     cache_only: true,
+                    signing_only: false,
+                    input_only: false,
+                });
+            }
+            let refs = literal_refs(
+                data.get("config")
+                    .and_then(|config| config.get("signing_permission_set_refs")),
+                false,
+            )?;
+            if let Some(refs) = refs {
+                if refs.iter().any(|reference| reference == "standard") {
+                    return Err(super::diagnostics::metadata_error(
+                        &file,
+                        "/config/signing_permission_set_refs",
+                        "Sensor signing requires explicit named permission sets",
+                    ));
+                }
+                plan.uses.push(PermissionUse {
+                    source_file: file.clone(),
+                    metadata_path: "/config/signing_permission_set_refs".into(),
+                    refs: Some(refs),
+                    action: None,
+                    cache_only: false,
+                    signing_only: true,
+                    input_only: false,
+                });
+            }
+        }
+        for (name, content) in files(&pack_dir.join("sensors"))? {
+            let file = format!("sensors/{name}");
+            let data = parse(&content, &file)?;
+            if let Some(refs) = literal_refs(
+                data.get("config")
+                    .and_then(|config| config.get("input_permission_set_refs")),
+                false,
+            )? {
+                if refs.iter().any(|reference| reference == "standard") {
+                    return Err(super::diagnostics::metadata_error(
+                        &file,
+                        "/config/input_permission_set_refs",
+                        "Sensor input access requires explicit named permission sets",
+                    ));
+                }
+                plan.uses.push(PermissionUse {
+                    source_file: file.clone(),
+                    metadata_path: "/config/input_permission_set_refs".into(),
+                    refs: Some(refs),
+                    action: None,
+                    cache_only: false,
+                    signing_only: false,
+                    input_only: true,
                 });
             }
         }
         Ok(plan)
     }
 
-    fn read_tasks(&mut self, workflow: &Value, pack_ref: &str) -> Result<()> {
-        let tasks: Vec<&Value> = match workflow.get("tasks") {
-            Some(Value::Array(tasks)) => tasks.iter().collect(),
-            Some(Value::Object(tasks)) => tasks.values().collect(),
+    fn read_tasks(
+        &mut self,
+        workflow: &Value,
+        pack_ref: &str,
+        file: &str,
+        base: &str,
+    ) -> Result<()> {
+        let tasks: Vec<(String, &Value)> = match workflow.get("tasks") {
+            Some(Value::Array(tasks)) => tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| (format!("{base}/tasks/{index}"), task))
+                .collect(),
+            Some(Value::Object(tasks)) => tasks
+                .iter()
+                .map(|(name, task)| {
+                    (
+                        format!("{base}/tasks{}", super::diagnostics::pointer(name)),
+                        task,
+                    )
+                })
+                .collect(),
             _ => Vec::new(),
         };
-        for task in tasks {
+        for (path, task) in tasks {
             let refs = literal_refs(
                 task.get("permission_set_refs")
                     .or_else(|| task.get("permission_set_ref")),
@@ -132,11 +272,15 @@ impl PackPermissionPlan {
                 .filter(|reference| !reference.contains("{{"))
                 .map(|reference| qualify(reference, pack_ref));
             self.uses.push(PermissionUse {
+                source_file: file.into(),
+                metadata_path: format!("{path}/permission_set_refs"),
                 refs,
                 action,
                 cache_only: false,
+                signing_only: false,
+                input_only: false,
             });
-            self.read_tasks(task, pack_ref)?;
+            self.read_tasks(task, pack_ref, file, &path)?;
         }
         Ok(())
     }
@@ -146,11 +290,19 @@ impl PackPermissionPlan {
         conn: &mut PgConnection,
         authority: &DelegationAuthority,
     ) -> Result<()> {
-        for grants in self.definitions.values() {
+        for (reference, grants) in &self.definitions {
             if !authority.manages_permissions() && !authority.covers(grants) {
-                return Err(Error::PermissionDenied(
-                    "Pack permission definitions exceed the registering identity's authority"
-                        .into(),
+                let index = grants
+                    .iter()
+                    .position(|grant| !authority.covers(std::slice::from_ref(grant)))
+                    .unwrap_or(0);
+                return Err(super::diagnostics::located(
+                    Error::PermissionDenied(
+                        "Pack permission definitions exceed the registering identity's authority"
+                            .into(),
+                    ),
+                    &self.definition_sources[reference],
+                    &format!("/grants/{index}"),
                 ));
             }
         }
@@ -180,33 +332,86 @@ impl PackPermissionPlan {
                         .or_else(|| external_defaults.get(action))
                 })
             });
-            let refs = named_refs(refs.map(Vec::as_slice).unwrap_or(&[]))?;
+            let refs = named_refs(refs.map(Vec::as_slice).unwrap_or(&[])).map_err(|error| {
+                super::diagnostics::located(error, &usage.source_file, &usage.metadata_path)
+            })?;
             references.extend(
                 refs.iter()
                     .filter(|reference| !self.definitions.contains_key(*reference))
                     .cloned(),
             );
-            resolved.push((refs, usage.cache_only));
+            resolved.push((
+                refs,
+                usage.cache_only,
+                usage.signing_only,
+                usage.input_only,
+                usage,
+            ));
         }
         let references: Vec<_> = references.into_iter().collect();
         let sets = PermissionSetRepository::find_by_refs_for_share(&mut *conn, &references).await?;
-        if sets.len() != references.len() {
-            return Err(Error::PermissionDenied(
-                "Pack references unavailable execution permission sets".into(),
-            ));
+        for (refs, _, _, _, usage) in &resolved {
+            if refs.iter().any(|reference| {
+                references.contains(reference) && !sets.iter().any(|set| &set.r#ref == reference)
+            }) {
+                return Err(super::diagnostics::located(Error::PermissionDenied("Requested execution permission sets are unavailable to this deployment identity. Check the submitted refs and registering authority.".into()), &usage.source_file, &usage.metadata_path));
+            }
         }
         let mut grants_by_ref = self.definitions.clone();
         for set in sets {
             grants_by_ref.insert(set.r#ref, serde_json::from_value::<Vec<Grant>>(set.grants)?);
         }
-        for (refs, cache_only) in resolved {
-            let grants: Vec<Grant> = refs
+        for (refs, cache_only, signing_only, input_only, usage) in resolved {
+            if signing_only
+                && refs.iter().any(|reference| {
+                    !grants_by_ref[reference].iter().any(|grant| {
+                        grant.resource == Resource::Keys
+                            && grant.actions.contains(&crate::rbac::Action::Use)
+                    })
+                })
+            {
+                return Err(Error::validation(
+                    "Sensor signing permission sets must grant Key use",
+                ));
+            }
+            let mut grants: Vec<Grant> = refs
                 .iter()
                 .flat_map(|reference| grants_by_ref[reference].iter())
                 .filter(|grant| !cache_only || grant.resource == Resource::Caches)
+                .filter(|grant| {
+                    !signing_only
+                        || (grant.resource == Resource::Keys
+                            && grant.actions.contains(&crate::rbac::Action::Use))
+                })
                 .cloned()
                 .collect();
-            authority.require_grants(&grants)?;
+            if input_only {
+                grants.retain(|grant| {
+                    matches!(grant.resource, Resource::Keys | Resource::Packs)
+                        && grant.actions.iter().any(|action| {
+                            matches!(
+                                action,
+                                crate::rbac::Action::Read | crate::rbac::Action::Decrypt
+                            )
+                        })
+                });
+                for grant in &mut grants {
+                    grant.actions.retain(|action| {
+                        matches!(
+                            action,
+                            crate::rbac::Action::Read | crate::rbac::Action::Decrypt
+                        )
+                    });
+                }
+            }
+            if signing_only {
+                for grant in &mut grants {
+                    grant.actions = vec![crate::rbac::Action::Use];
+                }
+            }
+            authority.require_grants(&grants).map_err(|error| {
+                super::diagnostics::located(error, &usage.source_file, &usage.metadata_path)
+            })?;
         }
         Ok(())
     }
@@ -219,10 +424,9 @@ fn files(directory: &Path) -> Result<Vec<(String, String)>> {
     read_yaml_files(directory)
 }
 
-fn parse(content: &str) -> Result<Value> {
-    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|error| {
-        Error::validation(format!("Invalid permission-bearing pack metadata: {error}"))
-    })?;
+fn parse(content: &str, file: &str) -> Result<Value> {
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(content)
+        .map_err(|error| super::diagnostics::yaml_error(file, &error))?;
     serde_json::to_value(value).map_err(Into::into)
 }
 
@@ -299,4 +503,31 @@ fn validate_grants(grants: &[Grant]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PackPermissionPlan;
+
+    #[test]
+    fn sensor_signing_requires_named_permission_sets() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sensors")).unwrap();
+        let sensor = root.path().join("sensors/signer.yaml");
+        std::fs::write(
+            &sensor,
+            "ref: example.signer\nconfig:\n  signing_permission_set_refs: [standard]\n",
+        )
+        .unwrap();
+        assert!(PackPermissionPlan::read(root.path(), "example").is_err());
+        std::fs::write(
+            &sensor,
+            "ref: example.signer\nconfig:\n  signing_permission_set_refs: [example.signer_use]\n",
+        )
+        .unwrap();
+        let plan = PackPermissionPlan::read(root.path(), "example").unwrap();
+        assert_eq!(plan.uses.len(), 1);
+        assert!(plan.uses[0].signing_only);
+        assert_eq!(plan.uses[0].refs.as_ref().unwrap(), &["example.signer_use"]);
+    }
 }

@@ -15,6 +15,7 @@ use attune_common::{
         jwt::{generate_token, generate_worker_token, validate_token, JwtConfig, TokenType},
     },
     blob_store::{body_from_file, BlobStore, FilesystemBlobStore, ObjectKey},
+    config::{PackRepublishConfig, PackRepublishMode},
     models::{ManagementOrigin, Pack},
     pack_registry::calculate_directory_checksum,
     platform_catalog::ManagedComponentKind,
@@ -32,12 +33,14 @@ use attune_common::{
     },
 };
 use axum::http::StatusCode;
+use futures::StreamExt;
 use helpers::{Result, TestContext};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::time::Duration;
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 use attune_api::pack_release_upgrade::upgrade_legacy_pack_releases;
 
@@ -75,6 +78,141 @@ print("Test action executed")
     fs::write(temp_dir.path().join("test.py"), action_content)?;
 
     Ok(temp_dir)
+}
+
+fn write_candidate_test_entrypoint(pack_dir: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(pack_dir.join("tests"))?;
+    fs::write(pack_dir.join("tests/run.sh"), "#!/bin/sh\nexit 0\n")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_install_authority_admits_only_the_named_fresh_pack() -> Result<()> {
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let identity = ctx.user.as_ref().expect("authenticated installer").id;
+    let set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "fixture.scoped_install".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([{
+                "resource": "packs", "actions": ["install"],
+                "constraints": {"pack_refs": ["scoped_fresh"]}
+            }]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+
+    let allowed = create_test_pack_dir("scoped_fresh", "1.0.0")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": allowed.path().to_string_lossy(), "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(PackRepository::find_by_ref(&ctx.pool, "scoped_fresh")
+        .await?
+        .is_some());
+
+    let denied = create_test_pack_dir("outside_scope", "1.0.0")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": denied.path().to_string_lossy(), "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(PackRepository::find_by_ref(&ctx.pool, "outside_scope")
+        .await?
+        .is_none());
+    assert!(PackInstallRepository::new(ctx.pool.clone())
+        .find_latest_by_pack_ref("outside_scope")
+        .await?
+        .is_none());
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_nested_workflows_resolve_later_candidate_action_declarations() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let source = create_test_pack_dir("nested_candidates", "1.0.0")?;
+    fs::create_dir_all(source.path().join("actions/workflows"))?;
+    fs::write(
+        source.path().join("actions/00_outer.yaml"),
+        "ref: nested_candidates.outer\nworkflow_file: workflows/outer.workflow.yaml\n",
+    )?;
+    fs::write(
+        source.path().join("actions/99_inner.yaml"),
+        "ref: nested_candidates.inner\nworkflow_file: workflows/inner.workflow.yaml\n",
+    )?;
+    fs::write(
+        source.path().join("actions/leaf.yaml"),
+        "ref: nested_candidates.leaf\nrunner_type: native\nentry_point: leaf.sh\n",
+    )?;
+    fs::write(
+        source.path().join("actions/leaf.sh"),
+        "#!/bin/sh\nprintf '{}\\n'\n",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            source.path().join("actions/leaf.sh"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+    }
+    fs::write(
+        source.path().join("actions/workflows/outer.workflow.yaml"),
+        "version: '1.0'\ntasks:\n  - name: inner\n    action: nested_candidates.inner\n",
+    )?;
+    fs::write(
+        source.path().join("actions/workflows/inner.workflow.yaml"),
+        "version: '1.0'\ntasks:\n  - name: leaf\n    action: nested_candidates.leaf\n",
+    )?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": source.path().to_string_lossy(), "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for reference in [
+        "nested_candidates.outer",
+        "nested_candidates.inner",
+        "nested_candidates.leaf",
+    ] {
+        assert!(
+            attune_common::repositories::action::ActionRepository::find_by_ref(
+                &ctx.pool, reference
+            )
+            .await?
+            .is_some()
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -131,7 +269,168 @@ async fn restricted_uploader_cannot_attach_admin_defaults_rules_or_queues() -> R
 }
 
 #[tokio::test]
-async fn registered_rules_and_pack_keep_the_registering_identity() -> Result<()> {
+async fn registration_binds_named_schemas_across_component_kinds() -> Result<()> {
+    use attune_common::repositories::{
+        action::ActionRepository,
+        executable_snapshot::ExecutableSnapshotRepository,
+        schema_contract::SchemaContractRepository,
+        trigger::{SensorRepository, TriggerRepository},
+        work_queue::WorkQueueRepository,
+    };
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let source = create_test_pack_dir("named_consumers", "1.0.0")?;
+    for directory in [
+        "types",
+        "actions",
+        "actions/workflows",
+        "triggers",
+        "sensors",
+        "queues",
+        "rules",
+    ] {
+        fs::create_dir_all(source.path().join(directory))?;
+    }
+    fs::write(source.path().join("pack.yaml"), "ref: named_consumers\nlabel: Named consumers\nversion: 1.0.0\nconf_schema:\n  count: {type: named_consumers.count, default: 5}\n")?;
+    fs::write(
+        source.path().join("types/count.yaml"),
+        "ref: named_consumers.count\nlabel: Count\nschema: {type: integer, minimum: 0}\n",
+    )?;
+    fs::write(source.path().join("actions/run.yaml"), "ref: named_consumers.run\nlabel: Run\nrunner_type: native\nentry_point: test.py\nparameters:\n  count: {type: named_consumers.count, required: true, default: 5}\noutput:\n  count: {type: named_consumers.count}\n")?;
+    fs::write(source.path().join("actions/flow.yaml"), "ref: named_consumers.flow\nlabel: Flow\nrunner_type: workflow\nworkflow_file: workflows/flow.workflow.yaml\n")?;
+    fs::write(source.path().join("actions/workflows/flow.workflow.yaml"), "ref: named_consumers.flow\nlabel: Flow\nversion: 1.0.0\nparameters:\n  count: {type: named_consumers.count, default: 5}\ntasks:\n  - name: run\n    action: named_consumers.run\n    input:\n      count: '{{ parameters.count }}'\n    next: []\n")?;
+    fs::write(source.path().join("triggers/probe.yaml"), "ref: named_consumers.probe\nlabel: Probe\nparameters:\n  count: {type: named_consumers.count, default: 5}\noutput:\n  count: {type: named_consumers.count}\nevent_config_schema:\n  count: {type: named_consumers.count}\n")?;
+    fs::write(source.path().join("sensors/probe.yaml"), "ref: named_consumers.sensor\nlabel: Sensor\nrunner_type: native\nentry_point: test.py\nenabled: false\nparameters:\n  count: {type: named_consumers.count, default: 5}\ntrigger_types: [named_consumers.probe]\n")?;
+    fs::write(source.path().join("queues/probe.yaml"), "ref: named_consumers.queue\nlabel: Queue\ndispatch_action: named_consumers.run\nitem_schema:\n  count: {type: named_consumers.count, default: 5}\naction_params:\n  count: '{{ queue.item.payload.count }}'\n")?;
+    fs::write(source.path().join("rules/probe.yaml"), "ref: named_consumers.rule\nlabel: Rule\ntrigger_ref: named_consumers.probe\naction_ref: named_consumers.run\naction_params: {}\npermission_set_refs: []\n")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_str().unwrap(),"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let action = ActionRepository::find_by_ref(&ctx.pool, "named_consumers.run")
+        .await?
+        .unwrap();
+    let mut transaction = ctx.pool.begin().await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action(&mut *transaction, action.id).await?;
+    let binding = SchemaContractRepository::materialize_action(&mut transaction, &snapshot).await?;
+    let input = attune_common::value_schema::CompiledContract::new(&binding.input)?;
+    assert_eq!(input.apply_defaults(&json!({}))?, json!({"count":5}));
+    assert!(input.validate(&json!({"count":-1})).is_err());
+    assert_eq!(binding.input.dependencies.len(), 1);
+    transaction.rollback().await?;
+    assert!(
+        TriggerRepository::find_by_ref(&ctx.pool, "named_consumers.probe")
+            .await?
+            .is_some()
+    );
+    assert!(
+        SensorRepository::find_by_ref(&ctx.pool, "named_consumers.sensor")
+            .await?
+            .is_some()
+    );
+    assert!(
+        WorkQueueRepository::find_by_ref(&ctx.pool, "named_consumers.queue")
+            .await?
+            .is_some()
+    );
+    let original_pack = PackRepository::find_by_ref(&ctx.pool, "named_consumers")
+        .await?
+        .unwrap();
+    assert_eq!(original_pack.config["count"], 5);
+    // The candidate is valid on its own. Only preserved configuration makes
+    // deployment incompatible, so this exercises transactional migration.
+    for path in [
+        "pack.yaml",
+        "actions/run.yaml",
+        "actions/workflows/flow.workflow.yaml",
+        "triggers/probe.yaml",
+        "sensors/probe.yaml",
+        "queues/probe.yaml",
+    ] {
+        let path = source.path().join(path);
+        let contents = fs::read_to_string(&path)?
+            .replace("default: 5", "default: 7")
+            .replace("version: 1.0.0", "version: 1.1.0");
+        fs::write(path, contents)?;
+    }
+    fs::write(
+        source.path().join("types/count.yaml"),
+        "ref: named_consumers.count\nlabel: Count\nschema: {type: integer, minimum: 6}\n",
+    )?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_str().unwrap(),"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    assert!(
+        !response.status().is_success(),
+        "Incompatible preserved named configuration must reject deployment"
+    );
+    let unchanged_pack = PackRepository::find_by_ref(&ctx.pool, "named_consumers")
+        .await?
+        .unwrap();
+    assert_eq!(unchanged_pack.active_release, original_pack.active_release);
+    assert_eq!(unchanged_pack.version, original_pack.version);
+    assert_eq!(unchanged_pack.config, original_pack.config);
+    assert_eq!(
+        ActionRepository::find_by_ref(&ctx.pool, "named_consumers.run")
+            .await?
+            .unwrap()
+            .param_schema,
+        action.param_schema
+    );
+    let mut transaction = ctx.pool.begin().await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action(&mut *transaction, action.id).await?;
+    let unchanged_binding =
+        SchemaContractRepository::materialize_action(&mut transaction, &snapshot).await?;
+    assert_eq!(unchanged_binding.input, binding.input);
+    transaction.rollback().await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_rule_required_defaults_preserve_authored_parameter_maps() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let source = create_test_pack_dir("rule_defaults", "1.0.0")?;
+    fs::create_dir(source.path().join("actions"))?;
+    fs::write(source.path().join("actions/run.yaml"),
+        "ref: rule_defaults.run\nlabel: Run\nrunner_type: native\nentry_point: test.py\nparameters:\n  count:\n    type: integer\n    required: true\n    default: 5\n")?;
+    fs::create_dir(source.path().join("rules"))?;
+    fs::write(source.path().join("rules/run.yaml"),
+        "ref: rule_defaults.run\nlabel: Run\ntrigger_ref: core.alert\naction_ref: rule_defaults.run\naction_params: {}\npermission_set_refs: []\n")?;
+    ctx.post(
+        "/api/v1/packs/register",
+        json!({"path":source.path().to_str().unwrap(),"skip_tests":true}),
+        ctx.token(),
+    )
+    .await?
+    .assert_status(StatusCode::CREATED);
+    let rule = attune_common::repositories::rule::RuleRepository::find_by_ref(
+        &ctx.pool,
+        "rule_defaults.run",
+    )
+    .await?
+    .unwrap();
+    assert_eq!(rule.action_params, json!({}));
+    assert_eq!(rule.trigger_params, json!({}));
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_pack_keeps_attribution_and_rules_use_system_owned_authority() -> Result<()> {
     let ctx = TestContext::new().await?.with_pack_install_auth().await?;
     PlatformCatalogRepository::reconcile(&ctx.pool).await?;
     let source = create_test_pack_dir("owned_rules", "1.0.0")?;
@@ -169,7 +468,19 @@ async fn registered_rules_and_pack_keep_the_registering_identity() -> Result<()>
     .await?
     .unwrap();
     assert_eq!(pack.installed_by, Some(identity));
-    assert_eq!(rule.owner_identity, Some(identity));
+    assert_ne!(rule.owner_identity, Some(identity));
+    let mut connection = ctx.pool.acquire().await?;
+    let authority = attune_common::repositories::rule_authority::RuleAuthorityRepository::current(
+        &mut connection,
+        &rule,
+    )
+    .await?
+    .unwrap();
+    assert_eq!(rule.owner_identity, Some(authority.identity_id));
+    assert_eq!(authority.pack_id, pack.id);
+    assert!(authority.execution_permission_set_refs.is_empty());
+    assert!(authority.input_grants.is_empty());
+    drop(connection);
     assert_eq!(rule.permission_set_refs, Some(Vec::new()));
     ctx.cleanup().await?;
     Ok(())
@@ -1133,14 +1444,16 @@ async fn test_install_pack_with_missing_dependency_fails() -> Result<()> {
         )
         .await?;
 
-    // Should fail with 400 Bad Request
+    let status = response.status();
+    let diagnostic: serde_json::Value = response.json().await?;
+    // Dependency validation uses the same 422 boundary as metadata validation.
     assert_eq!(
-        response.status(),
-        400,
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
         "Installation should fail when dependencies are missing"
     );
 
-    let body: serde_json::Value = response.json().await?;
+    let body = diagnostic;
     let error_msg = body["error"].as_str().unwrap();
     assert!(
         error_msg.contains("dependency validation failed") || error_msg.contains("missing-pack"),
@@ -1170,9 +1483,12 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
 
     assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     let body: serde_json::Value = response.json().await?;
-    assert!(body["error"]
-        .as_str()
-        .is_some_and(|message| message.contains("failed while loading components")));
+    assert!(body["details"]["diagnostics"]
+        .as_array()
+        .is_some_and(|diagnostics| diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "metadata.invalid_yaml"
+                && diagnostic["path"] == "caches/broken.yaml")));
     assert!(
         PackRepository::find_by_ref(&ctx.pool, "test_pack_load_failure")
             .await?
@@ -1635,6 +1951,7 @@ testing:
 "#,
     );
     fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
+    write_candidate_test_entrypoint(pack_dir.path())?;
 
     let response = ctx
         .post(
@@ -1649,18 +1966,16 @@ testing:
         )
         .await?;
 
-    if response.status() != axum::http::StatusCode::OK {
-        panic!("force install returned an unexpected status");
-    }
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(PackRepository::find_by_ref(&ctx.pool, "force-tested")
         .await?
-        .is_some());
+        .is_none());
     let installs = PackInstallRepository::new(ctx.pool.clone())
         .list_by_pack_ref("force-tested", 10, 0)
         .await?;
     assert_eq!(
         installs.first().map(|install| install.status.as_str()),
-        Some("succeeded")
+        Some("failed")
     );
     let failed_test_attempt = installs
         .iter()
@@ -1693,6 +2008,7 @@ testing:
 "#,
     );
     fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
+    write_candidate_test_entrypoint(pack_dir.path())?;
 
     let response = ctx
         .post(
@@ -2154,6 +2470,7 @@ testing:
 "#,
     );
     fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
+    write_candidate_test_entrypoint(pack_dir.path())?;
     PackRepository::create(
         &ctx.pool,
         CreatePackInput {
@@ -2674,6 +2991,278 @@ async fn pack_releases_reject_conflicting_versions_and_preserve_previous_bytes()
         .is_file());
     assert_ne!(releases[0].digest, releases[1].digest);
 
+    Ok(())
+}
+
+async fn upload_test_pack(
+    ctx: &TestContext,
+    source: &std::path::Path,
+    force: bool,
+) -> Result<helpers::TestResponse> {
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gzip);
+    archive.append_dir_all(".", source)?;
+    let archive = archive.into_inner()?.finish()?;
+    let boundary = "attune-dev-version-test";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"force\"\r\n\r\n{force}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"skip_tests\"\r\n\r\ntrue\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"republish\"\r\n\r\n{{\"mode\":\"on\"}}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"pack\"; filename=\"pack.tar.gz\"\r\n\
+         Content-Type: application/gzip\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(&archive);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/packs/upload")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header("authorization", format!("Bearer {}", ctx.token().unwrap()))
+        .body(axum::body::Body::from(body))?;
+    Ok(helpers::TestResponse::new(
+        ctx.app.clone().oneshot(request).await?,
+    ))
+}
+
+#[tokio::test]
+async fn dev_version_republish_applies_to_install_upload_and_registration() -> Result<()> {
+    let ctx = TestContext::new_with_dev_version_republish()
+        .await?
+        .with_admin_auth()
+        .await?;
+    let source = create_test_pack_dir("dev-version", "1.2.3-dev")?;
+    let installed = ctx.post(
+        "/api/v1/packs/install",
+        json!({"source": source.path().to_str().unwrap(), "skip_tests": true, "skip_deps": true}),
+        ctx.token(),
+    ).await?;
+    assert_eq!(installed.status(), StatusCode::OK);
+    let first = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "dev-version")
+        .await?
+        .unwrap();
+
+    fs::write(
+        source.path().join("test.py"),
+        "print('second dev release')\n",
+    )?;
+    let no_force = upload_test_pack(&ctx, source.path(), false).await?;
+    assert_eq!(no_force.status(), StatusCode::CONFLICT);
+    let uploaded = upload_test_pack(&ctx, source.path(), true).await?;
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    let second = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "dev-version")
+        .await?
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.digest, second.digest);
+    assert_eq!(first.version, second.version);
+
+    let repeated = upload_test_pack(&ctx, source.path(), true).await?;
+    assert_eq!(repeated.status(), StatusCode::CREATED);
+    assert_eq!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "dev-version")
+            .await?
+            .unwrap()
+            .id,
+        second.id,
+    );
+
+    fs::write(
+        source.path().join("test.py"),
+        "print('third dev release')\n",
+    )?;
+    let registered = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": source.path().to_str().unwrap(), "force": true, "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let third = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "dev-version")
+        .await?
+        .unwrap();
+    assert_ne!(second.id, third.id);
+    assert_eq!(third.version, "1.2.3-dev");
+    assert_eq!(
+        PackReleaseRepository::list_by_pack(&ctx.pool, first.pack)
+            .await?
+            .len(),
+        3
+    );
+    assert_eq!(
+        fs::read_to_string(std::path::Path::new(&second.content_path).join("test.py"))?,
+        "print('second dev release')\n",
+    );
+    let original = PackReleaseRepository::find_by_id(&ctx.pool, first.id)
+        .await?
+        .unwrap();
+    assert_eq!(original.digest, first.digest);
+    assert_eq!(original.content_path, first.content_path);
+    let mut stored = ctx
+        .state
+        .blob_store
+        .get_pinned(
+            &ObjectKey::new(first.object_key.unwrap())?,
+            &attune_common::blob_store::ProviderVersion::from_stored(
+                &first.provider_version.unwrap(),
+            )?,
+            first.archive_size as u64,
+            hex::decode(&first.digest)?.try_into().unwrap(),
+            None,
+        )
+        .await?;
+    let mut archive = Vec::new();
+    while let Some(chunk) = stored.next().await {
+        archive.extend_from_slice(&chunk?);
+    }
+    assert_eq!(archive.len() as i64, first.archive_size);
+    assert_eq!(hex::encode(Sha256::digest(&archive)), first.digest);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dev_version_republish_cannot_be_enabled_by_an_upload_or_force() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let source = create_test_pack_dir("strict-dev-version", "1.2.3-dev")?;
+    assert_eq!(
+        upload_test_pack(&ctx, source.path(), false).await?.status(),
+        StatusCode::CREATED
+    );
+    let original = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "strict-dev-version")
+        .await?
+        .unwrap();
+    fs::write(
+        source.path().join("test.py"),
+        "print('changed dev bytes')\n",
+    )?;
+    let conflict = upload_test_pack(&ctx, source.path(), true).await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "strict-dev-version")
+            .await?
+            .unwrap()
+            .id,
+        original.id,
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dev_version_republish_still_rejects_other_duplicate_versions() -> Result<()> {
+    let ctx = TestContext::new_with_dev_version_republish()
+        .await?
+        .with_admin_auth()
+        .await?;
+    for (index, version) in ["1.2.3", "1.2.3-rc", "1.2.3-dev.1", "1.2.3-dev+build"]
+        .iter()
+        .enumerate()
+    {
+        let pack_ref = format!("strict-other-version-{index}");
+        let source = create_test_pack_dir(&pack_ref, version)?;
+        assert_eq!(
+            upload_test_pack(&ctx, source.path(), false).await?.status(),
+            StatusCode::CREATED
+        );
+        fs::write(source.path().join("test.py"), "print('changed bytes')\n")?;
+        let conflict = upload_test_pack(&ctx, source.path(), true).await?;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT, "{version}");
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pack_republish_on_allows_changed_stable_versions() -> Result<()> {
+    let ctx = TestContext::new_with_pack_republish(PackRepublishConfig {
+        mode: PackRepublishMode::On,
+        ..Default::default()
+    })
+    .await?
+    .with_admin_auth()
+    .await?;
+    let source = create_test_pack_dir("republish-stable", "1.2.3")?;
+    assert_eq!(
+        upload_test_pack(&ctx, source.path(), false).await?.status(),
+        StatusCode::CREATED
+    );
+    let first = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "republish-stable")
+        .await?
+        .unwrap();
+    fs::write(
+        source.path().join("test.py"),
+        "print('changed stable bytes')\n",
+    )?;
+    assert_eq!(
+        upload_test_pack(&ctx, source.path(), true).await?.status(),
+        StatusCode::CREATED
+    );
+    let second = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "republish-stable")
+        .await?
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.digest, second.digest);
+    assert_eq!(second.version, "1.2.3");
+    assert_eq!(
+        PackReleaseRepository::find_by_id(&ctx.pool, first.id)
+            .await?
+            .unwrap()
+            .digest,
+        first.digest,
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pack_republish_custom_suffix_replaces_the_default_suffix() -> Result<()> {
+    let ctx = TestContext::new_with_pack_republish(PackRepublishConfig {
+        mode: PackRepublishMode::Suffix,
+        suffix: "-snapshot".to_string(),
+    })
+    .await?
+    .with_admin_auth()
+    .await?;
+    for (index, version, allowed) in [
+        (0, "1.2.3-snapshot", true),
+        (1, "1.2.3-dev", false),
+        (2, "1.2.3", false),
+    ] {
+        let pack_ref = format!("custom-suffix-{index}");
+        let source = create_test_pack_dir(&pack_ref, version)?;
+        assert_eq!(
+            upload_test_pack(&ctx, source.path(), false).await?.status(),
+            StatusCode::CREATED
+        );
+        let first = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, &pack_ref)
+            .await?
+            .unwrap();
+        fs::write(
+            source.path().join("test.py"),
+            "print('changed custom suffix bytes')\n",
+        )?;
+        let republished = upload_test_pack(&ctx, source.path(), true).await?;
+        assert_eq!(
+            republished.status(),
+            if allowed {
+                StatusCode::CREATED
+            } else {
+                StatusCode::CONFLICT
+            },
+            "{version}"
+        );
+        let active = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, &pack_ref)
+            .await?
+            .unwrap();
+        assert_eq!(active.id != first.id, allowed, "{version}");
+        assert_eq!(active.version, version);
+    }
+    ctx.cleanup().await?;
     Ok(())
 }
 

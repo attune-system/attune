@@ -9,6 +9,7 @@ import type { PaginatedResponse_KeySummary } from "../models/PaginatedResponse_K
 import type { SignKeyJwtRequest } from "../models/SignKeyJwtRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
 import type { UpdateKeyRequest } from "../models/UpdateKeyRequest";
+import type { Value } from "../models/Value";
 import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
@@ -114,6 +115,8 @@ export class SecretsService {
        * Unique reference identifier
        */
       ref: string;
+      schema_binding?: null | Value;
+      schema_digest?: string | null;
       /**
        * Last update timestamp
        */
@@ -122,6 +125,7 @@ export class SecretsService {
        * JSON value, or null when the caller cannot read and decrypt encrypted material.
        */
       value: any;
+      value_schema?: null | Value;
     };
     /**
      * Optional message
@@ -204,6 +208,8 @@ export class SecretsService {
        * Unique reference identifier
        */
       ref: string;
+      schema_binding?: null | Value;
+      schema_digest?: string | null;
       /**
        * Last update timestamp
        */
@@ -212,6 +218,7 @@ export class SecretsService {
        * JSON value, or null when the caller cannot read and decrypt encrypted material.
        */
       value: any;
+      value_schema?: null | Value;
     };
     /**
      * Optional message
@@ -296,6 +303,8 @@ export class SecretsService {
        * Unique reference identifier
        */
       ref: string;
+      schema_binding?: null | Value;
+      schema_digest?: string | null;
       /**
        * Last update timestamp
        */
@@ -304,6 +313,7 @@ export class SecretsService {
        * JSON value, or null when the caller cannot read and decrypt encrypted material.
        */
       value: any;
+      value_schema?: null | Value;
     };
     /**
      * Optional message

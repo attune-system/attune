@@ -12,7 +12,7 @@ use attune_common::repositories::{
         PermissionSetRepository,
     },
     platform_catalog::PlatformCatalogRepository,
-    Create, FindById, FindByRef, Update,
+    Create, FindById, FindByRef,
 };
 use helpers::{create_test_pool, ActionFixture, IdentityFixture, PackFixture};
 use serde_json::json;

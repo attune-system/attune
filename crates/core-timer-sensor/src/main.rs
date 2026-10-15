@@ -4,7 +4,8 @@
 //! to the Attune platform. Each timer sensor instance manages multiple timer schedules
 //! based on active rules.
 //!
-//! Configuration is provided via environment variables or stdin JSON:
+//! Connection metadata comes from the environment; sensor values and initial
+//! rule configurations arrive through a single stdin JSON bootstrap.
 //! - ATTUNE_API_URL: Base URL of the Attune API
 //! - ATTUNE_API_TOKEN: Service account token for authentication
 //! - ATTUNE_SENSOR_REF: Reference name for this sensor (e.g., "core.timer")
@@ -15,6 +16,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
+use std::io::Read;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -43,22 +45,14 @@ struct Args {
     /// Log format (json, pretty)
     #[arg(long)]
     log_format: Option<String>,
-
-    /// Read configuration from stdin as JSON instead of environment variables
-    #[arg(long)]
-    stdin_config: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Load configuration
-    let config = if args.stdin_config {
-        SensorConfig::from_stdin().await?
-    } else {
-        SensorConfig::from_env()?
-    };
+    let bootstrap = read_sensor_bootstrap(std::io::stdin().lock())?;
+    let config = SensorConfig::from_env()?;
 
     config.validate().await?;
     init_tracing(
@@ -73,7 +67,8 @@ async fn main() -> Result<()> {
     info!("Starting Attune Timer Sensor");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
     info!(
-        config_source = if args.stdin_config { "stdin" } else { "env" },
+        config_source = "stdin",
+        config_field_count = bootstrap.config.len(),
         log_level = %args.log_level.as_deref().unwrap_or(config.log_level.as_str()),
         log_format = %args.log_format.as_deref().unwrap_or(config.log_format.as_str()),
         "Configuration loaded"
@@ -101,8 +96,8 @@ async fn main() -> Result<()> {
         .context("Failed to initialize timer manager")?;
     info!("Timer manager initialized");
 
-    start_managed_trigger_instances(&timer_manager).await?;
-    info!("Loaded managed trigger bootstrap state from ATTUNE_SENSOR_TRIGGERS");
+    start_managed_trigger_instances(&timer_manager, bootstrap.triggers).await?;
+    info!("Loaded managed trigger bootstrap state from stdin");
 
     // Create rule lifecycle listener
     let listener = RuleLifecycleListener::new(
@@ -183,7 +178,7 @@ fn init_tracing(log_level: &str, log_format: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ManagedTriggerInstance {
     id: i64,
     #[serde(default)]
@@ -192,18 +187,59 @@ struct ManagedTriggerInstance {
     config: serde_json::Value,
 }
 
-async fn start_managed_trigger_instances(timer_manager: &TimerManager) -> Result<()> {
-    let Ok(raw) = std::env::var("ATTUNE_SENSOR_TRIGGERS") else {
-        return Ok(());
-    };
-    if raw.trim().is_empty() {
-        return Ok(());
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SensorBootstrap {
+    config: serde_json::Map<String, serde_json::Value>,
+    triggers: Vec<ManagedTriggerInstance>,
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::read_sensor_bootstrap;
+
+    #[test]
+    fn stdin_bootstrap_preserves_structured_settings_and_trigger_values() {
+        let data = br#"{"config":{"enabled":false,"count":0},"triggers":[{"id":1,"trigger_ref":"core.intervaltimer","config":{"interval":3}}]}"#;
+        let bootstrap = read_sensor_bootstrap(data.as_slice()).unwrap();
+        assert_eq!(bootstrap.config["enabled"], false);
+        assert_eq!(bootstrap.config["count"], 0);
+        assert_eq!(bootstrap.triggers[0].config["interval"], 3);
     }
 
-    let instances: Vec<ManagedTriggerInstance> = serde_json::from_str(&raw)
-        .context("Failed to parse ATTUNE_SENSOR_TRIGGERS as managed trigger instances")?;
+    #[test]
+    fn malformed_bootstrap_diagnostics_do_not_echo_values() {
+        for data in [
+            b"private-credential-fixture".as_slice(),
+            br#"{"config":[],"triggers":[]}"#,
+        ] {
+            let failure = read_sensor_bootstrap(data).err().unwrap();
+            assert!(!failure.to_string().contains("private-credential-fixture"));
+        }
+    }
+}
+
+fn read_sensor_bootstrap(reader: impl std::io::Read) -> Result<SensorBootstrap> {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    reader
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("Failed to read sensor bootstrap"))?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(anyhow::anyhow!(
+            "Sensor bootstrap exceeds its delivery limit"
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Invalid sensor bootstrap JSON"))
+}
+
+async fn start_managed_trigger_instances(
+    timer_manager: &TimerManager,
+    instances: Vec<ManagedTriggerInstance>,
+) -> Result<()> {
     info!(
-        "Loaded {} managed trigger instance(s) from ATTUNE_SENSOR_TRIGGERS",
+        "Loaded {} managed trigger instance(s) from stdin",
         instances.len()
     );
 

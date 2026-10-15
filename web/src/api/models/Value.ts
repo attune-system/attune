@@ -2,4 +2,5 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export type Value = {};
+export type Value =
+  string | null | number | boolean | Array<Value> | { [key: string]: Value };

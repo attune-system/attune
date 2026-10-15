@@ -416,6 +416,7 @@ jobs:
 
   web-blocking:
     name: Web Blocking Checks
+    timeout-minutes: 45
     runs-on: ubuntu-24.04
     needs: changes
     if: |
@@ -438,6 +439,33 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Setup Rust for API contracts
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Cache API contract build
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: web-api-contracts-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('crates/**/*.rs', '**/Cargo.toml') }}
+          restore-keys: |
+            web-api-contracts-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+
+      - name: Generated API client freshness
+        run: npm run check:api
+
+      - name: API generation regression tests
+        run: npm run test:api-generation
+
+      - name: API wire-contract tests
+        working-directory: .
+        env:
+          ATTUNE_TEST_RUN_ID: web-ci-${{ github.run_id }}
+        run: cargo test -p attune-api --test web_form_contract_tests -- --test-threads=4
+
       - name: Prettier
         run: npm run format:check
 
@@ -446,6 +474,9 @@ jobs:
 
       - name: TypeScript
         run: npm run typecheck
+
+      - name: Generated TypeScript contracts
+        run: npm run typecheck:contracts
 
       - name: Vitest
         run: npm test

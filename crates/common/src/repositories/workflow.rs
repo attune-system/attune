@@ -125,11 +125,13 @@ impl List for WorkflowDefinitionRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Create for WorkflowDefinitionRepository {
-    type CreateInput = CreateWorkflowDefinitionInput;
+super::schema_consumer::schema_consumer_repository!(WorkflowDefinitionRepository, CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput, "workflow", value_patch, [param_schema, out_schema], graph definition);
 
-    async fn create<'e, E>(executor: E, input: Self::CreateInput) -> Result<Self::Entity>
+impl WorkflowDefinitionRepository {
+    async fn create_row<'e, E>(
+        executor: E,
+        input: CreateWorkflowDefinitionInput,
+    ) -> Result<WorkflowDefinition>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -155,11 +157,12 @@ impl Create for WorkflowDefinitionRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Update for WorkflowDefinitionRepository {
-    type UpdateInput = UpdateWorkflowDefinitionInput;
-
-    async fn update<'e, E>(executor: E, id: i64, input: Self::UpdateInput) -> Result<Self::Entity>
+impl WorkflowDefinitionRepository {
+    async fn update_row<'e, E>(
+        executor: E,
+        id: i64,
+        input: UpdateWorkflowDefinitionInput,
+    ) -> Result<WorkflowDefinition>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -241,12 +244,14 @@ impl WorkflowDefinitionRepository {
             CacheTransactionMode::PinMutation,
         )
         .await?;
-        let result = sqlx::query("DELETE FROM workflow_definition WHERE id = $1")
-            .bind(id)
-            .execute(&mut *transaction)
-            .await?;
+        let deleted = super::schema_type::SchemaTypeRepository::delete_consumer_row(
+            &mut *transaction,
+            "workflow",
+            id,
+        )
+        .await?;
         transaction.commit().await?;
-        Ok(result.rows_affected() > 0)
+        Ok(deleted)
     }
 }
 

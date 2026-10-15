@@ -24,7 +24,7 @@ export type CreateInquiryRequest = {
   /**
    * Optional schema for the expected response format (flat format with inline required/secret)
    */
-  response_schema?: any | null;
+  response_schema?: Record<string, any> | null;
   /**
    * Optional relative timeout in seconds.
    */

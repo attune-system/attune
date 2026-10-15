@@ -1,10 +1,9 @@
 import { useParams, Link } from "react-router-dom";
 import { useEnforcement } from "@/hooks/useEvents";
-import { useTrigger } from "@/hooks/useTriggers";
-import { useRule } from "@/hooks/useRules";
-import { useAction } from "@/hooks/useActions";
 import { EnforcementStatus, EnforcementCondition } from "@/api";
 import { CuratedDataCard } from "@/components/common/CuratedDataPanel";
+import ContractDataCard from "@/components/common/ContractDataCard";
+import { isJsonObject } from "@/components/common/curatedDataUtils";
 
 export default function EnforcementDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -16,13 +15,14 @@ export default function EnforcementDetailPage() {
     error,
   } = useEnforcement(enforcementId);
   const enforcement = enforcementData?.data;
-  const enforcementTraceTag = (
-    enforcement as
-      (typeof enforcement & { trace_tag?: string | null }) | undefined
-  )?.trace_tag;
-  const { data: triggerData } = useTrigger(enforcement?.trigger_ref || "");
-  const { data: ruleData } = useRule(enforcement?.rule_ref || "");
-  const { data: actionData } = useAction(ruleData?.data?.action_ref || "");
+  const enforcementTraceTag = enforcement?.trace_tag;
+  const record: unknown = enforcement;
+  const inputContract = isJsonObject(record)
+    ? record.input_contract
+    : undefined;
+  const payloadContract = isJsonObject(record)
+    ? record.payload_contract
+    : undefined;
 
   const formatDate = (dateString: string) => {
     return new Date(dateString).toLocaleString();
@@ -245,10 +245,9 @@ export default function EnforcementDetailPage() {
 
           {/* Configuration Card */}
           {enforcement.config && Object.keys(enforcement.config).length > 0 && (
-            <CuratedDataCard
+            <ContractDataCard
               title="Enforcement Configuration"
-              description="Action parameters resolved for this enforcement, annotated with the action parameter schema when available."
-              schema={actionData?.data?.param_schema}
+              contract={inputContract}
               values={enforcement.config}
               emptyMessage="No enforcement configuration was captured."
               maskSecrets
@@ -258,12 +257,12 @@ export default function EnforcementDetailPage() {
           {/* Payload Card */}
           {enforcement.payload &&
             Object.keys(enforcement.payload).length > 0 && (
-              <CuratedDataCard
+              <ContractDataCard
                 title="Payload"
-                description="Trigger payload that activated the rule, annotated with the trigger output schema when available."
-                schema={triggerData?.data?.out_schema}
+                contract={payloadContract}
                 values={enforcement.payload}
                 emptyMessage="No payload data was captured."
+                maskSecrets
               />
             )}
         </div>

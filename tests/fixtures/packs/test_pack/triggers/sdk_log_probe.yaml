@@ -1,0 +1,8 @@
+ref: test_pack.sdk_log_probe
+label: SDK Key Log Probe
+enabled: true
+parameters:
+  key_ref:
+    type: string
+    required: true
+output: {}

@@ -38,7 +38,12 @@ pub enum KeyCommands {
         decrypt: bool,
     },
     /// Create a new key/secret
+    #[command(
+        after_help = "Examples:\n  attune key create --local-ref address --name Address --value '{\"city\":\"Oslo\"}' --value-schema '{\"type\":\"core.address\"}' --encrypt"
+    )]
     Create {
+        #[command(flatten)]
+        schema: AssignSchemaArgs,
         /// Identifier within the owner scope (e.g., "github_token")
         #[arg(long)]
         local_ref: String,
@@ -77,7 +82,18 @@ pub enum KeyCommands {
         encrypt: bool,
     },
     /// Update an existing key/secret
+    #[command(
+        after_help = "Examples:\n  attune key update system.address --rebind-schema\n  attune key update system.address --value-schema '{\"type\":\"core.address\"}'\n  attune key update system.address --clear-schema"
+    )]
     Update {
+        #[command(flatten)]
+        schema: AssignSchemaArgs,
+        /// Remove the assigned schema without changing the stored value
+        #[arg(long, conflicts_with_all = ["value_schema", "rebind_schema", "schema_digest"])]
+        clear_schema: bool,
+        /// Select current named revisions and revalidate the complete value
+        #[arg(long)]
+        rebind_schema: bool,
         /// Key reference identifier
         key_ref: String,
 
@@ -103,6 +119,35 @@ pub enum KeyCommands {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(clap::Args)]
+pub struct AssignSchemaArgs {
+    /// Single-value JSON schema, for example '{"type":"core.address"}'
+    #[arg(long)]
+    value_schema: Option<String>,
+    /// Compare a preview digest. This does not select a revision or contract.
+    #[arg(long)]
+    schema_digest: Option<String>,
+}
+
+impl AssignSchemaArgs {
+    fn parse(&self) -> Result<Option<JsonValue>> {
+        self.value_schema
+            .as_deref()
+            .map(|body| {
+                anyhow::ensure!(body.len() <= 1 << 20, "Value schema exceeds 1 MiB");
+                let schema: JsonValue = serde_json::from_str(body).map_err(|_| {
+                    anyhow::anyhow!("--value-schema requires a JSON schema object or boolean")
+                })?;
+                anyhow::ensure!(
+                    schema.is_object() || schema.is_boolean(),
+                    "--value-schema requires a JSON schema object or boolean"
+                );
+                Ok(schema)
+            })
+            .transpose()
+    }
 }
 
 // ── Response / request types used for (de)serialization against the API ────
@@ -134,6 +179,12 @@ struct KeyResponse {
     encrypted: bool,
     #[serde(default)]
     value: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value_schema: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema_binding: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema_digest: Option<String>,
     created: String,
     updated: String,
 }
@@ -167,6 +218,10 @@ struct CreateKeyRequestBody {
     name: String,
     value: JsonValue,
     encrypted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_schema: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_digest: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +232,11 @@ struct UpdateKeyRequestBody {
     value: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     encrypted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_schema: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_digest: Option<String>,
+    rebind_schema: bool,
 }
 
 // ── Command dispatch ───────────────────────────────────────────────────────
@@ -209,6 +269,7 @@ pub async fn handle_key_command(
             handle_show(profile, key_ref, decrypt, api_url, output_format).await
         }
         KeyCommands::Create {
+            schema,
             local_ref,
             name,
             value,
@@ -230,12 +291,16 @@ pub async fn handle_key_command(
                 owner_action_ref,
                 owner_sensor_ref,
                 encrypt,
+                schema,
                 api_url,
                 output_format,
             )
             .await
         }
         KeyCommands::Update {
+            schema,
+            clear_schema,
+            rebind_schema,
             key_ref,
             name,
             value,
@@ -247,6 +312,7 @@ pub async fn handle_key_command(
                 name,
                 value,
                 encrypted,
+                (schema, clear_schema, rebind_schema),
                 api_url,
                 output_format,
             )
@@ -414,6 +480,7 @@ async fn handle_create(
     owner_action_ref: Option<String>,
     owner_sensor_ref: Option<String>,
     encrypted: bool,
+    schema: AssignSchemaArgs,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -435,6 +502,8 @@ async fn handle_create(
         name,
         value: json_value,
         encrypted,
+        value_schema: schema.parse()?,
+        schema_digest: schema.schema_digest,
     };
 
     let key: KeyResponse = client.post("/keys", &request).await?;
@@ -471,18 +540,27 @@ async fn handle_create(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_update(
     profile: &Option<String>,
     key_ref: String,
     name: Option<String>,
     value: Option<String>,
     encrypted: Option<bool>,
+    schema_options: (AssignSchemaArgs, bool, bool),
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
-    if name.is_none() && value.is_none() && encrypted.is_none() {
+    let (schema, clear_schema, rebind_schema) = schema_options;
+    if name.is_none()
+        && value.is_none()
+        && encrypted.is_none()
+        && schema.value_schema.is_none()
+        && !clear_schema
+        && !rebind_schema
+    {
         anyhow::bail!(
-            "At least one field must be provided to update (--name, --value, or --encrypted)"
+            "Provide --name, --value, --encrypted, --value-schema, --clear-schema, or --rebind-schema"
         );
     }
 
@@ -495,6 +573,13 @@ async fn handle_update(
         name,
         value: json_value,
         encrypted,
+        value_schema: if clear_schema {
+            Some(JsonValue::Null)
+        } else {
+            schema.parse()?
+        },
+        schema_digest: schema.schema_digest,
+        rebind_schema,
     };
 
     let path = format!("/keys/{}", urlencoding::encode(&key_ref));
@@ -684,9 +769,37 @@ mod tests {
             name: "API token".to_string(),
             encrypted: true,
             value,
+            value_schema: None,
+            schema_binding: None,
+            schema_digest: None,
             created: "2026-09-14T00:00:00Z".to_string(),
             updated: "2026-09-14T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn schema_assignment_preserves_false_and_removal_sends_explicit_null() {
+        let schema = AssignSchemaArgs {
+            value_schema: Some("false".into()),
+            schema_digest: None,
+        };
+        assert_eq!(schema.parse().unwrap(), Some(json!(false)));
+        let invalid = AssignSchemaArgs {
+            value_schema: Some("null".into()),
+            schema_digest: None,
+        };
+        assert!(invalid.parse().is_err());
+        let body = UpdateKeyRequestBody {
+            name: None,
+            value: None,
+            encrypted: None,
+            value_schema: Some(JsonValue::Null),
+            schema_digest: None,
+            rebind_schema: false,
+        };
+        let serialized = serde_json::to_value(body).unwrap();
+        assert_eq!(serialized.get("value_schema"), Some(&JsonValue::Null));
+        assert!(serialized.get("value").is_none());
     }
 
     #[test]

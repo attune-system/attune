@@ -9,11 +9,14 @@
 pub mod archive;
 pub mod client;
 pub mod dependency;
+pub mod diagnostics;
 pub mod installer;
 pub mod loader;
 pub mod outbound;
 pub mod permissions;
 pub mod policy;
+pub mod runtime_policy;
+pub mod schema_types;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};

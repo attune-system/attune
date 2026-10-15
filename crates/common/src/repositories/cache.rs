@@ -85,15 +85,87 @@ pub struct CacheNamespacePage {
 pub struct CacheNamespaceReadVisibility {
     pub identity_id: Id,
     pub grants: Vec<CacheNamespaceGrantFilter>,
+    pub owner_filter: Option<CacheNamespaceOwnerFilter>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CacheNamespaceOwnerFilter {
+    System,
+    Identity(Id),
+    Pack(String),
+    Action(String),
+    Sensor(String),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum CacheOwnershipScope {
+    #[default]
+    Any,
+    ManagedPack(Id),
+    Pack(Id),
+    Action(Id),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum CacheGrantContext {
+    #[default]
+    Delegation,
+    Recorded,
 }
 
 /// The cache-row fields constrained by one readable RBAC grant.
 #[derive(Debug, Clone, Default)]
 pub struct CacheNamespaceGrantFilter {
+    pub ownership: CacheOwnershipScope,
+    pub context: CacheGrantContext,
+    pub ids: Option<Vec<Id>>,
+    pub pack_refs: Option<Vec<String>>,
     pub owner: Option<OwnerConstraint>,
     pub owner_types: Option<Vec<OwnerType>>,
     pub owner_refs: Option<Vec<String>>,
     pub namespace_refs: Option<Vec<String>>,
+}
+
+impl CacheNamespaceGrantFilter {
+    pub fn from_recorded_grant(
+        grant: &crate::rbac::Grant,
+        ownership: CacheOwnershipScope,
+    ) -> Option<Self> {
+        use crate::rbac::{Action, ExecutionScopeConstraint, Resource};
+        if grant.resource != Resource::Caches || !grant.actions.contains(&Action::Read) {
+            return None;
+        }
+        let Some(scope) = &grant.constraints else {
+            return Some(Self {
+                ownership,
+                context: CacheGrantContext::Recorded,
+                ..Default::default()
+            });
+        };
+        if scope.encrypted.is_some()
+            || scope.visibility.is_some()
+            || matches!(
+                scope.execution_scope,
+                Some(ExecutionScopeConstraint::SelfOnly | ExecutionScopeConstraint::Descendants)
+            )
+            || scope
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| !attributes.is_empty())
+        {
+            return None;
+        }
+        Some(Self {
+            ownership,
+            context: CacheGrantContext::Recorded,
+            ids: scope.ids.clone(),
+            pack_refs: scope.pack_refs.clone(),
+            owner: scope.owner,
+            owner_types: scope.owner_types.clone(),
+            owner_refs: scope.owner_refs.clone(),
+            namespace_refs: scope.refs.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3746,6 +3818,32 @@ fn push_cache_namespace_visibility_clause(
         push_cache_namespace_grant_clause(query, visibility.identity_id, grant);
     }
     query.push(")");
+    match &visibility.owner_filter {
+        None => {}
+        Some(CacheNamespaceOwnerFilter::System) => {
+            query.push(" AND n.owner_type = 'system'");
+        }
+        Some(CacheNamespaceOwnerFilter::Identity(identity)) => {
+            query
+                .push(" AND n.owner_type = 'identity' AND n.owner_identity = ")
+                .push_bind(*identity);
+        }
+        Some(CacheNamespaceOwnerFilter::Pack(reference)) => {
+            query
+                .push(" AND n.owner_type = 'pack' AND n.owner_pack_ref = ")
+                .push_bind(reference.clone());
+        }
+        Some(CacheNamespaceOwnerFilter::Action(reference)) => {
+            query
+                .push(" AND n.owner_type = 'action' AND n.owner_action_ref = ")
+                .push_bind(reference.clone());
+        }
+        Some(CacheNamespaceOwnerFilter::Sensor(reference)) => {
+            query
+                .push(" AND n.owner_type = 'sensor' AND n.owner_sensor_ref = ")
+                .push_bind(reference.clone());
+        }
+    }
 }
 
 fn push_cache_namespace_grant_clause(
@@ -3764,6 +3862,44 @@ fn push_cache_namespace_grant_clause(
                 query.push(" AND ");
             }
         };
+    }
+
+    match grant.ownership {
+        CacheOwnershipScope::Any => {}
+        CacheOwnershipScope::ManagedPack(pack) => {
+            and_sep!();
+            query
+                .push(CACHE_DATA_PACK_ID_SQL)
+                .push(" = ")
+                .push_bind(pack)
+                .push(" AND (n.management_origin <> 'pack' OR n.managing_pack = ")
+                .push_bind(pack)
+                .push(")");
+        }
+        CacheOwnershipScope::Pack(pack) => {
+            and_sep!();
+            query
+                .push("(n.owner_type = 'pack' AND n.owner_pack = ")
+                .push_bind(pack)
+                .push(")");
+        }
+        CacheOwnershipScope::Action(action) => {
+            and_sep!();
+            query
+                .push("(n.owner_type = 'action' AND n.owner_action = ")
+                .push_bind(action)
+                .push(")");
+        }
+    }
+    if let Some(ids) = &grant.ids {
+        and_sep!();
+        query.push("n.id = ANY(").push_bind(ids.clone()).push(")");
+    }
+    if let Some(refs) = &grant.pack_refs {
+        and_sep!();
+        query.push("EXISTS (SELECT 1 FROM pack scoped_pack WHERE scoped_pack.id = ").push(CACHE_DATA_PACK_ID_SQL)
+            .push(" AND (n.management_origin <> 'pack' OR n.managing_pack = scoped_pack.id) AND scoped_pack.ref = ANY(")
+            .push_bind(refs.clone()).push("))");
     }
 
     if let Some(owner) = grant.owner {
@@ -3809,7 +3945,11 @@ fn push_cache_namespace_grant_clause(
             query.push_bind(OwnerType::Action);
             query.push(" THEN n.owner_action_ref WHEN ");
             query.push_bind(OwnerType::Sensor);
-            query.push(" THEN n.owner_sensor_ref ELSE NULL END) IN (");
+            query.push(" THEN n.owner_sensor_ref ");
+            if matches!(grant.context, CacheGrantContext::Recorded) {
+                query.push("WHEN 'identity' THEN n.owner_identity::TEXT ");
+            }
+            query.push("ELSE NULL END) IN (");
             {
                 let mut separated = query.separated(", ");
                 for owner_ref in owner_refs {
@@ -3825,7 +3965,10 @@ fn push_cache_namespace_grant_clause(
         if namespace_refs.is_empty() {
             query.push("FALSE");
         } else {
-            query.push("n.namespace IN (");
+            query.push(match grant.context {
+                CacheGrantContext::Delegation => "n.namespace IN (",
+                CacheGrantContext::Recorded => "COALESCE(n.definition_ref, n.namespace) IN (",
+            });
             {
                 let mut separated = query.separated(", ");
                 for namespace_ref in namespace_refs {
@@ -3841,6 +3984,12 @@ fn push_cache_namespace_grant_clause(
     }
     query.push(")");
 }
+
+const CACHE_DATA_PACK_ID_SQL: &str = "(CASE n.owner_type \
+    WHEN 'pack' THEN (SELECT p.id FROM pack p WHERE p.id = n.owner_pack) \
+    WHEN 'action' THEN (SELECT a.pack FROM action a WHERE a.id = n.owner_action AND a.management_origin = 'pack') \
+    WHEN 'sensor' THEN (SELECT s.pack FROM sensor s WHERE s.id = n.owner_sensor AND s.management_origin = 'pack') \
+    ELSE NULL END)";
 
 fn push_cache_namespace_freshness_clause(
     query: &mut QueryBuilder<'_, Postgres>,
@@ -3953,6 +4102,63 @@ async fn lock_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_namespace_filters_preserve_structural_ownership_and_target_constraints() {
+        let grant = serde_json::from_value(serde_json::json!({"resource":"caches", "actions":["read"],
+            "constraints":{"pack_refs":["local"], "owner_refs":["local"], "refs":["local.data"], "ids":[7]}})).unwrap();
+        let filter = CacheNamespaceGrantFilter::from_recorded_grant(
+            &grant,
+            CacheOwnershipScope::ManagedPack(42),
+        )
+        .unwrap();
+        assert!(matches!(
+            filter.ownership,
+            CacheOwnershipScope::ManagedPack(42)
+        ));
+        let visibility = CacheNamespaceReadVisibility {
+            identity_id: 17,
+            grants: vec![filter],
+            owner_filter: Some(CacheNamespaceOwnerFilter::Pack("local".into())),
+        };
+        let mut query = QueryBuilder::<Postgres>::new("SELECT n.id FROM cache_namespace n WHERE ");
+        push_cache_namespace_visibility_clause(&mut query, &visibility);
+        let sql = query.sql();
+        assert!(sql.contains("a.management_origin = 'pack'"));
+        assert!(sql.contains("s.management_origin = 'pack'"));
+        assert!(sql.contains("n.management_origin <> 'pack' OR n.managing_pack ="));
+        assert!(sql.contains("COALESCE(n.definition_ref, n.namespace) IN ("));
+        assert!(sql.contains("n.id = ANY("));
+        assert!(sql.contains("n.owner_pack_ref ="));
+        assert!(!sql.contains("LIKE"));
+    }
+
+    #[test]
+    fn recorded_namespace_filters_fail_closed_for_inapplicable_grants() {
+        for constraints in [
+            serde_json::json!({"encrypted":false}),
+            serde_json::json!({"visibility":["public"]}),
+            serde_json::json!({"execution_scope":"self"}),
+            serde_json::json!({"attributes":{"team":"ops"}}),
+        ] {
+            let grant = serde_json::from_value(serde_json::json!({"resource":"caches", "actions":["read"], "constraints":constraints})).unwrap();
+            assert!(CacheNamespaceGrantFilter::from_recorded_grant(
+                &grant,
+                CacheOwnershipScope::Any
+            )
+            .is_none());
+        }
+        for grant in [
+            serde_json::json!({"resource":"caches", "actions":["update"]}),
+            serde_json::json!({"resource":"keys", "actions":["read"]}),
+        ] {
+            assert!(CacheNamespaceGrantFilter::from_recorded_grant(
+                &serde_json::from_value(grant).unwrap(),
+                CacheOwnershipScope::Any
+            )
+            .is_none());
+        }
+    }
 
     #[test]
     fn owner_scope_requires_matching_canonical_owner() {

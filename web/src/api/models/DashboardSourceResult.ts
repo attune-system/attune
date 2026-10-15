@@ -6,7 +6,7 @@ import type { DashboardSourceError } from "./DashboardSourceError";
 import type { DashboardSourceMeta } from "./DashboardSourceMeta";
 import type { DashboardSourceStatus } from "./DashboardSourceStatus";
 export type DashboardSourceResult = {
-  data: any | null;
+  data: Record<string, any> | null;
   error?: null | DashboardSourceError;
   meta: DashboardSourceMeta;
   source_id: string;

@@ -3,15 +3,16 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { i64 } from "./i64";
+import type { Value } from "./Value";
 import type { WorkQueueItemStatus } from "./WorkQueueItemStatus";
 export type WorkQueueItemResponse = {
-  ack_summary: any | null;
+  ack_summary: Record<string, any> | null;
   attempt_count: number;
   created: string;
   enqueue_source: string;
   id: i64;
   item_key?: string | null;
-  last_error: any | null;
+  last_error: Record<string, any> | null;
   lease_expires_at?: string | null;
   lease_token?: string | null;
   leased_execution?: null | i64;
@@ -23,6 +24,7 @@ export type WorkQueueItemResponse = {
   requested_by_enforcement?: null | i64;
   requested_by_execution?: null | i64;
   requested_by_identity?: null | i64;
+  schema_binding?: null | Value;
   status: WorkQueueItemStatus;
   trace_tag?: string | null;
   updated: string;

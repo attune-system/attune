@@ -14,8 +14,7 @@ use utoipa::ToSchema;
 use validator::Validate;
 
 use attune_common::secret_values::{
-    prepare_secret_values, redact_secret_path_sources, secret_paths_from_schema, SecretPathSource,
-    SecretSource, ENTITY_EVENT_CONFIG, ENTITY_EVENT_PAYLOAD,
+    prepare_secret_values, ENTITY_EVENT_CONFIG, ENTITY_EVENT_PAYLOAD,
 };
 use attune_common::{
     mq::{EventCreatedPayload, MessageEnvelope, MessageType},
@@ -26,6 +25,7 @@ use attune_common::{
             EnforcementVisibilityFilter, EventRepository, EventSearchFilters,
             EventVisibilityFilter, VisibilityReadScope,
         },
+        event_schema::EventSchemaRepository,
         execution::ExecutionRepository,
         execution_secret_value::ExecutionSecretValueRepository,
         rule::RuleRepository,
@@ -59,6 +59,7 @@ use crate::{
 
 /// Request body for creating an event
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateEventRequest {
     /// Trigger reference (e.g., "core.timer", "core.webhook")
     /// Also accepts "trigger_type" for compatibility with the sensor interface spec.
@@ -87,40 +88,6 @@ pub struct CreateEventRequest {
     /// When omitted for execution-token callers, inherits from the parent execution.
     #[schema(example = "core.timer.1234", nullable = true)]
     pub trace_tag: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RedactedEventParts {
-    pub payload: Option<JsonValue>,
-    pub config: Option<JsonValue>,
-    pub payload_secrets: Vec<attune_common::secret_values::SecretValueInput>,
-    pub config_secrets: Vec<attune_common::secret_values::SecretValueInput>,
-}
-
-/// Redact event payload/config fields designated as secret by the trigger schema.
-///
-/// By convention, a trigger `param_schema` describes the event payload. For
-/// schemas that explicitly contain top-level `payload` and/or `config` object
-/// definitions, those nested definitions are applied to the corresponding event
-/// section.
-pub(crate) fn redact_event_parts_for_trigger(
-    trigger_ref: &str,
-    schema: Option<&JsonValue>,
-    payload: Option<JsonValue>,
-    config: Option<JsonValue>,
-) -> RedactedEventParts {
-    let (payload_schema, config_schema) = event_section_schemas(schema);
-    let (payload, payload_secrets) =
-        redact_event_section(trigger_ref, "payload", payload, payload_schema.or(schema));
-    let (config, config_secrets) =
-        redact_event_section(trigger_ref, "config", config, config_schema);
-
-    RedactedEventParts {
-        payload,
-        config,
-        payload_secrets,
-        config_secrets,
-    }
 }
 
 fn event_token_type_allowed(token_type: &TokenType) -> bool {
@@ -200,6 +167,25 @@ pub async fn create_event(
             "Trigger '{}' is disabled",
             payload.trigger_ref
         )));
+    }
+
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut *tx)
+        .await?;
+    let recorded_authority = user.0.recorded_runtime_authority(&mut tx).await?;
+    if let Some(authority) = &recorded_authority {
+        let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+            &mut tx,
+            attune_common::repositories::runtime_target::RuntimeTarget::EventTrigger(trigger.id),
+            authority.authority().owner.sponsor_identity_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Event target is unavailable".into()))?;
+        if !authority.allows_new_effect(&target, RbacAction::Create) {
+            return Err(ApiError::Forbidden(
+                "Selected runtime authority does not permit Events/Create on this trigger".into(),
+            ));
+        }
     }
 
     // Resolve and authorize the source before accepting a rule target or event payload.
@@ -294,12 +280,170 @@ pub async fn create_event(
     };
     let source_trace_tag = explicit_trace_tag.or(inherited_trace_tag);
 
-    let redacted = redact_event_parts_for_trigger(
-        &trigger.r#ref,
-        trigger.param_schema.as_ref(),
-        payload.payload,
-        payload.config,
-    );
+    if sensor_fence.is_some() {
+        SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
+    }
+    let mut event_input_origins = Vec::new();
+    let mut event_origin_bytes = 0usize;
+    if let Some(authority) = &recorded_authority {
+        let execution_id = authority.credential_binding().execution_id;
+        for secret in ExecutionSecretValueRepository::find_stored_by_entity(
+            &mut *tx,
+            attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
+            execution_id,
+        )
+        .await?
+        {
+            push_bounded_event_origin(
+                &mut event_input_origins,
+                &mut event_origin_bytes,
+                attune_common::secret_provenance::SecretOrigin::Entity {
+                    entity_type: attune_common::secret_values::ENTITY_EXECUTION_CONFIG.into(),
+                    entity_id: execution_id,
+                    path: secret.json_path,
+                },
+            )?;
+        }
+        for origin in
+            attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins(
+                &mut tx,
+                authority.credential_binding().admission_id,
+            )
+            .await?
+        {
+            push_bounded_event_origin(
+                &mut event_input_origins,
+                &mut event_origin_bytes,
+                attune_common::secret_provenance::SecretOrigin::Key(origin),
+            )?;
+        }
+    }
+    let (trigger, binding) = if let Some(fence) = sensor_fence {
+        let sensor_id = source_id.expect("sensor fence requires a resolved sensor");
+        if !SensorWorkloadRepository::lock_current_fence(&mut tx, sensor_id, fence).await? {
+            return Err(ApiError::Forbidden(
+                "Sensor workload assignment is stale or expired".into(),
+            ));
+        }
+        let (generation_id, generation, _) =
+            attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+                &mut *tx,
+                fence.workload_id,
+                fence.generation,
+            )
+            .await?
+            .ok_or_else(|| {
+                ApiError::Forbidden("Sensor generation binding is unavailable".into())
+            })?;
+        if generation.executable.sensor.id != sensor_id {
+            return Err(ApiError::Forbidden(
+                "Sensor generation owner mismatch".into(),
+            ));
+        }
+        for entity_type in [
+            attune_common::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_CONFIG,
+            attune_common::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_RULE_CONFIG,
+        ] {
+            for secret in ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *tx,
+                entity_type,
+                generation_id,
+            )
+            .await?
+            {
+                let origin = attune_common::secret_provenance::SecretOrigin::Entity {
+                    entity_type: entity_type.to_string(),
+                    entity_id: generation_id,
+                    path: secret.json_path,
+                };
+                push_bounded_event_origin(
+                    &mut event_input_origins,
+                    &mut event_origin_bytes,
+                    origin,
+                )?;
+            }
+        }
+        for (delivery, path) in attune_common::repositories::sensor_schema::SensorSchemaRepository::delivery_origin_paths(&mut *tx, generation_id).await? {
+            push_bounded_event_origin(&mut event_input_origins, &mut event_origin_bytes,
+                attune_common::secret_provenance::SecretOrigin::Entity {
+                    entity_type: attune_common::repositories::sensor_schema::ENTITY_SENSOR_RULE_DELIVERY_CONFIG.to_string(),
+                    entity_id: delivery, path,
+                })?;
+        }
+        for origin in
+            attune_common::repositories::sensor_schema::SensorSchemaRepository::key_read_origins(
+                &mut *tx,
+                generation_id,
+            )
+            .await?
+        {
+            push_bounded_event_origin(
+                &mut event_input_origins,
+                &mut event_origin_bytes,
+                attune_common::secret_provenance::SecretOrigin::Key(origin),
+            )?;
+        }
+        let binding = generation
+            .triggers
+            .get(&trigger.r#ref)
+            .filter(|binding| binding.event.trigger_id == Some(trigger.id))
+            .ok_or_else(|| {
+                ApiError::Forbidden("Trigger is not admitted for this sensor generation".into())
+            })?
+            .event
+            .clone();
+        (trigger, binding)
+    } else {
+        EventSchemaRepository::materialize_current(&mut tx, trigger.id, false).await?
+    };
+    let mut redacted = binding.prepare(payload.payload, payload.config)?;
+    if !event_input_origins.is_empty() {
+        let count = redacted.payload_secrets.len() + redacted.config_secrets.len();
+        if event_origin_bytes
+            .checked_mul(count)
+            .is_none_or(|bytes| bytes > 4 * 1024 * 1024)
+        {
+            return Err(ApiError::ValidationError(
+                "Event input provenance exceeds its limit".into(),
+            ));
+        }
+        for secret in redacted
+            .payload_secrets
+            .iter_mut()
+            .chain(&mut redacted.config_secrets)
+        {
+            let mut provenance = attune_common::secret_provenance::SecretProvenance {
+                origins: event_input_origins.clone(),
+                templates: Vec::new(),
+            };
+            if secret.source_kind == "provenance" {
+                let previous = secret
+                    .source_ref
+                    .as_deref()
+                    .and_then(|reference| {
+                        serde_json::from_str::<attune_common::secret_provenance::SecretProvenance>(
+                            reference,
+                        )
+                        .ok()
+                    })
+                    .ok_or_else(|| {
+                        ApiError::InternalServerError("Invalid event secret provenance".into())
+                    })?;
+                provenance.merge(previous);
+            } else {
+                provenance
+                    .origins
+                    .push(attune_common::secret_provenance::SecretOrigin::Local {
+                        source_kind: secret.source_kind.clone(),
+                        source_ref: secret.source_ref.clone(),
+                    });
+            }
+            secret.source_kind = "provenance".into();
+            secret.source_ref = Some(serde_json::to_string(&provenance).map_err(|_| {
+                ApiError::InternalServerError("Event provenance could not be encoded".into())
+            })?);
+        }
+    }
     let prepared_payload_secrets =
         prepare_event_secret_values(&state, redacted.payload_secrets).await?;
     let prepared_config_secrets =
@@ -308,7 +452,7 @@ pub async fn create_event(
     // Create event input
     let mut input = CreateEventInput {
         trigger: Some(trigger.id),
-        trigger_ref: payload.trigger_ref.clone(),
+        trigger_ref: trigger.r#ref.clone(),
         config: redacted.config,
         payload: redacted.payload,
         trace_tag: source_trace_tag,
@@ -319,7 +463,6 @@ pub async fn create_event(
     };
 
     // Create the event
-    let mut tx = state.db.begin().await?;
     if let Some(fence) = sensor_fence {
         SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
         let sensor_id = source_id.expect("sensor fence requires a resolved sensor");
@@ -369,6 +512,12 @@ pub async fn create_event(
         }
     }
     let event = EventRepository::create(&mut *tx, input).await?;
+    if let Some(authority) = &recorded_authority {
+        attune_common::repositories::execution_event_emitter::ExecutionEventEmitterRepository::attach(
+            &mut tx, &event, authority,
+        ).await?;
+    }
+    EventSchemaRepository::attach(&mut tx, event.id, &binding).await?;
     if !prepared_payload_secrets.is_empty() {
         ExecutionSecretValueRepository::upsert_many_with_conn(
             &mut tx,
@@ -643,14 +792,87 @@ pub async fn get_event(
     };
 
     let mut response = EventResponse::from(event.clone());
+    let binding = EventSchemaRepository::find(&state.db, event.id).await?;
+    response.schema_binding = binding
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| ApiError::InternalServerError("Invalid stored event schema".into()))?;
     if query.include_secret_values {
-        response.payload =
-            reveal_event_secret_entity(&state, response.payload, ENTITY_EVENT_PAYLOAD, event.id)
-                .await?;
-        response.config =
-            reveal_event_secret_entity(&state, response.config, ENTITY_EVENT_CONFIG, event.id)
-                .await?;
-        emit_event_secret_disclosure_audit(&state, &user, &event, reveal_paths);
+        if let Some(binding) = &binding {
+            if !binding.matches_owner(&event) {
+                return Err(ApiError::Forbidden(
+                    "Event schema binding does not match its owner".into(),
+                ));
+            }
+            // Validate complete internal plaintext, never a partially disclosed
+            // projection whose denied fields still contain redaction markers.
+            let payload = restore_bound_event_secret_entity(
+                &state,
+                response.payload.clone(),
+                ENTITY_EVENT_PAYLOAD,
+                event.id,
+            )
+            .await?;
+            let config = restore_bound_event_secret_entity(
+                &state,
+                response.config.clone(),
+                ENTITY_EVENT_CONFIG,
+                event.id,
+            )
+            .await?;
+            binding.validate_restored(payload.as_ref(), config.as_ref())?;
+        } else {
+            for entity_type in [ENTITY_EVENT_PAYLOAD, ENTITY_EVENT_CONFIG] {
+                if !ExecutionSecretValueRepository::find_stored_by_entity(
+                    &state.db,
+                    entity_type,
+                    event.id,
+                )
+                .await?
+                .is_empty()
+                {
+                    return Err(ApiError::Forbidden(
+                        "Event secret disclosure requires its original schema binding".into(),
+                    ));
+                }
+            }
+        }
+        response.payload = crate::secret_disclosure::reveal_authorized(
+            &state,
+            &user,
+            response.payload,
+            ENTITY_EVENT_PAYLOAD,
+            event.id,
+        )
+        .await?;
+        response.config = crate::secret_disclosure::reveal_authorized(
+            &state,
+            &user,
+            response.config,
+            ENTITY_EVENT_CONFIG,
+            event.id,
+        )
+        .await?;
+        let mut still_redacted =
+            redacted_paths(&response.payload.clone().unwrap_or(serde_json::Value::Null))
+                .into_iter()
+                .map(|path| format!("payload{path}"))
+                .collect::<std::collections::BTreeSet<_>>();
+        still_redacted.extend(
+            redacted_paths(&response.config.clone().unwrap_or(serde_json::Value::Null))
+                .into_iter()
+                .map(|path| format!("config{path}")),
+        );
+        emit_event_secret_disclosure_audit(
+            &state,
+            &user,
+            &event,
+            reveal_paths
+                .into_iter()
+                .filter(|path| !still_redacted.contains(path))
+                .collect(),
+        );
     }
     apply_event_response_visibility(
         &mut response,
@@ -658,6 +880,9 @@ pub async fn get_event(
         &trigger_read_scope,
         global_event_read,
     );
+    if response.trigger_ref == REDACTED_REF {
+        response.schema_binding = None;
+    }
 
     let response = ApiResponse::new(response);
 
@@ -787,65 +1012,6 @@ pub async fn list_enforcements(
     Ok((StatusCode::OK, Json(response)))
 }
 
-fn event_section_schemas(schema: Option<&JsonValue>) -> (Option<&JsonValue>, Option<&JsonValue>) {
-    let Some(schema) = schema else {
-        return (None, None);
-    };
-    let Some(map) = schema.as_object() else {
-        return (None, None);
-    };
-
-    if map.get("type").and_then(JsonValue::as_str) == Some("object") {
-        let properties = map.get("properties").and_then(JsonValue::as_object);
-        return (
-            properties.and_then(|props| props.get("payload")),
-            properties.and_then(|props| props.get("config")),
-        );
-    }
-
-    (
-        map.get("payload")
-            .filter(|schema| looks_like_section_schema(schema)),
-        map.get("config")
-            .filter(|schema| looks_like_section_schema(schema)),
-    )
-}
-
-fn looks_like_section_schema(schema: &JsonValue) -> bool {
-    schema.as_object().is_some_and(|map| {
-        map.contains_key("properties")
-            || map.get("type").and_then(JsonValue::as_str) == Some("object")
-    })
-}
-
-fn redact_event_section(
-    trigger_ref: &str,
-    section: &'static str,
-    value: Option<JsonValue>,
-    schema: Option<&JsonValue>,
-) -> (
-    Option<JsonValue>,
-    Vec<attune_common::secret_values::SecretValueInput>,
-) {
-    let Some(value) = value else {
-        return (None, Vec::new());
-    };
-
-    let path_sources = secret_paths_from_schema(schema)
-        .into_iter()
-        .map(|path| SecretPathSource {
-            source: SecretSource::TriggerSchema {
-                trigger_ref: Some(trigger_ref.to_string()),
-                section,
-                path: path.clone(),
-            },
-            path,
-        })
-        .collect::<Vec<_>>();
-    let (redacted, secrets) = redact_secret_path_sources(value, &path_sources);
-    (Some(redacted), secrets)
-}
-
 async fn prepare_event_secret_values(
     state: &Arc<AppState>,
     secrets: Vec<attune_common::secret_values::SecretValueInput>,
@@ -867,6 +1033,26 @@ async fn prepare_event_secret_values(
         .map_err(|e| ApiError::InternalServerError(format!("Failed to encrypt secret values: {e}")))
 }
 
+fn push_bounded_event_origin(
+    origins: &mut Vec<attune_common::secret_provenance::SecretOrigin>,
+    bytes: &mut usize,
+    origin: attune_common::secret_provenance::SecretOrigin,
+) -> Result<(), ApiError> {
+    let size = serde_json::to_vec(&origin)
+        .map_err(|_| ApiError::InternalServerError("Event provenance could not be encoded".into()))?
+        .len();
+    *bytes = bytes
+        .checked_add(size)
+        .ok_or_else(|| ApiError::ValidationError("Event provenance exceeds its limit".into()))?;
+    if origins.len() >= 1024 || *bytes > 1024 * 1024 {
+        return Err(ApiError::ValidationError(
+            "Event provenance exceeds its limit".into(),
+        ));
+    }
+    origins.push(origin);
+    Ok(())
+}
+
 const REDACTED_REF: &str = "[redacted]";
 
 fn allows_scoped_collection_read_without_resource_grant(
@@ -886,7 +1072,7 @@ fn allows_public_trigger_event_read_without_resource_grant(
     user.claims.token_type == TokenType::Access && action == RbacAction::Read
 }
 
-fn event_visibility_filter_from_grants(
+pub(crate) fn event_visibility_filter_from_grants(
     grants: &[Grant],
     include_public_trigger_scope: bool,
 ) -> EventVisibilityFilter {
@@ -1035,7 +1221,7 @@ fn apply_enforcement_response_visibility(
     }
 }
 
-async fn authorize_event_access(
+pub(crate) async fn authorize_event_access(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     event: &attune_common::models::event::Event,
@@ -1047,6 +1233,42 @@ async fn authorize_event_access(
         return Ok(());
     };
 
+    let Some(filter) = event_action_visibility_filter(user, grants, action)? else {
+        return Ok(());
+    };
+    let visible = match *visibility_cache {
+        Some(visible) => visible,
+        None => {
+            let result = EventRepository::search(
+                &state.db,
+                &EventSearchFilters {
+                    id: Some(event.id),
+                    include_total: false,
+                    limit: 1,
+                    offset: 0,
+                    visibility: Some(filter),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let visible = !result.rows.is_empty();
+            *visibility_cache = Some(visible);
+            visible
+        }
+    };
+    if !visible {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: events visibility".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn event_action_visibility_filter(
+    user: &AuthenticatedUser,
+    grants: &[Grant],
+    action: RbacAction,
+) -> Result<Option<EventVisibilityFilter>, ApiError> {
     let has_resource_grant = resource_action_grant_exists(grants, Resource::Events, action);
     let allow_public_trigger_read =
         allows_public_trigger_event_read_without_resource_grant(user, action);
@@ -1057,43 +1279,16 @@ async fn authorize_event_access(
         )));
     }
     if has_resource_grant && has_unconstrained_resource_action(grants, Resource::Events, action) {
-        return Ok(());
+        return Ok(None);
     }
 
-    // The rule/trigger visibility predicate below does not depend on
-    // `action`, so it is computed at most once per event per request and
-    // reused across the Read/Decrypt checks instead of re-running the same
-    // search query.
-    let visible = match *visibility_cache {
-        Some(visible) => visible,
-        None => {
-            let filters = EventSearchFilters {
-                id: Some(event.id),
-                include_total: false,
-                limit: 1,
-                offset: 0,
-                visibility: Some(event_visibility_filter_from_grants(
-                    grants,
-                    allow_public_trigger_read,
-                )),
-                ..Default::default()
-            };
-            let result = EventRepository::search(&state.db, &filters).await?;
-            let visible = !result.rows.is_empty();
-            *visibility_cache = Some(visible);
-            visible
-        }
-    };
-    if !visible {
-        return Err(ApiError::Forbidden(
-            "Insufficient permissions: events visibility".to_string(),
-        ));
-    }
-
-    Ok(())
+    Ok(Some(event_visibility_filter_from_grants(
+        grants,
+        allow_public_trigger_read,
+    )))
 }
 
-async fn reveal_event_secret_entity(
+async fn restore_bound_event_secret_entity(
     state: &Arc<AppState>,
     redacted: Option<serde_json::Value>,
     entity_type: &str,
@@ -1253,6 +1448,30 @@ pub async fn get_enforcement(
     };
 
     let mut response = EnforcementResponse::from(enforcement.clone());
+    let binding =
+        attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+            &state.db,
+            attune_common::repositories::schema_contract::BindingOwner::Enforcement,
+            enforcement.id,
+        )
+        .await?;
+    response.input_contract = binding
+        .as_ref()
+        .map(|binding| serde_json::to_value(&binding.input))
+        .transpose()
+        .map_err(|_| {
+            ApiError::InternalServerError("Invalid stored enforcement input schema".into())
+        })?;
+    if let Some(event) = enforcement.event {
+        let binding = EventSchemaRepository::find(&state.db, event).await?;
+        response.payload_contract = binding
+            .and_then(|binding| binding.payload)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| {
+                ApiError::InternalServerError("Invalid original enforcement payload schema".into())
+            })?;
+    }
     if include_execution_context {
         let mut enforcement_trace_tags =
             EnforcementRepository::trace_tags_by_enforcement_ids(&state.db, &[id]).await?;
@@ -1371,8 +1590,14 @@ fn emit_enforcement_secret_disclosure_audit(
 
 /// Register event and enforcement routes
 pub fn routes() -> Router<Arc<AppState>> {
+    use axum::handler::Handler;
     Router::new()
-        .route("/events", get(list_events).post(create_event))
+        .route(
+            "/events",
+            get(list_events).post(create_event.layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::EventIngress,
+            ))),
+        )
         .route("/events/{id}", get(get_event))
         .route("/enforcements", get(list_enforcements))
         .route("/enforcements/{id}", get(get_enforcement))
@@ -1422,12 +1647,13 @@ mod tests {
             "password": {"type": "string", "secret": true}
         });
 
-        let redacted = redact_event_parts_for_trigger(
-            "demo.login",
-            Some(&schema),
-            Some(json!({"username": "alice", "password": "s3cr3t"})),
-            None,
-        );
+        let binding = event_test_binding("demo.login", Some(&schema), None);
+        let redacted = binding
+            .prepare(
+                Some(json!({"username": "alice", "password": "s3cr3t"})),
+                None,
+            )
+            .unwrap();
 
         let payload = redacted.payload.unwrap();
         assert_eq!(payload["username"], "alice");
@@ -1448,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn redacts_event_payload_and_config_from_sectioned_schema() {
+    fn redacts_event_payload_and_config_from_distinct_flat_schemas() {
         let schema = json!({
             "payload": {
                 "properties": {
@@ -1466,12 +1692,17 @@ mod tests {
             }
         });
 
-        let redacted = redact_event_parts_for_trigger(
+        let binding = event_test_binding(
             "demo.webhook",
-            Some(&schema),
-            Some(json!({"api_key": "payload-secret", "message": "ok"})),
-            Some(json!({"headers": {"authorization": "Bearer secret"}})),
+            Some(&schema["payload"]["properties"]),
+            Some(&schema["config"]["properties"]),
         );
+        let redacted = binding
+            .prepare(
+                Some(json!({"api_key": "payload-secret", "message": "ok"})),
+                Some(json!({"headers": {"authorization": "Bearer secret"}})),
+            )
+            .unwrap();
 
         let payload = redacted.payload.unwrap();
         let config = redacted.config.unwrap();
@@ -1483,5 +1714,37 @@ mod tests {
             redacted.config_secrets[0].json_path,
             "/headers/authorization"
         );
+    }
+
+    fn event_test_binding(
+        reference: &str,
+        payload: Option<&JsonValue>,
+        config: Option<&JsonValue>,
+    ) -> attune_common::event_schema::EventSchemaBinding {
+        use attune_common::value_schema::{
+            compile, Limits, RegistryView, SchemaContext, SourceIdentity,
+        };
+        let compile_section = |schema: Option<&JsonValue>| {
+            schema.map(|schema| {
+                compile(
+                    SourceIdentity::Assigned {
+                        component_ref: reference.to_owned(),
+                        assignment_id: uuid::Uuid::new_v4(),
+                    },
+                    SchemaContext::FlatDocument,
+                    schema,
+                    &RegistryView::new(),
+                    Limits::default(),
+                )
+                .unwrap()
+            })
+        };
+        attune_common::event_schema::EventSchemaBinding {
+            trigger_id: Some(1),
+            trigger_ref: reference.to_owned(),
+            payload: compile_section(payload),
+            config: compile_section(config),
+            webhook: false,
+        }
     }
 }

@@ -679,7 +679,34 @@ async fn dispatch_with_authorizer<F, Fut>(
             continue;
         }
 
-        match candidate.tx.send(notification.clone()) {
+        let mut delivery = notification.clone();
+        if candidate.auth.token_type == TokenType::Sensor
+            && notification.notification_type == "rule_lifecycle_changed"
+        {
+            let mut metadata = serde_json::Map::new();
+            if let Some(payload) = notification.payload.as_object() {
+                for field in [
+                    "event_type",
+                    "rule_id",
+                    "rule_ref",
+                    "trigger_ref",
+                    "old_trigger_ref",
+                    "enabled",
+                ] {
+                    if let Some(value) = payload.get(field) {
+                        metadata.insert(field.to_string(), value.clone());
+                    }
+                }
+            }
+            // Plaintext configurations must cross the workload-fenced API
+            // boundary, where the original generation validates and records them.
+            metadata.insert(
+                "auth_mode".to_string(),
+                serde_json::Value::String("deferred".into()),
+            );
+            delivery.payload = serde_json::Value::Object(metadata);
+        }
+        match candidate.tx.send(delivery) {
             Ok(()) => sent_count += 1,
             Err(_) => to_remove.push(candidate.client_id),
         }
@@ -2149,6 +2176,10 @@ mod tests {
         rx
     }
 
+    mod artifact_load {
+        include!("artifact_load_tests.rs");
+    }
+
     #[tokio::test]
     async fn test_dispatch_evaluates_once_per_identity_and_delivers_to_all_sockets() {
         let manager = SubscriberManager::new();
@@ -2180,6 +2211,48 @@ mod tests {
         for rx in [&mut rx_a1, &mut rx_a2, &mut rx_a3, &mut rx_b1, &mut rx_b2] {
             assert!(rx.try_recv().is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_loses_artifact_updates_without_closing_client_subscriptions() {
+        let manager = SubscriberManager::new();
+        let mut socket = register_all(&manager, test_auth_ctx(1, TokenType::Access));
+        let (tx, mut broadcaster) = tokio::sync::broadcast::channel(4);
+        for id in 1..=100 {
+            let mut notification = make_notification("artifact");
+            notification.entity_id = id;
+            tx.send(notification).unwrap();
+        }
+        assert!(matches!(
+            broadcaster.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(96))
+        ));
+        // The production broadcaster continues with retained messages after
+        // Lagged. It does not disconnect sockets or synthesize lost updates.
+        for id in 97..=100 {
+            let notification = broadcaster.try_recv().unwrap();
+            assert_eq!(notification.entity_id, id);
+            dispatch_with_authorizer(&manager, notification, |_| async { true }).await;
+            assert_eq!(socket.try_recv().unwrap().entity_id, id);
+        }
+        assert_eq!(manager.client_count(), 1);
+        assert!(matches!(
+            socket.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            broadcaster.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        // A later notification still reaches that same connection. Browser
+        // reconciliation, not socket connectivity, must recover the missed 96.
+        let notification = make_notification("artifact");
+        tx.send(notification).unwrap();
+        dispatch_with_authorizer(&manager, broadcaster.try_recv().unwrap(), |_| async {
+            true
+        })
+        .await;
+        assert_eq!(socket.try_recv().unwrap().entity_type, "artifact");
     }
 
     #[tokio::test]

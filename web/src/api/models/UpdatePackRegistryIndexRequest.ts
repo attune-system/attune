@@ -7,7 +7,7 @@
  */
 export type UpdatePackRegistryIndexRequest = {
   enabled?: boolean | null;
-  headers?: any | null;
+  headers?: Record<string, any> | null;
   name?: string | null;
   position?: number | null;
   url?: string | null;

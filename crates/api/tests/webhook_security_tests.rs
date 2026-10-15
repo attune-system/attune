@@ -11,7 +11,6 @@
 use attune_common::repositories::{
     pack::{CreatePackInput, PackRepository},
     trigger::{CreateTriggerInput, TriggerRepository},
-    Create,
 };
 use axum::{
     body::Body,
@@ -70,6 +69,7 @@ async fn create_test_trigger(
         description: Some(format!("Test trigger {}", trigger_ref)),
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,

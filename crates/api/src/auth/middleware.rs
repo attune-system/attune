@@ -40,6 +40,50 @@ pub struct AuthenticatedUser {
 }
 
 impl AuthenticatedUser {
+    /// Descriptive IDs for an already authenticated request, never a permit.
+    /// Do not copy credentials, policy bodies or input values into audit events.
+    pub fn with_recorded_audit_context(&self, details: serde_json::Value) -> serde_json::Value {
+        let Ok(Some(binding)) = self.claims.admitted_execution_credential() else {
+            return details;
+        };
+        let mut details = match details {
+            serde_json::Value::Object(details) => details,
+            value => serde_json::Map::from_iter([("operation_details".into(), value)]),
+        };
+        details.insert("runtime_authority".into(), serde_json::json!({
+            "authority_source":"pack", "execution_id":binding.execution_id,
+            "admission_id":binding.admission_id, "sponsor_identity_id":binding.sponsor_identity_id,
+            "attempt":binding.attempt,
+        }));
+        serde_json::Value::Object(details)
+    }
+
+    pub async fn recorded_runtime_authority(
+        &self,
+        connection: &mut sqlx::PgConnection,
+    ) -> attune_common::Result<
+        Option<attune_common::repositories::runtime_authority::ValidatedRuntimeAuthority>,
+    > {
+        let credential = self.claims.admitted_execution_credential().map_err(|_| {
+            attune_common::Error::PermissionDenied("Invalid recorded execution credential".into())
+        })?;
+        let Some(credential) = credential else {
+            return Ok(None);
+        };
+        let selected = self.claims.admitted_permission_set_refs().map_err(|_| {
+            attune_common::Error::PermissionDenied("Invalid recorded execution selection".into())
+        })?;
+        let authority = attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::validate_execution_credential(
+            connection, &credential,
+        ).await?;
+        if authority.authority().selected_refs != selected {
+            return Err(attune_common::Error::PermissionDenied(
+                "Execution credential selection differs from admitted authority".into(),
+            ));
+        }
+        Ok(Some(authority))
+    }
+
     pub(crate) fn from_claims(claims: Claims) -> Self {
         Self { claims }
     }
@@ -118,6 +162,22 @@ pub async fn require_auth(
 /// Extractor for authenticated user
 pub struct RequireAuth(pub AuthenticatedUser);
 
+/// Trusted route marker. A recorded token must not fall through an unconverted
+/// consumer that relies only on its token type or mutable human IAM.
+#[derive(Clone, Copy)]
+pub(crate) enum RecordedRuntimeConsumer {
+    EventIngress,
+    KeyRead,
+    KeyList,
+    KeyUpdate,
+    KeyDelete,
+    KeyCreate,
+    SchemaMetadata,
+    CacheRead,
+    CacheDataMutation,
+    KeySigning,
+}
+
 impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth {
     type Rejection = AuthError;
 
@@ -166,7 +226,29 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth 
             }
         }
 
-        Ok(RequireAuth(AuthenticatedUser::from_claims(claims)))
+        let user = AuthenticatedUser::from_claims(claims);
+        if user
+            .claims
+            .admitted_execution_credential()
+            .map_err(|_| AuthError::InvalidToken)?
+            .is_some()
+        {
+            let mut transaction = state.db.begin().await.map_err(|_| AuthError::Internal)?;
+            user.recorded_runtime_authority(&mut transaction)
+                .await
+                .map_err(|error| match error {
+                    attune_common::Error::Database(_) => AuthError::Internal,
+                    _ => AuthError::InvalidToken,
+                })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AuthError::Internal)?;
+            if parts.extensions.get::<RecordedRuntimeConsumer>().is_none() {
+                return Err(AuthError::Unauthorized);
+            }
+        }
+        Ok(RequireAuth(user))
     }
 }
 
@@ -247,6 +329,38 @@ impl IntoResponse for AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_audit_context_contains_binding_ids_without_copying_credential_metadata() {
+        let attempt = uuid::Uuid::new_v4();
+        let user = AuthenticatedUser::from_claims(Claims {
+            sub: "33".into(),
+            login: "execution:11".into(),
+            iat: 1,
+            exp: 2,
+            token_type: TokenType::Execution,
+            scope: Some("execution".into()),
+            metadata: Some(
+                serde_json::json!({"authority_source":"pack", "execution_id":11,
+                "action_ref":"private.action", "permission_set_refs":["private.policy"],
+                "unrelated_token_secret":"not-for-audit", "runtime_authority":{
+                    "execution_id":11,"admission_id":22,"sponsor_identity_id":33,
+                    "action_ref":"private.action","attempt":attempt
+                }}),
+            ),
+        });
+        let details = user.with_recorded_audit_context(
+            serde_json::json!({"operation":"sign_jwt", "runtime_authority":{"forged":true}}),
+        );
+        assert_eq!(
+            details,
+            serde_json::json!({"operation":"sign_jwt", "runtime_authority":{
+                "authority_source":"pack", "execution_id":11,"admission_id":22,"sponsor_identity_id":33,"attempt":attempt
+            }})
+        );
+        assert!(!details.to_string().contains("private"));
+        assert!(!details.to_string().contains("not-for-audit"));
+    }
 
     #[test]
     fn test_authenticated_user() {

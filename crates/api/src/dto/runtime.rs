@@ -72,7 +72,7 @@ pub struct CreateRuntimeRequest {
 
     /// Optional installation metadata
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object, nullable = true, example = json!({"method": "system"}))]
+    #[schema(nullable = true, example = json!({"method": "system"}))]
     pub installation: Option<JsonValue>,
 
     /// Runtime execution configuration
@@ -84,6 +84,7 @@ pub struct CreateRuntimeRequest {
 
 /// Request DTO for updating a runtime.
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRuntimeRequest {
     /// Optional human-readable description patch.
     pub description: Option<NullableStringPatch>,
@@ -94,7 +95,7 @@ pub struct UpdateRuntimeRequest {
     pub name: Option<String>,
 
     /// Distribution metadata used for verification and platform support
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, nullable = true, required = false)]
     pub distributions: Option<JsonValue>,
 
     /// Optional installation metadata patch.
@@ -102,7 +103,7 @@ pub struct UpdateRuntimeRequest {
 
     /// Runtime execution configuration
     #[validate(custom(function = "validate_runtime_environment"))]
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, nullable = true, required = false)]
     pub execution_config: Option<JsonValue>,
 }
 
@@ -184,7 +185,7 @@ pub struct RuntimeResponse {
     #[schema(value_type = Object)]
     pub distributions: JsonValue,
 
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(nullable = true)]
     pub installation: Option<JsonValue>,
 
     #[schema(value_type = Object)]

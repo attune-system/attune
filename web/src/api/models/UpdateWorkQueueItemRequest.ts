@@ -5,7 +5,7 @@
 import type { NullableStringPatch } from "./NullableStringPatch";
 export type UpdateWorkQueueItemRequest = {
   item_key?: null | NullableStringPatch;
-  metadata: any | null;
-  payload: any | null;
+  metadata: Record<string, any> | null;
+  payload: Record<string, any> | null;
   priority?: number | null;
 };

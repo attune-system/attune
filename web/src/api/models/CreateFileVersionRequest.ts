@@ -23,5 +23,5 @@ export type CreateFileVersionRequest = {
   /**
    * Free-form metadata about this version
    */
-  meta?: any | null;
+  meta?: Record<string, any> | null;
 };

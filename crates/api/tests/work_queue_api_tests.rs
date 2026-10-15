@@ -167,7 +167,7 @@ async fn create_queue_with_visibility(
     )
     .await;
 
-    WorkQueueRepository::create(
+    let queue = WorkQueueRepository::create(
         &ctx.pool,
         CreateWorkQueueInput {
             r#ref: format!("{}.{}", pack.r#ref, queue_name),
@@ -194,7 +194,19 @@ async fn create_queue_with_visibility(
         },
     )
     .await
-    .expect("create queue")
+    .expect("create queue");
+    helpers::activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            work_queues: vec![queue.id],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("activate queue schema source");
+    queue
 }
 
 #[tokio::test]
@@ -579,12 +591,9 @@ async fn queue_api_supports_merge_patch_enqueue_and_pending_item_lifecycle() {
     let admin_token = register_queue_admin(&ctx).await;
     let token = Some(admin_token.as_str());
 
-    let (_pack, action) = create_pack_with_action(
-        &ctx,
-        &format!("queue_api_pack_{}", uuid::Uuid::new_v4().simple()),
-        &format!("queue_api_pack.dispatch_{}", uuid::Uuid::new_v4().simple()),
-    )
-    .await;
+    let pack_ref = format!("queue_api_pack_{}", uuid::Uuid::new_v4().simple());
+    let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
+    let (_pack, action) = create_pack_with_action(&ctx, &pack_ref, &action_ref).await;
 
     let queue_ref = format!("adhoc.queue_{}", uuid::Uuid::new_v4().simple());
     let create = ctx
@@ -978,12 +987,9 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
     let admin_token = register_queue_admin(&ctx).await;
     let token = Some(admin_token.as_str());
 
-    let (pack, action) = create_pack_with_action(
-        &ctx,
-        &format!("queue_pack_{}", uuid::Uuid::new_v4().simple()),
-        &format!("queue_pack.dispatch_{}", uuid::Uuid::new_v4().simple()),
-    )
-    .await;
+    let pack_ref = format!("queue_pack_{}", uuid::Uuid::new_v4().simple());
+    let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
+    let (pack, action) = create_pack_with_action(&ctx, &pack_ref, &action_ref).await;
 
     let queue = WorkQueueRepository::create(
         &ctx.pool,

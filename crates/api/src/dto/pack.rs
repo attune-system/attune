@@ -2,6 +2,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+pub struct PackDetailQuery {
+    #[serde(default)]
+    pub include_secret_values: bool,
+}
 use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
@@ -288,6 +293,8 @@ pub struct PackRegistryIndexSummary {
 /// Response for pack install/register operations with test results
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PackInstallResponse {
+    #[serde(default)]
+    pub diagnostics: Vec<attune_common::pack_check::PackDiagnostic>,
     /// The installed/registered pack
     pub pack: PackResponse,
 
@@ -313,6 +320,7 @@ pub struct PackInstallResponse {
 /// Response describing a tracked pack installation attempt.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PackInstallStatusResponse {
+    pub diagnostic_details: Option<serde_json::Value>,
     /// Pack install record id
     pub install_id: i64,
     /// Pack reference this install attempt belongs to
@@ -341,6 +349,7 @@ impl From<attune_common::models::PackInstall> for PackInstallStatusResponse {
     fn from(record: attune_common::models::PackInstall) -> Self {
         Self {
             install_id: record.id,
+            diagnostic_details: record.diagnostic_details,
             pack_ref: record.pack_ref,
             pack_version: record.pack_version,
             status: record.status,
@@ -399,14 +408,17 @@ pub struct UpdatePackRequest {
     pub version: Option<String>,
 
     /// Configuration schema
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub conf_schema: Option<JsonValue>,
 
     /// Pack configuration values
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub config: Option<JsonValue>,
 
     /// Pack metadata
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub meta: Option<JsonValue>,
 
@@ -468,6 +480,9 @@ pub struct PackResponse {
     /// Pack configuration
     #[schema(value_type = Object)]
     pub config: JsonValue,
+
+    /// Original contract for the current configuration revision.
+    pub config_schema_binding: Option<JsonValue>,
 
     /// Pack metadata
     #[schema(value_type = Object)]
@@ -605,6 +620,11 @@ pub struct PackSummary {
 /// Convert from Pack model to PackResponse
 impl From<attune_common::models::Pack> for PackResponse {
     fn from(pack: attune_common::models::Pack) -> Self {
+        let config = attune_common::secret_values::configuration_metadata_projection(
+            &pack.r#ref,
+            &pack.conf_schema,
+            pack.config.clone(),
+        );
         Self {
             id: pack.id,
             r#ref: pack.r#ref,
@@ -612,7 +632,8 @@ impl From<attune_common::models::Pack> for PackResponse {
             description: pack.description,
             version: pack.version,
             conf_schema: pack.conf_schema,
-            config: pack.config,
+            config,
+            config_schema_binding: None,
             meta: pack.meta,
             tags: pack.tags,
             runtime_deps: pack.runtime_deps,
@@ -739,6 +760,7 @@ pub struct DownloadedPack {
 /// Information about a failed pack download
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FailedPack {
+    pub details: Option<JsonValue>,
     /// Pack source that failed
     pub source: String,
     /// Error message
@@ -884,6 +906,9 @@ pub struct BuildPackEnvsRequest {
 /// Response DTO for build pack environments operation
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BuildPackEnvsResponse {
+    /// This endpoint detects API-host interpreters only; it does not build worker environments.
+    pub detection_only: bool,
+    pub message: String,
     /// Successfully built environments
     pub built_environments: Vec<BuiltEnvironment>,
     /// Failed environment builds
@@ -1016,6 +1041,8 @@ pub struct RegisterPacksResponse {
 /// Information about a registered pack
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RegisteredPack {
+    #[serde(default)]
+    pub diagnostics: Vec<attune_common::pack_check::PackDiagnostic>,
     /// Pack reference
     pub pack_ref: String,
     /// Pack database ID
@@ -1080,6 +1107,7 @@ pub struct ValidationResults {
 /// Failed pack registration
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FailedPackRegistration {
+    pub details: Option<JsonValue>,
     /// Pack reference
     pub pack_ref: String,
     /// Pack path

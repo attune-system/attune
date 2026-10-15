@@ -8,11 +8,7 @@ import {
 import { useSensorLog, useSensorLogs } from "@/hooks/useSensorLogs";
 import { useMemo, useRef, useState } from "react";
 import type { SensorResponse, SensorSummary, UpdateSensorRequest } from "@/api";
-import {
-  LogRetentionLimitPatch,
-  LogRetentionPolicyPatch,
-  RetentionPolicyType,
-} from "@/api";
+import { RetentionPolicyType } from "@/api";
 import { ChevronDown, ChevronRight, Search, Settings, X } from "lucide-react";
 import OnOffSwitch from "@/components/common/OnOffSwitch";
 import RetentionPolicyControls from "@/components/common/RetentionPolicyControls";
@@ -21,6 +17,7 @@ import {
   type RetentionPolicy,
 } from "@/components/common/retentionPolicy";
 import PackIcon from "@/components/common/PackIcon";
+import ContractDataCard from "@/components/common/ContractDataCard";
 import PackFilter from "@/components/common/PackFilter";
 import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -545,6 +542,14 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
             </dl>
           </div>
 
+          <ContractDataCard
+            title="Sensor configuration"
+            contract={sensor.data?.config_schema_binding}
+            values={sensor.data?.config}
+            emptyMessage="No sensor configuration is currently set."
+            maskSecrets
+          />
+
           <div className="bg-white shadow rounded-lg p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-semibold">Sensor Logs</h2>
@@ -652,33 +657,25 @@ function ConfigureSensorRetentionModal({
       await onSave({
         log_retention_policy: logRetention.policy
           ? {
-              op: LogRetentionPolicyPatch.op.SET,
+              op: "set",
               value: logRetention.policy as RetentionPolicyType,
             }
-          : ({
-              op: "clear",
-            } as unknown as UpdateSensorRequest["log_retention_policy"]),
+          : { op: "clear" },
         log_retention_limit: logRetention.limit
-          ? { op: LogRetentionLimitPatch.op.SET, value: logRetention.limit }
-          : ({
-              op: "clear",
-            } as unknown as UpdateSensorRequest["log_retention_limit"]),
+          ? { op: "set", value: logRetention.limit }
+          : { op: "clear" },
         artifact_retention_policy: artifactRetention.policy
           ? {
-              op: LogRetentionPolicyPatch.op.SET,
+              op: "set",
               value: artifactRetention.policy as RetentionPolicyType,
             }
-          : ({
-              op: "clear",
-            } as unknown as UpdateSensorRequest["artifact_retention_policy"]),
+          : { op: "clear" },
         artifact_retention_limit: artifactRetention.limit
           ? {
-              op: LogRetentionLimitPatch.op.SET,
+              op: "set",
               value: artifactRetention.limit,
             }
-          : ({
-              op: "clear",
-            } as unknown as UpdateSensorRequest["artifact_retention_limit"]),
+          : { op: "clear" },
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save retention");

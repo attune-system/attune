@@ -15,6 +15,7 @@ import type { CreateFileVersionRequest } from "../models/CreateFileVersionReques
 import type { CreateVersionJsonRequest } from "../models/CreateVersionJsonRequest";
 import type { OwnerType } from "../models/OwnerType";
 import type { PaginatedResponse_ArtifactSummary } from "../models/PaginatedResponse_ArtifactSummary";
+import type { PaginatedResponse_ArtifactVersionSummary } from "../models/PaginatedResponse_ArtifactVersionSummary";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
 import type { SetDataRequest } from "../models/SetDataRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
@@ -981,68 +982,34 @@ export class ArtifactsService {
     });
   }
   /**
-   * List all versions for an artifact (without binary content)
-   * @returns any List of versions
+   * List a visibility-filtered page of versions without binary/JSON content.
+   * @returns PaginatedResponse_ArtifactVersionSummary Visible versions with exact totals
    * @throws ApiError
    */
   public static listVersions({
     id,
+    page,
+    perPage,
   }: {
     /**
      * Artifact ID
      */
     id: number;
-  }): CancelablePromise<{
-    data: Array<{
-      body_state?: null | ArtifactBodyState;
-      /**
-       * MIME content type
-       */
-      content_type?: string | null;
-      /**
-       * Creation timestamp
-       */
-      created: string;
-      /**
-       * Who created this version
-       */
-      created_by?: string | null;
-      /**
-       * Execution that produced this version
-       */
-      execution?: number | null;
-      /**
-       * Relative file path for disk-backed versions
-       */
-      file_path?: string | null;
-      /**
-       * Version ID
-       */
-      id: number;
-      object_key?: string | null;
-      provider_version?: string | null;
-      sha256?: string | null;
-      /**
-       * Size of content in bytes
-       */
-      size_bytes?: number | null;
-      /**
-       * Version number
-       */
-      version: number;
-    }>;
-    /**
-     * Optional message
-     */
-    message?: string | null;
-  }> {
+    page?: number;
+    perPage?: number;
+  }): CancelablePromise<PaginatedResponse_ArtifactVersionSummary> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/artifacts/{id}/versions",
       path: {
         id: id,
       },
+      query: {
+        page: page,
+        per_page: perPage,
+      },
       errors: {
+        400: `Invalid pagination`,
         404: `Artifact not found`,
       },
     });
@@ -1582,78 +1549,40 @@ export class ArtifactsService {
     });
   }
   /**
-   * List all artifacts for a given execution
-   * @returns any List of artifacts for execution
+   * List a disclosure-eligible page of artifacts for a given execution.
+   * @returns PaginatedResponse_ArtifactSummary Eligible artifacts with exact totals
    * @throws ApiError
    */
   public static listArtifactsByExecution({
     executionId,
+    page,
+    perPage,
+    type,
   }: {
     /**
      * Execution ID
      */
     executionId: number;
-  }): CancelablePromise<{
-    data: Array<{
-      /**
-       * Classification used to distinguish runtime log artifacts from general artifacts.
-       */
-      classification: ArtifactClassification;
-      /**
-       * MIME content type
-       */
-      content_type?: string | null;
-      /**
-       * Creation timestamp
-       */
-      created: string;
-      /**
-       * Artifact ID
-       */
-      id: number;
-      /**
-       * Human-readable name
-       */
-      name?: string | null;
-      /**
-       * Owner identifier
-       */
-      owner: string;
-      /**
-       * Artifact reference
-       */
-      ref: string;
-      /**
-       * Owner scope
-       */
-      scope: OwnerType;
-      /**
-       * Size of latest version in bytes
-       */
-      size_bytes?: number | null;
-      /**
-       * Artifact type
-       */
-      type: ArtifactType;
-      /**
-       * Last update timestamp
-       */
-      updated: string;
-      /**
-       * Visibility level
-       */
-      visibility: ArtifactVisibility;
-    }>;
+    page?: number;
+    perPage?: number;
     /**
-     * Optional message
+     * Optional type filter, including bounded progress-artifact discovery.
      */
-    message?: string | null;
-  }> {
+    type?: null | ArtifactType;
+  }): CancelablePromise<PaginatedResponse_ArtifactSummary> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/executions/{execution_id}/artifacts",
       path: {
         execution_id: executionId,
+      },
+      query: {
+        page: page,
+        per_page: perPage,
+        type: type,
+      },
+      errors: {
+        400: `Invalid pagination`,
       },
     });
   }

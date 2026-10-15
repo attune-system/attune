@@ -16,7 +16,6 @@ use crate::models::{
 use crate::queue_definition::{
     validate_queue_reference_visibility_config, validate_work_queue_batch_settings,
     validate_work_queue_config, validate_work_queue_config_for_batch_mode,
-    validate_work_queue_item_schema,
 };
 use crate::schema::RefValidator;
 use crate::trace_tag::default_queue_item_trace_tag;
@@ -191,17 +190,84 @@ impl List for WorkQueueRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Create for WorkQueueRepository {
-    type CreateInput = CreateWorkQueueInput;
+impl WorkQueueRepository {
+    async fn validate_schema(
+        connection: &mut sqlx::PgConnection,
+        pack: Option<i64>,
+        reference: &str,
+        schema: &serde_json::Value,
+        candidate: Option<&crate::value_schema::RegistryView>,
+    ) -> Result<()> {
+        if let Some(pack) = pack {
+            super::schema_consumer::validate_fields(
+                connection,
+                pack,
+                reference,
+                &[("item_schema", Some(schema))],
+                candidate,
+            )
+            .await
+        } else {
+            super::schema_contract::SchemaContractRepository::materialize_unowned(
+                connection,
+                crate::value_schema::SourceIdentity::Authoring {
+                    component_ref: reference.into(),
+                },
+                crate::value_schema::SchemaContext::FlatDocument,
+                schema,
+            )
+            .await?;
+            Ok(())
+        }
+    }
 
-    async fn create<'e, E>(executor: E, input: Self::CreateInput) -> Result<Self::Entity>
+    pub fn create<'a, 'c, A>(
+        executor: A,
+        input: CreateWorkQueueInput,
+    ) -> impl std::future::Future<Output = Result<WorkQueue>> + Send + 'a
+    where
+        A: sqlx::Acquire<'c, Database = Postgres> + Send + 'a,
+    {
+        async move {
+            let mut connection = executor.acquire().await?;
+            let mut transaction = sqlx::Connection::begin(&mut *connection).await?;
+            let queue = Self::create_with_registry(&mut transaction, input, None).await?;
+            transaction.commit().await?;
+            Ok(queue)
+        }
+    }
+
+    pub(crate) async fn create_with_registry(
+        connection: &mut sqlx::PgConnection,
+        input: CreateWorkQueueInput,
+        candidate: Option<&crate::value_schema::RegistryView>,
+    ) -> Result<WorkQueue> {
+        Self::validate_schema(
+            connection,
+            input.pack,
+            &input.r#ref,
+            &input.item_schema,
+            candidate,
+        )
+        .await?;
+        let queue = Self::create_row(&mut *connection, input).await?;
+        super::schema_type::SchemaTypeRepository::replace_consumer_references(
+            connection,
+            queue.pack,
+            "queue",
+            &queue.r#ref,
+            &[("item_schema", Some(&queue.item_schema))],
+        )
+        .await?;
+        Ok(queue)
+    }
+
+    async fn create_row<'e, E>(executor: E, input: CreateWorkQueueInput) -> Result<WorkQueue>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
         RefValidator::validate_work_queue_ref(&input.r#ref)?;
         RefValidator::validate_component_ref(&input.dispatch_action_ref)?;
-        validate_work_queue_item_schema(&input.item_schema)?;
         crate::queue_definition::validate_work_queue_action_params(&input.action_params)?;
         validate_work_queue_config_for_batch_mode(input.batch_mode, &input.config)?;
         validate_queue_reference_visibility_config(
@@ -255,19 +321,81 @@ impl Create for WorkQueueRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Update for WorkQueueRepository {
-    type UpdateInput = UpdateWorkQueueInput;
+impl WorkQueueRepository {
+    pub fn update<'a, 'c, A>(
+        executor: A,
+        id: i64,
+        input: UpdateWorkQueueInput,
+    ) -> impl std::future::Future<Output = Result<WorkQueue>> + Send + 'a
+    where
+        A: sqlx::Acquire<'c, Database = Postgres> + Send + 'a,
+    {
+        async move {
+            let mut connection = executor.acquire().await?;
+            let mut transaction = sqlx::Connection::begin(&mut *connection).await?;
+            let queue = Self::update_with_registry(&mut transaction, id, input, None).await?;
+            transaction.commit().await?;
+            Ok(queue)
+        }
+    }
 
-    async fn update<'e, E>(executor: E, id: i64, input: Self::UpdateInput) -> Result<Self::Entity>
+    pub(crate) async fn update_with_registry(
+        connection: &mut sqlx::PgConnection,
+        id: i64,
+        input: UpdateWorkQueueInput,
+        candidate: Option<&crate::value_schema::RegistryView>,
+    ) -> Result<WorkQueue> {
+        super::schema_type::SchemaTypeRepository::lock_selection(&mut *connection).await?;
+        sqlx::query("SELECT id FROM work_queue WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .execute(&mut *connection)
+            .await?;
+        let existing = Self::get_by_id(&mut *connection, id).await?;
+        let pack = match &input.pack {
+            Some(Patch::Set(pack)) => Some(*pack),
+            Some(Patch::Clear) => None,
+            None => existing.pack,
+        };
+        Self::validate_schema(
+            connection,
+            pack,
+            &existing.r#ref,
+            input.item_schema.as_ref().unwrap_or(&existing.item_schema),
+            candidate,
+        )
+        .await?;
+        let queue = Self::update_row(&mut *connection, id, input).await?;
+        if existing.pack != queue.pack {
+            super::schema_type::SchemaTypeRepository::replace_consumer_references(
+                connection,
+                existing.pack,
+                "queue",
+                &queue.r#ref,
+                &[("item_schema", None)],
+            )
+            .await?;
+        }
+        super::schema_type::SchemaTypeRepository::replace_consumer_references(
+            connection,
+            queue.pack,
+            "queue",
+            &queue.r#ref,
+            &[("item_schema", Some(&queue.item_schema))],
+        )
+        .await?;
+        Ok(queue)
+    }
+
+    async fn update_row<'e, E>(
+        executor: E,
+        id: i64,
+        input: UpdateWorkQueueInput,
+    ) -> Result<WorkQueue>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
         if let Some(dispatch_action_ref) = &input.dispatch_action_ref {
             RefValidator::validate_component_ref(dispatch_action_ref)?;
-        }
-        if let Some(item_schema) = &input.item_schema {
-            validate_work_queue_item_schema(item_schema)?;
         }
         if let Some(action_params) = &input.action_params {
             crate::queue_definition::validate_work_queue_action_params(action_params)?;
@@ -524,7 +652,11 @@ impl Delete for WorkQueueRepository {
              ), deleted AS ( \
                  DELETE FROM work_queue \
                  WHERE id = $1 AND NOT (SELECT blocked FROM target) \
-                 RETURNING 1 \
+                 RETURNING pack, ref \
+             ), removed_edges AS ( \
+                 DELETE FROM schema_type_reference edge USING deleted \
+                 WHERE edge.source_pack IS NOT DISTINCT FROM deleted.pack AND edge.source_ref = deleted.ref \
+                   AND edge.source_kind = 'queue' \
              ) \
              SELECT target.exists, target.blocked, EXISTS (SELECT 1 FROM deleted) AS deleted \
              FROM target",
@@ -543,6 +675,41 @@ impl Delete for WorkQueueRepository {
 }
 
 impl WorkQueueRepository {
+    pub async fn find_by_id_for_share(
+        connection: &mut PgConnection,
+        queue_id: Id,
+    ) -> Result<Option<WorkQueue>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {WORK_QUEUE_SELECT_COLUMNS} FROM work_queue WHERE id = $1 FOR SHARE"
+        ))
+        .bind(queue_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+    pub async fn item_schema_source(
+        connection: &mut PgConnection,
+        queue_id: Id,
+    ) -> Result<crate::value_schema::SourceIdentity> {
+        let (queue_ref, is_adhoc, release, digest): (String, bool, Option<Id>, Option<String>) = sqlx::query_as(
+            "SELECT q.ref, q.is_adhoc, q.managed_release, r.digest FROM work_queue q LEFT JOIN pack_release r ON r.id = q.managed_release WHERE q.id = $1 FOR SHARE OF q"
+        ).bind(queue_id).fetch_one(connection).await?;
+        if is_adhoc {
+            Ok(crate::value_schema::SourceIdentity::Assigned {
+                component_ref: queue_ref,
+                assignment_id: Uuid::new_v4(),
+            })
+        } else {
+            Ok(crate::value_schema::SourceIdentity::Released {
+                component_ref: queue_ref,
+                release_id: release.ok_or_else(|| {
+                    crate::Error::validation("Queue schema has no immutable source release")
+                })?,
+                release_digest: digest.ok_or_else(|| {
+                    crate::Error::validation("Queue schema source release is unavailable")
+                })?,
+            })
+        }
+    }
     pub async fn find_by_ref_including_retired<'e, E>(
         executor: E,
         ref_str: &str,
@@ -900,6 +1067,27 @@ impl Create for WorkQueueItemRepository {
 }
 
 impl WorkQueueItemRepository {
+    pub async fn create_bound_pinned<'e, E>(
+        executor: E,
+        input: CreateWorkQueueItemInput,
+        snapshot: &crate::models::ExecutionExecutableSnapshot,
+        binding: &crate::value_schema::ValueSchemaBinding,
+    ) -> Result<WorkQueueItem>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        binding
+            .validate(crate::value_schema::SchemaContext::FlatDocument)
+            .map_err(|error| {
+                crate::Error::validation(format!("Invalid queue item admission contract: {error}"))
+            })?;
+        if binding.contract.source.component_ref() != input.queue_ref {
+            return Err(crate::Error::validation(
+                "Queue payload contract does not match its owner",
+            ));
+        }
+        Self::create_with_snapshot_and_binding(executor, input, Some(snapshot), Some(binding)).await
+    }
     pub async fn create_pinned<'e, E>(
         executor: E,
         input: CreateWorkQueueItemInput,
@@ -919,6 +1107,18 @@ impl WorkQueueItemRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        Self::create_with_snapshot_and_binding(executor, input, snapshot, None).await
+    }
+
+    async fn create_with_snapshot_and_binding<'e, E>(
+        executor: E,
+        input: CreateWorkQueueItemInput,
+        snapshot: Option<&crate::models::ExecutionExecutableSnapshot>,
+        binding: Option<&crate::value_schema::ValueSchemaBinding>,
+    ) -> Result<WorkQueueItem>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let mut input = input;
         if input.trace_tag.is_none() {
             input.trace_tag = Some(default_queue_item_trace_tag(
@@ -931,8 +1131,8 @@ impl WorkQueueItemRepository {
               (queue, queue_ref, pack_release, pack_release_digest, executable_snapshot, item_key, priority, status, payload, metadata, trace_tag, enqueue_source, \
               requested_by_identity, requested_by_execution, requested_by_enforcement, \
               leased_execution, lease_token, lease_expires_at, attempt_count, last_error, \
-              ack_summary) \
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
+               ack_summary, schema_binding) \
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
              RETURNING {}",
             WORK_QUEUE_ITEM_SELECT_COLUMNS
         );
@@ -959,6 +1159,7 @@ impl WorkQueueItemRepository {
             .bind(input.attempt_count)
             .bind(&input.last_error)
             .bind(&input.ack_summary)
+            .bind(binding.map(sqlx::types::Json))
             .fetch_one(executor)
             .await
             .map_err(Into::into)

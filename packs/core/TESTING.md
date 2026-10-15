@@ -141,34 +141,26 @@ python3 ./packs/core/actions/http_request.py
 
 ## Testing Sensors
 
-Sensors receive configuration via environment variables prefixed with `ATTUNE_SENSOR_`.
+Connection metadata stays in the environment. Sensor settings and initial rule
+configurations arrive in one stdin JSON object. The bundled timer is a native
+process, not the former Python interval sensor.
 
-### Test `core.interval_timer_sensor`
+### Test the timer bootstrap
 
 ```bash
-# Create test trigger instances JSON
-export ATTUNE_SENSOR_TRIGGERS='[
-  {
-    "id": 1,
-    "ref": "core.intervaltimer",
-    "config": {
-      "unit": "seconds",
-      "interval": 5
-    }
-  }
-]'
-
-# Run sensor (will output events every 5 seconds)
-python3 ./packs/core/sensors/interval_timer_sensor.py
+# Requires API/notifier connection metadata and a token for a current admitted
+# core.timer_sensor workload. RULE_ID must identify its enabled interval rule.
+jq -n --argjson id "$RULE_ID" '{
+  config: {},
+  triggers: [{id: $id, ref: "core.local_timer", trigger_ref: "core.intervaltimer",
+    config: {unit: "seconds", interval: 5}}]
+}' | attune-core-timer-sensor
 ```
 
-**Expected Output:**
-```
-Interval Timer Sensor started (check_interval=1s)
-{"type": "interval", "interval_seconds": 5, "fired_at": "2024-01-20T12:00:00Z", "execution_count": 1, "sensor_ref": "core.interval_timer_sensor", "trigger_instance_id": 1, "trigger_ref": "core.intervaltimer"}
-{"type": "interval", "interval_seconds": 5, "fired_at": "2024-01-20T12:00:05Z", "execution_count": 2, "sensor_ref": "core.interval_timer_sensor", "trigger_instance_id": 1, "trigger_ref": "core.intervaltimer"}
-...
-```
+The process logs startup and sends timer events through the API every five
+seconds. Stdout is a log stream, not an event transport. Check the Events page or
+event API for `core.intervaltimer`. Build the binary and configure connection
+metadata as described in `crates/core-timer-sensor/README.md`.
 
 Press `Ctrl+C` to stop the sensor.
 
@@ -177,29 +169,17 @@ Press `Ctrl+C` to stop the sensor.
 ## Testing with Multiple Trigger Instances
 
 ```bash
-# Test multiple timers
-export ATTUNE_SENSOR_TRIGGERS='[
-  {
-    "id": 1,
-    "ref": "core.intervaltimer",
-    "config": {"unit": "seconds", "interval": 3}
-  },
-  {
-    "id": 2,
-    "ref": "core.intervaltimer",
-    "config": {"unit": "seconds", "interval": 5}
-  },
-  {
-    "id": 3,
-    "ref": "core.intervaltimer",
-    "config": {"unit": "seconds", "interval": 10}
-  }
-]'
-
-python3 ./packs/core/sensors/interval_timer_sensor.py
+# These must be enabled rule IDs belonging to the same admitted workload.
+jq -n --argjson first "$FIRST_RULE_ID" --argjson second "$SECOND_RULE_ID" '{
+  config: {},
+  triggers: [
+    {id: $first, trigger_ref: "core.intervaltimer", config: {unit: "seconds", interval: 3}},
+    {id: $second, trigger_ref: "core.intervaltimer", config: {unit: "seconds", interval: 5}}
+  ]
+}' | attune-core-timer-sensor
 ```
 
-You should see events firing at different intervals (3s, 5s, 10s).
+Events should arrive at independent three-second and five-second intervals.
 
 ---
 

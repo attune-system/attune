@@ -20,17 +20,10 @@ import type {
   ActionSummary,
   ExecutionSummary,
   PermissionSetSummary,
-  UpdateActionRequest,
   WorkerToleration,
   WorkerAffinity,
 } from "@/api";
-import {
-  ActionReferenceVisibility,
-  LogRetentionLimitPatch,
-  LogRetentionPolicyPatch,
-  RetentionPolicyType,
-  TimeoutSecondsPatch,
-} from "@/api";
+import { ActionReferenceVisibility, RetentionPolicyType } from "@/api";
 import type { ParamSchemaProperty } from "@/components/common/ParamSchemaForm";
 import {
   ChevronDown,
@@ -674,7 +667,7 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
                               <span className="font-mono font-semibold text-sm">
                                 {key}
                               </span>
-                              {param?.required && (
+                              {param?.required === true && (
                                 <span className="text-xs px-2 py-0.5 bg-red-100 text-red-700 rounded">
                                   Required
                                 </span>
@@ -736,7 +729,7 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
                               <span className="font-mono font-semibold text-sm">
                                 {key}
                               </span>
-                              {param?.required && (
+                              {param?.required === true && (
                                 <span className="text-xs px-2 py-0.5 bg-red-100 text-red-700 rounded">
                                   Required
                                 </span>
@@ -1262,39 +1255,29 @@ function ConfigureActionModal({
           worker_affinity: hasAffinity ? affinity : null,
           log_retention_policy: logRetention.policy
             ? {
-                op: LogRetentionPolicyPatch.op.SET,
+                op: "set",
                 value: logRetention.policy as RetentionPolicyType,
               }
-            : ({
-                op: "clear",
-              } as unknown as UpdateActionRequest["log_retention_policy"]),
+            : { op: "clear" },
           log_retention_limit: logRetention.limit
-            ? { op: LogRetentionLimitPatch.op.SET, value: logRetention.limit }
-            : ({
-                op: "clear",
-              } as unknown as UpdateActionRequest["log_retention_limit"]),
+            ? { op: "set", value: logRetention.limit }
+            : { op: "clear" },
           artifact_retention_policy: artifactRetention.policy
             ? {
-                op: LogRetentionPolicyPatch.op.SET,
+                op: "set",
                 value: artifactRetention.policy as RetentionPolicyType,
               }
-            : ({
-                op: "clear",
-              } as unknown as UpdateActionRequest["artifact_retention_policy"]),
+            : { op: "clear" },
           artifact_retention_limit: artifactRetention.limit
             ? {
-                op: LogRetentionLimitPatch.op.SET,
+                op: "set",
                 value: artifactRetention.limit,
               }
-            : ({
-                op: "clear",
-              } as unknown as UpdateActionRequest["artifact_retention_limit"]),
+            : { op: "clear" },
           timeout_seconds:
             timeoutSeconds && timeoutSeconds > 0
-              ? { op: TimeoutSecondsPatch.op.SET, value: timeoutSeconds }
-              : ({
-                  op: "clear",
-                } as unknown as UpdateActionRequest["timeout_seconds"]),
+              ? { op: "set", value: timeoutSeconds }
+              : { op: "clear" },
           // Preserve fields we don't edit in this modal
           runtime: action.runtime ?? null,
           required_worker_runtimes: action.required_worker_runtimes ?? {},

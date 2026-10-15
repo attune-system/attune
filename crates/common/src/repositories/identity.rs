@@ -181,6 +181,17 @@ impl Delete for IdentityRepository {
 }
 
 impl IdentityRepository {
+    pub async fn find_attributes_by_id<'e, E>(executor: E, id: Id) -> Result<Option<JsonDict>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar("SELECT attributes FROM identity WHERE id = $1")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     /// One statement provides a consistent current identity/assignment snapshot.
     pub async fn authorization_state(
         pool: &PgPool,

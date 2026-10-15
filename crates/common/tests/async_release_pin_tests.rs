@@ -28,7 +28,7 @@ use attune_common::{
             WorkQueueItemRepository, WorkQueueRepository,
         },
         workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
-        Create, FindById, Update,
+        Create, FindById,
     },
 };
 use chrono::{Duration, Utc};

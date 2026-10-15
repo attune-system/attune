@@ -66,17 +66,58 @@ fn default_item_schema() -> JsonValue {
 }
 
 pub fn parse_work_queue_definition_yaml(content: &str) -> Result<WorkQueueDefinition> {
-    let definition: WorkQueueDefinition = serde_yaml_ng::from_str(content).map_err(|e| {
-        Error::validation(format!("Failed to parse work queue YAML definition: {}", e))
-    })?;
-    validate_work_queue_definition(&definition)?;
+    parse_work_queue_definition_yaml_with_registry(
+        content,
+        &crate::value_schema::RegistryView::new(),
+    )
+}
+
+pub fn parse_work_queue_definition_yaml_with_registry(
+    content: &str,
+    registry: &crate::value_schema::RegistryView,
+) -> Result<WorkQueueDefinition> {
+    let definition = parse_work_queue_definition_metadata(content)?;
+    validate_work_queue_item_schema_with_registry(&definition.item_schema, registry)?;
+    Ok(definition)
+}
+
+/// Offline checking validates metadata and schema syntax without inventing
+/// bodies for unresolved external types. Deployment always uses the registry
+/// parser above before it mutates a queue.
+pub(crate) fn parse_work_queue_definition_metadata(content: &str) -> Result<WorkQueueDefinition> {
+    let value = serde_yaml_ng::from_str(content)
+        .map_err(|error| crate::pack_registry::diagnostics::yaml_error("queue metadata", &error))?;
+    let definition: WorkQueueDefinition =
+        crate::pack_registry::diagnostics::decode_yaml_value("queue metadata", "", value)?;
+    crate::value_schema::inspect_definition(
+        crate::value_schema::SchemaContext::FlatDocument,
+        &definition.item_schema,
+        crate::value_schema::Limits::default(),
+    )
+    .map_err(|error| Error::validation(format!("Invalid item_schema: {error}")))?;
+    validate_work_queue_metadata(&definition)?;
     Ok(definition)
 }
 
 pub fn validate_work_queue_definition(definition: &WorkQueueDefinition) -> Result<WorkQueueConfig> {
+    validate_work_queue_definition_with_registry(
+        definition,
+        &crate::value_schema::RegistryView::new(),
+    )
+}
+
+pub fn validate_work_queue_definition_with_registry(
+    definition: &WorkQueueDefinition,
+    registry: &crate::value_schema::RegistryView,
+) -> Result<WorkQueueConfig> {
+    let config = validate_work_queue_metadata(definition)?;
+    validate_work_queue_item_schema_with_registry(&definition.item_schema, registry)?;
+    Ok(config)
+}
+
+fn validate_work_queue_metadata(definition: &WorkQueueDefinition) -> Result<WorkQueueConfig> {
     RefValidator::validate_work_queue_ref(&definition.r#ref)?;
     RefValidator::validate_component_ref(&definition.dispatch_action)?;
-    validate_work_queue_item_schema(&definition.item_schema)?;
     validate_work_queue_action_params(&definition.action_params)?;
     validate_permission_set_refs(definition.permission_set_refs.as_deref())?;
     validate_trace_tag_template(definition.trace_tag_template.as_deref())?;
@@ -147,11 +188,31 @@ fn validate_trace_tag_template(trace_tag_template: Option<&str>) -> Result<()> {
 }
 
 pub fn validate_work_queue_item_schema(item_schema: &JsonValue) -> Result<()> {
+    validate_work_queue_item_schema_with_registry(
+        item_schema,
+        &crate::value_schema::RegistryView::new(),
+    )
+}
+
+pub fn validate_work_queue_item_schema_with_registry(
+    item_schema: &JsonValue,
+    registry: &crate::value_schema::RegistryView,
+) -> Result<()> {
     if !item_schema.is_object() {
         return Err(Error::validation(
             "item_schema must be a JSON object using the flat trigger-style schema format",
         ));
     }
+    crate::value_schema::compile(
+        crate::value_schema::SourceIdentity::Authoring {
+            component_ref: "queue.item_schema".into(),
+        },
+        crate::value_schema::SchemaContext::FlatDocument,
+        item_schema,
+        registry,
+        crate::value_schema::Limits::default(),
+    )
+    .map_err(|error| Error::validation(format!("Invalid item_schema: {error}")))?;
     Ok(())
 }
 
@@ -326,6 +387,26 @@ mod tests {
         validate_work_queue_config_for_batch_mode, validate_work_queue_item_schema,
     };
     use crate::models::{WorkQueueBatchMode, WorkQueueUpdateStrategy};
+
+    #[test]
+    fn named_queue_items_require_an_explicit_validated_registry() {
+        use crate::value_schema::{RegistryEntry, RegistryView};
+        let source = "ref: fixture.inbox\nlabel: Inbox\ndispatch_action: fixture.consume\nitem_schema:\n  token:\n    type: fixture.token\n";
+        assert!(parse_work_queue_definition_yaml(source).is_err());
+        let mut registry = RegistryView::new();
+        registry.insert(
+            "fixture.token".into(),
+            RegistryEntry::Candidate(json!({"type":"string","secret":true})),
+        );
+        let definition =
+            super::parse_work_queue_definition_yaml_with_registry(source, &registry).unwrap();
+        assert_eq!(definition.item_schema["token"]["type"], "fixture.token");
+        registry.insert(
+            "fixture.token".into(),
+            RegistryEntry::Candidate(json!({"type":"integer","secret":true})),
+        );
+        assert!(super::parse_work_queue_definition_yaml_with_registry(source, &registry).is_err());
+    }
 
     #[test]
     fn parses_valid_work_queue_definition() {
@@ -553,5 +634,20 @@ permission_set_refs:
         assert!(error
             .to_string()
             .contains("item_schema must be a JSON object"));
+    }
+
+    #[test]
+    fn item_schema_checks_definition_constraints_not_just_outer_shape() {
+        assert!(validate_work_queue_item_schema(
+            &json!({"value": {"type": "integer", "default": "invalid"}})
+        )
+        .is_err());
+        assert!(
+            validate_work_queue_item_schema(&json!({"type": "object", "properties": {}})).is_err()
+        );
+        assert!(validate_work_queue_item_schema(
+            &json!({"value": {"anyOf": [{"type": "integer"}, {"type": "string"}]}})
+        )
+        .is_ok());
     }
 }

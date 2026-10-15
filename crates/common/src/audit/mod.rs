@@ -78,6 +78,9 @@ pub mod event_type {
         pub const ROLE_ASSIGNMENT_CHANGED: &str = "admin.role_assignment.changed";
         pub const PERMISSION_SET_CHANGED: &str = "admin.permission_set.changed";
         pub const PERMISSION_ASSIGNMENT_CHANGED: &str = "admin.permission_assignment.changed";
+        pub const RUNTIME_APPROVAL_ISSUED: &str = "admin.runtime_approval.issued";
+        pub const RUNTIME_APPROVAL_REPLACED: &str = "admin.runtime_approval.replaced";
+        pub const RUNTIME_APPROVAL_REVOKED: &str = "admin.runtime_approval.revoked";
         pub const SECURITY_CONFIG_CHANGED: &str = "admin.security_config.changed";
     }
 
@@ -132,6 +135,7 @@ pub mod event_type {
     }
 
     pub mod inquiry {
+        pub const SECRET_VALUES_DISCLOSED: &str = "inquiry.secret_values.disclosed";
         pub const HUMAN_RESPONSE_ACCEPTED: &str = "inquiry.human_response.accepted";
         pub const CALLBACK_RESPONSE_ACCEPTED: &str = "inquiry.callback_response.accepted";
     }

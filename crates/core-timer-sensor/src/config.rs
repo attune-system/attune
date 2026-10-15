@@ -1,10 +1,9 @@
 //! Configuration module for timer sensor
 //!
-//! Supports loading configuration from environment variables or stdin JSON.
+//! Connection metadata for the managed timer process. Business values use stdin.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 
 /// Sensor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,16 +75,6 @@ impl SensorConfig {
             log_level,
             log_format,
         })
-    }
-
-    /// Load configuration from stdin JSON
-    pub async fn from_stdin() -> Result<Self> {
-        let mut buffer = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buffer)
-            .context("Failed to read configuration from stdin")?;
-
-        serde_json::from_str(&buffer).context("Failed to parse JSON configuration from stdin")
     }
 
     /// Validate configuration

@@ -6,6 +6,7 @@ import ParamSchemaForm, {
   type ParamSchema,
 } from "@/components/common/ParamSchemaForm";
 import { useRequestExecution } from "@/hooks/useExecutions";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 interface RunWorkflowModalProps {
   /** The workflow's action ref (e.g., "examples.hello_workflow") */
@@ -54,6 +55,10 @@ export default function RunWorkflowModal({
     useState<Record<string, unknown>>(buildInitialValues);
   const [paramErrors, setParamErrors] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  const [previewDigest, setPreviewDigest] = useState<string | undefined>();
+  const [acceptedExecutionId, setAcceptedExecutionId] = useState<number | null>(
+    null,
+  );
   const [phase, setPhase] = useState<"idle" | "saving" | "executing">("idle");
 
   const isSubmitting = phase !== "idle";
@@ -83,11 +88,11 @@ export default function RunWorkflowModal({
     // Phase 2: Execute
     setPhase("executing");
     try {
-      // Strip out empty-string values so the backend applies schema defaults
-      // for parameters the user left blank.
+      // Only missing values receive defaults. Preserve explicit empty strings,
+      // null, false, and zero across the admission boundary.
       const cleanedParams: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(parameters)) {
-        if (value !== "" && value !== undefined) {
+        if (value !== undefined) {
           cleanedParams[key] = value;
         }
       }
@@ -97,18 +102,44 @@ export default function RunWorkflowModal({
         parameters: cleanedParams,
       });
       const executionId = response.data.id;
+      const binding: unknown = response.data.schema_binding;
+      const acceptedDigest =
+        typeof binding === "object" &&
+        binding !== null &&
+        "input_digest" in binding
+          ? binding.input_digest
+          : undefined;
 
       // Open execution in new tab and close the modal
       window.open(`/executions/${executionId}`, "_blank");
-      onClose();
+      if (
+        previewDigest !== undefined &&
+        typeof acceptedDigest === "string" &&
+        previewDigest !== acceptedDigest
+      ) {
+        setAcceptedExecutionId(executionId);
+        setPhase("idle");
+      } else {
+        onClose();
+      }
     } catch (err: unknown) {
-      const e = err as { body?: { message?: string }; message?: string };
-      const message =
-        e?.body?.message || e?.message || "Failed to start execution";
-      setError(message);
+      const summary = safeErrorSummary(err);
+      setError(
+        summary.status === undefined
+          ? "Failed to start execution"
+          : `Failed to start execution. HTTP ${summary.status}.`,
+      );
       setPhase("idle");
     }
-  }, [paramSchema, parameters, onSave, actionRef, requestExecution, onClose]);
+  }, [
+    paramSchema,
+    parameters,
+    onSave,
+    actionRef,
+    requestExecution,
+    onClose,
+    previewDigest,
+  ]);
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
@@ -134,6 +165,15 @@ export default function RunWorkflowModal({
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-5 py-4">
+          {acceptedExecutionId !== null && (
+            <div
+              role="status"
+              className="mb-4 p-3 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg text-sm"
+            >
+              The accepted input contract differs from the form preview.
+              Execution {acceptedExecutionId} uses the server-selected contract.
+            </div>
+          )}
           {error && (
             <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">
               {error}
@@ -152,6 +192,8 @@ export default function RunWorkflowModal({
               values={parameters}
               onChange={setParameters}
               errors={paramErrors}
+              onPreviewDigest={setPreviewDigest}
+              disabled={isSubmitting || acceptedExecutionId !== null}
             />
           </div>
         </div>
@@ -163,11 +205,11 @@ export default function RunWorkflowModal({
             disabled={isSubmitting}
             className="px-4 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 transition-colors"
           >
-            Cancel
+            {acceptedExecutionId === null ? "Cancel" : "Close"}
           </button>
           <button
             onClick={handleExecute}
-            disabled={isSubmitting}
+            disabled={isSubmitting || acceptedExecutionId !== null}
             className="flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium text-white bg-green-600 rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
           >
             {phase === "saving" ? (

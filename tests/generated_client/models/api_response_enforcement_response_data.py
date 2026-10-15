@@ -19,8 +19,14 @@ if TYPE_CHECKING:
     from ..models.api_response_enforcement_response_data_config_type_0 import (
         ApiResponseEnforcementResponseDataConfigType0,
     )
+    from ..models.api_response_enforcement_response_data_input_contract_type_0 import (
+        ApiResponseEnforcementResponseDataInputContractType0,
+    )
     from ..models.api_response_enforcement_response_data_payload import (
         ApiResponseEnforcementResponseDataPayload,
+    )
+    from ..models.api_response_enforcement_response_data_payload_contract_type_0 import (
+        ApiResponseEnforcementResponseDataPayloadContractType0,
     )
 
 
@@ -42,6 +48,10 @@ class ApiResponseEnforcementResponseData:
         status (EnforcementStatus):
         trigger_ref (str): Trigger reference Example: system.error_event.
         event (int | None | Unset):
+        input_contract (ApiResponseEnforcementResponseDataInputContractType0 | None | Unset): Stored action input
+            contract, without static executable metadata.
+        payload_contract (ApiResponseEnforcementResponseDataPayloadContractType0 | None | Unset): Original event payload
+            contract, when its admission record is retained.
         resolved_at (datetime.datetime | None | Unset): Timestamp when the enforcement was resolved (status changed from
             created to processed/disabled) Example: 2024-01-13T10:30:01Z.
         rule (int | None | Unset):
@@ -59,6 +69,12 @@ class ApiResponseEnforcementResponseData:
     status: EnforcementStatus
     trigger_ref: str
     event: int | None | Unset = UNSET
+    input_contract: (
+        ApiResponseEnforcementResponseDataInputContractType0 | None | Unset
+    ) = UNSET
+    payload_contract: (
+        ApiResponseEnforcementResponseDataPayloadContractType0 | None | Unset
+    ) = UNSET
     resolved_at: datetime.datetime | None | Unset = UNSET
     rule: int | None | Unset = UNSET
     trace_tag: None | str | Unset = UNSET
@@ -67,6 +83,12 @@ class ApiResponseEnforcementResponseData:
     def to_dict(self) -> dict[str, Any]:
         from ..models.api_response_enforcement_response_data_config_type_0 import (
             ApiResponseEnforcementResponseDataConfigType0,
+        )
+        from ..models.api_response_enforcement_response_data_input_contract_type_0 import (
+            ApiResponseEnforcementResponseDataInputContractType0,
+        )
+        from ..models.api_response_enforcement_response_data_payload_contract_type_0 import (
+            ApiResponseEnforcementResponseDataPayloadContractType0,
         )
 
         condition = self.condition.value
@@ -96,6 +118,27 @@ class ApiResponseEnforcementResponseData:
             event = UNSET
         else:
             event = self.event
+
+        input_contract: dict[str, Any] | None | Unset
+        if isinstance(self.input_contract, Unset):
+            input_contract = UNSET
+        elif isinstance(
+            self.input_contract, ApiResponseEnforcementResponseDataInputContractType0
+        ):
+            input_contract = self.input_contract.to_dict()
+        else:
+            input_contract = self.input_contract
+
+        payload_contract: dict[str, Any] | None | Unset
+        if isinstance(self.payload_contract, Unset):
+            payload_contract = UNSET
+        elif isinstance(
+            self.payload_contract,
+            ApiResponseEnforcementResponseDataPayloadContractType0,
+        ):
+            payload_contract = self.payload_contract.to_dict()
+        else:
+            payload_contract = self.payload_contract
 
         resolved_at: None | str | Unset
         if isinstance(self.resolved_at, Unset):
@@ -134,6 +177,10 @@ class ApiResponseEnforcementResponseData:
         )
         if event is not UNSET:
             field_dict["event"] = event
+        if input_contract is not UNSET:
+            field_dict["input_contract"] = input_contract
+        if payload_contract is not UNSET:
+            field_dict["payload_contract"] = payload_contract
         if resolved_at is not UNSET:
             field_dict["resolved_at"] = resolved_at
         if rule is not UNSET:
@@ -151,8 +198,14 @@ class ApiResponseEnforcementResponseData:
         from ..models.api_response_enforcement_response_data_config_type_0 import (
             ApiResponseEnforcementResponseDataConfigType0,
         )
+        from ..models.api_response_enforcement_response_data_input_contract_type_0 import (
+            ApiResponseEnforcementResponseDataInputContractType0,
+        )
         from ..models.api_response_enforcement_response_data_payload import (
             ApiResponseEnforcementResponseDataPayload,
+        )
+        from ..models.api_response_enforcement_response_data_payload_contract_type_0 import (
+            ApiResponseEnforcementResponseDataPayloadContractType0,
         )
 
         d = dict(src_dict)
@@ -202,6 +255,56 @@ class ApiResponseEnforcementResponseData:
 
         event = _parse_event(d.pop("event", UNSET))
 
+        def _parse_input_contract(
+            data: object,
+        ) -> ApiResponseEnforcementResponseDataInputContractType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                input_contract_type_0 = (
+                    ApiResponseEnforcementResponseDataInputContractType0.from_dict(data)
+                )
+
+                return input_contract_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                ApiResponseEnforcementResponseDataInputContractType0 | None | Unset,
+                data,
+            )
+
+        input_contract = _parse_input_contract(d.pop("input_contract", UNSET))
+
+        def _parse_payload_contract(
+            data: object,
+        ) -> ApiResponseEnforcementResponseDataPayloadContractType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                payload_contract_type_0 = (
+                    ApiResponseEnforcementResponseDataPayloadContractType0.from_dict(
+                        data
+                    )
+                )
+
+                return payload_contract_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                ApiResponseEnforcementResponseDataPayloadContractType0 | None | Unset,
+                data,
+            )
+
+        payload_contract = _parse_payload_contract(d.pop("payload_contract", UNSET))
+
         def _parse_resolved_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
                 return data
@@ -248,6 +351,8 @@ class ApiResponseEnforcementResponseData:
             status=status,
             trigger_ref=trigger_ref,
             event=event,
+            input_contract=input_contract,
+            payload_contract=payload_contract,
             resolved_at=resolved_at,
             rule=rule,
             trace_tag=trace_tag,

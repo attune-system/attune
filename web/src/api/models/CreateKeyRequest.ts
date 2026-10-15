@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { OwnerType } from "./OwnerType";
+import type { Value } from "./Value";
 /**
  * Request to create a new key/secret
  */
@@ -40,7 +41,12 @@ export type CreateKeyRequest = {
    */
   owner_type: OwnerType;
   /**
+   * Optional preview comparison, never a contract/revision selector.
+   */
+  schema_digest?: string | null;
+  /**
    * The secret value to store. Can be a string, object, array, number, or boolean.
    */
   value: any;
+  value_schema?: null | Value;
 };

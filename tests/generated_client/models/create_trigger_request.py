@@ -11,6 +11,9 @@ from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.create_trigger_request_event_config_schema_type_0 import (
+        CreateTriggerRequestEventConfigSchemaType0,
+    )
     from ..models.create_trigger_request_out_schema_type_0 import (
         CreateTriggerRequestOutSchemaType0,
     )
@@ -31,6 +34,8 @@ class CreateTriggerRequest:
         ref (str): Unique reference identifier (e.g., "core.webhook", "system.timer") Example: core.webhook.
         description (None | str | Unset): Trigger description Example: Triggers when a webhook is received.
         enabled (bool | Unset): Whether the trigger is enabled Example: True.
+        event_config_schema (CreateTriggerRequestEventConfigSchemaType0 | None | Unset): Flat schema for sensor-supplied
+            event configuration, not trigger-instance parameters.
         out_schema (CreateTriggerRequestOutSchemaType0 | None | Unset): Output schema (flat format) defining event data
             structure with inline required/secret
         pack_ref (None | str | Unset): Optional pack reference this trigger belongs to Example: core.
@@ -45,6 +50,9 @@ class CreateTriggerRequest:
     ref: str
     description: None | str | Unset = UNSET
     enabled: bool | Unset = UNSET
+    event_config_schema: CreateTriggerRequestEventConfigSchemaType0 | None | Unset = (
+        UNSET
+    )
     out_schema: CreateTriggerRequestOutSchemaType0 | None | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
     param_schema: CreateTriggerRequestParamSchemaType0 | None | Unset = UNSET
@@ -55,6 +63,9 @@ class CreateTriggerRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.create_trigger_request_event_config_schema_type_0 import (
+            CreateTriggerRequestEventConfigSchemaType0,
+        )
         from ..models.create_trigger_request_out_schema_type_0 import (
             CreateTriggerRequestOutSchemaType0,
         )
@@ -73,6 +84,16 @@ class CreateTriggerRequest:
             description = self.description
 
         enabled = self.enabled
+
+        event_config_schema: dict[str, Any] | None | Unset
+        if isinstance(self.event_config_schema, Unset):
+            event_config_schema = UNSET
+        elif isinstance(
+            self.event_config_schema, CreateTriggerRequestEventConfigSchemaType0
+        ):
+            event_config_schema = self.event_config_schema.to_dict()
+        else:
+            event_config_schema = self.event_config_schema
 
         out_schema: dict[str, Any] | None | Unset
         if isinstance(self.out_schema, Unset):
@@ -120,6 +141,8 @@ class CreateTriggerRequest:
             field_dict["description"] = description
         if enabled is not UNSET:
             field_dict["enabled"] = enabled
+        if event_config_schema is not UNSET:
+            field_dict["event_config_schema"] = event_config_schema
         if out_schema is not UNSET:
             field_dict["out_schema"] = out_schema
         if pack_ref is not UNSET:
@@ -135,6 +158,9 @@ class CreateTriggerRequest:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.create_trigger_request_event_config_schema_type_0 import (
+            CreateTriggerRequestEventConfigSchemaType0,
+        )
         from ..models.create_trigger_request_out_schema_type_0 import (
             CreateTriggerRequestOutSchemaType0,
         )
@@ -157,6 +183,29 @@ class CreateTriggerRequest:
         description = _parse_description(d.pop("description", UNSET))
 
         enabled = d.pop("enabled", UNSET)
+
+        def _parse_event_config_schema(
+            data: object,
+        ) -> CreateTriggerRequestEventConfigSchemaType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                event_config_schema_type_0 = (
+                    CreateTriggerRequestEventConfigSchemaType0.from_dict(data)
+                )
+
+                return event_config_schema_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CreateTriggerRequestEventConfigSchemaType0 | None | Unset, data)
+
+        event_config_schema = _parse_event_config_schema(
+            d.pop("event_config_schema", UNSET)
+        )
 
         def _parse_out_schema(
             data: object,
@@ -237,6 +286,7 @@ class CreateTriggerRequest:
             ref=ref,
             description=description,
             enabled=enabled,
+            event_config_schema=event_config_schema,
             out_schema=out_schema,
             pack_ref=pack_ref,
             param_schema=param_schema,

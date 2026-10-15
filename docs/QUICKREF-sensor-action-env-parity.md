@@ -17,7 +17,7 @@ Both sensors and actions receive standard environment variables that provide exe
 | **API Base URL** | `ATTUNE_API_URL` | `ATTUNE_API_URL` | ✅ Same variable name |
 | **Triggering Rule** | N/A | `ATTUNE_RULE` | Only for actions triggered by rules |
 | **Triggering Event** | N/A | `ATTUNE_TRIGGER` | Only for actions triggered by events |
-| **Trigger Instances** | `ATTUNE_SENSOR_TRIGGERS` | N/A | Sensor-specific: rules to monitor |
+| **Trigger instances** | stdin `triggers` section | N/A | Initial rules to monitor, potentially sensitive |
 | **Message Queue URL** | `ATTUNE_MQ_URL` | N/A | Sensor-specific: for event publishing |
 | **MQ Exchange** | `ATTUNE_MQ_EXCHANGE` | N/A | Sensor-specific: event destination |
 | **Log Level** | `ATTUNE_LOG_LEVEL` | N/A | Sensor-specific: runtime logging config |
@@ -47,7 +47,7 @@ Sensors receive additional variables for their unique responsibilities:
 - `ATTUNE_MQ_EXCHANGE` - Exchange name for event routing
 
 ### Monitoring Configuration
-- `ATTUNE_SENSOR_TRIGGERS` - JSON array of trigger instances to monitor
+- stdin JSON supplies the flat `config` map and initial `triggers` array
 - `ATTUNE_LOG_LEVEL` - Runtime logging verbosity
 
 ### Example Sensor Environment
@@ -58,7 +58,6 @@ ATTUNE_API_URL=http://localhost:8080
 ATTUNE_API_TOKEN=eyJ0eXAiOiJKV1QiLCJhbGc...
 ATTUNE_MQ_URL=amqp://localhost:5672
 ATTUNE_MQ_EXCHANGE=attune.events
-ATTUNE_SENSOR_TRIGGERS=[{"rule_id":1,"rule_ref":"core.timer_to_echo",...}]
 ATTUNE_LOG_LEVEL=info
 ```
 
@@ -121,7 +120,7 @@ ATTUNE_API_TOKEN=eyJ0eXAiOiJKV1QiLCJhbGc...
 
 ## Usage Examples
 
-### Sensor Using Environment Variables
+### Sensor using environment metadata and stdin values
 
 ```bash
 #!/bin/bash
@@ -130,7 +129,8 @@ ATTUNE_API_TOKEN=eyJ0eXAiOiJKV1QiLCJhbGc...
 echo "Starting sensor: $ATTUNE_SENSOR_REF (ID: $ATTUNE_SENSOR_ID)" >&2
 
 # Parse trigger instances
-TRIGGERS=$(echo "$ATTUNE_SENSOR_TRIGGERS" | jq -r '.')
+BOOTSTRAP=$(cat)
+TRIGGERS=$(jq -c '.triggers' <<< "$BOOTSTRAP")
 
 # Monitor for events and publish to MQ
 # (Typically sensors use language-specific libraries, not bash)

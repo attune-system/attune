@@ -4,14 +4,9 @@
 /* eslint-disable */
 export type LogRetentionLimitPatch =
   | {
-      op: LogRetentionLimitPatch.op;
+      op: "set";
       value: number;
     }
   | {
-      op: LogRetentionLimitPatch.op;
+      op: "clear";
     };
-export namespace LogRetentionLimitPatch {
-  export enum op {
-    SET = "set",
-  }
-}

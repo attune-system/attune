@@ -54,7 +54,7 @@ use crate::models::{
 use crate::pack_cache_definition::{CacheDefinitionOwnerType, CacheDefinitionYaml};
 use crate::platform_catalog::{is_legacy_definition, ManagedComponentKind};
 use crate::policy_control::parse_policy_controls;
-use crate::queue_definition::parse_work_queue_definition_yaml;
+use crate::queue_definition::parse_work_queue_definition_yaml_with_registry;
 use crate::rbac::{validate_cache_grant_constraints, Grant, Resource};
 use crate::repositories::action::{
     validate_action_reference_visibility_config, ActionRepository, CreatePolicyInput,
@@ -95,6 +95,7 @@ use crate::version_matching::extract_version_components;
 use crate::workflow::parser::parse_workflow_yaml;
 
 struct CleanupRefs<'a> {
+    schema_types: &'a [String],
     permission_sets: &'a [String],
     runtimes: &'a [String],
     triggers: &'a [String],
@@ -112,6 +113,8 @@ struct CleanupRefs<'a> {
 pub struct PackLoadResult {
     /// Stable IDs written by this load. Activation stamps only these rows.
     pub projections: PackProjectionIds,
+    pub schema_types_loaded: usize,
+    pub schema_types_updated: usize,
     /// Number of permission sets created
     pub permission_sets_loaded: usize,
     /// Number of permission sets updated
@@ -180,7 +183,8 @@ pub struct PackLoadResult {
 
 impl PackLoadResult {
     pub fn total_loaded(&self) -> usize {
-        self.permission_sets_loaded
+        self.schema_types_loaded
+            + self.permission_sets_loaded
             + self.runtimes_loaded
             + self.triggers_loaded
             + self.actions_loaded
@@ -206,7 +210,8 @@ impl PackLoadResult {
     }
 
     pub fn total_updated(&self) -> usize {
-        self.permission_sets_updated
+        self.schema_types_updated
+            + self.permission_sets_updated
             + self.runtimes_updated
             + self.triggers_updated
             + self.actions_updated
@@ -287,26 +292,37 @@ impl<'a> PackComponentLoader<'a> {
             pack_ref: self.pack_ref.clone(),
             cache_admission: self.cache_admission.clone(),
             legacy_platform_refs: HashSet::new(),
+            candidate_action_refs: HashSet::new(),
             absent_metadata_policy: self.absent_metadata_policy,
             runtime_version_ids: Vec::new(),
+            candidate_schema_registry: Default::default(),
+            source_file: None,
         };
-        loader.load_all(pack_dir).await
+        let result = loader.load_all(pack_dir).await;
+        result.map_err(|error| match loader.source_file.as_deref() {
+            Some(file) => super::diagnostics::located(error, file, ""),
+            None => error,
+        })
     }
 }
 
 struct TransactionalPackComponentLoader<'a> {
+    source_file: Option<String>,
     authority: crate::delegation::DelegationAuthority,
     connection: &'a mut PgConnection,
     pack_id: Id,
     pack_ref: String,
     cache_admission: CacheAdmissionConfig,
     legacy_platform_refs: HashSet<(ManagedComponentKind, String)>,
+    candidate_action_refs: HashSet<String>,
     absent_metadata_policy: crate::models::AbsentMetadataPolicy,
     runtime_version_ids: Vec<Id>,
+    candidate_schema_registry: crate::value_schema::RegistryView,
 }
 
 impl TransactionalPackComponentLoader<'_> {
     async fn load_all(&mut self, pack_dir: &Path) -> Result<PackLoadResult> {
+        super::diagnostics::validate_metadata(pack_dir)?;
         crate::pack_check::validate_pack_environment(pack_dir)?;
         PlatformCatalogRepository::check_compatibility(&mut *self.connection).await?;
         // Cache definitions load after every other component because their
@@ -314,12 +330,43 @@ impl TransactionalPackComponentLoader<'_> {
         // constraints before mutating any component so a malformed cache file
         // cannot leave an otherwise valid pack reload partially applied.
         self.preflight_cache_definitions(pack_dir)?;
+        let type_plan = super::schema_types::preflight(
+            &mut *self.connection,
+            self.pack_id,
+            &self.pack_ref,
+            pack_dir,
+            self.absent_metadata_policy,
+        )
+        .await?;
+        self.candidate_schema_registry = type_plan.registry;
         self.preflight_component_ownership(pack_dir).await?;
         super::permissions::PackPermissionPlan::read(pack_dir, &self.pack_ref)?
             .validate(&mut *self.connection, &self.authority)
             .await?;
 
         let mut result = PackLoadResult::default();
+        let mut schema_type_refs = Vec::new();
+        for definition in type_plan.declared.values() {
+            let exists = crate::repositories::schema_type::SchemaTypeRepository::find_by_ref(
+                &mut *self.connection,
+                &definition.r#ref,
+            )
+            .await?
+            .is_some();
+            crate::repositories::schema_type::SchemaTypeRepository::upsert(
+                &mut *self.connection,
+                self.pack_id,
+                definition,
+                &type_plan.contracts[&definition.r#ref],
+            )
+            .await?;
+            if exists {
+                result.schema_types_updated += 1;
+            } else {
+                result.schema_types_loaded += 1;
+            }
+            schema_type_refs.push(definition.r#ref.clone());
+        }
 
         info!(
             "Loading components for pack '{}' from {}",
@@ -362,7 +409,9 @@ impl TransactionalPackComponentLoader<'_> {
             .await?;
 
         // 11. Clean up entities that are no longer in the pack's YAML files
+        self.source_file = None;
         let cleanup_refs = CleanupRefs {
+            schema_types: &schema_type_refs,
             permission_sets: &permission_set_refs,
             runtimes: &runtime_refs,
             triggers: &trigger_refs,
@@ -460,6 +509,9 @@ impl TransactionalPackComponentLoader<'_> {
                     )
                     .await?;
                 }
+                if directory == "actions" {
+                    self.candidate_action_refs.insert(component_ref.to_string());
+                }
             }
         }
 
@@ -501,7 +553,11 @@ impl TransactionalPackComponentLoader<'_> {
         let queues_dir = pack_dir.join("queues");
         if queues_dir.exists() {
             for (filename, content) in read_yaml_files(&queues_dir)? {
-                let definition = parse_work_queue_definition_yaml(&content).map_err(|error| {
+                let definition = parse_work_queue_definition_yaml_with_registry(
+                    &content,
+                    &self.candidate_schema_registry,
+                )
+                .map_err(|error| {
                     Error::validation(format!(
                         "Failed to parse work queue YAML {filename}: {error}"
                     ))
@@ -676,6 +732,7 @@ impl TransactionalPackComponentLoader<'_> {
         );
 
         for (filename, content) in &yaml_files {
+            self.source_file = Some(format!("permission_sets/{filename}"));
             let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|e| {
                 Error::validation(format!(
                     "Failed to parse permission set YAML {}: {}",
@@ -848,6 +905,7 @@ impl TransactionalPackComponentLoader<'_> {
         );
 
         for (filename, content) in &yaml_files {
+            self.source_file = Some(format!("runtimes/{filename}"));
             let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|e| {
                 Error::validation(format!("Failed to parse runtime YAML {}: {}", filename, e))
             })?;
@@ -1195,6 +1253,7 @@ impl TransactionalPackComponentLoader<'_> {
         );
 
         for (filename, content) in &yaml_files {
+            self.source_file = Some(format!("triggers/{filename}"));
             let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|e| {
                 Error::validation(format!("Failed to parse trigger YAML {}: {}", filename, e))
             })?;
@@ -1242,13 +1301,17 @@ impl TransactionalPackComponentLoader<'_> {
                 &reference_allowed_pack_refs,
             )?;
 
-            let param_schema = data
-                .get("parameters")
-                .and_then(|v| serde_json::to_value(v).ok());
+            let param_schema = crate::schema_type::read_schema_field(
+                &data,
+                crate::schema_type::PARAM_SCHEMA_FIELDS,
+            )?;
+            let out_schema = crate::schema_type::read_schema_field(
+                &data,
+                crate::schema_type::OUTPUT_SCHEMA_FIELDS,
+            )?;
 
-            let out_schema = data
-                .get("output")
-                .and_then(|v| serde_json::to_value(v).ok());
+            let event_config_schema =
+                crate::schema_type::read_schema_field(&data, &["event_config_schema"])?;
 
             // Check if trigger already exists — update in place if so
             if let Some(existing) = TriggerRepository::find_by_ref_including_retired(
@@ -1279,14 +1342,23 @@ impl TransactionalPackComponentLoader<'_> {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
                     }),
+                    event_config_schema: Some(match event_config_schema {
+                        Some(value) => Patch::Set(value),
+                        None => Patch::Clear,
+                    }),
                     sensor: None,
                     sensor_ref: None,
                     reference_visibility: Some(reference_visibility),
                     reference_allowed_pack_refs: Some(reference_allowed_pack_refs.clone()),
                 };
 
-                match TriggerRepository::update(&mut *self.connection, existing.id, update_input)
-                    .await
+                match TriggerRepository::update_with_registry(
+                    &mut *self.connection,
+                    existing.id,
+                    update_input,
+                    Some(&self.candidate_schema_registry),
+                )
+                .await
                 {
                     Ok(_) => {
                         ComponentLifecycleRepository::set_declared_enabled(
@@ -1316,13 +1388,20 @@ impl TransactionalPackComponentLoader<'_> {
                 param_schema,
                 out_schema,
                 sensor: None,
+                event_config_schema,
                 sensor_ref: None,
                 is_adhoc: false,
                 reference_visibility,
                 reference_allowed_pack_refs,
             };
 
-            match TriggerRepository::create(&mut *self.connection, input).await {
+            match TriggerRepository::create_with_registry(
+                &mut *self.connection,
+                input,
+                Some(&self.candidate_schema_registry),
+            )
+            .await
+            {
                 Ok(trigger) => {
                     info!("Created trigger '{}' (ID: {})", trigger_ref, trigger.id);
                     trigger_ids.insert(trigger_ref.clone(), trigger.id);
@@ -1383,6 +1462,7 @@ impl TransactionalPackComponentLoader<'_> {
         regular_action_files.extend(workflow_action_files);
 
         for (filename, content) in &regular_action_files {
+            self.source_file = Some(format!("actions/{filename}"));
             let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|e| {
                 Error::validation(format!("Failed to parse action YAML {}: {}", filename, e))
             })?;
@@ -1431,14 +1511,11 @@ impl TransactionalPackComponentLoader<'_> {
                 {
                     Ok(id) => Some(id),
                     Err(e) => {
-                        let msg = format!(
-                            "Failed to load workflow file '{}' for action '{}': {}",
-                            wf_path, action_ref, e
-                        );
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                        // Continue creating the action without workflow link
-                        None
+                        return Err(super::diagnostics::located(
+                            e,
+                            &format!("actions/{filename}"),
+                            "/workflow_file",
+                        ))
                     }
                 }
             } else {
@@ -1468,13 +1545,14 @@ impl TransactionalPackComponentLoader<'_> {
                 self.resolve_runtime_id(runner_type).await?
             };
 
-            let param_schema = data
-                .get("parameters")
-                .and_then(|v| serde_json::to_value(v).ok());
-
-            let out_schema = data
-                .get("output")
-                .and_then(|v| serde_json::to_value(v).ok());
+            let param_schema = crate::schema_type::read_schema_field(
+                &data,
+                crate::schema_type::PARAM_SCHEMA_FIELDS,
+            )?;
+            let out_schema = crate::schema_type::read_schema_field(
+                &data,
+                crate::schema_type::OUTPUT_SCHEMA_FIELDS,
+            )?;
             let enabled = data.get("enabled").and_then(|v| v.as_bool());
 
             let parameter_delivery = data
@@ -1533,21 +1611,56 @@ impl TransactionalPackComponentLoader<'_> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let reference_visibility =
-                parse_action_reference_visibility(data.get("reference_visibility"))?;
+            let reference_visibility = parse_action_reference_visibility(
+                data.get("reference_visibility"),
+            )
+            .map_err(|e| {
+                super::diagnostics::located(
+                    e,
+                    &format!("actions/{filename}"),
+                    "/reference_visibility",
+                )
+            })?;
             let reference_allowed_pack_refs =
                 parse_reference_allowed_pack_refs(data.get("reference_allowed_pack_refs"))?;
             validate_action_reference_visibility_config(
                 reference_visibility,
                 &reference_allowed_pack_refs,
             )?;
-            let log_retention_policy =
-                parse_log_retention_policy(data.get("log_retention_policy"))?;
-            let log_retention_limit = parse_log_retention_limit(data.get("log_retention_limit"))?;
-            let artifact_retention_policy =
-                parse_log_retention_policy(data.get("artifact_retention_policy"))?;
+            let log_retention_policy = parse_log_retention_policy(data.get("log_retention_policy"))
+                .map_err(|error| {
+                    super::diagnostics::located(
+                        error,
+                        &format!("actions/{filename}"),
+                        "/log_retention_policy",
+                    )
+                })?;
+            let log_retention_limit = parse_log_retention_limit(data.get("log_retention_limit"))
+                .map_err(|error| {
+                    super::diagnostics::located(
+                        error,
+                        &format!("actions/{filename}"),
+                        "/log_retention_limit",
+                    )
+                })?;
+            let artifact_retention_policy = parse_log_retention_policy(
+                data.get("artifact_retention_policy"),
+            )
+            .map_err(|_| {
+                super::diagnostics::metadata_error(
+                    &format!("actions/{filename}"),
+                    "/artifact_retention_policy",
+                    "Invalid artifact retention policy",
+                )
+            })?;
             let artifact_retention_limit =
-                parse_log_retention_limit(data.get("artifact_retention_limit"))?;
+                parse_log_retention_limit(data.get("artifact_retention_limit")).map_err(|_| {
+                    super::diagnostics::metadata_error(
+                        &format!("actions/{filename}"),
+                        "/artifact_retention_limit",
+                        "Artifact retention limit must be an integer",
+                    )
+                })?;
             let timeout_seconds = parse_timeout_seconds(data.get("timeout_seconds"))?;
 
             // Check if action already exists — update in place if so
@@ -1612,8 +1725,13 @@ impl TransactionalPackComponentLoader<'_> {
                     }),
                 };
 
-                match ActionRepository::update(&mut *self.connection, existing.id, update_input)
-                    .await
+                match ActionRepository::update_with_registry(
+                    &mut *self.connection,
+                    existing.id,
+                    update_input,
+                    Some(&self.candidate_schema_registry),
+                )
+                .await
                 {
                     Ok(_) => {
                         ComponentLifecycleRepository::set_declared_enabled(
@@ -1759,6 +1877,7 @@ impl TransactionalPackComponentLoader<'_> {
         );
 
         for (filename, content) in &yaml_files {
+            self.source_file = Some(format!("dashboards/{filename}"));
             let yaml_value: serde_yaml_ng::Value = match serde_yaml_ng::from_str(content) {
                 Ok(data) => data,
                 Err(e) => {
@@ -1983,7 +2102,11 @@ impl TransactionalPackComponentLoader<'_> {
         );
 
         for (filename, content) in &yaml_files {
-            let definition = match parse_work_queue_definition_yaml(content) {
+            self.source_file = Some(format!("queues/{filename}"));
+            let definition = match parse_work_queue_definition_yaml_with_registry(
+                content,
+                &self.candidate_schema_registry,
+            ) {
                 Ok(definition) => definition,
                 Err(e) => {
                     let msg = format!("Failed to parse work queue YAML {}: {}", filename, e);
@@ -2084,8 +2207,13 @@ impl TransactionalPackComponentLoader<'_> {
                     ),
                 };
 
-                match WorkQueueRepository::update(&mut *self.connection, existing.id, update_input)
-                    .await
+                match WorkQueueRepository::update_with_registry(
+                    &mut *self.connection,
+                    existing.id,
+                    update_input,
+                    Some(&self.candidate_schema_registry),
+                )
+                .await
                 {
                     Ok(_) => {
                         ComponentLifecycleRepository::set_declared_enabled(
@@ -2107,7 +2235,7 @@ impl TransactionalPackComponentLoader<'_> {
                 continue;
             }
 
-            match WorkQueueRepository::create(
+            match WorkQueueRepository::create_with_registry(
                 &mut *self.connection,
                 CreateWorkQueueInput {
                     r#ref: definition.r#ref.clone(),
@@ -2132,6 +2260,7 @@ impl TransactionalPackComponentLoader<'_> {
                     reference_visibility: definition.reference_visibility,
                     reference_allowed_pack_refs: definition.reference_allowed_pack_refs.clone(),
                 },
+                Some(&self.candidate_schema_registry),
             )
             .await
             {
@@ -2169,6 +2298,7 @@ impl TransactionalPackComponentLoader<'_> {
         );
 
         for (filename, content) in &yaml_files {
+            self.source_file = Some(format!("policies/{filename}"));
             let data: serde_yaml_ng::Value = match serde_yaml_ng::from_str(content) {
                 Ok(data) => data,
                 Err(e) => {
@@ -2384,6 +2514,7 @@ impl TransactionalPackComponentLoader<'_> {
         );
 
         for (filename, content) in &yaml_files {
+            self.source_file = Some(format!("rules/{filename}"));
             let data: serde_yaml_ng::Value = match serde_yaml_ng::from_str(content) {
                 Ok(data) => data,
                 Err(e) => {
@@ -2505,6 +2636,67 @@ impl TransactionalPackComponentLoader<'_> {
                 .get("trigger_params")
                 .and_then(|v| serde_json::to_value(v).ok())
                 .unwrap_or_else(|| serde_json::json!({}));
+            for (reference, pack, schema, params) in [
+                (
+                    &action.r#ref,
+                    Some(action.pack),
+                    action.param_schema.as_ref(),
+                    &action_params,
+                ),
+                (
+                    &trigger.r#ref,
+                    trigger.pack,
+                    trigger.param_schema.as_ref(),
+                    &trigger_params,
+                ),
+            ] {
+                if let Some(schema) = schema {
+                    let contract = if pack == Some(self.pack_id) {
+                        crate::value_schema::compile(
+                            crate::value_schema::SourceIdentity::Authoring {
+                                component_ref: reference.clone(),
+                            },
+                            crate::value_schema::SchemaContext::FlatDocument,
+                            schema,
+                            &self.candidate_schema_registry,
+                            Default::default(),
+                        )
+                        .map_err(|error| {
+                            Error::validation(format!("Invalid rule parameter schema: {error}"))
+                        })?
+                    } else if let Some(owner) = pack {
+                        let owner = crate::repositories::pack::PackRepository::find_by_id(
+                            &mut *self.connection,
+                            owner,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            Error::validation("Rule schema declaring pack is unavailable")
+                        })?;
+                        crate::repositories::schema_contract::SchemaContractRepository::compile_owned_assignment(&mut *self.connection,
+                            crate::value_schema::SourceIdentity::Authoring {component_ref:reference.clone()},crate::value_schema::SchemaContext::FlatDocument,schema,&owner).await?
+                    } else {
+                        crate::value_schema::compile_inline(
+                            reference,
+                            crate::value_schema::SchemaContext::FlatDocument,
+                            schema,
+                        )
+                        .map_err(|error| {
+                            Error::validation(format!("Invalid rule parameter schema: {error}"))
+                        })?
+                    };
+                    let compiled = crate::value_schema::CompiledContract::new(&contract)
+                        .map_err(|_| Error::validation("Invalid rule parameter contract"))?;
+                    compiled.validate_rule_secret_templates(params)
+                        .map_err(|error| Error::validation(format!("Rule '{rule_ref}' secret parameters require whole Key templates: {error}")))?;
+                    compiled
+                        .apply_defaults(params)
+                        .and_then(|defaulted| compiled.validate_authoring(&defaulted))
+                        .map_err(|error| {
+                            Error::validation(format!("Invalid rule parameters: {error}"))
+                        })?;
+                }
+            }
             let sensor_placement = RuleSensorPlacementInput {
                 selector: data
                     .get("sensor_worker_selector")
@@ -2533,6 +2725,9 @@ impl TransactionalPackComponentLoader<'_> {
                 data.get("permission_set_refs")
                     .or_else(|| data.get("permission_set_ref")),
             )?;
+            let input_permission_set_refs =
+                parse_optional_permission_set_refs(data.get("input_permission_set_refs"))?
+                    .unwrap_or_default();
 
             if let Some(existing) =
                 RuleRepository::find_by_ref_including_retired(&mut *self.connection, &rule_ref)
@@ -2588,6 +2783,12 @@ impl TransactionalPackComponentLoader<'_> {
                 )
                 .await?;
                 info!("Updated rule '{}' (ID: {})", rule_ref, existing.id);
+                crate::repositories::rule_authority::RuleAuthorityRepository::set_input_refs(
+                    &mut *self.connection,
+                    existing.id,
+                    &input_permission_set_refs,
+                )
+                .await?;
                 result.rules_updated += 1;
                 loaded_refs.push(rule_ref);
                 continue;
@@ -2618,6 +2819,12 @@ impl TransactionalPackComponentLoader<'_> {
             )
             .await?;
             info!("Created rule '{}' (ID: {})", rule.r#ref, rule.id);
+            crate::repositories::rule_authority::RuleAuthorityRepository::set_input_refs(
+                &mut *self.connection,
+                rule.id,
+                &input_permission_set_refs,
+            )
+            .await?;
             result.rules_loaded += 1;
             loaded_refs.push(rule.r#ref);
         }
@@ -2657,11 +2864,18 @@ impl TransactionalPackComponentLoader<'_> {
         })?;
 
         let mut workflow_yaml = parse_workflow_yaml(&content).map_err(|error| {
-            Error::validation(format!(
-                "Failed to parse workflow YAML {} (referenced by action '{}'): {error}",
-                full_path.display(),
-                action_ref
-            ))
+            let file = format!("actions/{workflow_file_path}");
+            match error {
+                crate::workflow::parser::ParseError::InvalidField { field, reason }
+                    if field.starts_with('/') =>
+                {
+                    super::diagnostics::metadata_error(&file, &field, reason)
+                }
+                crate::workflow::parser::ParseError::YamlError(error) => {
+                    super::diagnostics::yaml_error(&file, &error)
+                }
+                other => super::diagnostics::metadata_error(&file, "", other.to_string()),
+            }
         })?;
 
         // The action YAML is authoritative for action-level metadata.
@@ -2690,36 +2904,51 @@ impl TransactionalPackComponentLoader<'_> {
 
         let workflow_ref = workflow_yaml.r#ref.clone();
         validate_pack_component_ref(&self.pack_ref, "workflow", &workflow_ref)?;
-        for action_ref in collect_workflow_action_refs(&workflow_yaml) {
+        for (action_ref, metadata_path) in
+            crate::action_visibility::collect_workflow_action_uses(&workflow_yaml)
+        {
+            // Ownership preflight has admitted the complete same-pack declaration
+            // set. Late workflow actions need not exist in the projection yet;
+            // validate_active_dependencies rechecks every edge after all upserts.
+            if self.candidate_action_refs.contains(&action_ref) {
+                continue;
+            }
             let action =
                 ActionRepository::find_by_ref_including_retired(&mut *self.connection, &action_ref)
                     .await?
                     .ok_or_else(|| {
-                        Error::validation(format!(
-                            "Workflow '{}' references unknown action '{}'",
-                            workflow_ref, action_ref
-                        ))
+                        super::diagnostics::metadata_error(&format!("actions/{workflow_file_path}"), &metadata_path,
+                            format!("Action '{action_ref}' is unavailable. Define the action or install the referenced dependency pack."))
                     })?;
             ensure_action_reference_allowed(
                 &action,
                 Some(&self.pack_ref),
                 "workflow",
                 &workflow_ref,
-            )?;
+            )
+            .map_err(|error| {
+                super::diagnostics::located(
+                    error,
+                    &format!("actions/{workflow_file_path}"),
+                    &metadata_path,
+                )
+            })?;
         }
 
         // The action YAML is authoritative for param_schema / out_schema.
         // Fall back to the workflow file's own schemas only if the action
         // YAML doesn't define them.
-        let param_schema = action_data
-            .get("parameters")
-            .and_then(|v| serde_json::to_value(v).ok())
-            .or_else(|| workflow_yaml.parameters.clone());
+        let param_schema = crate::schema_type::read_schema_field(
+            &action_data,
+            crate::schema_type::PARAM_SCHEMA_FIELDS,
+        )?
+        .or_else(|| workflow_yaml.parameters.clone());
 
-        let out_schema = action_data
-            .get("output")
-            .and_then(|v| serde_json::to_value(v).ok())
-            .or_else(|| workflow_yaml.output.clone());
+        let out_schema = crate::schema_type::read_schema_field(
+            &action_data,
+            crate::schema_type::OUTPUT_SCHEMA_FIELDS,
+        )?
+        .or_else(|| workflow_yaml.output.clone());
 
         let definition_json = serde_json::to_value(&workflow_yaml)
             .map_err(|e| Error::validation(format!("Failed to serialize workflow: {}", e)))?;
@@ -2760,8 +2989,13 @@ impl TransactionalPackComponentLoader<'_> {
                 tags: Some(tags),
             };
 
-            WorkflowDefinitionRepository::update(&mut *self.connection, existing.id, update_input)
-                .await?;
+            WorkflowDefinitionRepository::update_with_registry(
+                &mut *self.connection,
+                existing.id,
+                update_input,
+                Some(&self.candidate_schema_registry),
+            )
+            .await?;
 
             info!(
                 "Updated workflow definition '{}' (ID: {}) for action '{}'",
@@ -2788,8 +3022,12 @@ impl TransactionalPackComponentLoader<'_> {
                 tags,
             };
 
-            let created =
-                WorkflowDefinitionRepository::create(&mut *self.connection, create_input).await?;
+            let created = WorkflowDefinitionRepository::create_with_registry(
+                &mut *self.connection,
+                create_input,
+                Some(&self.candidate_schema_registry),
+            )
+            .await?;
 
             info!(
                 "Created workflow definition '{}' (ID: {}) for action '{}'",
@@ -2825,6 +3063,7 @@ impl TransactionalPackComponentLoader<'_> {
         );
 
         for (filename, content) in &yaml_files {
+            self.source_file = Some(format!("sensors/{filename}"));
             let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|e| {
                 Error::validation(format!("Failed to parse sensor YAML {}: {}", filename, e))
             })?;
@@ -2912,11 +3151,12 @@ impl TransactionalPackComponentLoader<'_> {
                 .to_string();
 
             // Resolve trigger reference(s) for post-load linkage
-            let sensor_triggers = self.resolve_sensor_triggers(&data, trigger_ids).await;
+            let sensor_triggers = self.resolve_sensor_triggers(&data, trigger_ids).await?;
 
-            let param_schema = data
-                .get("parameters")
-                .and_then(|v| serde_json::to_value(v).ok());
+            let param_schema = crate::schema_type::read_schema_field(
+                &data,
+                crate::schema_type::PARAM_SCHEMA_FIELDS,
+            )?;
 
             let config = data
                 .get("config")
@@ -2940,13 +3180,40 @@ impl TransactionalPackComponentLoader<'_> {
                 .get("worker_affinity")
                 .map(|value| serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({})))
                 .unwrap_or_else(|| serde_json::json!({}));
-            let log_retention_policy =
-                parse_log_retention_policy(data.get("log_retention_policy"))?;
-            let log_retention_limit = parse_log_retention_limit(data.get("log_retention_limit"))?;
-            let artifact_retention_policy =
-                parse_log_retention_policy(data.get("artifact_retention_policy"))?;
+            let log_retention_policy = parse_log_retention_policy(data.get("log_retention_policy"))
+                .map_err(|error| {
+                    super::diagnostics::located(
+                        error,
+                        &format!("sensors/{filename}"),
+                        "/log_retention_policy",
+                    )
+                })?;
+            let log_retention_limit = parse_log_retention_limit(data.get("log_retention_limit"))
+                .map_err(|error| {
+                    super::diagnostics::located(
+                        error,
+                        &format!("sensors/{filename}"),
+                        "/log_retention_limit",
+                    )
+                })?;
+            let artifact_retention_policy = parse_log_retention_policy(
+                data.get("artifact_retention_policy"),
+            )
+            .map_err(|_| {
+                super::diagnostics::metadata_error(
+                    &format!("sensors/{filename}"),
+                    "/artifact_retention_policy",
+                    "Invalid artifact retention policy",
+                )
+            })?;
             let artifact_retention_limit =
-                parse_log_retention_limit(data.get("artifact_retention_limit"))?;
+                parse_log_retention_limit(data.get("artifact_retention_limit")).map_err(|_| {
+                    super::diagnostics::metadata_error(
+                        &format!("sensors/{filename}"),
+                        "/artifact_retention_limit",
+                        "Artifact retention limit must be an integer",
+                    )
+                })?;
 
             // Upsert: update existing sensors so re-registration corrects
             // stale metadata (especially runtime assignments).
@@ -3001,8 +3268,13 @@ impl TransactionalPackComponentLoader<'_> {
                     }),
                 };
 
-                match SensorRepository::update(&mut *self.connection, existing.id, update_input)
-                    .await
+                match SensorRepository::update_with_registry(
+                    &mut *self.connection,
+                    existing.id,
+                    update_input,
+                    Some(&self.candidate_schema_registry),
+                )
+                .await
                 {
                     Ok(_) => {
                         ComponentLifecycleRepository::set_declared_enabled(
@@ -3048,7 +3320,13 @@ impl TransactionalPackComponentLoader<'_> {
                 log_retention_limit,
             };
 
-            match SensorRepository::create(&mut *self.connection, input).await {
+            match SensorRepository::create_with_registry(
+                &mut *self.connection,
+                input,
+                Some(&self.candidate_schema_registry),
+            )
+            .await
+            {
                 Ok(sensor) => {
                     info!("Created sensor '{}' (ID: {})", sensor_ref, sensor.id);
                     self.link_triggers_to_sensor(sensor.id, &sensor_ref, &sensor_triggers)
@@ -3095,6 +3373,7 @@ impl TransactionalPackComponentLoader<'_> {
         let mut loaded_refs = Vec::new();
 
         for (filename, content) in &yaml_files {
+            self.source_file = Some(format!("caches/{filename}"));
             let definition: CacheDefinitionYaml =
                 serde_yaml_ng::from_str(content).map_err(|e| {
                     Error::validation(format!("Failed to parse cache YAML {}: {}", filename, e))
@@ -3273,11 +3552,10 @@ impl TransactionalPackComponentLoader<'_> {
             return Ok((runtime.id, runtime.r#ref));
         }
 
-        warn!(
-            "Could not find runtime for runner_type '{}', component will have no runtime",
-            runner_type
-        );
-        Ok((0, "unknown".to_string()))
+        Err(super::diagnostics::metadata_error(
+            self.source_file.as_deref().unwrap_or("pack.yaml"), "/runner_type",
+            format!("Runtime '{runner_type}' is unavailable. Install its runtime definition or select an existing runner_type."),
+        ))
     }
 
     /// Resolve all trigger references for a sensor from its YAML `trigger_types`/`trigger_type` field.
@@ -3287,7 +3565,7 @@ impl TransactionalPackComponentLoader<'_> {
         &mut self,
         data: &serde_yaml_ng::Value,
         trigger_ids: &HashMap<String, Id>,
-    ) -> Vec<(Option<Id>, String)> {
+    ) -> Result<Vec<(Option<Id>, String)>> {
         // Collect all trigger type strings
         let trigger_type_strs: Vec<String> =
             if let Some(seq) = data.get("trigger_types").and_then(|v| v.as_sequence()) {
@@ -3298,11 +3576,11 @@ impl TransactionalPackComponentLoader<'_> {
             } else if let Some(t) = data.get("trigger_type").and_then(|v| v.as_str()) {
                 vec![t.to_string()]
             } else {
-                return vec![];
+                return Ok(vec![]);
             };
 
         let mut results = Vec::new();
-        for t in trigger_type_strs {
+        for (index, t) in trigger_type_strs.into_iter().enumerate() {
             let trigger_ref = if t.contains('.') {
                 t
             } else {
@@ -3316,16 +3594,17 @@ impl TransactionalPackComponentLoader<'_> {
             }
 
             // Fall back to database lookup
-            match TriggerRepository::find_by_ref(&mut *self.connection, &trigger_ref).await {
-                Ok(Some(trigger)) => results.push((Some(trigger.id), trigger_ref)),
-                _ => {
-                    warn!("Could not resolve trigger ref '{}' for sensor", trigger_ref);
-                    results.push((None, trigger_ref));
-                }
+            match TriggerRepository::find_by_ref(&mut *self.connection, &trigger_ref).await? {
+                Some(trigger) => results.push((Some(trigger.id), trigger_ref)),
+                None => return Err(super::diagnostics::metadata_error(
+                    self.source_file.as_deref().unwrap_or("pack.yaml"),
+                    &if data.get("trigger_types").is_some() { format!("/trigger_types/{index}") } else { "/trigger_type".into() },
+                    format!("Trigger '{trigger_ref}' is unavailable. Define it or install the referenced pack."),
+                )),
             }
         }
 
-        results
+        Ok(results)
     }
 
     /// After a sensor is created/updated, update its triggers to point back to it.
@@ -3366,7 +3645,13 @@ impl TransactionalPackComponentLoader<'_> {
                 ..Default::default()
             };
 
-            TriggerRepository::update(&mut *self.connection, trigger_id, update_input).await?;
+            TriggerRepository::update_with_registry(
+                &mut *self.connection,
+                trigger_id,
+                update_input,
+                Some(&self.candidate_schema_registry),
+            )
+            .await?;
             info!("Linked trigger '{}' → sensor '{}'", trigger_ref, sensor_ref);
         }
         Ok(())
@@ -3431,6 +3716,15 @@ impl TransactionalPackComponentLoader<'_> {
         let runtime_versions = self.runtime_version_ids.clone();
 
         Ok(PackProjectionIds {
+            schema_types: ids(
+                self.connection,
+                "schema_type",
+                "ref",
+                "pack",
+                self.pack_id,
+                refs.schema_types,
+            )
+            .await?,
             runtimes,
             runtime_versions,
             permission_sets: ids(
@@ -3640,7 +3934,9 @@ pub(super) fn read_yaml_files(dir: &Path) -> Result<Vec<(String, String)>> {
         .map_err(|e| Error::io(format!("Failed to read directory {}: {}", dir.display(), e)))?;
 
     let mut paths: Vec<_> = entries
-        .filter_map(|e| e.ok())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| Error::io("Could not read a pack metadata directory entry"))?
+        .into_iter()
         .filter(|e| {
             let path = e.path();
             path.is_file()

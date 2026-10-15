@@ -1,6 +1,5 @@
 //! Inquiry repository for database operations
 
-use crate::inquiry_options::validate_response_options;
 use crate::models::{enums::InquiryStatus, inquiry::*, Id, JsonDict, JsonSchema};
 use crate::rbac::{Action, ExecutionScopeConstraint, Grant, OwnerConstraint, Resource};
 use crate::{Error, Result};
@@ -75,6 +74,31 @@ impl InquiryVisibilityContext {
 }
 
 pub struct InquiryRepository;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InquiryDisclosureRow {
+    pub id: i64,
+    pub created_by_execution: i64,
+    pub assigned_to: Option<i64>,
+}
+
+impl InquiryRepository {
+    pub async fn find_disclosure_rows<'e, E>(
+        executor: E,
+        ids: &[i64],
+    ) -> Result<Vec<InquiryDisclosureRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(
+            "SELECT id, created_by_execution, assigned_to FROM inquiry WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(executor)
+        .await
+        .map_err(Into::into)
+    }
+}
 
 impl Repository for InquiryRepository {
     type Entity = Inquiry;
@@ -152,20 +176,54 @@ impl Create for InquiryRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        validate_response_options(input.response_schema.as_ref(), &input.response_options)?;
+        crate::inquiry_options::validate_bound_response_options(None, &input.response_options)?;
+        let binding = crate::inquiry_schema::InquirySchemaBinding::inline(
+            input.response_schema.clone(),
+            format!("inquiry.creator_{}", input.created_by_execution),
+        )?;
+        let (options, secrets) = binding.prepare_options(
+            &input.response_options,
+            &crate::secret_provenance::SecretProvenance::default(),
+        )?;
+        if !secrets.is_empty()
+            || input.response.as_ref().is_some_and(|response| {
+                binding
+                    .prepare_response(
+                        response,
+                        &crate::secret_provenance::SecretProvenance::default(),
+                    )
+                    .map(|(_, secrets)| !secrets.is_empty())
+                    .unwrap_or(true)
+            })
+        {
+            return Err(Error::validation(
+                "Sensitive inquiry creation requires the bound encrypted creation path",
+            ));
+        }
+        let body = serde_json::to_value(&binding)
+            .map_err(|_| Error::validation("Invalid inquiry binding"))?;
+        let digest = crate::value_schema::digest(&body)
+            .map_err(|_| Error::validation("Invalid inquiry binding digest"))?;
+        let fingerprint = crate::value_schema::digest(&serde_json::json!({"prompt": input.prompt, "schema": input.response_schema, "options": input.response_options, "assigned_to": input.assigned_to}))
+            .map_err(|_| Error::validation("Invalid public inquiry admission request"))?;
         let query = format!(
-            "INSERT INTO inquiry (created_by_execution, prompt, response_schema, response_options, assigned_to, status, response, timeout_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {INQUIRY_SELECT_COLUMNS}"
+            "WITH inserted AS (INSERT INTO inquiry (created_by_execution, prompt, response_schema, response_options, assigned_to, status, response, timeout_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {INQUIRY_SELECT_COLUMNS}), attached AS ( \
+             INSERT INTO inquiry_schema_binding (entity_id, binding, binding_digest, request_fingerprint) \
+             SELECT id, $9, $10, $11 FROM inserted) SELECT {INQUIRY_SELECT_COLUMNS} FROM inserted"
         );
         sqlx::query_as::<_, Inquiry>(&query)
             .bind(input.created_by_execution)
             .bind(&input.prompt)
             .bind(&input.response_schema)
-            .bind(sqlx::types::Json(&input.response_options))
+            .bind(sqlx::types::Json(&options))
             .bind(input.assigned_to)
             .bind(input.status)
             .bind(&input.response)
             .bind(input.timeout_at)
+            .bind(body)
+            .bind(digest)
+            .bind(fingerprint)
             .fetch_one(executor)
             .await
             .map_err(Into::into)
@@ -240,6 +298,16 @@ impl Delete for InquiryRepository {
 }
 
 impl InquiryRepository {
+    pub async fn find_workflow_by_creator_purpose(
+        connection: &mut PgConnection,
+        creator: Id,
+        purpose: &str,
+    ) -> Result<Option<Inquiry>> {
+        Ok(sqlx::query_as(&format!("SELECT {INQUIRY_SELECT_COLUMNS_QUALIFIED} FROM inquiry i JOIN execution e ON e.id = $1 \
+            WHERE i.workflow_execution = (e.workflow_task->>'workflow_execution')::BIGINT AND i.workflow_task_name = e.workflow_task->>'task_name' \
+            AND i.action_attempt_family = COALESCE(e.original_execution, e.id) AND i.purpose = $2"))
+            .bind(creator).bind(purpose.trim()).fetch_optional(connection).await?)
+    }
     pub async fn find_contexts_by_ids<'e, E>(
         executor: E,
         inquiry_ids: &[Id],
@@ -283,8 +351,29 @@ impl InquiryRepository {
     /// Repeating an equivalent request returns the existing row.
     pub async fn create_workflow_inquiry_idempotent(
         conn: &mut PgConnection,
-        mut input: CreateWorkflowInquiryInput,
+        input: CreateWorkflowInquiryInput,
     ) -> Result<Inquiry> {
+        Self::create_workflow_inquiry_impl(conn, input, true)
+            .await
+            .map(|(inquiry, _)| inquiry)
+    }
+
+    /// Caller validates and encrypts every option under its selected immutable
+    /// contract and compares admission fingerprints when this returns an existing
+    /// record. The entire operation must run in the caller's creation transaction.
+    pub(crate) async fn create_prepared_workflow_inquiry(
+        conn: &mut PgConnection,
+        input: CreateWorkflowInquiryInput,
+    ) -> Result<(Inquiry, bool)> {
+        crate::inquiry_options::validate_bound_response_options(None, &input.response_options)?;
+        Self::create_workflow_inquiry_impl(conn, input, false).await
+    }
+
+    async fn create_workflow_inquiry_impl(
+        conn: &mut PgConnection,
+        mut input: CreateWorkflowInquiryInput,
+        inline: bool,
+    ) -> Result<(Inquiry, bool)> {
         input.purpose = input.purpose.trim().to_string();
         if input.purpose.is_empty() {
             return Err(Error::Validation(
@@ -296,10 +385,35 @@ impl InquiryRepository {
                 "inquiry timeout_seconds must be positive".to_string(),
             ));
         }
-        validate_response_options(input.response_schema.as_ref(), &input.response_options)?;
+        let (binding_body, binding_digest, request_fingerprint) = if inline {
+            let fingerprint = crate::value_schema::digest(&serde_json::json!({"purpose": input.purpose, "prompt": input.prompt,
+                "schema": input.response_schema, "options": input.response_options, "assigned_to": input.assigned_to, "timeout_seconds": input.timeout_seconds}))
+                .map_err(|_| Error::validation("Invalid public inquiry admission request"))?;
+            let binding = crate::inquiry_schema::InquirySchemaBinding::inline(
+                input.response_schema.clone(),
+                format!("inquiry.creator_{}", input.created_by_execution),
+            )?;
+            let (options, secrets) = binding.prepare_options(
+                &input.response_options,
+                &crate::secret_provenance::SecretProvenance::default(),
+            )?;
+            if !secrets.is_empty() {
+                return Err(Error::validation(
+                    "Sensitive inquiry creation requires the bound encrypted creation path",
+                ));
+            }
+            input.response_options = options;
+            let body = serde_json::to_value(binding)
+                .map_err(|_| Error::validation("Invalid inquiry binding"))?;
+            let digest = crate::value_schema::digest(&body)
+                .map_err(|_| Error::validation("Invalid inquiry binding digest"))?;
+            (Some(body), Some(digest), Some(fingerprint))
+        } else {
+            (None, None, None)
+        };
 
         let insert = format!(
-            "INSERT INTO inquiry (created_by_execution, workflow_execution, workflow_task_name, \
+            "WITH inserted AS (INSERT INTO inquiry (created_by_execution, workflow_execution, workflow_task_name, \
              action_attempt_family, purpose, prompt, response_schema, response_options, assigned_to, status, \
              timeout_at, timeout_seconds) \
              SELECT e.id, (e.workflow_task->>'workflow_execution')::BIGINT, \
@@ -311,7 +425,10 @@ impl InquiryRepository {
              WHERE e.id = $1 AND e.workflow_task IS NOT NULL \
              ON CONFLICT (workflow_execution, workflow_task_name, action_attempt_family, purpose) \
              WHERE workflow_execution IS NOT NULL DO NOTHING \
-             RETURNING {INQUIRY_SELECT_COLUMNS}"
+              RETURNING {INQUIRY_SELECT_COLUMNS}), attached AS ( \
+              INSERT INTO inquiry_schema_binding (entity_id, binding, binding_digest, request_fingerprint) \
+              SELECT id, $9, $10, $11 FROM inserted WHERE $9::JSONB IS NOT NULL) \
+              SELECT {INQUIRY_SELECT_COLUMNS} FROM inserted"
         );
         if let Some(inquiry) = sqlx::query_as::<_, Inquiry>(&insert)
             .bind(input.created_by_execution)
@@ -322,10 +439,13 @@ impl InquiryRepository {
             .bind(input.assigned_to)
             .bind(InquiryStatus::Pending)
             .bind(input.timeout_seconds)
+            .bind(binding_body)
+            .bind(binding_digest)
+            .bind(&request_fingerprint)
             .fetch_optional(&mut *conn)
             .await?
         {
-            return Ok(inquiry);
+            return Ok((inquiry, true));
         }
 
         let existing_query = format!(
@@ -347,11 +467,10 @@ impl InquiryRepository {
                 )
             })?;
 
-        if existing.prompt != input.prompt
-            || existing.response_schema != input.response_schema
-            || existing.response_options != input.response_options
-            || existing.assigned_to != input.assigned_to
-            || existing.timeout_seconds != input.timeout_seconds
+        if inline
+            && super::inquiry_schema::InquirySchemaRepository::find(&mut *conn, existing.id)
+                .await?
+                .is_none_or(|stored| Some(stored.request_fingerprint) != request_fingerprint)
         {
             return Err(Error::AlreadyExists {
                 entity: "inquiry".to_string(),
@@ -359,7 +478,7 @@ impl InquiryRepository {
                 value: input.purpose,
             });
         }
-        Ok(existing)
+        Ok((existing, false))
     }
 
     /// Records the first valid response. Callers must perform authorization and

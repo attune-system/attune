@@ -94,12 +94,12 @@ use crate::{
     dto::{
         artifact::{
             AllocateFileVersionByRefRequest, AppendProgressRequest, ArtifactJsonPatch,
-            ArtifactQueryParams, ArtifactResponse, ArtifactStringPatch, ArtifactSummary,
-            ArtifactVersionResponse, ArtifactVersionSummary, CreateArtifactRequest,
-            CreateFileVersionRequest, CreateVersionJsonRequest, SetDataRequest,
-            UpdateArtifactRequest,
+            ArtifactPageParams, ArtifactQueryParams, ArtifactResponse, ArtifactStringPatch,
+            ArtifactSummary, ArtifactVersionResponse, ArtifactVersionSummary,
+            CreateArtifactRequest, CreateFileVersionRequest, CreateVersionJsonRequest,
+            ExecutionArtifactQueryParams, SetDataRequest, UpdateArtifactRequest,
         },
-        common::{PaginatedResponse, PaginationParams},
+        common::PaginatedResponse,
         ApiResponse, SuccessResponse,
     },
     http_range::{insert_range_headers, range_not_satisfiable, range_status, resolve_range},
@@ -236,6 +236,7 @@ pub async fn list_artifacts(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ArtifactQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = query.pagination().map_err(ApiError::BadRequest)?;
     let filters = ArtifactSearchFilters {
         scope: query.scope,
         owner: query.owner.clone(),
@@ -248,19 +249,12 @@ pub async fn list_artifacts(
         offset: query.offset(),
     };
 
-    let result = match artifact_read_context_for_user(&state, &user).await? {
-        Some(read_ctx) => {
-            ArtifactRepository::search_readable(&state.db, &filters, &read_ctx).await?
-        }
-        None => ArtifactRepository::search(&state.db, &filters).await?,
-    };
+    let result = crate::artifact_reads::ArtifactReads::new(&state, &user)
+        .await?
+        .global_summaries(&filters)
+        .await?;
 
     let items: Vec<ArtifactSummary> = result.rows.into_iter().map(ArtifactSummary::from).collect();
-
-    let pagination = PaginationParams {
-        page: query.page,
-        page_size: query.per_page,
-    };
 
     let response = PaginatedResponse::new(items, &pagination, result.total as u64);
     Ok((StatusCode::OK, Json(response)))
@@ -289,7 +283,12 @@ pub async fn get_artifact(
 
     authorize_artifact_action(&state, &user, Action::Read, &artifact)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
+        .map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact with ID {} not found", id),
+            )
+        })?;
 
     Ok((
         StatusCode::OK,
@@ -320,7 +319,12 @@ pub async fn get_artifact_by_ref(
 
     authorize_artifact_action(&state, &user, Action::Read, &artifact)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Artifact '{}' not found", artifact_ref)))?;
+        .map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact '{}' not found", artifact_ref),
+            )
+        })?;
 
     Ok((
         StatusCode::OK,
@@ -577,14 +581,15 @@ pub async fn delete_artifact(
 // Artifacts by Execution
 // ============================================================================
 
-/// List all artifacts for a given execution
+/// List a disclosure-eligible page of artifacts for a given execution.
 #[utoipa::path(
     get,
     path = "/api/v1/executions/{execution_id}/artifacts",
     tag = "artifacts",
-    params(("execution_id" = i64, Path, description = "Execution ID")),
+    params(("execution_id" = i64, Path, description = "Execution ID"), ExecutionArtifactQueryParams),
     responses(
-        (status = 200, description = "List of artifacts for execution", body = inline(ApiResponse<Vec<ArtifactSummary>>)),
+        (status = 200, description = "Eligible artifacts with exact totals", body = PaginatedResponse<ArtifactSummary>),
+        (status = 400, description = "Invalid pagination"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -592,12 +597,30 @@ pub async fn list_artifacts_by_execution(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(execution_id): Path<i64>,
+    Query(query): Query<ExecutionArtifactQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut artifacts = ArtifactRepository::find_by_execution(&state.db, execution_id).await?;
-    artifacts = filter_artifacts_for_read(&state, &user, artifacts).await?;
-    let items: Vec<ArtifactSummary> = artifacts.into_iter().map(ArtifactSummary::from).collect();
+    let pagination = query.pagination().map_err(ApiError::BadRequest)?;
+    let filters = ArtifactSearchFilters {
+        r#type: query.r#type,
+        execution: Some(execution_id),
+        limit: pagination.limit(),
+        offset: pagination.offset(),
+        ..Default::default()
+    };
+    let result = crate::artifact_reads::ArtifactReads::new(&state, &user)
+        .await?
+        .execution_summaries(&filters)
+        .await?;
+    let items: Vec<ArtifactSummary> = result.rows.into_iter().map(ArtifactSummary::from).collect();
 
-    Ok((StatusCode::OK, Json(ApiResponse::new(items))))
+    Ok((
+        StatusCode::OK,
+        Json(PaginatedResponse::new(
+            items,
+            &pagination,
+            result.total as u64,
+        )),
+    ))
 }
 
 // ============================================================================
@@ -694,14 +717,15 @@ pub async fn set_artifact_data(
 // Version Management
 // ============================================================================
 
-/// List all versions for an artifact (without binary content)
+/// List a visibility-filtered page of versions without binary/JSON content.
 #[utoipa::path(
     get,
     path = "/api/v1/artifacts/{id}/versions",
     tag = "artifacts",
-    params(("id" = i64, Path, description = "Artifact ID")),
+    params(("id" = i64, Path, description = "Artifact ID"), ArtifactPageParams),
     responses(
-        (status = 200, description = "List of versions", body = inline(ApiResponse<Vec<ArtifactVersionSummary>>)),
+        (status = 200, description = "Visible versions with exact totals", body = PaginatedResponse<ArtifactVersionSummary>),
+        (status = 400, description = "Invalid pagination"),
         (status = 404, description = "Artifact not found"),
     ),
     security(("bearer_auth" = []))
@@ -710,28 +734,38 @@ pub async fn list_versions(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(query): Query<ArtifactPageParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = query.pagination().map_err(ApiError::BadRequest)?;
     // Verify artifact exists
-    let artifact = ArtifactRepository::find_by_id(&state.db, id)
+    let artifact = ArtifactRepository::find_summary_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
-    authorize_artifact_action(&state, &user, Action::Read, &artifact)
+    let versions = crate::artifact_reads::ArtifactReads::new(&state, &user)
+        .await?
+        .version_summaries(&artifact, &pagination)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
-
-    let versions = match artifact_read_context_for_user(&state, &user).await? {
-        Some(read_ctx) => {
-            ArtifactVersionRepository::list_readable_by_artifact(&state.db, id, &read_ctx).await?
-        }
-        None => ArtifactVersionRepository::list_by_artifact(&state.db, id).await?,
-    };
+        .map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact with ID {} not found", id),
+            )
+        })?;
     let items: Vec<ArtifactVersionSummary> = versions
+        .rows
         .into_iter()
         .map(ArtifactVersionSummary::from)
         .collect();
 
-    Ok((StatusCode::OK, Json(ApiResponse::new(items))))
+    Ok((
+        StatusCode::OK,
+        Json(PaginatedResponse::new(
+            items,
+            &pagination,
+            versions.total as u64,
+        )),
+    ))
 }
 
 /// Get a specific version's metadata and JSON content (no binary)
@@ -761,7 +795,12 @@ pub async fn get_version(
 
     authorize_artifact_action(&state, &user, Action::Read, &artifact)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
+        .map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact with ID {} not found", id),
+            )
+        })?;
 
     let ver = match artifact_read_context_for_user(&state, &user).await? {
         Some(read_ctx) => {
@@ -803,7 +842,12 @@ pub async fn get_latest_version(
 
     authorize_artifact_action(&state, &user, Action::Read, &artifact)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
+        .map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact with ID {} not found", id),
+            )
+        })?;
 
     let ver = match artifact_read_context_for_user(&state, &user).await? {
         Some(read_ctx) => {
@@ -1108,7 +1152,12 @@ pub async fn download_version(
 
     authorize_artifact_action(&state, &user, Action::Read, &artifact)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
+        .map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact with ID {} not found", id),
+            )
+        })?;
 
     // First try without content (cheaper query) to check for file_path
     let ver = match artifact_read_context_for_user(&state, &user).await? {
@@ -1121,6 +1170,8 @@ pub async fn download_version(
     .ok_or_else(|| {
         ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
     })?;
+
+    authorize_sensor_log_version_content(&state, &user, &artifact, ver.id).await?;
 
     emit_artifact_audit(
         &state,
@@ -1137,7 +1188,8 @@ pub async fn download_version(
     );
 
     if ver.body_state == Some(ArtifactBodyState::Ready) {
-        return serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await;
+        let response = serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await?;
+        return guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await;
     }
     if matches!(
         ver.body_state,
@@ -1151,7 +1203,7 @@ pub async fn download_version(
 
     // Unmigrated or pending file-backed version: read from staging/disk.
     if let Some(ref file_path) = ver.file_path {
-        return serve_file_from_disk(
+        let response = serve_file_from_disk(
             &state.config.artifacts_dir,
             file_path,
             &artifact.r#ref,
@@ -1159,7 +1211,8 @@ pub async fn download_version(
             ver.content_type.as_deref(),
             &request_headers,
         )
-        .await;
+        .await?;
+        return guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await;
     }
 
     // DB-stored version: need to fetch with content
@@ -1169,7 +1222,8 @@ pub async fn download_version(
             ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
         })?;
 
-    serve_db_content(&artifact.r#ref, version, &ver, &request_headers)
+    let response = serve_db_content(&artifact.r#ref, version, &ver, &request_headers)?;
+    guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await
 }
 
 /// Download the latest version's content
@@ -1198,7 +1252,12 @@ pub async fn download_latest(
 
     authorize_artifact_action(&state, &user, Action::Read, &artifact)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
+        .map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact with ID {} not found", id),
+            )
+        })?;
 
     let read_ctx = artifact_read_context_for_user(&state, &user).await?;
     // First try without content (cheaper query) to check for file_path.
@@ -1220,15 +1279,8 @@ pub async fn download_latest(
                 id
             )));
         }
-        if let Some((sensor_ref, stream)) = sensor_log_artifact_parts(&artifact.r#ref) {
-            return serve_sensor_log_legacy_or_empty(
-                &state.config.artifacts_dir,
-                &artifact.r#ref,
-                &sensor_ref,
-                stream,
-                &request_headers,
-            )
-            .await;
+        if sensor_log_artifact_parts(&artifact.r#ref).is_some() {
+            return serve_empty_sensor_log(&artifact.r#ref, &request_headers);
         }
         return Err(ApiError::NotFound(format!(
             "No versions found for artifact {}",
@@ -1237,6 +1289,7 @@ pub async fn download_latest(
     };
 
     let version = ver.version;
+    authorize_sensor_log_version_content(&state, &user, &artifact, ver.id).await?;
 
     emit_artifact_audit(
         &state,
@@ -1253,7 +1306,8 @@ pub async fn download_latest(
     );
 
     if ver.body_state == Some(ArtifactBodyState::Ready) {
-        return serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await;
+        let response = serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await?;
+        return guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await;
     }
     if matches!(
         ver.body_state,
@@ -1278,7 +1332,10 @@ pub async fn download_latest(
             )
             .await
             {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    return guard_sensor_log_download(&state, &user, &artifact, ver.id, response)
+                        .await
+                }
                 Err(ApiError::NotFound(_)) => {
                     return serve_empty_sensor_log(&artifact.r#ref, &request_headers)
                 }
@@ -1289,7 +1346,7 @@ pub async fn download_latest(
             }
         }
 
-        return serve_file_from_disk(
+        let response = serve_file_from_disk(
             &state.config.artifacts_dir,
             file_path,
             &artifact.r#ref,
@@ -1297,7 +1354,8 @@ pub async fn download_latest(
             ver.content_type.as_deref(),
             &request_headers,
         )
-        .await;
+        .await?;
+        return guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await;
     }
 
     // DB-stored version: need to fetch with content
@@ -1305,7 +1363,83 @@ pub async fn download_latest(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("No versions found for artifact {}", id)))?;
 
-    serve_db_content(&artifact.r#ref, ver.version, &ver, &request_headers)
+    let response = serve_db_content(&artifact.r#ref, ver.version, &ver, &request_headers)?;
+    guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await
+}
+
+async fn guard_sensor_log_download(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    artifact: &attune_common::models::artifact::Artifact,
+    version: i64,
+    response: axum::response::Response,
+) -> ApiResult<axum::response::Response> {
+    use attune_common::repositories::sensor_schema::SensorSchemaRepository;
+    use futures::StreamExt;
+    let sensor_ref = if let Some((binding, _)) =
+        SensorSchemaRepository::find_log_generation(&state.db, version).await?
+    {
+        SensorSchemaRepository::find_by_binding_id(&state.db, binding)
+            .await?
+            .ok_or_else(|| ApiError::Forbidden("Sensor log generation has expired".into()))?
+            .0
+            .executable
+            .sensor
+            .r#ref
+    } else if let Some((sensor_ref, _)) = sensor_log_artifact_parts(&artifact.r#ref) {
+        sensor_ref
+    } else if artifact.scope == OwnerType::Sensor
+        && artifact.classification == ArtifactClassification::RuntimeLog
+    {
+        artifact.owner.clone()
+    } else {
+        return Ok(response);
+    };
+    let state = state.clone();
+    let user = user.clone();
+    let artifact_id = artifact.id;
+    let (parts, body) = response.into_parts();
+    let stream = futures::stream::try_unfold(body.into_data_stream(), move |mut reader| {
+        let state = state.clone();
+        let user = user.clone();
+        let sensor_ref = sensor_ref.clone();
+        async move {
+            let Some(chunk) = reader.next().await else {
+                return Ok(None);
+            };
+            let chunk =
+                chunk.map_err(|_| std::io::Error::other("Artifact download was interrupted"))?;
+            let allowed = async {
+                if user.claims.exp <= chrono::Utc::now().timestamp() {
+                    return Err(ApiError::Forbidden(
+                        "Log stream credentials have expired".into(),
+                    ));
+                }
+                let artifact = ArtifactRepository::find_by_id(&state.db, artifact_id)
+                    .await?
+                    .ok_or_else(|| ApiError::Forbidden("Artifact source is unavailable".into()))?;
+                authorize_artifact_action(&state, &user, Action::Read, &artifact).await?;
+                crate::secret_disclosure::authorize_sensor_runtime_log(
+                    &state,
+                    &user,
+                    version,
+                    &sensor_ref,
+                )
+                .await
+            }
+            .await;
+            if allowed.is_err() {
+                return Err(std::io::Error::other(
+                    "Sensor log disclosure authority is unavailable",
+                ));
+            }
+            Ok(Some((chunk, reader)))
+        }
+    });
+    Ok(axum::response::Response::from_parts(
+        parts,
+        Body::from_stream(stream),
+    ))
 }
 
 /// Delete a specific version by version number (including disk file if file-backed)
@@ -1982,26 +2116,10 @@ async fn authorize_artifact_action(
     };
 
     if action == Action::Read {
-        let Some(read_ctx) = artifact_read_context_for_user(state, user).await? else {
-            return Ok(());
-        };
-        if ArtifactRepository::is_readable(&state.db, artifact.id, &read_ctx).await? {
-            if artifact.classification == ArtifactClassification::RuntimeLog {
-                for execution_id in
-                    ArtifactRepository::linked_execution_ids(&state.db, artifact.id).await?
-                {
-                    let execution = ExecutionRepository::find_by_id(&state.db, execution_id)
-                        .await?
-                        .ok_or_else(|| {
-                            ApiError::Forbidden("Runtime log execution is unavailable".into())
-                        })?;
-                    crate::secret_disclosure::authorize_runtime_log(state, user, &execution)
-                        .await?;
-                }
-            }
-            return Ok(());
-        }
-        return Err(denied());
+        return crate::artifact_reads::ArtifactReads::new(state, user)
+            .await?
+            .authorize_detail(artifact)
+            .await;
     }
 
     let ctx = artifact_authorization_context(identity_id, artifact);
@@ -2193,38 +2311,6 @@ async fn authorize_artifact_create(
     Err(denied())
 }
 
-/// Filter a list of artifacts to those the calling user is authorized to read.
-///
-/// Returns the filtered list. For non-Access/Execution tokens (sensor, refresh,
-/// …) the list is returned unchanged because those tokens are not subject to
-/// identity-RBAC artifact checks.
-async fn filter_artifacts_for_read(
-    state: &Arc<AppState>,
-    user: &AuthenticatedUser,
-    artifacts: Vec<attune_common::models::artifact::Artifact>,
-) -> Result<Vec<attune_common::models::artifact::Artifact>, ApiError> {
-    if !matches!(
-        user.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        return Ok(artifacts);
-    }
-
-    // Per-row authorization. This is O(N) checks per page, which is acceptable
-    // at typical page sizes (≤100). A SQL-level filter is a future optimization
-    // (see AGENTS.md for the artifact RBAC design notes).
-    let mut allowed = Vec::with_capacity(artifacts.len());
-    for artifact in artifacts {
-        if authorize_artifact_action(state, user, Action::Read, &artifact)
-            .await
-            .is_ok()
-        {
-            allowed.push(artifact);
-        }
-    }
-    Ok(allowed)
-}
-
 fn artifact_authorization_context(
     identity_id: i64,
     artifact: &attune_common::models::artifact::Artifact,
@@ -2273,59 +2359,36 @@ fn sensor_log_artifact_parts(artifact_ref: &str) -> Option<(String, &'static str
     }
 }
 
-async fn serve_sensor_log_legacy_or_empty(
-    artifacts_dir: &str,
-    artifact_ref: &str,
-    sensor_ref: &str,
-    stream: &str,
-    request_headers: &HeaderMap,
-) -> ApiResult<axum::response::Response> {
-    let legacy_path = format!("sensors/{sensor_ref}/{stream}.log");
-    let transport = VolumeTransport::new(artifacts_dir);
-    match transport.file_size(&legacy_path).await {
-        Ok(Some(size)) => {
-            let range = match resolve_range(request_headers, size) {
-                Ok(range) => range,
-                Err(message) => return Ok(range_not_satisfiable(size, message)),
-            };
-            let reader = transport
-                .open_reader(&legacy_path, range.start)
-                .await
-                .map_err(|e| {
-                    ApiError::InternalServerError(format!(
-                        "Failed to read sensor log '{legacy_path}': {e}"
-                    ))
-                })?;
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
-                "text/plain; charset=utf-8".parse().unwrap(),
-            );
-            headers.insert(
-                header::CONTENT_DISPOSITION,
-                format!(
-                    "attachment; filename=\"{}.log\"",
-                    artifact_ref.replace('.', "_")
-                )
-                .parse()
-                .unwrap(),
-            );
-            insert_range_headers(&mut headers, range, size);
-            let body =
-                tokio_util::io::ReaderStream::with_capacity(reader.take(range.len()), 64 * 1024);
-            Ok((range_status(range), headers, Body::from_stream(body)).into_response())
-        }
-        Ok(None) => serve_empty_sensor_log(artifact_ref, request_headers),
-        Err(attune_common::error::Error::Io(message))
-            if message.contains("No such file or directory") =>
-        {
-            serve_empty_sensor_log(artifact_ref, request_headers)
-        }
-        Err(e) => Err(ApiError::InternalServerError(format!(
-            "Failed to read sensor log '{}': {}",
-            legacy_path, e
-        ))),
+async fn authorize_sensor_log_version_content(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    artifact: &attune_common::models::artifact::Artifact,
+    version_id: i64,
+) -> ApiResult<()> {
+    use attune_common::repositories::sensor_schema::SensorSchemaRepository;
+    // Mutable artifact metadata cannot erase a version's recorded source.
+    if let Some((binding_id, _)) =
+        SensorSchemaRepository::find_log_generation(&state.db, version_id).await?
+    {
+        let (binding, _) = SensorSchemaRepository::find_by_binding_id(&state.db, binding_id)
+            .await?
+            .ok_or_else(|| ApiError::Forbidden("Sensor log generation has expired".into()))?;
+        crate::secret_disclosure::authorize_sensor_runtime_log(
+            state,
+            user,
+            version_id,
+            &binding.executable.sensor.r#ref,
+        )
+        .await?;
+    } else if sensor_log_artifact_parts(&artifact.r#ref).is_some()
+        || (artifact.scope == OwnerType::Sensor
+            && artifact.classification == ArtifactClassification::RuntimeLog)
+    {
+        return Err(ApiError::Forbidden(
+            "Sensor log disclosure requires its admitted generation".into(),
+        ));
     }
+    Ok(())
 }
 
 fn serve_empty_sensor_log(
@@ -2709,28 +2772,13 @@ async fn checked_tail_path(
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Artifact not found or not file-backed"),
     ),
+    security(("bearer_auth" = []))
 )]
 pub async fn stream_artifact(
+    RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    // --- auth ---------------------------------------------------------------
-    use crate::auth::jwt::{extract_token_from_header, validate_token};
-
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .ok_or(ApiError::Unauthorized(
-            "Missing authentication token".to_string(),
-        ))?;
-    let token = extract_token_from_header(auth_header).ok_or(ApiError::Unauthorized(
-        "Invalid authentication token".to_string(),
-    ))?;
-    let claims = validate_token(token, &state.jwt_config)
-        .map_err(|_| ApiError::Unauthorized("Invalid authentication token".to_string()))?;
-    let user = AuthenticatedUser::from_claims(claims);
-
     // --- resolve artifact + latest version ---------------------------------
     let artifact = ArtifactRepository::find_by_id(&state.db, id)
         .await?
@@ -2738,7 +2786,12 @@ pub async fn stream_artifact(
 
     authorize_artifact_action(&state, &user, Action::Read, &artifact)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
+        .map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact with ID {} not found", id),
+            )
+        })?;
 
     if !is_file_backed_type(artifact.r#type) {
         return Err(ApiError::BadRequest(format!(
@@ -2774,6 +2827,7 @@ pub async fn stream_artifact(
     };
 
     let artifacts_dir = std::path::PathBuf::from(&state.config.artifacts_dir);
+    authorize_sensor_log_version_content(&state, &user, &artifact, ver.id).await?;
     let execution_id = ver.execution;
     let log_stream = LogStreamRepository::find_by_artifact_version(&state.db, ver.id).await?;
 
@@ -3262,6 +3316,50 @@ pub async fn stream_artifact(
         }
     });
 
+    // Rule deliveries can add stricter secret origins while a log version is
+    // still being appended. Recheck after reading, before exposing each frame.
+    use futures::StreamExt;
+    let disclosure_state = state.clone();
+    let disclosure_user = user.clone();
+    let version_id = ver.id;
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = ended.clone();
+    let stream = stream
+        .take_while(move |_| {
+            futures::future::ready(!stop.load(std::sync::atomic::Ordering::Acquire))
+        })
+        .then(move |frame| {
+            let state = disclosure_state.clone();
+            let user = disclosure_user.clone();
+            let ended = ended.clone();
+            async move {
+                let allowed = async {
+                    if user.claims.exp <= chrono::Utc::now().timestamp() {
+                        return Err(ApiError::Forbidden(
+                            "Log stream credentials have expired".into(),
+                        ));
+                    }
+                    let artifact = ArtifactRepository::find_by_id(&state.db, id)
+                        .await?
+                        .ok_or_else(|| {
+                            ApiError::Forbidden("Artifact source is unavailable".into())
+                        })?;
+                    authorize_artifact_action(&state, &user, Action::Read, &artifact).await?;
+                    authorize_sensor_log_version_content(&state, &user, &artifact, version_id).await
+                }
+                .await;
+                if allowed.is_err() {
+                    ended.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(artifact_stream_error_event(
+                        "artifact_stream_access_revoked",
+                        "Log disclosure authority is unavailable",
+                        false,
+                    ))
+                } else {
+                    frame
+                }
+            }
+        });
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))

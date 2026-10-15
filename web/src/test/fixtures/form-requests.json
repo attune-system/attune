@@ -1,0 +1,53 @@
+{
+  "ruleUpdate": {
+    "label": "Updated notification",
+    "description": "Send a notification",
+    "trigger_ref": "demo.event",
+    "action_ref": "demo.echo",
+    "enabled": true,
+    "trigger_params": { "interval": 30 },
+    "action_params": { "message": "{{ event.payload.message }}" },
+    "permission_set_refs": null,
+    "trace_tag_template": null,
+    "sensor_worker_selector": { "region": "west" },
+    "sensor_worker_tolerations": [],
+    "sensor_worker_affinity": {}
+  },
+  "triggerUpdate": {
+    "label": "Event",
+    "enabled": true,
+    "reference_visibility": "public",
+    "reference_allowed_pack_refs": [],
+    "param_schema": {
+      "op": "set",
+      "value": {
+        "target": { "type": "demo.address", "required": true },
+        "mode": {
+          "type": ["string", "null"],
+          "default": null,
+          "required": false
+        }
+      }
+    },
+    "out_schema": { "op": "set", "value": {} },
+    "event_config_schema": {
+      "op": "set",
+      "value": { "token": { "type": "string", "secret": true } }
+    },
+    "description": { "op": "clear" }
+  },
+  "runtimeClear": {
+    "description": { "op": "clear" },
+    "installation": { "op": "clear" },
+    "name": "Python",
+    "distributions": {},
+    "execution_config": {}
+  },
+  "runtimeSet": {
+    "description": { "op": "set", "value": "Existing description" },
+    "installation": { "op": "set", "value": { "method": "system" } },
+    "name": "Python",
+    "distributions": {},
+    "execution_config": {}
+  }
+}

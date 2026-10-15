@@ -405,6 +405,14 @@ impl SupervisorService {
 
             if retention_due {
                 self.run_cache_retention_step(&retention.cache_retention).await;
+                if retention.enabled {
+                    match attune_common::repositories::component_configuration::ComponentConfigurationRepository::cleanup_retired(&self.inner.pool, 1000).await {
+                        Ok((generations, configurations)) => {
+                            if generations > 0 || configurations > 0 {info!(generations, configurations, "Reclaimed unreferenced schema configuration sources");}
+                        },
+                        Err(error) => {retention_success = false; warn!(%error, "Configuration source retention failed");},
+                    }
+                }
             }
 
             // Startup remediation still runs when a previous leader completed

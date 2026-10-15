@@ -391,6 +391,7 @@ export class QueuesService {
   public static getQueueItem({
     ref,
     itemId,
+    decrypt,
   }: {
     /**
      * Queue reference identifier
@@ -400,6 +401,10 @@ export class QueuesService {
      * Queue item identifier
      */
     itemId: number;
+    /**
+     * Restore encrypted payload fields. Requires queue read and decrypt rights.
+     */
+    decrypt?: boolean;
   }): CancelablePromise<ApiResponse_WorkQueueItemResponse> {
     return __request(OpenAPI, {
       method: "GET",
@@ -407,6 +412,9 @@ export class QueuesService {
       path: {
         ref: ref,
         item_id: itemId,
+      },
+      query: {
+        decrypt: decrypt,
       },
       errors: {
         403: `Insufficient permissions`,

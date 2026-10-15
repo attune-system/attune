@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ComponentCounts } from "./ComponentCounts";
+import type { PackDiagnostic } from "./PackDiagnostic";
 import type { TestResult } from "./TestResult";
 import type { ValidationResults } from "./ValidationResults";
 /**
@@ -13,6 +14,7 @@ export type RegisteredPack = {
    * Registered components by type
    */
   components_registered: ComponentCounts;
+  diagnostics?: Array<PackDiagnostic>;
   /**
    * Pack install tracking ID when tests were dispatched or failed to dispatch
    */

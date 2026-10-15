@@ -2,6 +2,10 @@ import { useState } from "react";
 import { useCreateKey } from "@/hooks/useKeys";
 import { OwnerType } from "@/api";
 import { X } from "lucide-react";
+import ValueSchemaEditor from "@/components/common/ValueSchemaEditor";
+import ContractValueForm from "@/components/common/ContractValueForm";
+import { SchemaPreviewContext } from "@/api/models/SchemaPreviewContext";
+import { toJsonValue } from "@/lib/json-value";
 
 interface KeyCreateModalProps {
   onClose: () => void;
@@ -18,21 +22,22 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
   const [ownerType, setOwnerType] = useState<OwnerType>(OwnerType.SYSTEM);
   const [owner, setOwner] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [valueSchema, setValueSchema] = useState<unknown>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [schemaDigest, setSchemaDigest] = useState<string | undefined>();
+  const [schemaValue, setSchemaValue] = useState<unknown>("");
 
   const createKeyMutation = useCreateKey();
   const ownerRef = ownerType === OwnerType.SYSTEM ? null : owner;
   const canonicalRef = `${ownerType}${ownerRef ? `.${ownerRef}` : ""}.${localRef || "<local-ref>"}`;
 
-  // Determine if encryption is allowed based on format
-  const canEncrypt =
-    format === "text" || format === "json" || format === "yaml";
-
-  // Auto-disable encryption for non-encryptable formats
-  const isEncrypted = canEncrypt && encrypted;
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    if (schemaError) {
+      setError(schemaError);
+      return;
+    }
 
     if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(localRef)) {
       setError(
@@ -44,11 +49,13 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
       setError("An owner is required for this scope");
       return;
     }
-    let parsedValue: unknown = value;
+    let parsedValue: unknown = valueSchema !== null ? schemaValue : value;
 
     // Validate and preserve the selected JSON value type.
     try {
-      if (format === "json") {
+      if (valueSchema !== null) {
+        parsedValue = schemaValue;
+      } else if (format === "json") {
         parsedValue = JSON.parse(value);
       } else if (format === "yaml") {
         // Basic YAML validation (not exhaustive)
@@ -80,8 +87,14 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
       await createKeyMutation.mutateAsync({
         local_ref: localRef,
         name,
-        value: parsedValue,
-        encrypted: isEncrypted,
+        value: toJsonValue(parsedValue),
+        encrypted,
+        ...(valueSchema !== null
+          ? {
+              value_schema: toJsonValue(valueSchema),
+              schema_digest: schemaDigest,
+            }
+          : {}),
         owner_type: ownerType,
         ...(ownerType === OwnerType.PACK && owner
           ? { owner_pack_ref: owner }
@@ -116,6 +129,12 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
         </div>
 
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
+          <ValueSchemaEditor
+            value={valueSchema}
+            onChange={setValueSchema}
+            onError={setSchemaError}
+            onDigest={setSchemaDigest}
+          />
           {error && (
             <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
               {error}
@@ -231,7 +250,17 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
             <p className="mt-1 text-xs text-gray-500">Human-readable name</p>
           </div>
 
-          <div>
+          {valueSchema !== null && (
+            <ContractValueForm
+              schema={valueSchema}
+              context={SchemaPreviewContext.SINGLE_VALUE}
+              value={schemaValue}
+              onChange={setSchemaValue}
+              maskValue={encrypted}
+              disabled={createKeyMutation.isPending}
+            />
+          )}
+          <div hidden={valueSchema !== null}>
             <label
               htmlFor="format"
               className="block text-sm font-medium text-gray-700 mb-1"
@@ -247,18 +276,17 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
               <option value="text">Text (can be encrypted)</option>
               <option value="json">JSON (can be encrypted)</option>
               <option value="yaml">YAML (can be encrypted)</option>
-              <option value="number">Number (cannot be encrypted)</option>
-              <option value="int">Integer (cannot be encrypted)</option>
-              <option value="bool">Boolean (cannot be encrypted)</option>
+              <option value="number">Number</option>
+              <option value="int">Integer</option>
+              <option value="bool">Boolean</option>
             </select>
             <p className="mt-1 text-xs text-gray-500">
-              {canEncrypt
-                ? "This format can be encrypted for security"
-                : "This format cannot be encrypted - stored as plain text"}
+              All value formats can be encrypted. Schema-secret values require
+              encryption.
             </p>
           </div>
 
-          <div>
+          <div hidden={valueSchema !== null}>
             <label
               htmlFor="value"
               className="block text-sm font-medium text-gray-700 mb-1"
@@ -280,7 +308,7 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
                         ? "123"
                         : "Enter value..."
               }
-              required
+              required={valueSchema === null}
               rows={format === "json" || format === "yaml" ? 6 : 3}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
             />
@@ -290,9 +318,8 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
             <input
               id="encrypted"
               type="checkbox"
-              checked={isEncrypted}
+              checked={encrypted}
               onChange={(e) => setEncrypted(e.target.checked)}
-              disabled={!canEncrypt}
               className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded disabled:opacity-50"
             />
             <label

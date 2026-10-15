@@ -1389,6 +1389,7 @@ mod tests {
             priority: 1,
             status: WorkQueueItemStatus::Leased,
             payload: json!({"order": 1}),
+            schema_binding: None,
             metadata: json!({}),
             enqueue_source: "test".to_string(),
             requested_by_identity: None,

@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ConcurrencyPolicyRequest } from "./ConcurrencyPolicyRequest";
+import type { QuotaPolicyRequest } from "./QuotaPolicyRequest";
 import type { RateLimitPolicyRequest } from "./RateLimitPolicyRequest";
 export type UpdatePolicyRequest = {
   concurrency?: null | ConcurrencyPolicyRequest;
@@ -10,7 +11,7 @@ export type UpdatePolicyRequest = {
   enabled?: boolean | null;
   name?: string | null;
   priority?: number | null;
-  quotas?: any[] | null;
+  quotas?: Array<QuotaPolicyRequest> | null;
   rate_limit?: null | RateLimitPolicyRequest;
-  tags?: any[] | null;
+  tags?: Array<string> | null;
 };

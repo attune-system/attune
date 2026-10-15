@@ -78,6 +78,7 @@ use crate::dto::{
     },
     rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest},
     runtime::{CreateRuntimeRequest, RuntimeResponse, RuntimeSummary, UpdateRuntimeRequest},
+    runtime_approval::{IssueRuntimeApprovalRequest, RuntimeApprovalResponse},
     trace::{TraceReportResponse, TraceWorkQueueDispatchSummary},
     trigger::{
         CreateSensorRequest, CreateTriggerRequest, SensorResponse, SensorSummary, TriggerResponse,
@@ -191,6 +192,12 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::actions::update_action,
         crate::routes::actions::delete_action,
         crate::routes::actions::get_queue_stats,
+
+        crate::routes::schema_types::list_schema_types,
+        crate::routes::schema_types::list_pack_schema_types,
+        crate::routes::schema_types::get_schema_type,
+        crate::routes::schema_types::inspect_schema_type,
+        crate::routes::schema_types::preview_schema,
 
         // Policies
         crate::routes::policies::list_policies,
@@ -331,6 +338,11 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
         // Permissions
         crate::routes::permissions::list_identities,
+        crate::routes::runtime_approvals::list_runtime_approvals,
+        crate::routes::runtime_approvals::get_runtime_approval,
+        crate::routes::runtime_approvals::issue_runtime_approval,
+        crate::routes::runtime_approvals::replace_runtime_approval,
+        crate::routes::runtime_approvals::revoke_runtime_approval,
         crate::routes::permissions::get_identity,
         crate::routes::permissions::create_identity,
         crate::routes::permissions::update_identity,
@@ -517,6 +529,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PaginatedResponse<IdentitySummary>,
             PaginatedResponse<WorkflowSummary>,
             PaginationMeta,
+            PaginatedResponse<crate::dto::artifact::ArtifactSummary>,
+            PaginatedResponse<crate::dto::artifact::ArtifactVersionSummary>,
             SuccessResponse,
 
             // Auth DTOs
@@ -540,6 +554,13 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PackResponse,
             PackSummary,
             PackReleaseResponse,
+            crate::dto::schema_types::SchemaTypeResponse,
+            crate::dto::schema_types::SchemaPreviewContext,
+            crate::dto::schema_types::SchemaPreviewRequest,
+            crate::dto::schema_types::SchemaContractResponse,
+            ApiResponse<crate::dto::schema_types::SchemaTypeResponse>,
+            ApiResponse<crate::dto::schema_types::SchemaContractResponse>,
+            PaginatedResponse<crate::dto::schema_types::SchemaTypeResponse>,
             RetiredPackComponentResponse,
             PlatformCatalogStateResponse,
             PlatformCatalogStatus,
@@ -566,6 +587,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             CreateIntegrationTokenResponse,
             RevokeIntegrationTokenRequest,
             PermissionSetSummary,
+            IssueRuntimeApprovalRequest,
+            RuntimeApprovalResponse,
             UpdatePermissionSetRequest,
             PermissionAssignmentResponse,
             PermissionBindingResponse,
@@ -995,12 +1018,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 200,
+            path_count, 205,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 262,
+            operation_count, 267,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 

@@ -7,14 +7,9 @@
  */
 export type TimeoutSecondsPatch =
   | {
-      op: TimeoutSecondsPatch.op;
+      op: "set";
       value: number;
     }
   | {
-      op: TimeoutSecondsPatch.op;
+      op: "clear";
     };
-export namespace TimeoutSecondsPatch {
-  export enum op {
-    SET = "set",
-  }
-}

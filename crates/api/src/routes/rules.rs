@@ -29,7 +29,7 @@ use attune_common::repositories::{
     sensor_admission::{
         SensorAdmissionFailure, SensorAdmissionRepository, SensorAdmissionRequirement,
     },
-    trigger::TriggerRepository,
+    trigger::{SensorRepository, TriggerRepository},
     Delete, FindByRef, Patch, Update,
 };
 use attune_common::scheduling::parse_rule_sensor_placement;
@@ -48,7 +48,10 @@ use crate::{
         build_visibility_read_scope, is_scoped_identity_token, scope_allows_resource_ref,
     },
     state::AppState,
-    validation::{validate_action_params, validate_trigger_params},
+    validation::params::{
+        validate_action_params_with_registry, validate_rule_params_with_registry,
+        validate_trigger_params_with_registry,
+    },
 };
 use attune_common::repositories::event::VisibilityReadScope;
 
@@ -437,10 +440,65 @@ pub async fn get_rule(
     RequireAuth(user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let rule = RuleRepository::find_by_ref(&state.db, &rule_ref)
+    let mut rule = RuleRepository::find_by_ref(&state.db, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
     ensure_sensor_trigger_scope_for_rule_read(&user, &rule.r#ref, &rule.trigger_ref)?;
+    if user.claims.token_type == TokenType::Sensor {
+        let fence = user
+            .sensor_workload_fence()
+            .map_err(|_| ApiError::Forbidden("Sensor workload fence is unavailable".into()))?;
+        let sensor_ref = user
+            .claims
+            .sensor_ref()
+            .map_err(|_| ApiError::Forbidden("Sensor scope is unavailable".into()))?;
+        let mut tx = state.db.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
+        SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
+        let sensor = SensorRepository::find_by_ref(&mut *tx, sensor_ref)
+            .await?
+            .ok_or_else(|| ApiError::Forbidden("Sensor owner is unavailable".into()))?;
+        if !attune_common::repositories::sensor_workload::SensorWorkloadRepository::lock_current_fence(&mut tx, sensor.id, fence).await? {
+            return Err(ApiError::Forbidden("Sensor workload assignment is stale or expired".into()));
+        }
+        rule = RuleRepository::find_by_id_for_share(&mut tx, rule.id)
+            .await?
+            .filter(|rule| rule.r#ref == rule_ref)
+            .ok_or_else(|| ApiError::NotFound("Rule is unavailable".into()))?;
+        ensure_sensor_trigger_scope_for_rule_read(&user, &rule.r#ref, &rule.trigger_ref)?;
+        let (generation_id, binding, _) =
+            attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+                &mut *tx,
+                fence.workload_id,
+                fence.generation,
+            )
+            .await?
+            .ok_or_else(|| {
+                ApiError::Forbidden("Sensor generation binding is unavailable".into())
+            })?;
+        if binding.executable.sensor.id != sensor.id
+            || !binding
+                .triggers
+                .get(&rule.trigger_ref)
+                .is_some_and(|trigger| trigger.event.trigger_id == rule.trigger)
+        {
+            return Err(ApiError::Forbidden(
+                "Sensor rule delivery owner mismatch".into(),
+            ));
+        }
+        if rule.enabled {
+            rule.trigger_params = attune_common::repositories::sensor_schema::SensorSchemaRepository::capture_rule_delivery(
+                &mut tx, generation_id, &binding, &rule, state.config.security.encryption_key.as_deref()).await?;
+        } else {
+            rule.trigger_params = serde_json::json!({});
+        }
+        // Managed sensors consume trigger-instance settings, not the rule's
+        // action inputs or conditions, which may contain unrelated credentials.
+        rule.action_params = serde_json::json!({});
+        rule.conditions = serde_json::json!({});
+        tx.commit().await?;
+    }
 
     // Rules are private-scoped metadata: scoped-identity callers must hold a
     // rule read grant covering this rule. Deny as NotFound to avoid leaking
@@ -518,10 +576,10 @@ pub async fn create_rule(
     }
 
     // Validate trigger parameters against schema
-    validate_trigger_params(&trigger, &request.trigger_params)?;
+    validate_trigger_params_with_registry(&state.db, &trigger, &request.trigger_params).await?;
 
     // Validate action parameters against schema
-    validate_action_params(&action, &request.action_params)?;
+    validate_action_params_with_registry(&state.db, &action, &request.action_params).await?;
 
     let effective_permission_set_refs = request
         .permission_set_refs
@@ -546,6 +604,7 @@ pub async fn create_rule(
     let trace_tag_template = request.trace_tag_template.clone();
     let authorized_component_ids = (pack.id, action.id, trigger.id);
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     if RuleRepository::find_by_ref(&mut *tx, &request.r#ref)
         .await?
@@ -584,8 +643,22 @@ pub async fn create_rule(
     }
     ensure_action_reference_allowed(&action, Some(&pack.r#ref), "rule", &request.r#ref)?;
     ensure_trigger_reference_allowed(&trigger, Some(&pack.r#ref), "rule", &request.r#ref)?;
-    validate_trigger_params(&trigger, &request.trigger_params)?;
-    validate_action_params(&action, &request.action_params)?;
+    validate_rule_params_with_registry(
+        &mut tx,
+        &trigger.r#ref,
+        trigger.pack,
+        trigger.param_schema.as_ref(),
+        &request.trigger_params,
+    )
+    .await?;
+    validate_rule_params_with_registry(
+        &mut tx,
+        &action.r#ref,
+        Some(action.pack),
+        action.param_schema.as_ref(),
+        &request.action_params,
+    )
+    .await?;
     parse_rule_sensor_placement(
         &request.sensor_worker_selector,
         &request.sensor_worker_tolerations,
@@ -764,23 +837,27 @@ pub async fn update_rule(
     )?;
 
     if request.action_params.is_some() || request.action_ref.is_some() {
-        validate_action_params(
+        validate_action_params_with_registry(
+            &state.db,
             &action,
             request
                 .action_params
                 .as_ref()
                 .unwrap_or(&existing_rule.action_params),
-        )?;
+        )
+        .await?;
     }
 
     if request.trigger_params.is_some() || request.trigger_ref.is_some() {
-        validate_trigger_params(
+        validate_trigger_params_with_registry(
+            &state.db,
             &trigger,
             request
                 .trigger_params
                 .as_ref()
                 .unwrap_or(&existing_rule.trigger_params),
-        )?;
+        )
+        .await?;
     }
 
     let permission_refs_to_validate = match &request.permission_set_refs {
@@ -815,6 +892,7 @@ pub async fn update_rule(
 
     let authorized_rule_id = existing_rule.id;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
@@ -852,22 +930,30 @@ pub async fn update_rule(
         &existing_rule.r#ref,
     )?;
     if request.action_params.is_some() || request.action_ref.is_some() {
-        validate_action_params(
-            &action,
+        validate_rule_params_with_registry(
+            &mut tx,
+            &action.r#ref,
+            Some(action.pack),
+            action.param_schema.as_ref(),
             request
                 .action_params
                 .as_ref()
                 .unwrap_or(&existing_rule.action_params),
-        )?;
+        )
+        .await?;
     }
     if request.trigger_params.is_some() || request.trigger_ref.is_some() {
-        validate_trigger_params(
-            &trigger,
+        validate_rule_params_with_registry(
+            &mut tx,
+            &trigger.r#ref,
+            trigger.pack,
+            trigger.param_schema.as_ref(),
             request
                 .trigger_params
                 .as_ref()
                 .unwrap_or(&existing_rule.trigger_params),
-        )?;
+        )
+        .await?;
     }
 
     let trigger_ref_changed = request
@@ -912,6 +998,24 @@ pub async fn update_rule(
     let trigger_config_changed =
         trigger_ref_changed || trigger_params_changed || sensor_placement.is_some();
     let admission_changed = trigger_ref_changed || sensor_placement.is_some() || became_enabled;
+    let authority_change = !existing_rule.is_adhoc
+        && (request.action_ref.is_some() || request.permission_set_refs.is_some());
+    let input_change = !existing_rule.is_adhoc
+        && (authority_change
+            || request.conditions.is_some()
+            || request.action_params.is_some()
+            || request.trigger_ref.is_some()
+            || request.trigger_params.is_some()
+            || request.trace_tag_template.is_some());
+    let mutation_authority = if input_change {
+        let authority =
+            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
+                .await?;
+        attune_common::repositories::rule_authority::RuleAuthorityRepository::require_mutation_authority(&mut tx, &existing_rule, &authority).await?;
+        Some(authority)
+    } else {
+        None
+    };
 
     // Create update input
     let update_input = UpdateRuleInput {
@@ -937,6 +1041,10 @@ pub async fn update_rule(
     };
 
     let mut rule = RuleRepository::update(&mut *tx, existing_rule.id, update_input).await?;
+    if authority_change {
+        attune_common::repositories::rule_authority::RuleAuthorityRepository::refresh_execution_refs(&mut tx, &rule,
+            mutation_authority.as_ref().ok_or_else(|| ApiError::Forbidden("Rule mutation authority is unavailable".into()))?).await?;
+    }
     if let Some(sensor_placement) = sensor_placement {
         rule =
             RuleRepository::update_sensor_placement(&mut *tx, existing_rule.id, sensor_placement)

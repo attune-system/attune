@@ -17,13 +17,34 @@ const PACK_INSTALL_COLUMNS: &str =
     "id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, \
     pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, \
     candidate_object_key, candidate_provider_version, candidate_archive_size, candidate_digest, test_execution_id, \
-    test_result, error_message, started_at, updated_at, finished_at";
+    test_result, error_message, diagnostic_details, started_at, updated_at, finished_at";
 
 /// Hard upper bound for an unfinished pack-install attempt.
 pub const PACK_INSTALL_ACTIVE_TTL_SECS: i64 = 7 * 60 * 60;
 pub const PACK_INSTALL_ACTIVATION_TTL_SECS: i64 = 15 * 60;
 
 impl PackInstallRepository {
+    /// Record the public deployment outcome independently of the candidate test outcome.
+    pub async fn record_diagnostics(
+        &self,
+        id: Id,
+        details: &crate::pack_registry::diagnostics::DeploymentDetails,
+        message: Option<&str>,
+        committed: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE pack_install SET diagnostic_details = $2, error_message = $3, \
+            status = CASE WHEN $4 THEN 'succeeded' ELSE status END, updated_at = NOW() \
+            WHERE id = $1",
+        )
+        .bind(id)
+        .bind(serde_json::to_value(details)?)
+        .bind(message)
+        .bind(committed)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
     /// Create a new pack install repository
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -168,6 +189,16 @@ impl PackInstallRepository {
             PACK_INSTALL_COLUMNS
         );
         Ok(sqlx::query_as::<_, PackInstall>(sql.as_str())
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// Record a terminal state only while dispatch or execution is active.
+    pub async fn begin_test_override_activation(&self, id: Id) -> Result<Option<PackInstall>> {
+        let sql = format!("UPDATE pack_install SET status = 'activating', error_message = NULL, finished_at = NULL, updated_at = NOW() \
+            WHERE id = $1 AND status = 'failed' AND test_result IS NOT NULL RETURNING {}", PACK_INSTALL_COLUMNS);
+        Ok(sqlx::query_as::<_, PackInstall>(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?)

@@ -21,6 +21,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 6. **NEVER** use `SELECT *` for SQLx `FromRow` models on evolving tables. Use repository `SELECT_COLUMNS` constants (for example in `execution.rs`, `pack.rs`, `runtime_version.rs`).
 7. **REMEMBER** selected runtime references to `event`, `enforcement`, and `execution` intentionally use plain `BIGINT` values without foreign keys so retention can remove rows independently. Preserve dangling-ID semantics. Native partitioning does not make `id` globally unique or justify adding reference FKs.
 8. **ALWAYS** keep schema definitions flat: `param_schema`, `out_schema`, and `conf_schema` use Attune's flat per-field format, not raw JSON Schema.
+   For value-schema validation, defaults, secret traversal, or template handling, use `crates/common/src/value_schema/` and read `docs/plans/named-type-schema-compiler.md`. Authoring previews are not runtime release bindings.
 9. **ALWAYS** keep `execution.config` flat: the object itself is the parameters map. Never wrap parameters under `{"parameters": ...}`.
 10. **ALWAYS** deliver action parameters via **stdin JSON**, not environment variables.
 11. **REMEMBER** execution API access is opt-in via `permission_set_refs`. The reserved ref `standard` grants only scoped key/artifact access for the executing action/pack (and containing workflow action/pack for workflow child executions).
@@ -192,6 +193,7 @@ Workflow details live in:
 ## Runtime / Execution Rules
 - Worker runtimes come from DB-backed runtime definitions; native runtimes are represented by empty interpreter config.
 - Candidate pack tests always download version-pinned archives from the API's configured object backend, including shared-volume workers. See `docs/deployment/pack-candidate-distribution.md`.
+- Pack publication keeps releases immutable. For the off/on/suffix republishing policy and preserved release pins, read `docs/packs/pack-release-artifacts-spec.md#republishing-policy`.
 - The worker/agent sets up isolated environments under `runtime_envs_dir/{pack_ref}/{runtime_name...}`.
 - When runtime versions exist, execution selects the highest available matching version.
 - `ATTUNE_API_TOKEN` is present only when the execution snapshot has non-empty `permission_set_refs`.

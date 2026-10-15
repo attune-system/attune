@@ -13,7 +13,7 @@ use crate::models::{
 };
 use crate::trace_tag::default_event_trace_tag;
 use crate::Result;
-use sqlx::{Executor, Postgres, QueryBuilder, Row};
+use sqlx::{Executor, PgConnection, Postgres, QueryBuilder, Row};
 
 use super::{ref_filter_like_pattern, Create, Delete, FindById, List, Repository, Update};
 
@@ -380,16 +380,120 @@ impl Delete for EventRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query("DELETE FROM event WHERE id = $1")
+        let deleted = sqlx::query_scalar::<_, i64>(
+            "WITH removed AS (DELETE FROM event WHERE id = $1 RETURNING id), \
+             bindings AS (DELETE FROM event_schema_binding USING removed WHERE event = removed.id), \
+             secrets AS (DELETE FROM execution_secret_value USING removed \
+                 WHERE entity_type IN ('event_payload', 'event_config') AND entity_id = removed.id) \
+             SELECT COUNT(*) FROM removed"
+        )
             .bind(id)
-            .execute(executor)
+            .fetch_one(executor)
             .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(deleted > 0)
     }
 }
 
+/// ID-only provenance identity. Keep every matching physical event so callers
+/// can reject ambiguous IDs across native daily and DEFAULT partitions.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct EventDisclosureRow {
+    pub id: Id,
+    pub created: chrono::DateTime<chrono::Utc>,
+    pub trigger: Option<Id>,
+    pub trigger_ref: String,
+}
+
+const DISCLOSURE_SELECT: &str =
+    "SELECT id, created, trigger, trigger_ref FROM event WHERE id = ANY($1) ORDER BY id, created";
+
 impl EventRepository {
+    pub async fn find_disclosure_rows<'e, E>(
+        executor: E,
+        ids: &[Id],
+    ) -> Result<Vec<EventDisclosureRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(DISCLOSURE_SELECT)
+            .bind(ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn visible_ids<'e, E>(
+        executor: E,
+        ids: &[Id],
+        visibility: &EventVisibilityFilter,
+    ) -> Result<Vec<Id>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let mut query =
+            QueryBuilder::<Postgres>::new("SELECT DISTINCT id FROM event WHERE id = ANY(");
+        query.push_bind(ids.to_vec()).push(") AND ");
+        push_event_visibility_predicate(&mut query, visibility);
+        query
+            .build_query_scalar()
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn explain_disclosure_rows<'e, E>(
+        executor: E,
+        ids: &[Id],
+    ) -> Result<serde_json::Value>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar(&format!(
+            "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) {DISCLOSURE_SELECT}"
+        ))
+        .bind(ids)
+        .fetch_one(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Explain the real SQLx-prepared SELECT on the same owned connection after
+    /// repeated execution. Only numeric fixture IDs are interpolated for EXECUTE.
+    pub async fn explain_prepared_disclosure_rows(
+        connection: &mut PgConnection,
+        ids: &[Id],
+    ) -> Result<serde_json::Value> {
+        if ids.is_empty() || ids.len() > 256 {
+            return Err(crate::Error::validation(
+                "Prepared event diagnostics require 1-256 fixture IDs",
+            ));
+        }
+        let (name, generic, custom): (String, i64, i64) = sqlx::query_as(
+            "SELECT name, generic_plans, custom_plans FROM pg_prepared_statements WHERE statement = $1 ORDER BY name LIMIT 1")
+            .bind(DISCLOSURE_SELECT).fetch_one(&mut *connection).await?;
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(crate::Error::validation(
+                "Invalid prepared event diagnostic identifier",
+            ));
+        }
+        let ids = ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) EXECUTE \"{name}\"(ARRAY[{ids}]::bigint[])");
+        let plan: serde_json::Value = sqlx::query_scalar(&sql)
+            .persistent(false)
+            .fetch_one(connection)
+            .await?;
+        Ok(
+            serde_json::json!({"generic_plans_before_explain":generic,"custom_plans_before_explain":custom,"plan":plan}),
+        )
+    }
     /// Find events by trigger ID
     pub async fn find_by_trigger<'e, E>(executor: E, trigger_id: Id) -> Result<Vec<Event>>
     where

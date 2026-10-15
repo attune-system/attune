@@ -28,6 +28,15 @@ pub struct TemplateOrigin {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SecretOrigin {
     Key(KeyOrigin),
+    /// Immutable ownership of caller-supplied queue payload material. Retaining
+    /// this origin does not reinterpret it through later payload mutations.
+    QueueItem {
+        queue_id: Id,
+        queue_ref: String,
+        pack_ref: Option<String>,
+        item_id: Id,
+        path: String,
+    },
     Entity {
         entity_type: String,
         entity_id: Id,

@@ -1,4 +1,5 @@
-name: python_multi_deps
+ref: test_pack.python_multi_deps
+label: Python multiple dependencies
 description: "Python action that imports multiple dependencies"
 enabled: true
 runner_type: python

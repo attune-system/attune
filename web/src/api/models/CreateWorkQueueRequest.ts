@@ -23,7 +23,7 @@ export type CreateWorkQueueRequest = {
    * to inherit the dispatch action default. Provide an empty array to force no
    * API token.
    */
-  permission_set_refs?: any[] | null;
+  permission_set_refs?: Array<string> | null;
   ref: string;
   /**
    * Pack refs allowed to target this queue when visibility is restricted.

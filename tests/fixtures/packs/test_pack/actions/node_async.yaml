@@ -1,4 +1,5 @@
-name: node_async
+ref: test_pack.node_async
+label: Node async
 description: "Node.js action that uses async/await"
 enabled: true
 runner_type: node

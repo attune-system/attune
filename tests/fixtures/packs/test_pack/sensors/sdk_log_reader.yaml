@@ -1,0 +1,8 @@
+ref: test_pack.sdk_log_reader
+label: SDK Key Log Probe
+description: Test-only probe for managed sensor Key-read provenance and log disclosure.
+enabled: true
+runner_type: python
+entry_point: sdk_log_sensor.py
+trigger_types:
+  - test_pack.sdk_log_probe

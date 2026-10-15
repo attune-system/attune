@@ -154,17 +154,22 @@ export class SensorsService {
    */
   public static getSensor({
     ref,
+    includeSecretValues,
   }: {
     /**
      * Sensor reference
      */
     ref: string;
+    includeSecretValues?: boolean;
   }): CancelablePromise<ApiResponse_SensorResponse> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/sensors/{ref}",
       path: {
         ref: ref,
+      },
+      query: {
+        include_secret_values: includeSecretValues,
       },
       errors: {
         404: `Sensor not found`,

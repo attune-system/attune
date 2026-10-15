@@ -79,6 +79,130 @@ async fn create_queue_fixture() -> (
 }
 
 #[tokio::test]
+async fn queue_item_admission_binding_survives_schema_changes_and_rejects_replacement() {
+    use attune_common::{
+        repositories::{
+            component_lifecycle::PackProjectionIds,
+            executable_snapshot::ExecutableSnapshotRepository,
+            pack_release::{CreatePackReleaseInput, PackReleaseRepository},
+            schema_contract::SchemaContractRepository,
+        },
+        value_schema::{SchemaContext, SourceIdentity, ValueSchemaBinding},
+    };
+    let (db, queue) = create_queue_fixture().await;
+    let mut transaction = db.begin().await.unwrap();
+    let release = PackReleaseRepository::create_or_get(
+        &mut transaction,
+        CreatePackReleaseInput {
+            pack: queue.pack.unwrap(),
+            pack_ref: queue.pack_ref.clone().unwrap(),
+            version: "1.0.0".into(),
+            digest: "a".repeat(64),
+            object_key: "owned/queue-binding".into(),
+            provider_version: "1".into(),
+            content_path: "owned/queue-binding".into(),
+            archive_size: 1,
+            manifest: json!({"dependencies": {}}),
+        },
+    )
+    .await
+    .unwrap();
+    PackReleaseRepository::activate_projected(
+        &mut transaction,
+        queue.pack.unwrap(),
+        release.id,
+        &PackProjectionIds {
+            actions: vec![queue.dispatch_action.unwrap()],
+            work_queues: vec![queue.id],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let source = WorkQueueRepository::item_schema_source(&mut transaction, queue.id)
+        .await
+        .unwrap();
+    assert!(matches!(source, SourceIdentity::Released { .. }));
+    let contract = SchemaContractRepository::materialize(
+        &mut transaction,
+        source,
+        SchemaContext::FlatDocument,
+        &queue.item_schema,
+    )
+    .await
+    .unwrap();
+    let binding = ValueSchemaBinding {
+        authored_schema: queue.item_schema.clone(),
+        contract,
+    };
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(
+        &mut *transaction,
+        queue.dispatch_action.unwrap(),
+    )
+    .await
+    .unwrap();
+    let item = WorkQueueItemRepository::create_bound_pinned(
+        &mut *transaction,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: queue.r#ref.clone(),
+            item_key: None,
+            priority: 0,
+            status: WorkQueueItemStatus::Queued,
+            payload: json!({"order_id": 1}),
+            metadata: json!({}),
+            trace_tag: None,
+            enqueue_source: "test".into(),
+            requested_by_identity: None,
+            requested_by_execution: None,
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+            ack_summary: None,
+        },
+        &snapshot,
+        &binding,
+    )
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    WorkQueueRepository::update(
+        &db,
+        queue.id,
+        UpdateWorkQueueInput {
+            item_schema: Some(json!({"order_id": {"type": "string"}})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let item = WorkQueueItemRepository::find_by_queue_and_id(&db, queue.id, item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = item.payload_binding().unwrap();
+    assert_eq!(
+        stored.contract.binding_digest,
+        binding.contract.binding_digest
+    );
+    attune_common::value_schema::CompiledContract::new(&stored.contract)
+        .unwrap()
+        .validate(&item.payload)
+        .unwrap();
+    assert!(
+        sqlx::query("UPDATE work_queue_item SET schema_binding = '{}' WHERE id = $1")
+            .bind(item.id)
+            .execute(&db)
+            .await
+            .is_err()
+    );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn work_queue_repository_crud_and_search_round_trip() {
     let (pool, queue) = create_queue_fixture().await;
 

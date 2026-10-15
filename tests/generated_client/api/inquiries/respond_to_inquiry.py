@@ -7,14 +7,15 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.api_response_inquiry_response import ApiResponseInquiryResponse
-from ...models.inquiry_respond_request import InquiryRespondRequest
+from ...models.inquiry_literal_response_request import InquiryLiteralResponseRequest
+from ...models.inquiry_option_response_request import InquiryOptionResponseRequest
 from ...types import Response
 
 
 def _get_kwargs(
     id: int,
     *,
-    body: InquiryRespondRequest,
+    body: InquiryLiteralResponseRequest | InquiryOptionResponseRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -25,7 +26,10 @@ def _get_kwargs(
         ),
     }
 
-    _kwargs["json"] = body.to_dict()
+    if isinstance(body, InquiryLiteralResponseRequest):
+        _kwargs["json"] = body.to_dict()
+    else:
+        _kwargs["json"] = body.to_dict()
 
     headers["Content-Type"] = "application/json"
 
@@ -90,13 +94,14 @@ def sync_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
-    body: InquiryRespondRequest,
+    body: InquiryLiteralResponseRequest | InquiryOptionResponseRequest,
 ) -> Response[Any | ApiResponseInquiryResponse]:
     """Respond to an inquiry (user-facing endpoint)
 
     Args:
         id (int):
-        body (InquiryRespondRequest): Request to respond to an inquiry (user-facing endpoint)
+        body (InquiryLiteralResponseRequest | InquiryOptionResponseRequest): Request to respond to
+            an inquiry (user-facing endpoint)
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -122,13 +127,14 @@ def sync(
     id: int,
     *,
     client: AuthenticatedClient,
-    body: InquiryRespondRequest,
+    body: InquiryLiteralResponseRequest | InquiryOptionResponseRequest,
 ) -> Any | ApiResponseInquiryResponse | None:
     """Respond to an inquiry (user-facing endpoint)
 
     Args:
         id (int):
-        body (InquiryRespondRequest): Request to respond to an inquiry (user-facing endpoint)
+        body (InquiryLiteralResponseRequest | InquiryOptionResponseRequest): Request to respond to
+            an inquiry (user-facing endpoint)
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -149,13 +155,14 @@ async def asyncio_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
-    body: InquiryRespondRequest,
+    body: InquiryLiteralResponseRequest | InquiryOptionResponseRequest,
 ) -> Response[Any | ApiResponseInquiryResponse]:
     """Respond to an inquiry (user-facing endpoint)
 
     Args:
         id (int):
-        body (InquiryRespondRequest): Request to respond to an inquiry (user-facing endpoint)
+        body (InquiryLiteralResponseRequest | InquiryOptionResponseRequest): Request to respond to
+            an inquiry (user-facing endpoint)
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -179,13 +186,14 @@ async def asyncio(
     id: int,
     *,
     client: AuthenticatedClient,
-    body: InquiryRespondRequest,
+    body: InquiryLiteralResponseRequest | InquiryOptionResponseRequest,
 ) -> Any | ApiResponseInquiryResponse | None:
     """Respond to an inquiry (user-facing endpoint)
 
     Args:
         id (int):
-        body (InquiryRespondRequest): Request to respond to an inquiry (user-facing endpoint)
+        body (InquiryLiteralResponseRequest | InquiryOptionResponseRequest): Request to respond to
+            an inquiry (user-facing endpoint)
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

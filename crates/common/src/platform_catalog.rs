@@ -10,6 +10,7 @@ pub const CATALOG_REVISION: i32 = 1;
 /// The component tables managed by pack installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManagedComponentKind {
+    SchemaType,
     Runtime,
     PermissionSet,
     Trigger,
@@ -26,6 +27,7 @@ pub enum ManagedComponentKind {
 impl ManagedComponentKind {
     pub(crate) fn table(self) -> &'static str {
         match self {
+            Self::SchemaType => "schema_type",
             Self::Runtime => "runtime",
             Self::PermissionSet => "permission_set",
             Self::Trigger => "trigger",

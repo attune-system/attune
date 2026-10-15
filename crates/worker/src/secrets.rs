@@ -70,8 +70,9 @@ impl SecretManager {
         )
         .await?
         .ok_or_else(|| Error::invalid_state("Execution secret owner is unavailable"))?;
-        attune_common::key_access::authorize_parameter_key_origins(
+        attune_common::key_access::authorize_execution_parameter_key_origins(
             &self.pool,
+            execution_id,
             execution.executor,
             &secrets,
         )

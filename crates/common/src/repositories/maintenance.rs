@@ -850,7 +850,7 @@ fn expired_artifact_version_predicate() -> &'static str {
             AND EXISTS (
                 SELECT 1 FROM log_stream retained_stream
                 WHERE retained_stream.artifact_version = av.id
-                  AND retained_stream.backend = 'shared_file'
+                  AND (retained_stream.backend = 'shared_file' OR retained_stream.sealed)
             )
             AND (
                 SELECT COUNT(*) FROM artifact_version newer

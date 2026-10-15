@@ -49,7 +49,7 @@ export type CreateActionRequest = {
   /**
    * Output schema (flat format) defining expected outputs with inline required/secret
    */
-  out_schema?: any | null;
+  out_schema?: Record<string, any> | null;
   /**
    * Pack reference this action belongs to
    */
@@ -57,7 +57,7 @@ export type CreateActionRequest = {
   /**
    * Parameter schema (StackStorm-style) defining expected inputs with inline required/secret
    */
-  param_schema?: any | null;
+  param_schema?: Record<string, any> | null;
   /**
    * Unique reference identifier (e.g., "core.http", "aws.ec2.start_instance")
    */

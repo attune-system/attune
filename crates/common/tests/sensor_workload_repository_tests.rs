@@ -20,7 +20,7 @@ use attune_common::{
             AcquireEligibleSensorWorkloadOutcome, RenewEligibleSensorWorkloadOutcome,
             SensorWorkloadAdmissionRepository,
         },
-        Create, PackRepository,
+        Create, FindById, PackRepository,
     },
 };
 use helpers::{
@@ -33,6 +33,18 @@ use uuid::Uuid;
 const LEASE_SECONDS: i64 = 300;
 
 async fn setup_fixture() -> (
+    attune_common::test_database::TestDatabase,
+    Sensor,
+    Worker,
+    Worker,
+) {
+    setup_fixture_with_schema(json!({}), json!({})).await
+}
+
+async fn setup_fixture_with_schema(
+    schema: serde_json::Value,
+    config: serde_json::Value,
+) -> (
     attune_common::test_database::TestDatabase,
     Sensor,
     Worker,
@@ -58,6 +70,52 @@ async fn setup_fixture() -> (
     .create(&pool)
     .await
     .expect("sensor");
+    if let Some(references) = config
+        .get("signing_permission_set_refs")
+        .and_then(|value| value.as_array())
+    {
+        for reference in references {
+            attune_common::repositories::identity::PermissionSetRepository::create(&*pool,
+                attune_common::repositories::identity::CreatePermissionSetInput {
+                    r#ref: reference.as_str().unwrap().to_string(), pack: None, pack_ref: None,
+                    label: None, description: None,
+                    grants: json!([{"resource": "keys", "actions": ["use", "read"], "constraints": {"refs": ["system.sensor_signer"]}}]),
+                }).await.expect("signing permission set fixture");
+        }
+    }
+    if let Some(references) = config
+        .get("input_permission_set_refs")
+        .and_then(|value| value.as_array())
+    {
+        for reference in references {
+            attune_common::repositories::identity::PermissionSetRepository::create(&*pool,
+                attune_common::repositories::identity::CreatePermissionSetInput {
+                    r#ref: reference.as_str().unwrap().to_string(), pack: None, pack_ref: None, label: None, description: None,
+                    grants: if reference.as_str() == Some("test.sensor_pack_inputs") {
+                        json!([{"resource":"packs","actions":["read","decrypt","configure"],"constraints":{"refs":[pack.r#ref]}}])
+                    } else {json!([{"resource":"keys","actions":["read","decrypt","use"],"constraints":{"refs":["system.sensor_input", "system.sensor_input_alt"]}}])},
+                }).await.unwrap();
+        }
+    }
+    sqlx::query("UPDATE sensor SET param_schema = $1, config = $2 WHERE id = $3")
+        .bind(schema)
+        .bind(config)
+        .bind(sensor.id)
+        .execute(&*pool)
+        .await
+        .expect("sensor settings");
+    let trigger =
+        TriggerFixture::new_unique(Some(pack.id), Some(pack.r#ref.clone()), "snapshot_trigger")
+            .create(&pool)
+            .await
+            .expect("released trigger");
+    sqlx::query("UPDATE trigger SET sensor = $1, sensor_ref = $2, out_schema = $3, event_config_schema = $4, param_schema = $6 WHERE id = $5")
+        .bind(sensor.id).bind(&sensor.r#ref)
+        .bind(json!({"token": {"type": "string", "secret": true}}))
+        .bind(json!({"count": {"type": "integer", "default": 3}}))
+        .bind(trigger.id)
+        .bind(json!({"credential": {"type": "string", "secret": true}, "interval": {"type": "integer", "default": 5}}))
+        .execute(&*pool).await.expect("released trigger settings");
     let mut tx = pool.begin().await.expect("begin release transaction");
     let release = PackReleaseRepository::create_or_get(
         &mut tx,
@@ -82,6 +140,7 @@ async fn setup_fixture() -> (
         &PackProjectionIds {
             runtimes: vec![runtime.id],
             sensors: vec![sensor.id],
+            triggers: vec![trigger.id],
             ..PackProjectionIds::default()
         },
     )
@@ -316,6 +375,836 @@ async fn eligibility_aware_acquisition_checks_active_workload_and_starts_generat
         .expect("load assignment")
         .expect("assignment");
     assert_eq!(assignment.generation, acquired.generation);
+}
+
+#[tokio::test]
+async fn sensor_generation_keeps_encrypted_config_and_contract_after_projection_changes() {
+    use attune_common::repositories::sensor_schema::SensorSchemaRepository;
+    let (pool, sensor, worker, _) = setup_fixture_with_schema(
+        json!({"credential": {"type": "string", "secret": true}, "count": {"type": "integer", "default": 7}}),
+        json!({"credential": "private-sensor-fixture"}),
+    ).await;
+    create_active_rule(&pool, &sensor).await;
+    use attune_common::{
+        models::RetentionPolicyType,
+        repositories::{
+            trigger::{SensorRepository, UpdateSensorInput},
+            Patch,
+        },
+    };
+    SensorRepository::update(
+        &*pool,
+        sensor.id,
+        UpdateSensorInput {
+            log_retention_policy: Some(Patch::Set(RetentionPolicyType::Versions)),
+            log_retention_limit: Some(Patch::Set(1)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("set operational retention before generation admission");
+    let key = "0123456789abcdef0123456789abcdef";
+    let outcome = SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+        &pool,
+        acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+        Some(key),
+    )
+    .await
+    .expect("admit secret sensor settings");
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) = outcome else {
+        panic!("not admitted")
+    };
+    let (id, binding, public) =
+        SensorSchemaRepository::find(&*pool, workload.workload_id, workload.generation)
+            .await
+            .expect("binding lookup")
+            .expect("binding");
+    assert!(!serde_json::to_string(&binding)
+        .unwrap()
+        .contains("private-sensor-fixture"));
+    assert!(!public.to_string().contains("private-sensor-fixture"));
+    assert_eq!(public["count"], 7);
+    assert_eq!(
+        binding.executable.sensor.log_retention_policy,
+        Some(RetentionPolicyType::Versions)
+    );
+    assert_eq!(binding.executable.sensor.log_retention_limit, Some(1));
+    SensorRepository::update(
+        &*pool,
+        sensor.id,
+        UpdateSensorInput {
+            log_retention_limit: Some(Patch::Set(9)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("change current operational retention");
+    let (_, preserved, _) =
+        SensorSchemaRepository::find(&*pool, workload.workload_id, workload.generation)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(preserved.executable.sensor.log_retention_limit, Some(1));
+    let admitted_trigger = binding
+        .executable
+        .triggers
+        .first()
+        .expect("trigger snapshot");
+    let event_binding = &binding.triggers[&admitted_trigger.r#ref].event;
+    sqlx::query("UPDATE trigger SET out_schema = $1, event_config_schema = $2 WHERE id = $3")
+        .bind(json!({"token": {"type": "integer"}}))
+        .bind(json!({"count": {"type": "integer", "default": 99}}))
+        .bind(admitted_trigger.id)
+        .execute(&*pool)
+        .await
+        .expect("change live trigger schemas");
+    let protected = event_binding
+        .prepare(Some(json!({"token": "original-secret"})), Some(json!({})))
+        .expect("validate event with admitted schema");
+    assert_eq!(protected.config.unwrap()["count"], 3);
+    assert!(!protected
+        .payload
+        .unwrap()
+        .to_string()
+        .contains("original-secret"));
+    sqlx::query("UPDATE sensor SET param_schema = $1, config = $2 WHERE id = $3")
+        .bind(json!({"credential": {"type": "integer"}}))
+        .bind(json!({"credential": 99}))
+        .bind(sensor.id)
+        .execute(&*pool)
+        .await
+        .expect("change mutable settings");
+    let mut connection = pool.acquire().await.unwrap();
+    let restored =
+        SensorSchemaRepository::restore_config(&mut connection, id, &binding, public, Some(key))
+            .await
+            .expect("restore original settings");
+    assert_eq!(
+        restored,
+        json!({"credential": "private-sensor-fixture", "count": 7})
+    );
+    assert!(
+        sqlx::query("UPDATE sensor_generation_schema_binding SET config = '{}' WHERE id = $1")
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .is_err()
+    );
+    assert!(sqlx::query("UPDATE execution_secret_value SET encrypted_value = '{}'::jsonb WHERE entity_type = 'sensor_generation_config' AND entity_id = $1")
+        .bind(id).execute(&mut *connection).await.is_err());
+    sqlx::query("DELETE FROM sensor_workload WHERE id = $1")
+        .bind(workload.workload_id)
+        .execute(&mut *connection)
+        .await
+        .expect("delete generation owner");
+    assert!(SensorSchemaRepository::find(
+        &mut *connection,
+        workload.workload_id,
+        workload.generation
+    )
+    .await
+    .unwrap()
+    .is_none());
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_secret_value WHERE entity_type = 'sensor_generation_config' AND entity_id = $1")
+        .bind(id).fetch_one(&mut *connection).await.unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn sensor_sdk_key_read_origins_enforce_count_and_total_byte_budgets() {
+    use attune_common::{
+        repositories::sensor_schema::SensorSchemaRepository, secret_provenance::KeyOrigin,
+    };
+    let (pool, sensor, worker, _) = setup_fixture().await;
+    create_active_rule(&pool, &sensor).await;
+    let outcome = SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+        &pool,
+        acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+        Some("0123456789abcdef0123456789abcdef"),
+    )
+    .await
+    .expect("admit SDK provenance fixture");
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) = outcome else {
+        panic!("SDK provenance fixture was not admitted")
+    };
+    let (generation, _, _) =
+        SensorSchemaRepository::find(&*pool, workload.workload_id, workload.generation)
+            .await
+            .unwrap()
+            .unwrap();
+    let base = KeyOrigin {
+        key_id: 1,
+        key_ref: "system.sdk_fixture".into(),
+        owner_type: attune_common::models::OwnerType::System,
+        owner_identity: None,
+        owner_ref: None,
+        encrypted: true,
+    };
+    let mut transaction = pool.begin().await.unwrap();
+    for index in 0..1024 {
+        let mut origin = base.clone();
+        origin.key_id = index + 1;
+        origin.key_ref = format!("system.sdk_fixture_{index}");
+        SensorSchemaRepository::record_key_read_origin(&mut transaction, generation, &origin)
+            .await
+            .expect("record bounded SDK origin");
+    }
+    assert_eq!(
+        SensorSchemaRepository::key_read_origins(&mut *transaction, generation)
+            .await
+            .unwrap()
+            .len(),
+        1024
+    );
+    let repeated = KeyOrigin {
+        key_ref: "system.sdk_fixture_0".into(),
+        ..base.clone()
+    };
+    SensorSchemaRepository::record_key_read_origin(&mut transaction, generation, &repeated)
+        .await
+        .expect("a repeated read must remain available at the count limit");
+    let error = SensorSchemaRepository::record_key_read_origin(&mut transaction, generation, &base)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("origin limit reached"));
+    transaction.rollback().await.unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    let mut rejected = false;
+    for index in 0..100 {
+        let origin = KeyOrigin {
+            key_id: index + 1,
+            key_ref: format!("system.sdk_{index}_{}", "x".repeat(15000)),
+            ..base.clone()
+        };
+        if let Err(error) =
+            SensorSchemaRepository::record_key_read_origin(&mut transaction, generation, &origin)
+                .await
+        {
+            assert!(error
+                .to_string()
+                .contains("origins exceed their byte limit"));
+            rejected = true;
+            break;
+        }
+    }
+    assert!(
+        rejected,
+        "SDK origins must not exceed their aggregate byte budget"
+    );
+    let retained = SensorSchemaRepository::key_read_origins(&mut *transaction, generation)
+        .await
+        .unwrap();
+    assert!(!retained.is_empty());
+    assert!(retained.len() < 100);
+    // Corrupt aggregate metadata via a fixture write to exercise fail-closed reads,
+    // independently of the normal writer's budget enforcement.
+    let extra = KeyOrigin {
+        key_id: 1000,
+        key_ref: format!("system.sdk_extra_{}", "x".repeat(15000)),
+        ..base
+    };
+    let extra_body = serde_json::to_value(extra).unwrap();
+    let extra_digest = "f".repeat(64);
+    sqlx::query("INSERT INTO sensor_generation_key_read_origin (generation_binding, origin_digest, origin) VALUES ($1, $2, $3)")
+        .bind(generation).bind(extra_digest).bind(extra_body)
+        .execute(&mut *transaction).await.unwrap();
+    let error = SensorSchemaRepository::key_read_origins(&mut *transaction, generation)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("origins exceed their byte limit"));
+    transaction.rollback().await.unwrap();
+    assert!(SensorSchemaRepository::key_read_origins(&*pool, generation)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn secret_sensor_admission_without_encryption_rolls_back_assignment() {
+    let (pool, sensor, worker, _) = setup_fixture_with_schema(
+        json!({"credential": {"type": "string", "secret": true}}),
+        json!({"credential": "private-sensor-fixture"}),
+    )
+    .await;
+    create_active_rule(&pool, &sensor).await;
+    let error = SensorWorkloadAdmissionRepository::acquire(
+        &pool,
+        acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("private-sensor-fixture"));
+    let assignments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sensor_workload_assignment a JOIN sensor_workload w ON w.id = a.workload WHERE w.sensor = $1")
+        .bind(sensor.id).fetch_one(&*pool).await.unwrap();
+    assert_eq!(assignments, 0);
+}
+
+#[tokio::test]
+async fn sensor_signing_grants_are_release_owned_use_only_and_immutable_after_policy_changes() {
+    let (pool, sensor, worker, _) = setup_fixture_with_schema(
+        json!({}),
+        json!({"signing_permission_set_refs": ["test.sensor_signing"]}),
+    )
+    .await;
+    create_active_rule(&pool, &sensor).await;
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) =
+        SensorWorkloadAdmissionRepository::acquire(
+            &pool,
+            acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("not admitted")
+    };
+    let (_, binding, _) = attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+        &*pool,
+        workload.workload_id,
+        workload.generation,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        binding.executable.signing_permission_set_refs,
+        ["test.sensor_signing"]
+    );
+    assert_eq!(binding.executable.signing_grants.len(), 1);
+    assert_eq!(
+        binding.executable.signing_grants[0].actions,
+        [attune_common::rbac::Action::Use]
+    );
+    sqlx::query("UPDATE permission_set SET grants = '[]' WHERE ref = 'test.sensor_signing'")
+        .execute(&*pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sensor SET config = '{}' WHERE id = $1")
+        .bind(sensor.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let (_, retained, _) =
+        attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+            &*pool,
+            workload.workload_id,
+            workload.generation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retained.executable.signing_grants,
+        binding.executable.signing_grants
+    );
+}
+
+#[tokio::test]
+async fn sensor_input_templates_use_deployed_read_decrypt_grants_and_record_key_origins() {
+    use attune_common::repositories::key::{CreateKeyInput, KeyRepository};
+    let (pool, sensor, worker, _) = setup_fixture_with_schema(
+        json!({"credential":{"type":"string","secret":true},"sensor_id":{"type":"integer"}}),
+        json!({"credential":"{{ keystore['system.sensor_input'] }}", "sensor_id":"{{ system.sensor.id }}", "input_permission_set_refs":["test.sensor_inputs"]}),
+    ).await;
+    create_active_rule(&pool, &sensor).await;
+    let key = "0123456789abcdef0123456789abcdef";
+    let mut tx = pool.begin().await.unwrap();
+    attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await.unwrap();
+    let author =
+        attune_common::repositories::trigger::SensorRepository::find_by_id(&mut *tx, sensor.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_sensor(
+        &mut tx,&author,author.config.as_ref(),Some(key)).await.unwrap();
+    assert!(!revision.config.to_string().contains("keystore"));
+    tx.commit().await.unwrap();
+    let stored_key = KeyRepository::create(
+        &*pool,
+        CreateKeyInput {
+            local_ref: "sensor_input".into(),
+            owner_type: attune_common::models::OwnerType::System,
+            owner_identity: None,
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Sensor input".into(),
+            encrypted: true,
+            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(key)),
+            value: attune_common::crypto::encrypt_json(&json!("private-key-input"), key).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE permission_set SET grants = '[]' WHERE ref = 'test.sensor_inputs'")
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) =
+        SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+            &pool,
+            acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+            Some(key),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("not admitted")
+    };
+    let (id, binding, public) =
+        attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+            &*pool,
+            workload.workload_id,
+            workload.generation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.executable.input_grants[0].actions,
+        [
+            attune_common::rbac::Action::Read,
+            attune_common::rbac::Action::Decrypt
+        ]
+    );
+    assert!(!public.to_string().contains("private-key-input"));
+    let mut connection = pool.acquire().await.unwrap();
+    let restored =
+        attune_common::repositories::sensor_schema::SensorSchemaRepository::restore_config(
+            &mut connection,
+            id,
+            &binding,
+            public,
+            Some(key),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored["credential"], "private-key-input");
+    let secrets = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+        &mut *connection, attune_common::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_CONFIG, id).await.unwrap();
+    let provenance: attune_common::secret_provenance::SecretProvenance =
+        serde_json::from_str(secrets[0].source_ref.as_ref().unwrap()).unwrap();
+    assert!(provenance.origins.iter().any(|origin| matches!(origin, attune_common::secret_provenance::SecretOrigin::Key(origin) if origin.key_id == stored_key.id)));
+}
+
+#[tokio::test]
+async fn sensor_pack_inputs_use_deployed_pack_read_decrypt_and_record_configuration_revision_origins(
+) {
+    use attune_common::repositories::{
+        component_configuration::ComponentConfigurationRepository, pack::UpdatePackInput,
+    };
+    let (pool, sensor, worker, _) = setup_fixture_with_schema(
+        json!({"credential":{"type":"string","secret":true}}),
+        json!({"credential":"{{ pack.config.token }}","input_permission_set_refs":["test.sensor_pack_inputs"]}),
+    ).await;
+    create_active_rule(&pool, &sensor).await;
+    let key = "0123456789abcdef0123456789abcdef";
+    let mut tx = pool.begin().await.unwrap();
+    ComponentConfigurationRepository::lock_selection(&mut tx)
+        .await
+        .unwrap();
+    let pack = PackRepository::update(
+        &mut *tx,
+        sensor.pack.unwrap(),
+        UpdatePackInput {
+            conf_schema: Some(json!({"token":{"type":"string","secret":true}})),
+            config: Some(json!({"token":"private-pack-input"})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let revision =
+        ComponentConfigurationRepository::bind_pack(&mut tx, &pack, Some(&pack.config), Some(key))
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query("UPDATE permission_set SET grants = '[]' WHERE ref = 'test.sensor_pack_inputs'")
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) =
+        SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+            &pool,
+            acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+            Some(key),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("not admitted")
+    };
+    let (id, binding, public) =
+        attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+            &*pool,
+            workload.workload_id,
+            workload.generation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.executable.input_grants[0].resource,
+        attune_common::rbac::Resource::Packs
+    );
+    assert_eq!(
+        binding.executable.input_grants[0].actions,
+        [
+            attune_common::rbac::Action::Read,
+            attune_common::rbac::Action::Decrypt
+        ]
+    );
+    assert!(!public.to_string().contains("private-pack-input"));
+    let mut connection = pool.acquire().await.unwrap();
+    let value = attune_common::repositories::sensor_schema::SensorSchemaRepository::restore_config(
+        &mut connection,
+        id,
+        &binding,
+        public,
+        Some(key),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value["credential"], "private-pack-input");
+    let secrets = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+        &mut *connection, attune_common::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_CONFIG, id).await.unwrap();
+    let provenance: attune_common::secret_provenance::SecretProvenance =
+        serde_json::from_str(secrets[0].source_ref.as_ref().unwrap()).unwrap();
+    assert!(provenance.origins.iter().any(|origin| matches!(origin, attune_common::secret_provenance::SecretOrigin::Entity {
+        entity_type, entity_id, path,
+    } if entity_type == attune_common::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION && *entity_id == revision.id && path == "/token")));
+}
+
+#[tokio::test]
+async fn sensor_initial_rule_values_are_encrypted_and_pinned_before_launch() {
+    use attune_common::repositories::sensor_schema::SensorSchemaRepository;
+    let (pool, sensor, worker, _) = setup_fixture_with_schema(
+        json!({}),
+        json!({"input_permission_set_refs":["test.sensor_inputs"]}),
+    )
+    .await;
+    let key = "0123456789abcdef0123456789abcdef";
+    use attune_common::repositories::key::{CreateKeyInput, KeyRepository};
+    let input_key = KeyRepository::create(
+        &*pool,
+        CreateKeyInput {
+            local_ref: "sensor_input".into(),
+            owner_type: attune_common::models::OwnerType::System,
+            owner_identity: None,
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Sensor input".into(),
+            encrypted: true,
+            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(key)),
+            value: attune_common::crypto::encrypt_json(&json!("private-rule-fixture"), key)
+                .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let rule_id = create_active_rule(&pool, &sensor).await;
+    let trigger =
+        attune_common::repositories::trigger::TriggerRepository::find_by_sensor(&*pool, sensor.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|trigger| trigger.r#ref.contains("snapshot_trigger"))
+            .unwrap();
+    sqlx::query(
+        "UPDATE rule SET trigger = $1, trigger_ref = $2, trigger_params = $3 WHERE id = $4",
+    )
+    .bind(trigger.id)
+    .bind(&trigger.r#ref)
+    .bind(json!({"credential":"{{ keystore['system.sensor_input'] }}"}))
+    .bind(rule_id)
+    .execute(&*pool)
+    .await
+    .unwrap();
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) =
+        SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+            &pool,
+            acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+            Some(key),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("not admitted")
+    };
+    let (id, binding, _) =
+        SensorSchemaRepository::find(&*pool, workload.workload_id, workload.generation)
+            .await
+            .unwrap()
+            .unwrap();
+    let public: serde_json::Value = sqlx::query_scalar(
+        "SELECT initial_rules FROM sensor_generation_schema_binding WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    assert!(!public.to_string().contains("private-rule-fixture"));
+    sqlx::query("UPDATE rule SET trigger_params = '{}' WHERE id = $1")
+        .bind(rule_id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    let rules =
+        SensorSchemaRepository::restore_initial_rules(&mut connection, id, &binding, Some(key))
+            .await
+            .unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["id"], rule_id);
+    assert_eq!(
+        rules[0]["config"],
+        json!({"credential":"private-rule-fixture", "interval":5})
+    );
+    assert!(
+        SensorSchemaRepository::restore_initial_rules(&mut connection, id, &binding, None)
+            .await
+            .is_err()
+    );
+    let failure = sqlx::query("UPDATE execution_secret_value SET encrypted_value = '{}' WHERE entity_type = 'sensor_generation_rule_config' AND entity_id = $1")
+        .bind(id).execute(&mut *connection).await.unwrap_err();
+    assert!(failure.to_string().contains("immutable"));
+    let rule = RuleRepository::find_by_id(&mut *connection, rule_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut changed = rule.clone();
+    changed.trigger_params = json!({"credential":"updated-rule-fixture"});
+    let mut rejected = pool.begin().await.unwrap();
+    let error = SensorSchemaRepository::capture_rule_delivery(
+        &mut rejected,
+        id,
+        &binding,
+        &changed,
+        Some(key),
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("updated-rule-fixture"));
+    rejected.rollback().await.unwrap();
+    changed.trigger_params = json!({"credential":"{{ keystore['system.sensor_input'] }}"});
+    sqlx::query("UPDATE key SET value = $1 WHERE id = $2")
+        .bind(attune_common::crypto::encrypt_json(&json!("updated-rule-fixture"), key).unwrap())
+        .bind(input_key.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let delivered =
+        SensorSchemaRepository::capture_rule_delivery(&mut tx, id, &binding, &changed, Some(key))
+            .await
+            .unwrap();
+    assert_eq!(
+        delivered,
+        json!({"credential":"updated-rule-fixture", "interval":5})
+    );
+    SensorSchemaRepository::capture_rule_delivery(&mut tx, id, &binding, &changed, Some(key))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let stored: Vec<(i64, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, config FROM sensor_rule_config_delivery WHERE generation_binding = $1",
+    )
+    .bind(id)
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(!stored[0].1.to_string().contains("updated-rule-fixture"));
+    sqlx::query("UPDATE key SET value = $1 WHERE id = $2")
+        .bind(attune_common::crypto::encrypt_json(&json!("another-rule-fixture"), key).unwrap())
+        .bind(input_key.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    SensorSchemaRepository::capture_rule_delivery(&mut tx, id, &binding, &changed, Some(key))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let paths = SensorSchemaRepository::delivery_origin_paths(&mut *connection, id)
+        .await
+        .unwrap();
+    assert_eq!(paths.len(), 2);
+    assert_ne!(paths[0].0, paths[1].0);
+    assert_eq!(paths[0].1, "/credential");
+    let alternate_key = KeyRepository::create(
+        &*pool,
+        CreateKeyInput {
+            local_ref: "sensor_input_alt".into(),
+            owner_type: attune_common::models::OwnerType::System,
+            owner_identity: None,
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Alternate sensor input".into(),
+            encrypted: true,
+            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(key)),
+            value: attune_common::crypto::encrypt_json(&json!("another-rule-fixture"), key)
+                .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    changed.trigger_params = json!({"credential":"{{ keystore['system.sensor_input_alt'] }}"});
+    let mut tx = pool.begin().await.unwrap();
+    SensorSchemaRepository::capture_rule_delivery(&mut tx, id, &binding, &changed, Some(key))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let paths = SensorSchemaRepository::delivery_origin_paths(&mut *connection, id)
+        .await
+        .unwrap();
+    assert_eq!(
+        paths.len(),
+        3,
+        "equal values with different Key origins must not reuse a delivery"
+    );
+    let secrets = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+        &mut *connection, attune_common::repositories::sensor_schema::ENTITY_SENSOR_RULE_DELIVERY_CONFIG, paths[2].0).await.unwrap();
+    let provenance: attune_common::secret_provenance::SecretProvenance =
+        serde_json::from_str(secrets[0].source_ref.as_ref().unwrap()).unwrap();
+    assert!(provenance.origins.iter().any(|origin| matches!(origin, attune_common::secret_provenance::SecretOrigin::Key(origin) if origin.key_id == alternate_key.id)));
+}
+
+async fn activate_schema_test_release(
+    pool: &PgPool,
+    pack: &attune_common::models::Pack,
+    digest: &str,
+    version: &str,
+    manifest: serde_json::Value,
+    projections: PackProjectionIds,
+) {
+    let mut tx = pool.begin().await.unwrap();
+    let release = PackReleaseRepository::create_or_get(
+        &mut tx,
+        CreatePackReleaseInput {
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            version: version.to_string(),
+            digest: digest.repeat(64),
+            object_key: format!("packs/blobs/{}-{digest}.tar.gz", pack.r#ref),
+            provider_version: "e:test-version".into(),
+            content_path: format!("/packs/.releases/{}-{digest}", pack.r#ref),
+            archive_size: 1,
+            manifest,
+        },
+    )
+    .await
+    .unwrap();
+    PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, &projections)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_sensor_trigger_bodies_are_assigned_once_under_eligible_release_dependencies() {
+    let (pool, sensor, worker, _) = setup_fixture().await;
+    create_active_rule(&pool, &sensor).await;
+    let pack = PackRepository::find_by_id(&*pool, sensor.pack.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let foreign = PackFixture::new_unique("sensor_external")
+        .create(&pool)
+        .await
+        .unwrap();
+    let trigger = TriggerFixture::new_unique(
+        Some(foreign.id),
+        Some(foreign.r#ref.clone()),
+        "foreign_trigger",
+    )
+    .create(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE trigger SET sensor = $1, sensor_ref = $2, out_schema = $3 WHERE id = $4")
+        .bind(sensor.id)
+        .bind(&sensor.r#ref)
+        .bind(json!({"count":{"type":"integer","default":1}}))
+        .bind(trigger.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    activate_schema_test_release(
+        &pool,
+        &foreign,
+        "c",
+        &foreign.version,
+        json!({}),
+        PackProjectionIds {
+            triggers: vec![trigger.id],
+            ..Default::default()
+        },
+    )
+    .await;
+    let projections = PackProjectionIds {
+        runtimes: vec![sensor.runtime],
+        sensors: vec![sensor.id],
+        ..Default::default()
+    };
+    activate_schema_test_release(
+        &pool,
+        &pack,
+        "b",
+        "1.0.1",
+        json!({"dependencies":{(foreign.r#ref.clone()):"*"}}),
+        projections,
+    )
+    .await;
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) =
+        SensorWorkloadAdmissionRepository::acquire(
+            &pool,
+            acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("not admitted")
+    };
+    let (_, binding, _) = attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+        &*pool,
+        workload.workload_id,
+        workload.generation,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let event = &binding.triggers[&trigger.r#ref].event;
+    assert!(matches!(
+        event.payload.as_ref().unwrap().source,
+        attune_common::value_schema::SourceIdentity::Assigned { .. }
+    ));
+    sqlx::query("UPDATE trigger SET out_schema = $1 WHERE id = $2")
+        .bind(json!({"count":{"type":"integer","default":99}}))
+        .bind(trigger.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        event
+            .prepare(Some(json!({})), None)
+            .unwrap()
+            .payload
+            .unwrap()["count"],
+        1
+    );
 }
 
 #[tokio::test]

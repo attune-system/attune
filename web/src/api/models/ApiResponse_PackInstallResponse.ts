@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { PackDiagnostic } from "./PackDiagnostic";
 import type { PackInstallProvenance } from "./PackInstallProvenance";
 import type { PackResponse } from "./PackResponse";
 import type { PackTestResult } from "./PackTestResult";
@@ -13,6 +14,7 @@ export type ApiResponse_PackInstallResponse = {
    * Response for pack install/register operations with test results
    */
   data: {
+    diagnostics?: Array<PackDiagnostic>;
     /**
      * ID of the pack install tracking record, present when tests were dispatched.
      */

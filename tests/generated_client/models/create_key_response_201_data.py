@@ -36,6 +36,9 @@ class CreateKeyResponse201Data:
         owner_pack_ref (None | str | Unset): Owner pack reference Example: github.
         owner_sensor (int | None | Unset):
         owner_sensor_ref (None | str | Unset): Owner sensor reference Example: github.webhook.
+        schema_binding (Any | None | Unset):
+        schema_digest (None | str | Unset):
+        value_schema (Any | None | Unset):
     """
 
     created: datetime.datetime
@@ -55,6 +58,9 @@ class CreateKeyResponse201Data:
     owner_pack_ref: None | str | Unset = UNSET
     owner_sensor: int | None | Unset = UNSET
     owner_sensor_ref: None | str | Unset = UNSET
+    schema_binding: Any | None | Unset = UNSET
+    schema_digest: None | str | Unset = UNSET
+    value_schema: Any | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -124,6 +130,24 @@ class CreateKeyResponse201Data:
         else:
             owner_sensor_ref = self.owner_sensor_ref
 
+        schema_binding: Any | None | Unset
+        if isinstance(self.schema_binding, Unset):
+            schema_binding = UNSET
+        else:
+            schema_binding = self.schema_binding
+
+        schema_digest: None | str | Unset
+        if isinstance(self.schema_digest, Unset):
+            schema_digest = UNSET
+        else:
+            schema_digest = self.schema_digest
+
+        value_schema: Any | None | Unset
+        if isinstance(self.value_schema, Unset):
+            value_schema = UNSET
+        else:
+            value_schema = self.value_schema
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -155,6 +179,12 @@ class CreateKeyResponse201Data:
             field_dict["owner_sensor"] = owner_sensor
         if owner_sensor_ref is not UNSET:
             field_dict["owner_sensor_ref"] = owner_sensor_ref
+        if schema_binding is not UNSET:
+            field_dict["schema_binding"] = schema_binding
+        if schema_digest is not UNSET:
+            field_dict["schema_digest"] = schema_digest
+        if value_schema is not UNSET:
+            field_dict["value_schema"] = value_schema
 
         return field_dict
 
@@ -251,6 +281,33 @@ class CreateKeyResponse201Data:
 
         owner_sensor_ref = _parse_owner_sensor_ref(d.pop("owner_sensor_ref", UNSET))
 
+        def _parse_schema_binding(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        schema_binding = _parse_schema_binding(d.pop("schema_binding", UNSET))
+
+        def _parse_schema_digest(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        schema_digest = _parse_schema_digest(d.pop("schema_digest", UNSET))
+
+        def _parse_value_schema(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        value_schema = _parse_value_schema(d.pop("value_schema", UNSET))
+
         create_key_response_201_data = cls(
             created=created,
             encrypted=encrypted,
@@ -269,6 +326,9 @@ class CreateKeyResponse201Data:
             owner_pack_ref=owner_pack_ref,
             owner_sensor=owner_sensor,
             owner_sensor_ref=owner_sensor_ref,
+            schema_binding=schema_binding,
+            schema_digest=schema_digest,
+            value_schema=value_schema,
         )
 
         create_key_response_201_data.additional_properties = d

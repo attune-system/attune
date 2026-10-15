@@ -87,6 +87,10 @@ pub struct KeyResponse {
     #[schema(value_type = Value, example = json!("ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))]
     pub value: JsonValue,
 
+    pub value_schema: Option<JsonValue>,
+    pub schema_binding: Option<JsonValue>,
+    pub schema_digest: Option<String>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -114,9 +118,31 @@ impl From<Key> for KeyResponse {
             name: key.name,
             encrypted: key.encrypted,
             value: key.value,
+            value_schema: None,
+            schema_binding: None,
+            schema_digest: None,
             created: key.created,
             updated: key.updated,
         }
+    }
+}
+
+impl KeyResponse {
+    pub fn with_schema(
+        mut self,
+        assignment: Option<&attune_common::repositories::key_schema::KeySchemaAssignment>,
+    ) -> attune_common::Result<Self> {
+        if let Some(assignment) = assignment {
+            self.value_schema = Some(assignment.authored_schema.clone());
+            self.schema_binding =
+                Some(serde_json::to_value(&assignment.contract).map_err(|_| {
+                    attune_common::Error::validation("Invalid Key rendering contract")
+                })?);
+            self.schema_digest = Some(assignment.contract.semantic_digest().map_err(|error| {
+                attune_common::Error::validation(format!("Invalid Key schema digest: {error}"))
+            })?);
+        }
+        Ok(self)
     }
 }
 
@@ -214,6 +240,10 @@ pub struct CreateKeyRequest {
     #[serde(default)]
     #[schema(example = false)]
     pub encrypted: bool,
+    /// Optional inline or named single-value schema. Selection is server-owned.
+    pub value_schema: Option<JsonValue>,
+    /// Optional preview comparison, never a contract/revision selector.
+    pub schema_digest: Option<String>,
 }
 
 /// Request to update an existing key/secret
@@ -226,11 +256,25 @@ pub struct UpdateKeyRequest {
 
     /// Update the secret value. Can be a string, object, array, number, or boolean.
     #[schema(value_type = Option<Value>, example = json!("ghp_new_token_xxxxxxxxxxxxxxxxxxxxxxxx"))]
+    #[serde(default, deserialize_with = "deserialize_present_json")]
     pub value: Option<JsonValue>,
 
     /// Update encryption status (re-encrypts if changing from false to true)
     #[schema(example = true)]
     pub encrypted: Option<bool>,
+    /// Omit to retain the assigned schema. Null removes it.
+    #[serde(default, deserialize_with = "deserialize_present_json")]
+    pub value_schema: Option<JsonValue>,
+    /// Explicitly select current installed named revisions and revalidate.
+    #[serde(default)]
+    pub rebind_schema: bool,
+    pub schema_digest: Option<String>,
+}
+
+fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<JsonValue>, D::Error> {
+    JsonValue::deserialize(deserializer).map(Some)
 }
 
 /// Query parameters for filtering keys
@@ -261,6 +305,24 @@ fn default_page() -> u32 {
 
 fn default_per_page() -> u32 {
     50
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn update_distinguishes_missing_values_and_schemas_from_explicit_null() {
+        let missing: UpdateKeyRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(missing.value.is_none());
+        assert!(missing.value_schema.is_none());
+        assert!(!missing.rebind_schema);
+        let explicit: UpdateKeyRequest =
+            serde_json::from_value(serde_json::json!({"value": null, "value_schema": null}))
+                .unwrap();
+        assert_eq!(explicit.value, Some(JsonValue::Null));
+        assert_eq!(explicit.value_schema, Some(JsonValue::Null));
+    }
 }
 
 impl KeyQueryParams {

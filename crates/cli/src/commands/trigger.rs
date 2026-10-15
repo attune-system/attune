@@ -82,6 +82,8 @@ struct Trigger {
     #[serde(default)]
     out_schema: Option<serde_json::Value>,
     #[serde(default)]
+    event_config_schema: Option<serde_json::Value>,
+    #[serde(default)]
     webhook_enabled: Option<bool>,
     #[serde(default)]
     webhook_key: Option<String>,
@@ -118,6 +120,8 @@ struct TriggerDetail {
     param_schema: Option<serde_json::Value>,
     #[serde(default)]
     out_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    event_config_schema: Option<serde_json::Value>,
     #[serde(default)]
     webhook_enabled: Option<bool>,
     #[serde(default)]

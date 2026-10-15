@@ -2,7 +2,7 @@
 
 use attune_common::models::trigger::Trigger;
 use attune_common::repositories::trigger::{CreateTriggerInput, TriggerRepository};
-use attune_common::repositories::{Create, FindById};
+use attune_common::repositories::FindById;
 use attune_common::test_database::TestDatabase;
 use sqlx::PgPool;
 
@@ -23,6 +23,7 @@ async fn create_test_trigger(pool: &PgPool) -> Trigger {
         description: Some("A test trigger for webhook functionality".to_string()),
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,

@@ -171,7 +171,7 @@ impl CachePartitionFixture {
         .await
         .unwrap();
         let parameters = serde_json::json!({"generation": "active"});
-        let parent = ExecutionRepository::create_pinned(
+        let parent = create_bound_fixture_execution(
             pool,
             CreateExecutionInput {
                 action: Some(actions[0].id),

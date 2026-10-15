@@ -1,4 +1,5 @@
-name: python_missing_dep
+ref: test_pack.python_missing_dep
+label: Python missing dependency
 description: "Python action that fails on a missing dependency"
 enabled: true
 runner_type: python

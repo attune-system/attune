@@ -4,7 +4,6 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 from typing_extensions import Self
 
 from ..types import UNSET, Unset
@@ -30,20 +29,19 @@ class UpdateRuntimeRequest:
     """Request DTO for updating a runtime.
 
     Attributes:
-        distributions (None | UpdateRuntimeRequestDistributionsType0): Distribution metadata used for verification and
-            platform support
-        execution_config (None | UpdateRuntimeRequestExecutionConfigType0): Runtime execution configuration
         description (None | NullableStringPatchType1 | SetString | Unset):
+        distributions (None | Unset | UpdateRuntimeRequestDistributionsType0): Distribution metadata used for
+            verification and platform support
+        execution_config (None | Unset | UpdateRuntimeRequestExecutionConfigType0): Runtime execution configuration
         installation (None | NullableJsonPatchType1 | SetJson | Unset):
         name (None | str | Unset): Display name Example: Python 3.
     """
 
-    distributions: None | UpdateRuntimeRequestDistributionsType0
-    execution_config: None | UpdateRuntimeRequestExecutionConfigType0
     description: None | NullableStringPatchType1 | SetString | Unset = UNSET
+    distributions: None | Unset | UpdateRuntimeRequestDistributionsType0 = UNSET
+    execution_config: None | Unset | UpdateRuntimeRequestExecutionConfigType0 = UNSET
     installation: None | NullableJsonPatchType1 | SetJson | Unset = UNSET
     name: None | str | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.nullable_json_patch_type_1 import (
@@ -61,18 +59,6 @@ class UpdateRuntimeRequest:
             UpdateRuntimeRequestExecutionConfigType0,
         )
 
-        distributions: dict[str, Any] | None
-        if isinstance(self.distributions, UpdateRuntimeRequestDistributionsType0):
-            distributions = self.distributions.to_dict()
-        else:
-            distributions = self.distributions
-
-        execution_config: dict[str, Any] | None
-        if isinstance(self.execution_config, UpdateRuntimeRequestExecutionConfigType0):
-            execution_config = self.execution_config.to_dict()
-        else:
-            execution_config = self.execution_config
-
         description: dict[str, Any] | None | Unset
         if isinstance(self.description, Unset):
             description = UNSET
@@ -82,6 +68,24 @@ class UpdateRuntimeRequest:
             description = self.description.to_dict()
         else:
             description = self.description
+
+        distributions: dict[str, Any] | None | Unset
+        if isinstance(self.distributions, Unset):
+            distributions = UNSET
+        elif isinstance(self.distributions, UpdateRuntimeRequestDistributionsType0):
+            distributions = self.distributions.to_dict()
+        else:
+            distributions = self.distributions
+
+        execution_config: dict[str, Any] | None | Unset
+        if isinstance(self.execution_config, Unset):
+            execution_config = UNSET
+        elif isinstance(
+            self.execution_config, UpdateRuntimeRequestExecutionConfigType0
+        ):
+            execution_config = self.execution_config.to_dict()
+        else:
+            execution_config = self.execution_config
 
         installation: dict[str, Any] | None | Unset
         if isinstance(self.installation, Unset):
@@ -100,15 +104,14 @@ class UpdateRuntimeRequest:
             name = self.name
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "distributions": distributions,
-                "execution_config": execution_config,
-            }
-        )
+
+        field_dict.update({})
         if description is not UNSET:
             field_dict["description"] = description
+        if distributions is not UNSET:
+            field_dict["distributions"] = distributions
+        if execution_config is not UNSET:
+            field_dict["execution_config"] = execution_config
         if installation is not UNSET:
             field_dict["installation"] = installation
         if name is not UNSET:
@@ -134,44 +137,6 @@ class UpdateRuntimeRequest:
         )
 
         d = dict(src_dict)
-
-        def _parse_distributions(
-            data: object,
-        ) -> None | UpdateRuntimeRequestDistributionsType0:
-            if data is None:
-                return data
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                distributions_type_0 = UpdateRuntimeRequestDistributionsType0.from_dict(
-                    data
-                )
-
-                return distributions_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(None | UpdateRuntimeRequestDistributionsType0, data)
-
-        distributions = _parse_distributions(d.pop("distributions"))
-
-        def _parse_execution_config(
-            data: object,
-        ) -> None | UpdateRuntimeRequestExecutionConfigType0:
-            if data is None:
-                return data
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                execution_config_type_0 = (
-                    UpdateRuntimeRequestExecutionConfigType0.from_dict(data)
-                )
-
-                return execution_config_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(None | UpdateRuntimeRequestExecutionConfigType0, data)
-
-        execution_config = _parse_execution_config(d.pop("execution_config"))
 
         def _parse_description(
             data: object,
@@ -203,6 +168,48 @@ class UpdateRuntimeRequest:
             return cast(None | NullableStringPatchType1 | SetString | Unset, data)
 
         description = _parse_description(d.pop("description", UNSET))
+
+        def _parse_distributions(
+            data: object,
+        ) -> None | Unset | UpdateRuntimeRequestDistributionsType0:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                distributions_type_0 = UpdateRuntimeRequestDistributionsType0.from_dict(
+                    data
+                )
+
+                return distributions_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | Unset | UpdateRuntimeRequestDistributionsType0, data)
+
+        distributions = _parse_distributions(d.pop("distributions", UNSET))
+
+        def _parse_execution_config(
+            data: object,
+        ) -> None | Unset | UpdateRuntimeRequestExecutionConfigType0:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                execution_config_type_0 = (
+                    UpdateRuntimeRequestExecutionConfigType0.from_dict(data)
+                )
+
+                return execution_config_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | Unset | UpdateRuntimeRequestExecutionConfigType0, data)
+
+        execution_config = _parse_execution_config(d.pop("execution_config", UNSET))
 
         def _parse_installation(
             data: object,
@@ -243,28 +250,11 @@ class UpdateRuntimeRequest:
         name = _parse_name(d.pop("name", UNSET))
 
         update_runtime_request = cls(
+            description=description,
             distributions=distributions,
             execution_config=execution_config,
-            description=description,
             installation=installation,
             name=name,
         )
 
-        update_runtime_request.additional_properties = d
         return update_runtime_request
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties
