@@ -13,9 +13,13 @@ export type UpdatePackRequest = {
    */
   conf_schema?: Record<string, any> | null;
   /**
-   * Pack configuration values
+   * Persistent overrides, replacing each supplied top-level field completely.
    */
   config?: Record<string, any> | null;
+  /**
+   * Remove these top-level overrides and use current release defaults. Null is not reset.
+   */
+  config_reset_fields?: Array<string>;
   /**
    * Pack dependencies (refs of required packs)
    */

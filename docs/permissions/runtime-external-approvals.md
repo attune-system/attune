@@ -1,10 +1,12 @@
 # External runtime approvals
 
-Implementation status: approval storage and control endpoints are available. Automatic deployment capture and production execution consumers are not yet connected. Creating an approval alone does not change an existing execution's runtime permissions. See the [implementation tracker](../plans/self-contained-pack-implementation-progress.md).
+Implementation status: approval storage, controls and transactional deployment capture are connected. The coordinated registrar exemption and production worker switch remain gated on complete admission and consumer integration. Creating an approval alone does not change an existing execution's runtime permissions. See the [implementation tracker](../plans/self-contained-pack-implementation-progress.md).
 
 An approval gives a named pack fixed external capabilities. It does not assign permission sets to a human. The issuer must currently cover every approved grant or have unrestricted permission-administration authority. Inspecting the subject pack requires Packs/Read. Controls accept access tokens, including integration access tokens, but not execution or sensor tokens.
 
 The approved subject and grants are immutable. Expiry is optional. Freezing, deleting, or changing the issuer's IAM does not revoke the approval. Use explicit revocation to stop its recorded runtime effects.
+
+Concrete resource and owner selectors resolve to existing identities when the approval is issued. Deleting a target and creating another with its ref does not transfer the approval. Open ownership scopes remain open to eligible resources created later. A fresh deployment can reuse only the fixed portion that still covers its resolved targets. Otherwise, it needs a new approval, recorded automatically only when the installer actually covers that scope. Permissions/Manage alone permits explicit approval issuance, not automatic runtime delegation.
 
 ## API
 

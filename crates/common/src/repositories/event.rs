@@ -12,7 +12,7 @@ use crate::models::{
     Id, JsonDict,
 };
 use crate::trace_tag::default_event_trace_tag;
-use crate::Result;
+use crate::{Error, Result};
 use sqlx::{Executor, PgConnection, Postgres, QueryBuilder, Row};
 
 use super::{ref_filter_like_pattern, Create, Delete, FindById, List, Repository, Update};
@@ -106,9 +106,44 @@ impl Default for EnforcementSearchFilters {
 
 #[derive(Debug, Clone, Default)]
 pub struct VisibilityGrantFilter {
+    pub managing_pack_id: Option<Id>,
     pub ids: Vec<Id>,
     pub refs: Vec<String>,
     pub pack_refs: Vec<String>,
+}
+
+#[cfg(test)]
+mod structural_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn structural_visibility_sql_conjoins_ownership_and_each_selector() {
+        let scope = VisibilityReadScope {
+            grants: vec![VisibilityGrantFilter {
+                managing_pack_id: Some(17),
+                ids: vec![8],
+                refs: vec!["local.one".into()],
+                pack_refs: vec!["local".into()],
+            }],
+            ..Default::default()
+        };
+        let mut query = QueryBuilder::new("");
+        push_visibility_scope_predicate(
+            &mut query,
+            &scope,
+            "r.id",
+            "r.ref",
+            "r.pack_ref",
+            &super::super::iam_ownership::component_pack("r"),
+            None,
+        );
+        let sql = query.sql();
+        assert!(sql.contains("r.management_origin = 'pack'"));
+        assert!(
+            sql.contains("= $1 AND r.id = ANY($2) AND r.ref = ANY($3) AND r.pack_ref = ANY($4)")
+        );
+        assert!(!sql.contains(" OR "));
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,6 +184,7 @@ pub(crate) fn push_visibility_scope_predicate(
     id_expr: &str,
     ref_expr: &str,
     pack_expr: &str,
+    managing_pack_expr: &str,
     visibility_expr: Option<&str>,
 ) {
     if scope.unconstrained {
@@ -177,7 +213,15 @@ pub(crate) fn push_visibility_scope_predicate(
         qb.push("(");
         let mut has_clause = false;
 
+        if let Some(pack) = grant.managing_pack_id {
+            qb.push(managing_pack_expr).push(" = ").push_bind(pack);
+            has_clause = true;
+        }
+
         if !grant.ids.is_empty() {
+            if has_clause {
+                qb.push(" AND ");
+            }
             qb.push(id_expr)
                 .push(" = ANY(")
                 .push_bind(grant.ids.clone())
@@ -229,6 +273,7 @@ fn push_event_visibility_predicate(
         "r.id",
         "r.ref",
         "r.pack_ref",
+        &super::iam_ownership::component_pack("r"),
         None,
     );
     qb.push(")")
@@ -243,6 +288,7 @@ fn push_event_visibility_predicate(
         "t.id",
         "t.ref",
         "t.pack_ref",
+        &super::iam_ownership::component_pack("t"),
         Some("t.reference_visibility"),
     );
     qb.push(")").push(")").push(")");
@@ -261,6 +307,7 @@ fn push_enforcement_visibility_predicate(
         "r.id",
         "r.ref",
         "r.pack_ref",
+        &super::iam_ownership::component_pack("r"),
         None,
     );
     qb.push(")");
@@ -297,19 +344,24 @@ impl FindById for EventRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let event = sqlx::query_as::<_, Event>(
+        let mut events = sqlx::query_as::<_, Event>(
             r#"
             SELECT id, trigger, trigger_ref, config, payload, trace_tag, source, source_ref,
                    rule, rule_ref, created
             FROM event
             WHERE id = $1
+            LIMIT 2
             "#,
         )
         .bind(id)
-        .fetch_optional(executor)
+        .fetch_all(executor)
         .await?;
-
-        Ok(event)
+        if events.len() > 1 {
+            return Err(crate::Error::PermissionDenied(
+                "Event ID requires its created identity".into(),
+            ));
+        }
+        Ok(events.pop())
     }
 }
 
@@ -382,7 +434,8 @@ impl Delete for EventRepository {
     {
         let deleted = sqlx::query_scalar::<_, i64>(
             "WITH removed AS (DELETE FROM event WHERE id = $1 RETURNING id), \
-             bindings AS (DELETE FROM event_schema_binding USING removed WHERE event = removed.id), \
+              bindings AS (DELETE FROM event_schema_binding USING removed WHERE event = removed.id), \
+              snapshots AS (DELETE FROM event_origin_snapshot s USING removed WHERE s.event = removed.id), \
              secrets AS (DELETE FROM execution_secret_value USING removed \
                  WHERE entity_type IN ('event_payload', 'event_config') AND entity_id = removed.id) \
              SELECT COUNT(*) FROM removed"
@@ -409,6 +462,19 @@ const DISCLOSURE_SELECT: &str =
     "SELECT id, created, trigger, trigger_ref FROM event WHERE id = ANY($1) ORDER BY id, created";
 
 impl EventRepository {
+    /// Complete native partition identity. New provenance consumers must never
+    /// infer created by looking up a numeric ID.
+    pub async fn find_by_identity<'e, E>(
+        executor: E,
+        id: Id,
+        created: DateTime<Utc>,
+    ) -> Result<Option<Event>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as("SELECT id,trigger,trigger_ref,config,payload,trace_tag,source,source_ref,rule,rule_ref,created FROM event WHERE id = $1 AND created = $2 FOR SHARE")
+            .bind(id).bind(created).fetch_optional(executor).await.map_err(Into::into)
+    }
     pub async fn find_disclosure_rows<'e, E>(
         executor: E,
         ids: &[Id],
@@ -437,6 +503,40 @@ impl EventRepository {
         push_event_visibility_predicate(&mut query, visibility);
         query
             .build_query_scalar()
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Retain exact event identities when applying ordinary endpoint visibility.
+    /// A visible partition twin must not authorize a different physical event.
+    pub async fn visible_identities<'e, E>(
+        executor: E,
+        identities: &[(Id, DateTime<Utc>)],
+        visibility: &EventVisibilityFilter,
+    ) -> Result<Vec<(Id, DateTime<Utc>)>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if identities.len() > 256 {
+            return Err(Error::validation(
+                "Event visibility batch exceeds its bound",
+            ));
+        }
+        let mut query =
+            QueryBuilder::<Postgres>::new("SELECT event.id,event.created FROM event JOIN unnest(");
+        query.push_bind(identities.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+            .push("::BIGINT[],")
+            .push_bind(identities.iter().map(|(_, created)| *created).collect::<Vec<_>>())
+            .push("::TIMESTAMPTZ[]) q(id,created) ON event.id=q.id AND event.created=q.created WHERE ");
+        // Enforcement links still carry only event.id. With partition twins,
+        // they cannot prove which event's rule visibility the caller owns.
+        // Do not borrow a twin's rule relationship for constrained disclosure.
+        query.push("NOT (EXISTS(SELECT 1 FROM enforcement ea WHERE ea.event=event.id) \
+            AND (SELECT count(*) FROM (SELECT 1 FROM event twin WHERE twin.id=event.id LIMIT 2) twins)>1) AND ");
+        push_event_visibility_predicate(&mut query, visibility);
+        query
+            .build_query_as()
             .fetch_all(executor)
             .await
             .map_err(Into::into)
@@ -1072,7 +1172,7 @@ impl EnforcementRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, Enforcement>(&format!(
-            "SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement WHERE rule = $1 AND event = $2 LIMIT 1"
+            "SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement WHERE rule = $1 AND event = $2 AND event_created IS NULL LIMIT 1"
         ))
         .bind(rule_id)
         .bind(event_id)
@@ -1085,7 +1185,7 @@ impl EnforcementRepository {
         conn: &mut sqlx::PgConnection,
         input: CreateEnforcementInput,
     ) -> Result<EnforcementCreateOrGetResult> {
-        Self::create_or_get_by_rule_event_with_snapshot(conn, input, None).await
+        Self::create_or_get_by_rule_event_with_snapshot(conn, input, None, None).await
     }
 
     pub async fn create_or_get_by_rule_event_pinned(
@@ -1093,13 +1193,91 @@ impl EnforcementRepository {
         input: CreateEnforcementInput,
         snapshot: &crate::models::ExecutionExecutableSnapshot,
     ) -> Result<EnforcementCreateOrGetResult> {
-        Self::create_or_get_by_rule_event_with_snapshot(conn, input, Some(snapshot)).await
+        Self::create_or_get_by_rule_event_with_snapshot(conn, input, Some(snapshot), None).await
+    }
+
+    pub async fn find_by_rule_and_event_identity<'e, E>(
+        executor: E,
+        rule: Id,
+        event: Id,
+        created: DateTime<Utc>,
+    ) -> Result<Option<Enforcement>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        Ok(sqlx::query_as(&format!("SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement WHERE rule = $1 AND event = $2 AND event_created = $3"))
+            .bind(rule).bind(event).bind(created).fetch_optional(executor).await?)
+    }
+
+    /// The producer supplies the actual Event row, never a timestamp guessed
+    /// from an ID lookup. Dedupe keeps timestamp twins independent.
+    pub async fn create_or_get_by_qualified_event_pinned(
+        conn: &mut sqlx::PgConnection,
+        input: CreateEnforcementInput,
+        snapshot: &crate::models::ExecutionExecutableSnapshot,
+        event: &Event,
+    ) -> Result<EnforcementCreateOrGetResult> {
+        if input.rule.is_none()
+            || input.event != Some(event.id)
+            || input.trigger_ref != event.trigger_ref
+        {
+            return Err(crate::Error::validation(
+                "Enforcement event identity mismatch",
+            ));
+        }
+        // Keep the producer's immutable event-source snapshot as the origin
+        // reference. The exact event may later be retained away independently.
+        let source = super::event_origin::EventOriginRepository::source_id(
+            &mut *conn,
+            event.id,
+            event.created,
+        )
+        .await?;
+        if !super::event_origin::EventOriginRepository::find(&mut *conn, source)
+            .await?
+            .matches(event)
+        {
+            return Err(crate::Error::validation(
+                "Enforcement event source snapshot mismatch",
+            ));
+        }
+        Self::create_or_get_by_rule_event_with_snapshot(
+            conn,
+            input,
+            Some(snapshot),
+            Some(event.created),
+        )
+        .await
+    }
+
+    /// Qualified accepted sources never fall back to another row with the same
+    /// ID. Only historical NULL timestamp links use the ambiguity-denying reader.
+    pub async fn source_event<'e, E>(
+        executor: E,
+        enforcement: &Enforcement,
+    ) -> Result<Option<Event>>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        let Some(id) = enforcement.event else {
+            return Ok(None);
+        };
+        let created: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT event_created FROM enforcement WHERE id = $1")
+                .bind(enforcement.id)
+                .fetch_one(executor)
+                .await?;
+        match created {
+            Some(created) => EventRepository::find_by_identity(executor, id, created).await,
+            None => EventRepository::find_by_id(executor, id).await,
+        }
     }
 
     async fn create_or_get_by_rule_event_with_snapshot(
         conn: &mut sqlx::PgConnection,
         input: CreateEnforcementInput,
         snapshot: Option<&crate::models::ExecutionExecutableSnapshot>,
+        event_created: Option<DateTime<Utc>>,
     ) -> Result<EnforcementCreateOrGetResult> {
         let (Some(rule_id), Some(event_id)) = (input.rule, input.event) else {
             let enforcement = if let Some(snapshot) = snapshot {
@@ -1132,9 +1310,9 @@ impl EnforcementRepository {
         let inserted = sqlx::query_as::<_, Enforcement>(
             r#"
             INSERT INTO enforcement (rule, rule_ref, trigger_ref, pack_release, pack_release_digest,
-                                     executable_snapshot, config, event, status, payload, condition, conditions)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT (rule, event) WHERE rule IS NOT NULL AND event IS NOT NULL DO NOTHING
+                                     executable_snapshot, config, event, status, payload, condition, conditions, event_created)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ON CONFLICT (rule, event, event_created) WHERE rule IS NOT NULL AND event IS NOT NULL DO NOTHING
             RETURNING id, rule, rule_ref, trigger_ref, pack_release, pack_release_digest,
                       executable_snapshot, config, event, status, payload, condition,
                       conditions, created, resolved_at
@@ -1152,6 +1330,7 @@ impl EnforcementRepository {
         .bind(&input.payload)
         .bind(input.condition)
         .bind(&input.conditions)
+        .bind(event_created)
         .fetch_optional(&mut *conn)
         .await?;
 
@@ -1162,15 +1341,20 @@ impl EnforcementRepository {
             });
         }
 
-        let enforcement = Self::find_by_rule_and_event(&mut *conn, rule_id, event_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "enforcement for rule {} and event {} disappeared after dedupe conflict",
-                    rule_id,
-                    event_id
-                )
-            })?;
+        let enforcement = match event_created {
+            Some(created) => {
+                Self::find_by_rule_and_event_identity(&mut *conn, rule_id, event_id, created)
+                    .await?
+            }
+            None => Self::find_by_rule_and_event(&mut *conn, rule_id, event_id).await?,
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "enforcement for rule {} and event {} disappeared after dedupe conflict",
+                rule_id,
+                event_id
+            )
+        })?;
 
         Ok(EnforcementCreateOrGetResult {
             enforcement,

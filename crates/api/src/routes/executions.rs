@@ -1,4 +1,5 @@
 //! Execution management API routes
+mod recorded;
 
 use axum::{
     extract::{Path, Query, State},
@@ -12,13 +13,12 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use futures::stream::{Stream, StreamExt};
 use sqlx::{Postgres, QueryBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
+mod streams;
 
 use attune_common::blob_store::ByteRange;
 use attune_common::models::enums::ActionReferenceVisibility;
@@ -39,7 +39,6 @@ use attune_common::repositories::{
         CreateExecutionInput, ExecutionRepository, ExecutionSearchFilters, ExecutionSearchResult,
         ExecutionWithRefs, UpdateExecutionInput,
     },
-    execution_secret_value::ExecutionSecretValueRepository,
     log_stream::LogStreamRepository,
     maintenance::MaintenanceRepository,
     work_queue::{WorkQueueItemRepository, WorkQueueRepository},
@@ -108,6 +107,14 @@ pub async fn create_execution(
     RequireAuth(user): RequireAuth,
     Json(request): Json<CreateExecutionRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "Execution creation requires an access or execution credential".into(),
+        ));
+    }
     // Validate that the action exists
     let action = ActionRepository::find_by_ref(&state.db, &request.action_ref)
         .await?
@@ -120,36 +127,17 @@ pub async fn create_execution(
     }
 
     let authz = state.authorization_service();
-    // Load identity attributes + effective grants once (for Access/Execution
-    // tokens) and reuse them below for both the action-execute check and the
-    // permission-set delegation check, instead of re-fetching per check.
-    // Returns `None` for token types not subject to identity-based RBAC,
-    // matching the original per-check bypass behavior.
-    let authz_snapshot = authz.load_snapshot(&user).await?;
-
-    if matches!(
-        user.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-
-        let mut action_ctx = AuthorizationContext::new(identity_id);
-        action_ctx.target_id = Some(action.id);
-        action_ctx.target_ref = Some(action.r#ref.clone());
-        action_ctx.pack_ref = Some(action.pack_ref.clone());
-
-        authz.authorize_with_snapshot(
-            &user,
-            authz_snapshot.as_ref(),
-            AuthorizationCheck {
-                resource: Resource::Actions,
-                action: Action::Execute,
-                context: action_ctx,
-            },
-        )?;
-    }
+    let recorded_credential = user
+        .claims
+        .admitted_execution_credential()
+        .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?;
+    // Interactive/ad-hoc delegation uses IAM. Recorded credentials are checked
+    // inside creation's transaction and never flattened into human grants.
+    let authz_snapshot = if recorded_credential.is_some() {
+        None
+    } else {
+        authz.load_snapshot(&user).await?
+    };
 
     // When the request is authenticated with an execution-scoped token (e.g.,
     // an MCP client invoked from inside a running execution), automatically
@@ -170,45 +158,209 @@ pub async fn create_execution(
     } else {
         None
     };
+    if user.claims.token_type == TokenType::Execution {
+        let parent = parent_execution
+            .as_ref()
+            .ok_or_else(|| ApiError::Unauthorized("Originating execution is unavailable".into()))?;
+        if parent.status != ExecutionStatus::Running {
+            return Err(ApiError::Forbidden(
+                "Originating execution is not running".into(),
+            ));
+        }
+    }
 
-    // SECURITY: Record the triggering identity on the execution so that the
-    // worker mints the execution-scoped API token (`ATTUNE_API_TOKEN`) with
-    // that identity's `sub` claim. This ensures callbacks from the action are
-    // subject to the same RBAC as the user who triggered them.
-    //
-    // For execution-token callers (e.g., the MCP server inside a running
-    // action), inherit the executor of the originating execution rather than
-    // using the token's `sub` directly — this preserves the security context
-    // across nested calls.
+    // Preserve requester attribution separately from the recorded runtime
+    // sponsor. An execution caller must have a real originating row.
     let executor_identity = match user.claims.token_type {
         TokenType::Access => user.identity_id().ok(),
-        TokenType::Execution => parent_execution
-            .as_ref()
-            .and_then(|p| p.executor)
-            .or_else(|| user.identity_id().ok()),
-        // Sensor / refresh tokens are not expected here; fall back to the
-        // claimed identity if present.
-        _ => user.identity_id().ok(),
+        TokenType::Execution => parent_execution.as_ref().and_then(|p| p.executor),
+        _ => None,
     };
 
     // Selection is server-owned. Keep code, contracts, parameters, and encrypted
     // values in one creation transaction; requests have no revision selector.
     let mut tx = state.db.begin().await?;
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
-    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+    let recorded_authority = user.recorded_runtime_authority(&mut tx).await?;
+    if let Some(authority) = &recorded_authority {
+        attune_common::repositories::runtime_read::RuntimeReadRepository::require_untainted(
+            &mut tx,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+    }
+    let action = ActionRepository::find_by_refs_for_share(
+        &mut tx,
+        std::slice::from_ref(&request.action_ref),
+    )
+    .await?
+    .into_iter()
+    .find(|current| current.id == action.id && current.enabled)
+    .ok_or_else(|| ApiError::Forbidden("Action changed or is no longer enabled".into()))?;
+    if let Some(authority) = &recorded_authority {
+        use attune_common::repositories::runtime_target::{
+            ComponentTarget, RuntimeTarget, RuntimeTargetRepository,
+        };
+        let target = RuntimeTargetRepository::resolve(
+            &mut tx,
+            RuntimeTarget::Component(ComponentTarget::Action, action.id),
+            authority.authority().owner.sponsor_identity_id,
+        )
+        .await?;
+        if !target
+            .as_ref()
+            .is_some_and(|target| authority.allows_new_effect(target, Action::Execute))
+        {
+            return Err(ApiError::Forbidden(
+                "Originating execution cannot invoke this action".into(),
+            ));
+        }
+        let parent = parent_execution
+            .as_ref()
+            .and_then(|parent| parent.executable_snapshot.as_ref())
+            .ok_or_else(|| ApiError::Forbidden("Originating executable is unavailable".into()))?;
+        attune_common::action_visibility::ensure_action_reference_allowed(
+            &action,
+            Some(&parent.executable.action.pack_ref),
+            "execution",
+            authority.authority().binding.action_ref(),
+        )?;
+    } else {
+        let identity_id = user
+            .identity_id()
+            .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+        let mut context = AuthorizationContext::new(identity_id);
+        context.target_id = Some(action.id);
+        context.target_ref = Some(action.r#ref.clone());
+        context.pack_ref = Some(action.pack_ref.clone());
+        authz.authorize_with_snapshot(
+            &user,
+            authz_snapshot.as_ref(),
+            AuthorizationCheck {
+                resource: Resource::Actions,
+                action: Action::Execute,
+                context,
+            },
+        )?;
+    }
+    let snapshot = if !action.is_adhoc || recorded_credential.is_some() {
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
+            &mut tx, action.pack,
+            attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Action, action.id),
+            &attune_common::runtime_authority::InvocationBinding::Action { action_ref: action.r#ref.clone() },
+        ).await?
+    } else {
+        ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?
+    };
     let action = &snapshot.executable.action;
-    let binding =
+    let binding = if !action.is_adhoc || recorded_credential.is_some() {
+        attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &snapshot).await?
+    } else {
         attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(
             &mut tx, &snapshot,
         )
-        .await?;
+        .await?
+    };
     let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)
         .map_err(|error| ApiError::BadRequest(format!("Invalid input contract: {error}")))?;
     let permission_set_refs = request
         .permission_set_refs
         .clone()
         .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
-    if !permission_set_refs.is_empty()
+    let recorded_parent = if let Some(parent) = parent_from_token {
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+            &mut tx,
+            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent),
+        )
+        .await?
+        .is_some()
+    } else {
+        false
+    };
+    if let Some(parent) = &parent_execution {
+        if recorded_parent && recorded_credential.is_none() {
+            return Err(ApiError::Unauthorized(
+                "Originating execution requires its recorded credential".into(),
+            ));
+        }
+        if !recorded_parent {
+            let adhoc = parent
+                .executable_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.executable.action.is_adhoc);
+            let claimed_action = user
+                .claims
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("action_ref"))
+                .and_then(serde_json::Value::as_str);
+            let claimed_refs = user
+                .claims
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("permission_set_refs"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|refs| {
+                    refs.iter()
+                        .map(serde_json::Value::as_str)
+                        .collect::<Option<std::collections::BTreeSet<_>>>()
+                });
+            let selected_refs = parent
+                .permission_set_refs
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            if !adhoc
+                || parent.executor != user.identity_id().ok()
+                || claimed_action != Some(parent.action_ref.as_str())
+                || selected_refs.is_empty()
+                || claimed_refs.as_ref() != Some(&selected_refs)
+            {
+                return Err(ApiError::Unauthorized(
+                    "Originating execution credential does not match its source".into(),
+                ));
+            }
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::validate_legacy_origin(&mut tx, parent.id, user.identity_id().map_err(|_| ApiError::Unauthorized("Invalid originating identity".into()))?, claimed_action.ok_or_else(|| ApiError::Unauthorized("Missing originating action".into()))?, &selected_refs.iter().map(|reference| (*reference).to_string()).collect::<Vec<_>>()).await?;
+        }
+    }
+    let admission = if !action.is_adhoc || recorded_parent {
+        use attune_common::{
+            repositories::execution_admission::ExecutionAdmissionRepository,
+            runtime_authority::{HumanAttribution, InvocationBinding, RequestAttribution},
+        };
+        let attribution = match parent_from_token {
+            Some(execution_id) => RequestAttribution::ParentExecution { execution_id },
+            None => RequestAttribution::Human {
+                actor: HumanAttribution {
+                    identity_id: user
+                        .identity_id()
+                        .map_err(|_| ApiError::Unauthorized("Invalid requester".into()))?,
+                    login: user.login().into(),
+                },
+            },
+        };
+        Some(
+            ExecutionAdmissionRepository::select(
+                &mut tx,
+                action.pack,
+                InvocationBinding::Action {
+                    action_ref: action.r#ref.clone(),
+                },
+                &snapshot,
+                &permission_set_refs,
+                attribution,
+                attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                    attune_common::repositories::runtime_target::ComponentTarget::Action,
+                    action.id,
+                ),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if admission.is_none()
+        && !permission_set_refs.is_empty()
         && !authz
             .can_delegate_permission_sets_with_snapshot(
                 &user,
@@ -282,57 +434,13 @@ pub async fn create_execution(
         .or(action.artifact_retention_limit)
         .or(Some(5));
 
-    let raw_config = request
-        .parameters
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let raw_config = input_contract
-        .apply_defaults(&raw_config)
-        .map_err(|error| ApiError::BadRequest(format!("Invalid execution parameters: {error}")))?;
-    input_contract
-        .validate(&raw_config)
-        .map_err(|error| ApiError::BadRequest(format!("Invalid execution parameters: {error}")))?;
-    let (redacted_config, secret_inputs) =
-        attune_common::secret_values::merge_contract_secret_redactions(
-            raw_config,
-            &[],
-            &input_contract,
-        )?;
-    let config_for_storage = if redacted_config.is_null()
-        || redacted_config
-            .as_object()
-            .is_some_and(|obj| obj.is_empty())
-    {
-        None
-    } else {
-        Some(redacted_config.clone())
-    };
-    let prepared_secrets = if secret_inputs.is_empty() {
-        Vec::new()
-    } else {
-        let encryption_key = state
-            .config
-            .security
-            .encryption_key
-            .as_ref()
-            .ok_or_else(|| {
-                ApiError::InternalServerError(
-                    "Cannot store secret execution parameters without security.encryption_key"
-                        .to_string(),
-                )
-            })?;
-        prepare_secret_values(secret_inputs, encryption_key).map_err(|e| {
-            ApiError::InternalServerError(format!(
-                "Failed to encrypt secret execution parameters: {e}"
-            ))
-        })?
-    };
-
     // Create execution input
     let execution_input = CreateExecutionInput {
         action: Some(action.id),
         action_ref: action.r#ref.clone(),
-        config: config_for_storage,
+        // Input permits require an admitted row. Keep this provisional row
+        // credential-bound but value-free until rendering finishes in this tx.
+        config: None,
         env_vars: request.env_vars.as_ref().map(|env_vars| {
             serde_json::to_value(env_vars).expect("string environment map must serialize")
         }),
@@ -354,8 +462,31 @@ pub async fn create_execution(
     };
 
     // Insert into database
-    let created_execution =
+    let mut created_execution =
         ExecutionRepository::create_pinned(&mut *tx, execution_input, &snapshot).await?;
+    let mut initial_admission = None;
+    if let Some(admission) = &admission {
+        let record = admission
+            .attach(
+                &mut tx,
+                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                    created_execution.id,
+                ),
+            )
+            .await?;
+        initial_admission = Some(record.id);
+        if let Some(parent) = parent_from_token {
+            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(&mut tx, "execution", parent, "execution", created_execution.id).await?;
+            attune_common::repositories::rule_authority::RuleAuthorityRepository::copy_execution(
+                &mut tx,
+                parent,
+                created_execution.id,
+            )
+            .await?;
+        } else if user.claims.token_type == TokenType::Access {
+            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_human(&mut tx, "execution", created_execution.id, executor_identity.ok_or_else(|| ApiError::Unauthorized("Input requester unavailable".into()))?).await?;
+        }
+    }
     attune_common::repositories::schema_contract::SchemaContractRepository::attach(
         &mut tx,
         attune_common::repositories::schema_contract::BindingOwner::Execution,
@@ -363,14 +494,94 @@ pub async fn create_execution(
         &binding,
     )
     .await?;
-    ExecutionSecretValueRepository::upsert_many_with_conn(
+    let supplied = request
+        .parameters
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let defaults = input_contract
+        .apply_defaults(&supplied)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid execution parameters: {error}")))?;
+    let (config, declared_sources) = if admission.is_some() {
+        attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::action_defaults(
+            &mut tx, created_execution.id, &supplied, defaults, state.config.security.encryption_key.as_deref(),
+        ).await?
+    } else {
+        (defaults, Vec::new())
+    };
+    input_contract
+        .validate(&config)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid execution parameters: {error}")))?;
+    attune_common::secret_values::validate_contract_secret_destination_paths(
+        &config,
+        &input_contract,
+        &declared_sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let (redacted, inputs) = attune_common::secret_values::merge_contract_secret_redactions(
+        config,
+        &declared_sources,
+        &input_contract,
+    )?;
+    let prepared_secrets = if inputs.is_empty() {
+        Vec::new()
+    } else {
+        prepare_secret_values(
+            inputs,
+            state
+                .config
+                .security
+                .encryption_key
+                .as_deref()
+                .ok_or_else(|| {
+                    ApiError::InternalServerError(
+                        "Execution input encryption is unavailable".into(),
+                    )
+                })?,
+        )?
+    };
+    let config = (!redacted.is_null()
+        && !redacted.as_object().is_some_and(|value| value.is_empty()))
+    .then_some(redacted);
+    // All source/target/receipt/schema fences remain held. No supplied string
+    // has been evaluated as a declaration, and no plaintext row was committed.
+    created_execution = ExecutionRepository::initialize_config_with_conn(
         &mut tx,
-        ENTITY_EXECUTION_CONFIG,
         created_execution.id,
+        initial_admission,
+        &snapshot,
+        config,
         &prepared_secrets,
     )
     .await?;
+    let input_receipts = if admission.is_some() {
+        attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::seal_execution_inputs(
+            &mut tx, created_execution.id,
+            state.config.security.encryption_key.as_deref().ok_or_else(|| ApiError::InternalServerError("Accepted input receipt encryption is unavailable".into()))?,
+        ).await?
+    } else {
+        Vec::new()
+    };
+    if let Some(authority) = &recorded_authority {
+        authority.ensure_fresh_on(&mut tx).await?;
+    }
+    if let Some(admission) = &admission {
+        admission.ensure_fresh_on(&mut tx).await?;
+    }
+    for receipt in &input_receipts {
+        receipt.ensure_fresh_on(&mut tx).await?;
+    }
     tx.commit().await?;
+    for receipt in &input_receipts {
+        receipt.ensure_fresh()?;
+    }
+    if let Some(authority) = &recorded_authority {
+        authority.effect_fence().ensure_fresh()?;
+    }
+    if let Some(admission) = &admission {
+        admission.effect_fence().ensure_fresh()?;
+    }
 
     // Publish ExecutionRequested message to queue
     let payload = ExecutionRequestedPayload {
@@ -427,6 +638,15 @@ pub async fn create_execution(
         state.audit_emitter.emit(builder.build());
     }
 
+    for receipt in &input_receipts {
+        receipt.ensure_fresh()?;
+    }
+    if let Some(authority) = &recorded_authority {
+        authority.effect_fence().ensure_fresh()?;
+    }
+    if let Some(admission) = &admission {
+        admission.effect_fence().ensure_fresh()?;
+    }
     Ok((StatusCode::CREATED, Json(ApiResponse::new(response))))
 }
 
@@ -451,7 +671,11 @@ pub async fn list_executions(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
+    let authz_snapshot = if recorded::active(&user)? {
+        None
+    } else {
+        state.authorization_service().load_snapshot(&user).await?
+    };
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let filters = ExecutionSearchFilters {
@@ -527,6 +751,9 @@ async fn authorize_execution_collection_access(
     snapshot: Option<&AuthorizationSnapshot>,
     action: Action,
 ) -> Result<(), ApiError> {
+    if recorded::active(user)? {
+        return Ok(());
+    }
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
@@ -569,6 +796,7 @@ async fn authorize_execution_collection_access(
 
 #[derive(Debug, Clone)]
 struct ExecutionVisibilityGrant {
+    managing_pack_id: Option<i64>,
     pack_refs: Option<Vec<String>>,
     refs: Option<Vec<String>>,
     ids: Option<Vec<i64>>,
@@ -631,6 +859,7 @@ fn collect_execution_visibility_grants(
         .filter_map(|grant| {
             let Some(constraints) = &grant.constraints else {
                 return Some(ExecutionVisibilityGrant {
+                    managing_pack_id: None,
                     pack_refs: None,
                     refs: None,
                     ids: None,
@@ -646,6 +875,7 @@ fn collect_execution_visibility_grants(
             }
 
             Some(ExecutionVisibilityGrant {
+                managing_pack_id: constraints.managing_pack_id,
                 pack_refs: constraints.pack_refs.clone(),
                 refs: constraints.refs.clone(),
                 ids: constraints.ids.clone(),
@@ -671,6 +901,15 @@ fn push_root_visibility_predicate(
         }
         has_clause = true;
         qb.push("(TRUE");
+
+        if let Some(pack) = grant.managing_pack_id {
+            qb.push(" AND ")
+                .push(attune_common::repositories::iam_ownership::execution_pack(
+                    "root",
+                ))
+                .push(" = ")
+                .push_bind(pack);
+        }
 
         if let Some(pack_refs) = &grant.pack_refs {
             if pack_refs.is_empty() {
@@ -851,6 +1090,9 @@ async fn search_authorized_executions(
     filters: &ExecutionSearchFilters,
     action: Action,
 ) -> Result<ExecutionSearchResult, ApiError> {
+    if recorded::active(user)? {
+        return recorded::search(state, user, filters, action).await;
+    }
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
@@ -979,6 +1221,9 @@ async fn load_authorized_execution_status_counts(
     user: &AuthenticatedUser,
     snapshot: Option<&AuthorizationSnapshot>,
 ) -> Result<Vec<ExecutionStatusCountRow>, ApiError> {
+    if recorded::active(user)? {
+        return recorded::status_counts(state, user).await;
+    }
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
@@ -1068,6 +1313,9 @@ pub async fn get_execution(
     Path(id): Path<i64>,
     Query(query): Query<ExecutionDetailQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    if recorded::active(&user)? {
+        return recorded::detail(&state, &user, id, query.include_secret_values).await;
+    }
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
@@ -1140,7 +1388,7 @@ pub async fn get_execution(
 
     let response = ApiResponse::new(response);
 
-    Ok((StatusCode::OK, Json(response)))
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
 /// List safe workflow cache iteration status for an execution.
@@ -1162,6 +1410,25 @@ pub async fn list_workflow_cache_iterations(
     RequireAuth(user): RequireAuth,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
+    if recorded::active(&user)? {
+        let mut tx = state.db.begin().await?;
+        crate::recorded_consumers::authorize_target(
+            &mut tx,
+            &user,
+            attune_common::repositories::runtime_target::RuntimeTarget::Execution(id),
+            Action::Read,
+        )
+        .await?;
+        let iterations = WorkflowCacheIterationRepository::list_by_execution(&mut *tx, id).await?;
+        let mut response: Vec<WorkflowCacheIterationResponse> = iterations
+            .into_iter()
+            .map(WorkflowCacheIterationResponse::from)
+            .collect();
+        for iteration in &mut response {
+            iteration.error_summary = None;
+        }
+        return Ok((StatusCode::OK, Json(ApiResponse::new(response))));
+    }
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {id} not found")))?;
@@ -1206,6 +1473,22 @@ pub async fn list_workflow_task_waits(
     RequireAuth(user): RequireAuth,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
+    if recorded::active(&user)? {
+        let mut tx = state.db.begin().await?;
+        crate::recorded_consumers::authorize_target(
+            &mut tx,
+            &user,
+            attune_common::repositories::runtime_target::RuntimeTarget::Execution(id),
+            Action::Read,
+        )
+        .await?;
+        let waits = WorkflowTaskWaitRepository::list_by_execution(&mut *tx, id).await?;
+        let response: Vec<WorkflowTaskWaitResponse> = waits
+            .into_iter()
+            .map(|wait| WorkflowTaskWaitResponse::try_from_wait(wait, false, None))
+            .collect::<attune_common::Result<_>>()?;
+        return Ok((StatusCode::OK, Json(ApiResponse::new(response))));
+    }
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {id} not found")))?;
@@ -1323,7 +1606,11 @@ pub async fn list_executions_by_status(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
+    let authz_snapshot = if recorded::active(&user)? {
+        None
+    } else {
+        state.authorization_service().load_snapshot(&user).await?
+    };
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     // Parse status from string
@@ -1398,7 +1685,11 @@ pub async fn list_executions_by_enforcement(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
+    let authz_snapshot = if recorded::active(&user)? {
+        None
+    } else {
+        state.authorization_service().load_snapshot(&user).await?
+    };
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let filters = ExecutionSearchFilters {
@@ -1447,7 +1738,11 @@ pub async fn get_execution_stats(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped status
     // count query below, instead of fetching them separately for each.
-    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
+    let authz_snapshot = if recorded::active(&user)? {
+        None
+    } else {
+        state.authorization_service().load_snapshot(&user).await?
+    };
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let rows =
@@ -1523,6 +1818,12 @@ pub async fn cancel_execution(
     RequireAuth(user): RequireAuth,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
+    if recorded::active(&user)? {
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(recorded::cancel(&state, &user, id).await?)),
+        ));
+    }
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
@@ -1733,6 +2034,14 @@ pub async fn reschedule_execution(
     RequireAuth(user): RequireAuth,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
+    if recorded::active(&user)? {
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(
+                recorded::reschedule(&state, &user, id).await?,
+            )),
+        ));
+    }
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
@@ -1761,8 +2070,24 @@ pub async fn reschedule_execution(
         ));
     };
 
+    use attune_common::repositories::requested_execution_publication::RequestedExecutionPublicationRepository as Requested;
+    let key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError("Requested input encryption unavailable".into())
+        })?;
+    let mut tx = state.db.begin().await?;
+    // Current human Cancel rights authorize the operation, never the target's
+    // original input ceiling. Prepare that independent proof before target locks.
+    let prepared = Requested::prepare(&mut tx, &execution, key)
+        .await?
+        .ok_or_else(|| ApiError::Conflict("Execution is not eligible for reschedule".into()))?;
+    prepared.lock_target(&mut tx).await?;
     let attempt = MaintenanceRepository::mark_execution_reschedule_attempt(
-        &state.db,
+        &mut *tx,
         id,
         "api-service",
         "manual execution reschedule requested",
@@ -1798,10 +2123,14 @@ pub async fn reschedule_execution(
         .with_source("api-service")
         .with_correlation_id(uuid::Uuid::new_v4());
 
-    publisher
-        .publish_envelope(&message)
+    if let Err(error) = prepared
+        .publish_bounded(&mut tx, publisher.publish_envelope(&message))
         .await
-        .map_err(|e| ApiError::InternalServerError(format!("Failed to publish message: {}", e)))?;
+    {
+        tx.rollback().await?;
+        return Err(error.into());
+    }
+    tx.commit().await?;
 
     emit_execution_reschedule_audit(&state, &user, &execution, &attempt);
 
@@ -2205,46 +2534,10 @@ pub async fn stream_execution_updates(
     headers: HeaderMap,
     Query(params): Query<StreamExecutionParams>,
     user: Result<RequireAuth, crate::auth::middleware::AuthError>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     let authenticated_user = authenticate_execution_stream_user(&state, &headers, user)?;
     validate_execution_updates_stream_user(&authenticated_user, params.execution_id)?;
-    let rx = state.broadcast_tx.subscribe();
-    let stream = BroadcastStream::new(rx);
-
-    let filtered_stream = stream.filter_map(move |msg| {
-        async move {
-            match msg {
-                Ok(notification) => {
-                    // Parse the notification as JSON
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&notification) {
-                        // Check if it's an execution update
-                        if let Some(entity_type) = value.get("entity_type").and_then(|v| v.as_str())
-                        {
-                            if entity_type == "execution" {
-                                // If filtering by execution_id, check if it matches
-                                if let Some(filter_id) = params.execution_id {
-                                    if let Some(entity_id) =
-                                        value.get("entity_id").and_then(|v| v.as_i64())
-                                    {
-                                        if entity_id != filter_id {
-                                            return None; // Skip this event
-                                        }
-                                    }
-                                }
-
-                                // Send the notification as an SSE event
-                                return Some(Ok(Event::default().data(notification)));
-                            }
-                        }
-                    }
-                    None
-                }
-                Err(_) => None, // Skip broadcast errors
-            }
-        }
-    });
-
-    Ok(Sse::new(filtered_stream).keep_alive(KeepAlive::default()))
+    streams::updates(state, authenticated_user, params.execution_id).await
 }
 
 #[derive(serde::Deserialize)]
@@ -2386,7 +2679,7 @@ pub async fn stream_execution_log(
     Path((id, stream_name)): Path<(i64, String)>,
     Query(params): Query<StreamExecutionLogParams>,
     user: Result<RequireAuth, crate::auth::middleware::AuthError>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     let authenticated_user = authenticate_execution_stream_user(&state, &headers, user)?;
     validate_execution_log_stream_user(&authenticated_user, id)?;
     let identity_id = authenticated_user
@@ -2417,6 +2710,17 @@ pub async fn stream_execution_log(
     if is_retry {
         state.execution_log_streams.record_retry();
     }
+    if crate::recorded_consumers::is_recorded(&authenticated_user)? {
+        return streams::protected_log(
+            state,
+            authenticated_user,
+            id,
+            stream_name,
+            start_offset,
+            permit,
+        )
+        .await;
+    }
 
     // Subscribe before any stream or terminal-status read. A racing update is
     // either visible in the read or remains queued for the following wait.
@@ -2429,6 +2733,50 @@ pub async fn stream_execution_log(
 
     let stream_name = ExecutionLogStream::parse(&stream_name)?;
     let artifact_ref = stream_name.artifact_ref(&execution.action_ref);
+    if attune_common::repositories::runtime_read::RuntimeReadRepository::source_admission(
+        &state.db, id,
+    )
+    .await?
+    .is_some()
+    {
+        let name = match stream_name {
+            ExecutionLogStream::Stdout => "stdout",
+            ExecutionLogStream::Stderr => "stderr",
+        };
+        return streams::protected_log(
+            state,
+            authenticated_user,
+            id,
+            name.to_owned(),
+            start_offset,
+            permit,
+        )
+        .await;
+    }
+    if let Some(artifact) = ArtifactRepository::find_by_ref(&state.db, &artifact_ref).await? {
+        if let Some(version) =
+            ArtifactVersionRepository::find_by_artifact_and_execution(&state.db, artifact.id, id)
+                .await?
+        {
+            if version.meta.as_ref().is_some_and(|meta| {
+                meta.get("log_encoding").is_some() || meta.get("encrypted_log_manifest").is_some()
+            }) {
+                let name = match stream_name {
+                    ExecutionLogStream::Stdout => "stdout",
+                    ExecutionLogStream::Stderr => "stderr",
+                };
+                return streams::protected_log(
+                    state,
+                    authenticated_user,
+                    id,
+                    name.to_owned(),
+                    start_offset,
+                    permit,
+                )
+                .await;
+            }
+        }
+    }
     let stream_state = Arc::clone(&state);
 
     let initial_state = ExecutionLogTailState::WaitingForStream {
@@ -2735,14 +3083,12 @@ pub async fn stream_execution_log(
         }
     });
 
-    let stream = stream.map(move |event| {
-        let _permit = &permit;
-        event
-    });
+    let stream = streams::guard_legacy_log(stream, state, authenticated_user, id, permit);
     Ok((
         [("x-accel-buffering", "no")],
         Sse::new(stream).keep_alive(KeepAlive::default()),
-    ))
+    )
+        .into_response())
 }
 
 async fn resolve_execution_log_stream(
@@ -2777,6 +3123,20 @@ async fn read_execution_log_chunk(
 ) -> Result<ExecutionLogRead, ExecutionLogReadError> {
     state.execution_log_streams.record_tail_database_query();
     session.stream = LogStreamRepository::find_by_id_in_pool(&state.db, session.stream.id).await?;
+    // A late allocation must never send framed ciphertext through the legacy
+    // plaintext-offset transport. Reconnecting selects the protected decoder.
+    let version =
+        ArtifactVersionRepository::find_by_id(&state.db, session.stream.artifact_version).await?;
+    if version.as_ref().is_none_or(|version| {
+        version.meta.as_ref().is_some_and(|meta| {
+            meta.get("log_encoding").is_some() || meta.get("encrypted_log_manifest").is_some()
+        })
+    }) {
+        return Err(attune_common::Error::PermissionDenied(
+            "Protected log requires authenticated delivery".into(),
+        )
+        .into());
+    }
     let shared_snapshot = if session.stream.backend == LogStreamBackend::SharedFile {
         Some(super::internal_files::resolve_shared_file_log_snapshot(state, &session.stream).await?)
     } else {
@@ -3137,12 +3497,43 @@ struct ExecutionVisibilityAnchorRow {
 /// once for each of the tree anchor and the ancestor-executor chain.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExecutionVisibilityCache {
+    managing_packs: HashMap<i64, Option<i64>>,
     lineages: HashMap<i64, Option<attune_common::repositories::execution::ExecutionLineageRow>>,
     ancestor_owners: HashMap<i64, Vec<i64>>,
     public_actions: HashMap<String, bool>,
 }
 
 impl ExecutionVisibilityCache {
+    pub(crate) fn managing_pack(&self, execution: i64) -> Option<i64> {
+        self.managing_packs.get(&execution).copied().flatten()
+    }
+    pub(crate) async fn load_ownership(
+        &mut self,
+        db: &sqlx::PgPool,
+        ids: &[i64],
+    ) -> Result<(), ApiError> {
+        let mut missing = ids
+            .iter()
+            .copied()
+            .chain(ids.iter().filter_map(|id| {
+                self.lineages
+                    .get(id)
+                    .and_then(Option::as_ref)
+                    .map(|lineage| lineage.anchor_id)
+            }))
+            .filter(|id| !self.managing_packs.contains_key(id))
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing.dedup();
+        for batch in missing.chunks(64) {
+            let owners = attune_common::repositories::iam_ownership::IamOwnershipRepository::execution_packs(db, batch).await?;
+            for id in batch {
+                self.managing_packs.insert(*id, owners.get(id).copied());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn load_public_actions(
         &mut self,
         db: &sqlx::PgPool,
@@ -3315,6 +3706,13 @@ pub(crate) async fn authorize_execution_projection(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let loaded_snapshot = if snapshot.is_none() {
+        authz.load_snapshot(user).await?
+    } else {
+        None
+    };
+    let snapshot = snapshot.or(loaded_snapshot.as_ref());
     let mut ctx = AuthorizationContext::new(identity_id);
     let (anchor, ancestor_ids) = if matches!(action, Action::Read | Action::Decrypt) {
         let lineage = visibility_cache.resolve(&state.db, execution).await?;
@@ -3336,6 +3734,25 @@ pub(crate) async fn authorize_execution_projection(
     };
 
     ctx.target_id = Some(anchor.id);
+    if snapshot.is_some_and(|snapshot| {
+        snapshot.grants.iter().any(|grant| {
+            grant.resource == Resource::Executions
+                && grant.actions.contains(&action)
+                && grant
+                    .constraints
+                    .as_ref()
+                    .is_some_and(|scope| scope.managing_pack_id.is_some())
+        })
+    }) {
+        visibility_cache
+            .load_ownership(&state.db, &[anchor.id])
+            .await?;
+        ctx.managing_pack_id = visibility_cache
+            .managing_packs
+            .get(&anchor.id)
+            .copied()
+            .flatten();
+    }
     ctx.target_ref = Some(anchor.action_ref.clone());
     ctx.pack_ref = anchor
         .action_ref
@@ -3355,7 +3772,6 @@ pub(crate) async fn authorize_execution_projection(
     ctx.execution_owner_identity_id = execution.executor;
     ctx.execution_ancestor_identity_ids = ancestor_ids;
 
-    let authz = state.authorization_service();
     let check = AuthorizationCheck {
         resource: Resource::Executions,
         action,
@@ -3433,6 +3849,9 @@ fn validate_execution_log_stream_user(
     user: &AuthenticatedUser,
     execution_id: i64,
 ) -> Result<(), ApiError> {
+    if crate::recorded_consumers::is_recorded(user)? {
+        return Ok(());
+    }
     let claims = &user.claims;
 
     match claims.token_type {
@@ -3472,6 +3891,9 @@ fn validate_execution_updates_stream_user(
     user: &AuthenticatedUser,
     execution_id: Option<i64>,
 ) -> Result<(), ApiError> {
+    if crate::recorded_consumers::is_recorded(user)? {
+        return Ok(());
+    }
     let claims = &user.claims;
 
     match claims.token_type {
@@ -3498,38 +3920,77 @@ pub struct StreamExecutionParams {
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/executions", get(list_executions))
-        .route("/executions/execute", axum::routing::post(create_execution))
-        .route("/executions/stats", get(get_execution_stats))
-        .route("/executions/stream", get(stream_execution_updates))
+        .route(
+            "/executions",
+            get(list_executions).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionMetadata,
+            )),
+        )
+        .route(
+            "/executions/execute",
+            axum::routing::post(create_execution).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionCreate,
+            )),
+        )
+        .route(
+            "/executions/stats",
+            get(get_execution_stats).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionMetadata,
+            )),
+        )
+        .route(
+            "/executions/stream",
+            get(stream_execution_updates).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionStream,
+            )),
+        )
         .route(
             "/executions/{id}/logs/{stream}/stream",
-            get(stream_execution_log),
+            get(stream_execution_log).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionStream,
+            )),
         )
-        .route("/executions/{id}", get(get_execution))
+        .route(
+            "/executions/{id}",
+            get(get_execution).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionMetadata,
+            )),
+        )
         .route(
             "/executions/{id}/workflow-cache-iterations",
-            get(list_workflow_cache_iterations),
+            get(list_workflow_cache_iterations).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionMetadata,
+            )),
         )
         .route(
             "/executions/{id}/workflow-task-waits",
-            get(list_workflow_task_waits),
+            get(list_workflow_task_waits).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionMetadata,
+            )),
         )
         .route(
             "/executions/{id}/cancel",
-            axum::routing::post(cancel_execution),
+            axum::routing::post(cancel_execution).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionControl,
+            )),
         )
         .route(
             "/executions/{id}/reschedule",
-            axum::routing::post(reschedule_execution),
+            axum::routing::post(reschedule_execution).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionControl,
+            )),
         )
         .route(
             "/executions/status/{status}",
-            get(list_executions_by_status),
+            get(list_executions_by_status).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionMetadata,
+            )),
         )
         .route(
             "/enforcements/{enforcement_id}/executions",
-            get(list_executions_by_enforcement),
+            get(list_executions_by_enforcement).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::ExecutionMetadata,
+            )),
         )
 }
 

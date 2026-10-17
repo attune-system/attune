@@ -772,12 +772,16 @@ impl SupervisorService {
         )
         .await?
         {
+            let mut evidence_tx = self.inner.pool.begin().await?;
+            attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut evidence_tx).await?;
+            if !attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::eligible(&mut evidence_tx,"pack_release",id).await? {evidence_tx.rollback().await?;continue;}
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            StorageMaintenanceRepository::clear_pack_snapshot(&self.inner.pool, id).await?;
+            StorageMaintenanceRepository::clear_pack_snapshot(&mut *evidence_tx, id).await?;
+            evidence_tx.commit().await?;
         }
         for (id, path) in StorageMaintenanceRepository::expired_artifact_snapshots(
             &self.inner.pool,
@@ -785,8 +789,12 @@ impl SupervisorService {
         )
         .await?
         {
+            let mut evidence_tx = self.inner.pool.begin().await?;
+            attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut evidence_tx).await?;
+            if !attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::eligible(&mut evidence_tx,"artifact_version",id).await? {evidence_tx.rollback().await?;continue;}
             self.inner.artifact_transport.delete_file(&path).await?;
-            StorageMaintenanceRepository::clear_artifact_snapshot(&self.inner.pool, id).await?;
+            StorageMaintenanceRepository::clear_artifact_snapshot(&mut *evidence_tx, id).await?;
+            evidence_tx.commit().await?;
         }
         Ok(())
     }
@@ -1211,21 +1219,22 @@ impl SupervisorService {
         .await?;
 
         for candidate in candidates {
-            let Some(attempt) = MaintenanceRepository::mark_execution_reschedule_attempt(
-                &self.inner.pool,
-                candidate.execution_id,
-                "attune-supervisor",
-                "requested execution remained stale after scheduler message may have been lost",
-                maintenance.execution_reschedule_max_attempts,
-                maintenance.execution_reschedule_grace_seconds,
-                false,
-            )
-            .await?
+            let Some(execution) =
+                ExecutionRepository::find_by_id(&self.inner.pool, candidate.execution_id).await?
             else {
                 continue;
             };
-
-            self.publish_execution_requested_attempt(&attempt).await?;
+            let attempt = match self
+                .republish_retained_requested(&execution, maintenance)
+                .await
+            {
+                Ok(Some(attempt)) => attempt,
+                Ok(None) => continue,
+                Err(_) => {
+                    warn!(execution_id = execution.id, "Retained Requested recovery was not authorized or publication acknowledgement is unknown; no raw republish fallback");
+                    continue;
+                }
+            };
             self.audit_corrective_action(
                 "execution",
                 "requested_execution_republished",
@@ -1313,32 +1322,70 @@ impl SupervisorService {
         Ok(())
     }
 
-    async fn publish_execution_requested_attempt(
+    async fn republish_retained_requested(
         &self,
-        attempt: &ExecutionRescheduleAttempt,
-    ) -> Result<()> {
-        let Some(publisher) = self.inner.publisher.as_ref() else {
-            warn!(
-                execution_id = attempt.execution_id,
-                "Cannot republish requested execution because MQ publisher is unavailable"
-            );
-            return Ok(());
-        };
+        execution: &Execution,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<Option<ExecutionRescheduleAttempt>> {
+        use attune_common::repositories::requested_execution_publication::RequestedExecutionPublicationRepository as Requested;
 
-        let payload = ExecutionRequestedPayload {
-            execution_id: attempt.execution_id,
-            action_id: attempt.action_id,
-            action_ref: attempt.action_ref.clone(),
-            parent_id: attempt.parent_id,
-            enforcement_id: attempt.enforcement_id,
-            config: attempt.config.clone(),
-            release_id: attempt.release_id,
-            release_digest: attempt.release_digest.clone(),
+        let publisher = self
+            .inner
+            .publisher
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Retry publisher unavailable"))?;
+        let key = self
+            .inner
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Retry input encryption unavailable"))?;
+        let mut tx = self.inner.pool.begin().await?;
+        let Some(prepared) = Requested::prepare(&mut tx, execution, key).await? else {
+            tx.rollback().await?;
+            return Ok(None);
         };
-        let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
-            .with_source("attune-supervisor");
-        publisher.publish_envelope(&envelope).await?;
-        Ok(())
+        prepared.lock_target(&mut tx).await?;
+        let Some(attempt) = MaintenanceRepository::mark_execution_reschedule_attempt(
+            &mut *tx,
+            execution.id,
+            "attune-supervisor",
+            "recover retained Requested execution after missing or unknown publication acknowledgement",
+            maintenance.execution_reschedule_max_attempts,
+            maintenance.execution_reschedule_grace_seconds,
+            false,
+        )
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let envelope = MessageEnvelope::new(
+            MessageType::ExecutionRequested,
+            ExecutionRequestedPayload {
+                execution_id: execution.id,
+                action_id: execution.action,
+                action_ref: execution.action_ref.clone(),
+                parent_id: execution.parent,
+                enforcement_id: execution.enforcement,
+                config: execution.config.clone(),
+                release_id: execution.pack_release,
+                release_digest: execution.pack_release_digest.clone(),
+            },
+        )
+        .with_source("attune-supervisor");
+        if let Err(error) = prepared
+            .publish_bounded(&mut tx, publisher.publish_envelope(&envelope))
+            .await
+        {
+            tx.rollback().await?;
+            return Err(error.into());
+        }
+        // Mark and final clocks commit together only after the configured
+        // publisher reports success. Unknown delivery leaves Requested recoverable.
+        tx.commit().await?;
+        Ok(Some(attempt))
     }
 
     async fn publish_execution_completed(&self, execution: &Execution) -> Result<()> {

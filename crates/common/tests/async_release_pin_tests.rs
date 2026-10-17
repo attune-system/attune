@@ -257,15 +257,87 @@ async fn queued_dispatch_keeps_release_a_after_b_activates() {
     .await
     .expect("queued item");
 
+    let other_action = ActionFixture::new_unique(pack.id, &pack.r#ref, "other_dispatch")
+        .create(&pool)
+        .await
+        .unwrap();
     let release_b = create_release(&pool, &pack, "2.0.0", 'b').await;
-    activate(&pool, pack.id, release_b.id).await;
+    activate_projected(
+        &pool,
+        pack.id,
+        release_b.id,
+        &PackProjectionIds {
+            actions: vec![action.id, other_action.id],
+            ..Default::default()
+        },
+    )
+    .await;
 
+    let snapshot_b = ExecutableSnapshotRepository::resolve_for_action(&pool, action.id)
+        .await
+        .unwrap();
+    let later = WorkQueueItemRepository::create_pinned(
+        &pool,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: item.queue_ref.clone(),
+            item_key: None,
+            priority: 0,
+            status: WorkQueueItemStatus::Queued,
+            payload: json!({"value":"B"}),
+            metadata: json!({}),
+            trace_tag: None,
+            enqueue_source: "test".into(),
+            requested_by_identity: None,
+            requested_by_execution: None,
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+            ack_summary: None,
+        },
+        &snapshot_b,
+    )
+    .await
+    .unwrap();
+    let other_snapshot = ExecutableSnapshotRepository::resolve_for_action(&pool, other_action.id)
+        .await
+        .unwrap();
+    let other_item = WorkQueueItemRepository::create_pinned(
+        &pool,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: item.queue_ref.clone(),
+            item_key: None,
+            priority: 0,
+            status: WorkQueueItemStatus::Queued,
+            payload: json!({"value":"other B action"}),
+            metadata: json!({}),
+            trace_tag: None,
+            enqueue_source: "test".into(),
+            requested_by_identity: None,
+            requested_by_execution: None,
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+            ack_summary: None,
+        },
+        &other_snapshot,
+    )
+    .await
+    .unwrap();
     let leased = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {
+            separate_requesters: false,
             queue: queue.id,
             ready_statuses: vec![WorkQueueItemStatus::Queued],
-            limit: 1,
+            limit: 2,
             batch_coalescing: None,
             leased_execution: None,
             lease_token: Uuid::new_v4(),
@@ -278,6 +350,42 @@ async fn queued_dispatch_keeps_release_a_after_b_activates() {
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, item.id);
     assert_eq!(leased[0].pack_release, Some(release_a.id));
+    let next = WorkQueueItemRepository::lease_next_batch(
+        &pool,
+        LeaseWorkQueueItemsInput {
+            separate_requesters: false,
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued],
+            limit: 2,
+            batch_coalescing: None,
+            leased_execution: None,
+            lease_token: Uuid::new_v4(),
+            lease_expires_at: Utc::now() + Duration::minutes(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].id, later.id);
+    assert_eq!(next[0].pack_release, Some(release_b.id));
+    let final_batch = WorkQueueItemRepository::lease_next_batch(
+        &pool,
+        LeaseWorkQueueItemsInput {
+            separate_requesters: false,
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued],
+            limit: 2,
+            batch_coalescing: None,
+            leased_execution: None,
+            lease_token: Uuid::new_v4(),
+            lease_expires_at: Utc::now() + Duration::minutes(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(final_batch.len(), 1);
+    assert_eq!(final_batch[0].id, other_item.id);
+    assert_eq!(final_batch[0].pack_release, Some(release_b.id));
     assert_eq!(
         leased[0].executable_snapshot.as_ref().unwrap()["release"]["id"],
         release_a.id

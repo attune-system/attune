@@ -2,6 +2,30 @@
 
 Source review of pack deployment, permission assignment, execution, and the direct event API, 2026-10-13. Paths and line numbers refer to the source inspected on that date. Tests were read, not run. No infrastructure was started or runtime code changed.
 
+## Implementation update, 2026-10-15
+
+The source review below describes the original human-delegated worker path.
+The managed-pack implementation now has a separate, tested recorded-credential
+path. It checks selected Events/Create against the locked actual trigger,
+execution liveness, sponsor, admission, attempt and explicit revocation. Human
+requester or approval-issuer inactivity is not a consumption dependency. The
+production worker has not switched to these credentials; do not treat the old
+event gate described below as globally fixed.
+
+`GET /api/v1/events/{id}` can return `execution_emitter` for recorded emissions.
+It contains immutable execution, admission, sponsor, pack, action, policy,
+release and attempt identifiers. It is descriptive metadata, not a reusable
+credential. Event read authorization runs first. Access-token callers also need
+visibility of the emitting execution; sensor and execution tokens do not receive
+this inspection projection. After execution retention, unrestricted execution
+read authority is required because scoped workflow ancestry cannot be recovered
+from emitter attribution alone. Requester and queue-item attribution are not
+included. Existing sensor `source` and `source_ref` fields retain their meaning.
+The web event detail uses the same filtered response.
+
+See [implementation progress](../plans/self-contained-pack-implementation-progress.md)
+for remaining production admission and consumer work.
+
 ## Main finding
 
 `POST /api/v1/events` authorizes direct submission by JWT token type. Only `Sensor` and `Execution` tokens pass. The execution branch does **not** require an Events/Create grant, resolve the JWT's permission-set refs, check the current executor identity, or enforce an action-to-trigger scope. Sensor submission has additional trigger ownership, workload lease, generation, and membership checks. See `crates/api/src/routes/events.rs:93-95`, `:129-205`, `:264-336`, and `:405-454`.
@@ -114,9 +138,9 @@ For a new named policy, an administrator can deploy the definition without attac
 
 `core.admin`, `core.editor`, `core.executor`, and `core.viewer` are compiled platform-catalog definitions. API startup reconciles them into PostgreSQL independently of filesystem pack installation. Matching old core-pack metadata is treated as platform metadata rather than replacing platform-owned sets. Sources: `crates/common/src/platform_catalog.rs:70-87`; `crates/common/src/repositories/platform_catalog.rs:153-185,234-243`; `crates/api/src/main.rs:382-387`; `crates/common/src/pack_registry/loader.rs:739-745`.
 
-HTTP core bootstrap creates a real identity, assigns `core.admin`, obtains a short-lived integration credential, and uploads through the API. Cleanup removes the credential but preserves an identity still referenced by installation or rule ownership. Sources: `scripts/bootstrap_core_pack.py:166-239,269-280`; `docker/init-packs.sh:8-10`.
+HTTP core bootstrap authenticates an existing deployment credential supplied through `ATTUNE_BOOTSTRAP_TOKEN` and uploads through the ordinary API admission path. It does not create identities, assign `core.admin`, or open a database. See [bootstrap admission](../deployment/candidate-api-effects.md#bootstrap-through-the-api).
 
-Default local Compose instead runs the Python volume/database loader followed by an immutable-release upgrade. This is not equivalent to API registration. The loader creates an admin-assigned registrar and sets rule owners to that registrar. It does not load `default_execution_permission_set_refs` or `permission_set_refs`, and does not capture the Rust deployment-owned rule authority records. The release upgrader freezes bytes and activates projections but does not call `capture_deployment`. This is a source-level lifecycle discrepancy, not a reproduced runtime failure. Sources: `docker-compose.yaml:137-207`; `scripts/load_core_pack.py:1037-1053,1122-1163,1493-1526`; `crates/api/src/pack_release_upgrade.rs:122-155`.
+Default local Compose now uses that API publisher too. Volume initialization assembles a private candidate rather than overwriting active metadata, and the former direct Python loader is an API-only wrapper. Legacy release scanning no longer activates unadmitted content. Bootstrap verifies an exact current core runtime-policy/release binding; platform readiness remains available before content admission. See [candidate effects and bootstrap admission](../deployment/candidate-api-effects.md).
 
 ### Redeployment and removal
 

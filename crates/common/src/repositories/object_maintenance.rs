@@ -82,6 +82,7 @@ impl ObjectMaintenanceRepository {
         sqlx::query_as(
             "SELECT id, object_key, provider_version, object_kind, size_bytes, state, attempts, updated \
              FROM object_maintenance_ledger l WHERE state = 'uploading' AND updated < $1 \
+             AND NOT EXISTS (SELECT 1 FROM file_evidence_put p JOIN file_evidence_owner o ON o.version=p.owner WHERE o.object_key=l.object_key) \
              AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
                              WHERE g.object_key = l.object_key AND g.state = 'issued' \
                                AND g.settle_until > clock_timestamp()) \
@@ -99,19 +100,9 @@ impl ObjectMaintenanceRepository {
         id: i64,
         observed_updated: DateTime<Utc>,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            "DELETE FROM object_maintenance_ledger \
-             WHERE id = $1 AND state = 'uploading' AND updated = $2 \
-             AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
-                             WHERE g.object_key = object_maintenance_ledger.object_key \
-                               AND g.state = 'issued' \
-                               AND g.settle_until > clock_timestamp())",
-        )
-        .bind(id)
-        .bind(observed_updated)
-        .execute(pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        // Native caller has just confirmed no object exists. Use the SAME
+        // completion transaction, with an observation/version race check.
+        Self::complete_delete_observation(pool, id, Some(observed_updated)).await
     }
 
     pub async fn schedule_unreferenced(
@@ -149,10 +140,13 @@ impl ObjectMaintenanceRepository {
         limit: i64,
     ) -> Result<Vec<ObjectLedgerEntry>> {
         let mut tx = pool.begin().await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
+            .await?;
         let rows = sqlx::query_as(
             "WITH candidates AS ( \
-                 SELECT id FROM object_maintenance_ledger \
-                 WHERE NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                  SELECT id FROM object_maintenance_ledger \
+                  WHERE NOT EXISTS(SELECT 1 FROM file_evidence_put p JOIN file_evidence_owner o ON o.version=p.owner WHERE o.object_key=object_maintenance_ledger.object_key) \
+                    AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
                                    WHERE g.object_key = object_maintenance_ledger.object_key \
                                      AND g.state = 'issued' \
                                      AND g.settle_until > clock_timestamp()) \
@@ -196,7 +190,8 @@ impl ObjectMaintenanceRepository {
                  AND ((status IN ('pending', 'running') AND started_at >= NOW() - ($3::bigint * INTERVAL '1 second')) \
                    OR (status = 'activating' AND updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')))) \
              OR EXISTS (SELECT 1 FROM artifact_version WHERE object_key = $1 AND provider_version = $2) \
-             OR EXISTS (SELECT 1 FROM log_segment WHERE object_key = $1 AND provider_version = $2)",
+              OR EXISTS (SELECT 1 FROM log_segment WHERE object_key = $1 AND provider_version = $2) \
+              OR EXISTS(SELECT 1 FROM file_evidence_put p JOIN file_evidence_owner o ON o.version=p.owner WHERE o.object_key=$1)",
         )
         .bind(key)
         .bind(version)
@@ -208,13 +203,29 @@ impl ObjectMaintenanceRepository {
     }
 
     pub async fn complete_delete(pool: &PgPool, id: i64) -> Result<bool> {
-        let result = sqlx::query(
-            "DELETE FROM object_maintenance_ledger WHERE id = $1 AND state = 'deleting'",
-        )
-        .bind(id)
-        .execute(pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        Self::complete_delete_observation(pool, id, None).await
+    }
+
+    async fn complete_delete_observation(
+        pool: &PgPool,
+        id: i64,
+        absent: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let mut tx = pool.begin().await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
+            .await?;
+        let deleted:Option<(String,Option<String>)>=sqlx::query_as("DELETE FROM object_maintenance_ledger l WHERE id=$1 AND (($2::timestamptz IS NULL AND state='deleting') OR ($2 IS NOT NULL AND state='uploading' AND updated=$2 AND NOT EXISTS(SELECT 1 FROM artifact_upload_grant g WHERE g.object_key=l.object_key AND g.state='issued' AND g.settle_until>clock_timestamp()))) AND NOT EXISTS(SELECT 1 FROM file_evidence_put p JOIN file_evidence_owner o ON o.version=p.owner WHERE o.object_key=l.object_key) RETURNING object_key,provider_version")
+            .bind(id).bind(absent).fetch_optional(&mut *tx).await?;
+        if let Some((key, provider)) = &deleted {
+            super::file_evidence_retention::FileEvidenceRetentionRepository::object_removed(
+                &mut tx,
+                key,
+                provider.as_deref(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(deleted.is_some())
     }
 
     pub async fn defer_referenced(pool: &PgPool, id: i64) -> Result<()> {

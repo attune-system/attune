@@ -89,6 +89,20 @@ export default function MultiSelect({
 
       {/* Selected Items Display */}
       <div
+        role="button"
+        tabIndex={0}
+        aria-label={label ?? placeholder}
+        aria-haspopup="listbox"
+        aria-expanded={isOpen}
+        onKeyDown={(event) => {
+          if (
+            event.target === event.currentTarget &&
+            (event.key === "Enter" || event.key === " ")
+          ) {
+            event.preventDefault();
+            setIsOpen((open) => !open);
+          }
+        }}
         onClick={() => setIsOpen(!isOpen)}
         className="min-h-[42px] w-full px-3 py-2 border border-gray-300 rounded-md bg-white cursor-pointer hover:border-gray-400 focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500"
       >
@@ -155,7 +169,12 @@ export default function MultiSelect({
           </div>
 
           {/* Options List */}
-          <div className="max-h-48 overflow-y-auto">
+          <div
+            role="listbox"
+            aria-label={label ?? placeholder}
+            aria-multiselectable="true"
+            className="max-h-48 overflow-y-auto"
+          >
             {filteredOptions.length === 0 ? (
               <div className="px-3 py-2 text-sm text-gray-500 text-center">
                 No options found
@@ -166,6 +185,15 @@ export default function MultiSelect({
                 return (
                   <div
                     key={option.value}
+                    role="option"
+                    aria-selected={isSelected}
+                    tabIndex={0}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        toggleOption(option.value);
+                      }
+                    }}
                     onClick={() => toggleOption(option.value)}
                     className={`px-3 py-2 cursor-pointer hover:bg-gray-100 flex items-center justify-between ${
                       isSelected ? "bg-blue-50" : ""

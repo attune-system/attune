@@ -217,7 +217,8 @@ pub struct SecretValueInput {
     pub source_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedSecretValue {
     pub json_path: String,
     pub encrypted_value: JsonValue,
@@ -590,6 +591,83 @@ pub fn redact_bound_action_result(
         }
     }
     Ok((result, secrets))
+}
+
+/// A runtime read can flow to any output field, regardless of authored schema.
+/// Encrypt complete payload fields, including acknowledgement duplicates, rather
+/// than attempting value matching or trusting a pack's declared secret paths.
+pub fn protect_runtime_read_result(
+    original: &JsonValue,
+    mut redacted: JsonValue,
+    mut inputs: Vec<SecretValueInput>,
+    reads: &[crate::secret_provenance::SecretOrigin],
+) -> Result<(JsonValue, Vec<SecretValueInput>)> {
+    if reads.is_empty() {
+        return Ok((redacted, inputs));
+    }
+    let mut provenance = crate::secret_provenance::SecretProvenance {
+        origins: reads.to_vec(),
+        templates: Vec::new(),
+    };
+    for input in &inputs {
+        if input.source_kind != "provenance" {
+            return Err(Error::validation("Unknown output provenance"));
+        }
+        let parent = input
+            .source_ref
+            .as_deref()
+            .ok_or_else(|| Error::validation("Missing output provenance"))?;
+        provenance.merge(serde_json::from_str(parent)?);
+    }
+    let reference = serde_json::to_string(&provenance)?;
+    if provenance.origins.len() > 256 || reference.len() > 1024 * 1024 {
+        return Err(Error::validation(
+            "Output read provenance exceeds its bound",
+        ));
+    }
+    for field in ["data", "stdout", "stderr", "error", "queue_ack"] {
+        if let Some(value) = original
+            .get(field)
+            .filter(|value| !value.is_null())
+            .cloned()
+        {
+            let path = format!("/{field}");
+            inputs.retain(|input| {
+                input.json_path != path && !input.json_path.starts_with(&format!("{path}/"))
+            });
+            inputs.push(SecretValueInput {
+                json_path: path,
+                value,
+                source_kind: "provenance".into(),
+                source_ref: Some(reference.clone()),
+            });
+            redacted[field] = redaction_marker();
+        }
+    }
+    Ok((redacted, inputs))
+}
+
+#[cfg(test)]
+mod runtime_read_result_tests {
+    use super::*;
+    #[test]
+    fn undeclared_data_errors_and_acknowledgements_inherit_reads_and_encrypt() {
+        let original = json!({"succeeded":true,"data":{"public":"sdk-secret"},"stdout":"sdk-secret","stderr":"sdk-secret","error":"sdk-secret","queue_ack":{"value":"sdk-secret"}});
+        let read = crate::repositories::runtime_read::RuntimeReadRepository::reference(42);
+        let (redacted, inputs) =
+            protect_runtime_read_result(&original, original.clone(), vec![], &[read.clone()])
+                .unwrap();
+        assert!(!redacted.to_string().contains("sdk-secret"));
+        assert_eq!(inputs.len(), 5);
+        for input in &inputs {
+            let provenance: crate::secret_provenance::SecretProvenance =
+                serde_json::from_str(input.source_ref.as_deref().unwrap()).unwrap();
+            assert_eq!(provenance.origins, vec![read.clone()]);
+        }
+        let key = "runtime-read-result-test-key-32-characters";
+        let prepared = prepare_secret_values(inputs, key).unwrap();
+        assert!(!format!("{prepared:?}").contains("sdk-secret"));
+    }
 }
 
 pub fn merge_schema_secret_redactions(

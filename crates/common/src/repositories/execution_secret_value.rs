@@ -33,6 +33,32 @@ pub struct SecretProvenanceRow {
 }
 
 impl ExecutionSecretValueRepository {
+    /// Runtime disclosure returns one overflow row and at most 1 MiB of origin
+    /// text. Oversized origins become unavailable, never silently authorized.
+    /// Ciphertext and encryption metadata are not projected.
+    pub async fn find_bounded_provenance<'e, E>(
+        executor: E,
+        entity_types: &[&str],
+        entity_ids: &[Id],
+    ) -> Result<Vec<SecretProvenanceRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(
+            "WITH bounded AS ( \
+               SELECT entity_type, entity_id, json_path, source_kind, source_ref \
+               FROM execution_secret_value WHERE entity_type = ANY($1) AND entity_id = ANY($2) \
+               ORDER BY entity_type, entity_id, json_path LIMIT 257 \
+             ), budgeted AS ( \
+               SELECT entity_type, entity_id, json_path, source_kind, source_ref, \
+                 SUM(COALESCE(octet_length(source_ref), 0)) OVER (ORDER BY entity_type, entity_id, json_path) AS origin_bytes \
+               FROM bounded \
+             ) SELECT entity_type, entity_id, json_path, source_kind, \
+               CASE WHEN origin_bytes <= 1048576 THEN source_ref ELSE NULL END AS source_ref \
+               FROM budgeted ORDER BY entity_type, entity_id, json_path",
+        ).bind(entity_types).bind(entity_ids).fetch_all(executor).await.map_err(Into::into)
+    }
+
     pub async fn find_provenance_by_entities<'e, E>(
         executor: E,
         entity_types: &[&str],
@@ -184,6 +210,31 @@ impl ExecutionSecretValueRepository {
                 source_ref: row.source_ref,
             })
             .collect())
+    }
+
+    /// Bind a prepared input buffer to the actual typed source row through
+    /// restoration. Call during source preparation, before destination locks.
+    pub async fn find_stored_at(
+        connection: &mut sqlx::PgConnection,
+        entity_type: &str,
+        entity_id: Id,
+        path: &str,
+    ) -> Result<Option<StoredSecretValue>> {
+        let row = sqlx::query_as::<_, ExecutionSecretValue>(
+            "SELECT id, entity_type, entity_id, json_path, source_kind, source_ref, encrypted_value, encryption_key_hash, created FROM execution_secret_value WHERE entity_type=$1 AND entity_id=$2 AND json_path=$3 FOR SHARE",
+        )
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(path)
+        .fetch_optional(connection)
+        .await?;
+        Ok(row.map(|row| StoredSecretValue {
+            json_path: row.json_path,
+            encrypted_value: row.encrypted_value,
+            encryption_key_hash: row.encryption_key_hash,
+            source_kind: row.source_kind,
+            source_ref: row.source_ref,
+        }))
     }
 
     pub async fn copy_entity<'e, E>(

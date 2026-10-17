@@ -19,6 +19,22 @@ pub enum AbsentMetadataPolicyArg {
 
 #[derive(Subcommand)]
 pub enum PackCommands {
+    /// Issue declaration-scoped input consent and inspect/revoke its shared approval record
+    #[command(
+        after_help = "Examples:\n  attune pack input-approval issue example --file input-approval.json --dry-run\n  attune pack input-approval list example --output json"
+    )]
+    InputApproval {
+        #[command(subcommand)]
+        command: super::input_approval::InputApprovalCommands,
+    },
+    /// Set persistent configuration overrides or reset fields to release defaults
+    #[command(
+        after_help = "Examples:\n  attune pack config set example --set-json retries=3\n  attune pack config reset example retry_policy --dry-run\n  attune pack config reset example retry_policy --yes"
+    )]
+    Config {
+        #[command(subcommand)]
+        command: super::component_config::ConfigurationCommands,
+    },
     /// Inspect and control fixed external runtime approvals for a pack
     Approval {
         #[command(subcommand)]
@@ -73,6 +89,9 @@ pub enum PackCommands {
     },
     /// Install a pack from various sources (registry, git, URL, or local)
     Install {
+        /// Permit incompatible trigger contract rollout with live admitted emitters
+        #[arg(long)]
+        acknowledge_incompatible_rollout: bool,
         /// Source (git URL, archive URL, local path, or registry reference)
         #[arg(value_name = "SOURCE")]
         source: String,
@@ -133,6 +152,9 @@ pub enum PackCommands {
     },
     /// Register a pack from a local directory (path must be accessible by the API server)
     Register {
+        /// Separate consent from --force; draining live emitters is safer
+        #[arg(long)]
+        acknowledge_incompatible_rollout: bool,
         /// Path to pack directory (must be a path the API server can access)
         path: String,
 
@@ -153,6 +175,8 @@ pub enum PackCommands {
     /// This command tarballs the local directory and streams it to the API,
     /// so it works regardless of whether the API is local or running in Docker.
     Upload {
+        #[arg(long)]
+        acknowledge_incompatible_rollout: bool,
         /// Path to the local pack directory (must contain pack.yaml)
         path: String,
 
@@ -426,6 +450,7 @@ struct PackDetail {
 
 #[derive(Debug, Serialize)]
 struct InstallPackRequest {
+    acknowledge_incompatible_rollout: bool,
     source: String,
     ref_spec: Option<String>,
     registry_id: Option<i64>,
@@ -483,6 +508,7 @@ struct IndexedPackRegistry {
 
 #[derive(Debug, Serialize)]
 struct RegisterPackRequest {
+    acknowledge_incompatible_rollout: bool,
     path: String,
     force: bool,
     skip_tests: bool,
@@ -522,6 +548,19 @@ pub async fn handle_pack_command(
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
+        PackCommands::Config { command } => {
+            super::component_config::handle(
+                profile,
+                api_url,
+                super::component_config::ConfigurationOwner::Pack,
+                command,
+                output_format,
+            )
+            .await
+        }
+        PackCommands::InputApproval { command } => {
+            super::input_approval::handle(profile, api_url, command, output_format).await
+        }
         PackCommands::Approval { command } => {
             super::pack_approval::handle(profile, api_url, command, output_format).await
         }
@@ -554,6 +593,7 @@ pub async fn handle_pack_command(
             handle_show(profile, pack_ref, api_url, output_format).await
         }
         PackCommands::Install {
+            acknowledge_incompatible_rollout,
             source,
             ref_spec,
             registry_id,
@@ -564,6 +604,7 @@ pub async fn handle_pack_command(
             absent_metadata_policy,
         } => {
             handle_install(
+                acknowledge_incompatible_rollout,
                 profile,
                 source,
                 ref_spec,
@@ -582,12 +623,14 @@ pub async fn handle_pack_command(
             handle_uninstall(profile, pack_ref, yes, api_url, output_format).await
         }
         PackCommands::Register {
+            acknowledge_incompatible_rollout,
             path,
             force,
             skip_tests,
             absent_metadata_policy,
         } => {
             handle_register(
+                acknowledge_incompatible_rollout,
                 profile,
                 path,
                 force,
@@ -599,12 +642,14 @@ pub async fn handle_pack_command(
             .await
         }
         PackCommands::Upload {
+            acknowledge_incompatible_rollout,
             path,
             force,
             skip_tests,
             absent_metadata_policy,
         } => {
             handle_upload(
+                acknowledge_incompatible_rollout,
                 profile,
                 path,
                 force,
@@ -1006,6 +1051,7 @@ async fn handle_show(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_install(
+    acknowledge_incompatible_rollout: bool,
     profile: &Option<String>,
     source: String,
     ref_spec: Option<String>,
@@ -1040,6 +1086,7 @@ async fn handle_install(
     }
 
     let request = InstallPackRequest {
+        acknowledge_incompatible_rollout,
         source: source.clone(),
         ref_spec,
         registry_id,
@@ -1265,6 +1312,7 @@ async fn handle_uninstall(
 }
 
 async fn handle_upload(
+    acknowledge_incompatible_rollout: bool,
     profile: &Option<String>,
     path: String,
     force: bool,
@@ -1339,6 +1387,9 @@ async fn handle_upload(
     );
 
     let mut extra_fields = Vec::new();
+    if acknowledge_incompatible_rollout {
+        extra_fields.push(("acknowledge_incompatible_rollout", "true".to_string()));
+    }
     if force {
         extra_fields.push(("force", "true".to_string()));
     }
@@ -1467,6 +1518,7 @@ fn append_dir_to_tar<W: std::io::Write>(tar: &mut tar::Builder<W>, base: &Path) 
 }
 
 async fn handle_register(
+    acknowledge_incompatible_rollout: bool,
     profile: &Option<String>,
     path: String,
     force: bool,
@@ -1502,6 +1554,7 @@ async fn handle_register(
     }
 
     let request = RegisterPackRequest {
+        acknowledge_incompatible_rollout,
         path: path.clone(),
         force,
         skip_tests,

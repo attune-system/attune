@@ -5,6 +5,7 @@ import type {
   CreateIdentityRequest,
   UpdateIdentityRequest,
   CreatePermissionAssignmentRequest,
+  CreatePermissionSetRequest,
   PermissionSetSummary,
   UpdatePermissionSetRequest,
 } from "@/api";
@@ -128,6 +129,22 @@ export function usePermissionSets(
     },
     enabled: options.enabled ?? true,
     staleTime: 30000,
+  });
+}
+
+export function useCreatePermissionSet() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (data: CreatePermissionSetRequest) =>
+      PermissionsService.createPermissionSet({ requestBody: data }),
+    onSuccess: (response) => {
+      queryClient.setQueryData<PermissionSetSummary[]>(
+        ["permission-sets", undefined],
+        (current) => (current ? [...current, response.data] : current),
+      );
+      queryClient.invalidateQueries({ queryKey: ["permission-sets"] });
+    },
   });
 }
 

@@ -31,6 +31,9 @@ pub enum QueueCommands {
     /// Enqueue one work item from a JSON request
     Enqueue(QueueEnqueueArgs),
     /// Update queue metadata
+    #[command(
+        after_help = "Examples:\n  attune queue update ops.inbox --requester-grouping aggregate\n  attune queue update ops.inbox --requester-grouping separate"
+    )]
     Update {
         /// Queue reference
         queue_ref: String,
@@ -42,6 +45,10 @@ pub enum QueueCommands {
         /// Clear execution trace tag template
         #[arg(long)]
         clear_trace_tag_template: bool,
+
+        /// Aggregate across requesters, or explicitly separate their batches
+        #[arg(long, value_enum)]
+        requester_grouping: Option<RequesterGrouping>,
     },
     /// Query and maintain pending queue items
     Items {
@@ -50,6 +57,12 @@ pub enum QueueCommands {
         #[command(subcommand)]
         command: QueueItemCommands,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum RequesterGrouping {
+    Aggregate,
+    Separate,
 }
 
 #[derive(Subcommand)]
@@ -234,6 +247,8 @@ struct QueueDetail {
     #[serde(default = "default_true")]
     accepting_new_items: bool,
     dispatch_action_ref: String,
+    #[serde(default = "default_json_object")]
+    config: JsonValue,
     #[serde(default)]
     trace_tag_template: Option<String>,
     reference_visibility: String,
@@ -297,6 +312,8 @@ struct UpdateQueueOperationalFlags {
 
 #[derive(Debug, Serialize)]
 struct UpdateQueueRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_tag_template: Option<Option<String>>,
 }
@@ -399,11 +416,13 @@ pub async fn handle_queue_command(
             queue_ref,
             trace_tag_template,
             clear_trace_tag_template,
+            requester_grouping,
         } => {
             handle_update(
                 queue_ref,
                 trace_tag_template,
                 clear_trace_tag_template,
+                requester_grouping,
                 profile,
                 api_url,
                 output_format,
@@ -501,18 +520,27 @@ async fn handle_update(
     queue_ref: String,
     trace_tag_template: Option<String>,
     clear_trace_tag_template: bool,
+    requester_grouping: Option<RequesterGrouping>,
     profile: &Option<String>,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
-    if trace_tag_template.is_none() && !clear_trace_tag_template {
+    if trace_tag_template.is_none() && !clear_trace_tag_template && requester_grouping.is_none() {
         anyhow::bail!("At least one field must be provided to update");
     }
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
     let path = format!("/queues/{}", encode_path_segment(&queue_ref));
+    let queue_config = match requester_grouping {
+        None => None,
+        Some(grouping) => {
+            let queue: QueueDetail = client.get(&path).await?;
+            Some(with_requester_grouping(queue.config, grouping)?)
+        }
+    };
     let request = UpdateQueueRequest {
+        config: queue_config,
         trace_tag_template: if clear_trace_tag_template {
             Some(None)
         } else {
@@ -521,6 +549,26 @@ async fn handle_update(
     };
     let queue: QueueDetail = client.put(&path, &request).await?;
     print_queue(queue, output_format, Some("updated"))
+}
+
+fn with_requester_grouping(
+    mut config: JsonValue,
+    grouping: RequesterGrouping,
+) -> Result<JsonValue> {
+    let object = config
+        .as_object_mut()
+        .context("Queue config must be an object")?;
+    let dispatch = object
+        .entry("dispatch")
+        .or_insert_with(|| serde_json::json!({}));
+    dispatch
+        .as_object_mut()
+        .context("Queue dispatch config must be an object")?
+        .insert(
+            "separate_requesters".into(),
+            JsonValue::Bool(matches!(grouping, RequesterGrouping::Separate)),
+        );
+    Ok(config)
 }
 
 fn print_queue_list(
@@ -609,6 +657,16 @@ fn print_queue(
                     },
                 ),
                 ("Dispatch Action", queue.dispatch_action_ref.clone()),
+                (
+                    "Batch Requester Grouping",
+                    if queue.config.pointer("/dispatch/separate_requesters")
+                        == Some(&JsonValue::Bool(true))
+                    {
+                        "Separate batches by requester".into()
+                    } else {
+                        "Aggregate across requesters (default)".into()
+                    },
+                ),
                 (
                     "Trace Tag Template",
                     queue
@@ -974,9 +1032,59 @@ fn compact_json(value: &JsonValue) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{with_requester_grouping, RequesterGrouping};
     use clap::CommandFactory;
 
     use crate::cli::Cli;
+
+    #[test]
+    fn requester_grouping_flag_is_noninteractive_and_validated() {
+        for grouping in ["aggregate", "separate"] {
+            assert!(<Cli as clap::Parser>::try_parse_from([
+                "attune",
+                "queue",
+                "update",
+                "ops.inbox",
+                "--requester-grouping",
+                grouping,
+            ])
+            .is_ok());
+        }
+        assert!(<Cli as clap::Parser>::try_parse_from([
+            "attune",
+            "queue",
+            "update",
+            "ops.inbox",
+            "--requester-grouping",
+            "unknown",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn requester_grouping_preserves_other_configuration_and_round_trips() {
+        let original = serde_json::json!({"dispatch":{"batch_size":{"source":"literal","value":16},
+            "coalescing":{"enabled":true,"group_by_path":"group"}}, "ack_contract":{"version":2}});
+        let separate =
+            with_requester_grouping(original.clone(), RequesterGrouping::Separate).unwrap();
+        assert_eq!(separate["dispatch"]["separate_requesters"], true);
+        assert_eq!(
+            separate["dispatch"]["batch_size"],
+            original["dispatch"]["batch_size"]
+        );
+        assert_eq!(
+            separate["dispatch"]["coalescing"],
+            original["dispatch"]["coalescing"]
+        );
+        assert_eq!(separate["ack_contract"], original["ack_contract"]);
+        let aggregate = with_requester_grouping(separate, RequesterGrouping::Aggregate).unwrap();
+        assert_eq!(aggregate["dispatch"]["separate_requesters"], false);
+        assert!(with_requester_grouping(
+            serde_json::json!({"dispatch":[]}),
+            RequesterGrouping::Separate
+        )
+        .is_err());
+    }
 
     #[test]
     fn queue_command_tree_contains_expected_verbs() {

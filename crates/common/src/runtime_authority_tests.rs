@@ -1,6 +1,31 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn canonical_iam_normalization_requires_structural_ownership_and_rejects_authored_envelopes() {
+    let raw = json!([{"resource":"actions","actions":["execute"]},{"resource":"workers","actions":["manage"]}]);
+    let grants: Vec<Grant> =
+        serde_json::from_value(normalize_iam_grants(raw, Some(12)).unwrap()).unwrap();
+    let mut context = AuthorizationContext::new(42);
+    context.pack_ref = Some("example".into());
+    assert!(!grants[0].allows(Resource::Actions, Action::Execute, &context));
+    context.managing_pack_id = Some(12);
+    assert!(grants[0].allows(Resource::Actions, Action::Execute, &context));
+    assert!(!grants[1].allows(Resource::Workers, Action::Manage, &context));
+    context.managing_pack_id = Some(13);
+    assert!(!grants[0].allows(Resource::Actions, Action::Execute, &context));
+    let forged = definition(
+        json!({"ref":"example.forged","grants":[{"resource":"actions","actions":["execute"],"constraints":{"managing_pack_id":12}}]}),
+    );
+    assert!(forged.authored_grants().is_err());
+    assert!(forged.compile(&owner(), &[]).is_err());
+    assert!(normalize_iam_grants(
+        json!([{"resource":"actions","actions":["execute"],"scope":"pack"}]),
+        None
+    )
+    .is_err());
+}
+
 fn owner() -> PackAuthorityOwner {
     PackAuthorityOwner {
         pack_id: 12,
@@ -38,10 +63,15 @@ fn attribution() -> RequestAttribution {
 fn policy() -> RuntimePolicy {
     let set = emitter_definition().compile(&owner(), &[]).unwrap();
     RuntimePolicy {
+        concrete_targets: BTreeMap::new(),
         owner: owner(),
         release_id: 7,
         release_digest: "a".repeat(64),
         invocations: vec![InvocationPolicy {
+            dispatch_template_digest: None,
+            source_id: None,
+            metadata_revision: None,
+            foreign_workflow_policy: None,
             binding: action_binding(),
             target_release_id: 7,
             target_release_digest: "a".repeat(64),

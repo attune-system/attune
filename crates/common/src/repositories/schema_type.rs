@@ -71,17 +71,17 @@ impl SchemaTypeRepository {
             .bind(pack_ref).bind(&patterns).bind(limit.clamp(1, 100)).bind(offset.max(0)).fetch_all(connection).await?;
         Ok((rows, total as u64))
     }
-    /// Creation takes shared graph admission before owner/rule locks. It reads
-    /// projections without locking pack rows; registration retains pack-first
-    /// exclusive admission, so neither path reverses pack/rule lock order.
+    /// Creation takes shared graph admission before pack/sponsor/policy/owner
+    /// locks. Mutation entry points must take exclusive graph admission before
+    /// any pack or component write lock, never upgrade behind those locks.
     pub async fn lock_selection(connection: &mut PgConnection) -> Result<()> {
         sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':named-type-graph', 0))")
             .execute(connection).await?;
         Ok(())
     }
-    /// Reclamation takes exclusive admission before inspecting runtime pins.
-    /// It never locks pack rows, so it cannot reverse registration's pack-first
-    /// order. New bindings become visible before eligible releases are deleted.
+    /// Exclusive graph admission for mutation/reclamation, acquired before
+    /// cache admission and pack/component locks. New bindings become visible
+    /// before eligible releases are deleted.
     pub async fn lock_reclamation(connection: &mut PgConnection) -> Result<()> {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':named-type-graph', 0))")
             .execute(connection).await?;
@@ -252,14 +252,13 @@ impl SchemaTypeRepository {
         Ok(count > 0)
     }
 
-    /// Pack-first lock order. Type graph writers hold this admission until commit.
+    /// Graph-first lock order. Writers retain exclusive admission until commit.
     pub async fn lock_graph(connection: &mut PgConnection, pack: i64) -> Result<()> {
+        Self::lock_reclamation(&mut *connection).await?;
         sqlx::query("SELECT id FROM pack WHERE id = $1 FOR NO KEY UPDATE")
             .bind(pack)
             .execute(&mut *connection)
             .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':named-type-graph', 0))")
-            .execute(connection).await?;
         Ok(())
     }
 

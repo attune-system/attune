@@ -138,7 +138,15 @@ pub fn collect_workflow_action_uses(workflow: &WorkflowDefinition) -> Vec<(Strin
                 .as_deref()
                 .filter(|action| !action.trim().is_empty())
             {
-                uses.push((action.trim().into(), format!("{path}/action")));
+                if !action.contains("{{") {
+                    uses.push((action.trim().into(), format!("{path}/action")));
+                }
+            }
+            for (index, target) in task.allowed_action_refs.iter().enumerate() {
+                uses.push((
+                    target.clone(),
+                    format!("{path}/allowed_action_refs/{index}"),
+                ));
             }
             if let Some(tasks) = &task.tasks {
                 visit(tasks, &path, uses);
@@ -152,10 +160,12 @@ pub fn collect_workflow_action_uses(workflow: &WorkflowDefinition) -> Vec<(Strin
 
 fn collect_task_action_refs(task: &Task, refs: &mut BTreeSet<String>) {
     if let Some(action) = task.action.as_deref() {
-        if !action.trim().is_empty() {
+        if !action.trim().is_empty() && !action.contains("{{") {
             refs.insert(action.trim().to_string());
         }
     }
+
+    refs.extend(task.allowed_action_refs.iter().cloned());
 
     if let Some(tasks) = &task.tasks {
         for task in tasks {

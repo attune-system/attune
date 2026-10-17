@@ -245,7 +245,14 @@ impl CompletionListener {
                     "Execution {} is a workflow task, advancing workflow",
                     execution_id
                 );
-                match ExecutionScheduler::maybe_retry_workflow_task(pool, publisher, exec).await {
+                match ExecutionScheduler::maybe_retry_workflow_task(
+                    pool,
+                    publisher,
+                    exec,
+                    encryption_key,
+                )
+                .await
+                {
                     Ok(true) => {
                         info!(
                             "Execution {} scheduled a workflow retry; delaying workflow advancement",
@@ -262,6 +269,9 @@ impl CompletionListener {
                         if let Some(mq_err) = Self::retryable_mq_error(&e) {
                             return Err(mq_err.into());
                         }
+                        // A refused/contended retry must not become ordinary
+                        // workflow advancement. Requeue the completion instead.
+                        return Err(e);
                     }
                 }
                 if let Err(e) = ExecutionScheduler::advance_workflow(
@@ -315,6 +325,7 @@ impl CompletionListener {
                             publisher,
                             action_id,
                             next_execution_id,
+                            encryption_key,
                         )
                         .await
                         {
@@ -983,10 +994,26 @@ impl CompletionListener {
         publisher: &Publisher,
         action_id: i64,
         execution_id: i64,
+        encryption_key: Option<&str>,
     ) -> Result<()> {
-        let execution = ExecutionRepository::find_by_id(pool, execution_id)
+        use attune_common::repositories::requested_execution_publication::RequestedExecutionPublicationRepository as Requested;
+        let mut publication = pool.begin().await?;
+        let execution = ExecutionRepository::find_by_id(&mut *publication, execution_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Execution {} not found", execution_id))?;
+        if execution.action != Some(action_id) {
+            return Err(anyhow::anyhow!(
+                "Policy queue release target action differs from its actual owner"
+            ));
+        }
+        let key = encryption_key
+            .ok_or_else(|| anyhow::anyhow!("Requested input encryption unavailable"))?;
+        let prepared = Requested::prepare(&mut publication, &execution, key)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Requested policy queue target is not currently eligible")
+            })?;
+        prepared.lock_target(&mut publication).await?;
 
         let payload = ExecutionRequestedPayload {
             execution_id,
@@ -1002,7 +1029,14 @@ impl CompletionListener {
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
             .with_source("executor-completion-listener");
 
-        publisher.publish_envelope(&envelope).await?;
+        if let Err(error) = prepared
+            .publish_bounded(&mut publication, publisher.publish_envelope(&envelope))
+            .await
+        {
+            publication.rollback().await?;
+            return Err(error.into());
+        }
+        publication.commit().await?;
 
         debug!(
             "Republished deferred ExecutionRequested for execution {}",

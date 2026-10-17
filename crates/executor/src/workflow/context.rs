@@ -50,8 +50,7 @@
 //! to integer `5` stays as `5`, not the string `"5"`.
 
 use attune_common::secret_values::{
-    pointer_from_dot_path, pointer_join, pointer_suffix, JsonPointer, RenderedJson,
-    SecretPathSource, SecretSource,
+    pointer_join, pointer_suffix, JsonPointer, RenderedJson, SecretPathSource, SecretSource,
 };
 use attune_common::workflow::expression::{
     self, is_truthy, EvalContext, EvalError, EvalResult as ExprResult,
@@ -146,6 +145,35 @@ pub struct WorkflowContext {
 }
 
 impl WorkflowContext {
+    /// Native consumers retain all input read references through expressions,
+    /// including dynamic selection. This is provenance, never an API grant.
+    pub fn bind_native_input_closure(
+        &self,
+        closure: &attune_common::repositories::native_input_origin::NativeInputClosure,
+    ) {
+        if closure.origins().is_empty() {
+            return;
+        }
+        let source = SecretSource::Bound(attune_common::secret_provenance::SecretProvenance {
+            origins: closure.origins().to_vec(),
+            templates: vec![],
+        });
+        for root in [
+            "parameters",
+            "workflow",
+            "task",
+            "result",
+            "inquiry",
+            "execution",
+            "work_queue_item",
+            "item",
+        ] {
+            self.mark_secret_source_path(root, source.clone());
+        }
+        // Control-dependent literal effects retain conservative lineage, not a
+        // fabricated receipt claiming an expression rendered the literal value.
+        self.retain_namespace_control_sources("parameters");
+    }
     /// Create a new workflow context.
     ///
     /// `parameters` — the immutable input parameters for this workflow run.
@@ -345,7 +373,7 @@ impl WorkflowContext {
         let mut values = serde_json::Map::new();
         for (reference, key) in keys {
             self.mark_secret_source_path(
-                &format!("keystore.{reference}"),
+                &format!("keystore[{}]", json!(reference)),
                 SecretSource::Bound(attune_common::secret_provenance::SecretProvenance::key(
                     key.origin,
                 )),
@@ -427,10 +455,77 @@ impl WorkflowContext {
     }
 
     pub fn mark_secret_source_path(&self, expression_path: &str, source: SecretSource) {
-        self.secret_sources
+        let mut sources = self
+            .secret_sources
             .entry(expression_path.to_string())
-            .or_default()
-            .push(source);
+            .or_default();
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+
+    pub fn retain_native_control_sources(&self, sources: &[SecretPathSource]) {
+        for source in sources {
+            self.mark_secret_source_path("system.__attune_native_control", source.source.clone());
+        }
+    }
+
+    pub fn native_control_sources(&self) -> Vec<SecretPathSource> {
+        self.secret_sources
+            .get("system.__attune_native_control")
+            .map(|sources| {
+                sources
+                    .iter()
+                    .cloned()
+                    .map(|source| SecretPathSource {
+                        path: String::new(),
+                        source,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn retain_namespace_control_sources(&self, namespace: &str) {
+        let prefix = format!("{namespace}.");
+        let sources = self
+            .secret_sources
+            .iter()
+            .filter(|entry| {
+                entry.key() == namespace
+                    || entry.key().starts_with(&prefix)
+                    || entry.key().starts_with(&format!("{namespace}["))
+            })
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .cloned()
+                    .map(|source| SecretPathSource {
+                        path: String::new(),
+                        source,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        self.retain_native_control_sources(&sources);
+    }
+
+    /// A rendered value is data, even if a supplied string contains template
+    /// syntax. Publication must not run a second expression pass over it.
+    pub fn publish_rendered(&mut self, name: &str, rendered: RenderedJson) {
+        self.set_var(name, rendered.value);
+        self.retain_native_control_sources(&rendered.secret_path_sources);
+        for source in rendered.secret_path_sources {
+            self.mark_secret_source_path(
+                &format!(
+                    "workflow[{}]{}",
+                    json!(name),
+                    pointer_to_expression_suffix(&source.path)
+                ),
+                source.source,
+            );
+        }
     }
 
     pub fn mark_secret_pointer_paths(
@@ -459,10 +554,9 @@ impl WorkflowContext {
     }
 
     pub fn export_variables_with_sensitivity(&self) -> ContextResult<RenderedJson> {
-        Ok(rendered_from_path_sources(
-            self.export_variables(),
-            self.secret_path_sources_for_expression("workflow", "", true)?,
-        ))
+        let mut sources = self.secret_path_sources_for_expression("workflow", "", true)?;
+        sources.extend(self.native_control_sources());
+        Ok(rendered_from_path_sources(self.export_variables(), sources))
     }
 
     pub fn set_template_origin(&mut self, component_type: &str, component_ref: &str) {
@@ -577,21 +671,40 @@ impl WorkflowContext {
     ) -> ContextResult<RenderedJson> {
         match value {
             JsonValue::String(s) => {
-                if let Some(result) = self.try_evaluate_pure_expression(s) {
-                    let trimmed = s.trim();
+                let trimmed = s.trim();
+                if trimmed.starts_with("{{")
+                    && trimmed.ends_with("}}")
+                    && trimmed.matches("{{").count() == 1
+                    && !trimmed[2..trimmed.len() - 2].trim().is_empty()
+                {
                     let expr = trimmed[2..trimmed.len() - 2].trim();
-                    let value = result?;
+                    let selected = self.evaluate_selected_expression(expr)?;
                     let path_sources =
-                        self.secret_path_sources_for_expression(expr, pointer, true)?;
-                    return Ok(rendered_from_path_sources(value, path_sources));
+                        self.secret_path_sources_for_selection(expr, &selected, pointer, true)?;
+                    return Ok(rendered_from_path_sources(selected.value, path_sources));
                 }
 
-                let rendered = self.render_template(s)?;
+                // Consume only authored template spans. Evaluation and source
+                // selection share one pass; inserted values are never revisited.
+                let mut rendered = String::new();
                 let mut path_sources = Vec::new();
-                for expr in template_expressions(s) {
-                    path_sources
-                        .extend(self.secret_path_sources_for_expression(&expr, pointer, false)?);
+                let mut start = 0;
+                while let Some(open) = s[start..].find("{{") {
+                    let open = start + open;
+                    let Some(close) = s[open..].find("}}") else {
+                        break;
+                    };
+                    let close = open + close;
+                    rendered.push_str(&s[start..open]);
+                    let expr = s[open + 2..close].trim();
+                    let selected = self.evaluate_selected_expression(expr)?;
+                    rendered.push_str(&value_to_string(&selected.value));
+                    path_sources.extend(
+                        self.secret_path_sources_for_selection(expr, &selected, pointer, false)?,
+                    );
+                    start = close + 2;
                 }
+                rendered.push_str(&s[start..]);
                 Ok(rendered_from_path_sources(
                     JsonValue::String(rendered),
                     path_sources,
@@ -635,29 +748,60 @@ impl WorkflowContext {
         dest_pointer: &str,
         pure_expression: bool,
     ) -> ContextResult<Vec<SecretPathSource>> {
-        let dependencies = expression::expression_dependencies(expr, self)
+        let selected = self.evaluate_selected_expression(expr)?;
+        self.secret_path_sources_for_selection(expr, &selected, dest_pointer, pure_expression)
+    }
+
+    fn evaluate_selected_expression(
+        &self,
+        expr: &str,
+    ) -> ContextResult<expression::SelectedEvaluation> {
+        let ast = expression::parse_expression(expr)
             .map_err(|error| ContextError::InvalidExpression(error.to_string()))?;
+        expression::eval_selected(&ast, self)
+            .map_err(|error| ContextError::InvalidExpression(error.to_string()))
+    }
+
+    fn secret_path_sources_for_selection(
+        &self,
+        expr: &str,
+        selected: &expression::SelectedEvaluation,
+        dest_pointer: &str,
+        pure_expression: bool,
+    ) -> ContextResult<Vec<SecretPathSource>> {
         let mut sources = Vec::new();
 
-        for dependency in &dependencies.paths {
-            let direct = pure_expression && dependencies.direct_path.as_ref() == Some(dependency);
-            let dependency = self.canonical_source_path(dependency);
+        for dependency in &selected.fields {
+            let direct = pure_expression && selected.direct.as_ref() == Some(dependency);
+            let destination =
+                if direct && dependency.namespace == "pack" && dependency.path.is_empty() {
+                    pointer_join(dest_pointer, "/config")
+                } else {
+                    dest_pointer.to_owned()
+                };
+            let dependency = self.canonical_selected_field(dependency.clone());
             for entry in self.secret_sources.iter() {
+                let Some(source) = self.canonical_source_path(entry.key()) else {
+                    continue;
+                };
                 collect_matching_sources(
                     &dependency,
-                    dest_pointer,
+                    &destination,
                     direct,
-                    &self.canonical_source_path(entry.key()),
+                    &source,
                     entry.value(),
                     &mut sources,
                 );
             }
             for (path, source) in &self.current_item_secret_sources {
+                let Some(path) = self.canonical_source_path(path) else {
+                    continue;
+                };
                 collect_matching_sources(
                     &dependency,
-                    dest_pointer,
+                    &destination,
                     direct,
-                    path,
+                    &path,
                     std::slice::from_ref(source),
                     &mut sources,
                 );
@@ -680,22 +824,51 @@ impl WorkflowContext {
         Ok(sources)
     }
 
-    fn canonical_source_path(&self, path: &str) -> String {
-        let path = normalize_expression_path(path);
-        let (root, suffix) = path.split_once('.').unwrap_or((&path, ""));
-        let canonical_root = match root {
+    fn canonical_source_path(&self, path: &str) -> Option<expression::SelectedField> {
+        let ast = expression::parse_expression(path).ok()?;
+        Some(self.canonical_selected_field(static_source_field(&ast, 0)?))
+    }
+
+    fn canonical_selected_field(
+        &self,
+        mut field: expression::SelectedField,
+    ) -> expression::SelectedField {
+        if field.namespace == "pack" {
+            if field.path.is_empty() {
+                field.namespace = "config".into();
+            } else if let Some(path) = pointer_suffix(&field.path, "/config") {
+                field.namespace = "config".into();
+                field.path = path;
+            }
+            return field;
+        }
+        let canonical_root = match field.namespace.as_str() {
             "vars" | "variables" => "workflow",
             "tasks" => "task",
-            _ if self.variables.contains_key(root) => "workflow",
-            _ => return path,
+            root if !matches!(
+                root,
+                "parameters"
+                    | "workflow"
+                    | "task"
+                    | "config"
+                    | "keystore"
+                    | "item"
+                    | "index"
+                    | "system"
+                    | "result"
+                    | "inquiry"
+                    | "execution"
+                    | "work_queue_item"
+            ) && self.variables.contains_key(root) =>
+            {
+                field.path =
+                    pointer_join(&format!("/{}", escape_pointer_segment(root)), &field.path);
+                "workflow"
+            }
+            _ => return field,
         };
-        if canonical_root == "workflow" && self.variables.contains_key(root) {
-            format!("workflow.{path}")
-        } else if suffix.is_empty() {
-            canonical_root.into()
-        } else {
-            format!("{canonical_root}.{suffix}")
-        }
+        field.namespace = canonical_root.into();
+        field
     }
 
     /// Evaluate a template expression using the expression engine.
@@ -742,12 +915,18 @@ impl WorkflowContext {
                 // simple template conditions like `{{ succeeded() }}` (though
                 // bare expressions are preferred going forward).
                 let rendered = self.render_template(condition)?;
-                match rendered.trim().to_lowercase().as_str() {
-                    "true" | "1" | "yes" => Ok(true),
-                    "false" | "0" | "no" | "" => Ok(false),
-                    _ => Ok(!rendered.trim().is_empty()),
-                }
+                Ok(Self::rendered_condition_truth(&JsonValue::String(rendered)))
             }
+        }
+    }
+
+    pub fn rendered_condition_truth(value: &JsonValue) -> bool {
+        match value {
+            JsonValue::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "false" | "0" | "no" | "" => false,
+                _ => true,
+            },
+            value => is_truthy(value),
         }
     }
 
@@ -773,30 +952,16 @@ impl WorkflowContext {
                 // booleans, numbers, arrays, objects, and null pass through
                 // unchanged.
                 let rendered = self.render_json_with_sensitivity(json_value)?;
-                self.set_var(var_name, rendered.value);
-                for source in rendered.secret_path_sources {
-                    self.mark_secret_source_path(
-                        &format!(
-                            "workflow.{var_name}{}",
-                            pointer_to_expression_suffix(&source.path)
-                        ),
-                        source.source,
-                    );
-                }
+                self.publish_rendered(var_name, rendered);
             }
         } else {
             // Simple variable publishing - store entire result
             for var_name in publish_vars {
-                self.set_var(var_name, result.clone());
-                for source in self.secret_path_sources_for_expression("result()", "", true)? {
-                    self.mark_secret_source_path(
-                        &format!(
-                            "workflow.{var_name}{}",
-                            pointer_to_expression_suffix(&source.path)
-                        ),
-                        source.source,
-                    );
-                }
+                let sources = self.secret_path_sources_for_expression("result()", "", true)?;
+                self.publish_rendered(
+                    var_name,
+                    rendered_from_path_sources(result.clone(), sources),
+                );
             }
         }
 
@@ -968,14 +1133,17 @@ fn rendered_from_path_sources(
 }
 
 fn collect_matching_sources(
-    expr: &str,
+    expr: &expression::SelectedField,
     dest_pointer: &str,
     pure_expression: bool,
-    source_expr_path: &str,
+    source_expr_path: &expression::SelectedField,
     source_values: &[SecretSource],
     output: &mut Vec<SecretPathSource>,
 ) {
-    if source_expr_path == expr || expr.starts_with(&format!("{source_expr_path}.")) {
+    if source_expr_path.namespace != expr.namespace {
+        return;
+    }
+    if pointer_suffix(&expr.path, &source_expr_path.path).is_some() {
         output.extend(
             source_values
                 .iter()
@@ -988,13 +1156,9 @@ fn collect_matching_sources(
         return;
     }
 
-    if source_expr_path.starts_with(&format!("{expr}.")) {
+    if let Some(suffix) = pointer_suffix(&source_expr_path.path, &expr.path) {
         let path = if pure_expression {
-            let source_pointer = pointer_from_dot_path(source_expr_path);
-            let expr_pointer = pointer_from_dot_path(expr);
-            pointer_suffix(&source_pointer, &expr_pointer)
-                .map(|suffix| pointer_join(dest_pointer, &suffix))
-                .unwrap_or_else(|| dest_pointer.to_string())
+            pointer_join(dest_pointer, &suffix)
         } else {
             dest_pointer.to_string()
         };
@@ -1027,28 +1191,57 @@ fn template_expressions(s: &str) -> Vec<String> {
     expressions
 }
 
-fn normalize_expression_path(expr: &str) -> String {
-    expr.trim()
-        .replace("result()", "result")
-        .replace("[\"", ".")
-        .replace("\"]", "")
-        .replace("[\'", ".")
-        .replace("']", "")
+fn static_source_field(expr: &expression::Expr, depth: usize) -> Option<expression::SelectedField> {
+    use expression::Expr;
+    if depth > 32 {
+        return None;
+    }
+    match expr {
+        Expr::Ident(namespace) => Some(expression::SelectedField {
+            namespace: namespace.clone(),
+            path: String::new(),
+        }),
+        Expr::FunctionCall { name, args } if name == "result" && args.is_empty() => {
+            Some(expression::SelectedField {
+                namespace: "result".into(),
+                path: String::new(),
+            })
+        }
+        Expr::DotAccess { object, field } => {
+            let mut selected = static_source_field(object, depth + 1)?;
+            selected.path = pointer_join(
+                &selected.path,
+                &format!("/{}", escape_pointer_segment(field)),
+            );
+            Some(selected)
+        }
+        Expr::IndexAccess { object, index } => {
+            let field = match index.as_ref() {
+                Expr::Literal(JsonValue::String(field)) => field.clone(),
+                Expr::Literal(JsonValue::Number(field)) => field.to_string(),
+                _ => return None,
+            };
+            let mut selected = static_source_field(object, depth + 1)?;
+            selected.path = pointer_join(
+                &selected.path,
+                &format!("/{}", escape_pointer_segment(&field)),
+            );
+            Some(selected)
+        }
+        _ => None,
+    }
 }
 
 fn pointer_to_expression_suffix(pointer: &str) -> String {
-    let suffix = pointer
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(unescape_pointer_segment)
-        .collect::<Vec<_>>()
-        .join(".");
-    if suffix.is_empty() {
-        String::new()
-    } else {
-        format!(".{suffix}")
-    }
+    pointer
+        .strip_prefix('/')
+        .map(|suffix| {
+            suffix
+                .split('/')
+                .map(|segment| format!("[{}]", json!(unescape_pointer_segment(segment))))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn escape_pointer_segment(segment: &str) -> String {
@@ -1120,6 +1313,7 @@ impl EvalContext for WorkflowContext {
 
             // `config` — pack configuration (read-only).
             "config" => Ok(self.pack_config.as_ref().clone()),
+            "pack" => Ok(json!({"config":self.pack_config.as_ref()})),
 
             // `keystore` — encrypted secrets (read-only).
             "keystore" => Ok(self.keystore.as_ref().clone()),
@@ -1204,6 +1398,142 @@ impl EvalContext for WorkflowContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_task_and_published_variable_keep_exact_property_names() {
+        let mut context = WorkflowContext::new(json!({}), HashMap::new());
+        context.set_task_result("task.with/slash", json!({"value":"protected"}));
+        context.mark_secret_pointer_paths(
+            "task[\"task.with/slash\"]",
+            &["/value".into()],
+            |path| SecretSource::ExecutionResult {
+                execution_id: 42,
+                path: path.clone(),
+            },
+        );
+        let rendered = context
+            .render_json_with_sensitivity(&json!("{{ task['task.with/slash'].value }}"))
+            .unwrap();
+        assert_eq!(rendered.value, "protected");
+        assert_eq!(rendered.secret_path_sources.len(), 1);
+        context.publish_rendered("var.with/slash", rendered);
+        let published = context
+            .render_json_with_sensitivity(&json!("{{ workflow['var.with/slash'] }}"))
+            .unwrap();
+        assert_eq!(published.value, "protected");
+        assert_eq!(published.secret_path_sources.len(), 1);
+    }
+
+    #[test]
+    fn sensitivity_uses_exact_selected_pointer_without_dotted_key_aliasing() {
+        let context = WorkflowContext::new(
+            json!({
+                "a.b": {"/": "protected"},
+                "a": {"b": {"/": "public"}},
+                "": "empty-name protected"
+            }),
+            HashMap::new(),
+        );
+        context.mark_secret_pointer_paths("parameters", &["/a.b/~1".into(), "/".into()], |path| {
+            SecretSource::WorkflowParameter {
+                execution_id: 1,
+                path: path.clone(),
+            }
+        });
+        let selected = context
+            .render_json_with_sensitivity(&json!("{{ parameters['a.b'] }}"))
+            .unwrap();
+        assert_eq!(selected.value, json!({"/":"protected"}));
+        assert_eq!(selected.secret_path_sources.len(), 1);
+        assert_eq!(selected.secret_path_sources[0].path, "/~1");
+        let public = context
+            .render_json_with_sensitivity(&json!("{{ parameters.a.b }}"))
+            .unwrap();
+        assert_eq!(public.value, json!({"/":"public"}));
+        assert!(public.secret_path_sources.is_empty());
+        let empty = context
+            .render_json_with_sensitivity(&json!("{{ parameters[''] }}"))
+            .unwrap();
+        assert_eq!(empty.value, "empty-name protected");
+        assert_eq!(empty.secret_path_sources.len(), 1);
+    }
+
+    #[test]
+    fn sensitivity_selects_only_executed_branches_and_keeps_selector_origins() {
+        let mut context =
+            WorkflowContext::new(json!({"one":"protected", "two":"other"}), HashMap::new());
+        context.set_var("selector", json!("one"));
+        context.mark_secret_pointer_paths("parameters", &["/one".into(), "/two".into()], |path| {
+            SecretSource::WorkflowParameter {
+                execution_id: 1,
+                path: path.clone(),
+            }
+        });
+        context.mark_secret_pointer_paths("workflow", &["/selector".into()], |path| {
+            SecretSource::ExecutionResult {
+                execution_id: 2,
+                path: path.clone(),
+            }
+        });
+        let skipped = context
+            .render_json_with_sensitivity(&json!("{{ false and parameters.two }}"))
+            .unwrap();
+        assert_eq!(skipped.value, false);
+        assert!(skipped.secret_path_sources.is_empty());
+        let selected = context
+            .render_json_with_sensitivity(&json!(
+                "prefix {{ parameters[workflow.selector] }} {{ false and parameters.two }}"
+            ))
+            .unwrap();
+        assert_eq!(selected.value, "prefix protected false");
+        assert_eq!(selected.secret_path_sources.len(), 2);
+        assert!(selected
+            .secret_path_sources
+            .iter()
+            .all(|source| source.path.is_empty()));
+        assert!(!selected.sources.iter().any(|source| matches!(source,
+            SecretSource::WorkflowParameter { path, .. } if path == "/two"
+        )));
+    }
+
+    #[test]
+    fn rendered_publication_never_evaluates_supplied_template_text() {
+        let mut context = WorkflowContext::new(json!({}), HashMap::new());
+        let supplied = json!("{{ keystore['foreign.not_authored'] }}");
+        context.publish_rendered("literal", RenderedJson::plain(supplied.clone()));
+        assert_eq!(context.get_var("literal"), Some(supplied));
+        assert!(context
+            .export_variables_with_sensitivity()
+            .unwrap()
+            .secret_path_sources
+            .is_empty());
+    }
+
+    #[test]
+    fn native_control_sources_survive_literal_output_and_do_not_grow_on_identical_retry() {
+        let mut context = WorkflowContext::new(json!({"token":"secret"}), HashMap::new());
+        let source = SecretSource::WorkflowParameter {
+            execution_id: 4,
+            path: "/token".into(),
+        };
+        context.mark_secret_source_path("parameters.token", source.clone());
+        context.retain_namespace_control_sources("parameters");
+        context.retain_namespace_control_sources("parameters");
+        assert_eq!(
+            context.native_control_sources(),
+            vec![SecretPathSource {
+                path: String::new(),
+                source: source.clone()
+            }]
+        );
+        context.publish_rendered("decision", RenderedJson::plain(json!(true)));
+        let variables = context.export_variables_with_sensitivity().unwrap();
+        assert_eq!(variables.value, json!({"decision":true}));
+        assert!(variables
+            .secret_path_sources
+            .iter()
+            .any(|item| item.path.is_empty() && item.source == source));
+    }
 
     // ---------------------------------------------------------------
     // parameters namespace
@@ -1925,9 +2255,9 @@ mod tests {
             exported.value,
             &exported.secret_path_sources,
         );
-        assert!(attune_common::secret_values::is_redaction_marker(
-            &redacted["combined"]
-        ));
+        // Publication keeps control lineage as well as the selected value
+        // fields, so the persisted variable object is conservatively protected.
+        assert!(attune_common::secret_values::is_redaction_marker(&redacted));
         let provenance: attune_common::secret_provenance::SecretProvenance =
             serde_json::from_str(secrets[0].source_ref.as_ref().unwrap()).unwrap();
         assert_eq!(provenance.origins.len(), 2);

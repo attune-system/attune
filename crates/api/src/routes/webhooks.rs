@@ -15,11 +15,10 @@ use attune_common::{
     mq::{EventCreatedPayload, MessageEnvelope, MessageType},
     repositories::{
         event::{CreateEventInput, EventRepository},
-        execution_secret_value::ExecutionSecretValueRepository,
         trigger::{TriggerRepository, WebhookEventLogInput},
         Create, FindById, FindByRef,
     },
-    secret_values::{prepare_secret_values, ENTITY_EVENT_CONFIG, ENTITY_EVENT_PAYLOAD},
+    secret_values::prepare_secret_values,
 };
 
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
@@ -784,28 +783,14 @@ pub async fn receive_webhook(
             ));
             ApiError::InternalServerError(e.to_string())
         })?;
-    attune_common::repositories::event_schema::EventSchemaRepository::attach(
-        &mut tx, event.id, &binding,
+    attune_common::repositories::event_origin::EventOriginRepository::capture(
+        &mut tx,
+        &event,
+        &binding,
+        &prepared_payload_secrets,
+        &prepared_config_secrets,
     )
     .await?;
-    if !prepared_payload_secrets.is_empty() {
-        ExecutionSecretValueRepository::upsert_many_with_conn(
-            &mut tx,
-            ENTITY_EVENT_PAYLOAD,
-            event.id,
-            &prepared_payload_secrets,
-        )
-        .await?;
-    }
-    if !prepared_config_secrets.is_empty() {
-        ExecutionSecretValueRepository::upsert_many_with_conn(
-            &mut tx,
-            ENTITY_EVENT_CONFIG,
-            event.id,
-            &prepared_config_secrets,
-        )
-        .await?;
-    }
     tx.commit().await?;
 
     // Publish EventCreated message to message queue if publisher is available
@@ -815,6 +800,7 @@ pub async fn receive_webhook(
     );
     if let Some(publisher) = state.get_publisher().await {
         let message_payload = EventCreatedPayload {
+            event_created: Some(event.created),
             event_id: event.id,
             trigger_id: event.trigger,
             trigger_ref: event.trigger_ref.clone(),

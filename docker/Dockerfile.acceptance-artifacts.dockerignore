@@ -1,0 +1,10 @@
+.git
+**/target
+**/node_modules
+web/dist
+.env
+.env.*
+**/*.private*
+**/*.log
+**/*.sqlite
+**/*.db

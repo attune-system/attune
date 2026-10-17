@@ -26,6 +26,88 @@ pub struct PreparedEventSections {
     pub config_secrets: Vec<SecretValueInput>,
 }
 
+impl PreparedEventSections {
+    /// Runtime plaintext can be copied into an undeclared public field. Protect
+    /// whole normalized sections, not only the trigger's declared secret paths.
+    pub fn inherit_runtime_reads(
+        &mut self,
+        origins: &[crate::secret_provenance::SecretOrigin],
+    ) -> Result<()> {
+        if origins.is_empty() {
+            return Ok(());
+        }
+        for (section, secrets) in [
+            (&mut self.payload, &mut self.payload_secrets),
+            (&mut self.config, &mut self.config_secrets),
+        ] {
+            let Some(mut value) = section.take() else {
+                continue;
+            };
+            let mut provenance = crate::secret_provenance::SecretProvenance {
+                origins: origins.to_vec(),
+                templates: vec![],
+            };
+            for secret in std::mem::take(secrets) {
+                if secret.json_path.is_empty() {
+                    value = secret.value;
+                } else {
+                    *value
+                        .pointer_mut(&secret.json_path)
+                        .ok_or_else(|| Error::validation("Event secret path is unavailable"))? =
+                        secret.value;
+                }
+                if secret.source_kind != "provenance" {
+                    return Err(Error::validation("Event secret provenance is unavailable"));
+                }
+                provenance.merge(serde_json::from_str(
+                    secret.source_ref.as_deref().ok_or_else(|| {
+                        Error::validation("Event secret provenance is unavailable")
+                    })?,
+                )?);
+            }
+            let reference = serde_json::to_string(&provenance)?;
+            if provenance.origins.len() > 256 || reference.len() > 1024 * 1024 {
+                return Err(Error::validation("Event read provenance exceeds its bound"));
+            }
+            secrets.push(SecretValueInput {
+                json_path: String::new(),
+                value,
+                source_kind: "provenance".into(),
+                source_ref: Some(reference),
+            });
+            *section = Some(crate::secret_values::redaction_marker());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod runtime_read_event_tests {
+    use super::*;
+    #[test]
+    fn public_event_fields_cannot_drop_runtime_origins() {
+        let origin = crate::repositories::runtime_read::RuntimeReadRepository::reference(7);
+        let mut sections = PreparedEventSections {
+            payload: Some(serde_json::json!({"public":"sdk-secret"})),
+            config: Some(serde_json::json!({"public":"sdk-secret"})),
+            payload_secrets: vec![],
+            config_secrets: vec![],
+        };
+        sections.inherit_runtime_reads(&[origin.clone()]).unwrap();
+        for (value, inputs) in [
+            (sections.payload, sections.payload_secrets),
+            (sections.config, sections.config_secrets),
+        ] {
+            assert!(!value.unwrap().to_string().contains("sdk-secret"));
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0].json_path, "");
+            let provenance: crate::secret_provenance::SecretProvenance =
+                serde_json::from_str(inputs[0].source_ref.as_deref().unwrap()).unwrap();
+            assert_eq!(provenance.origins, vec![origin.clone()]);
+        }
+    }
+}
+
 impl EventSchemaBinding {
     /// Trigger removal clears the nullable projection FK, not the recorded
     /// admission identity. Never resolve a replacement component by reference.

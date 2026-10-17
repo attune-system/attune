@@ -40,6 +40,7 @@ pub(crate) struct ArtifactReads<'a> {
     disclosure_snapshot: Option<AuthorizationSnapshot>,
     execution_disclosure: HashMap<i64, bool>,
     source_records: DisclosureRecords,
+    receipt_guard: Option<crate::receipt_disclosure::SharedHumanReceiptGuard>,
 }
 
 impl<'a> ArtifactReads<'a> {
@@ -54,6 +55,7 @@ impl<'a> ArtifactReads<'a> {
             disclosure_snapshot: None,
             execution_disclosure: HashMap::new(),
             source_records: DisclosureRecords::default(),
+            receipt_guard: None,
         })
     }
 
@@ -61,6 +63,14 @@ impl<'a> ArtifactReads<'a> {
         &self,
         filters: &ArtifactSearchFilters,
     ) -> ApiResult<ArtifactSearchResult<ArtifactSummaryRow>> {
+        if crate::recorded_consumers::is_recorded(self.user)? {
+            return crate::recorded_consumers::artifact_summaries(
+                &self.state.db,
+                self.user,
+                filters,
+            )
+            .await;
+        }
         Ok(
             ArtifactRepository::search_summaries(&self.state.db, filters, self.context.as_ref())
                 .await?,
@@ -70,6 +80,39 @@ impl<'a> ArtifactReads<'a> {
     pub(crate) async fn authorize_detail(&mut self, artifact: &Artifact) -> ApiResult<()> {
         self.authorize_header(artifact.id, artifact.classification)
             .await
+    }
+
+    /// Consume this request-local cache so a later transport wait retains every
+    /// receipt deadline, rather than reusing a cached bool without its fence.
+    pub(crate) async fn authorize_detail_with_receipts(
+        self,
+        artifact: &Artifact,
+    ) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
+        let executions =
+            ArtifactRepository::linked_execution_ids_bounded(&self.state.db, artifact.id, 257)
+                .await?;
+        let guard = crate::receipt_disclosure::HumanReceiptGuard::for_executions(
+            self.state,
+            self.user,
+            &executions,
+        )
+        .await?
+        .shared();
+        self.authorize_detail_with_prepared_receipts(artifact, guard)
+            .await
+    }
+
+    pub(crate) async fn authorize_detail_with_prepared_receipts(
+        mut self,
+        artifact: &Artifact,
+        guard: crate::receipt_disclosure::SharedHumanReceiptGuard,
+    ) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
+        self.receipt_guard = Some(guard.clone());
+        self.authorize_header(artifact.id, artifact.classification)
+            .await?;
+        let freshness = self.source_records.take_receipt_freshness();
+        freshness.ensure_fresh()?;
+        Ok(guard)
     }
 
     pub(crate) async fn version_summaries(
@@ -94,6 +137,9 @@ impl<'a> ArtifactReads<'a> {
         id: i64,
         classification: ArtifactClassification,
     ) -> ApiResult<()> {
+        if crate::recorded_consumers::is_recorded(self.user)? {
+            return crate::recorded_consumers::artifact_read(&self.state.db, self.user, id).await;
+        }
         let Some(context) = self.context.as_ref() else {
             return Ok(());
         };
@@ -114,6 +160,14 @@ impl<'a> ArtifactReads<'a> {
         &mut self,
         filters: &ArtifactSearchFilters,
     ) -> ApiResult<ArtifactSearchResult<ArtifactSummaryRow>> {
+        if crate::recorded_consumers::is_recorded(self.user)? {
+            return crate::recorded_consumers::artifact_summaries(
+                &self.state.db,
+                self.user,
+                filters,
+            )
+            .await;
+        }
         let start = std::time::Instant::now();
         let mut candidates = 0usize;
         let mut after = None;
@@ -213,7 +267,11 @@ impl<'a> ArtifactReads<'a> {
         let mut secrets = HashMap::<i64, Vec<SecretProvenanceRow>>::new();
         for row in ExecutionSecretValueRepository::find_provenance_by_entities(
             &self.state.db,
-            &[ENTITY_EXECUTION_CONFIG, ENTITY_EXECUTION_RESULT],
+            &[
+                ENTITY_EXECUTION_CONFIG,
+                ENTITY_EXECUTION_RESULT,
+                "workflow_variables",
+            ],
             ids,
         )
         .await?
@@ -287,16 +345,29 @@ impl<'a> ArtifactReads<'a> {
                                 "Runtime log secret disclosure requires identity access".into(),
                             )
                         })?;
-                        match authorize_runtime_log_cached(
-                            self.state,
-                            self.user,
-                            execution,
-                            secrets,
-                            snapshot,
-                            &mut self.source_records,
-                        )
-                        .await
-                        {
+                        let result = if let Some(guard) = &self.receipt_guard {
+                            crate::secret_disclosure::authorize_runtime_log_cached_guarded(
+                                self.state,
+                                self.user,
+                                execution,
+                                secrets,
+                                snapshot,
+                                &mut self.source_records,
+                                guard.clone(),
+                            )
+                            .await
+                        } else {
+                            authorize_runtime_log_cached(
+                                self.state,
+                                self.user,
+                                execution,
+                                secrets,
+                                snapshot,
+                                &mut self.source_records,
+                            )
+                            .await
+                        };
+                        match result {
                             Ok(()) => true,
                             Err(ApiError::Forbidden(_) | ApiError::NotFound(_)) => false,
                             Err(error) => return Err(error),

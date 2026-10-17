@@ -9,6 +9,7 @@
 pub mod archive;
 pub mod client;
 pub mod dependency;
+pub mod deployment_admission;
 pub mod diagnostics;
 pub mod installer;
 pub mod loader;

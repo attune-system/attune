@@ -1,0 +1,94 @@
+# All base images are explicit immutable inputs. No registry publication here.
+ARG TOOLCHAIN_IMAGE
+ARG NODE_IMAGE
+ARG SERVICE_BASE
+ARG PYTHON_BASE
+ARG BUSYBOX_IMAGE
+ARG POSTGRES_IMAGE
+ARG NGINX_IMAGE
+
+FROM --platform=$BUILDPLATFORM ${TOOLCHAIN_IMAGE} AS compile
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG ATTUNE_BUILD_GIT_SHA
+ARG SOURCE_DATE_EPOCH
+ENV SQLX_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CMAKE_BUILD_PARALLEL_LEVEL=2 CARGO_TARGET_DIR=/source/target MAKEFLAGS=-j2
+WORKDIR /source
+COPY . .
+# This supplied toolchain must already contain cargo-zigbuild, Zig and both musl
+# targets. Never silently download a different toolchain or regenerate lockfiles.
+RUN test "$BUILDPLATFORM" = "$TARGETPLATFORM" && \
+    test -f Cargo.lock && test -f crates/core-timer-sensor/Cargo.lock && \
+    cargo build --locked --release -j 2 --bin attune-api --bin attune-executor --bin attune-notifier --bin attune-supervisor --bin export-openapi && \
+    cargo build --locked --release -j 2 -p attune-common --example bootstrap_acceptance_archive --example storage_probe_inspector --example interoperability_acceptance_archive --example interoperability_inspector --example legacy_native_writer --example native_settlement_adapter --example native_producer_acceptance_archive && \
+    mkdir -p /out/services /out/agents /out/tools /out/core/sensors/bin /out/native-controller && \
+    cp target/release/attune-api target/release/attune-executor target/release/attune-notifier target/release/attune-supervisor /out/services/ && \
+    cp target/release/examples/bootstrap_acceptance_archive target/release/examples/storage_probe_inspector target/release/examples/interoperability_acceptance_archive target/release/examples/interoperability_inspector target/release/examples/legacy_native_writer target/release/examples/native_settlement_adapter target/release/examples/native_producer_acceptance_archive /out/tools/ && \
+    for module in main controller journal native protocol http_input; do cp "scripts/legacy_storage_controller/$module.py" /out/native-controller/ || exit 1; done && \
+    cp docker/acceptance/attune-native-legacy@.service /out/native-controller/ && \
+    cp scripts/acceptance/native-controller-source-pins.json scripts/legacy_storage_controller/producer-context.example.json scripts/legacy_storage_controller/config.example.json /out/native-controller/ && \
+    cp -R scripts/legacy_storage_controller/producer_pack /out/native-producer-pack && \
+    /out/tools/native_producer_acceptance_archive /out/native-producer-pack /out/native-producer-store > /out/native-producer-release.json && \
+    target/release/export-openapi /out/openapi.json && \
+    case "$TARGETARCH" in amd64) target=x86_64-unknown-linux-musl;; arm64) target=aarch64-unknown-linux-musl;; *) exit 2;; esac && \
+    cargo zigbuild --locked --release -j 2 --target "$target" --bin attune-agent --bin attune-sensor-agent --bin attune --bin attune-mcp && \
+    cp target/"$target"/release/attune-agent target/"$target"/release/attune-sensor-agent target/"$target"/release/attune target/"$target"/release/attune-mcp /out/agents/ && \
+    cp -R packs/core/. /out/core/ && \
+    for pair in amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl; do \
+        arch="${pair%%:*}"; target="${pair#*:}"; \
+        CARGO_TARGET_DIR=/source/crates/core-timer-sensor/target cargo zigbuild --locked --release -j 2 --manifest-path crates/core-timer-sensor/Cargo.toml --target "$target" --bin attune-core-timer-sensor && \
+        mkdir -p "/out/core/sensors/bin/linux-$arch" && \
+        cp "crates/core-timer-sensor/target/$target/release/attune-core-timer-sensor" "/out/core/sensors/bin/linux-$arch/attune-core-timer-sensor" || exit 1; \
+    done && \
+    /out/tools/bootstrap_acceptance_archive /out/core /out/canonical-store > /out/core-release.json
+
+FROM scratch AS native-export
+COPY --from=compile /out/ /
+
+FROM ${NODE_IMAGE} AS frontend-build
+ARG SOURCE_DATE_EPOCH
+WORKDIR /source/web
+COPY web/ ./
+COPY --from=compiled /openapi.json ./openapi.json
+RUN npm ci --no-audit --no-fund && npm run generate:api-client && npm run build
+
+FROM scratch AS frontend-export
+COPY --from=frontend-build /source/web/dist/ /dist/
+
+FROM ${SERVICE_BASE} AS service
+ARG SERVICE
+WORKDIR /opt/attune
+COPY --from=compiled /services/attune-${SERVICE} /usr/local/bin/attune-service
+COPY migrations/ ./migrations/
+USER 0
+RUN test -x /usr/local/bin/attune-service && id -u attune && \
+    mkdir -p config packs logs artifacts blobs runtime_envs agent && chown -R 1000:1000 /opt/attune
+USER 1000
+ENV ATTUNE_CONFIG=/opt/attune/config/config.yaml RUST_LOG=info
+CMD ["/usr/local/bin/attune-service"]
+
+FROM ${BUSYBOX_IMAGE} AS agent
+COPY --from=compiled /agents/ /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/attune-agent"]
+
+FROM ${PYTHON_BASE} AS init-packs
+COPY --from=compiled /core/ /source/packs/core/
+COPY scripts/bootstrap_core_pack.py /scripts/bootstrap_core_pack.py
+COPY docker/acceptance/init-packs.sh /init-packs.sh
+RUN python3 -c 'import sys,yaml; assert sys.version_info >= (3,11)' && chmod +x /init-packs.sh
+CMD ["/bin/sh", "/init-packs.sh"]
+
+FROM ${POSTGRES_IMAGE} AS migrations
+RUN psql --version | grep -E 'PostgreSQL\) 18\.'
+COPY migrations/ /migrations/
+COPY docker/run-migrations.sh /run-migrations.sh
+COPY scripts/seed-standard-pack-index.sh /seed-standard-pack-index.sh
+COPY docker/init-roles.sql /docker/init-roles.sql
+CMD ["/bin/sh", "/run-migrations.sh"]
+
+FROM ${NGINX_IMAGE} AS web
+COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker/inject-env.sh /docker-entrypoint.d/40-inject-env.sh
+COPY --from=frontend /dist/ /usr/share/nginx/html/
+RUN chmod +x /docker-entrypoint.d/40-inject-env.sh && mkdir -p /usr/share/nginx/html/config

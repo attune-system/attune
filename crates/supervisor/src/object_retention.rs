@@ -33,6 +33,7 @@ pub async fn run_cycle(
     let upload_cutoff = now - seconds(config.object_upload_abandon_seconds);
     let delete_cutoff = now - seconds(config.object_delete_grace_seconds);
     let mut metrics = ObjectRetentionMetrics::default();
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::audit_pending(pool,config.artifact_cleanup_batch_size).await?;
 
     if config.pack_release_retention_enabled {
         let result = PackRetentionRepository::collect(
@@ -91,6 +92,26 @@ pub async fn run_cycle(
                 metrics.failures += 1;
                 ObjectMaintenanceRepository::record_failure(pool, entry.id, &error.to_string())
                     .await?;
+            }
+        }
+    }
+
+    // Metadata cleanup is only eligibility. Native conditional-create fencing
+    // below proves old PUTs cannot recreate payload bytes, including after an
+    // API restart or a late remote response. Failure leaves every pin intact.
+    use attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository as Evidence;
+    for plan in Evidence::recovery_candidates(pool, config.artifact_cleanup_batch_size).await? {
+        let key = plan.key()?;
+        match attune_common::blob_store::settle_atomic_file_put(
+            blob_store.as_ref(),
+            &key,
+            plan.token(),
+        )
+        .await
+        {
+            Ok(settled) => Evidence::complete_put_recovery(pool, &plan, &settled).await?,
+            Err(_) => {
+                metrics.failures += 1;
             }
         }
     }

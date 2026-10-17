@@ -169,6 +169,9 @@ export default function QueueForm({
     () => initialPermissionSetRefs?.join(", ") ?? "",
   );
   const initialQueueConfig = parseQueueConfig(initialData?.config);
+  const [separateRequesters, setSeparateRequesters] = useState(
+    () => initialQueueConfig.dispatch?.separate_requesters === true,
+  );
   const initialConcurrency = initialQueueConfig.dispatch?.concurrency;
   const initialBatchSize = initialQueueConfig.dispatch?.batch_size;
   const [advancedConfigOpen, setAdvancedConfigOpen] = useState(false);
@@ -290,6 +293,7 @@ export default function QueueForm({
 
   const buildQueueConfig = (): JsonObject => {
     const dispatch: JsonObject = {
+      separate_requesters: separateRequesters,
       concurrency: buildTunableConfig(
         "Concurrency",
         concurrencySource,
@@ -925,6 +929,32 @@ export default function QueueForm({
                 {errors.action_params}
               </p>
             )}
+          </div>
+
+          <div>
+            <label
+              htmlFor="batch-requester-grouping"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
+              Requester grouping
+            </label>
+            <select
+              id="batch-requester-grouping"
+              value={separateRequesters ? "separate" : "aggregate"}
+              onChange={(event) =>
+                setSeparateRequesters(event.target.value === "separate")
+              }
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+            >
+              <option value="aggregate">
+                Aggregate across requesters, default
+              </option>
+              <option value="separate">Separate batches by requester</option>
+            </select>
+            <p className="mt-1 text-xs text-gray-500">
+              Applies to batch dispatch. Grouping does not grant contributors
+              access to the whole batch's results or logs.
+            </p>
           </div>
 
           <div className="rounded-lg border border-gray-200">

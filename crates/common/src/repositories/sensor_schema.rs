@@ -26,6 +26,7 @@ pub struct SensorSchemaRepository;
 
 #[derive(Clone)]
 pub struct SensorDisclosureRow {
+    pub managing_pack_id: Option<i64>,
     pub id: i64,
     pub binding: SensorGenerationBinding,
     pub initial_rules: Value,
@@ -33,6 +34,7 @@ pub struct SensorDisclosureRow {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SensorDeliveryDisclosureRow {
+    pub managing_pack_id: Option<i64>,
     pub id: i64,
     pub generation_binding: i64,
     pub rule: i64,
@@ -60,14 +62,19 @@ impl SensorSchemaRepository {
     where
         E: Executor<'e, Database = Postgres>,
     {
-        let rows: Vec<(i64, Value, String, Value)> = sqlx::query_as("SELECT id, binding, binding_digest, \
+        let rows: Vec<(i64, Value, String, Value, Option<i64>)> = sqlx::query_as("SELECT id, binding, binding_digest, \
             (SELECT COALESCE(jsonb_object_agg(entry.key, jsonb_build_object('ref',entry.value->'ref','pack_ref',entry.value->'pack_ref')),'{}'::jsonb) \
-             FROM jsonb_each(initial_rules) entry) AS initial_rules \
+             FROM jsonb_each(initial_rules) entry) AS initial_rules, \
+             (SELECT s.pack FROM sensor s JOIN pack p ON p.id = s.pack \
+              WHERE s.id = (binding #>> '{executable,sensor,id}')::BIGINT \
+              AND s.pack = (binding #>> '{executable,sensor,pack}')::BIGINT \
+              AND s.ref = binding #>> '{executable,sensor,ref}' AND s.management_origin = 'pack') AS managing_pack_id \
              FROM sensor_generation_schema_binding WHERE id = ANY($1)")
             .bind(ids).fetch_all(executor).await?;
         rows.into_iter()
-            .map(|(id, body, hash, initial_rules)| {
+            .map(|(id, body, hash, initial_rules, managing_pack_id)| {
                 Ok(SensorDisclosureRow {
+                    managing_pack_id,
                     id,
                     binding: Self::decode_disclosure_binding(body, &hash)?,
                     initial_rules,
@@ -83,11 +90,16 @@ impl SensorSchemaRepository {
     where
         E: Executor<'e, Database = Postgres>,
     {
-        sqlx::query_as("SELECT id, generation_binding, rule, rule_ref, pack_ref FROM sensor_rule_config_delivery WHERE id = ANY($1)")
+        sqlx::query_as("SELECT d.id, d.generation_binding, d.rule, d.rule_ref, d.pack_ref, \
+            (SELECT r.pack FROM rule r JOIN pack p ON p.id = r.pack WHERE r.id = d.rule AND r.ref = d.rule_ref AND r.management_origin = 'pack') AS managing_pack_id \
+            FROM sensor_rule_config_delivery d WHERE d.id = ANY($1)")
             .bind(ids).fetch_all(executor).await.map_err(Into::into)
     }
 
-    fn decode_disclosure_binding(body: Value, hash: &str) -> Result<SensorGenerationBinding> {
+    pub(super) fn decode_disclosure_binding(
+        body: Value,
+        hash: &str,
+    ) -> Result<SensorGenerationBinding> {
         if digest(&body).map_err(|_| Error::validation("Invalid sensor generation digest"))? != hash
         {
             return Err(Error::validation("Sensor generation digest mismatch"));
@@ -389,6 +401,21 @@ impl SensorSchemaRepository {
     ) -> Result<Value> {
         super::schema_type::SchemaTypeRepository::lock_selection(&mut *connection).await?;
         binding.validate()?;
+        let selected_rule = RuleRepository::find_by_id_for_share(connection, rule.id)
+            .await?
+            .ok_or_else(|| Error::validation("Sensor delivery rule is unavailable"))?;
+        if selected_rule.r#ref != rule.r#ref
+            || selected_rule.pack != rule.pack
+            || selected_rule.pack_ref != rule.pack_ref
+            || selected_rule.trigger != rule.trigger
+            || selected_rule.trigger_ref != rule.trigger_ref
+            || selected_rule.trigger_params != rule.trigger_params
+        {
+            return Err(Error::validation(
+                "Sensor delivery rule changed before capture",
+            ));
+        }
+        let rule = &selected_rule;
         let stored_digest: Option<String> = sqlx::query_scalar(
             "SELECT binding_digest FROM sensor_generation_schema_binding WHERE id = $1 FOR UPDATE",
         )
@@ -489,6 +516,20 @@ impl SensorSchemaRepository {
             .bind(generation_id).bind(rule.id).bind(&rule.r#ref).bind(&rule.pack_ref).bind(&rule.trigger_ref)
             .bind(fingerprint).bind(public).fetch_optional(&mut *connection).await?;
         if let Some(id) = id {
+            super::sensor_rule_origin::SensorRuleOriginRepository::capture(
+                connection,
+                ENTITY_SENSOR_RULE_DELIVERY_CONFIG,
+                id,
+                rule,
+                trigger.parameters.as_ref(),
+                binding.executable.sensor.id,
+                binding
+                    .executable
+                    .sensor
+                    .pack
+                    .ok_or_else(|| Error::validation("Sensor structural owner is unavailable"))?,
+            )
+            .await?;
             ExecutionSecretValueRepository::upsert_many_with_conn(
                 connection,
                 ENTITY_SENSOR_RULE_DELIVERY_CONFIG,
@@ -583,22 +624,68 @@ impl SensorSchemaRepository {
                 "Sensor admission snapshot does not match its workload",
             ));
         }
+        let metadata =
+            super::managed_sensor_metadata::ManagedSensorMetadataRepository::for_generation(
+                connection,
+                workload.workload_id,
+                workload.generation,
+            )
+            .await?;
+        let metadata_revision=super::managed_sensor_metadata::ManagedSensorMetadataRepository::revision_for_generation(
+            connection,workload.workload_id,workload.generation).await?;
+        super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_admission(
+            connection,
+            workload.workload_id,
+            workload.generation,
+        )
+        .await?;
+        let config = if let Some(metadata) = &metadata {
+            metadata.config_contract.clone()
+        } else {
+            SchemaContractRepository::materialize(
+                connection,
+                SourceIdentity::Released {
+                    component_ref: executable.sensor.r#ref.clone(),
+                    release_id: executable.release.id,
+                    release_digest: executable.release.digest.clone(),
+                },
+                SchemaContext::FlatDocument,
+                executable
+                    .sensor
+                    .param_schema
+                    .as_ref()
+                    .unwrap_or(&json!({})),
+            )
+            .await?
+        };
+        let triggers = if let Some(metadata) = &metadata {
+            metadata.trigger_contracts.clone()
+        } else {
+            Self::capture_trigger_contracts(connection, &mut executable, &config).await?
+        };
+        Self::persist_admitted_generation(
+            connection,
+            workload,
+            executable,
+            config,
+            triggers,
+            metadata,
+            metadata_revision,
+            encryption_key,
+        )
+        .await
+    }
+
+    pub(super) async fn capture_trigger_contracts(
+        connection: &mut PgConnection,
+        executable: &mut SensorExecutableSnapshot,
+        config: &crate::value_schema::Contract,
+    ) -> Result<std::collections::BTreeMap<String, SensorTriggerBinding>> {
         let source = |reference: String| SourceIdentity::Released {
             component_ref: reference,
             release_id: executable.release.id,
             release_digest: executable.release.digest.clone(),
         };
-        let config = SchemaContractRepository::materialize(
-            connection,
-            source(executable.sensor.r#ref.clone()),
-            SchemaContext::FlatDocument,
-            executable
-                .sensor
-                .param_schema
-                .as_ref()
-                .unwrap_or(&json!({})),
-        )
-        .await?;
         let mut triggers = std::collections::BTreeMap::new();
         let mut selected_triggers = Vec::new();
         let mut contract_bytes = serde_json::to_vec(&config)
@@ -721,15 +808,42 @@ impl SensorSchemaRepository {
             selected_triggers.push(selected_trigger);
         }
         executable.triggers = selected_triggers;
+        Ok(triggers)
+    }
+
+    async fn persist_admitted_generation(
+        connection: &mut PgConnection,
+        workload: &OwnedSensorWorkload,
+        mut executable: SensorExecutableSnapshot,
+        config: crate::value_schema::Contract,
+        triggers: std::collections::BTreeMap<String, SensorTriggerBinding>,
+        metadata: Option<super::managed_sensor_metadata::SensorMetadata>,
+        metadata_revision: Option<i64>,
+        encryption_key: Option<&str>,
+    ) -> Result<()> {
         let current = SensorRepository::find_by_id_for_share(connection, workload.sensor_id)
             .await?
             .ok_or_else(|| Error::validation("Sensor configuration owner is unavailable"))?;
-        let projection = super::component_configuration::ComponentConfigurationRepository::current(
-            &mut *connection,
-            "sensor",
-            current.id,
-        )
-        .await?;
+        let projection = if let Some(metadata) = &metadata {
+            let id = metadata.configuration_revision.ok_or_else(|| {
+                Error::validation("New sensor generation requires pinned configuration")
+            })?;
+            Some(
+                super::component_configuration::ComponentConfigurationRepository::find(
+                    &mut *connection,
+                    id,
+                )
+                .await?
+                .ok_or_else(|| Error::validation("Pinned sensor configuration is unavailable"))?,
+            )
+        } else {
+            super::component_configuration::ComponentConfigurationRepository::current(
+                &mut *connection,
+                "sensor",
+                current.id,
+            )
+            .await?
+        };
         let values = if let Some(revision) = &projection {
             super::component_configuration::ComponentConfigurationRepository::restore(
                 connection,
@@ -748,20 +862,27 @@ impl SensorSchemaRepository {
         executable.sensor.config = None;
         // Operational retention overrides apply when a new process generation
         // is admitted. Existing generations keep their captured settings.
-        executable.sensor.log_retention_policy = current.log_retention_policy;
-        executable.sensor.log_retention_limit = current.log_retention_limit;
-        executable.sensor.artifact_retention_policy = current.artifact_retention_policy;
-        executable.sensor.artifact_retention_limit = current.artifact_retention_limit;
+        if metadata.is_none() {
+            executable.sensor.log_retention_policy = current.log_retention_policy;
+            executable.sensor.log_retention_limit = current.log_retention_limit;
+            executable.sensor.artifact_retention_policy = current.artifact_retention_policy;
+            executable.sensor.artifact_retention_limit = current.artifact_retention_limit;
+        }
         let binding = SensorGenerationBinding {
+            metadata_revision,
             executable,
             config,
             triggers,
         };
         let input_contract = CompiledContract::new(&binding.config)
             .map_err(|_| Error::validation("Invalid sensor input contract"))?;
-        let values = input_contract.apply_defaults(&values).map_err(|error| {
-            Error::validation(format!("Invalid sensor config defaults: {error}"))
-        })?;
+        let values = if projection.is_none() {
+            input_contract
+                .apply_defaults(&values)
+                .map_err(|_| Error::validation("Invalid sensor config defaults"))?
+        } else {
+            values
+        };
         let rendered =
             Self::render_inputs(connection, &binding, &values, None, encryption_key).await?;
         let values = binding.prepare_config(&rendered.value)?;
@@ -814,7 +935,45 @@ impl SensorSchemaRepository {
         let hash =
             digest(&body).map_err(|_| Error::validation("Invalid sensor generation digest"))?;
         let id: i64 = sqlx::query_scalar("INSERT INTO sensor_generation_schema_binding (workload, generation, binding, binding_digest, config, initial_rules) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id")
-            .bind(workload.workload_id).bind(workload.generation).bind(body).bind(hash).bind(public).bind(initial_rules).fetch_one(&mut *connection).await?;
+            .bind(workload.workload_id).bind(workload.generation).bind(body).bind(hash).bind(public).bind(&initial_rules).fetch_one(&mut *connection).await?;
+        for entry in initial_rules
+            .as_object()
+            .into_iter()
+            .flat_map(|rules| rules.values())
+        {
+            let rule_id = entry
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| Error::validation("Invalid sensor rule bootstrap identity"))?;
+            let rule = RuleRepository::find_by_id_for_share(connection, rule_id)
+                .await?
+                .ok_or_else(|| Error::validation("Sensor bootstrap rule is unavailable"))?;
+            if entry.get("pack_id").and_then(Value::as_i64) != Some(rule.pack)
+                || entry.get("ref").and_then(Value::as_str) != Some(rule.r#ref.as_str())
+            {
+                return Err(Error::validation(
+                    "Sensor bootstrap structural owner mismatch",
+                ));
+            }
+            let parameters = binding
+                .triggers
+                .get(&rule.trigger_ref)
+                .and_then(|trigger| trigger.parameters.as_ref());
+            super::sensor_rule_origin::SensorRuleOriginRepository::capture(
+                connection,
+                ENTITY_SENSOR_GENERATION_RULE_CONFIG,
+                id,
+                &rule,
+                parameters,
+                binding.executable.sensor.id,
+                binding
+                    .executable
+                    .sensor
+                    .pack
+                    .ok_or_else(|| Error::validation("Sensor structural owner is unavailable"))?,
+            )
+            .await?;
+        }
         ExecutionSecretValueRepository::upsert_many_with_conn(
             connection,
             ENTITY_SENSOR_GENERATION_CONFIG,
@@ -829,6 +988,35 @@ impl SensorSchemaRepository {
             &prepared_rules,
         )
         .await?;
+        Ok(())
+    }
+
+    pub(super) async fn validate_readmission_inputs(
+        connection: &mut PgConnection,
+        metadata_revision: i64,
+        executable: &SensorExecutableSnapshot,
+        contract: &crate::value_schema::Contract,
+        values: &Value,
+        key: Option<&str>,
+    ) -> Result<()> {
+        let mut executable = executable.clone();
+        executable.triggers.clear();
+        let binding = SensorGenerationBinding {
+            metadata_revision: Some(metadata_revision),
+            executable,
+            config: contract.clone(),
+            triggers: Default::default(),
+        };
+        binding.validate()?;
+        let rendered = Self::render_inputs(connection, &binding, values, None, key).await?;
+        binding.prepare_config(&rendered.value)?;
+        let compiled = CompiledContract::new(contract)
+            .map_err(|_| Error::validation("Invalid sensor input contract"))?;
+        crate::secret_values::validate_contract_secret_destination_paths(
+            &rendered.value,
+            &compiled,
+            &rendered.secret_paths,
+        )?;
         Ok(())
     }
 
@@ -866,6 +1054,12 @@ impl SensorSchemaRepository {
                 .into_iter()
                 .filter(|rule| rule.enabled)
             {
+                let rule = RuleRepository::find_by_id_for_share(connection, rule.id)
+                    .await?
+                    .filter(|rule| rule.trigger == Some(trigger.id) && rule.enabled)
+                    .ok_or_else(|| {
+                        Error::validation("Sensor bootstrap rule changed before capture")
+                    })?;
                 if rules.len() >= 10_000 {
                     return Err(Error::validation("Sensor bootstrap exceeds its rule limit"));
                 }
@@ -893,7 +1087,7 @@ impl SensorSchemaRepository {
                     secret.json_path = format!("/{}/config{}", rule.id, secret.json_path);
                 }
                 secrets.extend(protected);
-                let entry = json!({"id": rule.id, "ref": rule.r#ref, "pack_ref": rule.pack_ref, "trigger_ref": trigger.r#ref, "config": public});
+                let entry = json!({"id": rule.id, "ref": rule.r#ref, "pack_id":rule.pack, "pack_ref": rule.pack_ref, "trigger_ref": trigger.r#ref, "config": public});
                 total_bytes = total_bytes
                     .checked_add(
                         config_bytes
@@ -921,6 +1115,7 @@ impl SensorSchemaRepository {
         binding: &SensorGenerationBinding,
         encryption_key: Option<&str>,
     ) -> Result<Vec<Value>> {
+        Self::validate_runtime_binding(connection, id, binding).await?;
         let public: Value = sqlx::query_scalar(
             "SELECT initial_rules FROM sensor_generation_schema_binding WHERE id = $1",
         )
@@ -1014,6 +1209,7 @@ impl SensorSchemaRepository {
         public: Value,
         encryption_key: Option<&str>,
     ) -> Result<Value> {
+        Self::validate_runtime_binding(connection, id, binding).await?;
         let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
             &mut *connection,
             ENTITY_SENSOR_GENERATION_CONFIG,
@@ -1036,5 +1232,26 @@ impl SensorSchemaRepository {
             .validate(&value)
             .map_err(|error| Error::validation(format!("Invalid bound sensor config: {error}")))?;
         Ok(value)
+    }
+
+    async fn validate_runtime_binding(
+        connection: &mut PgConnection,
+        id: i64,
+        binding: &SensorGenerationBinding,
+    ) -> Result<()> {
+        super::schema_type::SchemaTypeRepository::lock_selection(connection).await?;
+        let source:Option<(i64,i64,String)>=sqlx::query_as("SELECT b.workload,b.generation,b.binding_digest FROM sensor_generation_schema_binding b JOIN sensor_workload_assignment a ON a.workload=b.workload AND a.generation=b.generation WHERE b.id=$1 AND a.worker IS NOT NULL AND a.lease_expires_at>clock_timestamp() FOR SHARE OF b,a")
+            .bind(id).fetch_optional(&mut *connection).await?;
+        let (workload, generation, hash) = source
+            .ok_or_else(|| Error::PermissionDenied("Sensor input generation is not live".into()))?;
+        if hash != binding.binding_digest()? {
+            return Err(Error::validation(
+                "Sensor input generation binding mismatch",
+            ));
+        }
+        super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(
+            connection, workload, generation,
+        )
+        .await
     }
 }

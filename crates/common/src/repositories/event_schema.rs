@@ -23,9 +23,7 @@ impl EventSchemaRepository {
         encryption_key: Option<&str>,
     ) -> Result<Option<crate::models::event::Event>> {
         use super::{Create, FindByRef};
-        use crate::secret_values::{
-            prepare_secret_values, ENTITY_EVENT_CONFIG, ENTITY_EVENT_PAYLOAD,
-        };
+        use crate::secret_values::prepare_secret_values;
         let mut tx = pool.begin().await?;
         SchemaTypeRepository::lock_selection(&mut *tx).await?;
         let Some(trigger) = TriggerRepository::find_by_ref(&mut *tx, &input.trigger_ref).await?
@@ -57,16 +55,14 @@ impl EventSchemaRepository {
         input.payload = sections.payload;
         input.config = sections.config;
         let event = super::event::EventRepository::create(&mut *tx, input).await?;
-        Self::attach(&mut tx, event.id, &binding).await?;
-        for (entity, secrets) in [
-            (ENTITY_EVENT_PAYLOAD, payload_secrets),
-            (ENTITY_EVENT_CONFIG, config_secrets),
-        ] {
-            super::execution_secret_value::ExecutionSecretValueRepository::upsert_many_with_conn(
-                &mut tx, entity, event.id, &secrets,
-            )
-            .await?;
-        }
+        super::event_origin::EventOriginRepository::capture(
+            &mut tx,
+            &event,
+            &binding,
+            &payload_secrets,
+            &config_secrets,
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(event))
     }
@@ -245,6 +241,12 @@ impl EventSchemaRepository {
              SELECT COUNT(*) FROM removed"
          ).bind(limit).bind(cutoff).fetch_one(&mut *connection).await?;
         super::execution_event_emitter::ExecutionEventEmitterRepository::cleanup_orphans(
+            connection,
+            limit.min(10000),
+            cutoff,
+        )
+        .await?;
+        super::event_origin::EventOriginRepository::cleanup_orphans(
             connection,
             limit.min(10000),
             cutoff,

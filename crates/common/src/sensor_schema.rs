@@ -20,6 +20,8 @@ pub struct SensorTriggerBinding {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SensorGenerationBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_revision: Option<i64>,
     pub executable: SensorExecutableSnapshot,
     pub config: Contract,
     pub triggers: BTreeMap<String, SensorTriggerBinding>,
@@ -103,7 +105,10 @@ impl SensorGenerationBinding {
             release_id: self.executable.release.id,
             release_digest: self.executable.release.digest.clone(),
         };
-        if self.config.source != expected || self.config.context != SchemaContext::FlatDocument {
+        let config_source = self.config.source == expected
+            || matches!(&self.config.source,
+            SourceIdentity::Assigned {component_ref,..} if self.metadata_revision.is_some_and(|id|id>0) && component_ref==&self.executable.sensor.r#ref);
+        if !config_source || self.config.context != SchemaContext::FlatDocument {
             return Err(Error::validation(
                 "Sensor config contract does not match its executable",
             ));
@@ -215,12 +220,11 @@ impl SensorGenerationBinding {
         self.validate()?;
         let contract = CompiledContract::new(&self.config)
             .map_err(|_| Error::validation("Invalid sensor config contract"))?;
-        let value = contract.apply_defaults(value).map_err(|error| {
-            Error::validation(format!("Invalid sensor config defaults: {error}"))
-        })?;
+        // Defaults were selected before operator whole-field replacement. Delivery
+        // must not recursively fill an overridden object from the schema again.
         contract
-            .validate(&value)
-            .map_err(|error| Error::validation(format!("Invalid sensor config: {error}")))?;
-        Ok(value)
+            .validate(value)
+            .map_err(|_| Error::validation("Invalid sensor config fields"))?;
+        Ok(value.clone())
     }
 }

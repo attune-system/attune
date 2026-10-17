@@ -1,5 +1,7 @@
 //! Distinct non-execution origins use the real disclosure route and repositories.
 use super::*;
+#[path = "source_origins/foreign_sensor.rs"]
+mod foreign_sensor;
 #[path = "../artifact_workload/profile.rs"]
 mod workload;
 use attune_common::{
@@ -10,6 +12,7 @@ use attune_common::{
             ComponentConfigurationRepository, ENTITY_COMPONENT_CONFIGURATION,
         },
         event::{CreateEventInput, EventRepository},
+        event_origin::{EventOriginRepository, EVENT_SOURCE_PAYLOAD},
         event_schema::EventSchemaRepository,
         inquiry::{CreateInquiryInput, InquiryRepository},
         native_maintenance::{
@@ -20,7 +23,7 @@ use attune_common::{
         trigger::{CreateTriggerInput, TriggerRepository},
         FindByRef,
     },
-    secret_values::{ENTITY_EVENT_PAYLOAD, ENTITY_INQUIRY_OPTIONS, ENTITY_INQUIRY_RESPONSE},
+    secret_values::{ENTITY_INQUIRY_OPTIONS, ENTITY_INQUIRY_RESPONSE},
 };
 
 fn entity_origin(kind: &str, id: i64) -> SecretOrigin {
@@ -65,7 +68,7 @@ async fn distinct_event_and_inquiry_chains_grow_by_frontier_not_source_count() -
     let path = format!("/api/v1/artifacts/{log}");
     let mut report = Vec::new();
     for kind in [
-        ENTITY_EVENT_PAYLOAD,
+        EVENT_SOURCE_PAYLOAD,
         ENTITY_INQUIRY_OPTIONS,
         ENTITY_INQUIRY_RESPONSE,
     ] {
@@ -75,7 +78,7 @@ async fn distinct_event_and_inquiry_chains_grow_by_frontier_not_source_count() -
             while roots.len() < width {
                 let mut origin = local_origin();
                 for _ in 0..4 {
-                    let id = if kind == ENTITY_EVENT_PAYLOAD {
+                    let id = if kind == EVENT_SOURCE_PAYLOAD {
                         // Events and their encrypted provenance stay immutable.
                         // Insert each link once, rather than changing a leaf.
                         event_with_origins(&ctx, &trigger, None, vec![origin]).await?
@@ -182,11 +185,11 @@ async fn event_with_origins(
     let mut tx = ctx.pool.begin().await?;
     let (_, binding) =
         EventSchemaRepository::materialize_current(&mut tx, trigger.id, false).await?;
-    let id = if let Some(at) = at {
+    let event = if let Some(at) = at {
         // Only fixture seeding sets historical timestamps. Production reads go
         // through repositories, and no database outside this clone is touched.
-        sqlx::query_scalar(
-            "INSERT INTO event (trigger, trigger_ref, created) VALUES ($1, $2, $3) RETURNING id",
+        sqlx::query_as::<_, attune_common::models::Event>(
+            "INSERT INTO event (trigger, trigger_ref, created) VALUES ($1, $2, $3) RETURNING id,trigger,trigger_ref,config,payload,trace_tag,source,source_ref,rule,rule_ref,created",
         )
         .bind(trigger.id)
         .bind(&trigger.r#ref)
@@ -209,11 +212,26 @@ async fn event_with_origins(
             },
         )
         .await?
-        .id
     };
-    EventSchemaRepository::attach(&mut tx, id, &binding).await?;
+    let prepared = prepare_secret_values(
+        vec![SecretValueInput {
+            json_path: "/private".into(),
+            value: json!("owned source fixture"),
+            source_kind: "provenance".into(),
+            source_ref: Some(serde_json::to_string(&SecretProvenance {
+                origins,
+                templates: vec![],
+            })?),
+        }],
+        ctx.state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .ok_or("fixture key missing")?,
+    )?;
+    let id = EventOriginRepository::capture(&mut tx, &event, &binding, &prepared, &[]).await?;
     tx.commit().await?;
-    source_secret_with_origins(ctx, ENTITY_EVENT_PAYLOAD, id, origins).await?;
     Ok(id)
 }
 
@@ -291,7 +309,7 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
     let path = format!("/api/v1/artifacts/{log}");
     let mut report = Vec::new();
     for kind in [
-        ENTITY_EVENT_PAYLOAD,
+        EVENT_SOURCE_PAYLOAD,
         ENTITY_INQUIRY_OPTIONS,
         ENTITY_INQUIRY_RESPONSE,
         ENTITY_COMPONENT_CONFIGURATION,
@@ -301,12 +319,12 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
         for count in [1, 64, 65] {
             while origins.len() < count {
                 let id = match kind {
-                    ENTITY_EVENT_PAYLOAD => event(&ctx, &trigger, None).await?,
+                    EVENT_SOURCE_PAYLOAD => event(&ctx, &trigger, None).await?,
                     ENTITY_INQUIRY_OPTIONS | ENTITY_INQUIRY_RESPONSE => inquiry(&ctx, destination).await?,
                     _ => sqlx::query_scalar("INSERT INTO component_configuration_revision (owner_kind, owner_id, owner_ref, pack_ref, contract, binding_digest, config) VALUES ('pack',$1,$2,$2,$3,$4,'{}') RETURNING id")
                         .bind(pack.id).bind(&pack.r#ref).bind(&revision.contract).bind(&revision.binding_digest).fetch_one(&ctx.pool).await?,
                 };
-                if kind != ENTITY_EVENT_PAYLOAD {
+                if kind != EVENT_SOURCE_PAYLOAD {
                     source_secret(&ctx, kind, id).await?;
                 }
                 origins.push(entity_origin(kind, id));
@@ -336,9 +354,11 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
             _ => return Err("expected fixture entity origin".into()),
         };
         match kind {
-            ENTITY_EVENT_PAYLOAD => {
-                sqlx::query("DELETE FROM event WHERE id = $1")
-                    .bind(expired)
+            EVENT_SOURCE_PAYLOAD => {
+                let source = EventOriginRepository::evidence(&ctx.pool, expired).await?;
+                sqlx::query("DELETE FROM event WHERE id = $1 AND created = $2")
+                    .bind(source.event)
+                    .bind(source.created)
                     .execute(&ctx.pool)
                     .await?;
             }
@@ -368,7 +388,8 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
 }
 
 #[tokio::test]
-async fn event_sources_survive_default_repair_but_deny_ambiguous_or_expired_ids() -> Result<()> {
+async fn exact_event_sources_survive_default_repair_and_partition_twins_but_not_expiry(
+) -> Result<()> {
     let ctx = TestContext::new().await?.with_auth().await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
@@ -393,7 +414,7 @@ async fn event_sources_survive_default_repair_but_deny_ambiguous_or_expired_ids(
     secret_origins(
         &ctx,
         destination,
-        vec![entity_origin(ENTITY_EVENT_PAYLOAD, id)],
+        vec![entity_origin(EVENT_SOURCE_PAYLOAD, id)],
     )
     .await?;
     let path = format!("/api/v1/artifacts/{log}");
@@ -404,26 +425,27 @@ async fn event_sources_survive_default_repair_but_deny_ambiguous_or_expired_ids(
         PartitionRepairOutcome::Applied { rows_moved: 1 }
     );
     assert_eq!(ctx.get(&path, ctx.token()).await?.status(), StatusCode::OK);
+    let source = EventOriginRepository::evidence(&ctx.pool, id).await?;
     sqlx::query("INSERT INTO event (id, trigger, trigger_ref, created) VALUES ($1,$2,$3,$4)")
-        .bind(id)
+        .bind(source.event)
         .bind(trigger.id)
         .bind(&trigger.r#ref)
         .bind(day + chrono::Duration::days(1))
         .execute(&ctx.pool)
         .await?;
     assert_eq!(
-        EventRepository::find_disclosure_rows(&ctx.pool, &[id])
+        EventRepository::find_disclosure_rows(&ctx.pool, &[source.event])
             .await?
             .len(),
         2
     );
     assert_eq!(
         ctx.get(&path, ctx.token()).await?.status(),
-        StatusCode::NOT_FOUND,
-        "ID-only provenance cannot select an arbitrary physical event"
+        StatusCode::OK,
+        "the immutable snapshot selects the original complete partition identity"
     );
     sqlx::query("DELETE FROM event WHERE id = $1 AND created = $2")
-        .bind(id)
+        .bind(source.event)
         .bind(day + chrono::Duration::days(1))
         .execute(&ctx.pool)
         .await?;
@@ -449,101 +471,81 @@ async fn event_sources_survive_default_repair_but_deny_ambiguous_or_expired_ids(
 async fn sensor_binding(
     ctx: &TestContext,
 ) -> Result<attune_common::sensor_schema::SensorGenerationBinding> {
-    use attune_common::{
-        models::{PackReleasePin, SensorExecutableSnapshot},
-        repositories::{
-            runtime::{CreateRuntimeInput, RuntimeRepository},
-            trigger::{CreateSensorInput, SensorRepository},
-        },
-        value_schema::{SchemaContext, SourceIdentity},
+    use attune_common::repositories::{
+        managed_sensor_metadata::ManagedSensorMetadataRepository, trigger::SensorRepository,
     };
-    let pack = PackRepository::find_by_ref(&ctx.pool, "artifact_perf")
+    let sensor = SensorRepository::find_by_ref(&ctx.pool, "artifact_perf.sensor")
         .await?
-        .ok_or("pack missing")?;
-    let runtime = RuntimeRepository::create(
-        &ctx.pool,
-        CreateRuntimeInput {
-            r#ref: "artifact_perf.native".into(),
-            pack: Some(pack.id),
-            pack_ref: Some(pack.r#ref.clone()),
-            name: "native".into(),
-            description: None,
-            aliases: vec![],
-            distributions: json!({}),
-            installation: None,
-            execution_config: json!({}),
-            auto_detected: false,
-            detection_config: json!({}),
-        },
-    )
-    .await?;
-    let sensor = SensorRepository::create(
-        &ctx.pool,
-        CreateSensorInput {
-            r#ref: "artifact_perf.sensor".into(),
-            pack: Some(pack.id),
-            pack_ref: Some(pack.r#ref.clone()),
-            label: "Source sensor".into(),
-            description: None,
-            entrypoint: "sensor".into(),
-            runtime: runtime.id,
-            runtime_ref: runtime.r#ref.clone(),
-            runtime_version_constraint: None,
-            enabled: true,
-            param_schema: None,
-            config: None,
-            worker_selector: json!({}),
-            worker_tolerations: json!([]),
-            worker_affinity: json!({}),
-            log_retention_policy: None,
-            log_retention_limit: None,
-            artifact_retention_policy: None,
-            artifact_retention_limit: None,
-        },
-    )
-    .await?;
-    let release =
-        attune_common::repositories::pack_release::PackReleaseRepository::find_active_by_pack_ref(
-            &ctx.pool,
-            &pack.r#ref,
-        )
+        .ok_or("admitted sensor missing")?;
+    let revision = ManagedSensorMetadataRepository::current_revision(&ctx.pool, sensor.id)
         .await?
-        .ok_or("release missing")?;
-    // Match the same immutable release identity as the production admission path.
-    let config = attune_common::value_schema::compile(
-        SourceIdentity::Released {
-            component_ref: sensor.r#ref.clone(),
-            release_id: release.id,
-            release_digest: release.digest.clone(),
-        },
-        SchemaContext::FlatDocument,
-        &json!({}),
-        &Default::default(),
-        Default::default(),
-    )?;
+        .ok_or("admitted sensor metadata missing")?;
+    let mut connection = ctx.pool.acquire().await?;
+    let metadata = ManagedSensorMetadataRepository::find(&mut connection, revision).await?;
     let binding = attune_common::sensor_schema::SensorGenerationBinding {
-        executable: SensorExecutableSnapshot {
-            release: PackReleasePin {
-                id: release.id,
-                digest: release.digest,
-                content_path: release.content_path,
-            },
-            sensor,
-            runtime,
-            runtime_versions: vec![],
-            triggers: vec![],
-            cache_permission_set_refs: vec![],
-            cache_grants: vec![],
-            signing_permission_set_refs: vec![],
-            signing_grants: vec![],
-            input_permission_set_refs: vec![],
-            input_grants: vec![],
-        },
-        config,
-        triggers: Default::default(),
+        metadata_revision: Some(revision),
+        executable: metadata.executable,
+        config: metadata.config_contract,
+        triggers: metadata.trigger_contracts,
     };
     binding.validate()?;
     Ok(binding)
+}
+
+#[tokio::test]
+async fn retained_foreign_sensor_rule_proof_validates_only_original_generation_and_contract(
+) -> Result<()> {
+    use attune_common::repositories::sensor_rule_origin::SensorRuleOriginProof;
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let _ = action(&ctx).await?;
+    let binding = sensor_binding(&ctx).await?;
+    let trigger = binding
+        .executable
+        .triggers
+        .first()
+        .ok_or("admitted trigger missing")?;
+    let pack = binding
+        .executable
+        .sensor
+        .pack
+        .ok_or("sensor pack missing")?;
+    let proof = SensorRuleOriginProof {
+        source_entity: "sensor_rule_delivery_config".into(),
+        source_id: 100,
+        rule_id: 200,
+        generation_binding: 300,
+        rule_ref: "foreign.rule".into(),
+        managing_pack_id: pack + 1,
+        pack_ref: "foreign".into(),
+        trigger_id: trigger.id,
+        trigger_ref: trigger.r#ref.clone(),
+        trigger_managing_pack_id: trigger.pack,
+        sensor_id: binding.executable.sensor.id,
+        sensor_managing_pack_id: pack,
+        dispatch_policy_revision: Some(400),
+        dispatch_source_release: Some(500),
+        dispatch_metadata_digest: Some("a".repeat(64)),
+        parameter_contract_digest: None,
+    };
+    proof.validate_binding(300, &binding)?;
+    assert!(proof.validate_binding(301, &binding).is_err());
+    let mut changed = proof.clone();
+    changed.trigger_id += 1;
+    assert!(changed.validate_binding(300, &binding).is_err());
+    changed = proof.clone();
+    changed.sensor_id += 1;
+    assert!(changed.validate_binding(300, &binding).is_err());
+    changed = proof.clone();
+    changed.parameter_contract_digest = Some("b".repeat(64));
+    assert!(changed.validate_binding(300, &binding).is_err());
+    changed = proof.clone();
+    changed.dispatch_policy_revision = None;
+    assert!(changed.validate_binding(300, &binding).is_err());
+    let mut replacement = binding.clone();
+    replacement.executable.triggers[0].id += 1;
+    assert!(proof.validate_binding(300, &replacement).is_err());
+    ctx.cleanup().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -563,8 +565,12 @@ async fn sensor_generation_rule_and_delivery_sources_are_batched_and_keep_record
     let action = ActionRepository::find_by_ref(&ctx.pool, &action_ref)
         .await?
         .ok_or("action missing")?;
-    let trigger = trigger(&ctx).await?;
     let binding = sensor_binding(&ctx).await?;
+    let trigger = binding
+        .executable
+        .triggers
+        .first()
+        .ok_or("admitted trigger missing")?;
     let log = artifact(
         &ctx,
         "artifact_perf.run.stdout.log",
@@ -609,15 +615,22 @@ async fn sensor_generation_rule_and_delivery_sources_are_batched_and_keep_record
                         trace_tag_template: None,
                         permission_set_refs: None,
                         enabled: true,
-                        is_adhoc: true,
+                        is_adhoc: false,
                         owner_identity: None,
                     },
                 )
                 .await?;
                 last_rule = rule.id;
                 let initial_rules = json!({rule.id.to_string(): {"ref":rule.r#ref, "pack_ref":rule.pack_ref, "config":{"unrelated":"x".repeat(64 * 1024)}}});
-                let generation: i64 = sqlx::query_scalar("INSERT INTO sensor_generation_schema_binding (workload,generation,binding,binding_digest,config,initial_rules) VALUES (1,$1,$2,$3,'{}',$4) RETURNING id")
-                    .bind(sequence).bind(serde_json::to_value(&binding)?).bind(binding.binding_digest()?).bind(initial_rules).fetch_one(&ctx.pool).await?;
+                let mut tx = ctx.pool.begin().await?;
+                let generation = managed_fixture::retained_generation(
+                    &mut tx,
+                    sequence,
+                    &binding,
+                    initial_rules,
+                )
+                .await?;
+                tx.commit().await?;
                 if origins.is_empty() {
                     let rows = attune_common::repositories::sensor_schema::SensorSchemaRepository::find_disclosure_rows(&ctx.pool, &[generation]).await?;
                     assert!(
@@ -734,7 +747,7 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
     secret_origins(
         &ctx,
         destination,
-        vec![entity_origin(ENTITY_EVENT_PAYLOAD, event_id)],
+        vec![entity_origin(EVENT_SOURCE_PAYLOAD, event_id)],
     )
     .await?;
     // Event authority needs its own resource grant plus original rule/trigger
@@ -744,12 +757,12 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
         StatusCode::NOT_FOUND
     );
     grant(&ctx, "fixture.source_scope", json!([
-        {"resource":"events","actions":["read","decrypt"],"constraints":{"refs":["scoped.resource"]}},
+        {"resource":"events","actions":["read","decrypt"],"constraints":{"refs":[trigger.r#ref]}},
         {"resource":"triggers","actions":["read"],"constraints":{"refs":[trigger.r#ref]}}
     ])).await?;
     assert_eq!(ctx.get(&path, ctx.token()).await?.status(), StatusCode::OK);
     replace_grants(&ctx, "fixture.source_scope", json!([
-        {"resource":"events","actions":["read","decrypt"],"constraints":{"refs":["scoped.resource"]}}
+        {"resource":"events","actions":["read","decrypt"],"constraints":{"refs":[trigger.r#ref]}}
     ])).await?;
     assert_eq!(
         ctx.get(&path, ctx.token()).await?.status(),
@@ -818,8 +831,8 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
         StatusCode::BAD_REQUEST
     );
 
-    // Repository corruption is an error, not a successful empty list. There is
-    // no trigger bypass here; this clone receives one deliberately bad binding.
+    // Repository corruption is an error, not a successful empty list. Delete
+    // and recreate only this fixture's immutable source with corrupt evidence.
     replace_grants(
         &ctx,
         "fixture.source_scope",
@@ -829,10 +842,13 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
     secret_origins(
         &ctx,
         destination,
-        vec![entity_origin(ENTITY_EVENT_PAYLOAD, event_id)],
+        vec![entity_origin(EVENT_SOURCE_PAYLOAD, event_id)],
     )
     .await?;
-    sqlx::query("DELETE FROM event_schema_binding WHERE event = $1")
+    let retained: (i64, chrono::DateTime<chrono::Utc>, Value, String) = sqlx::query_as(
+        "SELECT event,event_created,snapshot,snapshot_digest FROM event_origin_snapshot WHERE id = $1"
+    ).bind(event_id).fetch_one(&ctx.pool).await?;
+    sqlx::query("DELETE FROM event_origin_snapshot WHERE id = $1")
         .bind(event_id)
         .execute(&ctx.pool)
         .await?;
@@ -841,9 +857,13 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
         StatusCode::NOT_FOUND
     );
     sqlx::query(
-        "INSERT INTO event_schema_binding (event,contract,binding_digest) VALUES ($1,'{}',$2)",
+        "INSERT INTO event_origin_snapshot (id,event,event_created,snapshot,snapshot_digest,evidence,evidence_digest) VALUES ($1,$2,$3,$4,$5,'{}',$6)",
     )
     .bind(event_id)
+    .bind(retained.0)
+    .bind(retained.1)
+    .bind(retained.2)
+    .bind(retained.3)
     .bind("0".repeat(64))
     .execute(&ctx.pool)
     .await?;
@@ -851,7 +871,7 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
         ctx.get(&path, ctx.token()).await?.status(),
         StatusCode::BAD_REQUEST
     );
-    sqlx::query("ALTER TABLE event_schema_binding RENAME TO fixture_unavailable_event_binding")
+    sqlx::query("ALTER TABLE event_origin_snapshot RENAME TO fixture_unavailable_event_binding")
         .execute(&ctx.pool)
         .await?;
     assert_eq!(

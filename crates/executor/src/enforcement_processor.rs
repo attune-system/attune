@@ -16,7 +16,7 @@ use attune_common::{
         Consumer, EnforcementCreatedPayload, ExecutionRequestedPayload, MessageEnvelope, Publisher,
     },
     repositories::{
-        event::{EnforcementRepository, EventRepository, UpdateEnforcementInput},
+        event::{EnforcementRepository, UpdateEnforcementInput},
         execution::{CreateExecutionInput, ExecutionRepository},
         execution_secret_value::ExecutionSecretValueRepository,
         rule::RuleRepository,
@@ -41,6 +41,7 @@ pub struct EnforcementProcessor {
     consumer: Arc<Consumer>,
     policy_enforcer: Arc<PolicyEnforcer>,
     queue_manager: Arc<ExecutionQueueManager>,
+    encryption_key: Option<String>,
 }
 
 fn log_enforcement_message_metadata(envelope: &MessageEnvelope<EnforcementCreatedPayload>) {
@@ -63,6 +64,7 @@ impl EnforcementProcessor {
         consumer: Arc<Consumer>,
         policy_enforcer: Arc<PolicyEnforcer>,
         queue_manager: Arc<ExecutionQueueManager>,
+        encryption_key: Option<String>,
     ) -> Self {
         Self {
             pool,
@@ -70,6 +72,7 @@ impl EnforcementProcessor {
             consumer,
             policy_enforcer,
             queue_manager,
+            encryption_key,
         }
     }
 
@@ -81,6 +84,7 @@ impl EnforcementProcessor {
         let publisher = self.publisher.clone();
         let policy_enforcer = self.policy_enforcer.clone();
         let queue_manager = self.queue_manager.clone();
+        let encryption_key = self.encryption_key.clone();
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -90,6 +94,7 @@ impl EnforcementProcessor {
                     let publisher = publisher.clone();
                     let policy_enforcer = policy_enforcer.clone();
                     let queue_manager = queue_manager.clone();
+                    let encryption_key = encryption_key.clone();
 
                     async move {
                         if let Err(e) = Self::process_enforcement_created(
@@ -98,6 +103,7 @@ impl EnforcementProcessor {
                             &policy_enforcer,
                             &queue_manager,
                             &envelope,
+                            encryption_key.as_deref(),
                         )
                         .await
                         {
@@ -119,10 +125,7 @@ impl EnforcementProcessor {
         rule: &Rule,
         enforcement: &Enforcement,
     ) -> Result<Option<String>> {
-        let event = match enforcement.event {
-            Some(event_id) => EventRepository::find_by_id(pool, event_id).await?,
-            None => None,
-        };
+        let event = EnforcementRepository::source_event(pool, enforcement).await?;
 
         Self::resolve_trace_tag_for_enforcement_with_event(rule, enforcement, event.as_ref())
     }
@@ -180,6 +183,7 @@ impl EnforcementProcessor {
         policy_enforcer: &PolicyEnforcer,
         queue_manager: &ExecutionQueueManager,
         envelope: &MessageEnvelope<EnforcementCreatedPayload>,
+        encryption_key: Option<&str>,
     ) -> Result<()> {
         log_enforcement_message_metadata(envelope);
 
@@ -210,11 +214,7 @@ impl EnforcementProcessor {
         .ok_or_else(|| anyhow::anyhow!("Rule not found for enforcement: {}", enforcement_id))?;
 
         // Fetch associated event if present
-        let event = if let Some(event_id) = enforcement.event {
-            EventRepository::find_by_id(pool, event_id).await?
-        } else {
-            None
-        };
+        let event = EnforcementRepository::source_event(pool, &enforcement).await?;
 
         // Evaluate whether to create execution
         if Self::should_create_execution(&enforcement, &rule, event.as_ref())? {
@@ -225,6 +225,7 @@ impl EnforcementProcessor {
                 queue_manager,
                 &enforcement,
                 &rule,
+                encryption_key,
             )
             .await?;
 
@@ -329,10 +330,18 @@ impl EnforcementProcessor {
         _queue_manager: &ExecutionQueueManager,
         enforcement: &Enforcement,
         rule: &Rule,
+        encryption_key: Option<&str>,
     ) -> Result<bool> {
         let mut tx = pool.begin().await?;
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await?;
+        if ExecutionRepository::find_top_level_by_enforcement(&mut *tx, enforcement.id)
+            .await?
+            .is_some()
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
         let rule = RuleRepository::find_by_id_for_share(&mut tx, rule.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Enforcement rule is no longer active"))?;
@@ -357,11 +366,6 @@ impl EnforcementProcessor {
                 })?
             }
         };
-        let authority = attune_common::delegation::DelegationAuthority::load_for_share(
-            &mut tx,
-            executor_identity,
-        )
-        .await?;
         let snapshot: attune_common::models::ExecutionExecutableSnapshot =
             match enforcement.executable_snapshot.clone() {
                 Some(snapshot) => serde_json::from_value(snapshot)?,
@@ -380,7 +384,7 @@ impl EnforcementProcessor {
             .as_ref()
             .map(|action| action.default_execution_permission_set_refs.clone())
             .unwrap_or_default();
-        let permission_set_refs = input_snapshot
+        let mut permission_set_refs = input_snapshot
             .as_ref()
             .map(|snapshot| snapshot.execution_permission_set_refs.clone())
             .unwrap_or_else(|| {
@@ -388,9 +392,31 @@ impl EnforcementProcessor {
                     .clone()
                     .unwrap_or(action_default_permission_set_refs)
             });
-        authority
-            .require_refs_for_share(&mut tx, &permission_set_refs)
+        let retained =
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+                &mut tx,
+                attune_common::repositories::runtime_authority::RuntimeOwner::Enforcement(
+                    enforcement.id,
+                ),
+            )
+            .await?
+            .is_some();
+        let admission = if !rule.is_adhoc || retained {
+            Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::inherit(
+                &mut tx, attune_common::repositories::runtime_authority::RuntimeOwner::Enforcement(enforcement.id), &snapshot,
+            ).await?)
+        } else {
+            attune_common::delegation::require_execution_refs_for_share(
+                &mut tx,
+                Some(executor_identity),
+                &permission_set_refs,
+            )
             .await?;
+            None
+        };
+        if let Some(admission) = &admission {
+            permission_set_refs = admission.authority().selected_refs.clone();
+        }
         let artifact_retention_policy = action
             .as_ref()
             .and_then(|action| action.artifact_retention_policy);
@@ -438,7 +464,21 @@ impl EnforcementProcessor {
         )
         .await?;
         let execution = execution_result.execution;
+        let mut input_receipts = Vec::new();
         if execution_result.created {
+            if let Some(input_authority) = &input_snapshot {
+                attune_common::repositories::rule_authority::RuleAuthorityRepository::attach_runtime(&mut tx, "execution", execution.id, input_authority).await?;
+            }
+            if let Some(admission) = &admission {
+                admission
+                    .attach(
+                        &mut tx,
+                        attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                            execution.id,
+                        ),
+                    )
+                    .await?;
+            }
             let inherited = attune_common::repositories::schema_contract::SchemaContractRepository::inherit_enforcement(
                 &mut tx, enforcement.id, execution.id,
             ).await?;
@@ -453,8 +493,26 @@ impl EnforcementProcessor {
                 execution.id,
             )
             .await?;
+            if admission.is_some() {
+                input_receipts = attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::seal_execution_inputs(
+                    &mut tx, execution.id,
+                    encryption_key.ok_or_else(|| anyhow::anyhow!("Accepted input receipt encryption is unavailable"))?,
+                ).await?;
+            }
+        }
+        if let Some(admission) = &admission {
+            admission.ensure_fresh_on(&mut tx).await?;
+        }
+        for receipt in &input_receipts {
+            receipt.ensure_fresh_on(&mut tx).await?;
         }
         tx.commit().await?;
+        for receipt in &input_receipts {
+            receipt.ensure_fresh()?;
+        }
+        if let Some(admission) = &admission {
+            admission.effect_fence().ensure_fresh()?;
+        }
 
         if execution_result.created {
             info!(
@@ -503,6 +561,12 @@ impl EnforcementProcessor {
         // NOTE: Queue slot will be released when worker publishes execution.completed
         // and CompletionListener calls queue_manager.notify_completion(action_id)
 
+        for receipt in &input_receipts {
+            receipt.ensure_fresh()?;
+        }
+        if let Some(admission) = &admission {
+            admission.effect_fence().ensure_fresh()?;
+        }
         Ok(execution_result.created)
     }
 }

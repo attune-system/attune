@@ -12,10 +12,13 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rrule::RRuleSet;
 use std::collections::HashMap;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -29,17 +32,52 @@ pub struct TimerManager {
 struct TimerManagerInner {
     /// Serializes scheduler mutations so lifecycle messages and reconciliation
     /// cannot register duplicate jobs for the same rule concurrently.
-    timer_mutation: Mutex<()>,
-    /// Map of rule_id -> job UUID in the scheduler
-    active_jobs: RwLock<HashMap<i64, Uuid>>,
+    timer_mutation: Mutex<TimerLifecycle>,
+    /// Per-rule scheduler jobs or owned interval tasks.
+    active_jobs: RwLock<HashMap<i64, ActiveTimer>>,
     /// Last applied timer config per rule.
     active_configs: RwLock<HashMap<i64, TimerConfig>>,
-    /// Shared cron scheduler for all timer types (wrapped in Mutex for shutdown)
+    /// Shared scheduler for calendar timers (wrapped in Mutex for shutdown).
     scheduler: Mutex<JobScheduler>,
     /// API client for creating events
     api_client: ApiClient,
     /// Sensor reference for event payloads
     sensor_ref: String,
+}
+
+#[derive(Default)]
+struct TimerLifecycle {
+    shutting_down: bool,
+}
+
+enum ActiveTimer {
+    Scheduled(Uuid),
+    Interval { id: Uuid, task: JoinHandle<()> },
+}
+
+impl ActiveTimer {
+    fn id(&self) -> Uuid {
+        match self {
+            Self::Scheduled(id) | Self::Interval { id, .. } => *id,
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        match self {
+            Self::Scheduled(_) => true,
+            Self::Interval { task, .. } => !task.is_finished(),
+        }
+    }
+}
+
+impl Drop for ActiveTimer {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle alone detaches it. Also abort if registration or
+        // teardown is cancelled before the handle can be explicitly joined.
+        if let Self::Interval { task, .. } = self {
+            task.abort();
+        }
+    }
 }
 
 impl TimerManager {
@@ -52,7 +90,7 @@ impl TimerManager {
 
         Ok(Self {
             inner: Arc::new(TimerManagerInner {
-                timer_mutation: Mutex::new(()),
+                timer_mutation: Mutex::new(TimerLifecycle::default()),
                 active_jobs: RwLock::new(HashMap::new()),
                 active_configs: RwLock::new(HashMap::new()),
                 scheduler: Mutex::new(scheduler),
@@ -64,7 +102,10 @@ impl TimerManager {
 
     /// Start a timer for a rule
     pub async fn start_timer(&self, rule_id: i64, config: TimerConfig) -> Result<()> {
-        let _mutation = self.inner.timer_mutation.lock().await;
+        let mutation = self.inner.timer_mutation.lock().await;
+        if mutation.shutting_down {
+            anyhow::bail!("Timer manager is shutting down");
+        }
 
         let existing_config = self
             .inner
@@ -74,7 +115,13 @@ impl TimerManager {
             .get(&rule_id)
             .cloned();
         if existing_config.as_ref() == Some(&config)
-            && self.inner.active_jobs.read().await.contains_key(&rule_id)
+            && self
+                .inner
+                .active_jobs
+                .read()
+                .await
+                .get(&rule_id)
+                .is_some_and(ActiveTimer::is_running)
         {
             debug!(
                 "Timer for rule {} already matches desired config; keeping existing schedule",
@@ -90,16 +137,17 @@ impl TimerManager {
 
         info!("Starting timer for rule {}: {:?}", rule_id, config);
 
-        // Create appropriate job type
-        let job = match &config {
+        let timer = match &config {
             TimerConfig::Interval { interval, unit } => {
-                self.create_interval_job(rule_id, *interval, *unit).await?
+                self.create_interval_timer(rule_id, *interval, *unit)?
             }
             TimerConfig::Cron { expression } => {
-                self.create_cron_job(rule_id, expression.clone()).await?
+                let job = self.create_cron_job(rule_id, expression.clone()).await?;
+                ActiveTimer::Scheduled(self.inner.scheduler.lock().await.add(job).await?)
             }
             TimerConfig::DateTime { fire_at } => {
-                self.create_datetime_job(rule_id, *fire_at).await?
+                let job = self.create_datetime_job(rule_id, *fire_at).await?;
+                ActiveTimer::Scheduled(self.inner.scheduler.lock().await.add(job).await?)
             }
             TimerConfig::RRule {
                 rule,
@@ -120,13 +168,8 @@ impl TimerManager {
             }
         };
 
-        // Add job to scheduler and store UUID
-        let job_uuid = self.inner.scheduler.lock().await.add(job).await?;
-        self.inner
-            .active_jobs
-            .write()
-            .await
-            .insert(rule_id, job_uuid);
+        let timer_id = timer.id();
+        self.inner.active_jobs.write().await.insert(rule_id, timer);
         self.inner
             .active_configs
             .write()
@@ -134,8 +177,8 @@ impl TimerManager {
             .insert(rule_id, config);
 
         info!(
-            "Timer started for rule {} with job UUID {}",
-            rule_id, job_uuid
+            "Timer started for rule {} with timer UUID {}",
+            rule_id, timer_id
         );
 
         Ok(())
@@ -149,17 +192,9 @@ impl TimerManager {
 
     async fn stop_timer_locked(&self, rule_id: i64) {
         self.inner.active_configs.write().await.remove(&rule_id);
-        let mut active_jobs = self.inner.active_jobs.write().await;
-
-        if let Some(job_uuid) = active_jobs.remove(&rule_id) {
-            if let Err(e) = self.inner.scheduler.lock().await.remove(&job_uuid).await {
-                warn!(
-                    "Failed to remove job {} for rule {}: {}",
-                    job_uuid, rule_id, e
-                );
-            } else {
-                info!("Stopped timer for rule {}", rule_id);
-            }
+        let timer = self.inner.active_jobs.write().await.remove(&rule_id);
+        if let Some(timer) = timer {
+            self.stop_owned_timer(rule_id, timer).await;
         } else {
             debug!("No timer found for rule {}", rule_id);
         }
@@ -167,22 +202,36 @@ impl TimerManager {
 
     /// Stop all timers
     pub async fn stop_all(&self) {
+        let _mutation = self.inner.timer_mutation.lock().await;
         self.inner.active_configs.write().await.clear();
-        let mut active_jobs = self.inner.active_jobs.write().await;
-
-        let count = active_jobs.len();
-        for (rule_id, job_uuid) in active_jobs.drain() {
-            if let Err(e) = self.inner.scheduler.lock().await.remove(&job_uuid).await {
-                warn!(
-                    "Failed to remove job {} for rule {}: {}",
-                    job_uuid, rule_id, e
-                );
-            } else {
-                debug!("Stopped timer for rule {}", rule_id);
-            }
+        let timers: Vec<_> = self.inner.active_jobs.write().await.drain().collect();
+        let count = timers.len();
+        for (rule_id, timer) in timers {
+            self.stop_owned_timer(rule_id, timer).await;
         }
 
         info!("Stopped {} timers", count);
+    }
+
+    async fn stop_owned_timer(&self, rule_id: i64, mut timer: ActiveTimer) {
+        match &mut timer {
+            ActiveTimer::Scheduled(id) => {
+                if let Err(e) = self.inner.scheduler.lock().await.remove(id).await {
+                    warn!("Failed to remove job {} for rule {}: {}", id, rule_id, e);
+                }
+            }
+            ActiveTimer::Interval { task, .. } => {
+                // Abort pending ticks and HTTP retries, then wait until the task
+                // has actually stopped before a replacement can start.
+                task.abort();
+                if let Err(e) = task.await {
+                    if !e.is_cancelled() {
+                        warn!("Interval task for rule {} failed: {}", rule_id, e);
+                    }
+                }
+            }
+        }
+        info!("Stopped timer for rule {}", rule_id);
     }
 
     /// Get count of active timers
@@ -204,30 +253,41 @@ impl TimerManager {
 
     #[cfg(test)]
     pub async fn job_uuid_for_rule(&self, rule_id: i64) -> Option<Uuid> {
-        self.inner.active_jobs.read().await.get(&rule_id).copied()
+        self.inner
+            .active_jobs
+            .read()
+            .await
+            .get(&rule_id)
+            .map(ActiveTimer::id)
     }
 
     /// Shutdown the scheduler
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down timer manager");
+        self.inner.timer_mutation.lock().await.shutting_down = true;
         self.stop_all().await;
         self.inner.scheduler.lock().await.shutdown().await?;
         Ok(())
     }
 
-    /// Create an interval-based job
-    async fn create_interval_job(
+    /// Create an interval task independent of the wall-clock cron scheduler.
+    /// Repeated cron-scheduler jobs can strand next_tick behind last_tick after
+    /// a late tick. Tokio's Skip policy advances directly to a future deadline.
+    fn create_interval_timer(
         &self,
         rule_id: i64,
         interval: u64,
         unit: TimeUnit,
-    ) -> Result<Job> {
-        let interval_seconds = match unit {
-            TimeUnit::Seconds => interval,
-            TimeUnit::Minutes => interval * 60,
-            TimeUnit::Hours => interval * 3600,
-            TimeUnit::Days => interval * 86400,
+    ) -> Result<ActiveTimer> {
+        let seconds_per_unit = match unit {
+            TimeUnit::Seconds => 1,
+            TimeUnit::Minutes => 60,
+            TimeUnit::Hours => 3600,
+            TimeUnit::Days => 86400,
         };
+        let interval_seconds = interval
+            .checked_mul(seconds_per_unit)
+            .context("Interval is too large to represent in seconds")?;
 
         if interval_seconds == 0 {
             return Err(anyhow::anyhow!("Interval must be greater than 0"));
@@ -236,56 +296,63 @@ impl TimerManager {
         let api_client = self.inner.api_client.clone();
         let sensor_ref = self.inner.sensor_ref.clone();
         let duration = Duration::from_secs(interval_seconds);
+        let first_tick = Instant::now()
+            .checked_add(duration)
+            .context("Interval is too large for the monotonic clock")?;
 
         info!(
-            "Creating interval job for rule {} (interval: {}s)",
+            "Creating interval task for rule {} (interval: {}s)",
             rule_id, interval_seconds
         );
 
-        let mut execution_count = 0u64;
+        let task = tokio::spawn(run_interval_timer(
+            rule_id,
+            first_tick,
+            duration,
+            move |count| {
+                let api_client = api_client.clone();
+                let sensor_ref = sensor_ref.clone();
+                let interval_secs = interval_seconds;
 
-        let job = Job::new_repeated_async(duration, move |_uuid, _lock| {
-            let api_client = api_client.clone();
-            let sensor_ref = sensor_ref.clone();
-            let rule_id = rule_id;
-            execution_count += 1;
-            let count = execution_count;
-            let interval_secs = interval_seconds;
+                async move {
+                    let now = Utc::now();
 
-            Box::pin(async move {
-                let now = Utc::now();
+                    // Create event payload matching intervaltimer output schema
+                    let payload = serde_json::json!({
+                        "type": "interval",
+                        "interval_seconds": interval_secs,
+                        "fired_at": now.to_rfc3339(),
+                        "execution_count": count,
+                        "sensor_ref": sensor_ref,
+                    });
 
-                // Create event payload matching intervaltimer output schema
-                let payload = serde_json::json!({
-                    "type": "interval",
-                    "interval_seconds": interval_secs,
-                    "fired_at": now.to_rfc3339(),
-                    "execution_count": count,
-                    "sensor_ref": sensor_ref,
-                });
+                    // Create event via API
+                    let request =
+                        CreateEventRequest::new("core.intervaltimer".to_string(), payload)
+                            .with_trigger_instance_id(format!("rule_{}", rule_id));
 
-                // Create event via API
-                let request = CreateEventRequest::new("core.intervaltimer".to_string(), payload)
-                    .with_trigger_instance_id(format!("rule_{}", rule_id));
-
-                match api_client.create_event_with_retry(request).await {
-                    Ok(event_id) => {
-                        info!(
-                            "Interval timer fired for rule {} (count: {}), created event {}",
-                            rule_id, count, event_id
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to create event for rule {} interval timer: {}",
-                            rule_id, e
-                        );
+                    match api_client.create_event_with_retry(request).await {
+                        Ok(event_id) => {
+                            info!(
+                                "Interval timer fired for rule {} (count: {}), created event {}",
+                                rule_id, count, event_id
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to create event for rule {} interval timer: {}",
+                                rule_id, e
+                            );
+                        }
                     }
                 }
-            })
-        })?;
+            },
+        ));
 
-        Ok(job)
+        Ok(ActiveTimer::Interval {
+            id: Uuid::new_v4(),
+            task,
+        })
     }
 
     /// Create a cron-based job
@@ -508,6 +575,9 @@ impl TimerManager {
             // the active RRULE chain before scheduling another one-shot job.
             let _mutation = if let Some(fired_uuid) = fired_job_uuid {
                 let mutation = this.inner.timer_mutation.lock().await;
+                if mutation.shutting_down {
+                    return Ok(());
+                }
 
                 let active_config = this
                     .inner
@@ -524,7 +594,13 @@ impl TimerManager {
                     return Ok(());
                 }
 
-                let active_job_uuid = this.inner.active_jobs.read().await.get(&rule_id).copied();
+                let active_job_uuid = this
+                    .inner
+                    .active_jobs
+                    .read()
+                    .await
+                    .get(&rule_id)
+                    .map(ActiveTimer::id);
                 if active_job_uuid != Some(fired_uuid) {
                     debug!(
                         "Skipping RRULE reschedule for rule {}: callback job {} is no longer current",
@@ -635,10 +711,53 @@ impl TimerManager {
                 .active_jobs
                 .write()
                 .await
-                .insert(rule_id, job_uuid);
+                .insert(rule_id, ActiveTimer::Scheduled(job_uuid));
 
             Ok(())
         })
+    }
+}
+
+/// Publish once on recovery, skip the other overdue ticks, and keep the cadence.
+/// Awaiting publication bounds each rule to one in-flight emission, including retries.
+async fn run_interval_timer<F, Fut>(
+    rule_id: i64,
+    first_tick: Instant,
+    period: Duration,
+    mut publish: F,
+) where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    // Unlike interval(), interval_at() does not fire immediately on startup.
+    let mut ticks = tokio::time::interval_at(first_tick, period);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut execution_count = 0u64;
+    loop {
+        let scheduled_tick = ticks.tick().await;
+        let delay = Instant::now().saturating_duration_since(scheduled_tick);
+        // A whole additional interval must have elapsed to distinguish missed
+        // ticks from ordinary executor jitter. Skip retains the original phase.
+        let skipped_ticks = delay.as_secs() / period.as_secs();
+        if skipped_ticks > 0 {
+            let recovered_at = Utc::now();
+            let expected_at = chrono::Duration::from_std(delay)
+                .ok()
+                .and_then(|delay| recovered_at.checked_sub_signed(delay))
+                .map(|time| time.to_rfc3339());
+            warn!(
+                rule_id,
+                interval_seconds = period.as_secs(),
+                missed_ticks = skipped_ticks + 1,
+                skipped_ticks,
+                delay_ms = delay.as_millis() as u64,
+                expected_at,
+                recovered_at = %recovered_at.to_rfc3339(),
+                "Interval timer missed ticks; publishing one recovery event and skipping the backlog"
+            );
+        }
+        execution_count += 1;
+        publish(execution_count).await;
     }
 }
 
@@ -678,6 +797,188 @@ fn build_ical_input(rule: &str, dtstart: chrono::DateTime<Utc>, tz: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, oneshot, Semaphore};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn warnings(&self) -> Vec<serde_json::Value> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|entry| entry["level"] == "WARN")
+                .collect()
+        }
+    }
+
+    fn spawn_test_interval<F, Fut>(
+        period_seconds: u64,
+        publish: F,
+    ) -> (JoinHandle<()>, CapturedLogs)
+    where
+        F: FnMut(u64) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let period = Duration::from_secs(period_seconds);
+        let task = tokio::spawn(
+            run_interval_timer(42, Instant::now() + period, period, publish)
+                .with_subscriber(subscriber),
+        );
+        (task, logs)
+    }
+
+    async fn stop_test_task(task: JoinHandle<()>) {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    async fn next_interval_event(
+        events: &mut mpsc::UnboundedReceiver<(u64, Instant)>,
+    ) -> (u64, Instant) {
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("timer did not publish promptly")
+            .expect("interval task exited")
+    }
+
+    struct IntervalHarness {
+        task: JoinHandle<()>,
+        events: mpsc::UnboundedReceiver<(u64, Instant)>,
+        logs: CapturedLogs,
+    }
+
+    impl IntervalHarness {
+        fn new(period_seconds: u64) -> Self {
+            let (sender, events) = mpsc::unbounded_channel();
+            let (task, logs) = spawn_test_interval(period_seconds, move |count| {
+                sender.send((count, Instant::now())).unwrap();
+                std::future::ready(())
+            });
+            Self { task, events, logs }
+        }
+
+        async fn next(&mut self) -> (u64, Instant) {
+            next_interval_event(&mut self.events).await
+        }
+
+        async fn assert_no_event(&mut self) {
+            tokio::task::yield_now().await;
+            assert!(self.events.try_recv().is_err(), "unexpected catch-up event");
+        }
+
+        async fn stop(self) {
+            stop_test_task(self.task).await;
+        }
+    }
+
+    struct EventRequest {
+        body: serde_json::Value,
+        respond: oneshot::Sender<u16>,
+    }
+
+    struct EventApi {
+        client: ApiClient,
+        requests: mpsc::UnboundedReceiver<EventRequest>,
+        task: JoinHandle<()>,
+    }
+
+    impl EventApi {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (sender, requests) = mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let header_end = loop {
+                        let mut buffer = [0; 1024];
+                        let size = socket.read(&mut buffer).await.unwrap();
+                        assert_ne!(size, 0, "client closed before sending headers");
+                        bytes.extend_from_slice(&buffer[..size]);
+                        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break index + 4;
+                        }
+                    };
+                    let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+                    assert!(headers.starts_with("POST /api/v1/events HTTP/1.1\r\n"));
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    let mut body = bytes[header_end..].to_vec();
+                    body.resize(content_length, 0);
+                    socket
+                        .read_exact(&mut body[bytes.len() - header_end..])
+                        .await
+                        .unwrap();
+                    let (respond, response) = oneshot::channel();
+                    sender
+                        .send(EventRequest {
+                            body: serde_json::from_slice(&body).unwrap(),
+                            respond,
+                        })
+                        .unwrap();
+                    let status = response.await.unwrap();
+                    let body = if status == 200 {
+                        r#"{"data":{"id":123}}"#
+                    } else {
+                        r#"{"error":"test failure"}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    // A cancellation test intentionally closes the client first.
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            });
+            Self {
+                client: ApiClient::new(format!("http://{address}"), "test-token".to_string()),
+                requests,
+                task,
+            }
+        }
+
+        async fn next(&mut self) -> EventRequest {
+            tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+                .await
+                .expect("timer did not call the event API")
+                .expect("event API exited")
+        }
+
+        async fn stop(self) {
+            stop_test_task(self.task).await;
+        }
+    }
 
     async fn test_manager() -> TimerManager {
         let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
@@ -736,6 +1037,212 @@ mod tests {
         manager.shutdown().await.unwrap();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_interval_job_advances_overdue_deadline() {
+        let start = Instant::now();
+        let mut timer = IntervalHarness::new(10);
+        timer.assert_no_event().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(timer.next().await, (1, start + Duration::from_secs(10)));
+
+        // Do not poll the scheduler for several intervals. One tick at 45s
+        // represents the missed 20s, 30s and 40s ticks, without a replay burst.
+        tokio::time::advance(Duration::from_secs(35)).await;
+        assert_eq!(timer.next().await, (2, start + Duration::from_secs(45)));
+        timer.assert_no_event().await;
+        let warnings = timer.logs.warnings();
+        assert_eq!(warnings.len(), 1);
+        let fields = &warnings[0]["fields"];
+        assert_eq!(fields["rule_id"], 42);
+        assert_eq!(fields["interval_seconds"], 10);
+        assert_eq!(fields["missed_ticks"], 3);
+        assert_eq!(fields["skipped_ticks"], 2);
+        assert_eq!(fields["delay_ms"], 25000);
+        assert!(fields["expected_at"].as_str().is_some());
+        assert!(fields["recovered_at"].as_str().is_some());
+
+        // Keep the original phase, rather than waiting until 55s after recovery.
+        tokio::time::advance(Duration::from_secs(4)).await;
+        timer.assert_no_event().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(timer.next().await, (3, start + Duration::from_secs(50)));
+        for count in 4..=6 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert_eq!(timer.next().await.0, count);
+            timer.assert_no_event().await;
+        }
+        assert_eq!(timer.logs.warnings().len(), 1);
+        timer.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_interval_recovers_from_repeated_stalls_and_exact_boundaries() {
+        let start = Instant::now();
+        let mut timer = IntervalHarness::new(10);
+        for (count, time) in [(1, 40), (2, 80), (3, 120)] {
+            tokio::time::advance(Duration::from_secs(40)).await;
+            assert_eq!(
+                timer.next().await,
+                (count, start + Duration::from_secs(time))
+            );
+            timer.assert_no_event().await;
+        }
+        assert_eq!(timer.logs.warnings().len(), 3);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(timer.next().await.0, 4);
+        timer.assert_no_event().await;
+        timer.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_interval_jitter_does_not_warn_or_shift_cadence() {
+        let start = Instant::now();
+        let mut timer = IntervalHarness::new(10);
+        tokio::time::advance(Duration::from_millis(10020)).await;
+        assert_eq!(timer.next().await.0, 1);
+        assert!(timer.logs.warnings().is_empty());
+        tokio::time::advance(Duration::from_millis(9980)).await;
+        assert_eq!(timer.next().await, (2, start + Duration::from_secs(20)));
+        timer.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_interval_slow_publication_does_not_overlap_or_replay_backlog() {
+        let start = Instant::now();
+        let completion = Arc::new(Semaphore::new(0));
+        let permits = completion.clone();
+        let (sender, mut events) = mpsc::unbounded_channel();
+        let (task, logs) = spawn_test_interval(10, move |count| {
+            let completion = completion.clone();
+            sender.send((count, Instant::now())).unwrap();
+            async move {
+                // Model a slow API request or its retry sequence.
+                completion.acquire().await.unwrap().forget();
+            }
+        });
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(next_interval_event(&mut events).await.0, 1);
+        tokio::time::advance(Duration::from_secs(35)).await;
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err(), "emissions must not overlap");
+        permits.add_permits(1);
+        assert_eq!(
+            next_interval_event(&mut events).await,
+            (2, start + Duration::from_secs(45))
+        );
+        permits.add_permits(1);
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err(), "backlog must not be replayed");
+        assert_eq!(logs.warnings().len(), 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            next_interval_event(&mut events).await,
+            (3, start + Duration::from_secs(50))
+        );
+        // Cancellation must also work while publication is pending.
+        stop_test_task(task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_interval_rules_keep_independent_cadences() {
+        let mut fast = IntervalHarness::new(10);
+        let mut slow = IntervalHarness::new(15);
+        tokio::time::advance(Duration::from_secs(35)).await;
+        assert_eq!(fast.next().await.0, 1);
+        assert_eq!(slow.next().await.0, 1);
+        fast.assert_no_event().await;
+        slow.assert_no_event().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(fast.next().await.0, 2);
+        slow.assert_no_event().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(slow.next().await.0, 2);
+        fast.assert_no_event().await;
+        fast.stop().await;
+        slow.stop().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_interval_publishes_and_resumes_after_real_scheduler_stall() {
+        let mut api = EventApi::start().await;
+        let manager = TimerManager::new(api.client.clone(), "core.timer_sensor".to_string())
+            .await
+            .unwrap();
+        manager
+            .start_timer(
+                42,
+                TimerConfig::Interval {
+                    interval: 1,
+                    unit: TimeUnit::Seconds,
+                },
+            )
+            .await
+            .unwrap();
+        let first = api.next().await;
+        assert_eq!(first.body["payload"]["execution_count"], 1);
+        first.respond.send(200).unwrap();
+        // Deliberately block this test-owned single-thread runtime. Unlike
+        // paused Tokio time, this also delays the old UTC-based scheduler and
+        // reproduces the deployed failure through real HTTP event publication.
+        std::thread::sleep(Duration::from_millis(3500));
+        for count in 2..=4 {
+            let request = api.next().await;
+            assert_eq!(request.body["trigger_ref"], "core.intervaltimer");
+            assert_eq!(request.body["trigger_instance_id"], "rule_42");
+            let payload = &request.body["payload"];
+            assert_eq!(payload["type"], "interval");
+            assert_eq!(payload["execution_count"], count);
+            assert_eq!(payload["interval_seconds"], 1);
+            assert_eq!(payload["sensor_ref"], "core.timer_sensor");
+            chrono::DateTime::parse_from_rfc3339(payload["fired_at"].as_str().unwrap()).unwrap();
+            request.respond.send(200).unwrap();
+        }
+        manager.shutdown().await.unwrap();
+        api.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_interval_survives_failed_publication_and_cancels_pending_request() {
+        let mut api = EventApi::start().await;
+        let manager = TimerManager::new(api.client.clone(), "core.timer_sensor".to_string())
+            .await
+            .unwrap();
+        manager
+            .start_timer(
+                42,
+                TimerConfig::Interval {
+                    interval: 1,
+                    unit: TimeUnit::Seconds,
+                },
+            )
+            .await
+            .unwrap();
+        let mut first_body = None;
+        for _ in 0..3 {
+            let request = api.next().await;
+            assert_eq!(request.body["payload"]["execution_count"], 1);
+            if let Some(body) = &first_body {
+                assert_eq!(&request.body, body, "retries must reuse the same event");
+            } else {
+                first_body = Some(request.body);
+            }
+            request.respond.send(503).unwrap();
+        }
+        let next = api.next().await;
+        assert_eq!(next.body["payload"]["execution_count"], 2);
+        // Hold this HTTP response while stopping the timer. Stop must not wait
+        // for the request timeout or leave a detached retry task behind.
+        let task = interval_abort_handle(&manager, 42).await;
+        tokio::time::timeout(Duration::from_secs(1), manager.stop_timer(42))
+            .await
+            .unwrap();
+        assert!(task.is_finished());
+        next.respond.send(200).unwrap();
+        manager.shutdown().await.unwrap();
+        api.stop().await;
+    }
+
     #[tokio::test]
     async fn test_interval_timer_validation() {
         let manager = test_manager().await;
@@ -750,6 +1257,120 @@ mod tests {
         assert!(result.is_err());
 
         manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_interval_timer_rejects_overflow_without_spawning_tasks() {
+        let manager = test_manager().await;
+        for unit in [
+            TimeUnit::Seconds,
+            TimeUnit::Minutes,
+            TimeUnit::Hours,
+            TimeUnit::Days,
+        ] {
+            let result = manager
+                .start_timer(
+                    42,
+                    TimerConfig::Interval {
+                        interval: u64::MAX,
+                        unit,
+                    },
+                )
+                .await;
+            assert!(result.is_err(), "oversized {unit:?} interval must fail");
+            assert_eq!(manager.timer_count().await, 0);
+        }
+        manager.shutdown().await.unwrap();
+    }
+
+    async fn interval_abort_handle(
+        manager: &TimerManager,
+        rule_id: i64,
+    ) -> tokio::task::AbortHandle {
+        match manager
+            .inner
+            .active_jobs
+            .read()
+            .await
+            .get(&rule_id)
+            .unwrap()
+        {
+            ActiveTimer::Interval { task, .. } => task.abort_handle(),
+            ActiveTimer::Scheduled(_) => panic!("expected interval task"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interval_task_is_not_detached_when_registration_is_dropped() {
+        let manager = test_manager().await;
+        let timer = manager
+            .create_interval_timer(42, 60, TimeUnit::Seconds)
+            .unwrap();
+        let abort = match &timer {
+            ActiveTimer::Interval { task, .. } => task.abort_handle(),
+            ActiveTimer::Scheduled(_) => panic!("expected interval task"),
+        };
+        drop(timer);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped interval task was detached instead of aborted");
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_interval_replacement_stop_all_and_shutdown_join_tasks() {
+        let manager = test_manager().await;
+        let config = TimerConfig::Interval {
+            interval: 60,
+            unit: TimeUnit::Seconds,
+        };
+        manager.start_timer(42, config.clone()).await.unwrap();
+        let original = interval_abort_handle(&manager, 42).await;
+        manager.start_timer(42, config.clone()).await.unwrap();
+        assert!(
+            !original.is_finished(),
+            "unchanged config must keep the task"
+        );
+        manager
+            .start_timer(
+                42,
+                TimerConfig::Cron {
+                    expression: "0 * * * * *".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(original.is_finished(), "replacement must join the old task");
+        manager.start_timer(42, config.clone()).await.unwrap();
+        let replacement = interval_abort_handle(&manager, 42).await;
+        manager.stop_timer(42).await;
+        assert!(replacement.is_finished());
+
+        manager.start_timer(42, config.clone()).await.unwrap();
+        let stopped = interval_abort_handle(&manager, 42).await;
+        manager.stop_all().await;
+        assert!(stopped.is_finished());
+        assert!(manager.active_rule_ids().await.is_empty());
+
+        manager.start_timer(42, config).await.unwrap();
+        let shutdown = interval_abort_handle(&manager, 42).await;
+        manager.shutdown().await.unwrap();
+        assert!(shutdown.is_finished());
+        assert_eq!(manager.timer_count().await, 0);
+        assert!(manager
+            .start_timer(
+                42,
+                TimerConfig::Interval {
+                    interval: 60,
+                    unit: TimeUnit::Seconds
+                }
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -740,6 +740,29 @@ impl InquiryRepository {
             push_inquiry_content_visible_predicate(&mut qb, ctx);
         }
 
+        if filters.workflow_action_ref.is_some() || filters.workflow_pack_ref.is_some() {
+            qb.push(" AND ");
+            super::iam_ownership::push_iam_grants(
+                &mut qb,
+                &ctx.grants,
+                Resource::Executions,
+                Action::Read,
+                ctx.identity_id,
+                &ctx.identity_attributes,
+                &super::iam_ownership::IamTargetSql {
+                    id: "workflow_root.id",
+                    reference: "workflow_root.action_ref",
+                    pack_ref: "split_part(workflow_root.action_ref, '.', 1)",
+                    managing_pack: &super::iam_ownership::execution_pack("workflow_root"),
+                    owner_identity: Some("workflow_root.executor"),
+                    execution_owner: Some("workflow_root.executor"),
+                    ancestor_identities: Some(&super::iam_ownership::execution_ancestor_ids(
+                        "workflow_root",
+                    )),
+                },
+            );
+        }
+
         qb.push(" ORDER BY i.created DESC");
         qb.push(" LIMIT ");
         qb.push_bind(filters.limit as i64);
@@ -894,6 +917,14 @@ fn push_single_inquiry_grant_predicate<'a>(
             *has_term = true;
         }
     };
+
+    if let Some(pack) = constraints.managing_pack_id {
+        push_and(query, &mut has_term);
+        query
+            .push(super::iam_ownership::execution_pack("e"))
+            .push(" = ")
+            .push_bind(pack);
+    }
 
     if let Some(pack_refs) = &constraints.pack_refs {
         if pack_refs.is_empty() {

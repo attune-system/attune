@@ -49,6 +49,40 @@ fn reject_sensor_admission(failures: Vec<SensorAdmissionFailure>) -> Result<(), 
     ))
 }
 
+async fn sensor_update_authority(
+    connection: &mut sqlx::PgConnection,
+    user: &AuthenticatedUser,
+    sensor: &SensorModel,
+) -> ApiResult<attune_common::delegation::DelegationAuthority> {
+    if user.claims.token_type != crate::auth::jwt::TokenType::Access {
+        return Err(ApiError::Forbidden(
+            "Sensor metadata controls require an access token".into(),
+        ));
+    }
+    let identity = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+    let authority =
+        attune_common::delegation::DelegationAuthority::load_for_share(connection, identity)
+            .await?;
+    let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+        connection,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Sensor,
+            sensor.id,
+        ),
+        identity,
+    )
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Sensor owner is unavailable".into()))?;
+    if !authority.allows(Resource::Triggers, Action::Update, target.context().clone()) {
+        return Err(ApiError::Forbidden(
+            "Sensor update is not authorized".into(),
+        ));
+    }
+    Ok(authority)
+}
+
 use crate::{
     auth::middleware::{AuthenticatedUser, RequireAuth},
     authz::AuthorizationService,
@@ -57,9 +91,9 @@ use crate::{
         trigger::{
             CreateSensorRequest, CreateTriggerRequest, LogRetentionLimitPatch,
             LogRetentionPolicyPatch, SensorJsonPatch, SensorListParams, SensorResponse,
-            SensorSummary, TriggerJsonPatch, TriggerListParams, TriggerReferenceParams,
-            TriggerResponse, TriggerStringPatch, TriggerSummary, UpdateSensorRequest,
-            UpdateTriggerRequest,
+            SensorRuntimeRevocationRequest, SensorSummary, TriggerJsonPatch, TriggerListParams,
+            TriggerReferenceParams, TriggerResponse, TriggerRolloutResponse, TriggerStringPatch,
+            TriggerSummary, UpdateSensorRequest, UpdateTriggerRequest,
         },
         ApiResponse, SuccessResponse,
     },
@@ -156,7 +190,21 @@ async fn filter_api_visible_triggers(
     referencing_pack_ref: Option<&str>,
 ) -> ApiResult<Vec<TriggerModel>> {
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
+    let snapshot = authz.load_snapshot(user).await?;
+    let grants = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.grants.as_slice())
+        .unwrap_or_default();
+    let owners =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_packs(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            &triggers
+                .iter()
+                .map(|trigger| trigger.id)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
     let identity_id = user.identity_id().ok();
 
     Ok(triggers
@@ -167,6 +215,10 @@ async fn filter_api_visible_triggers(
                     .is_some_and(|pack_ref| trigger_reference_allowed(trigger, Some(pack_ref)))
                 || identity_id.is_some_and(|id| {
                     let mut ctx = AuthorizationContext::new(id);
+                    ctx.managing_pack_id = owners.get(&trigger.id).copied();
+                    if let Some(snapshot) = &snapshot {
+                        ctx.identity_attributes = snapshot.identity_attributes.clone();
+                    }
                     ctx.target_id = Some(trigger.id);
                     ctx.target_ref = Some(trigger.r#ref.clone());
                     ctx.pack_ref = trigger.pack_ref.clone();
@@ -296,10 +348,24 @@ async fn visible_trigger_page(
     };
 
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
-    let scope = compute_trigger_read_scope(&grants, identity_id);
+    let snapshot = authz.load_snapshot(user).await?;
+    let grants = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.grants.as_slice())
+        .unwrap_or_default();
+    let scope = compute_trigger_read_scope(grants, identity_id);
 
     filters.visibility = Some(TriggerVisibilityFilter {
+        structural_scope: snapshot
+            .as_ref()
+            .map(|snapshot| {
+                super::visibility::structural_visibility_scope(
+                    snapshot,
+                    Resource::Triggers,
+                    Action::Update,
+                )
+            })
+            .unwrap_or_default(),
         unscoped: scope.unscoped,
         allowed_pack_refs: scope.allowed_pack_refs,
         allowed_refs: scope.allowed_refs,
@@ -322,7 +388,18 @@ async fn filter_api_visible_sensors(
     sensors: Vec<SensorModel>,
 ) -> ApiResult<Vec<SensorModel>> {
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
+    let snapshot = authz.load_snapshot(user).await?;
+    let grants = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.grants.as_slice())
+        .unwrap_or_default();
+    let owners =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_packs(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Sensor,
+            &sensors.iter().map(|sensor| sensor.id).collect::<Vec<_>>(),
+        )
+        .await?;
     let identity_id = user.identity_id().ok();
 
     Ok(sensors
@@ -330,6 +407,10 @@ async fn filter_api_visible_sensors(
         .filter(|sensor| {
             identity_id.is_some_and(|id| {
                 let mut ctx = AuthorizationContext::new(id);
+                ctx.managing_pack_id = owners.get(&sensor.id).copied();
+                if let Some(snapshot) = &snapshot {
+                    ctx.identity_attributes = snapshot.identity_attributes.clone();
+                }
                 ctx.target_id = Some(sensor.id);
                 ctx.target_ref = Some(sensor.r#ref.clone());
                 ctx.pack_ref = sensor.pack_ref.clone();
@@ -363,6 +444,13 @@ async fn authorize_sensor_configuration_decrypt(
         .map_err(|_| ApiError::Unauthorized("Invalid sensor configuration identity".into()))?;
     let mut context = AuthorizationContext::new(identity);
     context.target_id = Some(sensor.id);
+    context.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Sensor,
+            sensor.id,
+        )
+        .await?;
     context.target_ref = Some(sensor.r#ref.clone());
     context.pack_ref = sensor.pack_ref.clone();
     state
@@ -473,10 +561,24 @@ async fn visible_sensor_page(
     };
 
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
-    let scope = compute_sensor_read_scope(&grants, identity_id);
+    let snapshot = authz.load_snapshot(user).await?;
+    let grants = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.grants.as_slice())
+        .unwrap_or_default();
+    let scope = compute_sensor_read_scope(grants, identity_id);
 
     filters.visibility = Some(SensorVisibilityFilter {
+        structural_scope: snapshot
+            .as_ref()
+            .map(|snapshot| {
+                super::visibility::structural_visibility_scope(
+                    snapshot,
+                    Resource::Triggers,
+                    Action::Update,
+                )
+            })
+            .unwrap_or_default(),
         unscoped: scope.unscoped,
         allowed_pack_refs: scope.allowed_pack_refs,
         allowed_refs: scope.allowed_refs,
@@ -841,6 +943,74 @@ pub async fn create_trigger(
     Ok((StatusCode::CREATED, Json(response)))
 }
 
+/// Inspect a proposed current-contract change without changing active projections.
+#[utoipa::path(
+    post,
+    path = "/api/v1/triggers/{ref}/rollout-preflight",
+    tag = "triggers",
+    params(("ref" = String, Path, description = "Trigger reference")),
+    request_body = UpdateTriggerRequest,
+    responses((status = 200, description = "Affected admitted emitter IDs", body = inline(ApiResponse<TriggerRolloutResponse>)))
+)]
+pub async fn trigger_rollout_preflight(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(trigger_ref): Path<String>,
+    Json(request): Json<UpdateTriggerRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+    let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Trigger not found".into()))?;
+    let identity = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+    let mut context = AuthorizationContext::new(identity);
+    context.target_id = Some(trigger.id);
+    context.target_ref = Some(trigger.r#ref.clone());
+    context.pack_ref = trigger.pack_ref.clone();
+    state
+        .authorization_service()
+        .authorize(
+            &user,
+            crate::authz::AuthorizationCheck {
+                resource: Resource::Triggers,
+                action: Action::Update,
+                context,
+            },
+        )
+        .await?;
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::trigger_rollout::TriggerRolloutRepository::lock_activation(
+        &mut tx,
+    )
+    .await?;
+    let trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
+        .await?
+        .filter(|selected| selected.id == trigger.id)
+        .ok_or_else(|| ApiError::Conflict("Trigger changed during preflight".into()))?;
+    let empty = json!({});
+    let proposed_out = match &request.out_schema {
+        Some(TriggerJsonPatch::Set(schema)) => Some(schema),
+        Some(TriggerJsonPatch::Clear) => Some(&empty),
+        None => trigger.out_schema.as_ref(),
+    };
+    let proposed_config = match &request.event_config_schema {
+        Some(TriggerJsonPatch::Set(schema)) => Some(schema),
+        Some(TriggerJsonPatch::Clear) => Some(&empty),
+        None => trigger.event_config_schema.as_ref(),
+    };
+    let impact = attune_common::repositories::trigger_rollout::TriggerRolloutRepository::preflight(
+        &mut tx,
+        trigger.id,
+        proposed_out,
+        proposed_config,
+    )
+    .await?;
+    tx.rollback().await?;
+    Ok(Json(ApiResponse::new(TriggerRolloutResponse::from(impact))))
+}
+
 /// Update an existing trigger
 #[utoipa::path(
     put,
@@ -859,7 +1029,7 @@ pub async fn create_trigger(
 )]
 pub async fn update_trigger(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
     Json(request): Json<UpdateTriggerRequest>,
 ) -> ApiResult<impl IntoResponse> {
@@ -870,6 +1040,25 @@ pub async fn update_trigger(
     let existing_trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+
+    let identity = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+    let mut context = AuthorizationContext::new(identity);
+    context.target_id = Some(existing_trigger.id);
+    context.target_ref = Some(existing_trigger.r#ref.clone());
+    context.pack_ref = existing_trigger.pack_ref.clone();
+    state
+        .authorization_service()
+        .authorize(
+            &user,
+            crate::authz::AuthorizationCheck {
+                resource: Resource::Triggers,
+                action: Action::Update,
+                context,
+            },
+        )
+        .await?;
 
     let effective_reference_visibility = request
         .reference_visibility
@@ -892,11 +1081,37 @@ pub async fn update_trigger(
         .await?;
     }
 
+    let authorized_trigger_id = existing_trigger.id;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::trigger_rollout::TriggerRolloutRepository::lock_activation(
+        &mut tx,
+    )
+    .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let existing_trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    if existing_trigger.id != authorized_trigger_id {
+        return Err(ApiError::Conflict(
+            "Trigger changed during authorization".into(),
+        ));
+    }
+
+    let empty_schema = json!({});
+    let proposed_out = match &request.out_schema {
+        Some(TriggerJsonPatch::Set(schema)) => Some(schema),
+        Some(TriggerJsonPatch::Clear) => Some(&empty_schema),
+        None => existing_trigger.out_schema.as_ref(),
+    };
+    let proposed_event_config = match &request.event_config_schema {
+        Some(TriggerJsonPatch::Set(schema)) => Some(schema),
+        Some(TriggerJsonPatch::Clear) => Some(&empty_schema),
+        None => existing_trigger.event_config_schema.as_ref(),
+    };
+    attune_common::repositories::trigger_rollout::TriggerRolloutRepository::preflight(
+        &mut tx, existing_trigger.id, proposed_out, proposed_event_config).await?
+        .require_drained_or_acknowledged(request.acknowledge_incompatible_rollout)
+        .map_err(|_| ApiError::Conflict("Trigger contract has live admitted emitters; drain them or set acknowledge_incompatible_rollout explicitly".into()))?;
 
     // Create update input
     let update_input = UpdateTriggerInput {
@@ -1288,6 +1503,7 @@ pub async fn get_sensor(
     }
 
     let mut response = SensorResponse::from(sensor.clone());
+    response.managed_metadata_revision = attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::current_revision(&state.db,sensor.id).await?;
     let configuration = attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(&state.db, "sensor", sensor.id).await?;
     if let Some(revision) = &configuration {
         revision.contract()?;
@@ -1433,7 +1649,7 @@ pub async fn update_sensor(
     // Validate request
     request.validate()?;
     let mut tx = state.db.begin().await?;
-    attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
+    attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::lock_mutation(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let placement_changed = request.worker_selector.is_some()
         || request.worker_tolerations.is_some()
@@ -1443,22 +1659,19 @@ pub async fn update_sensor(
     let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
-    if !can_access_sensor_api(&state, &user, &existing_sensor).await? {
-        return Err(ApiError::Forbidden(
-            "Sensor update is not authorized".into(),
-        ));
-    }
-    let configuration_changed = request.param_schema.is_some() || request.config.is_some();
+    let authority = sensor_update_authority(&mut tx, &user, &existing_sensor).await?;
+    let configuration_changed = request.param_schema.is_some()
+        || request.config.is_some()
+        || !request.config_reset_fields.is_empty();
     let supplied_config = request.config.clone();
-    if request.param_schema.is_some()
-        && supplied_config.is_none()
-        && existing_sensor
-            .config
-            .as_ref()
-            .is_some_and(|config| !attune_common::secret_values::redacted_paths(config).is_empty())
-    {
-        authorize_sensor_configuration_decrypt(&state, &user, &existing_sensor).await?;
-    }
+    let metadata_changed = configuration_changed
+        || request.entrypoint.is_some()
+        || placement_changed
+        || request.artifact_retention_policy.is_some()
+        || request.artifact_retention_limit.is_some()
+        || request.log_retention_policy.is_some()
+        || request.log_retention_limit.is_some();
+    let managed = attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::is_managed(&mut tx,existing_sensor.id).await?;
 
     // Create update input
     let update_input = UpdateSensorInput {
@@ -1473,7 +1686,7 @@ pub async fn update_sensor(
             SensorJsonPatch::Set(value) => Patch::Set(value),
             SensorJsonPatch::Clear => Patch::Clear,
         }),
-        config: request.config,
+        config: None,
         worker_selector: request
             .worker_selector
             .map(|value| serde_json::to_value(value).unwrap_or_else(|_| json!({}))),
@@ -1502,10 +1715,29 @@ pub async fn update_sensor(
     };
 
     let mut sensor = SensorRepository::update(&mut *tx, existing_sensor.id, update_input).await?;
-    if configuration_changed {
-        let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_sensor(
-            &mut tx, &sensor, supplied_config.as_ref(), state.config.security.encryption_key.as_deref()).await?;
+    if configuration_changed || (managed && metadata_changed) {
+        let pack_ref = sensor
+            .pack_ref
+            .as_deref()
+            .ok_or_else(|| ApiError::Conflict("Sensor requires its declaring pack".into()))?;
+        let pack = PackRepository::find_by_ref(&mut *tx, pack_ref)
+            .await?
+            .ok_or_else(|| ApiError::Conflict("Sensor pack is unavailable".into()))?;
+        let identity = authority.identity_id;
+        attune_common::repositories::component_configuration::ComponentConfigurationRepository::authorize_preserved_migration(
+            &mut tx,"sensor",sensor.id,&sensor.r#ref,&pack,sensor.param_schema.as_ref().unwrap_or(&json!({})),&authority).await?;
+        let revision = if managed {
+            attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_sensor_readmission(
+                &mut tx,&sensor,supplied_config.as_ref(),&request.config_reset_fields,state.config.security.encryption_key.as_deref()).await?
+        } else {
+            attune_common::repositories::component_configuration::ComponentConfigurationRepository::patch_sensor(
+                &mut tx,&sensor,supplied_config.as_ref(),&request.config_reset_fields,state.config.security.encryption_key.as_deref()).await?
+        };
         sensor.config = Some(revision.config);
+        if managed {
+            attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::readmit(
+                &mut tx,&sensor,identity,state.config.security.encryption_key.as_deref()).await?;
+        }
     }
     if placement_changed || (!existing_sensor.enabled && sensor.enabled) {
         let requirement = if sensor.enabled {
@@ -1517,6 +1749,7 @@ pub async fn update_sensor(
             SensorAdmissionRepository::assess_sensor(&mut tx, sensor.id, requirement).await?,
         )?;
     }
+    let metadata_revision = attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::current_revision(&mut *tx,sensor.id).await?;
     tx.commit().await?;
     if let Some(enabled) = request.enabled {
         if enabled != existing_sensor.enabled {
@@ -1524,10 +1757,45 @@ pub async fn update_sensor(
         }
     }
 
-    let response =
-        ApiResponse::with_message(SensorResponse::from(sensor), "Sensor updated successfully");
+    let mut response = SensorResponse::from(sensor);
+    response.managed_metadata_revision = metadata_revision;
+    let response = ApiResponse::with_message(response, "Sensor updated successfully");
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+#[utoipa::path(post, path = "/api/v1/sensors/{ref}/revoke-runtime", tag = "sensors",
+    params(("ref" = String, Path, description = "Sensor reference")),
+    request_body = SensorRuntimeRevocationRequest,
+    responses((status = 200, description = "Sensor runtime authority explicitly revoked", body = SuccessResponse)))]
+pub async fn revoke_sensor_runtime(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(reference): Path<String>,
+    Json(request): Json<SensorRuntimeRevocationRequest>,
+) -> ApiResult<impl IntoResponse> {
+    if request
+        .metadata_revision
+        .is_some_and(|revision| revision <= 0)
+    {
+        return Err(ApiError::BadRequest(
+            "Metadata revision must be positive".into(),
+        ));
+    }
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::lock_mutation(&mut tx).await?;
+    let sensor = SensorRepository::find_by_ref(&mut *tx, &reference)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Sensor is unavailable".into()))?;
+    sensor_update_authority(&mut tx, &user, &sensor).await?;
+    if !attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::revoke(
+        &mut tx,sensor.id,request.metadata_revision).await? {
+        return Err(ApiError::NotFound("Sensor metadata revision is unavailable".into()));
+    }
+    tx.commit().await?;
+    Ok(Json(SuccessResponse::new(
+        "Sensor runtime authority revoked",
+    )))
 }
 
 /// Delete a sensor
@@ -1722,6 +1990,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/triggers/{ref}/enable", post(enable_trigger))
         .route("/triggers/{ref}/disable", post(disable_trigger))
+        .route(
+            "/triggers/{ref}/rollout-preflight",
+            post(trigger_rollout_preflight),
+        )
         .route("/packs/{pack_ref}/triggers", get(list_triggers_by_pack))
         // Sensor routes
         .route("/sensors", get(list_sensors).post(create_sensor))
@@ -1732,6 +2004,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/sensors/{ref}/enable", post(enable_sensor))
         .route("/sensors/{ref}/disable", post(disable_sensor))
+        .route("/sensors/{ref}/revoke-runtime", post(revoke_sensor_runtime))
         .route("/packs/{pack_ref}/sensors", get(list_sensors_by_pack))
         .route(
             "/triggers/{trigger_ref}/sensors",

@@ -5,6 +5,7 @@
 import type { ApiResponse_SensorResponse } from "../models/ApiResponse_SensorResponse";
 import type { CreateSensorRequest } from "../models/CreateSensorRequest";
 import type { PaginatedResponse_SensorSummary } from "../models/PaginatedResponse_SensorSummary";
+import type { SensorRuntimeRevocationRequest } from "../models/SensorRuntimeRevocationRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
 import type { UpdateSensorRequest } from "../models/UpdateSensorRequest";
 import type { CancelablePromise } from "../core/CancelablePromise";
@@ -280,6 +281,30 @@ export class SensorsService {
         404: `Sensor not found`,
         500: `Internal server error`,
       },
+    });
+  }
+  /**
+   * @returns SuccessResponse Sensor runtime authority explicitly revoked
+   * @throws ApiError
+   */
+  public static revokeSensorRuntime({
+    ref,
+    requestBody,
+  }: {
+    /**
+     * Sensor reference
+     */
+    ref: string;
+    requestBody: SensorRuntimeRevocationRequest;
+  }): CancelablePromise<SuccessResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/sensors/{ref}/revoke-runtime",
+      path: {
+        ref: ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
     });
   }
   /**

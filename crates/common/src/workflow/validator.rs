@@ -392,7 +392,16 @@ impl WorkflowValidator {
         // Validate action references format
         for task in &workflow.tasks {
             if let Some(ref action) = task.action {
-                if !Self::is_valid_action_ref(action) {
+                if action.contains("{{") {
+                    crate::pack_registry::runtime_policy::task_action_targets(
+                        action,
+                        Some(&serde_json::json!(task.allowed_action_refs)),
+                        "workflow",
+                        "workflow",
+                        &format!("/tasks/{}", task.name),
+                    )
+                    .map_err(|error| ValidationError::InvalidActionRef(error.to_string()))?;
+                } else if !Self::is_valid_action_ref(action) {
                     return Err(ValidationError::InvalidActionRef(format!(
                         "Task '{}' has invalid action reference: {}",
                         task.name, action

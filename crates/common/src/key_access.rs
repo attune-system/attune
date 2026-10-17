@@ -6,7 +6,7 @@ use crate::{
     delegation::DelegationAuthority,
     models::{Id, Key, OwnerType},
     rbac::{Action, AuthorizationContext, Grant, Resource},
-    repositories::{key::KeyRepository, FindById},
+    repositories::{iam_ownership::VerifiedKeyOrigins, FindById},
     secret_provenance::KeyOrigin,
     Error, Result,
 };
@@ -45,7 +45,18 @@ pub fn origin_action_allowed(
     origin: &KeyOrigin,
     action: Action,
 ) -> bool {
+    origin_action_allowed_verified(grants, caller, origin, action, &Default::default())
+}
+
+pub fn origin_action_allowed_verified(
+    grants: &[Grant],
+    caller: &AuthorizationContext,
+    origin: &KeyOrigin,
+    action: Action,
+    ownership: &crate::repositories::iam_ownership::VerifiedKeyOrigins,
+) -> bool {
     let mut context = origin_context(caller.identity_id, origin);
+    context.managing_pack_id = ownership.managing_pack(origin);
     context.identity_attributes = caller.identity_attributes.clone();
     grants.iter().any(|grant| {
         if origin.owner_type == OwnerType::Identity
@@ -88,7 +99,7 @@ where
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    let keys = KeyRepository::find_by_refs(executor, &refs).await?;
+    let (keys, ownership) = VerifiedKeyOrigins::keys_by_refs(executor, &refs).await?;
     if keys.len() != refs.len() {
         return Err(Error::PermissionDenied(
             "Referenced key is not available".into(),
@@ -96,8 +107,8 @@ where
     }
     for key in keys {
         let origin = key_origin(&key);
-        if !authority.key_allows(&origin, Action::Read)
-            || key.encrypted && !authority.key_allows(&origin, Action::Decrypt)
+        if !authority.key_allows_verified(&origin, Action::Read, &ownership)
+            || key.encrypted && !authority.key_allows_verified(&origin, Action::Decrypt, &ownership)
         {
             return Err(Error::PermissionDenied(
                 "Referenced key value is not authorized".into(),
@@ -132,21 +143,51 @@ pub async fn authorize_execution_parameter_key_origins(
     identity: Option<Id>,
     secrets: &[crate::secret_values::StoredSecretValue],
 ) -> Result<()> {
-    if secrets.is_empty() {
-        return Ok(());
-    }
-    let mut connection = pool.acquire().await?;
-    let authority =
-        crate::repositories::rule_authority::RuleAuthorityRepository::execution_input_authority(
-            &mut connection,
-            execution,
-            identity,
-        )
-        .await?;
+    let mut transaction = pool.begin().await?;
+    authorize_execution_parameter_key_origins_with_conn(
+        &mut transaction,
+        execution,
+        identity,
+        secrets,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// The worker retains this transaction through decryption. Recorded input
+/// snapshots remain separate contributors, never a union of their grants.
+pub async fn authorize_execution_parameter_key_origins_with_conn(
+    connection: &mut sqlx::PgConnection,
+    execution: Id,
+    identity: Option<Id>,
+    secrets: &[crate::secret_values::StoredSecretValue],
+) -> Result<()> {
+    use crate::repositories::{
+        execution_admission::ExecutionAdmissionRepository, runtime_authority::RuntimeOwner,
+    };
+    let recorded =
+        ExecutionAdmissionRepository::find(connection, RuntimeOwner::Execution(execution))
+            .await?
+            .is_some();
+    let authorities = ExecutionAdmissionRepository::input_authorities(
+        connection,
+        execution,
+        if recorded { None } else { identity },
+    )
+    .await?;
     let mut visited = std::collections::BTreeSet::new();
     for secret in secrets {
-        check_parameter_origins(&mut connection, authority.as_ref(), secret, &mut visited, 0)
-            .await?;
+        check_parameter_origins(
+            connection,
+            &authorities,
+            recorded.then_some(execution),
+            &secret.json_path,
+            secret,
+            &mut visited,
+            0,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -156,16 +197,18 @@ pub async fn authorize_parameter_key_origins_with_conn(
     identity_id: Option<Id>,
     secrets: &[crate::secret_values::StoredSecretValue],
 ) -> Result<()> {
-    let authority = match identity_id {
+    let authorities = match identity_id {
         Some(identity_id) => {
-            Some(DelegationAuthority::load_for_share(connection, identity_id).await?)
+            vec![DelegationAuthority::load_for_share(connection, identity_id).await?]
         }
-        None => None,
+        None => Vec::new(),
     };
     for secret in secrets {
         check_parameter_origins(
             connection,
-            authority.as_ref(),
+            &authorities,
+            None,
+            &secret.json_path,
             secret,
             &mut std::collections::BTreeSet::new(),
             0,
@@ -177,7 +220,9 @@ pub async fn authorize_parameter_key_origins_with_conn(
 
 fn check_parameter_origins<'a>(
     connection: &'a mut sqlx::PgConnection,
-    authority: Option<&'a DelegationAuthority>,
+    authorities: &'a [DelegationAuthority],
+    recorded_execution: Option<Id>,
+    destination_path: &'a str,
     secret: &'a crate::secret_values::StoredSecretValue,
     visited: &'a mut std::collections::BTreeSet<(String, Id, String)>,
     depth: usize,
@@ -197,14 +242,66 @@ fn check_parameter_origins<'a>(
         if provenance.origins.is_empty() {
             return Err(denied());
         }
+        let ownership = if authorities
+            .iter()
+            .any(DelegationAuthority::needs_key_ownership)
+        {
+            let ids = provenance
+                .origins
+                .iter()
+                .filter_map(|origin| match origin {
+                    SecretOrigin::Key(origin) => Some(origin.key_id),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut ownership = VerifiedKeyOrigins::default();
+            for batch in ids.chunks(64) {
+                ownership.extend(VerifiedKeyOrigins::load(&mut *connection, batch).await?);
+            }
+            ownership
+        } else {
+            VerifiedKeyOrigins::default()
+        };
         for origin in provenance.origins {
+            if let Some(execution) = recorded_execution {
+                if crate::repositories::declared_input::DeclaredInputRepository::delivery_allowed(
+                    connection,
+                    execution,
+                    destination_path,
+                    &origin,
+                )
+                .await?
+                {
+                    continue;
+                }
+                if crate::repositories::immutable_input_origin::is_immutable_origin(&origin) {
+                    if crate::repositories::execution_admission::ExecutionAdmissionRepository::input_runtime_origin_allowed(
+                        connection, execution, &origin,
+                    ).await? { continue; }
+                    return Err(denied());
+                }
+            }
             match origin {
                 SecretOrigin::Key(origin) => {
-                    let authority = authority.ok_or_else(denied)?;
-                    if !authority.key_allows(&origin, Action::Read)
-                        || origin.encrypted && !authority.key_allows(&origin, Action::Decrypt)
+                    for action in [Action::Read]
+                        .into_iter()
+                        .chain(origin.encrypted.then_some(Action::Decrypt))
                     {
-                        return Err(denied());
+                        let allowed = if let Some(execution) = recorded_execution {
+                            crate::repositories::execution_admission::ExecutionAdmissionRepository::input_key_origin_allowed(
+                                connection, execution, &origin, action,
+                            ).await?
+                        } else {
+                            !authorities.is_empty()
+                                && authorities.iter().all(|authority| {
+                                    authority.key_allows_verified(&origin, action, &ownership)
+                                })
+                        };
+                        if !allowed {
+                            return Err(denied());
+                        }
                     }
                 }
                 SecretOrigin::QueueItem { .. } => {
@@ -236,14 +333,36 @@ fn check_parameter_origins<'a>(
                     if entity_type == crate::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION {
                         let revision = crate::repositories::component_configuration::ComponentConfigurationRepository::find(&mut *connection, entity_id)
                             .await?.ok_or_else(denied)?;
-                        if !crate::repositories::component_configuration::ComponentConfigurationRepository::owner_survives(connection, &revision).await? {return Err(denied());}
-                        let authority = authority.ok_or_else(denied)?;
-                        let mut context = AuthorizationContext::new(authority.identity_id);
-                        context.target_id = Some(revision.owner_id);
-                        context.target_ref = Some(revision.owner_ref);
-                        context.pack_ref = Some(revision.pack_ref);
-                        let (resource, read) = if revision.owner_kind == "pack" {(Resource::Packs, Action::Read)} else {(Resource::Triggers, Action::Update)};
-                        for action in [read, Action::Decrypt] {if !authority.allows(resource, action, context.clone()) {return Err(denied());}}
+                        if !crate::repositories::component_configuration::ComponentConfigurationRepository::owner_survives(connection, &revision).await? {
+                            return Err(denied());
+                        }
+                        if authorities.is_empty() {
+                            return Err(denied());
+                        }
+                        let managing_pack = match revision.owner_kind.as_str() {
+                            "pack" => Some(revision.owner_id),
+                            "sensor" => crate::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                                &mut *connection, crate::repositories::runtime_target::ComponentTarget::Sensor, revision.owner_id,
+                            ).await?,
+                            _ => None,
+                        };
+                        for authority in authorities {
+                            let mut context = AuthorizationContext::new(authority.identity_id);
+                            context.managing_pack_id = managing_pack;
+                            context.target_id = Some(revision.owner_id);
+                            context.target_ref = Some(revision.owner_ref.clone());
+                            context.pack_ref = Some(revision.pack_ref.clone());
+                            let (resource, read) = if revision.owner_kind == "pack" {
+                                (Resource::Packs, Action::Read)
+                            } else {
+                                (Resource::Triggers, Action::Update)
+                            };
+                            for action in [read, Action::Decrypt] {
+                                if !authority.allows(resource, action, context.clone()) {
+                                    return Err(denied());
+                                }
+                            }
+                        }
                     }
                     if entity_type
                         == crate::repositories::sensor_schema::ENTITY_SENSOR_RULE_DELIVERY_CONFIG
@@ -283,7 +402,9 @@ fn check_parameter_origins<'a>(
                         .ok_or_else(denied)?;
                     check_parameter_origins(
                         &mut *connection,
-                        authority,
+                        authorities,
+                        recorded_execution,
+                        destination_path,
                         parent,
                         visited,
                         depth + 1,

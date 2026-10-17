@@ -44,9 +44,7 @@ use crate::{
     },
     middleware::{ApiError, ApiResult},
     routes::rule_lifecycle_notifier::notify_rule_lifecycle_changed,
-    routes::visibility::{
-        build_visibility_read_scope, is_scoped_identity_token, scope_allows_resource_ref,
-    },
+    routes::visibility::{build_visibility_read_scope, is_scoped_identity_token},
     state::AppState,
     validation::params::{
         validate_action_params_with_registry, validate_rule_params_with_registry,
@@ -504,7 +502,19 @@ pub async fn get_rule(
     // rule read grant covering this rule. Deny as NotFound to avoid leaking
     // rule existence to unauthorized callers.
     if let Some(scope) = rule_read_visibility(&state, &user).await? {
-        if !scope_allows_resource_ref(&scope, Some(rule.id), Some(rule.r#ref.as_str())) {
+        let managing_pack =
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                &state.db,
+                attune_common::repositories::runtime_target::ComponentTarget::Rule,
+                rule.id,
+            )
+            .await?;
+        if !super::visibility::scope_allows_owned_resource_ref(
+            &scope,
+            Some(rule.id),
+            Some(rule.r#ref.as_str()),
+            managing_pack,
+        ) {
             return Err(ApiError::NotFound(format!("Rule '{}' not found", rule_ref)));
         }
     }
@@ -795,8 +805,23 @@ pub async fn update_rule(
     let authz = state.authorization_service();
     let mut ctx = AuthorizationContext::new(identity_id);
     ctx.target_id = Some(existing_rule.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Rule,
+            existing_rule.id,
+        )
+        .await?;
     ctx.target_ref = Some(existing_rule.r#ref.clone());
     ctx.pack_ref = Some(existing_rule.pack_ref.clone());
+    let authorized_managing_pack =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Rule,
+            existing_rule.id,
+        )
+        .await?;
+    ctx.managing_pack_id = authorized_managing_pack;
     authz
         .authorize(
             &user,
@@ -836,7 +861,7 @@ pub async fn update_rule(
         &existing_rule.r#ref,
     )?;
 
-    if request.action_params.is_some() || request.action_ref.is_some() {
+    if existing_rule.is_adhoc && (request.action_params.is_some() || request.action_ref.is_some()) {
         validate_action_params_with_registry(
             &state.db,
             &action,
@@ -877,7 +902,8 @@ pub async fn update_rule(
         None => None,
     };
     if let Some(permission_refs_to_validate) = permission_refs_to_validate {
-        if !permission_refs_to_validate.is_empty()
+        if existing_rule.is_adhoc
+            && !permission_refs_to_validate.is_empty()
             && !state
                 .authorization_service()
                 .can_delegate_permission_sets(&user, &permission_refs_to_validate)
@@ -891,13 +917,27 @@ pub async fn update_rule(
     }
 
     let authorized_rule_id = existing_rule.id;
+    let authorized_rule_pack = existing_rule.pack;
+    let authorized_rule_updated = existing_rule.updated;
     let mut tx = state.db.begin().await?;
-    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
-    if existing_rule.id != authorized_rule_id {
+    let current_managing_pack =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &mut *tx,
+            attune_common::repositories::runtime_target::ComponentTarget::Rule,
+            existing_rule.id,
+        )
+        .await?;
+    if existing_rule.id != authorized_rule_id
+        || existing_rule.pack != authorized_rule_pack
+        || existing_rule.updated != authorized_rule_updated
+        || current_managing_pack != authorized_managing_pack
+    {
         return Err(ApiError::Conflict(format!(
             "Rule '{}' changed while the update was being authorized",
             rule_ref
@@ -929,7 +969,7 @@ pub async fn update_rule(
         "rule",
         &existing_rule.r#ref,
     )?;
-    if request.action_params.is_some() || request.action_ref.is_some() {
+    if existing_rule.is_adhoc && (request.action_params.is_some() || request.action_ref.is_some()) {
         validate_rule_params_with_registry(
             &mut tx,
             &action.r#ref,
@@ -1001,21 +1041,25 @@ pub async fn update_rule(
     let authority_change = !existing_rule.is_adhoc
         && (request.action_ref.is_some() || request.permission_set_refs.is_some());
     let input_change = !existing_rule.is_adhoc
-        && (authority_change
+        && (request.action_ref.is_some()
             || request.conditions.is_some()
             || request.action_params.is_some()
             || request.trigger_ref.is_some()
             || request.trigger_params.is_some()
             || request.trace_tag_template.is_some());
-    let mutation_authority = if input_change {
-        let authority =
-            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
-                .await?;
-        attune_common::repositories::rule_authority::RuleAuthorityRepository::require_mutation_authority(&mut tx, &existing_rule, &authority).await?;
-        Some(authority)
-    } else {
-        None
-    };
+    let policy_change =
+        !existing_rule.is_adhoc && (authority_change || input_change || sensor_placement.is_some());
+    if input_change {
+        // An authorized managed behavior edit retains this purpose-specific
+        // ceiling. It neither borrows the editor's Key grants nor recaptures
+        // mutable input permission sets under a new runtime policy.
+        attune_common::repositories::rule_authority::RuleAuthorityRepository::current(
+            &mut tx,
+            &existing_rule,
+        )
+        .await?
+        .ok_or_else(|| ApiError::Conflict("Managed rule input authority is unavailable".into()))?;
+    }
 
     // Create update input
     let update_input = UpdateRuleInput {
@@ -1041,10 +1085,6 @@ pub async fn update_rule(
     };
 
     let mut rule = RuleRepository::update(&mut *tx, existing_rule.id, update_input).await?;
-    if authority_change {
-        attune_common::repositories::rule_authority::RuleAuthorityRepository::refresh_execution_refs(&mut tx, &rule,
-            mutation_authority.as_ref().ok_or_else(|| ApiError::Forbidden("Rule mutation authority is unavailable".into()))?).await?;
-    }
     if let Some(sensor_placement) = sensor_placement {
         rule =
             RuleRepository::update_sensor_placement(&mut *tx, existing_rule.id, sensor_placement)
@@ -1059,6 +1099,47 @@ pub async fn update_rule(
         reject_sensor_admission(
             SensorAdmissionRepository::assess_rule(&mut tx, rule.id, requirement).await?,
         )?;
+    }
+    if policy_change {
+        let revision = attune_common::repositories::managed_component_readmission::ManagedComponentReadmission::rule(&mut tx, rule.id, identity_id).await?
+            .ok_or_else(|| ApiError::Conflict("Managed rule admission is unavailable".into()))?;
+        let binding = attune_common::runtime_authority::InvocationBinding::Rule {
+            rule_ref: rule.r#ref.clone(),
+            action_ref: rule.action_ref.clone(),
+        };
+        let target = attune_common::repositories::managed_executable::ManagedExecutableRepository::resolve_invocation(&mut tx, &revision.policy, &binding).await?;
+        let has_input_schema = target.executable.action.param_schema.is_some()
+            || target
+                .executable
+                .workflow_definition
+                .as_ref()
+                .is_some_and(|workflow| {
+                    workflow.param_schema.is_some()
+                        || workflow
+                            .definition
+                            .get("parameters")
+                            .is_some_and(|schema| !schema.is_null())
+                });
+        if has_input_schema {
+            let schemas = attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &target).await?;
+            let contract = attune_common::value_schema::CompiledContract::new(&schemas.input)
+                .map_err(|_| {
+                    ApiError::ValidationError("Invalid admitted rule input contract".into())
+                })?;
+            contract
+                .validate_rule_secret_templates(&rule.action_params)
+                .map_err(|error| {
+                    ApiError::ValidationError(format!(
+                        "Rule secret parameters require whole Key templates: {error}"
+                    ))
+                })?;
+            contract
+                .apply_defaults(&rule.action_params)
+                .and_then(|defaulted| contract.validate_authoring(&defaulted))
+                .map_err(|error| {
+                    ApiError::ValidationError(format!("Invalid admitted rule parameters: {error}"))
+                })?;
+        }
     }
     tx.commit().await?;
 
@@ -1193,6 +1274,13 @@ pub async fn delete_rule(
         let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_id = Some(rule.id);
+        ctx.managing_pack_id =
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                &state.db,
+                attune_common::repositories::runtime_target::ComponentTarget::Rule,
+                rule.id,
+            )
+            .await?;
         ctx.target_ref = Some(rule.r#ref.clone());
         ctx.pack_ref = Some(rule.pack_ref.clone());
         authz

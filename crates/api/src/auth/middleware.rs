@@ -40,6 +40,26 @@ pub struct AuthenticatedUser {
 }
 
 impl AuthenticatedUser {
+    /// Order-only fence for routes with their own parent-protection protocol.
+    /// Taking this lock grants no authority. The route must still validate its
+    /// recorded source on the same connection before accessing any target.
+    pub async fn lock_recorded_capture_admission(
+        &self,
+        connection: &mut sqlx::PgConnection,
+    ) -> attune_common::Result<()> {
+        let binding = self.claims.admitted_execution_credential().map_err(|_| {
+            attune_common::Error::PermissionDenied("Invalid recorded execution credential".into())
+        })?;
+        if let Some(binding) = binding {
+            attune_common::repositories::runtime_read::RuntimeReadRepository::lock_open(
+                connection,
+                binding.admission_id,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Descriptive IDs for an already authenticated request, never a permit.
     /// Do not copy credentials, policy bodies or input values into audit events.
     pub fn with_recorded_audit_context(&self, details: serde_json::Value) -> serde_json::Value {
@@ -59,6 +79,27 @@ impl AuthenticatedUser {
     }
 
     pub async fn recorded_runtime_authority(
+        &self,
+        connection: &mut sqlx::PgConnection,
+    ) -> attune_common::Result<
+        Option<attune_common::repositories::runtime_authority::ValidatedRuntimeAuthority>,
+    > {
+        let Some(authority) = self.validate_recorded_runtime_authority(connection).await? else {
+            return Ok(None);
+        };
+        // Acquire before route targets, and after canonical source validation.
+        attune_common::repositories::runtime_read::RuntimeReadRepository::lock_open(
+            connection,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+        authority.ensure_fresh_on(connection).await?;
+        Ok(Some(authority))
+    }
+
+    /// Live acquisition orders both capture fences after canonical source
+    /// validation. Taking capture before source would invert ordinary SDK reads.
+    pub(crate) async fn validate_recorded_runtime_authority(
         &self,
         connection: &mut sqlx::PgConnection,
     ) -> attune_common::Result<
@@ -159,13 +200,20 @@ pub async fn require_auth(
     Ok(next.run(request).await)
 }
 
-/// Extractor for authenticated user
-pub struct RequireAuth(pub AuthenticatedUser);
+/// Protected-route extractor. The default remains JWT/user authentication.
+/// Purpose-specific contexts must supply their own authenticated extractor;
+/// they cannot manufacture or fall back to an AuthenticatedUser.
+pub struct RequireAuth<T = AuthenticatedUser>(pub T);
 
 /// Trusted route marker. A recorded token must not fall through an unconverted
 /// consumer that relies only on its token type or mutable human IAM.
 #[derive(Clone, Copy)]
 pub(crate) enum RecordedRuntimeConsumer {
+    ExecutionStream,
+    ExecutionCreate,
+    ExecutionMetadata,
+    ExecutionControl,
+    QueueOperations,
     EventIngress,
     KeyRead,
     KeyList,
@@ -176,9 +224,14 @@ pub(crate) enum RecordedRuntimeConsumer {
     CacheRead,
     CacheDataMutation,
     KeySigning,
+    ArtifactMetadataRead,
+    ArtifactVersionRead,
+    ArtifactCreate,
+    ArtifactDataMutation,
+    ArtifactMetadataMutation,
 }
 
-impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth {
+impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth<AuthenticatedUser> {
     type Rejection = AuthError;
 
     async fn from_request_parts(
@@ -196,6 +249,17 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth 
         };
 
         // Allow access, sensor, execution, and worker tokens
+        if claims.scope.as_deref() == Some("worker_delivery") {
+            attune_common::worker_delivery::credential(&claims)
+                .map_err(|_| AuthError::InvalidToken)?;
+            if parts
+                .extensions
+                .get::<crate::recorded_files::WorkerDeliveryConsumer>()
+                .is_none()
+            {
+                return Err(AuthError::Unauthorized);
+            }
+        }
         if claims.token_type != TokenType::Access
             && claims.token_type != TokenType::Sensor
             && claims.token_type != TokenType::Execution

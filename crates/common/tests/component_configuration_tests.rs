@@ -18,6 +18,328 @@ use serde_json::json;
 const KEY: &str = "configuration-test-encryption-key";
 
 #[tokio::test]
+async fn aged_release_defaults_stay_pinned_and_reclamation_respects_the_batch_limit() {
+    let pool = create_test_pool().await.unwrap();
+    let pack = PackFixture::new_unique("defaults_retention")
+        .create(&pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    ComponentConfigurationRepository::lock_selection(&mut tx)
+        .await
+        .unwrap();
+    ComponentConfigurationRepository::bind_release_pack(
+        &mut tx,
+        &pack,
+        &json!({"count":1}),
+        Some(KEY),
+    )
+    .await
+    .unwrap();
+    let defaults_id: i64 = sqlx::query_scalar("SELECT defaults_revision FROM component_configuration_layers WHERE owner_kind = 'pack' AND owner_id = $1")
+        .bind(pack.id).fetch_one(&mut *tx).await.unwrap();
+    let defaults = ComponentConfigurationRepository::find(&mut *tx, defaults_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Fixture insertion respects immutable records: never rewrite applied migration
+    // bytes, existing timestamps, contracts or ciphertext to simulate aging.
+    let mut aged = Vec::new();
+    for _ in 0..3 {
+        let id: i64 = sqlx::query_scalar("INSERT INTO component_configuration_revision (owner_kind,owner_id,owner_ref,pack_ref,contract,binding_digest,config,created) VALUES ('pack',$1,$2,$2,$3,$4,$5,NOW()-INTERVAL '2 hours') RETURNING id")
+            .bind(pack.id).bind(&pack.r#ref).bind(&defaults.contract).bind(&defaults.binding_digest)
+            .bind(&defaults.config).fetch_one(&mut *tx).await.unwrap();
+        aged.push(id);
+    }
+    sqlx::query("UPDATE component_configuration_layers SET defaults_revision = $1 WHERE owner_kind = 'pack' AND owner_id = $2")
+        .bind(aged[0]).bind(pack.id).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        ComponentConfigurationRepository::cleanup_retired(&pool, 0)
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+    assert_eq!(
+        ComponentConfigurationRepository::cleanup_retired(&pool, 1)
+            .await
+            .unwrap(),
+        (0, 1)
+    );
+    assert!(ComponentConfigurationRepository::find(&*pool, aged[0])
+        .await
+        .unwrap()
+        .is_some());
+    assert!(ComponentConfigurationRepository::find(&*pool, aged[1])
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ComponentConfigurationRepository::find(&*pool, aged[2])
+        .await
+        .unwrap()
+        .is_some());
+    let mut tx = pool.begin().await.unwrap();
+    ComponentConfigurationRepository::lock_selection(&mut tx)
+        .await
+        .unwrap();
+    ComponentConfigurationRepository::bind_release_pack(
+        &mut tx,
+        &pack,
+        &json!({"count":2}),
+        Some(KEY),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        ComponentConfigurationRepository::cleanup_retired(&pool, 1)
+            .await
+            .unwrap(),
+        (0, 1)
+    );
+    assert!(ComponentConfigurationRepository::find(&*pool, aged[0])
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ComponentConfigurationRepository::find(&*pool, aged[2])
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        ComponentConfigurationRepository::cleanup_retired(&pool, 1)
+            .await
+            .unwrap(),
+        (0, 1)
+    );
+    assert!(ComponentConfigurationRepository::find(&*pool, aged[2])
+        .await
+        .unwrap()
+        .is_none());
+    let current = ComponentConfigurationRepository::current(&*pool, "pack", pack.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.config["count"], 2);
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn pack_and_sensor_release_defaults_overrides_null_and_reset_agree() {
+    let pool = create_test_pool().await.unwrap();
+    let pack = PackFixture::new_unique("layer_config")
+        .create(&pool)
+        .await
+        .unwrap();
+    let runtime = helpers::RuntimeFixture::new(Some(pack.id), Some(pack.r#ref.clone()), "python")
+        .create(&pool)
+        .await
+        .unwrap();
+    let sensor = helpers::SensorFixture::new(
+        Some(pack.id),
+        Some(pack.r#ref.clone()),
+        runtime.id,
+        runtime.r#ref,
+        "reader",
+    )
+    .create(&pool)
+    .await
+    .unwrap();
+    let schema = json!({
+        "count":{"type":"integer","default":1},
+        "nullable":{"type":["string","null"],"default":"release"},
+        "object":{"type":"object","default":{"nested":1},"properties":{"nested":{"type":"integer","default":1}}},
+        "list":{"type":"array","items":{"type":"integer"},"default":[1,2]},
+        "token":{"type":"string","secret":true}
+    });
+    for (kind, owner, reference) in [
+        ("pack", pack.id, &pack.r#ref),
+        ("sensor", sensor.id, &sensor.r#ref),
+    ] {
+        let mut tx = pool.begin().await.unwrap();
+        ComponentConfigurationRepository::lock_selection(&mut tx)
+            .await
+            .unwrap();
+        let initial = ComponentConfigurationRepository::bind_layers(
+            &mut tx,
+            kind,
+            owner,
+            reference,
+            &pack.r#ref,
+            None,
+            &schema,
+            &json!({}),
+            None,
+            &[],
+            Some(&json!({})),
+            Some(KEY),
+        )
+        .await
+        .unwrap();
+        assert_eq!(initial.config["count"], 1);
+        let patch = json!({"object":{"custom":2},"list":[9],"nullable":null,"token":"do-not-leak-layer-secret"});
+        let overridden = ComponentConfigurationRepository::bind_layers(
+            &mut tx,
+            kind,
+            owner,
+            reference,
+            &pack.r#ref,
+            None,
+            &schema,
+            &initial.config,
+            Some(&patch),
+            &[],
+            None,
+            Some(KEY),
+        )
+        .await
+        .unwrap();
+        assert_eq!(overridden.config["object"], json!({"custom":2}));
+        assert_eq!(overridden.config["list"], json!([9]));
+        assert!(overridden.config["nullable"].is_null());
+        assert!(!overridden
+            .config
+            .to_string()
+            .contains("do-not-leak-layer-secret"));
+        let deployed = ComponentConfigurationRepository::bind_layers(
+            &mut tx,
+            kind,
+            owner,
+            reference,
+            &pack.r#ref,
+            None,
+            &schema,
+            &overridden.config,
+            None,
+            &[],
+            Some(&json!({"count":3,"object":{"nested":4},"list":[4,5],"nullable":"new"})),
+            Some(KEY),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deployed.config["count"], 3);
+        assert_eq!(deployed.config["object"], json!({"custom":2}));
+        assert!(deployed.config["nullable"].is_null());
+        let reset = ComponentConfigurationRepository::bind_layers(
+            &mut tx,
+            kind,
+            owner,
+            reference,
+            &pack.r#ref,
+            None,
+            &schema,
+            &deployed.config,
+            None,
+            &[
+                "object".into(),
+                "list".into(),
+                "nullable".into(),
+                "token".into(),
+            ],
+            None,
+            Some(KEY),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reset.config,
+            json!({"count":3,"object":{"nested":4},"list":[4,5],"nullable":"new"})
+        );
+        let old = ComponentConfigurationRepository::restore(&mut tx, &overridden, Some(KEY))
+            .await
+            .unwrap();
+        assert_eq!(old["token"], "do-not-leak-layer-secret");
+        let error = ComponentConfigurationRepository::bind_layers(
+            &mut tx,
+            kind,
+            owner,
+            reference,
+            &pack.r#ref,
+            None,
+            &schema,
+            &reset.config,
+            Some(&json!({"unknown":"do-not-leak-layer-secret"})),
+            &[],
+            None,
+            Some(KEY),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.to_string().contains("do-not-leak-layer-secret"));
+        tx.rollback().await.unwrap();
+    }
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn historical_values_become_overrides_and_capability_selectors_require_readmission() {
+    let pool = create_test_pool().await.unwrap();
+    let pack = PackFixture::new_unique("historical_layers")
+        .create(&pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    ComponentConfigurationRepository::lock_selection(&mut tx)
+        .await
+        .unwrap();
+    let pack = PackRepository::update(
+        &mut *tx,
+        pack.id,
+        UpdatePackInput {
+            config: Some(json!({"count":7})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    ComponentConfigurationRepository::preserve_before_deployment(&mut tx, pack.id, Some(KEY))
+        .await
+        .unwrap();
+    let original = ComponentConfigurationRepository::current(&mut *tx, "pack", pack.id)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM component_configuration_layers WHERE owner_kind = 'pack' AND owner_id = $1",
+    )
+    .bind(pack.id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let deployed = ComponentConfigurationRepository::bind_release_pack(
+        &mut tx,
+        &pack,
+        &json!({"count":9}),
+        Some(KEY),
+    )
+    .await
+    .unwrap();
+    assert_eq!(deployed.config["count"], 7);
+    let reset = ComponentConfigurationRepository::patch_pack(
+        &mut tx,
+        &pack,
+        None,
+        &["count".into()],
+        Some(KEY),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reset.config["count"], 9);
+    assert_eq!(original.config["count"], 7);
+    for field in [
+        "input_permission_set_refs",
+        "cache_permission_set_refs",
+        "signing_permission_set_refs",
+    ] {
+        assert!(
+            attune_common::repositories::component_configuration::sensor_authority_field(field)
+        );
+    }
+    assert!(!attune_common::repositories::component_configuration::sensor_authority_field("label"));
+    tx.rollback().await.unwrap();
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn equivalent_deployments_preserve_ciphertext_without_decrypt_but_schema_migration_requires_it(
 ) {
     let pool = create_test_pool().await.unwrap();

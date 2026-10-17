@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "docker_context": "default",
+  "buildx_builder": "REQUIRED_CENTRAL_PERMISSIONED_BUILDER",
+  "platform": "linux/amd64",
+  "source_archive": "/owned/source/integrated-source.tar",
+  "source_sha256": "REQUIRED_MEASURED_SOURCE_ARCHIVE_SHA256",
+  "source_revision": "REQUIRED_REAL_SOURCE_REVISION",
+  "source_date_epoch": 0,
+  "base_images": {
+    "toolchain": "REQUIRED_PINNED_RUST_ZIG_NATIVE_MUSL_TOOLCHAIN_AT_SHA256",
+    "node": "REQUIRED_PINNED_NODE24_IMAGE_AT_SHA256",
+    "service": "REQUIRED_PINNED_COMPATIBLE_RUNTIME_BASE_AT_SHA256",
+    "python": "REQUIRED_PINNED_PYTHON_WITH_PYYAML_AT_SHA256",
+    "busybox": "REQUIRED_PINNED_BUSYBOX_AT_SHA256",
+    "postgres": "REQUIRED_PINNED_POSTGRES18_CLIENT_IMAGE_AT_SHA256",
+    "nginx": "REQUIRED_PINNED_NGINX_AT_SHA256"
+  }
+}

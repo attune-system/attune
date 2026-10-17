@@ -72,8 +72,9 @@ pub struct SaveWorkflowFileRequest {
     #[schema(example = json!(["incident_response", "deployments"]), default = json!([]))]
     pub reference_allowed_pack_refs: Vec<String>,
 
-    /// The full workflow definition as JSON (will be serialized to YAML on disk)
-    #[schema(value_type = Object)]
+    /// The full workflow definition as JSON. Tasks with a templated action must
+    /// declare allowed_action_refs, an array of 1 to 256 literal action refs.
+    #[schema(value_type = Object, example = json!({"tasks":[{"name":"choose","action":"{{ parameters.target }}","allowed_action_refs":["example.first","example.second"]}]}))]
     pub definition: JsonValue,
 
     /// Parameter schema (flat format with inline required/secret)
@@ -160,8 +161,10 @@ pub struct UpdateWorkflowRequest {
     #[schema(value_type = Object, nullable = true)]
     pub out_schema: Option<JsonValue>,
 
-    /// Workflow definition
-    #[schema(value_type = Object, nullable = true)]
+    /// Workflow definition. A task with a templated action requires a finite
+    /// literal allowed_action_refs array. Rendered permissions only reduce its
+    /// admitted per-target ceiling.
+    #[schema(value_type = Object, nullable = true, example = json!({"tasks":[{"name":"choose","action":"{{ parameters.target }}","allowed_action_refs":["example.first","example.second"]}]}))]
     pub definition: Option<JsonValue>,
 
     /// Tags

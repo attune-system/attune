@@ -4,6 +4,8 @@
 //! schema admission, pack, runtime sponsor, policy, runtime owner, approvals.
 //! Human identities are checked only when issuing an approval, not at consumption.
 
+pub mod recorded_collections;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
@@ -133,10 +135,86 @@ pub struct ValidatedRuntimeAuthority {
     approvals: BTreeSet<Id>,
     current_attempt: Uuid,
     standard_owners: BTreeSet<(String, Id)>,
+    concrete_targets: BTreeMap<String, crate::runtime_authority::GrantTargetBindings>,
+    effect_fence: ApprovalEffectFence,
+}
+
+/// Approval rows remain locked by the source-validation transaction. Row locks
+/// fence revocation, but cannot stop wall-clock expiry while waiting on a target.
+/// Carry this opaque deadline through every target/version/capture wait and check
+/// it immediately before the effect or disclosure. Reacquire per transaction.
+#[derive(Debug, Clone)]
+pub struct ApprovalEffectFence {
+    earliest_expiry: Option<DateTime<Utc>>,
+}
+
+impl ApprovalEffectFence {
+    pub(crate) fn from_input_approval(expiry: Option<DateTime<Utc>>) -> Result<Self> {
+        let fence = Self {
+            earliest_expiry: expiry,
+        };
+        fence.ensure_fresh()?;
+        Ok(fence)
+    }
+    pub fn approval_deadline(&self) -> Option<DateTime<Utc>> {
+        self.earliest_expiry
+    }
+    pub fn ensure_fresh(&self) -> Result<()> {
+        self.check_at(Utc::now())
+    }
+
+    /// Uses PostgreSQL's current wall clock, never transaction-start `now()`.
+    /// This acquires no source, target or approval row lock and cannot invert
+    /// their ordering. Call AFTER the actual target/version/capture locks.
+    pub async fn ensure_fresh_on(&self, connection: &mut PgConnection) -> Result<()> {
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(connection)
+            .await?;
+        self.check_at(now)
+    }
+
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            earliest_expiry: self
+                .earliest_expiry
+                .into_iter()
+                .chain(other.earliest_expiry)
+                .min(),
+        }
+    }
+
+    fn check_at(&self, now: DateTime<Utc>) -> Result<()> {
+        if self.earliest_expiry.is_some_and(|expiry| expiry <= now) {
+            return Err(Error::PermissionDenied(
+                "Validated external approval expired before effect or disclosure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct ValidatedApprovals {
+    ids: BTreeSet<Id>,
+    fence: ApprovalEffectFence,
 }
 
 impl ValidatedRuntimeAuthority {
+    pub fn effect_fence(&self) -> &ApprovalEffectFence {
+        &self.effect_fence
+    }
+
+    pub fn ensure_fresh(&self) -> Result<()> {
+        self.effect_fence.ensure_fresh()
+    }
+
+    pub async fn ensure_fresh_on(&self, connection: &mut PgConnection) -> Result<()> {
+        self.effect_fence.ensure_fresh_on(connection).await
+    }
+
     pub fn cache_read_filters(&self) -> Vec<super::cache::CacheNamespaceGrantFilter> {
+        if self.ensure_fresh().is_err() {
+            return Vec::new();
+        }
         use super::cache::{CacheGrantContext, CacheNamespaceGrantFilter, CacheOwnershipScope};
         let mut filters: Vec<_> =
             self.record
@@ -153,7 +231,36 @@ impl ValidatedRuntimeAuthority {
                         } if self.approvals.contains(approval_id) => CacheOwnershipScope::Any,
                         _ => return None,
                     };
-                    CacheNamespaceGrantFilter::from_recorded_grant(grant.grant(), ownership)
+                    let binding = self
+                        .concrete_targets
+                        .get(&super::runtime_target_binding::grant_key(grant).ok()?)?;
+                    let mut filter =
+                        CacheNamespaceGrantFilter::from_recorded_grant(grant.grant(), ownership)?;
+                    if let Some(targets) = &binding.targets {
+                        filter.pinned_targets = Some(
+                            targets
+                                .iter()
+                                .filter(|target| target.kind == "cache_namespace")
+                                .cloned()
+                                .collect(),
+                        );
+                        let ids = targets
+                            .iter()
+                            .filter(|target| target.kind == "cache_namespace")
+                            .map(|target| target.id)
+                            .filter(|id| filter.ids.as_ref().is_none_or(|ids| ids.contains(id)))
+                            .collect();
+                        filter.ids = Some(ids);
+                    }
+                    filter.pinned_owners = binding
+                        .owners
+                        .as_ref()
+                        .map(|owners| owners.iter().cloned().collect());
+                    filter.pinned_packs = binding
+                        .packs
+                        .as_ref()
+                        .map(|packs| packs.iter().copied().collect());
+                    Some(filter)
                 })
                 .collect();
         filters.extend(self.standard_owners.iter().filter_map(|(kind, id)| {
@@ -172,6 +279,9 @@ impl ValidatedRuntimeAuthority {
     }
 
     pub fn key_read_filters(&self) -> Vec<super::key::KeyGrantFilter> {
+        if self.ensure_fresh().is_err() {
+            return Vec::new();
+        }
         use super::key::{KeyGrantFilter, KeyOwnershipScope};
         let mut filters: Vec<_> =
             self.record
@@ -188,7 +298,35 @@ impl ValidatedRuntimeAuthority {
                         } if self.approvals.contains(approval_id) => KeyOwnershipScope::Any,
                         _ => return None,
                     };
-                    KeyGrantFilter::from_recorded_grant(grant.grant(), ownership)
+                    let binding = self
+                        .concrete_targets
+                        .get(&super::runtime_target_binding::grant_key(grant).ok()?)?;
+                    let mut filter = KeyGrantFilter::from_recorded_grant(grant.grant(), ownership)?;
+                    if let Some(targets) = &binding.targets {
+                        filter.pinned_targets = Some(
+                            targets
+                                .iter()
+                                .filter(|target| target.kind == "key")
+                                .cloned()
+                                .collect(),
+                        );
+                        let ids = targets
+                            .iter()
+                            .filter(|target| target.kind == "key")
+                            .map(|target| target.id)
+                            .filter(|id| filter.ids.as_ref().is_none_or(|ids| ids.contains(id)))
+                            .collect();
+                        filter.ids = Some(ids);
+                    }
+                    filter.pinned_owners = binding
+                        .owners
+                        .as_ref()
+                        .map(|owners| owners.iter().cloned().collect());
+                    filter.pinned_packs = binding
+                        .packs
+                        .as_ref()
+                        .map(|packs| packs.iter().copied().collect());
+                    Some(filter)
                 })
                 .collect();
         filters.extend(self.standard_owners.iter().filter_map(|(kind, id)| {
@@ -226,6 +364,9 @@ impl ValidatedRuntimeAuthority {
         target: &super::runtime_target::ResolvedRuntimeTarget,
         action: Action,
     ) -> bool {
+        if self.ensure_fresh().is_err() {
+            return false;
+        }
         let context = target.context();
         let standard_operation = match target.resource() {
             Resource::Keys => matches!(action, Action::Read | Action::Decrypt),
@@ -249,6 +390,27 @@ impl ValidatedRuntimeAuthority {
             return true;
         }
         self.record.authority.grants.iter().any(|grant| {
+            // An unscoped external Artifact grant is the public baseline, not
+            // permission to inspect another owner's private data. A local
+            // ownership envelope is itself an explicit structural constraint.
+            let private_artifact = target.resource() == Resource::Artifacts
+                && context.visibility == Some(crate::models::ArtifactVisibility::Private)
+                && matches!(grant, AdmittedGrant::External { .. })
+                && grant.grant().constraints.is_none()
+                && !(context.owner_type == Some(crate::models::OwnerType::Identity)
+                    && context.owner_identity_id == Some(context.identity_id));
+            if private_artifact {
+                return false;
+            }
+            let Ok(key) = super::runtime_target_binding::grant_key(grant) else {
+                return false;
+            };
+            let Some(binding) = self.concrete_targets.get(&key) else {
+                return false;
+            };
+            if !super::runtime_target_binding::matches(binding, target) {
+                return false;
+            }
             let private_key = target.resource() == Resource::Keys
                 && context.owner_type == Some(crate::models::OwnerType::Identity)
                 && context.owner_identity_id != Some(context.identity_id);
@@ -289,15 +451,178 @@ impl ValidatedRuntimeAuthority {
         action: Action,
         context: &AuthorizationContext,
     ) -> bool {
-        self.record
-            .authority
-            .grants
-            .iter()
-            .any(|grant| grant.allows(&self.approvals, target_pack_id, resource, action, context))
+        if self.ensure_fresh().is_err() {
+            return false;
+        }
+        self.record.authority.grants.iter().any(|grant| {
+            // Concrete selectors require the opaque repository-resolved
+            // target API. A hand-built context cannot prove stable identity.
+            let scoped = grant.grant().constraints.as_ref().is_some_and(|scope| {
+                scope.refs.is_some() || scope.owner_refs.is_some() || scope.pack_refs.is_some()
+            });
+            !scoped && grant.allows(&self.approvals, target_pack_id, resource, action, context)
+        })
     }
 }
 
 pub struct RuntimeAuthorityRepository;
+
+impl RuntimeAuthorityRepository {
+    /// Deployment-only lookup of the previous projection. It is not authority
+    /// for new runtime admission after the pack's active release changes.
+    pub(crate) async fn retained_deployment_policy(
+        connection: &mut PgConnection,
+        pack_id: Id,
+    ) -> Result<Option<RuntimePolicyRevision>> {
+        let revision: Option<Id> = sqlx::query_scalar(
+            "SELECT revision FROM pack_runtime_policy_current WHERE pack = $1 FOR SHARE",
+        )
+        .bind(pack_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        match revision {
+            Some(id) => Ok(Self::find_policy(connection, id)
+                .await?
+                .filter(|policy| policy.revoked_at.is_none())),
+            None => Ok(None),
+        }
+    }
+
+    /// Stable system-managed sponsor creation is serialized independently of
+    /// human ownership. No IAM grants are assigned by this operation.
+    pub async fn ensure_owner(
+        connection: &mut PgConnection,
+        pack_id: Id,
+    ) -> Result<PackAuthorityOwner> {
+        use super::Create;
+        positive_id(pack_id)?;
+        SchemaTypeRepository::lock_selection(connection).await?;
+        let reference: String = sqlx::query_scalar("SELECT ref FROM pack WHERE id = $1 FOR SHARE")
+            .bind(pack_id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| Error::validation("Runtime sponsor pack is unavailable"))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('runtime-authority-owner:' || $1::text, 0))")
+            .bind(pack_id).execute(&mut *connection).await?;
+        if let Some(owner) = Self::find_owner(connection, pack_id).await? {
+            return Ok(owner);
+        }
+        let identity = IdentityRepository::create(
+            &mut *connection,
+            super::identity::CreateIdentityInput {
+                login: format!("attune-pack:{}:{}", reference, Uuid::new_v4()),
+                display_name: Some(format!("Pack: {reference}")),
+                password_hash: None,
+                attributes: json!({"type":"pack","pack_ref":reference}),
+            },
+        )
+        .await?;
+        sqlx::query("INSERT INTO pack_runtime_identity (pack,identity) VALUES ($1,$2)")
+            .bind(pack_id)
+            .bind(identity.id)
+            .execute(connection)
+            .await?;
+        Ok(PackAuthorityOwner {
+            pack_id,
+            pack_ref: reference,
+            sponsor_identity_id: identity.id,
+        })
+    }
+
+    /// Readmit future uses of a managed policy edit. Existing admissions keep
+    /// their old immutable set bodies and approval IDs. Invoke in the set-write
+    /// transaction after ordinary Permissions/Manage authorization.
+    pub async fn readmit_permission_set(
+        connection: &mut PgConnection,
+        reference: &str,
+        editor_identity: Id,
+    ) -> Result<Vec<RuntimePolicyRevision>> {
+        SchemaTypeRepository::lock_reclamation(connection).await?;
+        let definition =
+            super::identity::PermissionSetRepository::authored_definition(connection, reference)
+                .await?
+                .ok_or_else(|| Error::validation("Edited policy authoring is unavailable"))?;
+        let declaring_pack = super::identity::PermissionSetRepository::find_by_refs_for_share(
+            connection,
+            &[reference.into()],
+        )
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|set| set.pack);
+        let packs: Vec<Id> = sqlx::query_scalar(
+            "SELECT current.pack FROM pack_runtime_policy_current current \
+             JOIN pack_runtime_policy_revision revision ON revision.id = current.revision \
+             WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(revision.policy->'invocations') invocation \
+                 WHERE invocation->'permission_sets' ? $1) ORDER BY current.pack",
+        ).bind(reference).fetch_all(&mut *connection).await?;
+        let mut revisions = Vec::new();
+        for pack in packs {
+            let current = Self::current_policy(connection, pack)
+                .await?
+                .ok_or_else(|| Error::validation("Edited policy admission is unavailable"))?;
+            let mut policy = current.policy.0;
+            if declaring_pack != Some(policy.owner.pack_id) {
+                // Foreign consumers hold fixed external approval and policy,
+                // not a subscription to the publisher's mutable definition.
+                continue;
+            }
+            let editor = DelegationAuthority::load_for_share(connection, editor_identity).await?;
+            let mut context = AuthorizationContext::new(editor_identity);
+            context.target_id = Some(policy.owner.pack_id);
+            context.target_ref = Some(policy.owner.pack_ref.clone());
+            context.pack_ref = Some(policy.owner.pack_ref.clone());
+            context.managing_pack_id = Some(policy.owner.pack_id);
+            if !editor.allows(Resource::Packs, Action::Configure, context) {
+                return Err(Error::PermissionDenied("Changing an admitted managed policy requires configuration authority on its pack".into()));
+            }
+            let external = definition
+                .grants
+                .iter()
+                .filter(|grant| {
+                    grant.scope.unwrap_or(definition.scope)
+                        == crate::runtime_authority::PermissionScope::External
+                })
+                .cloned()
+                .map(|grant| grant.into_external_approval_grant())
+                .collect::<Result<Vec<_>>>()?;
+            let approvals =
+                Self::admit_external_grants(connection, pack, editor_identity, &external).await?;
+            let admitted = definition.compile(&policy.owner, &approvals)?;
+            for invocation in &mut policy.invocations {
+                if invocation.permission_sets.contains_key(reference) {
+                    invocation
+                        .permission_sets
+                        .insert(reference.into(), admitted.clone());
+                }
+            }
+            let revision = Self::capture_policy(connection, &policy).await?;
+            Self::activate_policy(connection, revision.id).await?;
+            revisions.push(revision);
+        }
+        Ok(revisions)
+    }
+
+    /// Readiness/activation needs the root's FULL admitted ceiling, rather than
+    /// a runtime selection's subset. `require_policy` already checks retained
+    /// publisher dependencies; explicitly check root approvals as well.
+    pub async fn require_deployment_policy(
+        connection: &mut PgConnection,
+        id: Id,
+    ) -> Result<RuntimePolicyRevision> {
+        let policy = Self::require_policy(connection, id).await?;
+        let grants = policy
+            .policy
+            .invocations
+            .iter()
+            .flat_map(|entry| entry.permission_sets.values())
+            .flat_map(|set| set.grants.iter())
+            .collect::<Vec<_>>();
+        let approvals = validate_approvals(connection, &policy.policy.owner, &grants).await?;
+        approvals.fence.ensure_fresh_on(connection).await?;
+        Ok(policy)
+    }
+}
 
 impl RuntimeAuthorityRepository {
     /// Historical, validated selection for worker protection and disclosure.
@@ -349,6 +674,7 @@ impl RuntimeAuthorityRepository {
         let query = format!(
             "SELECT {APPROVAL_COLUMNS} FROM runtime_external_approval \
              WHERE subject_pack = $1 AND revoked_at IS NULL \
+               AND NOT EXISTS(SELECT 1 FROM runtime_input_only_approval input WHERE input.approval = runtime_external_approval.id) \
                AND (expires_at IS NULL OR expires_at > clock_timestamp()) ORDER BY id FOR SHARE",
         );
         let records: Vec<ExternalApprovalRecord> = sqlx::query_as(&query)
@@ -358,20 +684,58 @@ impl RuntimeAuthorityRepository {
         let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *connection)
             .await?;
-        let mut approvals = records
+        let records = records
             .into_iter()
             .filter(|record| record.is_active(now))
-            .map(|record| record.approval())
-            .collect::<Result<Vec<_>>>()?;
-        let missing: Vec<_> = grants
-            .iter()
-            .filter(|grant| {
-                !approvals
-                    .iter()
-                    .any(|approval| approval.covers(&owner, grant))
-            })
-            .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+        let mut projected = BTreeMap::<Id, ExternalApproval>::new();
+        let mut missing = Vec::new();
+        for grant in grants {
+            let mut covered = false;
+            for record in &records {
+                if !record.approval()?.covers(&owner, grant) {
+                    continue;
+                }
+                let admitted = AdmittedGrant::External {
+                    approval_id: record.id,
+                    grant: grant.clone(),
+                };
+                let bindings = super::runtime_target_binding::capture_grants(
+                    connection,
+                    &owner,
+                    std::slice::from_ref(&admitted),
+                    &BTreeMap::new(),
+                )
+                .await?;
+                let binding = &bindings[&super::runtime_target_binding::grant_key(&admitted)?];
+                if !super::runtime_target_binding::approval_covers_binding(
+                    connection, record, &owner, grant, binding,
+                )
+                .await?
+                {
+                    continue;
+                }
+                // Return only the requested, identity-bound portion currently
+                // proven by this fixed approval. The persisted approval remains
+                // unchanged; pure compilation cannot accidentally pick a stale
+                // broader approval merely because its numeric ID is lower.
+                let approval = projected
+                    .entry(record.id)
+                    .or_insert_with(|| ExternalApproval {
+                        id: record.id,
+                        subject_pack_id: subject_pack,
+                        grants: Vec::new(),
+                    });
+                if !approval.grants.contains(grant) {
+                    approval.grants.push(grant.clone());
+                }
+                covered = true;
+            }
+            if !covered {
+                missing.push(grant.clone());
+            }
+        }
+        let mut approvals = projected.into_values().collect::<Vec<_>>();
         if !missing.is_empty() {
             installer.require_grants(&missing).map_err(|_| Error::PermissionDenied(
                 "External runtime scope requires separate approval by an authorized owner or administrator".into(),
@@ -443,6 +807,20 @@ impl RuntimeAuthorityRepository {
             expires_at,
         )
         .await?;
+        let input_only: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM runtime_input_only_approval WHERE approval = $1)",
+        )
+        .bind(previous_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        if input_only {
+            sqlx::query("INSERT INTO runtime_input_only_approval(approval) VALUES ($1)")
+                .bind(replacement.id)
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("INSERT INTO runtime_declared_input_approval(declaration,approval) SELECT declaration,$2 FROM runtime_declared_input_approval WHERE approval = $1")
+                .bind(previous_id).bind(replacement.id).execute(&mut *connection).await?;
+        }
         let revoked = sqlx::query(
             "UPDATE runtime_external_approval SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL",
         ).bind(previous_id).execute(connection).await?;
@@ -512,7 +890,8 @@ impl RuntimeAuthorityRepository {
             .await?
             .ok_or_else(|| Error::PermissionDenied("Approval issuer is unavailable".into()))?;
         let body = approval_body(subject_pack, &grants);
-        let digest = digest(&body).map_err(|_| Error::validation("Invalid approval metadata"))?;
+        let body_digest =
+            digest(&body).map_err(|_| Error::validation("Invalid approval metadata"))?;
         let query = format!(
             "INSERT INTO runtime_external_approval \
              (subject_pack, issuer_identity, issuer_login, grants, approval_digest, expires_at) \
@@ -523,11 +902,34 @@ impl RuntimeAuthorityRepository {
             .bind(issuer_identity)
             .bind(identity.login)
             .bind(Json(grants))
-            .bind(digest)
+            .bind(body_digest)
             .bind(expires_at)
-            .fetch_one(connection)
+            .fetch_one(&mut *connection)
             .await?;
         record.approval()?;
+        let owner = Self::ensure_owner(connection, subject_pack).await?;
+        let admitted = record
+            .grants
+            .iter()
+            .map(|grant| AdmittedGrant::External {
+                approval_id: record.id,
+                grant: grant.clone(),
+            })
+            .collect::<Vec<_>>();
+        let bindings = super::runtime_target_binding::capture_grants(
+            connection,
+            &owner,
+            &admitted,
+            &BTreeMap::new(),
+        )
+        .await?;
+        for grant in &admitted {
+            let key = super::runtime_target_binding::grant_key(grant)?;
+            let grant_digest = digest(&serde_json::to_value(grant.grant())?)
+                .map_err(|_| Error::validation("Invalid approval grant digest"))?;
+            sqlx::query("INSERT INTO runtime_external_approval_target_binding (approval,grant_digest,binding) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+                .bind(record.id).bind(grant_digest).bind(Json(&bindings[&key])).execute(&mut *connection).await?;
+        }
         Ok(record)
     }
 
@@ -554,8 +956,18 @@ impl RuntimeAuthorityRepository {
         policy: &RuntimePolicy,
     ) -> Result<RuntimePolicyRevision> {
         policy.validate()?;
-        SchemaTypeRepository::lock_selection(&mut *connection).await?;
+        SchemaTypeRepository::lock_reclamation(&mut *connection).await?;
         lock_sponsor(connection, &policy.owner).await?;
+        let mut captured = policy.clone();
+        super::runtime_target_binding::capture(connection, &mut captured).await?;
+        super::managed_executable::ManagedExecutableRepository::capture_sources(
+            connection,
+            &mut captured,
+        )
+        .await?;
+        super::workflow_policy::WorkflowPolicyRepository::capture(connection, &mut captured)
+            .await?;
+        let policy = &captured;
         let release: Option<String> = sqlx::query_scalar(
             "SELECT digest FROM pack_release WHERE id = $1 AND pack = $2 FOR SHARE",
         )
@@ -585,22 +997,12 @@ impl RuntimeAuthorityRepository {
             }
             let (_, target_pack) = target_release
                 .ok_or_else(|| Error::validation("Invocation executable release is unavailable"))?;
-            let executable: Option<serde_json::Value> = sqlx::query_scalar(
-                "SELECT snapshot FROM pack_release_executable \
-                 WHERE release = $1 AND component_kind = 'action' AND component_ref = $2 FOR SHARE",
-            )
-            .bind(invocation.target_release_id)
-            .bind(invocation.binding.action_ref())
-            .fetch_optional(&mut *connection)
-            .await?;
-            let executable = executable.ok_or_else(|| {
-                Error::validation(
-                    "Invocation action is not present in the pinned immutable release",
+            let executable =
+                super::managed_executable::ManagedExecutableRepository::invocation_snapshot(
+                    connection, invocation,
                 )
-            })?;
-            let executable: crate::models::ActionExecutableSnapshot =
-                serde_json::from_value(executable)
-                    .map_err(|_| Error::validation("Invalid pinned invocation executable"))?;
+                .await?
+                .executable;
             if executable.action.r#ref != invocation.binding.action_ref()
                 || executable.action.pack != target_pack
                 || matches!(
@@ -627,23 +1029,7 @@ impl RuntimeAuthorityRepository {
                     ..
                 } = &invocation.binding
                 {
-                    let source: serde_json::Value = sqlx::query_scalar(
-                        "SELECT snapshot FROM pack_release_executable WHERE release = $1 \
-                            AND component_kind = 'action' AND component_ref = $2 FOR SHARE",
-                    )
-                    .bind(policy.release_id)
-                    .bind(workflow_ref)
-                    .fetch_optional(&mut *connection)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::validation(
-                            "Standard workflow owner is absent from its pinned release",
-                        )
-                    })?;
-                    let source: crate::models::ActionExecutableSnapshot =
-                        serde_json::from_value(source).map_err(|_| {
-                            Error::validation("Invalid pinned standard workflow owner")
-                        })?;
+                    let source = super::managed_executable::ManagedExecutableRepository::workflow_source_snapshot(connection,policy,workflow_ref).await?;
                     if source.action.r#ref != *workflow_ref
                         || source.action.pack != policy.owner.pack_id
                         || source.workflow_definition.is_none()
@@ -665,7 +1051,8 @@ impl RuntimeAuthorityRepository {
             .flat_map(|invocation| invocation.permission_sets.values())
             .flat_map(|set| set.grants.iter())
             .collect();
-        validate_approvals(connection, &policy.owner, &grants).await?;
+        let approvals = validate_approvals(connection, &policy.owner, &grants).await?;
+        super::runtime_target_binding::validate_approval_bindings(connection, policy).await?;
         let body_digest = digest(&serde_json::to_value(policy)?)
             .map_err(|_| Error::validation("Invalid runtime policy"))?;
         sqlx::query(
@@ -690,6 +1077,26 @@ impl RuntimeAuthorityRepository {
             .fetch_one(&mut *connection)
             .await?;
         record.validate()?;
+        for invocation in &policy.invocations {
+            if let Some(pin) = &invocation.foreign_workflow_policy {
+                if pin.revision >= record.id {
+                    return Err(Error::validation(
+                        "Workflow policy dependencies must precede their consumer revision",
+                    ));
+                }
+                sqlx::query("INSERT INTO runtime_workflow_policy_dependency (policy_revision,dependency) VALUES ($1,$2) ON CONFLICT DO NOTHING")
+                    .bind(record.id).bind(pin.revision).execute(&mut *connection).await?;
+            }
+        }
+        let metadata_revisions = policy
+            .invocations
+            .iter()
+            .filter_map(|entry| entry.metadata_revision)
+            .collect::<BTreeSet<_>>();
+        for metadata in metadata_revisions {
+            sqlx::query("INSERT INTO runtime_authority_metadata_dependency (policy_revision,metadata_revision) VALUES ($1,$2) ON CONFLICT DO NOTHING")
+                .bind(record.id).bind(metadata).execute(&mut *connection).await?;
+        }
         for (invocation, kind, id) in standard_bindings {
             sqlx::query(
                 "INSERT INTO runtime_standard_owner_binding \
@@ -716,8 +1123,20 @@ impl RuntimeAuthorityRepository {
         )
         .bind(record.id)
         .bind(releases.into_iter().collect::<Vec<_>>())
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
+        super::declared_input::DeclaredInputRepository::capture(connection, &record).await?;
+        // The exact policy ID is known now. Publish all dispatch source bodies
+        // before activation or any rule/sensor producer can observe this policy.
+        super::managed_component_readmission::ManagedComponentReadmission::capture_deployment_dispatch(
+            connection, &record,
+        ).await?;
+        let (_, dependencies) = lock_policy_with_deadline(connection, record.id).await?;
+        approvals
+            .fence
+            .intersect(&dependencies)
+            .ensure_fresh_on(connection)
+            .await?;
         Ok(record)
     }
 
@@ -737,9 +1156,136 @@ impl RuntimeAuthorityRepository {
         Ok(record)
     }
 
+    /// Live policy fence also validates every retained foreign graph dependency.
+    /// No current-pointer/ordinary enablement check is applied to dependencies.
+    pub async fn require_policy(
+        connection: &mut PgConnection,
+        id: Id,
+    ) -> Result<RuntimePolicyRevision> {
+        SchemaTypeRepository::lock_selection(connection).await?;
+        lock_policy(connection, id).await
+    }
+
+    /// Retained origin/dependency validation, not permission for a new runtime
+    /// effect. Parent completion or execution-row retention is not revocation.
+    pub(crate) async fn require_retained_admission(
+        connection: &mut PgConnection,
+        id: Id,
+    ) -> Result<RuntimeAdmissionRecord> {
+        let (record, _) = Self::retained_admission_with_fence(connection, id).await?;
+        Ok(record)
+    }
+
+    /// Source-stage capture for bounded worker completion/native/historical
+    /// permits. This checks retained admission dependencies without granting a
+    /// Running execution credential or terminal process API access.
+    pub async fn retained_admission_fence(
+        connection: &mut PgConnection,
+        id: Id,
+    ) -> Result<ApprovalEffectFence> {
+        let (_, fence) = Self::retained_admission_with_fence(connection, id).await?;
+        Ok(fence)
+    }
+
+    pub(crate) async fn retained_admission_with_fence(
+        connection: &mut PgConnection,
+        id: Id,
+    ) -> Result<(RuntimeAdmissionRecord, ApprovalEffectFence)> {
+        SchemaTypeRepository::lock_selection(connection).await?;
+        let query =
+            format!("SELECT {ADMISSION_COLUMNS} FROM runtime_authority_admission WHERE id = $1");
+        let record: RuntimeAdmissionRecord = sqlx::query_as(&query)
+            .bind(id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| Error::PermissionDenied("Retained admission is unavailable".into()))?;
+        let (policy, policy_fence) =
+            lock_policy_with_deadline(connection, record.policy_revision).await?;
+        let record: RuntimeAdmissionRecord = sqlx::query_as(&format!("{query} FOR SHARE"))
+            .bind(id)
+            .fetch_one(&mut *connection)
+            .await?;
+        record.validate(&policy)?;
+        if record.revoked_at.is_some() {
+            return Err(Error::PermissionDenied(
+                "Retained admission is revoked".into(),
+            ));
+        }
+        let approvals = validate_approvals(
+            connection,
+            &record.authority.owner,
+            &record.authority.grants.iter().collect::<Vec<_>>(),
+        )
+        .await?;
+        let dependencies = validate_admission_dependencies(connection, &record).await?;
+        let fence = policy_fence
+            .intersect(&approvals.fence)
+            .intersect(&dependencies);
+        fence.ensure_fresh_on(connection).await?;
+        Ok((record, fence))
+    }
+
+    /// B captures this while selecting a task, before waiting on native targets.
+    /// It validates only the selected refs plus already pinned graph dependencies;
+    /// neither current permission bodies nor human IAM supply extra grants.
+    pub async fn selected_effect_fence(
+        connection: &mut PgConnection,
+        authority: &SelectedRuntimeAuthority,
+    ) -> Result<ApprovalEffectFence> {
+        SchemaTypeRepository::lock_selection(connection).await?;
+        let (policy, policy_fence) =
+            lock_policy_with_deadline(connection, authority.policy_id).await?;
+        authority.validate_against(&policy.policy)?;
+        let approvals = validate_approvals(
+            connection,
+            &authority.owner,
+            &authority.grants.iter().collect::<Vec<_>>(),
+        )
+        .await?;
+        let mut fence = policy_fence.intersect(&approvals.fence);
+        if let crate::runtime_authority::RequestAttribution::ParentExecution { execution_id } =
+            &authority.attribution
+        {
+            let parent = Self::execution_admission(connection, *execution_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::PermissionDenied(
+                        "Selected effect parent admission is unavailable".into(),
+                    )
+                })?;
+            let parent_fence = Self::retained_admission_fence(connection, parent.id).await?;
+            fence = fence.intersect(&parent_fence);
+        }
+        fence.ensure_fresh_on(connection).await?;
+        Ok(fence)
+    }
+
+    /// B attaches this in the retry creation transaction after recording the new
+    /// owner. It retains the original admission's independent revocation fence.
+    pub async fn retain_inherited_admission(
+        connection: &mut PgConnection,
+        source: Id,
+        target: Id,
+    ) -> Result<()> {
+        let source = Self::require_retained_admission(connection, source).await?;
+        let target = Self::require_retained_admission(connection, target).await?;
+        let mut expected = source.authority.0.clone();
+        expected.attempt = target.authority.attempt;
+        if source.id >= target.id || expected != target.authority.0 {
+            return Err(Error::PermissionDenied(
+                "Retry admission does not preserve its original selection".into(),
+            ));
+        }
+        sqlx::query("INSERT INTO runtime_admission_dependency (admission,dependency,dependency_kind) VALUES ($1,$2,'retry') ON CONFLICT DO NOTHING")
+            .bind(target.id).bind(source.id).execute(&mut *connection).await?;
+        validate_admission_dependencies(connection, &target)
+            .await?
+            .ensure_fresh()
+    }
+
     pub async fn activate_policy(connection: &mut PgConnection, id: Id) -> Result<()> {
-        SchemaTypeRepository::lock_selection(&mut *connection).await?;
-        let policy = lock_policy(connection, id).await?;
+        SchemaTypeRepository::lock_reclamation(&mut *connection).await?;
+        let (policy, policy_fence) = lock_policy_with_deadline(connection, id).await?;
         let active_release: Option<Id> =
             sqlx::query_scalar("SELECT active_release FROM pack WHERE id = $1")
                 .bind(policy.policy.owner.pack_id)
@@ -750,6 +1296,21 @@ impl RuntimeAuthorityRepository {
                 "Only the active executable release can acquire current policy",
             ));
         }
+        let previous: Option<Id> = sqlx::query_scalar(
+            "SELECT revision FROM pack_runtime_policy_current WHERE pack = $1 FOR SHARE",
+        )
+        .bind(policy.policy.owner.pack_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if previous != Some(id) {
+            let pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_queue_item item JOIN work_queue queue ON queue.id = item.queue WHERE queue.pack = $1 AND queue.management_origin = 'pack' AND item.status IN ('queued','leased','retry'))")
+                .bind(policy.policy.owner.pack_id).fetch_one(&mut *connection).await?;
+            if pending {
+                return Err(Error::validation(
+                    "Drain accepted queue items before changing the admitted pack policy revision",
+                ));
+            }
+        }
         let grants = policy
             .policy
             .invocations
@@ -757,15 +1318,19 @@ impl RuntimeAuthorityRepository {
             .flat_map(|invocation| invocation.permission_sets.values())
             .flat_map(|set| set.grants.iter())
             .collect::<Vec<_>>();
-        validate_approvals(connection, &policy.policy.owner, &grants).await?;
+        let approvals = validate_approvals(connection, &policy.policy.owner, &grants).await?;
         sqlx::query(
             "INSERT INTO pack_runtime_policy_current (pack,revision) VALUES ($1,$2) \
              ON CONFLICT (pack) DO UPDATE SET revision = EXCLUDED.revision",
         )
         .bind(policy.policy.owner.pack_id)
         .bind(id)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
+        policy_fence
+            .intersect(&approvals.fence)
+            .ensure_fresh_on(connection)
+            .await?;
         Ok(())
     }
 
@@ -812,10 +1377,44 @@ impl RuntimeAuthorityRepository {
         let (owner_kind, owner_id) = owner.parts();
         positive_id(owner_id)?;
         SchemaTypeRepository::lock_selection(&mut *connection).await?;
-        let policy = lock_policy(connection, authority.policy_id).await?;
+        let (policy, policy_fence) =
+            lock_policy_with_deadline(connection, authority.policy_id).await?;
         authority.validate_against(&policy.policy)?;
         lock_runtime_owner(connection, owner, authority).await?;
-        validate_approvals(
+        let admitted_executable =
+            super::managed_executable::ManagedExecutableRepository::resolve_invocation(
+                connection,
+                &policy.policy,
+                &authority.binding,
+            )
+            .await?;
+        let snapshot_query = match owner {
+            RuntimeOwner::Execution(_) => {
+                "SELECT executable_snapshot,action FROM execution WHERE id = $1 FOR SHARE"
+            }
+            RuntimeOwner::Enforcement(_) => {
+                "SELECT executable_snapshot,NULL::BIGINT FROM enforcement WHERE id = $1 FOR SHARE"
+            }
+        };
+        let (actual, action_id): (
+            Option<Json<crate::models::ExecutionExecutableSnapshot>>,
+            Option<Id>,
+        ) = sqlx::query_as(snapshot_query)
+            .bind(owner_id)
+            .fetch_one(&mut *connection)
+            .await?;
+        let actual = actual.ok_or_else(|| {
+            Error::PermissionDenied("Runtime owner has no immutable executable metadata".into())
+        })?;
+        if action_id.is_some_and(|id| id != admitted_executable.executable.action.id)
+            || serde_json::to_value(&actual.executable)?
+                != serde_json::to_value(&admitted_executable.executable)?
+        {
+            return Err(Error::PermissionDenied(
+                "Runtime owner metadata differs from its immutable admitted executable".into(),
+            ));
+        }
+        let approvals = validate_approvals(
             connection,
             &authority.owner,
             &authority.grants.iter().collect::<Vec<_>>(),
@@ -823,8 +1422,8 @@ impl RuntimeAuthorityRepository {
         .await?;
         let body_digest = digest(&serde_json::to_value(authority)?)
             .map_err(|_| Error::validation("Invalid selected runtime authority"))?;
-        sqlx::query(
-            "INSERT INTO runtime_authority_admission \
+        let inserted = sqlx::query(
+             "INSERT INTO runtime_authority_admission \
              (owner_kind,owner_id,policy_revision,authority,authority_digest) VALUES ($1,$2,$3,$4,$5) \
              ON CONFLICT (owner_kind,owner_id) DO NOTHING",
         )
@@ -834,7 +1433,7 @@ impl RuntimeAuthorityRepository {
         .bind(Json(authority))
         .bind(body_digest)
         .execute(&mut *connection)
-        .await?;
+        .await?.rows_affected() == 1;
         let query = format!(
             "SELECT {ADMISSION_COLUMNS} FROM runtime_authority_admission \
              WHERE owner_kind = $1 AND owner_id = $2 FOR SHARE"
@@ -853,6 +1452,24 @@ impl RuntimeAuthorityRepository {
                 "Runtime owner already has different or revoked authority".into(),
             ));
         }
+        if let crate::runtime_authority::RequestAttribution::ParentExecution { execution_id } =
+            &record.authority.attribution
+        {
+            let dependency:Id = sqlx::query_scalar("SELECT id FROM runtime_authority_admission WHERE owner_kind = 'execution' AND owner_id = $1 FOR SHARE")
+                .bind(execution_id).fetch_optional(&mut *connection).await?
+                .ok_or_else(|| Error::PermissionDenied("Parent admission dependency is unavailable".into()))?;
+            if dependency >= record.id {
+                return Err(Error::validation("Runtime admission dependency cycle"));
+            }
+            sqlx::query("INSERT INTO runtime_admission_dependency (admission,dependency) VALUES ($1,$2) ON CONFLICT DO NOTHING")
+                .bind(record.id).bind(dependency).execute(&mut *connection).await?;
+        }
+        let dependency_fence = validate_admission_dependencies_inner(
+            connection,
+            &record,
+            inserted.then_some(record.id),
+        )
+        .await?;
         if let RuntimeOwner::Execution(execution_id) = owner {
             sqlx::query(
                 "INSERT INTO runtime_authority_execution_attempt (execution,admission,attempt) \
@@ -870,9 +1487,14 @@ impl RuntimeAuthorityRepository {
             .bind(execution_id)
             .bind(record.id)
             .bind(record.authority.attempt)
-            .execute(connection)
+            .execute(&mut *connection)
             .await?;
         }
+        policy_fence
+            .intersect(&approvals.fence)
+            .intersect(&dependency_fence)
+            .ensure_fresh_on(connection)
+            .await?;
         Ok(record)
     }
 
@@ -903,7 +1525,8 @@ impl RuntimeAuthorityRepository {
             .ok_or_else(|| {
                 Error::PermissionDenied("Execution runtime admission is unavailable".into())
             })?;
-        let policy = lock_policy(connection, initial.policy_revision).await?;
+        let (policy, policy_fence) =
+            lock_policy_with_deadline(connection, initial.policy_revision).await?;
         let worker: Option<(Option<Id>, String)> =
             sqlx::query_as("SELECT worker, status::text FROM execution WHERE id = $1 FOR UPDATE")
                 .bind(execution_id)
@@ -931,6 +1554,7 @@ impl RuntimeAuthorityRepository {
                 "Execution has no active runtime API admission".into(),
             ));
         }
+        let dependency_fence = validate_admission_dependencies(connection, &record).await?;
         let current: Option<Uuid> = sqlx::query_scalar(
             "SELECT attempt FROM runtime_authority_execution_fence \
              WHERE execution = $1 AND admission = $2 FOR UPDATE",
@@ -973,12 +1597,17 @@ impl RuntimeAuthorityRepository {
                 "Runtime attempt fence is unavailable".into(),
             ));
         }
-        validate_approvals(
+        let approvals = validate_approvals(
             connection,
             &record.authority.owner,
             &record.authority.grants.iter().collect::<Vec<_>>(),
         )
         .await?;
+        policy_fence
+            .intersect(&approvals.fence)
+            .intersect(&dependency_fence)
+            .ensure_fresh_on(connection)
+            .await?;
         Ok(RuntimeCredentialBinding {
             execution_id,
             admission_id: record.id,
@@ -1009,7 +1638,8 @@ impl RuntimeAuthorityRepository {
             .ok_or_else(|| {
                 Error::PermissionDenied("Execution runtime admission is unavailable".into())
             })?;
-        let policy = lock_policy(connection, initial.policy_revision).await?;
+        let (policy, policy_fence) =
+            lock_policy_with_deadline(connection, initial.policy_revision).await?;
         let authority = &initial.authority;
         let status = lock_runtime_owner(
             connection,
@@ -1041,6 +1671,7 @@ impl RuntimeAuthorityRepository {
                 "Execution credential does not match admitted authority".into(),
             ));
         }
+        let dependency_fence = validate_admission_dependencies(connection, &record).await?;
         let attempt: Option<Uuid> = sqlx::query_scalar(
             "SELECT attempt FROM runtime_authority_execution_fence \
              WHERE execution = $1 AND admission = $2 FOR SHARE",
@@ -1060,6 +1691,9 @@ impl RuntimeAuthorityRepository {
             &record.authority.grants.iter().collect::<Vec<_>>(),
         )
         .await?;
+        let effect_fence = policy_fence
+            .intersect(&dependency_fence)
+            .intersect(&approvals.fence);
         let standard_owners = if record
             .authority
             .selected_refs
@@ -1085,11 +1719,14 @@ impl RuntimeAuthorityRepository {
         } else {
             BTreeSet::new()
         };
+        effect_fence.ensure_fresh_on(connection).await?;
         Ok(ValidatedRuntimeAuthority {
             record,
-            approvals,
+            approvals: approvals.ids,
             current_attempt: credential.attempt,
             standard_owners,
+            concrete_targets: policy.policy.concrete_targets.clone(),
+            effect_fence,
         })
     }
 
@@ -1115,7 +1752,10 @@ impl RuntimeAuthorityRepository {
     }
 }
 
-async fn lock_sponsor(connection: &mut PgConnection, owner: &PackAuthorityOwner) -> Result<()> {
+pub(crate) async fn lock_sponsor(
+    connection: &mut PgConnection,
+    owner: &PackAuthorityOwner,
+) -> Result<()> {
     let reference: Option<String> =
         sqlx::query_scalar("SELECT ref FROM pack WHERE id = $1 FOR SHARE")
             .bind(owner.pack_id)
@@ -1147,6 +1787,73 @@ async fn lock_sponsor(connection: &mut PgConnection, owner: &PackAuthorityOwner)
 }
 
 async fn lock_policy(connection: &mut PgConnection, id: Id) -> Result<RuntimePolicyRevision> {
+    let (policy, fence) = lock_policy_with_deadline(connection, id).await?;
+    fence.ensure_fresh()?;
+    Ok(policy)
+}
+
+async fn lock_policy_with_deadline(
+    connection: &mut PgConnection,
+    id: Id,
+) -> Result<(RuntimePolicyRevision, ApprovalEffectFence)> {
+    let root = lock_policy_one(connection, id).await?;
+    let mut fence = ApprovalEffectFence {
+        earliest_expiry: None,
+    };
+    let mut pending = vec![root.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(record) = pending.pop() {
+        if !visited.insert(record.id) {
+            continue;
+        }
+        if visited.len() > 256 {
+            return Err(Error::PermissionDenied(
+                "Workflow policy dependency graph exceeds admission bound".into(),
+            ));
+        }
+        let expected = record
+            .policy
+            .invocations
+            .iter()
+            .filter_map(|entry| entry.foreign_workflow_policy.as_ref())
+            .map(|pin| pin.revision)
+            .collect::<BTreeSet<_>>();
+        let actual:Vec<Id> = sqlx::query_scalar("SELECT dependency FROM runtime_workflow_policy_dependency WHERE policy_revision = $1 ORDER BY dependency FOR SHARE")
+            .bind(record.id).fetch_all(&mut *connection).await?;
+        if actual.into_iter().collect::<BTreeSet<_>>() != expected {
+            return Err(Error::PermissionDenied(
+                "Workflow policy dependency evidence is incomplete".into(),
+            ));
+        }
+        for pin in record
+            .policy
+            .invocations
+            .iter()
+            .filter_map(|entry| entry.foreign_workflow_policy.as_ref())
+        {
+            if pin.revision >= record.id {
+                return Err(Error::validation("Workflow policy dependency cycle"));
+            }
+            let dependency = lock_policy_one(connection, pin.revision).await?;
+            pin.verify(&dependency)?;
+            let grants = dependency
+                .policy
+                .invocations
+                .iter()
+                .flat_map(|entry| entry.permission_sets.values())
+                .flat_map(|set| set.grants.iter())
+                .collect::<Vec<_>>();
+            let approvals =
+                validate_approvals(connection, &dependency.policy.owner, &grants).await?;
+            fence = fence.intersect(&approvals.fence);
+            pending.push(dependency);
+        }
+    }
+    fence.ensure_fresh()?;
+    Ok((root, fence))
+}
+
+async fn lock_policy_one(connection: &mut PgConnection, id: Id) -> Result<RuntimePolicyRevision> {
     let initial = RuntimeAuthorityRepository::find_policy(connection, id)
         .await?
         .ok_or_else(|| Error::PermissionDenied("Runtime policy is unavailable".into()))?;
@@ -1166,6 +1873,133 @@ async fn lock_policy(connection: &mut PgConnection, id: Id) -> Result<RuntimePol
         ));
     }
     Ok(record)
+}
+
+async fn validate_admission_dependencies(
+    connection: &mut PgConnection,
+    root: &RuntimeAdmissionRecord,
+) -> Result<ApprovalEffectFence> {
+    validate_admission_dependencies_inner(connection, root, None).await
+}
+
+async fn validate_admission_dependencies_inner(
+    connection: &mut PgConnection,
+    root: &RuntimeAdmissionRecord,
+    staged_record: Option<Id>,
+) -> Result<ApprovalEffectFence> {
+    let mut fence = ApprovalEffectFence {
+        earliest_expiry: None,
+    };
+    let mut pending = vec![root.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(record) = pending.pop() {
+        if !visited.insert(record.id) {
+            continue;
+        }
+        if visited.len() > 256 {
+            return Err(Error::PermissionDenied(
+                "Runtime admission lineage exceeds bound".into(),
+            ));
+        }
+        if staged_record != Some(record.id) {
+            for accepted in
+                super::accepted_batch_dependency::AcceptedBatchDependencyRepository::validate(
+                    connection, &record,
+                )
+                .await?
+            {
+                let (policy, deadline) =
+                    lock_policy_with_deadline(connection, accepted.policy_id).await?;
+                accepted.validate_against(&policy.policy)?;
+                let approvals = validate_approvals(
+                    connection,
+                    &accepted.owner,
+                    &accepted.grants.iter().collect::<Vec<_>>(),
+                )
+                .await?;
+                fence = fence.intersect(&deadline).intersect(&approvals.fence);
+            }
+        }
+        let dependencies:Vec<(Id,String)> = sqlx::query_as("SELECT dependency,dependency_kind FROM runtime_admission_dependency WHERE admission = $1 ORDER BY dependency FOR SHARE")
+            .bind(record.id).fetch_all(&mut *connection).await?;
+        let parent = match &record.authority.attribution {
+            crate::runtime_authority::RequestAttribution::ParentExecution { execution_id } => {
+                Some(*execution_id)
+            }
+            _ => None,
+        };
+        if dependencies
+            .iter()
+            .filter(|(_, kind)| kind == "parent")
+            .count()
+            != usize::from(parent.is_some())
+        {
+            return Err(Error::PermissionDenied(
+                "Runtime admission lineage evidence is incomplete".into(),
+            ));
+        }
+        for (id, kind) in dependencies {
+            if id >= record.id {
+                return Err(Error::validation("Runtime admission lineage cycle"));
+            }
+            let query = format!(
+                "SELECT {ADMISSION_COLUMNS} FROM runtime_authority_admission WHERE id = $1"
+            );
+            let dependency: RuntimeAdmissionRecord = sqlx::query_as(&query)
+                .bind(id)
+                .fetch_one(&mut *connection)
+                .await?;
+            let (policy, policy_fence) =
+                lock_policy_with_deadline(connection, dependency.policy_revision).await?;
+            let dependency: RuntimeAdmissionRecord = sqlx::query_as(&format!("{query} FOR SHARE"))
+                .bind(id)
+                .fetch_one(&mut *connection)
+                .await?;
+            if dependency.revoked_at.is_some()
+                || kind == "parent"
+                    && (dependency.owner_kind != "execution" || Some(dependency.owner_id) != parent)
+            {
+                return Err(Error::PermissionDenied(
+                    "Originating runtime admission is unavailable or revoked".into(),
+                ));
+            }
+            fence = fence.intersect(&policy_fence);
+            dependency.validate(&policy)?;
+            if kind == "retry" {
+                let mut expected = dependency.authority.0.clone();
+                expected.attempt = record.authority.attempt;
+                if expected != record.authority.0 {
+                    return Err(Error::PermissionDenied(
+                        "Retry dependency selection mismatch".into(),
+                    ));
+                }
+            } else if kind == "accepted_item" {
+                if !matches!(
+                    record.authority.binding,
+                    crate::runtime_authority::InvocationBinding::Action { .. }
+                ) || !matches!(
+                    record.authority.attribution,
+                    crate::runtime_authority::RequestAttribution::QueueBatch { .. }
+                ) {
+                    return Err(Error::PermissionDenied(
+                        "Accepted batch dependency has no Action batch attribution".into(),
+                    ));
+                }
+            } else if kind != "parent" {
+                return Err(Error::validation("Unknown admission dependency purpose"));
+            }
+            let approvals = validate_approvals(
+                connection,
+                &dependency.authority.owner,
+                &dependency.authority.grants.iter().collect::<Vec<_>>(),
+            )
+            .await?;
+            fence = fence.intersect(&approvals.fence);
+            pending.push(dependency);
+        }
+    }
+    fence.ensure_fresh()?;
+    Ok(fence)
 }
 
 async fn lock_runtime_owner(
@@ -1215,13 +2049,29 @@ async fn validate_approvals(
     connection: &mut PgConnection,
     owner: &PackAuthorityOwner,
     grants: &[&AdmittedGrant],
-) -> Result<BTreeSet<Id>> {
+) -> Result<ValidatedApprovals> {
     let ids: BTreeSet<_> = grants
         .iter()
         .filter_map(|grant| grant.approval_id())
         .collect();
     if ids.is_empty() {
-        return Ok(ids);
+        return Ok(ValidatedApprovals {
+            ids,
+            fence: ApprovalEffectFence {
+                earliest_expiry: None,
+            },
+        });
+    }
+    let input_only: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM runtime_input_only_approval WHERE approval = ANY($1))",
+    )
+    .bind(ids.iter().copied().collect::<Vec<_>>())
+    .fetch_one(&mut *connection)
+    .await?;
+    if input_only {
+        return Err(Error::PermissionDenied(
+            "Declared-input approvals cannot authorize runtime API grants".into(),
+        ));
     }
     let query = format!(
         "SELECT {APPROVAL_COLUMNS} FROM runtime_external_approval WHERE id = ANY($1) ORDER BY id FOR SHARE"
@@ -1231,12 +2081,14 @@ async fn validate_approvals(
         .fetch_all(connection)
         .await?;
     let mut approvals = BTreeMap::new();
+    let mut earliest_expiry = None;
     for record in records {
         if !record.is_active(Utc::now()) {
             return Err(Error::PermissionDenied(
                 "External approval expired or was explicitly revoked".into(),
             ));
         }
+        earliest_expiry = earliest_expiry.into_iter().chain(record.expires_at).min();
         approvals.insert(record.id, record.approval()?);
     }
     for grant in grants {
@@ -1251,7 +2103,9 @@ async fn validate_approvals(
             }
         }
     }
-    Ok(ids)
+    let fence = ApprovalEffectFence { earliest_expiry };
+    fence.ensure_fresh()?;
+    Ok(ValidatedApprovals { ids, fence })
 }
 
 fn approval_body(subject_pack: Id, grants: &[Grant]) -> serde_json::Value {
@@ -1265,4 +2119,48 @@ fn require_digest(value: &impl Serialize, expected: &str) -> Result<()> {
         return Err(Error::validation("Runtime authority digest mismatch"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod expiry_fence_tests {
+    use super::*;
+
+    #[test]
+    fn deadline_intersection_keeps_earliest_selected_or_dependency_expiry() {
+        let now = Utc::now();
+        let direct = ApprovalEffectFence {
+            earliest_expiry: Some(now + chrono::Duration::seconds(30)),
+        };
+        let graph = ApprovalEffectFence {
+            earliest_expiry: Some(now + chrono::Duration::seconds(10)),
+        };
+        let parent = ApprovalEffectFence {
+            earliest_expiry: Some(now + chrono::Duration::seconds(20)),
+        };
+        let combined = direct.intersect(&graph).intersect(&parent);
+        assert_eq!(combined.approval_deadline(), graph.approval_deadline());
+        assert!(combined
+            .check_at(now + chrono::Duration::seconds(9))
+            .is_ok());
+        assert!(combined
+            .check_at(now + chrono::Duration::seconds(10))
+            .is_err());
+        assert!(combined
+            .check_at(now + chrono::Duration::seconds(11))
+            .is_err());
+    }
+
+    #[test]
+    fn no_expiry_never_discards_another_fences_deadline() {
+        let unbounded = ApprovalEffectFence {
+            earliest_expiry: None,
+        };
+        let expired = ApprovalEffectFence {
+            earliest_expiry: Some(Utc::now() - chrono::Duration::seconds(1)),
+        };
+        assert!(unbounded.ensure_fresh().is_ok());
+        assert!(unbounded.intersect(&expired).ensure_fresh().is_err());
+        assert!(expired.intersect(&unbounded).ensure_fresh().is_err());
+        assert_eq!(unbounded.intersect(&unbounded).approval_deadline(), None);
+    }
 }

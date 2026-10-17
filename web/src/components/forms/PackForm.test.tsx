@@ -38,6 +38,19 @@ const pack = {
 beforeEach(() => update.mockReset());
 
 describe("pack configuration editing", () => {
+  it("resets a secret field without sending its redaction or plaintext", async () => {
+    render(
+      <MemoryRouter>
+        <PackForm pack={pack} onSuccess={vi.fn()} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByLabelText("Reset token to release default"));
+    fireEvent.submit(screen.getByLabelText(/^Label/).closest("form")!);
+    await waitFor(() => expect(update).toHaveBeenCalled());
+    expect(update.mock.calls[0][0].data.config_reset_fields).toEqual(["token"]);
+    expect(update.mock.calls[0][0].data).not.toHaveProperty("config");
+  });
+
   it("does not resubmit redacted configuration or rebind an unchanged schema for metadata edits", async () => {
     render(
       <MemoryRouter>

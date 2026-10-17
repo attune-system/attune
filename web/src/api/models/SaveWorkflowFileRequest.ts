@@ -8,7 +8,8 @@ import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
  */
 export type SaveWorkflowFileRequest = {
   /**
-   * The full workflow definition as JSON (will be serialized to YAML on disk)
+   * The full workflow definition as JSON. Tasks with a templated action must
+   * declare allowed_action_refs, an array of 1 to 256 literal action refs.
    */
   definition: Record<string, any>;
   /**

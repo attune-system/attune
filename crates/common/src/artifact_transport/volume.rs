@@ -35,11 +35,88 @@ pub struct VolumeTransport {
 pub struct SealedLogFile {
     _file: std::fs::File,
 }
+impl SealedLogFile {
+    #[cfg(unix)]
+    pub fn freeze(&self) -> Result<()> {
+        self._file
+            .set_permissions(std::fs::Permissions::from_mode(0o444))
+            .map_err(|error| Error::Io(format!("Failed to freeze log: {error}")))?;
+        self._file
+            .sync_all()
+            .map_err(|error| Error::Io(format!("Failed to sync log: {error}")))
+    }
+    #[cfg(not(unix))]
+    pub fn freeze(&self) -> Result<()> {
+        Err(Error::invalid_state(
+            "shared log sealing requires a Unix filesystem",
+        ))
+    }
+}
+
+/// Holds the actual append flock across an asynchronous source-clock check.
+pub struct LockedLogAppend {
+    file: std::fs::File,
+    path: PathBuf,
+    size: u64,
+}
+impl LockedLogAppend {
+    pub fn size_bytes(&self) -> u64 {
+        self.size
+    }
+    /// No further task/lock wait between the caller's DB-clock check and bytes.
+    /// Recorded encrypted log frames are bounded; legacy appends stay off-thread.
+    pub fn append(mut self, content: &[u8]) -> Result<()> {
+        self.file.write_all(content).map_err(|error| {
+            Error::Io(format!("Failed to append {}: {error}", self.path.display()))
+        })?;
+        self.file
+            .flush()
+            .map_err(|error| Error::Io(format!("Failed to flush log: {error}")))?;
+        self.file
+            .sync_data()
+            .map_err(|error| Error::Io(format!("Failed to sync log: {error}")))?;
+        Ok(())
+    }
+}
 
 impl VolumeTransport {
+    pub async fn lock_log_append(&self, file_path: &str) -> Result<LockedLogAppend> {
+        let path = self.ensure_parent(file_path).await?;
+        tokio::task::spawn_blocking(move || lock_log_append_blocking(path))
+            .await
+            .map_err(|error| Error::Io(format!("Log append lock task failed: {error}")))?
+    }
     pub async fn seal_log_file(&self, file_path: &str) -> Result<(SealedLogFile, u64, [u8; 32])> {
+        self.seal_log_file_limit(file_path, None, true).await
+    }
+
+    pub async fn seal_log_file_bounded(
+        &self,
+        file_path: &str,
+        max_bytes: u64,
+    ) -> Result<(SealedLogFile, u64, [u8; 32])> {
+        self.seal_log_file_limit(file_path, Some(max_bytes), true)
+            .await
+    }
+
+    /// Lock/hash without freezing, for the caller's final manifest and source
+    /// clock check. Keep the returned flock until publication finishes.
+    pub async fn inspect_log_file(
+        &self,
+        file_path: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<(SealedLogFile, u64, [u8; 32])> {
+        self.seal_log_file_limit(file_path, max_bytes, false).await
+    }
+
+    async fn seal_log_file_limit(
+        &self,
+        file_path: &str,
+        max_bytes: Option<u64>,
+        freeze: bool,
+    ) -> Result<(SealedLogFile, u64, [u8; 32])> {
         let path = self.resolve(file_path).await?;
-        tokio::task::spawn_blocking(move || seal_log_file_blocking(path))
+        tokio::task::spawn_blocking(move || seal_log_file_blocking(path, max_bytes, freeze))
             .await
             .map_err(|error| Error::Io(format!("Log sealing task failed: {error}")))?
     }
@@ -414,11 +491,15 @@ fn lock_exclusive(_: &std::fs::File, _: &Path) -> Result<()> {
 }
 
 fn append_log_file_blocking(path: PathBuf, content: &[u8]) -> Result<()> {
+    lock_log_append_blocking(path)?.append(content)
+}
+
+fn lock_log_append_blocking(path: PathBuf) -> Result<LockedLogAppend> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut file = options
+    let file = options
         .open(&path)
         .map_err(|error| Error::Io(format!("Failed to open {}: {error}", path.display())))?;
     lock_exclusive(&file, &path)?;
@@ -430,13 +511,11 @@ fn append_log_file_blocking(path: PathBuf, content: &[u8]) -> Result<()> {
     if metadata.permissions().mode() & 0o222 == 0 {
         return Err(Error::invalid_state("shared log stream is sealed"));
     }
-    file.write_all(content)
-        .map_err(|error| Error::Io(format!("Failed to append {}: {error}", path.display())))?;
-    file.flush()
-        .map_err(|error| Error::Io(format!("Failed to flush {}: {error}", path.display())))?;
-    file.sync_data()
-        .map_err(|error| Error::Io(format!("Failed to sync {}: {error}", path.display())))?;
-    Ok(())
+    Ok(LockedLogAppend {
+        file,
+        path,
+        size: metadata.len(),
+    })
 }
 
 #[cfg(unix)]
@@ -493,7 +572,11 @@ fn delete_abandoned_log_file_blocking(_: PathBuf) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn seal_log_file_blocking(path: PathBuf) -> Result<(SealedLogFile, u64, [u8; 32])> {
+fn seal_log_file_blocking(
+    path: PathBuf,
+    max_bytes: Option<u64>,
+    freeze: bool,
+) -> Result<(SealedLogFile, u64, [u8; 32])> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -506,10 +589,16 @@ fn seal_log_file_blocking(path: PathBuf) -> Result<(SealedLogFile, u64, [u8; 32]
         .metadata()
         .map_err(|error| Error::Io(format!("Failed to inspect {}: {error}", path.display())))?;
     reject_hard_linked_regular_file(&path, &before)?;
+    if max_bytes.is_some_and(|limit| before.len() > limit) {
+        return Err(Error::PermissionDenied(
+            "Shared log exceeds its delivery byte cap".into(),
+        ));
+    }
     file.seek(std::io::SeekFrom::Start(0))
         .map_err(|error| Error::Io(format!("Failed to seek {}: {error}", path.display())))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
     loop {
         let read = file
             .read(&mut buffer)
@@ -517,10 +606,20 @@ fn seal_log_file_blocking(path: PathBuf) -> Result<(SealedLogFile, u64, [u8; 32]
         if read == 0 {
             break;
         }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| Error::validation("Shared log size overflow"))?;
+        if max_bytes.is_some_and(|limit| total > limit) {
+            return Err(Error::PermissionDenied(
+                "Shared log exceeds its delivery byte cap".into(),
+            ));
+        }
         hasher.update(&buffer[..read]);
     }
-    file.set_permissions(std::fs::Permissions::from_mode(0o444))
-        .map_err(|error| Error::Io(format!("Failed to freeze {}: {error}", path.display())))?;
+    if freeze {
+        file.set_permissions(std::fs::Permissions::from_mode(0o444))
+            .map_err(|error| Error::Io(format!("Failed to freeze {}: {error}", path.display())))?;
+    }
     file.sync_all()
         .map_err(|error| Error::Io(format!("Failed to sync {}: {error}", path.display())))?;
     let pathname = std::fs::symlink_metadata(&path)
@@ -543,7 +642,11 @@ fn seal_log_file_blocking(path: PathBuf) -> Result<(SealedLogFile, u64, [u8; 32]
 }
 
 #[cfg(not(unix))]
-fn seal_log_file_blocking(_: PathBuf) -> Result<(SealedLogFile, u64, [u8; 32])> {
+fn seal_log_file_blocking(
+    _: PathBuf,
+    _: Option<u64>,
+    _: bool,
+) -> Result<(SealedLogFile, u64, [u8; 32])> {
     Err(Error::invalid_state(
         "shared log sealing requires a Unix filesystem",
     ))
@@ -554,6 +657,66 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn denied_shared_inspection_does_not_freeze_a_valid_prefix() {
+        let root = TempDir::new().unwrap();
+        let transport = VolumeTransport::new(root.path().to_str().unwrap());
+        transport
+            .write_file("deferred/log.txt", b"prefix", None)
+            .await
+            .unwrap();
+        let (guard, size, _) = transport
+            .inspect_log_file("deferred/log.txt", Some(32))
+            .await
+            .unwrap();
+        assert_eq!(size, 6);
+        // Caller denies an expired fence or an incomplete final manifest.
+        drop(guard);
+        transport
+            .append_log_file("deferred/log.txt", b"suffix")
+            .await
+            .unwrap();
+        let (guard, size, _) = transport
+            .inspect_log_file("deferred/log.txt", Some(32))
+            .await
+            .unwrap();
+        assert_eq!(size, 12);
+        guard.freeze().unwrap();
+        drop(guard);
+        assert!(transport
+            .append_log_file("deferred/log.txt", b"extra")
+            .await
+            .is_err());
+        root.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_shared_seal_rejects_oversized_files_before_publication() {
+        let root = TempDir::new().unwrap();
+        let transport = VolumeTransport::new(root.path().to_str().unwrap());
+        transport
+            .write_file("bounded/log.txt", b"123456", None)
+            .await
+            .unwrap();
+        assert!(transport
+            .seal_log_file_bounded("bounded/log.txt", 5)
+            .await
+            .is_err());
+        transport
+            .append_log_file("bounded/log.txt", b"78")
+            .await
+            .unwrap();
+        let (guard, size, _) = transport
+            .seal_log_file_bounded("bounded/log.txt", 8)
+            .await
+            .unwrap();
+        assert_eq!(size, 8);
+        drop(guard);
+        root.close().unwrap();
+    }
 
     async fn read_all(transport: &VolumeTransport, path: &str) -> Result<Vec<u8>> {
         let mut reader = transport.open_reader(path, 0).await?;

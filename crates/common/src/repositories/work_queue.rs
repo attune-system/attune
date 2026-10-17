@@ -191,6 +191,17 @@ impl List for WorkQueueRepository {
 }
 
 impl WorkQueueRepository {
+    pub async fn find_by_id_for_update(
+        connection: &mut PgConnection,
+        queue_id: Id,
+    ) -> Result<Option<WorkQueue>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {WORK_QUEUE_SELECT_COLUMNS} FROM work_queue WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(queue_id)
+        .fetch_optional(connection)
+        .await?)
+    }
     async fn validate_schema(
         connection: &mut sqlx::PgConnection,
         pack: Option<i64>,
@@ -982,6 +993,7 @@ pub struct UpdateWorkQueueItemInput {
 
 #[derive(Debug, Clone)]
 pub struct LeaseWorkQueueItemsInput {
+    pub separate_requesters: bool,
     pub queue: Id,
     pub ready_statuses: Vec<WorkQueueItemStatus>,
     pub limit: i64,
@@ -1316,7 +1328,7 @@ impl WorkQueueItemRepository {
             .map_err(Into::into)
     }
 
-    fn selected_item_document_sql() -> &'static str {
+    pub(crate) fn selected_item_document_sql() -> &'static str {
         "jsonb_strip_nulls(jsonb_build_object(\
             'payload', payload, \
             'metadata', metadata, \
@@ -1383,6 +1395,32 @@ impl WorkQueueItemRepository {
             .fetch_all(db)
             .await?;
 
+        Ok(WorkQueueItemSearchResult { rows, total })
+    }
+
+    pub async fn preview_selected_mutable_with_conn(
+        connection: &mut PgConnection,
+        queue: Id,
+        selector: &WorkQueueItemJsonPathSelector,
+        limit: u32,
+    ) -> Result<WorkQueueItemSearchResult> {
+        let total = Self::count_selected_mutable(&mut *connection, queue, selector).await?;
+        let query = format!(
+            "SELECT {} FROM work_queue_item WHERE queue = $1 \
+             AND status = ANY($2::work_queue_item_status_enum[]) \
+             AND jsonb_path_exists({}, $3::jsonpath, $4::jsonb) \
+             ORDER BY priority DESC, created ASC, id ASC LIMIT $5",
+            WORK_QUEUE_ITEM_SELECT_COLUMNS,
+            Self::selected_item_document_sql()
+        );
+        let rows = sqlx::query_as::<_, WorkQueueItem>(&query)
+            .bind(queue)
+            .bind(Self::mutable_pending_statuses())
+            .bind(&selector.path)
+            .bind(&selector.vars)
+            .bind(limit as i64)
+            .fetch_all(&mut *connection)
+            .await?;
         Ok(WorkQueueItemSearchResult { rows, total })
     }
 
@@ -1620,6 +1658,37 @@ impl WorkQueueItemRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
+        let (mut qb, mut count_qb) = Self::search_queries(filters);
+        let total: i64 = count_qb.build_query_scalar().fetch_one(db).await?;
+        let rows = qb.build_query_as::<WorkQueueItem>().fetch_all(db).await?;
+        Ok(WorkQueueItemSearchResult {
+            rows,
+            total: total.max(0) as u64,
+        })
+    }
+
+    pub async fn search_with_conn(
+        connection: &mut PgConnection,
+        filters: &WorkQueueItemSearchFilters,
+    ) -> Result<WorkQueueItemSearchResult> {
+        let (mut qb, mut count_qb) = Self::search_queries(filters);
+        let total: i64 = count_qb
+            .build_query_scalar()
+            .fetch_one(&mut *connection)
+            .await?;
+        let rows = qb
+            .build_query_as::<WorkQueueItem>()
+            .fetch_all(&mut *connection)
+            .await?;
+        Ok(WorkQueueItemSearchResult {
+            rows,
+            total: total.max(0) as u64,
+        })
+    }
+
+    fn search_queries(
+        filters: &WorkQueueItemSearchFilters,
+    ) -> (QueryBuilder<'_, Postgres>, QueryBuilder<'_, Postgres>) {
         let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
             "SELECT {} FROM work_queue_item",
             WORK_QUEUE_ITEM_SELECT_COLUMNS
@@ -1708,19 +1777,12 @@ impl WorkQueueItemRepository {
 
         let _ = has_where;
 
-        let total: i64 = count_qb.build_query_scalar().fetch_one(db).await?;
-
         qb.push(" ORDER BY priority DESC, created ASC, id ASC LIMIT ")
             .push_bind(filters.limit as i64)
             .push(" OFFSET ")
             .push_bind(filters.offset as i64);
 
-        let rows = qb.build_query_as::<WorkQueueItem>().fetch_all(db).await?;
-
-        Ok(WorkQueueItemSearchResult {
-            rows,
-            total: total.max(0) as u64,
-        })
+        (qb, count_qb)
     }
 
     pub async fn list_for_queue<'e, E>(executor: E, queue: Id) -> Result<Vec<WorkQueueItem>>
@@ -1890,6 +1952,10 @@ impl WorkQueueItemRepository {
             WITH anchor AS (
                 SELECT id,
                        priority,
+                       historical_requester_identity,
+                       pack_release,
+                       pack_release_digest,
+                       executable_snapshot,
                        payload #> $7::text[] AS group_value
                 FROM work_queue_item
                 WHERE queue = $1
@@ -1907,6 +1973,10 @@ impl WorkQueueItemRepository {
                 WHERE item.queue = $1
                   AND item.status = ANY($2::work_queue_item_status_enum[])
                   AND item.id <> anchor.id
+                  AND (NOT $10 OR item.historical_requester_identity IS NOT DISTINCT FROM anchor.historical_requester_identity)
+                  AND item.pack_release IS NOT DISTINCT FROM anchor.pack_release
+                  AND item.pack_release_digest IS NOT DISTINCT FROM anchor.pack_release_digest
+                  AND item.executable_snapshot IS NOT DISTINCT FROM anchor.executable_snapshot
                   AND (
                         $8 = false
                         OR anchor.group_value IS NULL
@@ -1961,6 +2031,7 @@ impl WorkQueueItemRepository {
             .bind(coalescing_path_segments)
             .bind(coalescing_enabled)
             .bind(across_priorities)
+            .bind(input.separate_requesters)
             .fetch_all(executor)
             .await
             .map_err(Into::into)

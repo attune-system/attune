@@ -55,7 +55,7 @@ use crate::pack_cache_definition::{CacheDefinitionOwnerType, CacheDefinitionYaml
 use crate::platform_catalog::{is_legacy_definition, ManagedComponentKind};
 use crate::policy_control::parse_policy_controls;
 use crate::queue_definition::parse_work_queue_definition_yaml_with_registry;
-use crate::rbac::{validate_cache_grant_constraints, Grant, Resource};
+use crate::rbac::{validate_cache_grant_constraints, Resource};
 use crate::repositories::action::{
     validate_action_reference_visibility_config, ActionRepository, CreatePolicyInput,
     PolicyRepository, UpdateActionInput, UpdatePolicyInput,
@@ -227,12 +227,14 @@ impl PackLoadResult {
 /// Loads pack components (triggers, actions, sensors) from YAML files on disk
 /// into the database.
 pub struct PackComponentLoader<'a> {
+    acknowledge_incompatible_rollout: bool,
     authority: crate::delegation::DelegationAuthority,
     pool: &'a PgPool,
     pack_id: Id,
     pack_ref: String,
     cache_admission: CacheAdmissionConfig,
     absent_metadata_policy: crate::models::AbsentMetadataPolicy,
+    pending_admission: bool,
 }
 
 impl<'a> PackComponentLoader<'a> {
@@ -244,12 +246,14 @@ impl<'a> PackComponentLoader<'a> {
         authority: crate::delegation::DelegationAuthority,
     ) -> Self {
         Self {
+            acknowledge_incompatible_rollout: false,
             authority,
             pool,
             pack_id,
             pack_ref: pack_ref.to_string(),
             cache_admission: cache_admission.clone(),
             absent_metadata_policy: crate::models::AbsentMetadataPolicy::Remove,
+            pending_admission: false,
         }
     }
 
@@ -258,6 +262,16 @@ impl<'a> PackComponentLoader<'a> {
         policy: crate::models::AbsentMetadataPolicy,
     ) -> Self {
         self.absent_metadata_policy = policy;
+        self
+    }
+
+    pub fn with_rollout_acknowledgement(mut self, acknowledged: bool) -> Self {
+        self.acknowledge_incompatible_rollout = acknowledged;
+        self
+    }
+
+    pub(crate) fn with_pending_admission(mut self) -> Self {
+        self.pending_admission = true;
         self
     }
 
@@ -280,13 +294,16 @@ impl<'a> PackComponentLoader<'a> {
         tx: &mut Transaction<'_, sqlx::Postgres>,
         pack_dir: &Path,
     ) -> Result<PackLoadResult> {
+        crate::repositories::schema_type::SchemaTypeRepository::lock_reclamation(tx).await?;
         crate::repositories::cache::CacheEntryRepository::protect_transaction(
             tx,
             crate::repositories::cache::CacheTransactionMode::Write,
         )
         .await?;
         let mut loader = TransactionalPackComponentLoader {
+            acknowledge_incompatible_rollout: self.acknowledge_incompatible_rollout,
             authority: self.authority.clone(),
+            pending_admission: self.pending_admission,
             connection: tx,
             pack_id: self.pack_id,
             pack_ref: self.pack_ref.clone(),
@@ -307,6 +324,8 @@ impl<'a> PackComponentLoader<'a> {
 }
 
 struct TransactionalPackComponentLoader<'a> {
+    acknowledge_incompatible_rollout: bool,
+    pending_admission: bool,
     source_file: Option<String>,
     authority: crate::delegation::DelegationAuthority,
     connection: &'a mut PgConnection,
@@ -340,9 +359,12 @@ impl TransactionalPackComponentLoader<'_> {
         .await?;
         self.candidate_schema_registry = type_plan.registry;
         self.preflight_component_ownership(pack_dir).await?;
-        super::permissions::PackPermissionPlan::read(pack_dir, &self.pack_ref)?
-            .validate(&mut *self.connection, &self.authority)
-            .await?;
+        let permissions = super::permissions::PackPermissionPlan::read(pack_dir, &self.pack_ref)?;
+        if !self.pending_admission {
+            permissions
+                .validate(&mut *self.connection, &self.authority)
+                .await?;
+        }
 
         let mut result = PackLoadResult::default();
         let mut schema_type_refs = Vec::new();
@@ -762,39 +784,12 @@ impl TransactionalPackComponentLoader<'_> {
                 continue;
             }
 
-            let label = data
-                .get("label")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let description = data
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let grants = data
-                .get("grants")
-                .and_then(|v| serde_json::to_value(v).ok())
-                .unwrap_or_else(|| serde_json::json!([]));
-
-            if !grants.is_array() {
-                let msg = format!(
-                    "Permission set '{}' has non-array 'grants', skipping",
-                    permission_set_ref
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-                result.permission_sets_skipped += 1;
-                continue;
-            }
-
-            let parsed_grants: Vec<Grant> =
-                serde_json::from_value(grants.clone()).map_err(|error| {
-                    Error::validation(format!(
-                        "Permission set '{}' has invalid grants: {}",
-                        permission_set_ref, error
-                    ))
-                })?;
+            let definition: crate::runtime_authority::PermissionSetDefinition =
+                serde_json::from_value(serde_json::to_value(&data)?)?;
+            let grants = definition.authored_grants()?;
+            let parsed_grants = definition.registrar_grants()?;
+            let label = definition.label.clone();
+            let description = definition.description.clone();
             for grant in &parsed_grants {
                 if grant.resource == Resource::Caches {
                     if let Some(constraints) = &grant.constraints {
@@ -839,7 +834,13 @@ impl TransactionalPackComponentLoader<'_> {
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(updated) => {
+                        PermissionSetRepository::store_authored_definition(
+                            &mut *self.connection,
+                            updated.id,
+                            &definition,
+                        )
+                        .await?;
                         info!(
                             "Updated permission set '{}' (ID: {})",
                             permission_set_ref, existing.id
@@ -863,6 +864,12 @@ impl TransactionalPackComponentLoader<'_> {
 
             match PermissionSetRepository::create(&mut *self.connection, input).await {
                 Ok(permission_set) => {
+                    PermissionSetRepository::store_authored_definition(
+                        &mut *self.connection,
+                        permission_set.id,
+                        &definition,
+                    )
+                    .await?;
                     info!(
                         "Created permission set '{}' (ID: {})",
                         permission_set_ref, permission_set.id
@@ -1321,6 +1328,67 @@ impl TransactionalPackComponentLoader<'_> {
             .await?
             {
                 ensure_existing_owner("trigger", &trigger_ref, existing.pack, self.pack_id)?;
+                let impact =
+                    crate::repositories::trigger_rollout::TriggerRolloutRepository::preflight(
+                        self.connection,
+                        existing.id,
+                        out_schema.as_ref(),
+                        event_config_schema.as_ref(),
+                    )
+                    .await?;
+                impact.require_drained_or_acknowledged(self.acknowledge_incompatible_rollout)?;
+                let pack = crate::repositories::pack::PackRepository::get_by_id(
+                    &mut *self.connection,
+                    self.pack_id,
+                )
+                .await?;
+                for (old, new) in [
+                    (existing.out_schema.as_ref(), out_schema.as_ref()),
+                    (
+                        existing.event_config_schema.as_ref(),
+                        event_config_schema.as_ref(),
+                    ),
+                ] {
+                    let Some(new) = new else {
+                        continue;
+                    };
+                    if old != Some(new) {
+                        continue;
+                    }
+                    let references = crate::value_schema::inspect_definition(
+                        crate::value_schema::SchemaContext::FlatDocument,
+                        new,
+                        crate::value_schema::Limits::default(),
+                    )
+                    .map_err(|_| Error::validation("Invalid trigger contract references"))?;
+                    if references.is_empty() {
+                        continue;
+                    }
+                    let source = crate::value_schema::SourceIdentity::Authoring {
+                        component_ref: trigger_ref.clone(),
+                    };
+                    let prior=crate::repositories::schema_contract::SchemaContractRepository::compile_owned_assignment(
+                        self.connection,source.clone(),crate::value_schema::SchemaContext::FlatDocument,new,&pack,
+                    ).await?;
+                    let candidate = crate::value_schema::compile(
+                        source,
+                        crate::value_schema::SchemaContext::FlatDocument,
+                        new,
+                        &self.candidate_schema_registry,
+                        crate::value_schema::Limits::default(),
+                    )
+                    .map_err(|_| Error::validation("Invalid candidate trigger contract"))?;
+                    if prior
+                        .semantic_digest()
+                        .map_err(|_| Error::validation("Invalid prior trigger contract"))?
+                        != candidate
+                            .semantic_digest()
+                            .map_err(|_| Error::validation("Invalid candidate trigger contract"))?
+                    {
+                        crate::repositories::trigger_rollout::TriggerRolloutRepository::preflight_changed_contract(self.connection,existing.id).await?
+                            .require_drained_or_acknowledged(self.acknowledge_incompatible_rollout)?;
+                    }
+                }
                 ComponentLifecycleRepository::reactivate_pack_component(
                     &mut *self.connection,
                     ManagedComponentKind::Trigger,

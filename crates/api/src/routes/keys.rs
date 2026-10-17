@@ -239,6 +239,9 @@ pub async fn list_keys(
     };
 
     let result = KeyRepository::search_with_connection(&mut transaction, &filters).await?;
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
+    }
     transaction.commit().await?;
 
     let paginated_keys: Vec<KeySummary> = result.rows.into_iter().map(KeySummary::from).collect();
@@ -311,6 +314,10 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
         || constraints.ids.is_some();
 
     Some(KeyGrantFilter {
+        ownership: constraints
+            .managing_pack_id
+            .map(attune_common::repositories::key::KeyOwnershipScope::ManagedPack)
+            .unwrap_or_default(),
         owner_types: constraints.owner_types.clone(),
         owner: constraints.owner,
         owner_refs: constraints.owner_refs.clone(),
@@ -526,6 +533,9 @@ pub async fn sign_key_jwt(
     })
     .await
     .map_err(|_| ApiError::InternalServerError("Signing operation failed".into()))??;
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut fence_transaction).await?;
+    }
     fence_transaction.commit().await?;
     emit_key_audit(
         &state,
@@ -562,6 +572,7 @@ pub async fn get_key(
 ) -> ApiResult<impl IntoResponse> {
     let delegated = delegated_key_grants(&state, &user).await?;
     let mut transaction = state.db.begin().await?;
+    SchemaTypeRepository::lock_selection(&mut transaction).await?;
     let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
     let (identity_id, grants) = match &recorded {
         Some(authority) => (authority.authority().owner.sponsor_identity_id, Vec::new()),
@@ -571,7 +582,7 @@ pub async fn get_key(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
 
-    let resolved = if recorded.is_some() {
+    let resolved = {
         Some(
             attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
                 &mut transaction,
@@ -581,12 +592,16 @@ pub async fn get_key(
             .await?
             .ok_or_else(|| ApiError::NotFound("Key is not available".into()))?,
         )
-    } else {
-        None
     };
     let allows = |action| match (&recorded, &resolved) {
         (Some(authority), Some(target)) => authority.allows_target(target, action),
-        _ => key_action_allowed(&grants, action, identity_id, &key),
+        _ => key_action_allowed_in_pack(
+            &grants,
+            action,
+            identity_id,
+            &key,
+            resolved.as_ref().and_then(|target| target.pack_id()),
+        ),
     };
     if !allows(Action::Read) {
         return Err(ApiError::NotFound(format!("Key '{}' not found", key_ref)));
@@ -705,6 +720,9 @@ pub async fn get_key(
 
     let assignment = KeySchemaRepository::find(&mut *transaction, key.id).await?;
     let response = ApiResponse::new(KeyResponse::from(key).with_schema(assignment.as_ref())?);
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
+    }
     transaction.commit().await?;
 
     Ok((StatusCode::OK, Json(response)))
@@ -761,39 +779,12 @@ pub async fn create_key(
     )
     .map_err(ApiError::BadRequest)?;
 
-    if let Some((identity_id, grants)) = authorization {
-        let mut ctx = AuthorizationContext::new(identity_id);
-
-        ctx.owner_identity_id = (request.owner_type == OwnerType::Identity
-            && request.owner_identity_login.as_deref() == Some(user.0.login()))
-        .then_some(identity_id);
-        ctx.owner_type = Some(request.owner_type);
-        ctx.owner_ref = requested_owner_ref;
-        ctx.encrypted = Some(request.encrypted);
-        ctx.target_ref = Some(key_ref.clone());
-
-        let create_allowed = if request.owner_type == OwnerType::Identity
-            && request.owner_identity_login.as_deref() != Some(user.0.login())
-        {
-            constrained_key_grant_allows(&grants, Action::Create, &ctx)
-        } else {
-            AuthorizationService::is_allowed(&grants, Resource::Keys, Action::Create, &ctx)
-        };
-        if !create_allowed {
-            return Err(ApiError::Forbidden(
-                "Insufficient permissions: keys:create".to_string(),
-            ));
-        }
-    }
-
-    // Resolve database IDs only after constrained authorization so callers
-    // cannot use owner lookup errors to enumerate resources they cannot access.
+    // Resolve the real owner before local-scope matching. Hide missing-owner
+    // diagnostics until authorization, just as for foreign owner denial.
     let resolved_owner = resolve_key_owner(&mut transaction, &request)
         .await
         .map_err(|error| {
-            if recorded.is_some()
-                && matches!(error, ApiError::BadRequest(_) | ApiError::NotFound(_))
-            {
+            if matches!(error, ApiError::BadRequest(_) | ApiError::NotFound(_)) {
                 ApiError::Forbidden(
                     "Key owner is not available to the recorded creation authority".into(),
                 )
@@ -801,7 +792,7 @@ pub async fn create_key(
                 error
             }
         })?;
-    if let Some(authority) = &recorded {
+    if recorded.is_some() || authorization.is_some() {
         use attune_common::repositories::runtime_target::{
             ProspectiveDataOwner, ProspectiveRuntimeTarget, RuntimeTargetRepository,
         };
@@ -832,13 +823,33 @@ pub async fn create_key(
                 local_ref: &request.local_ref,
                 encrypted: request.encrypted,
             },
-            authority.authority().owner.sponsor_identity_id,
+            recorded
+                .as_ref()
+                .map(|authority| authority.authority().owner.sponsor_identity_id)
+                .or_else(|| authorization.as_ref().map(|(identity, _)| *identity))
+                .ok_or_else(missing)?,
         )
         .await?
         .ok_or_else(missing)?;
-        if target.context().target_ref.as_deref() != Some(key_ref.as_str())
-            || !authority.allows_new_effect(&target, Action::Create)
-        {
+        let allowed = if let Some(authority) = &recorded {
+            authority.allows_new_effect(&target, Action::Create)
+        } else if let Some((identity_id, grants)) = &authorization {
+            let mut ctx = target.context().clone();
+            ctx.owner_identity_id = (request.owner_type == OwnerType::Identity
+                && request.owner_identity_login.as_deref() == Some(user.0.login()))
+            .then_some(*identity_id);
+            ctx.owner_ref = requested_owner_ref;
+            if request.owner_type == OwnerType::Identity
+                && request.owner_identity_login.as_deref() != Some(user.0.login())
+            {
+                constrained_key_grant_allows(grants, Action::Create, &ctx)
+            } else {
+                AuthorizationService::is_allowed(grants, Resource::Keys, Action::Create, &ctx)
+            }
+        } else {
+            false
+        };
+        if target.context().target_ref.as_deref() != Some(key_ref.as_str()) || !allowed {
             return Err(ApiError::Forbidden(
                 "Insufficient recorded authority: keys:create".into(),
             ));
@@ -846,6 +857,13 @@ pub async fn create_key(
     }
 
     // Keep the database uniqueness constraint as the final concurrency guard.
+    if let Some(authority) = &recorded {
+        attune_common::repositories::runtime_read::RuntimeReadRepository::require_untainted(
+            &mut transaction,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+    }
     if KeyRepository::find_by_ref(&mut *transaction, &key_ref)
         .await?
         .is_some()
@@ -914,6 +932,9 @@ pub async fn create_key(
 
     let mut key = KeyRepository::create(&mut *transaction, key_input).await?;
     KeySchemaRepository::set(&mut transaction, key.id, assignment.as_ref()).await?;
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
+    }
     transaction.commit().await?;
 
     // Return decrypted value in response
@@ -992,7 +1013,7 @@ pub async fn update_key(
         Some(authority) => (authority.authority().owner.sponsor_identity_id, Vec::new()),
         None => delegated.ok_or_else(missing_key_authority)?,
     };
-    let target = if recorded.is_some() {
+    let target = {
         Some(
             attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
                 &mut transaction,
@@ -1002,12 +1023,16 @@ pub async fn update_key(
             .await?
             .ok_or_else(|| ApiError::NotFound("Key is not available".into()))?,
         )
-    } else {
-        None
     };
     let allows = |action| match (&recorded, &target) {
         (Some(authority), Some(target)) => authority.allows_new_effect(target, action),
-        _ => key_action_allowed(&grants, action, identity_id, &existing),
+        _ => key_action_allowed_in_pack(
+            &grants,
+            action,
+            identity_id,
+            &existing,
+            target.as_ref().and_then(|target| target.pack_id()),
+        ),
     };
     if !allows(Action::Update) {
         return Err(ApiError::Forbidden(
@@ -1016,6 +1041,13 @@ pub async fn update_key(
     }
 
     let stored_assignment = KeySchemaRepository::find(&mut *transaction, existing.id).await?;
+    if let Some(authority) = &recorded {
+        attune_common::repositories::runtime_read::RuntimeReadRepository::require_untainted(
+            &mut transaction,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+    }
     let schema_changed = request.value_schema.as_ref().is_some_and(|schema| {
         if schema.is_null() {
             stored_assignment.is_some()
@@ -1153,8 +1185,20 @@ pub async fn update_key(
         )
     } else {
         (
-            key_action_allowed(&grants, Action::Read, identity_id, &updated_key),
-            key_action_allowed(&grants, Action::Decrypt, identity_id, &updated_key),
+            key_action_allowed_in_pack(
+                &grants,
+                Action::Read,
+                identity_id,
+                &updated_key,
+                target.as_ref().and_then(|target| target.pack_id()),
+            ),
+            key_action_allowed_in_pack(
+                &grants,
+                Action::Decrypt,
+                identity_id,
+                &updated_key,
+                target.as_ref().and_then(|target| target.pack_id()),
+            ),
         )
     };
     if can_read && (!updated_key.encrypted || can_decrypt) {
@@ -1184,6 +1228,9 @@ pub async fn update_key(
                 tracing::error!("Failed to decrypt updated key '{}': {}", key_ref, e);
                 ApiError::InternalServerError(format!("Failed to decrypt value: {}", e))
             })?;
+    }
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
     }
     transaction.commit().await?;
 
@@ -1266,7 +1313,15 @@ pub async fn delete_key(
         TokenType::Access | TokenType::Execution
     ) {
         let (identity_id, grants) = delegated.ok_or_else(missing_key_authority)?;
-        if !key_action_allowed(&grants, Action::Delete, identity_id, &key) {
+        let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+            &mut transaction,
+            attune_common::repositories::runtime_target::RuntimeTarget::Key(key.id),
+            identity_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Key is not available".into()))?;
+        if !key_action_allowed_in_pack(&grants, Action::Delete, identity_id, &key, target.pack_id())
+        {
             return Err(ApiError::Forbidden(
                 "Insufficient permissions: keys:delete".to_string(),
             ));
@@ -1278,6 +1333,9 @@ pub async fn delete_key(
 
     if !deleted {
         return Err(ApiError::NotFound(format!("Key '{}' not found", key_ref)));
+    }
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
     }
     transaction.commit().await?;
 
@@ -1356,7 +1414,18 @@ fn key_authorization_context(identity_id: i64, key: &Key) -> AuthorizationContex
 }
 
 fn key_action_allowed(grants: &[Grant], action: Action, identity_id: i64, key: &Key) -> bool {
-    let ctx = key_authorization_context(identity_id, key);
+    key_action_allowed_in_pack(grants, action, identity_id, key, None)
+}
+
+fn key_action_allowed_in_pack(
+    grants: &[Grant],
+    action: Action,
+    identity_id: i64,
+    key: &Key,
+    managing_pack_id: Option<i64>,
+) -> bool {
+    let mut ctx = key_authorization_context(identity_id, key);
+    ctx.managing_pack_id = managing_pack_id;
     if key.owner_type == OwnerType::Identity && key.owner_identity != Some(identity_id) {
         return constrained_key_grant_allows(grants, action, &ctx);
     }
@@ -1841,6 +1910,59 @@ mod tests {
             actual, expected,
             "case `{case}` mismatch: compiled filters gave {actual}, key_action_allowed gave {expected}"
         );
+    }
+
+    #[test]
+    fn local_key_iam_needs_structural_context_and_keeps_narrower_selectors() {
+        let key = key_fixture(
+            8,
+            "pack.local.secret",
+            OwnerType::Pack,
+            Some("local"),
+            None,
+            Some("local"),
+            false,
+        );
+        let grants = vec![read_grant(Some(GrantConstraints {
+            managing_pack_id: Some(17),
+            ids: Some(vec![8]),
+            refs: Some(vec![key.r#ref.clone()]),
+            ..Default::default()
+        }))];
+        assert!(key_action_allowed_in_pack(
+            &grants,
+            Action::Read,
+            42,
+            &key,
+            Some(17)
+        ));
+        for owner in [None, Some(18)] {
+            assert!(!key_action_allowed_in_pack(
+                &grants,
+                Action::Read,
+                42,
+                &key,
+                owner
+            ));
+        }
+        let mut other = key.clone();
+        other.id = 9;
+        assert!(!key_action_allowed_in_pack(
+            &grants,
+            Action::Read,
+            42,
+            &other,
+            Some(17)
+        ));
+        other = key.clone();
+        other.owner_type = OwnerType::System;
+        assert!(!key_action_allowed_in_pack(
+            &grants,
+            Action::Read,
+            42,
+            &other,
+            Some(17)
+        ));
     }
 
     #[test]

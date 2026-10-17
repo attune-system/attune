@@ -188,7 +188,7 @@ async fn artifact_partition_and_maintenance_workload_profile() -> Result<()> {
         latest,
         sources
             .iter()
-            .map(|id| entity_origin(ENTITY_EVENT_PAYLOAD, *id))
+            .map(|id| entity_origin(EVENT_SOURCE_PAYLOAD, *id))
             .collect(),
     )
     .await?;

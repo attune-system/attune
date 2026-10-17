@@ -60,6 +60,7 @@ pub struct TriggerSearchFilters {
 ///   from the identity's grants.
 #[derive(Debug, Clone, Default)]
 pub struct TriggerVisibilityFilter {
+    pub structural_scope: super::event::VisibilityReadScope,
     /// True when the identity holds an unconstrained grant; no additional
     /// predicate is applied (all rows visible).
     pub unscoped: bool,
@@ -110,7 +111,17 @@ fn push_trigger_visibility_predicate(
     qb.push_bind(visibility.allowed_refs.clone());
     qb.push(") OR id = ANY(");
     qb.push_bind(visibility.allowed_ids.clone());
-    qb.push(")))");
+    qb.push(")) OR ");
+    super::event::push_visibility_scope_predicate(
+        qb,
+        &visibility.structural_scope,
+        "trigger.id",
+        "trigger.ref",
+        "trigger.pack_ref",
+        &super::iam_ownership::component_pack("trigger"),
+        None,
+    );
+    qb.push(")");
 }
 
 // ============================================================================
@@ -144,6 +155,7 @@ pub struct SensorSearchFilters {
 /// pack/ref/id allow-list.
 #[derive(Debug, Clone, Default)]
 pub struct SensorVisibilityFilter {
+    pub structural_scope: super::event::VisibilityReadScope,
     /// True when the identity holds an unconstrained grant; no additional
     /// predicate is applied (all rows visible).
     pub unscoped: bool,
@@ -1413,7 +1425,17 @@ fn push_sensor_visibility_predicate(
     qb.push_bind(visibility.allowed_refs.clone());
     qb.push(") OR id = ANY(");
     qb.push_bind(visibility.allowed_ids.clone());
-    qb.push("))");
+    qb.push(") OR ");
+    super::event::push_visibility_scope_predicate(
+        qb,
+        &visibility.structural_scope,
+        "sensor.id",
+        "sensor.ref",
+        "sensor.pack_ref",
+        &super::iam_ownership::component_pack("sensor"),
+        None,
+    );
+    qb.push(")");
 }
 
 impl SensorRepository {

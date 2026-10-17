@@ -42,6 +42,25 @@ pub struct SharedLogBodyCandidate {
 pub struct StorageMaintenanceRepository;
 
 impl StorageMaintenanceRepository {
+    async fn cleanup_transaction(
+        pool: &PgPool,
+        id: i64,
+    ) -> Result<Option<Transaction<'static, Postgres>>> {
+        let mut tx = pool.begin().await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
+            .await?;
+        if super::file_evidence_retention::FileEvidenceRetentionRepository::request_cleanup(
+            &mut tx,
+            &[id],
+        )
+        .await?
+            != [id]
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        Ok(Some(tx))
+    }
     pub async fn legacy_pack_files(pool: &PgPool) -> Result<Vec<LegacyPackFile>> {
         sqlx::query_as(
             "SELECT id, archive_path, digest, archive_size FROM pack_release \
@@ -162,6 +181,18 @@ impl StorageMaintenanceRepository {
         shared_file: bool,
     ) -> Result<bool> {
         let mut tx = pool.begin().await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
+            .await?;
+        if super::file_evidence_retention::FileEvidenceRetentionRepository::request_cleanup(
+            &mut tx,
+            &[id],
+        )
+        .await?
+            != [id]
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         sqlx::query("SELECT id FROM artifact_version WHERE id = $1 FOR UPDATE")
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -247,7 +278,7 @@ impl StorageMaintenanceRepository {
         let query = format!(
             "SELECT av.id, av.artifact, av.object_key, av.provider_version, av.size_bytes, \
                     av.sha256, av.file_path, av.legacy_snapshot_expires_at \
-             FROM artifact_version av WHERE {predicate} ORDER BY av.body_updated, av.id LIMIT $2"
+             FROM artifact_version av WHERE {predicate} AND file_evidence_version_eligible(av.id) ORDER BY av.body_updated, av.id LIMIT $2"
         );
         sqlx::query_as(&query)
             .bind(cutoff)
@@ -264,6 +295,9 @@ impl StorageMaintenanceRepository {
         size_bytes: i64,
         sha256: &str,
     ) -> Result<bool> {
+        let Some(mut tx) = Self::cleanup_transaction(pool, id).await? else {
+            return Ok(false);
+        };
         let result = sqlx::query(
             "UPDATE artifact_version av SET body_state = 'deleting', provider_version = $2, \
              size_bytes = $3, sha256 = $4 WHERE av.id = $1 AND av.body_state = 'pending' \
@@ -275,9 +309,11 @@ impl StorageMaintenanceRepository {
         .bind(provider_version)
         .bind(size_bytes)
         .bind(sha256)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let changed = result.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     pub async fn mark_log_deleting_from_pending(
@@ -286,6 +322,9 @@ impl StorageMaintenanceRepository {
         segment_count: i64,
         size_bytes: i64,
     ) -> Result<bool> {
+        let Some(mut tx) = Self::cleanup_transaction(pool, id).await? else {
+            return Ok(false);
+        };
         let result = sqlx::query(
             "UPDATE artifact_version SET body_state = 'deleting', provider_version = $2, \
              size_bytes = $3, sha256 = repeat('0', 64) \
@@ -294,19 +333,24 @@ impl StorageMaintenanceRepository {
         .bind(id)
         .bind(format!("segments:{segment_count}"))
         .bind(size_bytes)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
     pub async fn mark_deleting(pool: &PgPool, id: i64) -> Result<bool> {
+        let Some(mut tx) = Self::cleanup_transaction(pool, id).await? else {
+            return Ok(false);
+        };
         let result = sqlx::query(
             "UPDATE artifact_version SET body_state = 'deleting' \
              WHERE id = $1 AND body_state = 'ready'",
         )
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -340,7 +384,7 @@ impl StorageMaintenanceRepository {
     pub async fn expired_pack_snapshots(pool: &PgPool, limit: i64) -> Result<Vec<(i64, String)>> {
         sqlx::query_as(
             "SELECT id, archive_path FROM pack_release WHERE archive_path IS NOT NULL \
-             AND legacy_snapshot_expires_at <= NOW() ORDER BY id LIMIT $1",
+              AND legacy_snapshot_expires_at <= NOW() AND NOT file_evidence_pinned('pack_release',id) ORDER BY id LIMIT $1",
         )
         .bind(limit.max(1))
         .fetch_all(pool)
@@ -348,13 +392,16 @@ impl StorageMaintenanceRepository {
         .map_err(Into::into)
     }
 
-    pub async fn clear_pack_snapshot(pool: &PgPool, id: i64) -> Result<bool> {
+    pub async fn clear_pack_snapshot<'e, E>(executor: E, id: i64) -> Result<bool>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
         let result = sqlx::query(
             "UPDATE pack_release SET archive_path = NULL, legacy_snapshot_expires_at = NULL \
              WHERE id = $1 AND legacy_snapshot_expires_at <= NOW()",
         )
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(result.rows_affected() == 1)
     }
@@ -373,13 +420,16 @@ impl StorageMaintenanceRepository {
         .map_err(Into::into)
     }
 
-    pub async fn clear_artifact_snapshot(pool: &PgPool, id: i64) -> Result<bool> {
+    pub async fn clear_artifact_snapshot<'e, E>(executor: E, id: i64) -> Result<bool>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
         let result = sqlx::query(
             "UPDATE artifact_version SET file_path = NULL, legacy_snapshot_expires_at = NULL \
              WHERE id = $1 AND legacy_snapshot_expires_at <= NOW()",
         )
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(result.rows_affected() == 1)
     }

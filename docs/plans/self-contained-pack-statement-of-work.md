@@ -2,7 +2,11 @@
 
 Date: 2026-10-13
 
-Status: implementation in progress following the user's 2026-10-14 authorization. See [implementation progress](self-contained-pack-implementation-progress.md) for completed work, validation, and outstanding stages. The full statement of work is not yet implemented or enabled.
+Status: implementation paused for budget on 2026-10-16. See the [budget checkpoint](self-contained-pack-budget-checkpoint.md) and local issue #112 with children #113–#122 for preserved work and deferred tasks. The full statement of work is not implemented or enabled. Resuming it requires explicit prioritization and budget approval.
+
+The user later authorized stabilizing the current branch for a release without
+all SOW features. This authorizes targeted release-blocker fixes and validation,
+not completion of the full SOW or activation of its experimental gates.
 
 ## Executive scope
 

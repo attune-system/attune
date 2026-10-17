@@ -542,23 +542,41 @@ pub(crate) async fn inquiry_authorization_caller(
 pub(crate) fn inquiry_disclosure_scope_allows(
     inquiry: &attune_common::repositories::inquiry::InquiryDisclosureRow,
     creator: Option<&attune_common::repositories::execution::ExecutionAuthorizationRow>,
+    managing_pack_id: Option<i64>,
     caller: &AuthorizationContext,
     grants: &[Grant],
 ) -> bool {
     let participant = inquiry.assigned_to == Some(caller.identity_id)
         || creator.and_then(|row| row.executor) == Some(caller.identity_id);
-    (participant || inquiry_action_allowed(inquiry.id, creator, caller, grants, RbacAction::Read))
-        && inquiry_action_allowed(inquiry.id, creator, caller, grants, RbacAction::Decrypt)
+    (participant
+        || inquiry_action_allowed(
+            inquiry.id,
+            creator,
+            managing_pack_id,
+            caller,
+            grants,
+            RbacAction::Read,
+        ))
+        && inquiry_action_allowed(
+            inquiry.id,
+            creator,
+            managing_pack_id,
+            caller,
+            grants,
+            RbacAction::Decrypt,
+        )
 }
 
 fn inquiry_action_allowed(
     inquiry: i64,
     creator: Option<&attune_common::repositories::execution::ExecutionAuthorizationRow>,
+    managing_pack_id: Option<i64>,
     caller: &AuthorizationContext,
     grants: &[Grant],
     action: RbacAction,
 ) -> bool {
     let mut ctx = caller.clone();
+    ctx.managing_pack_id = creator.and(managing_pack_id);
     ctx.target_id = Some(inquiry);
     ctx.target_ref = Some(format!("inquiry:{inquiry}"));
     if let Some(creator) = creator {
@@ -624,6 +642,7 @@ struct InquiryVisibilityEvaluator {
     grants: Vec<Grant>,
     execution_cache: HashMap<i64, Option<attune_common::models::execution::Execution>>,
     ancestor_cache: HashMap<i64, Vec<i64>>,
+    execution_packs: HashMap<i64, i64>,
 }
 
 impl InquiryVisibilityEvaluator {
@@ -639,6 +658,7 @@ impl InquiryVisibilityEvaluator {
             grants,
             execution_cache: HashMap::new(),
             ancestor_cache: HashMap::new(),
+            execution_packs: HashMap::new(),
         })
     }
 
@@ -658,18 +678,11 @@ impl InquiryVisibilityEvaluator {
             return true;
         }
 
-        let mut ctx = AuthorizationContext::new(self.identity_id);
-        ctx.identity_attributes = self.identity_attributes.clone();
-        ctx.target_ref = filters.workflow_action_ref.clone();
-        ctx.pack_ref = filters.workflow_pack_ref.clone().or_else(|| {
-            filters
-                .workflow_action_ref
-                .as_deref()
-                .and_then(|action_ref| action_ref.split_once('.'))
-                .map(|(pack_ref, _)| pack_ref.to_string())
-        });
-
-        AuthorizationService::is_allowed(&self.grants, Resource::Executions, RbacAction::Read, &ctx)
+        // Target predicates are checked against actual workflow executions in
+        // the repository before pagination. Requested refs supply no proof.
+        self.grants.iter().any(|grant| {
+            grant.resource == Resource::Executions && grant.actions.contains(&RbacAction::Read)
+        })
     }
 
     async fn evaluate(
@@ -714,6 +727,15 @@ impl InquiryVisibilityEvaluator {
         }
 
         let execution = ExecutionRepository::find_by_id(&self.state.db, execution_id).await?;
+        if self.grants.iter().any(|grant| {
+            matches!(grant.resource, Resource::Executions | Resource::Inquiries)
+                && grant
+                    .constraints
+                    .as_ref()
+                    .is_some_and(|scope| scope.managing_pack_id.is_some())
+        }) {
+            self.execution_packs.extend(attune_common::repositories::iam_ownership::IamOwnershipRepository::execution_packs(&self.state.db, &[execution_id]).await?);
+        }
         self.execution_cache.insert(execution_id, execution.clone());
         Ok(execution)
     }
@@ -736,7 +758,14 @@ impl InquiryVisibilityEvaluator {
         caller.identity_attributes = self.identity_attributes.clone();
         let creator =
             execution.map(attune_common::repositories::execution::ExecutionAuthorizationRow::from);
-        inquiry_action_allowed(inquiry.id, creator.as_ref(), &caller, &self.grants, action)
+        inquiry_action_allowed(
+            inquiry.id,
+            creator.as_ref(),
+            execution.and_then(|execution| self.execution_packs.get(&execution.id).copied()),
+            &caller,
+            &self.grants,
+            action,
+        )
     }
 
     async fn execution_readable(
@@ -750,6 +779,7 @@ impl InquiryVisibilityEvaluator {
             &self.identity_attributes,
             execution,
             &ancestor_ids,
+            self.execution_packs.get(&execution.id).copied(),
         ))
     }
 
@@ -779,8 +809,10 @@ fn execution_readable_from(
     identity_attributes: &HashMap<String, serde_json::Value>,
     execution: &attune_common::models::execution::Execution,
     ancestor_identity_ids: &[i64],
+    managing_pack_id: Option<i64>,
 ) -> bool {
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.managing_pack_id = managing_pack_id;
     ctx.identity_attributes = identity_attributes.clone();
     ctx.target_id = Some(execution.id);
     ctx.target_ref = Some(execution.action_ref.clone());
@@ -907,6 +939,21 @@ async fn load_inquiry_enrichment(
 
     let ancestor_ids_by_execution =
         ExecutionRepository::ancestor_executor_ids_by_ids(&state.db, &execution_ids).await?;
+    let execution_packs = if ctx.grants.iter().any(|grant| {
+        grant.resource == Resource::Executions
+            && grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+    }) {
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::execution_packs(
+            &state.db,
+            &execution_ids,
+        )
+        .await?
+    } else {
+        HashMap::new()
+    };
 
     let enrichment = inquiries
         .iter()
@@ -914,7 +961,7 @@ async fn load_inquiry_enrichment(
             let context = contexts_by_id.get(&inquiry.id).cloned();
             let creator_execution = executions_by_id.get(&inquiry.created_by_execution).cloned();
             let creator_execution_visible = creator_execution.as_ref().is_some_and(|execution| {
-                execution_is_visible(ctx, execution, &ancestor_ids_by_execution)
+                execution_is_visible(ctx, execution, &ancestor_ids_by_execution, &execution_packs)
             });
             let workflow_execution = context
                 .as_ref()
@@ -922,7 +969,7 @@ async fn load_inquiry_enrichment(
                 .and_then(|execution_id| executions_by_id.get(&execution_id))
                 .cloned();
             let workflow_execution_visible = workflow_execution.as_ref().is_some_and(|execution| {
-                execution_is_visible(ctx, execution, &ancestor_ids_by_execution)
+                execution_is_visible(ctx, execution, &ancestor_ids_by_execution, &execution_packs)
             });
 
             (
@@ -945,6 +992,7 @@ fn execution_is_visible(
     ctx: &InquiryVisibilityContext,
     execution: &Execution,
     ancestor_ids_by_execution: &HashMap<i64, Vec<i64>>,
+    execution_packs: &HashMap<i64, i64>,
 ) -> bool {
     let ancestors = ancestor_ids_by_execution
         .get(&execution.id)
@@ -956,6 +1004,7 @@ fn execution_is_visible(
         &ctx.identity_attributes,
         execution,
         ancestors,
+        execution_packs.get(&execution.id).copied(),
     )
 }
 

@@ -13,8 +13,34 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+async fn shared_target(ctx: &TestContext) -> Result<()> {
+    let shared = create_test_pack(&ctx.pool, "shared").await?;
+    attune_common::repositories::trigger::TriggerRepository::create(
+        &ctx.pool,
+        attune_common::repositories::trigger::CreateTriggerInput {
+            r#ref: "shared.completed".into(),
+            pack: Some(shared.id),
+            pack_ref: Some(shared.r#ref),
+            label: "Shared target".into(),
+            description: None,
+            enabled: true,
+            param_schema: None,
+            event_config_schema: None,
+            out_schema: None,
+            sensor: None,
+            sensor_ref: None,
+            is_adhoc: false,
+            reference_visibility: Default::default(),
+            reference_allowed_pack_refs: Vec::new(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 async fn issuer() -> Result<TestContext> {
     let ctx = TestContext::new().await?.with_auth().await?;
+    shared_target(&ctx).await?;
     let identity = ctx.user.as_ref().unwrap().id;
     let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
         r#ref: "fixture.approval_issuer".into(), pack: None, pack_ref: None, label: None, description: None,
@@ -140,6 +166,7 @@ async fn pack_read_does_not_authorize_broader_external_grants_or_cross_subject_c
 async fn permission_administrator_can_approve_without_personally_holding_the_runtime_grant(
 ) -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
+    shared_target(&ctx).await?;
     create_test_pack(&ctx.pool, "admin_subject").await?;
     let response = ctx.post("/api/v1/packs/admin_subject/external-approvals",
         json!({"grants": [{"resource": "events", "actions": ["create"], "constraints": {"refs": ["shared.completed"]}}]}),

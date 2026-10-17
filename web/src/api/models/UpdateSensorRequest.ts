@@ -13,9 +13,13 @@ export type UpdateSensorRequest = {
   artifact_retention_limit?: null | LogRetentionLimitPatch;
   artifact_retention_policy?: null | LogRetentionPolicyPatch;
   /**
-   * Complete replacement configuration. Omit to preserve the current encrypted revision.
+   * Persistent overrides, replacing each supplied top-level field completely.
    */
   config?: Record<string, any> | null;
+  /**
+   * Remove these top-level overrides and use current release defaults. Null is not reset.
+   */
+  config_reset_fields?: Array<string>;
   /**
    * Sensor description
    */

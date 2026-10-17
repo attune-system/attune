@@ -93,6 +93,12 @@ impl ExecutableSnapshotRepository {
         action_ids: &[Id],
         sensor_ids: &[Id],
     ) -> Result<()> {
+        // Desired-state deployment replaces future metadata overrides, including
+        // redeployment of identical code bytes. Old policy revisions retain pins.
+        sqlx::query("DELETE FROM managed_executable_metadata_current WHERE action = ANY($1)")
+            .bind(action_ids)
+            .execute(&mut *connection)
+            .await?;
         sqlx::query(
             r#"
             INSERT INTO pack_release_executable
@@ -139,7 +145,7 @@ impl ExecutableSnapshotRepository {
                 'cache_grants', COALESCE((
                     SELECT jsonb_agg(grant_value ORDER BY p.ref, ordinal)
                     FROM permission_set p
-                    CROSS JOIN LATERAL jsonb_array_elements(p.grants) WITH ORDINALITY AS g(grant_value, ordinal)
+                    CROSS JOIN LATERAL jsonb_array_elements(effective_permission_set_grants(p.grants, COALESCE(p.pack, 0))) WITH ORDINALITY AS g(grant_value, ordinal)
                     WHERE p.ref IN (SELECT btrim(value) FROM jsonb_array_elements_text(COALESCE(s.config->'cache_permission_set_refs', '[]'::jsonb)) AS refs(value))
                         AND p.retired_at IS NULL AND grant_value->>'resource' = 'caches'
                 ), '[]'::jsonb),
@@ -147,7 +153,7 @@ impl ExecutableSnapshotRepository {
                 'signing_grants', COALESCE((
                     SELECT jsonb_agg(jsonb_set(grant_value, '{actions}', '["use"]'::jsonb) ORDER BY p.ref, ordinal)
                     FROM permission_set p
-                    CROSS JOIN LATERAL jsonb_array_elements(p.grants) WITH ORDINALITY AS g(grant_value, ordinal)
+                    CROSS JOIN LATERAL jsonb_array_elements(effective_permission_set_grants(p.grants, COALESCE(p.pack, 0))) WITH ORDINALITY AS g(grant_value, ordinal)
                     WHERE p.ref IN (SELECT btrim(value) FROM jsonb_array_elements_text(COALESCE(s.config->'signing_permission_set_refs', '[]'::jsonb)) AS refs(value))
                         AND p.retired_at IS NULL AND grant_value->>'resource' = 'keys' AND grant_value->'actions' ? 'use'
                 ), '[]'::jsonb),
@@ -155,7 +161,7 @@ impl ExecutableSnapshotRepository {
                 'input_grants', COALESCE((
                     SELECT jsonb_agg(jsonb_set(grant_value, '{actions}', selected.actions) ORDER BY p.ref, ordinal)
                     FROM permission_set p
-                    CROSS JOIN LATERAL jsonb_array_elements(p.grants) WITH ORDINALITY AS g(grant_value, ordinal)
+                    CROSS JOIN LATERAL jsonb_array_elements(effective_permission_set_grants(p.grants, COALESCE(p.pack, 0))) WITH ORDINALITY AS g(grant_value, ordinal)
                     CROSS JOIN LATERAL (SELECT jsonb_agg(action) AS actions FROM jsonb_array_elements(grant_value->'actions') action
                         WHERE action IN ('"read"'::jsonb, '"decrypt"'::jsonb)) selected
                     WHERE p.ref IN (SELECT btrim(value) FROM jsonb_array_elements_text(COALESCE(s.config->'input_permission_set_refs', '[]'::jsonb)) AS refs(value))
@@ -223,7 +229,7 @@ impl ExecutableSnapshotRepository {
                 SELECT
                     a.id,
                     a.ref,
-                    executable.snapshot,
+                    COALESCE(metadata.snapshot, executable.snapshot) AS snapshot,
                     pr.id AS release_id,
                     pr.digest AS release_digest,
                     pr.content_path
@@ -236,6 +242,10 @@ impl ExecutableSnapshotRepository {
                  AND executable.component_kind = 'action'
                  AND executable.component_id = a.id
                 JOIN pack_release pr ON pr.id = executable.release
+                LEFT JOIN managed_executable_metadata_current metadata_current ON metadata_current.action = a.id
+                LEFT JOIN managed_executable_metadata_revision metadata
+                  ON metadata.id = metadata_current.revision AND metadata.release = executable.release
+                 AND metadata.action = a.id AND metadata.pack = a.pack AND metadata.action_ref = a.ref
                 WHERE a.retired_at IS NULL
                   AND a.effective_enabled
                   AND (a.runtime IS NULL OR r.id IS NOT NULL)

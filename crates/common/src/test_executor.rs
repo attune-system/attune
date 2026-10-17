@@ -20,6 +20,8 @@ const MAX_TEST_OUTPUT_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestConfig {
     pub enabled: bool,
+    #[serde(default)]
+    pub candidate_api_effects: bool,
     pub discovery: DiscoveryConfig,
     pub runners: HashMap<String, RunnerConfig>,
     pub result_format: Option<String>,
@@ -104,12 +106,28 @@ pub struct RunnerConfig {
 pub struct TestExecutor {
     /// Base directory for pack files
     pack_base_dir: PathBuf,
+    candidate_effects: Option<CandidateTestEnvironment>,
+}
+
+/// Separate from ATTUNE_API_TOKEN and archive-download credentials.
+/// No Debug implementation because this contains a runtime secret.
+pub struct CandidateTestEnvironment {
+    pub url: String,
+    pub token: String,
 }
 
 impl TestExecutor {
     /// Create a new test executor
     pub fn new(pack_base_dir: PathBuf) -> Self {
-        Self { pack_base_dir }
+        Self {
+            pack_base_dir,
+            candidate_effects: None,
+        }
+    }
+
+    pub fn with_candidate_effects(mut self, environment: CandidateTestEnvironment) -> Self {
+        self.candidate_effects = Some(environment);
+        self
     }
 
     /// Execute all tests for a pack, looking up the pack directory from the base dir
@@ -163,6 +181,9 @@ impl TestExecutor {
             ));
         }
         test_config.validate_policy()?;
+        if test_config.candidate_api_effects != self.candidate_effects.is_some() {
+            return Err(Error::validation("Candidate API effects require an isolated server-owned context; ordinary tests cannot receive one"));
+        }
 
         if !pack_dir.exists() {
             return Err(Error::not_found(
@@ -403,6 +424,10 @@ impl TestExecutor {
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
         cmd.kill_on_drop(true);
+        if let Some(candidate) = &self.candidate_effects {
+            cmd.env("ATTUNE_CANDIDATE_EFFECTS_URL", &candidate.url)
+                .env("ATTUNE_CANDIDATE_EFFECTS_TOKEN", &candidate.token);
+        }
         #[cfg(unix)]
         cmd.process_group(0);
 
@@ -595,8 +620,48 @@ struct CommandOutput {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn candidate_credentials_are_explicit_and_not_general_execution_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run.sh"),
+            "set -eu\ntest \"$ATTUNE_CANDIDATE_EFFECTS_URL\" = https://api/candidate\ntest \"$ATTUNE_CANDIDATE_EFFECTS_TOKEN\" = candidate-only\ntest -z \"${ATTUNE_API_TOKEN:-}\"\ntest -z \"${ATTUNE_CANDIDATE_ACCESS_TOKEN:-}\"\nprintf 'Total Tests: 1\\nPassed: 1\\nFailed: 0\\n'\n").unwrap();
+        let mut config = test_config(None, None);
+        config.candidate_api_effects = true;
+        config.runners.insert(
+            "isolated".into(),
+            RunnerConfig {
+                r#type: "script".into(),
+                entry_point: "run.sh".into(),
+                timeout: Some(10),
+                result_format: None,
+            },
+        );
+        let plain = TestExecutor::new(root.path().to_path_buf());
+        assert!(plain
+            .execute_pack_tests_at(root.path(), "candidate", "1.0.0", &config)
+            .await
+            .is_err());
+        let isolated = TestExecutor::new(root.path().to_path_buf()).with_candidate_effects(
+            CandidateTestEnvironment {
+                url: "https://api/candidate".into(),
+                token: "candidate-only".into(),
+            },
+        );
+        let result = isolated
+            .execute_pack_tests_at(root.path(), "candidate", "1.0.0", &config)
+            .await
+            .unwrap();
+        assert_eq!(result.passed, 1);
+        config.candidate_api_effects = false;
+        assert!(isolated
+            .execute_pack_tests_at(root.path(), "candidate", "1.0.0", &config)
+            .await
+            .is_err());
+    }
+
     fn test_config(min_pass_rate: Option<f64>, on_failure: Option<&str>) -> TestConfig {
         TestConfig {
+            candidate_api_effects: false,
             enabled: true,
             discovery: DiscoveryConfig {
                 method: "directory".to_string(),

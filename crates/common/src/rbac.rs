@@ -7,9 +7,11 @@ use crate::models::{ArtifactVisibility, Id, OwnerType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = RbacResource)]
 pub enum Resource {
     Packs,
     Actions,
@@ -34,8 +36,9 @@ pub enum Resource {
     AuditLog,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = RbacAction)]
 pub enum Action {
     Read,
     Create,
@@ -51,8 +54,9 @@ pub enum Action {
     Use,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = RbacOwnerConstraint)]
 pub enum OwnerConstraint {
     #[serde(rename = "self")]
     SelfOnly,
@@ -60,8 +64,9 @@ pub enum OwnerConstraint {
     None,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = RbacExecutionScopeConstraint)]
 pub enum ExecutionScopeConstraint {
     #[serde(rename = "self")]
     SelfOnly,
@@ -69,9 +74,13 @@ pub enum ExecutionScopeConstraint {
     Any,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = RbacGrantConstraints)]
 pub struct GrantConstraints {
+    /// Server-normalized structural ownership. Authored selectors cannot set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managing_pack_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_refs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,8 +103,9 @@ pub struct GrantConstraints {
     pub attributes: Option<HashMap<String, JsonValue>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = RbacGrant)]
 pub struct Grant {
     pub resource: Resource,
     pub actions: Vec<Action>,
@@ -171,6 +181,8 @@ fn is_valid_cache_namespace_ref(value: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct AuthorizationContext {
+    /// Set only from repository-owned target resolution, never a ref prefix.
+    pub managing_pack_id: Option<Id>,
     pub identity_id: Id,
     pub identity_attributes: HashMap<String, JsonValue>,
     pub target_id: Option<Id>,
@@ -188,6 +200,7 @@ pub struct AuthorizationContext {
 impl AuthorizationContext {
     pub fn new(identity_id: Id) -> Self {
         Self {
+            managing_pack_id: None,
             identity_id,
             identity_attributes: HashMap::new(),
             target_id: None,
@@ -213,6 +226,20 @@ impl Grant {
         let Some(constraints) = &self.constraints else {
             return true;
         };
+        if let Some(pack_id) = constraints.managing_pack_id {
+            if ctx.managing_pack_id != Some(pack_id)
+                || !crate::runtime_authority::pack_owned_resource(self.resource)
+                || matches!(
+                    self.resource,
+                    Resource::Keys | Resource::Artifacts | Resource::Caches
+                ) && !matches!(
+                    ctx.owner_type,
+                    Some(OwnerType::Pack | OwnerType::Action | OwnerType::Sensor)
+                )
+            {
+                return false;
+            }
+        }
 
         if let Some(pack_refs) = &constraints.pack_refs {
             let Some(pack_ref) = &ctx.pack_ref else {
@@ -373,6 +400,9 @@ fn delegation_constraints_cover(
         }
     };
     attributes_match
+        && held
+            .managing_pack_id
+            .is_none_or(|pack| requested.managing_pack_id == Some(pack))
         && owner
         && execution_scope
         && selected_scope_is_subset(held.pack_refs.as_deref(), requested.pack_refs.as_deref())
@@ -402,6 +432,57 @@ fn selected_scope_is_subset<T: PartialEq>(held: Option<&[T]>, requested: Option<
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn structural_iam_containment_cannot_drop_or_change_managing_pack() {
+        let held = Grant {
+            resource: Resource::Actions,
+            actions: vec![Action::Execute],
+            constraints: Some(GrantConstraints {
+                managing_pack_id: Some(17),
+                ..Default::default()
+            }),
+        };
+        let context = AuthorizationContext::new(42);
+        let mut requested = held.clone();
+        requested.constraints.as_mut().unwrap().ids = Some(vec![8]);
+        assert!(can_delegate_grants(
+            &[held.clone()],
+            &[requested.clone()],
+            &context
+        ));
+        for pack in [None, Some(18)] {
+            requested.constraints.as_mut().unwrap().managing_pack_id = pack;
+            assert!(!can_delegate_grants(
+                &[held.clone()],
+                &[requested.clone()],
+                &context
+            ));
+        }
+    }
+
+    #[test]
+    fn structural_context_does_not_enable_global_administration() {
+        let mut context = AuthorizationContext::new(42);
+        context.managing_pack_id = Some(17);
+        for resource in [
+            Resource::Workers,
+            Resource::Identities,
+            Resource::Permissions,
+            Resource::Retention,
+            Resource::AuditLog,
+        ] {
+            let grant = Grant {
+                resource,
+                actions: vec![Action::Manage],
+                constraints: Some(GrantConstraints {
+                    managing_pack_id: Some(17),
+                    ..Default::default()
+                }),
+            };
+            assert!(!grant.allows(resource, Action::Manage, &context));
+        }
+    }
 
     #[test]
     fn delegation_cannot_discard_requested_scope_constraints() {

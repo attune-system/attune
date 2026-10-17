@@ -168,6 +168,74 @@ async fn create_execution(pool: &PgPool, action: &Action) -> TResult<Execution> 
     .await?)
 }
 
+#[tokio::test]
+async fn normalized_local_inquiry_scope_reveals_only_actual_creator_pack() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let reader = create_identity(&ctx.pool, "local_inquiry_reader").await?;
+    let (pack, action) = setup_pack_action(&ctx.pool, "local_inquiry_scope").await?;
+    let (foreign_pack, foreign_action) =
+        setup_pack_action(&ctx.pool, "foreign_inquiry_scope").await?;
+    activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &attune_common::repositories::component_lifecycle::PackProjectionIds {
+            actions: vec![action.id],
+            ..Default::default()
+        },
+    )
+    .await?;
+    activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &foreign_pack,
+        &attune_common::repositories::component_lifecycle::PackProjectionIds {
+            actions: vec![foreign_action.id],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let local_execution = create_execution(&ctx.pool, &action).await?;
+    let foreign_execution = create_execution(&ctx.pool, &foreign_action).await?;
+    let local = create_inquiry(&ctx.pool, local_execution.id, None).await?;
+    let foreign = create_inquiry(&ctx.pool, foreign_execution.id, None).await?;
+    let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: format!("{}.inquiry_local", pack.r#ref), pack: Some(pack.id), pack_ref: Some(pack.r#ref.clone()),
+        label: None, description: None, grants: json!([
+            {"resource":"inquiries","actions":["read","decrypt"]}, {"resource":"executions","actions":["read"]}
+        ]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: reader.id,
+            permset: set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(reader.id).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    let token = generate_access_token(reader.id, &reader.login, &jwt_config())?;
+    let detail = ctx
+        .get(&format!("/api/v1/inquiries/{}", local.id), Some(&token))
+        .await?;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let body: serde_json::Value = detail.json().await?;
+    assert_eq!(body["data"]["created_by_execution"], local_execution.id);
+    assert_eq!(
+        ctx.get(&format!("/api/v1/inquiries/{}", foreign.id), Some(&token))
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let list: serde_json::Value = ctx
+        .get("/api/v1/inquiries?limit=1", Some(&token))
+        .await?
+        .json()
+        .await?;
+    assert_eq!(list["items"][0]["id"], local.id);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
 async fn create_child_execution(
     pool: &PgPool,
     action: &Action,

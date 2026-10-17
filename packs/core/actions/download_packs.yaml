@@ -10,7 +10,9 @@ entry_point: download_packs.sh
 
 # Parameter delivery: stdin for secure parameter passing (no env vars)
 parameter_delivery: stdin
-parameter_format: dotenv
+parameter_format: json
+required_worker_runtimes:
+  python: ">=3.11,<4.0"
 
 # Output format: json (structured data parsing enabled)
 output_format: json
@@ -41,10 +43,23 @@ parameters:
     type: boolean
     description: "Verify SSL certificates for HTTPS downloads"
     default: true
+  api_url:
+    type: string
+    description: Optional explicit bearer endpoint. Omit to use the execution's ATTUNE_API_URL.
+  api_token:
+    type: string
+    secret: true
+    description: Existing bearer access token. Omit to use an explicitly authorized execution token.
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
-output_schema:
+output:
+  pack_paths:
+    type: array
+    items:
+      type: string
+  duration_seconds:
+    type: integer
   downloaded_packs:
     type: array
     description: "List of successfully downloaded packs"
@@ -70,10 +85,10 @@ output_schema:
           type: string
           description: "Pack version (from pack.yaml)"
         git_commit:
-          type: string
+          type: [string, "null"]
           description: "Git commit hash (for git sources)"
         checksum:
-          type: string
+          type: [string, "null"]
           description: "Directory checksum"
   failed_packs:
     type: array

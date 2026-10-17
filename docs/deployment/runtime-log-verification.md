@@ -123,6 +123,9 @@ limiter. The suite checks these behaviors against RustFS:
 - S3 version IDs and exact pinned reads.
 - The 15-second reconciliation path after one replica misses log and terminal
   notifications.
+- Slow publication longer than terminal grace, with completion only after sealing
+  is acknowledged. A separate early-completion case expects `log_stream_incomplete`
+  and EOF rather than silently treating the stream as successfully completed.
 - Append-before-seal and seal-before-append orderings through production HTTP
   routes.
 - Initial PostgreSQL listener failure followed by a readiness signal after the

@@ -53,6 +53,14 @@ export interface WorkflowTask {
   name: string;
   /** Action reference (e.g., "core.echo") */
   action: string;
+  /** Finite literal ceiling for a rendered action selector. */
+  allowed_action_refs?: string[];
+  /** Nested tasks retain their authored collection shape and names. */
+  tasks?: WorkflowTask[];
+  taskCollectionShape?: "map";
+  authoredKey?: string;
+  /** Original task fields not owned by this inspector survive editing. */
+  sourceTask?: WorkflowYamlTask;
   /** Input parameters (template strings or values) */
   input: Record<string, unknown>;
   /** Permission set refs for this task's execution token; may be a template */
@@ -253,6 +261,8 @@ export const CANCELLATION_POLICY_LABELS: Record<CancellationPolicy, string> = {
 
 /** Complete workflow builder state */
 export interface WorkflowBuilderState {
+  sourceDefinition?: WorkflowYamlDefinition;
+  taskCollectionShape?: "map";
   /** Workflow name (used to derive ref and filename) */
   name: string;
   /** Human-readable label */
@@ -311,7 +321,8 @@ export interface WorkflowYamlDefinition {
   parameters?: Record<string, unknown>;
   output?: Record<string, unknown>;
   vars?: Record<string, unknown>;
-  tasks: WorkflowYamlTask[];
+  tasks: WorkflowYamlTasks;
+  [key: string]: unknown;
   output_map?: Record<string, string>;
   tags?: string[];
   cancellation_policy?: CancellationPolicy;
@@ -327,7 +338,8 @@ export interface WorkflowYamlDefinition {
 export interface WorkflowGraphDefinition {
   version: string;
   vars?: Record<string, unknown>;
-  tasks: WorkflowYamlTask[];
+  tasks: WorkflowYamlTasks;
+  [key: string]: unknown;
   output_map?: Record<string, string>;
   cancellation_policy?: CancellationPolicy;
 }
@@ -381,10 +393,16 @@ export interface TaskChartMeta {
 
 /** Task as represented in YAML format */
 export interface WorkflowYamlTask {
-  name: string;
+  name?: string;
   action?: string;
+  action_ref?: string;
+  allowed_action_refs?: string[] | null;
+  tasks?: WorkflowYamlTasks | null;
+  params?: Record<string, unknown>;
+  [key: string]: unknown;
   input?: Record<string, unknown>;
   permission_set_refs?: string | string[];
+  permission_set_ref?: string | string[];
   delay?: number;
   with_items?: string;
   iterate_cache?: WorkflowYamlIterateCacheConfig;
@@ -398,6 +416,9 @@ export interface WorkflowYamlTask {
   /** Visual metadata (position) — ignored by backend */
   __chart_meta__?: TaskChartMeta;
 }
+
+export type WorkflowYamlTasks =
+  WorkflowYamlTask[] | Record<string, WorkflowYamlTask>;
 
 /** Request to save a workflow file to disk and sync to DB */
 export interface SaveWorkflowFileRequest {
@@ -525,6 +546,7 @@ export function builderStateToDefinition(
 ): WorkflowYamlDefinition {
   const graph = builderStateToGraph(state, actionSchemas);
   const definition: WorkflowYamlDefinition = {
+    ...graph,
     ref: `${state.packRef}.${state.name}`,
     label: state.label,
     version: state.version,
@@ -569,26 +591,77 @@ export function builderStateToDefinition(
  * file on disk — no `ref`, `label`, `description`, `parameters`, `output`,
  * or `tags`. Those belong in the companion action YAML.
  */
-export function builderStateToGraph(
-  state: WorkflowBuilderState,
+function builderTasksToYaml(
+  builderTasks: WorkflowTask[],
+  shape: "map" | undefined,
   actionSchemas?: Map<string, Record<string, unknown> | null>,
-): WorkflowGraphDefinition {
-  const tasks: WorkflowYamlTask[] = state.tasks.map((task) => {
+): WorkflowYamlTasks {
+  const tasks: WorkflowYamlTask[] = builderTasks.map((task) => {
     const yamlTask: WorkflowYamlTask = {
+      ...task.sourceTask,
       name: task.name,
     };
+    // Clear inspector-owned fields before applying edits, so clearing a field
+    // cannot restore its original value. Other executable fields stay untouched.
+    for (const field of [
+      "action",
+      "action_ref",
+      "allowed_action_refs",
+      "tasks",
+      "input",
+      "params",
+      "permission_set_refs",
+      "permission_set_ref",
+      "delay",
+      "with_items",
+      "iterate_cache",
+      "batch_size",
+      "concurrency",
+      "retry",
+      "timeout",
+      "next",
+      "join",
+      "wait_for",
+      "on_success",
+      "on_failure",
+      "on_complete",
+      "on_timeout",
+      "decision",
+      "publish",
+    ]) {
+      delete yamlTask[field];
+    }
+    if (shape === "map" && task.sourceTask?.name === undefined)
+      delete yamlTask.name;
 
     if (task.action) {
       yamlTask.action = task.action;
     }
+    if (task.allowed_action_refs !== undefined)
+      yamlTask.allowed_action_refs = [...task.allowed_action_refs];
+    if (task.tasks !== undefined)
+      yamlTask.tasks = builderTasksToYaml(
+        task.tasks,
+        task.taskCollectionShape,
+        actionSchemas,
+      );
 
     // Filter input: strip values that match schema defaults
-    const schema = actionSchemas?.get(task.action);
+    // A current authoring preview is not the retained target's runtime schema.
+    // Never erase explicit historical values based on a publisher's new defaults.
+    const schema = task.sourceTask
+      ? undefined
+      : actionSchemas?.get(task.action);
     const effectiveInput = schema
       ? stripDefaultInputs(task.input, schema)
       : task.input;
     if (Object.keys(effectiveInput).length > 0) {
-      yamlTask.input = effectiveInput;
+      if (
+        task.sourceTask?.params !== undefined &&
+        task.sourceTask.input === undefined
+      )
+        yamlTask.params = effectiveInput;
+      else yamlTask.input = effectiveInput;
     }
 
     if (task.permission_set_refs !== undefined) {
@@ -607,6 +680,7 @@ export function builderStateToGraph(
 
     // Persist canvas position in __chart_meta__ so layout is restored on reload
     yamlTask.__chart_meta__ = {
+      ...task.sourceTask?.__chart_meta__,
       position: { x: task.position.x, y: task.position.y },
     };
 
@@ -642,10 +716,43 @@ export function builderStateToGraph(
 
     return yamlTask;
   });
+  return shape === "map"
+    ? Object.fromEntries(
+        tasks.map((task, index) => [
+          builderTasks[index].authoredKey ?? builderTasks[index].name,
+          task,
+        ]),
+      )
+    : tasks;
+}
+
+export function builderStateToGraph(
+  state: WorkflowBuilderState,
+  actionSchemas?: Map<string, Record<string, unknown> | null>,
+): WorkflowGraphDefinition {
+  const extras = { ...state.sourceDefinition };
+  for (const field of [
+    "ref",
+    "label",
+    "description",
+    "parameters",
+    "output",
+    "tags",
+    "vars",
+    "output_map",
+    "cancellation_policy",
+    "tasks",
+  ])
+    delete extras[field];
 
   const graph: WorkflowGraphDefinition = {
+    ...extras,
     version: state.version,
-    tasks,
+    tasks: builderTasksToYaml(
+      state.tasks,
+      state.taskCollectionShape,
+      actionSchemas,
+    ),
   };
 
   if (Object.keys(state.vars).length > 0) {
@@ -943,14 +1050,16 @@ export function autoLayoutTasks(tasks: WorkflowTask[]): WorkflowTask[] {
   return tasks;
 }
 
-export function definitionToBuilderState(
-  definition: WorkflowYamlDefinition,
-  packRef: string,
-  name: string,
-): WorkflowBuilderState {
-  const rawTasks = definition.tasks || [];
+function yamlTasksToBuilder(collection: WorkflowYamlTasks): WorkflowTask[] {
+  const entries = Array.isArray(collection)
+    ? collection.map((task) => ({ task, key: undefined }))
+    : Object.entries(collection).map(([key, task]) => ({ task, key }));
+  const rawTasks = entries.map(({ task, key }) => ({
+    ...task,
+    name: task.name ?? key ?? "",
+  }));
   const missingPositionFlags: boolean[] = rawTasks.map(
-    (t) => !(t as LegacyYamlTask).__chart_meta__?.position,
+    (t) => !t.__chart_meta__?.position,
   );
 
   const tasks: WorkflowTask[] = rawTasks.map((rawTask, index) => {
@@ -983,13 +1092,21 @@ export function definitionToBuilderState(
     }
 
     return {
-      id: `task-${index}-${Date.now()}`,
-      name: task.name,
-      action: task.action || "",
-      input: task.input || {},
+      id: generateTaskId(),
+      name: rawTask.name,
+      action: task.action || task.action_ref || "",
+      allowed_action_refs:
+        task.allowed_action_refs == null
+          ? undefined
+          : [...task.allowed_action_refs],
+      tasks: task.tasks == null ? undefined : yamlTasksToBuilder(task.tasks),
+      taskCollectionShape:
+        task.tasks && !Array.isArray(task.tasks) ? "map" : undefined,
+      authoredKey: entries[index].key,
+      sourceTask: entries[index].task,
+      input: task.input || task.params || {},
       permission_set_refs: normalizeNullable(
-        task.permission_set_refs as
-          WorkflowTask["permission_set_refs"] | null | undefined,
+        task.permission_set_refs ?? task.permission_set_ref,
       ),
       next,
       delay: normalizeNullable(task.delay as number | null | undefined),
@@ -1002,6 +1119,7 @@ export function definitionToBuilderState(
       ),
       iterate_cache: task.iterate_cache
         ? {
+            ...task.iterate_cache,
             owner_type: task.iterate_cache.owner_type,
             owner_ref: normalizeNullable(task.iterate_cache.owner_ref),
             namespace: task.iterate_cache.namespace,
@@ -1033,8 +1151,19 @@ export function definitionToBuilderState(
   if (missingPositionFlags.some(Boolean) && tasks.length > 0) {
     autoLayoutTasks(tasks);
   }
+  return tasks;
+}
+
+export function definitionToBuilderState(
+  definition: WorkflowYamlDefinition,
+  packRef: string,
+  name: string,
+): WorkflowBuilderState {
+  const tasks = yamlTasksToBuilder(definition.tasks || []);
 
   return {
+    sourceDefinition: definition,
+    taskCollectionShape: !Array.isArray(definition.tasks) ? "map" : undefined,
     name,
     label: definition.label,
     description: definition.description || "",
@@ -1321,6 +1450,110 @@ export function createEmptyTask(
   };
 }
 
+function taskPointerToken(value: string): string {
+  return value.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
+export function locateWorkflowTasks(
+  tasks: WorkflowTask[],
+  shape?: "map",
+  base = "",
+): { task: WorkflowTask; path: string; siblings: WorkflowTask[] }[] {
+  return tasks.flatMap((task, index) => {
+    const selector =
+      shape === "map" ? (task.authoredKey ?? task.name) : String(index);
+    const path = `${base}/tasks/${taskPointerToken(selector)}`;
+    return [
+      { task, path, siblings: tasks },
+      ...locateWorkflowTasks(task.tasks ?? [], task.taskCollectionShape, path),
+    ];
+  });
+}
+
+/** Update one task and its sibling transitions without flattening nested scopes. */
+export function updateWorkflowTask(
+  tasks: WorkflowTask[],
+  taskId: string,
+  updates: Partial<WorkflowTask>,
+): WorkflowTask[] {
+  const selected = tasks.find((task) => task.id === taskId);
+  const renamed =
+    selected && updates.name !== undefined && updates.name !== selected.name;
+  return tasks.map((task) => {
+    let result = task.id === taskId ? { ...task, ...updates } : task;
+    if (
+      task.id === taskId &&
+      updates.name !== undefined &&
+      task.authoredKey !== undefined
+    )
+      result = { ...result, authoredKey: updates.name };
+    if (renamed) {
+      const next = renameTaskInTransitions(
+        result.next,
+        selected.name,
+        updates.name ?? selected.name,
+      );
+      if (next !== result.next) result = { ...result, next };
+    }
+    if (!selected && result.tasks)
+      result = {
+        ...result,
+        tasks: updateWorkflowTask(result.tasks, taskId, updates),
+      };
+    return result;
+  });
+}
+
+export const MAX_ALLOWED_ACTION_REFS = 256;
+
+/** Structural preview only. The server decides referenceability and admission. */
+export function validateAllowedActionRefs(
+  task: { action: string; allowed_action_refs?: unknown },
+  path: string,
+): string[] {
+  const errors: string[] = [];
+  const allowed = task.allowed_action_refs;
+  const dynamic = task.action.includes("{{");
+  if (allowed === undefined && !dynamic) return errors;
+  if (
+    !Array.isArray(allowed) ||
+    allowed.length < 1 ||
+    allowed.length > MAX_ALLOWED_ACTION_REFS
+  ) {
+    return [
+      `${path}/allowed_action_refs: declare 1 to ${MAX_ALLOWED_ACTION_REFS} literal fully qualified action refs`,
+    ];
+  }
+  allowed.forEach((reference: unknown, index: number) => {
+    if (typeof reference !== "string" || !isValidComponentRef(reference))
+      errors.push(
+        `${path}/allowed_action_refs/${index}: expected a literal pack.action ref, without templates or wildcards`,
+      );
+  });
+  if (!dynamic && !allowed.includes(task.action))
+    errors.push(
+      `${path}/action: literal action must belong to allowed_action_refs`,
+    );
+  return errors;
+}
+
+export function retainUnrenderedTaskInputs({
+  stored,
+  edited,
+  renderedFields,
+}: {
+  stored: Record<string, unknown>;
+  edited: Record<string, unknown>;
+  renderedFields: string[];
+}): Record<string, unknown> {
+  return {
+    ...Object.fromEntries(
+      Object.entries(stored).filter(([name]) => !renderedFields.includes(name)),
+    ),
+    ...edited,
+  };
+}
+
 /**
  * Generate a unique task name that doesn't conflict with existing tasks
  */
@@ -1511,6 +1744,10 @@ function validatePermissionSetRefs(
 
   const seen = new Set<string>();
   for (const ref of value) {
+    if (ref.includes("{{")) {
+      validateTemplateSyntax(ref, label, errors);
+      continue;
+    }
     if (seen.has(ref)) {
       errors.push(`${label} contains duplicate ref "${ref}"`);
     }
@@ -1526,6 +1763,7 @@ function validateActionInputs(
   actionSchemas: ActionSchemaMap | undefined,
   errors: string[],
 ) {
+  if (task.sourceTask) return; // The server validates the retained target contract.
   const schema = actionSchemas?.get(task.action);
   if (!schema) return;
 
@@ -1718,16 +1956,31 @@ export function validateWorkflow(
     errors.push("Workflow must have at least one task");
   }
 
+  validateTaskScope(
+    state.tasks,
+    actionSchemas,
+    errors,
+    state.taskCollectionShape,
+    "",
+  );
+  return errors;
+}
+
+function validateTaskScope(
+  tasks: WorkflowTask[],
+  actionSchemas: ActionSchemaMap | undefined,
+  errors: string[],
+  shape: "map" | undefined,
+  base: string,
+) {
   // Check for duplicate task names
   const taskNames = new Set<string>();
   const inboundCounts = new Map<string, number>();
-  for (const task of state.tasks) {
+  for (const task of tasks) {
     if (!task.name.trim()) {
       errors.push("Task name is required");
-    } else if (!isValidLocalRef(task.name)) {
-      errors.push(
-        `Task "${task.name}" must start with a lowercase letter and use only lowercase letters, numbers, underscores, or hyphens`,
-      );
+    } else if ([...task.name].length > 255) {
+      errors.push(`Task "${task.name}" must be 255 characters or fewer`);
     }
     if (taskNames.has(task.name)) {
       errors.push(`Duplicate task name: "${task.name}"`);
@@ -1736,17 +1989,37 @@ export function validateWorkflow(
   }
 
   const transitionsByTask = new Map(
-    state.tasks.map((task) => [
+    tasks.map((task) => [
       task.name,
       (task.next ?? []).flatMap((transition) => transition.do ?? []),
     ]),
   );
 
   // Check that tasks have an action reference
-  for (const task of state.tasks) {
-    if (!task.action) {
+  for (const [index, task] of tasks.entries()) {
+    const path = `${base}/tasks/${taskPointerToken(shape === "map" ? (task.authoredKey ?? task.name) : String(index))}`;
+    errors.push(...validateAllowedActionRefs(task, path));
+    if (
+      shape !== "map" &&
+      tasks.some(
+        (other, otherIndex) =>
+          otherIndex !== index && other.name === String(index),
+      )
+    )
+      errors.push(`${path}: ambiguous numeric task name/index`);
+    if (task.tasks)
+      validateTaskScope(
+        task.tasks,
+        actionSchemas,
+        errors,
+        task.taskCollectionShape,
+        path,
+      );
+    if (!task.action && !task.tasks?.length) {
       errors.push(`Task "${task.name}" must have an action assigned`);
-    } else if (!isValidComponentRef(task.action)) {
+    } else if (task.action.includes("{{")) {
+      validateTemplateSyntax(task.action, `${path}/action`, errors);
+    } else if (task.action && !isValidComponentRef(task.action)) {
       errors.push(`Task "${task.name}" action ref "${task.action}" is invalid`);
     }
 
@@ -1947,7 +2220,7 @@ export function validateWorkflow(
   }
 
   // Check that all transition targets reference existing tasks
-  for (const task of state.tasks) {
+  for (const task of tasks) {
     if (
       task.join !== undefined &&
       task.join !== null &&
@@ -2027,7 +2300,7 @@ export function validateWorkflow(
     }
   }
 
-  for (const task of state.tasks) {
+  for (const task of tasks) {
     if (task.join !== undefined && task.join !== null) {
       const inbound = inboundCounts.get(task.name) ?? 0;
       if (inbound === 0) {
@@ -2041,6 +2314,4 @@ export function validateWorkflow(
       }
     }
   }
-
-  return errors;
 }

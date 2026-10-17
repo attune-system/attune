@@ -90,6 +90,33 @@ pub async fn get_trace_report(
     let execution_ids: Vec<i64> = executions.iter().map(|execution| execution.id).collect();
 
     let mut ancestor_cache: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
+    let ancestors =
+        if can_read_executions && !has_unconstrained_read_grant(&grants, Resource::Executions) {
+            ExecutionRepository::ancestor_executor_ids_by_ids(&state.db, &execution_ids).await?
+        } else {
+            HashMap::new()
+        };
+    for execution in &executions {
+        ancestor_cache.insert(
+            execution.parent,
+            ancestors.get(&execution.id).cloned().unwrap_or_default(),
+        );
+    }
+    let execution_packs = if grants.iter().any(|grant| {
+        grant.resource == Resource::Executions
+            && grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+    }) {
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::execution_packs(
+            &state.db,
+            &execution_ids,
+        )
+        .await?
+    } else {
+        HashMap::new()
+    };
     let mut visible_execution_ids = HashSet::new();
     let mut visible_execution_rows = Vec::new();
 
@@ -106,6 +133,7 @@ pub async fn get_trace_report(
                     &identity_attributes,
                     execution,
                     &mut ancestor_cache,
+                    execution_packs.get(&execution.id).copied(),
                 )
                 .await?
             };
@@ -134,6 +162,23 @@ pub async fn get_trace_report(
     }
 
     let mut visible_enforcement_ids = HashSet::new();
+    let rule_owners = if grants.iter().any(|grant| {
+        grant.resource == Resource::Enforcements
+            && grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+    }) {
+        let ids = fetched_enforcements
+            .iter()
+            .filter_map(|row| row.rule)
+            .collect::<Vec<_>>();
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_refs_and_packs(&state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Rule, &ids).await?.into_iter()
+            .map(|(id, reference, pack)| ((id,reference),pack)).collect::<HashMap<_,_>>()
+    } else {
+        HashMap::new()
+    };
     let mut visible_enforcements = Vec::new();
     if can_read_enforcements {
         let global_enforcement_read = has_unconstrained_read_grant(&grants, Resource::Enforcements);
@@ -146,6 +191,12 @@ pub async fn get_trace_report(
                     identity_id,
                     &identity_attributes,
                     enforcement,
+                    enforcement.rule.and_then(|id| {
+                        rule_owners
+                            .get(&(id, enforcement.rule_ref.clone()))
+                            .copied()
+                            .flatten()
+                    }),
                 )
             };
             if allowed {
@@ -170,6 +221,22 @@ pub async fn get_trace_report(
     }
 
     let mut visible_event_ids = HashSet::new();
+    let mut trigger_owners = HashMap::new();
+    let local_event_scope = grants.iter().any(|grant| {
+        grant.resource == Resource::Events
+            && grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+    });
+    if local_event_scope {
+        let ids = fetched_events
+            .iter()
+            .filter_map(|row| row.trigger)
+            .collect::<Vec<_>>();
+        for (id, reference, pack) in attune_common::repositories::iam_ownership::IamOwnershipRepository::component_refs_and_packs(&state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger, &ids).await? {trigger_owners.insert((id,reference),pack);}
+    }
     let mut visible_events = Vec::new();
     if can_read_events {
         let global_event_read = has_unconstrained_read_grant(&grants, Resource::Events);
@@ -177,7 +244,18 @@ pub async fn get_trace_report(
             let allowed = if global_event_read {
                 true
             } else {
-                event_visible_for_trace(&grants, identity_id, &identity_attributes, &event)
+                event_visible_for_trace(
+                    &grants,
+                    identity_id,
+                    &identity_attributes,
+                    &event,
+                    event.trigger.and_then(|id| {
+                        trigger_owners
+                            .get(&(id, event.trigger_ref.clone()))
+                            .copied()
+                            .flatten()
+                    }),
+                )
             };
             if allowed {
                 visible_event_ids.insert(event.id);
@@ -191,8 +269,27 @@ pub async fn get_trace_report(
         let global_event_read = has_unconstrained_read_grant(&grants, Resource::Events);
         if let Some((prefix, id)) = parse_default_trace_id(&normalized) {
             if let Some(event) = EventRepository::find_by_id(&state.db, id).await? {
+                if local_event_scope {
+                    if let Some(trigger) = event.trigger {
+                        if !trigger_owners.contains_key(&(trigger, event.trigger_ref.clone())) {
+                            for (id, reference, pack) in attune_common::repositories::iam_ownership::IamOwnershipRepository::component_refs_and_packs(&state.db,
+                            attune_common::repositories::runtime_target::ComponentTarget::Trigger, &[trigger]).await? {trigger_owners.insert((id,reference),pack);}
+                        }
+                    }
+                }
                 let allowed = global_event_read
-                    || event_visible_for_trace(&grants, identity_id, &identity_attributes, &event);
+                    || event_visible_for_trace(
+                        &grants,
+                        identity_id,
+                        &identity_attributes,
+                        &event,
+                        event.trigger.and_then(|id| {
+                            trigger_owners
+                                .get(&(id, event.trigger_ref.clone()))
+                                .copied()
+                                .flatten()
+                        }),
+                    );
                 if event.trigger_ref == prefix && allowed && visible_event_ids.insert(event.id) {
                     visible_events.push(event);
                 }
@@ -393,8 +490,10 @@ async fn execution_visible_for_trace(
     identity_attributes: &HashMap<String, serde_json::Value>,
     execution: &ExecutionWithRefs,
     ancestor_cache: &mut HashMap<Option<i64>, Vec<i64>>,
+    managing_pack_id: Option<i64>,
 ) -> ApiResult<bool> {
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.managing_pack_id = managing_pack_id;
     ctx.identity_attributes = identity_attributes.clone();
     ctx.target_id = Some(execution.id);
     ctx.target_ref = Some(execution.action_ref.clone());
@@ -451,8 +550,10 @@ fn enforcement_visible_for_trace(
     identity_id: i64,
     identity_attributes: &HashMap<String, serde_json::Value>,
     enforcement: &attune_common::models::event::Enforcement,
+    managing_pack_id: Option<i64>,
 ) -> bool {
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.managing_pack_id = managing_pack_id;
     ctx.identity_attributes = identity_attributes.clone();
     ctx.target_id = Some(enforcement.id);
     ctx.target_ref = Some(enforcement.rule_ref.clone());
@@ -469,8 +570,10 @@ fn event_visible_for_trace(
     identity_id: i64,
     identity_attributes: &HashMap<String, serde_json::Value>,
     event: &attune_common::models::event::Event,
+    managing_pack_id: Option<i64>,
 ) -> bool {
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.managing_pack_id = managing_pack_id;
     ctx.identity_attributes = identity_attributes.clone();
     ctx.target_id = Some(event.id);
     ctx.target_ref = Some(event.trigger_ref.clone());

@@ -433,6 +433,11 @@ impl ExecutionManager {
         child_actions: &[String],
         encryption_key: Option<&str>,
     ) -> Result<()> {
+        if !child_actions.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Completion callbacks are not admitted invocations; use workflow task bindings"
+            ));
+        }
         info!(
             "Triggering {} child executions for parent: {}",
             child_actions.len(),
@@ -540,7 +545,7 @@ impl ExecutionManager {
                 // Inherit triggering identity from parent so the callback
                 // token has the same security context.
                 executor: parent.executor,
-                permission_set_refs: parent.permission_set_refs.clone(),
+                permission_set_refs: Vec::new(),
                 artifact_retention_policy: parent.artifact_retention_policy,
                 artifact_retention_limit: parent.artifact_retention_limit,
                 worker_selector: parent.worker_selector.clone(),

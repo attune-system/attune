@@ -92,6 +92,9 @@ const IdentityDetailPage = lazy(
 const PermissionSetDetailPage = lazy(
   () => import("@/pages/access-control/PermissionSetDetailPage"),
 );
+const PermissionSetCreatePage = lazy(
+  () => import("@/pages/access-control/PermissionSetCreatePage"),
+);
 
 function PageLoader() {
   return (
@@ -226,6 +229,10 @@ function App() {
                   <Route
                     path="access-control/identities/:id"
                     element={<IdentityDetailPage />}
+                  />
+                  <Route
+                    path="access-control/permission-sets/new"
+                    element={<PermissionSetCreatePage />}
                   />
                   <Route
                     path="access-control/permission-sets/:ref"

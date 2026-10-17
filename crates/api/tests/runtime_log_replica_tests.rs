@@ -245,7 +245,9 @@ struct Replica {
 impl Replica {
     async fn stop(mut self) -> Result<()> {
         self.state.execution_log_streams.begin_shutdown();
-        tokio::time::timeout(Duration::from_secs(2), &mut self.server).await???;
+        tokio::time::timeout(Duration::from_secs(2), &mut self.server)
+            .await
+            .map_err(|_| "replica shutdown exceeded the two-second test deadline")???;
         if let Some(task) = self.notifications.take() {
             task.abort();
         }
@@ -590,12 +592,21 @@ where
     tokio::time::timeout(wait, async {
         loop {
             let event = stream.next().await.ok_or("SSE stream ended")??;
+            if let Some(error) = unexpected_sse_terminal(&event, name) {
+                return Err(error.into());
+            }
             if event.event == name {
                 return Ok(event);
             }
         }
     })
-    .await?
+    .await
+    .map_err(|_| {
+        format!(
+            "timed out waiting for SSE event {name} after {} ms",
+            wait.as_millis()
+        )
+    })?
 }
 
 async fn next_data_event<S, E>(stream: &mut S, wait: Duration) -> Result<Event>
@@ -606,12 +617,54 @@ where
     tokio::time::timeout(wait, async {
         loop {
             let event = stream.next().await.ok_or("SSE stream ended")??;
+            if let Some(error) = unexpected_sse_terminal(&event, "content or append") {
+                return Err(error.into());
+            }
             if matches!(event.event.as_str(), "content" | "append") {
                 return Ok(event);
             }
         }
     })
-    .await?
+    .await
+    .map_err(|_| {
+        format!(
+            "timed out waiting for SSE data after {} ms",
+            wait.as_millis()
+        )
+    })?
+}
+
+fn unexpected_sse_terminal(event: &Event, expected: &str) -> Option<String> {
+    if event.event == "error" && expected != "error" {
+        let body: serde_json::Value =
+            serde_json::from_str(&event.data).unwrap_or(serde_json::Value::Null);
+        let code = body["code"]
+            .as_str()
+            .filter(|code| {
+                code.len() <= 64
+                    && code
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+            .unwrap_or("unrecognized_error");
+        return Some(format!("SSE error {code} while waiting for {expected}"));
+    }
+    (event.event == "done" && expected != "done").then(|| format!("SSE done before {expected}"))
+}
+
+#[tokio::test]
+async fn data_helper_reports_terminal_error_codes_instead_of_opaque_eof() {
+    let bytes = futures::stream::iter([Ok::<_, std::io::Error>(
+        "event: error\ndata: {\"code\":\"log_stream_incomplete\",\"message\":\"fixture\"}\n\n",
+    )]);
+    let mut stream = bytes.eventsource();
+    let error = next_data_event(&mut stream, Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("log_stream_incomplete"),
+        "{error}"
+    );
 }
 
 async fn put_segment(
@@ -1273,12 +1326,13 @@ async fn object_s3_reader_recovers_missed_notifications_and_terminal() -> Result
     let harness = Harness::start(&[true, false]).await?;
     let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
     let client = reqwest::Client::new();
+    // Publication may take longer than terminal grace. Keep the execution
+    // running until publication/sealing are acknowledged, as the writer does.
+    harness.controls[0]
+        .response_delay_ms
+        .store(3_000, Ordering::SeqCst);
     let mut reader =
         Box::pin(open_log_stream(&client, &harness.replicas[1], &fixture, None).await?);
-    sqlx::query("UPDATE execution SET status = 'completed' WHERE id = $1")
-        .bind(fixture.execution_id)
-        .execute(harness.database.pool())
-        .await?;
     assert_eq!(
         put_segment(
             &client,
@@ -1303,6 +1357,11 @@ async fn object_s3_reader_recovers_missed_notifications_and_terminal() -> Result
         reqwest::StatusCode::OK
     );
 
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE id = $1")
+        .bind(fixture.execution_id)
+        .execute(harness.database.pool())
+        .await?;
+
     assert_eq!(
         next_data_event(&mut reader, Duration::from_secs(18))
             .await?
@@ -1310,6 +1369,30 @@ async fn object_s3_reader_recovers_missed_notifications_and_terminal() -> Result
         "reconciled"
     );
     next_event(&mut reader, "done", Duration::from_secs(2)).await?;
+    harness.stop().await
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires PostgreSQL and versioned S3 storage; exercises terminal grace"]
+async fn object_s3_terminal_before_publication_reports_incomplete_without_data() -> Result<()> {
+    let harness = Harness::start(&[false, false]).await?;
+    let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE id = $1")
+        .bind(fixture.execution_id)
+        .execute(harness.database.pool())
+        .await?;
+    let client = reqwest::Client::new();
+    let mut reader =
+        Box::pin(open_log_stream(&client, &harness.replicas[1], &fixture, None).await?);
+    let event = next_event(&mut reader, "error", Duration::from_secs(8)).await?;
+    let payload: serde_json::Value = serde_json::from_str(&event.data)?;
+    assert_eq!(payload["code"], "log_stream_incomplete");
+    assert_eq!(payload["retryable"], false);
+    assert!(tokio::time::timeout(Duration::from_secs(2), reader.next())
+        .await
+        .map_err(|_| "terminal error stream did not close within two seconds")?
+        .is_none());
+    drop(reader);
     harness.stop().await
 }
 

@@ -210,6 +210,43 @@ async fn create_queue_with_visibility(
 }
 
 #[tokio::test]
+async fn queue_requester_grouping_round_trips_through_create_inspect_and_update() -> Result<()> {
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let token = register_queue_admin(&ctx).await;
+    let (_, action) =
+        create_pack_with_action(&ctx, "batch_grouping", "batch_grouping.dispatch").await;
+    let path = "/api/v1/queues/adhoc.batch_grouping";
+    let response = ctx.post("/api/v1/queues", json!({"ref":"adhoc.batch_grouping", "label":"Batch grouping",
+        "dispatch_action_ref":action.r#ref, "batch_mode":"batch", "config":{"dispatch":{"separate_requesters":true}}
+    }), Some(&token)).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["data"]["config"]["dispatch"]["separate_requesters"],
+        true
+    );
+    for separate in [false, true] {
+        let response = ctx
+            .put(
+                path,
+                json!({"config":{"dispatch":{"separate_requesters":separate}}}),
+                Some(&token),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = ctx.get(path, Some(&token)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(
+            body["data"]["config"]["dispatch"]["separate_requesters"],
+            separate
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn queue_api_bulk_enqueues_items() {
     let ctx = TestContext::new()
         .await

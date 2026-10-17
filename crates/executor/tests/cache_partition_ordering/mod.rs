@@ -293,35 +293,93 @@ async fn live_cache_iteration_fails_before_pins_or_children_are_created() {
     let pool = fixture.database.pool();
     let snapshot = fixture.parent.executable_snapshot.as_ref().unwrap();
     let action = &snapshot.executable.action;
-    let namespace = CacheNamespaceRepository::create(pool, CreateCacheNamespaceInput {
-        mode: attune_common::models::CacheMode::Live,
-        owner: CacheOwnerScope::pack(action.pack, Some(action.pack_ref.clone())),
-        namespace: "partition_ordering".into(), policy: Default::default(),
-    }).await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        pool,
+        CreateCacheNamespaceInput {
+            mode: attune_common::models::CacheMode::Live,
+            owner: CacheOwnerScope::pack(action.pack, Some(action.pack_ref.clone())),
+            namespace: "partition_ordering".into(),
+            policy: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
     let mut live_write = pool.begin().await.unwrap();
-    attune_common::repositories::cache::CacheLiveRepository::apply_conn(&mut live_write,
+    attune_common::repositories::cache::CacheLiveRepository::apply_conn(
+        &mut live_write,
         attune_common::repositories::cache::ApplyLiveCacheInput {
-            namespace: namespace.id, request_id: "initial", request_checksum: "initial", expected_revision: 0,
-            entries: &[], deleted_external_ids: &[], source_revision: None,
-        }, &attune_common::config::CacheAdmissionConfig::default()).await.unwrap();
+            namespace: namespace.id,
+            request_id: "initial",
+            request_checksum: "initial",
+            expected_revision: 0,
+            entries: &[],
+            deleted_external_ids: &[],
+            source_revision: None,
+        },
+        &attune_common::config::CacheAdmissionConfig::default(),
+    )
+    .await
+    .unwrap();
     live_write.commit().await.unwrap();
-    let backing = CacheNamespaceRepository::find_by_id(pool, namespace.id).await.unwrap().unwrap().active_generation.unwrap();
+    let backing = CacheNamespaceRepository::find_by_id(pool, namespace.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .active_generation
+        .unwrap();
     let task = cache_task(&fixture, backing);
-    let child = &snapshot.pack_executables["cache_partition_it.consume"].executable.action;
+    let child = &snapshot.pack_executables["cache_partition_it.consume"]
+        .executable
+        .action;
+    let pinned_child = &snapshot.pack_executables["cache_partition_it.consume"];
+    let task_snapshot = ExecutionExecutableSnapshot {
+        release: pinned_child.release.clone(),
+        executable: pinned_child.executable.clone(),
+        pack_executables: snapshot.pack_executables.clone(),
+    };
     let mut tx = pool.begin().await.unwrap();
-    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation).await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
     let result = ExecutionScheduler::initialize_cache_iteration_with_conn(
-        &mut tx, &fixture.parent, &task, child, &fixture.context, task.iterate_cache.as_ref().unwrap(), None,
-    ).await;
-    assert!(matches!(result, Err(CacheIterationInitializationError::Logical(CacheIterationInitializationFailure::LiveNamespace))));
-    let pins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_cache_iteration WHERE workflow_execution = $1")
-        .bind(fixture.workflow_execution_id).fetch_one(&mut *tx).await.unwrap();
+        &mut tx,
+        &fixture.parent,
+        &task,
+        child,
+        &task_snapshot,
+        &fixture.context,
+        task.iterate_cache.as_ref().unwrap(),
+        None,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(CacheIterationInitializationError::Logical(
+            CacheIterationInitializationFailure::LiveNamespace
+        ))
+    ));
+    let pins: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_cache_iteration WHERE workflow_execution = $1",
+    )
+    .bind(fixture.workflow_execution_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
     let children: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent = $1")
-        .bind(fixture.parent.id).fetch_one(&mut *tx).await.unwrap();
+        .bind(fixture.parent.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
     assert_eq!((pins, children), (0, 0));
-    let pin = WorkflowCacheIterationRepository::create_or_find_for_update(&mut tx,
-        iteration_input(&fixture, namespace.id, backing, "consume")).await;
-    assert!(pin.unwrap_err().to_string().contains("live caches cannot be iterated"));
+    let pin = WorkflowCacheIterationRepository::create_or_find_for_update(
+        &mut tx,
+        iteration_input(&fixture, namespace.id, backing, "consume"),
+    )
+    .await;
+    assert!(pin
+        .unwrap_err()
+        .to_string()
+        .contains("live caches cannot be iterated"));
     tx.rollback().await.unwrap();
     fixture.database.cleanup().await.unwrap();
 }
@@ -387,7 +445,7 @@ fn cache_task(fixture: &CachePartitionFixture, generation: i64) -> TaskNode {
 }
 
 async fn dispatch(
-    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     fixture: &CachePartitionFixture,
     parent: &Execution,
     task: &TaskNode,

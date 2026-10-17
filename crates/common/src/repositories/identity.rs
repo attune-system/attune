@@ -200,7 +200,7 @@ impl IdentityRepository {
         sqlx::query_as(
             "SELECT i.id AS identity_id, i.attributes, i.frozen,
                 COALESCE((SELECT jsonb_agg(g.value)
-                    FROM permission_set ps CROSS JOIN LATERAL jsonb_array_elements(ps.grants) AS g(value)
+                    FROM permission_set ps CROSS JOIN LATERAL jsonb_array_elements(effective_permission_set_grants(ps.grants, COALESCE(ps.pack, 0))) AS g(value)
                     WHERE ps.retired_at IS NULL AND (
                         EXISTS (SELECT 1 FROM permission_assignment pa WHERE pa.identity = i.id AND pa.permset = ps.id)
                         OR EXISTS (SELECT 1 FROM identity_role_assignment ira
@@ -712,6 +712,8 @@ pub struct PermissionSetRepository;
 pub struct PermissionSetAdminRow {
     #[sqlx(flatten)]
     pub permission_set: PermissionSet,
+    pub authored_grants: serde_json::Value,
+    pub authored_definition: serde_json::Value,
     pub management_origin: ManagementOriginKind,
     pub roles: sqlx::types::Json<Vec<PermissionSetRoleAssignment>>,
 }
@@ -787,6 +789,7 @@ impl Create for PermissionSetRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        crate::runtime_authority::normalize_iam_grants(input.grants.clone(), input.pack)?;
         sqlx::query_as::<_, PermissionSet>(
             "INSERT INTO permission_set (ref, pack, pack_ref, label, description, grants) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, ref, pack, pack_ref, label, description, grants, retired_at, created, updated"
         ).bind(&input.r#ref).bind(input.pack).bind(&input.pack_ref).bind(&input.label).bind(&input.description).bind(&input.grants).fetch_one(executor).await.map_err(Into::into)
@@ -819,7 +822,12 @@ impl Update for PermissionSetRepository {
             if has_updates {
                 query.push(", ");
             }
-            query.push("grants = ").push_bind(grants);
+            let _: Vec<crate::runtime_authority::PermissionGrantDefinition> =
+                serde_json::from_value(grants.clone())?;
+            query
+                .push("grants = validated_authored_permission_set_grants(")
+                .push_bind(grants)
+                .push(", COALESCE(pack, 0))");
             has_updates = true;
         }
 
@@ -856,6 +864,60 @@ impl Delete for PermissionSetRepository {
 }
 
 impl PermissionSetRepository {
+    /// Authoring and effective IAM data are separate contracts. Exporters and
+    /// readmission must use this instead of reverse-engineering normalized grants.
+    pub async fn authored_definition(
+        connection: &mut PgConnection,
+        reference: &str,
+    ) -> Result<Option<crate::runtime_authority::PermissionSetDefinition>> {
+        let row: Option<(Option<Id>, Option<String>, Option<String>, serde_json::Value,Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT ps.pack,ps.label,ps.description,ps.grants,authored.definition FROM permission_set ps LEFT JOIN permission_set_authoring_definition authored ON authored.permission_set = ps.id WHERE ps.ref = $1 AND ps.retired_at IS NULL FOR SHARE OF ps",
+        ).bind(reference).fetch_optional(connection).await?;
+        row.map(|(pack, label, description, grants, authored)| {
+            if let Some(authored) = authored {
+                let mut definition: crate::runtime_authority::PermissionSetDefinition =
+                    serde_json::from_value(authored)?;
+                if definition.reference != reference || definition.authored_grants()? != grants {
+                    return Err(crate::Error::validation(
+                        "Permission authoring projection needs readmission",
+                    ));
+                }
+                definition.label = label;
+                definition.description = description;
+                return Ok(definition);
+            }
+            serde_json::from_value(serde_json::json!({
+                "ref":reference, "label":label, "description":description,
+                "scope": if pack.is_some() { "pack" } else { "external" }, "grants":grants,
+            }))
+            .map_err(Into::into)
+        })
+        .transpose()
+    }
+
+    pub async fn store_authored_definition(
+        connection: &mut PgConnection,
+        set_id: Id,
+        definition: &crate::runtime_authority::PermissionSetDefinition,
+    ) -> Result<()> {
+        let expected = definition.authored_grants()?;
+        let actual: Option<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT ref,grants FROM permission_set WHERE id = $1 FOR SHARE")
+                .bind(set_id)
+                .fetch_optional(&mut *connection)
+                .await?;
+        if actual.as_ref().is_none_or(|(reference, grants)| {
+            reference != &definition.reference || *grants != expected
+        }) {
+            return Err(crate::Error::validation(
+                "Canonical permission authoring does not match its stored grant projection",
+            ));
+        }
+        sqlx::query("INSERT INTO permission_set_authoring_definition (permission_set,definition) VALUES ($1,$2) ON CONFLICT (permission_set) DO UPDATE SET definition = EXCLUDED.definition")
+            .bind(set_id).bind(serde_json::to_value(definition)?).execute(connection).await?;
+        Ok(())
+    }
+
     pub async fn find_by_refs_for_share(
         conn: &mut PgConnection,
         refs: &[String],
@@ -875,12 +937,15 @@ impl PermissionSetRepository {
     ) -> Result<Vec<PermissionSetAdminRow>> {
         sqlx::query_as(
             "SELECT ps.id, ps.ref, ps.pack, ps.pack_ref, ps.label, ps.description,
-                    ps.grants, ps.retired_at, ps.created, ps.updated, ps.management_origin,
+                    ps.grants, ps.grants AS authored_grants,
+                    COALESCE(authored.definition,jsonb_build_object('ref',ps.ref,'label',ps.label,'description',ps.description,'scope',CASE WHEN ps.pack IS NULL THEN 'external' ELSE 'pack' END,'grants',ps.grants)) AS authored_definition,
+                    ps.retired_at, ps.created, ps.updated, ps.management_origin,
                     COALESCE((SELECT jsonb_agg(jsonb_build_object(
                         'id', ra.id, 'permset', ra.permset, 'role', ra.role, 'created', ra.created)
                         ORDER BY ra.role) FROM permission_set_role_assignment ra
                         WHERE ra.permset = ps.id), '[]'::jsonb) AS roles
              FROM permission_set ps
+             LEFT JOIN permission_set_authoring_definition authored ON authored.permission_set = ps.id
              WHERE ($1::TEXT IS NULL OR ps.pack_ref = $1)
                AND ($2::TEXT IS NULL OR ps.ref = $2)
                AND ($3 OR ps.retired_at IS NULL)

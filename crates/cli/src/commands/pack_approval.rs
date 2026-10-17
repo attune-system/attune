@@ -92,6 +92,10 @@ fn parse_body(bytes: &[u8]) -> Result<Value> {
 }
 
 fn read_body(file: &str) -> Result<Value> {
+    parse_body(&read_request(file)?)
+}
+
+pub(super) fn read_request(file: &str) -> Result<Vec<u8>> {
     let mut reader: Box<dyn Read> = if file == "-" {
         Box::new(std::io::stdin())
     } else {
@@ -105,7 +109,7 @@ fn read_body(file: &str) -> Result<Value> {
     if bytes.len() > 1_048_576 {
         bail!("Approval request exceeds 1 MiB");
     }
-    parse_body(&bytes)
+    Ok(bytes)
 }
 
 fn path(pack: &str, id: Option<i64>) -> Result<String> {

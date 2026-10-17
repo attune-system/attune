@@ -63,3 +63,43 @@ across concurrent changes.
 
 See [the performance implementation checkpoint](../plans/artifacts-postgresql-implementation.md#implementation-checkpoint)
 for query-growth evidence, pending source-scope batching, and performance gates.
+
+## Recorded execution credentials
+
+Recorded reads use structural database owners and pinned `standard` owner IDs,
+not requester IAM or action-ref prefixes. All linked executions must be readable;
+secret-bearing content also requires execution decrypt and every retained origin.
+Missing bindings, cycles, excessive origin graphs and unavailable source owners
+deny disclosure. Sensor-generation, sensor-delivery and inquiry origins remain
+closed until their typed disclosure consumers are connected.
+
+Migration `20261015003001` records owner IDs when artifacts are created or their
+owner is explicitly changed. A harmless metadata edit cannot rebind an old
+artifact after an action ref is reused. Historical rows without this proof stay
+closed to recorded credentials; the migration does not infer their owners from
+current names. Human artifact reads keep their existing contract. Retained
+identity ownership does not depend on that human account remaining present.
+
+Protected plaintext delivery remains closed even when those checks pass. The
+current runtime SDK-read registry records Keys only; it cannot retain every
+source execution/event/queue gate when an action forwards artifact content.
+Recorded version-content/history, download and SSE routes remain unmarked and denied
+until that provenance and transaction-scoped version selection are connected.
+The converted reads are artifact metadata/data and bounded artifact summary
+collections, with sensitive linked content denied.
+
+Recorded collection reads scan lightweight candidates in 256-row batches and
+authorize before pagination and exact counting. They retain only the requested
+page. This path has linear authorization query cost in the candidate count; it
+does not inherit the batched human-reader query-growth claim. Each artifact has
+a maximum of 256 linked executions, and origin traversal permits at most 256
+nodes, 32 levels and 1 MiB of encoded provenance. Overflow fails closed.
+
+Create, metadata update/delete, progress append, data replacement, JSON version
+creation and version deletion retain the credential and target locks through
+commit. Owner transfers require authority on the destination too. Recorded JSON
+versions retain the credential's own execution attribution and cannot claim a
+different execution. Mutation responses omit existing artifact data. File
+allocation/upload mutations remain denied to recorded credentials until
+converted, and production worker issuance remains gated on complete consumer and
+completion readiness.

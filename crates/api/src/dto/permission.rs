@@ -155,6 +155,9 @@ pub struct PermissionSetSummary {
     pub label: Option<String>,
     pub description: Option<String>,
     pub grants: JsonValue,
+    /// Canonical authored scope, distinct from normalized effective ownership.
+    pub authored_grants: JsonValue,
+    pub authored_definition: JsonValue,
     pub retired_at: Option<chrono::DateTime<chrono::Utc>>,
     pub management_origin: ManagementOriginKind,
     pub roles: Vec<PermissionSetRoleAssignmentResponse>,
@@ -182,6 +185,8 @@ impl From<PermissionSetAdminRow> for PermissionSetSummary {
             label: set.label,
             description: set.description,
             grants: set.grants,
+            authored_grants: row.authored_grants,
+            authored_definition: row.authored_definition,
             retired_at: set.retired_at,
             management_origin: row.management_origin,
         }
@@ -189,7 +194,23 @@ impl From<PermissionSetAdminRow> for PermissionSetSummary {
 }
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreatePermissionSetRequest {
+    #[serde(default)]
+    pub scope: Option<attune_common::runtime_authority::PermissionScope>,
+    /// Unique reference in namespace.name format. Does not imply pack ownership.
+    #[validate(length(min = 3, max = 255))]
+    pub r#ref: String,
+    #[validate(length(max = 255))]
+    pub label: Option<String>,
+    pub description: Option<String>,
+    pub grants: JsonValue,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct UpdatePermissionSetRequest {
+    #[serde(default)]
+    pub scope: Option<attune_common::runtime_authority::PermissionScope>,
     #[serde(default)]
     #[validate(length(max = 255))]
     pub label: Option<String>,

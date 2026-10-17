@@ -414,6 +414,7 @@ mod tests {
 
     fn action_task(name: &str) -> super::super::parser::Task {
         super::super::parser::Task {
+            allowed_action_refs: Vec::new(),
             name: name.to_string(),
             r#type: super::super::parser::TaskType::Action,
             action: Some("core.echo".to_string()),

@@ -43,20 +43,15 @@ impl PackPermissionPlan {
                 .as_str()
                 .ok_or_else(|| Error::validation("Permission set definition requires ref"))?
                 .to_string();
-            let grants_value = serde_yaml_ng::to_value(
-                data.get("grants")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new())),
-            )
-            .map_err(|_| {
-                super::diagnostics::metadata_error(
-                    &file,
-                    "/grants",
-                    "Grant definitions must contain supported metadata values",
-                )
-            })?;
-            let grants: Vec<Grant> =
-                super::diagnostics::decode_yaml_value(&file, "/grants", grants_value)?;
+            let definition: crate::runtime_authority::PermissionSetDefinition =
+                serde_json::from_value(data.clone()).map_err(|_| {
+                    super::diagnostics::metadata_error(
+                        &file,
+                        "/grants",
+                        "Invalid canonical permission set definition",
+                    )
+                })?;
+            let grants = definition.registrar_grants()?;
             validate_grants(&grants)
                 .map_err(|error| super::diagnostics::located(error, &file, "/grants"))?;
             plan.definition_sources

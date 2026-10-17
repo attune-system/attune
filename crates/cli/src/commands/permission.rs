@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use attune_common::models::ManagementOriginKind;
+use attune_common::runtime_authority::{PermissionScope, PermissionSetDefinition};
 use clap::{Args, Subcommand};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -138,6 +139,9 @@ struct PermissionSet {
     label: Option<String>,
     description: Option<String>,
     grants: Value,
+    authored_grants: Value,
+    #[serde(default)]
+    authored_definition: Option<PermissionSetDefinition>,
     retired_at: Option<String>,
     management_origin: ManagementOriginKind,
     roles: Vec<PermissionSetRole>,
@@ -152,27 +156,32 @@ struct PermissionSetRole {
     created: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PermissionSetDefinition {
-    #[serde(rename = "ref")]
-    reference: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    grants: Value,
-}
-
-impl From<&PermissionSet> for PermissionSetDefinition {
-    fn from(set: &PermissionSet) -> Self {
-        Self {
-            reference: set.reference.clone(),
-            label: set.label.clone(),
-            description: set.description.clone(),
-            grants: set.grants.clone(),
-        }
+fn authored_definition(set: &PermissionSet) -> Result<PermissionSetDefinition> {
+    if let Some(mut definition) = set.authored_definition.clone() {
+        let mut projection = definition.clone();
+        projection.grants = serde_json::from_value(set.authored_grants.clone())
+            .context("Invalid authored permission grants from API")?;
+        anyhow::ensure!(
+            definition.reference == set.reference
+                && definition.authored_grants()? == projection.authored_grants()?,
+            "Canonical permission definition differs from its authored projection"
+        );
+        definition.label = set.label.clone();
+        definition.description = set.description.clone();
+        return Ok(definition);
     }
+    Ok(PermissionSetDefinition {
+        reference: set.reference.clone(),
+        label: set.label.clone(),
+        description: set.description.clone(),
+        scope: if set.pack_ref.is_some() {
+            PermissionScope::Pack
+        } else {
+            PermissionScope::External
+        },
+        grants: serde_json::from_value(set.authored_grants.clone())
+            .context("Invalid authored permission grants from API")?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,7 +246,7 @@ pub(super) async fn run(
             PermissionSetCommands::Export { permission_set_ref } => {
                 let set = get_set(client, &permission_set_ref).await?;
                 output::print_output(
-                    &PermissionSetDefinition::from(&set),
+                    &authored_definition(&set)?,
                     if format == OutputFormat::Table {
                         OutputFormat::Yaml
                     } else {
@@ -335,9 +344,7 @@ fn read_definition(path: &Path, expected_ref: &str) -> Result<PermissionSetDefin
             definition.reference
         );
     }
-    if !definition.grants.is_array() {
-        bail!("Permission set grants must be an array");
-    }
+    definition.authored_grants()?;
     Ok(definition)
 }
 
@@ -348,6 +355,49 @@ async fn update_set(
     dry_run: bool,
 ) -> Result<MutationResult> {
     let definition = read_definition(path, reference)?;
+    update_definition(client, reference, definition, dry_run).await
+}
+
+/// Canonical authorable export shared by the CLI and MCP, never effective grants.
+pub async fn export_for_client(client: &mut ApiClient, reference: &str) -> Result<Value> {
+    serde_json::to_value(authored_definition(&get_set(client, reference).await?)?)
+        .map_err(Into::into)
+}
+
+/// Import the same definition as the CLI without filesystem or stdin indirection.
+pub async fn import_for_client(
+    client: &mut ApiClient,
+    reference: &str,
+    value: Value,
+    confirmed: bool,
+) -> Result<Value> {
+    let definition = client_definition(reference, value, confirmed)?;
+    Ok(update_definition(client, reference, definition, false)
+        .await?
+        .after)
+}
+
+fn client_definition(
+    reference: &str,
+    value: Value,
+    confirmed: bool,
+) -> Result<PermissionSetDefinition> {
+    anyhow::ensure!(confirmed, "Permission import requires confirm_import=true");
+    let definition: PermissionSetDefinition = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        definition.reference == reference,
+        "Definition ref must match target"
+    );
+    definition.authored_grants()?;
+    Ok(definition)
+}
+
+async fn update_definition(
+    client: &mut ApiClient,
+    reference: &str,
+    definition: PermissionSetDefinition,
+    dry_run: bool,
+) -> Result<MutationResult> {
     let before = get_set(client, reference).await?;
     if before.management_origin == ManagementOriginKind::Platform {
         bail!("Permission set '{reference}' is platform-managed and cannot be updated");
@@ -355,7 +405,7 @@ async fn update_set(
     if before.retired_at.is_some() {
         bail!("Permission set '{reference}' is retired and cannot be updated");
     }
-    let body = json!({"label": definition.label, "description": definition.description, "grants": definition.grants});
+    let body = json!({"label": definition.label, "description": definition.description, "scope": definition.scope, "grants": definition.grants});
     let after: PermissionSet = client
         .put(
             &format!("/permissions/sets/{}?dry_run={dry_run}", before.id),
@@ -371,8 +421,8 @@ async fn update_set(
         "set_update",
         json!({"permission_set_ref": reference, "permission_set_id": before.id}),
         dry_run,
-        serde_json::to_value(PermissionSetDefinition::from(&before))?,
-        serde_json::to_value(PermissionSetDefinition::from(&after))?,
+        serde_json::to_value(authored_definition(&before)?)?,
+        serde_json::to_value(authored_definition(&after)?)?,
     ))
 }
 
@@ -551,4 +601,70 @@ fn print_bindings(bindings: &[PermissionBinding]) -> Result<()> {
     }
     println!("{table}");
     Ok(())
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_import_requires_confirmation_matching_ref_and_canonical_scopes() {
+        let value = json!({"ref":"example.effects","scope":"external","grants":[
+            {"resource":"events","actions":["create"]},
+            {"resource":"actions","actions":["execute"],"scope":"pack"}
+        ]});
+        assert!(client_definition("example.effects", value.clone(), false).is_err());
+        assert!(client_definition("example.other", value.clone(), true).is_err());
+        let definition = client_definition("example.effects", value.clone(), true).unwrap();
+        assert_eq!(definition.scope, PermissionScope::External);
+        assert_eq!(definition.grants[0].scope, None);
+        assert_eq!(definition.authored_grants().unwrap()[1]["scope"], "pack");
+        let mut invalid = value;
+        invalid["scope"] = json!("invented");
+        assert!(client_definition("example.effects", invalid, true).is_err());
+    }
+
+    #[test]
+    fn export_import_uses_authored_scope_not_the_normalized_envelope() {
+        let set: PermissionSet = serde_json::from_value(json!({
+            "id":7,"ref":"example.effects","pack_ref":"example","label":null,"description":null,
+            "grants":[{"resource":"events","actions":["create"],"constraints":{"managing_pack_id":42}}],
+            "authored_grants":[{"resource":"events","actions":["create"],"scope":"external"}],
+            "retired_at":null,"management_origin":"pack","roles":[],
+        })).unwrap();
+        let definition = authored_definition(&set).unwrap();
+        let yaml = serde_yaml_ng::to_string(&definition).unwrap();
+        assert!(!yaml.contains("managing_pack_id"));
+        let parsed: PermissionSetDefinition = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(parsed.authored_grants().unwrap(), set.authored_grants);
+    }
+
+    #[test]
+    fn canonical_import_preserves_set_default_and_grant_override() {
+        let definition:PermissionSetDefinition=serde_yaml_ng::from_str(
+            "ref: example.effects\nscope: external\ngrants:\n  - resource: events\n    actions: [create]\n  - resource: actions\n    actions: [execute]\n    scope: pack\n",
+        ).unwrap();
+        let grants = definition.authored_grants().unwrap();
+        assert_eq!(grants[0]["scope"], "external");
+        assert_eq!(grants[1]["scope"], "pack");
+        assert!(serde_yaml_ng::from_str::<PermissionSetDefinition>(
+            "ref: example.bad\nscope: invented\ngrants: []\n",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn export_retains_external_set_default_for_future_grants() {
+        let definition: PermissionSetDefinition = serde_yaml_ng::from_str(
+            "ref: example.effects\nscope: external\ngrants:\n  - resource: events\n    actions: [create]\n",
+        ).unwrap();
+        let set: PermissionSet = serde_json::from_value(json!({
+            "id":7,"ref":"example.effects","pack_ref":"example","label":null,"description":null,
+            "grants":[],"authored_grants":definition.authored_grants().unwrap(),
+            "authored_definition":definition,"retired_at":null,"management_origin":"pack","roles":[],
+        })).unwrap();
+        let exported = authored_definition(&set).unwrap();
+        assert_eq!(exported.scope, PermissionScope::External);
+        assert_eq!(exported.grants[0].scope, None);
+    }
 }

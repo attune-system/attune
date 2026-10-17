@@ -5,7 +5,10 @@ use crate::{
     auth::middleware::{AuthenticatedUser, RequireAuth},
     authz::AuthorizationCheck,
     dto::{
-        runtime_approval::{IssueRuntimeApprovalRequest, RuntimeApprovalResponse},
+        runtime_approval::{
+            DeclaredInputTargetListParams, InputApprovalTarget, IssueDeclaredInputApprovalRequest,
+            IssueRuntimeApprovalRequest, RuntimeApprovalResponse,
+        },
         ApiResponse, PaginatedResponse, PaginationParams,
     },
     middleware::{ApiError, ApiResult},
@@ -19,6 +22,7 @@ use attune_common::{
     rbac::{Action, AuthorizationContext, Resource},
     repositories::{
         pack::PackRepository,
+        public_input_approval::{DeclaredInputApprovalTarget, PublicInputApprovalRepository},
         runtime_authority::{ExternalApprovalRecord, RuntimeAuthorityRepository},
     },
 };
@@ -53,6 +57,7 @@ async fn authorize_pack(
         .ok_or_else(|| ApiError::NotFound("Pack not found".into()))?;
     let mut context = AuthorizationContext::new(identity);
     context.target_id = Some(pack.id);
+    context.managing_pack_id = Some(pack.id);
     context.target_ref = Some(pack.r#ref.clone());
     context.pack_ref = Some(pack.r#ref.clone());
     state
@@ -79,6 +84,38 @@ async fn subject_approval(
         .await?
         .filter(|record| record.subject_pack == pack_id)
         .ok_or_else(|| ApiError::NotFound("External approval not found".into()))
+}
+
+async fn public_records(
+    connection: &mut sqlx::PgConnection,
+    user: &AuthenticatedUser,
+    records: Vec<ExternalApprovalRecord>,
+) -> ApiResult<Vec<RuntimeApprovalResponse>> {
+    let identity = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+    let mut purposes =
+        PublicInputApprovalRepository::purposes(connection, identity, &records).await?;
+    records
+        .into_iter()
+        .map(|record| {
+            let purpose = purposes.remove(&record.id).ok_or_else(|| {
+                ApiError::InternalServerError("Approval purpose metadata is unavailable".into())
+            })?;
+            Ok(RuntimeApprovalResponse::from_record(record, purpose))
+        })
+        .collect()
+}
+
+async fn public_record(
+    connection: &mut sqlx::PgConnection,
+    user: &AuthenticatedUser,
+    record: ExternalApprovalRecord,
+) -> ApiResult<RuntimeApprovalResponse> {
+    public_records(connection, user, vec![record])
+        .await?
+        .pop()
+        .ok_or_else(|| ApiError::InternalServerError("Approval metadata is unavailable".into()))
 }
 
 fn audit(
@@ -126,12 +163,9 @@ pub async fn list_runtime_approvals(
         i64::from(page.page.saturating_sub(1)) * i64::from(page.limit()),
     )
     .await?;
+    let records = public_records(&mut tx, &user, records).await?;
     tx.commit().await?;
-    Ok(Json(PaginatedResponse::new(
-        records.into_iter().map(Into::into).collect(),
-        &page,
-        total as u64,
-    )))
+    Ok(Json(PaginatedResponse::new(records, &page, total as u64)))
 }
 
 #[utoipa::path(get, path = "/api/v1/packs/{pack_ref}/external-approvals/{id}", tag = "permissions",
@@ -146,8 +180,9 @@ pub async fn get_runtime_approval(
     let mut tx = state.db.begin().await?;
     let pack = authorize_pack(&mut tx, &state, &user, &reference).await?;
     let record = subject_approval(&mut tx, pack.id, id).await?;
+    let record = public_record(&mut tx, &user, record).await?;
     tx.commit().await?;
-    Ok(Json(ApiResponse::new(record.into())))
+    Ok(Json(ApiResponse::new(record)))
 }
 
 #[utoipa::path(post, path = "/api/v1/packs/{pack_ref}/external-approvals", tag = "permissions",
@@ -177,6 +212,7 @@ pub async fn issue_runtime_approval(
         request.expires_at,
     )
     .await?;
+    let record = public_record(&mut tx, &user, record).await?;
     tx.commit().await?;
     audit(
         &state,
@@ -186,7 +222,93 @@ pub async fn issue_runtime_approval(
         record.id,
         None,
     );
-    Ok((StatusCode::CREATED, Json(ApiResponse::new(record.into()))))
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(record))))
+}
+
+#[utoipa::path(post, path = "/api/v1/packs/{pack_ref}/external-input-approvals", tag = "permissions",
+    params(("pack_ref" = String, Path)), request_body = IssueDeclaredInputApprovalRequest,
+    responses((status = 201, description = "Independent fixed approval for one retained input declaration, with no execution API grants", body = ApiResponse<RuntimeApprovalResponse>)),
+    security(("bearer_auth" = [])))]
+pub async fn issue_declared_input_approval(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(reference): Path<String>,
+    Json(request): Json<IssueDeclaredInputApprovalRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<RuntimeApprovalResponse>>)> {
+    use attune_common::repositories::{
+        declared_input::DeclaredInputRepository, inherited_input::InheritedInputRepository,
+    };
+    let mut tx = state.db.begin().await?;
+    let pack = authorize_pack(&mut tx, &state, &user, &reference).await?;
+    let identity = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+    let (target, request) = request.into_parts();
+    let (policy, binding, declaration) = match target {
+        InputApprovalTarget::Renderer(renderer) => {
+            let permit = DeclaredInputRepository::permit(
+                &mut tx,
+                renderer,
+                &request.declaration_revision,
+                &request.source_path,
+                &request.expression,
+            )
+            .await?;
+            let source = RuntimeAuthorityRepository::execution_admission(&mut tx, renderer)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Renderer admission not found".into()))?;
+            (
+                source.policy_revision,
+                source.authority.binding.clone(),
+                permit.declaration().clone(),
+            )
+        }
+        InputApprovalTarget::Policy(policy, binding) => {
+            let (_, declaration) = DeclaredInputRepository::declaration_for_policy(
+                &mut tx,
+                policy,
+                &binding,
+                &request.declaration_revision,
+                &request.source_path,
+                &request.expression,
+            )
+            .await?;
+            (policy, binding, declaration)
+        }
+    };
+    if declaration.pack != pack.id {
+        return Err(ApiError::NotFound(
+            "Input declaration not found for this pack".into(),
+        ));
+    }
+    let id = InheritedInputRepository::approve_external_declaration(
+        &mut tx,
+        policy,
+        &binding,
+        &request.declaration_revision,
+        &request.source_path,
+        &request.expression,
+        identity,
+        request
+            .grants
+            .into_iter()
+            .map(|grant| grant.into_external_approval_grant())
+            .collect::<attune_common::Result<Vec<_>>>()?,
+        request.expires_at,
+    )
+    .await?;
+    let record = subject_approval(&mut tx, pack.id, id).await?;
+    let record = public_record(&mut tx, &user, record).await?;
+    tx.commit().await?;
+    audit(
+        &state,
+        &user,
+        event_type::admin::RUNTIME_APPROVAL_ISSUED,
+        &pack,
+        id,
+        None,
+    );
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(record))))
 }
 
 #[utoipa::path(post, path = "/api/v1/packs/{pack_ref}/external-approvals/{id}/replace", tag = "permissions",
@@ -217,6 +339,7 @@ pub async fn replace_runtime_approval(
         request.expires_at,
     )
     .await?;
+    let record = public_record(&mut tx, &user, record).await?;
     tx.commit().await?;
     audit(
         &state,
@@ -226,7 +349,7 @@ pub async fn replace_runtime_approval(
         record.id,
         Some(id),
     );
-    Ok((StatusCode::CREATED, Json(ApiResponse::new(record.into()))))
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(record))))
 }
 
 #[utoipa::path(post, path = "/api/v1/packs/{pack_ref}/external-approvals/{id}/revoke", tag = "permissions",
@@ -250,6 +373,7 @@ pub async fn revoke_runtime_approval(
     }
     RuntimeAuthorityRepository::revoke_approval(&mut tx, id).await?;
     let record = subject_approval(&mut tx, pack.id, id).await?;
+    let record = public_record(&mut tx, &user, record).await?;
     tx.commit().await?;
     audit(
         &state,
@@ -259,11 +383,59 @@ pub async fn revoke_runtime_approval(
         id,
         None,
     );
-    Ok(Json(ApiResponse::new(record.into())))
+    Ok(Json(ApiResponse::new(record)))
+}
+
+#[utoipa::path(get, path = "/api/v1/packs/{pack_ref}/input-approval-targets", tag = "permissions",
+    params(("pack_ref" = String, Path), DeclaredInputTargetListParams),
+    responses((status = 200, description = "Authorized immutable input targets, filtered before pagination; metadata is not consent or an invocation permit", body = PaginatedResponse<DeclaredInputApprovalTarget>)),
+    security(("bearer_auth" = [])))]
+pub async fn list_input_approval_targets(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(reference): Path<String>,
+    Query(query): Query<DeclaredInputTargetListParams>,
+) -> ApiResult<Json<PaginatedResponse<DeclaredInputApprovalTarget>>> {
+    if query.page == 0
+        || query.page_size == 0
+        || query.page_size > 100
+        || query.policy_revision.is_some_and(|id| id <= 0)
+    {
+        return Err(ApiError::BadRequest(
+            "page must be positive, page_size 1 to 100 and policy_revision positive when supplied"
+                .into(),
+        ));
+    }
+    let mut tx = state.db.begin().await?;
+    let pack = authorize_pack(&mut tx, &state, &user, &reference).await?;
+    let page = PaginationParams {
+        page: query.page,
+        page_size: query.page_size,
+    };
+    let (targets, total) = PublicInputApprovalRepository::discover(
+        &mut tx,
+        user.identity_id()
+            .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?,
+        pack.id,
+        query.policy_revision,
+        i64::from(page.limit()),
+        i64::from(page.page.saturating_sub(1)) * i64::from(page.limit()),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(PaginatedResponse::new(targets, &page, total as u64)))
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/packs/{pack_ref}/input-approval-targets",
+            get(list_input_approval_targets),
+        )
+        .route(
+            "/packs/{pack_ref}/external-input-approvals",
+            post(issue_declared_input_approval),
+        )
         .route(
             "/packs/{pack_ref}/external-approvals",
             get(list_runtime_approvals).post(issue_runtime_approval),

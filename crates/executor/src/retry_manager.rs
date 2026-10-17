@@ -250,6 +250,14 @@ impl RetryManager {
         let original = ExecutionRepository::find_by_id(&self.pool, execution_id)
             .await?
             .ok_or_else(|| Error::not_found("Execution", "id", execution_id.to_string()))?;
+        if !matches!(
+            original.status,
+            ExecutionStatus::Failed | ExecutionStatus::Timeout
+        ) {
+            return Err(Error::validation(
+                "Only failed or timed-out executions can admit retries",
+            ));
+        }
 
         let retry_count = original.retry_count;
         let max_retries = original.max_retries.unwrap_or(0);
@@ -299,6 +307,20 @@ impl RetryManager {
         )
         .await?
         .ok_or_else(|| Error::validation("Retry source is missing its schema binding"))?;
+        let admission = if !snapshot.executable.action.is_adhoc
+            || attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+                &mut transaction,
+                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                    original.id,
+                ),
+            )
+            .await?
+            .is_some()
+        {
+            Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::inherit(&mut transaction, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(original.id), snapshot).await?)
+        } else {
+            None
+        };
         let created = ExecutionRepository::create_retry(
             &mut *transaction,
             retry_execution,
@@ -309,6 +331,16 @@ impl RetryManager {
             original_execution_id,
         )
         .await?;
+        if let Some(admission) = admission {
+            admission
+                .attach(
+                    &mut transaction,
+                    attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                        created.id,
+                    ),
+                )
+                .await?;
+        }
         attune_common::repositories::schema_contract::SchemaContractRepository::attach(
             &mut transaction,
             attune_common::repositories::schema_contract::BindingOwner::Execution,
@@ -322,6 +354,7 @@ impl RetryManager {
             created.id,
         )
         .await?;
+        attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(&mut transaction, "execution", original.id, "execution", created.id).await?;
         ExecutionSecretValueRepository::copy_entity(
             &mut *transaction,
             ENTITY_EXECUTION_CONFIG,

@@ -3,7 +3,10 @@
 
 ref: core.intervaltimer
 label: "Interval Timer"
-description: "Fires at regular intervals based on specified time unit and interval"
+description: >-
+  Fires at regular intervals, starting after one full interval. After missed
+  ticks, immediately publishes one recovery event, logs a warning, and skips
+  the remaining overdue ticks before resuming the original cadence.
 enabled: true
 
 # Trigger type
@@ -24,6 +27,7 @@ parameters:
     type: integer
     description: "Number of time units between each trigger"
     default: 60
+    minimum: 1
     required: true
 
 # Payload schema - data emitted when trigger fires

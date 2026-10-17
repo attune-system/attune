@@ -16,6 +16,7 @@ enum Command {
     },
     Seal {
         truncated: bool,
+        manifest: Option<String>,
         reply: oneshot::Sender<Result<()>>,
     },
 }
@@ -99,14 +100,27 @@ impl SharedFileLogWriter {
     }
 
     pub async fn seal(self, truncated: bool) -> Result<()> {
+        self.seal_with_manifest(truncated, None).await
+    }
+
+    pub async fn seal_with_manifest(self, truncated: bool, manifest: Option<String>) -> Result<()> {
         if let Some(message) = self.failure.lock().unwrap().clone() {
             return Err(Error::invalid_state(format!(
                 "shared log writer failed: {message}"
             )));
         }
-        self.transport
-            .seal_log_stream(self.artifact_version, truncated)
-            .await
+        match manifest {
+            Some(manifest) => {
+                self.transport
+                    .seal_log_stream_with_manifest(self.artifact_version, truncated, &manifest)
+                    .await
+            }
+            None => {
+                self.transport
+                    .seal_log_stream(self.artifact_version, truncated)
+                    .await
+            }
+        }
     }
 }
 
@@ -215,7 +229,7 @@ impl SegmentedLogWriter {
                                 permits.push(permit);
                             }
                         }
-                        Some(Command::Seal { truncated, reply }) => {
+                        Some(Command::Seal { truncated, manifest, reply }) => {
                             let result = if let Some(error) = failure.take() {
                                 Err(error)
                             } else {
@@ -223,7 +237,10 @@ impl SegmentedLogWriter {
                                     if !buffer.is_empty() {
                                         flush(&transport, artifact_version, &mut sequence, &mut buffer, config, FlushReason::Seal, segment_target_bytes).await?;
                                     }
-                                    transport.seal_log_stream(artifact_version, truncated).await
+                                    match manifest {
+                                        Some(manifest) => transport.seal_log_stream_with_manifest(artifact_version,truncated,&manifest).await,
+                                        None => transport.seal_log_stream(artifact_version,truncated).await,
+                                    }
                                 }.await
                             };
                             let _ = reply.send(result);
@@ -304,12 +321,20 @@ impl SegmentedLogWriter {
     }
 
     pub async fn seal(self, truncated: bool) -> Result<()> {
+        self.seal_with_manifest(truncated, None).await
+    }
+
+    pub async fn seal_with_manifest(self, truncated: bool, manifest: Option<String>) -> Result<()> {
         if let Some(message) = self.failure.borrow().clone() {
             return Err(Error::invalid_state(message.to_string()));
         }
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(Command::Seal { truncated, reply })
+            .send(Command::Seal {
+                truncated,
+                manifest,
+                reply,
+            })
             .await
             .map_err(|_| Error::invalid_state("log segment writer stopped before sealing"))?;
         response.await.map_err(|_| {

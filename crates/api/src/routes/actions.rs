@@ -368,6 +368,13 @@ pub async fn update_action(
         let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_id = Some(existing_action.id);
+        ctx.managing_pack_id =
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                &state.db,
+                attune_common::repositories::runtime_target::ComponentTarget::Action,
+                existing_action.id,
+            )
+            .await?;
         ctx.target_ref = Some(existing_action.r#ref.clone());
         ctx.pack_ref = Some(existing_action.pack_ref.clone());
         authz
@@ -468,7 +475,44 @@ pub async fn update_action(
         }),
     };
 
-    let action = ActionRepository::update(&state.db, existing_action.id, update_input).await?;
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
+    attune_common::repositories::pack::PackRepository::acquire_mutation_lock(
+        &mut tx,
+        &existing_action.pack_ref,
+    )
+    .await?;
+    let editor = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+    let authority =
+        attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, editor).await?;
+    let mut context = AuthorizationContext::new(editor);
+    context.target_id = Some(existing_action.id);
+    context.target_ref = Some(existing_action.r#ref.clone());
+    context.pack_ref = Some(existing_action.pack_ref.clone());
+    context.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &mut *tx,
+            attune_common::repositories::runtime_target::ComponentTarget::Action,
+            existing_action.id,
+        )
+        .await?;
+    if !authority.allows(Resource::Actions, Action::Update, context) {
+        return Err(ApiError::Forbidden(
+            "Action update authority changed before readmission".into(),
+        ));
+    }
+    let readmit = attune_common::repositories::managed_executable::ManagedExecutableRepository::changes_admitted_metadata(&update_input);
+    let action = ActionRepository::update(&mut *tx, existing_action.id, update_input).await?;
+    if readmit {
+        attune_common::repositories::managed_executable::ManagedExecutableRepository::readmit_action(
+        &mut tx, action.id, editor,
+    )
+    .await?;
+    }
+    tx.commit().await?;
     let operation = if existing_action.enabled != action.enabled {
         if action.enabled {
             "enabled"
@@ -518,6 +562,13 @@ pub async fn delete_action(
         let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_id = Some(action.id);
+        ctx.managing_pack_id =
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                &state.db,
+                attune_common::repositories::runtime_target::ComponentTarget::Action,
+                action.id,
+            )
+            .await?;
         ctx.target_ref = Some(action.r#ref.clone());
         ctx.pack_ref = Some(action.pack_ref.clone());
         authz
@@ -717,8 +768,12 @@ fn can_read_action_with_grants(
     grants: &[attune_common::rbac::Grant],
     identity_id: i64,
     action: &ActionModel,
+    managing_pack_id: Option<i64>,
+    attributes: &std::collections::HashMap<String, serde_json::Value>,
 ) -> bool {
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.managing_pack_id = managing_pack_id;
+    ctx.identity_attributes = attributes.clone();
     ctx.target_id = Some(action.id);
     ctx.target_ref = Some(action.r#ref.clone());
     ctx.pack_ref = Some(action.pack_ref.clone());
@@ -732,7 +787,32 @@ async fn filter_api_visible_actions(
     referencing_pack_ref: Option<&str>,
 ) -> ApiResult<Vec<ActionModel>> {
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
+    let snapshot = authz.load_snapshot(user).await?;
+    let grants = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.grants.as_slice())
+        .unwrap_or_default();
+    let attributes = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.identity_attributes.clone())
+        .unwrap_or_default();
+    let ids = actions.iter().map(|action| action.id).collect::<Vec<_>>();
+    let owners = if grants.iter().any(|grant| {
+        grant.resource == Resource::Actions
+            && grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+    }) {
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_packs(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Action,
+            &ids,
+        )
+        .await?
+    } else {
+        Default::default()
+    };
     let identity_id = user.identity_id().ok();
 
     Ok(actions
@@ -741,7 +821,15 @@ async fn filter_api_visible_actions(
             action.reference_visibility == ActionReferenceVisibility::Public
                 || referencing_pack_ref
                     .is_some_and(|pack_ref| action_reference_allowed(action, Some(pack_ref)))
-                || identity_id.is_some_and(|id| can_read_action_with_grants(&grants, id, action))
+                || identity_id.is_some_and(|id| {
+                    can_read_action_with_grants(
+                        grants,
+                        id,
+                        action,
+                        owners.get(&action.id).copied(),
+                        &attributes,
+                    )
+                })
         })
         .collect())
 }
@@ -852,6 +940,25 @@ async fn filter_executable_actions(
     let authz = state.authorization_service();
     let mut allowed = Vec::new();
     let identity_id = user.identity_id().ok();
+    let snapshot = authz.load_snapshot(user).await?;
+    let owners = if snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.grants.iter().any(|grant| {
+            grant.resource == Resource::Actions
+                && grant
+                    .constraints
+                    .as_ref()
+                    .is_some_and(|scope| scope.managing_pack_id.is_some())
+        })
+    }) {
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_packs(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Action,
+            &actions.iter().map(|action| action.id).collect::<Vec<_>>(),
+        )
+        .await?
+    } else {
+        Default::default()
+    };
 
     for action_model in actions {
         if matches!(
@@ -863,18 +970,19 @@ async fn filter_executable_actions(
             };
             let mut ctx = AuthorizationContext::new(identity_id);
             ctx.target_id = Some(action_model.id);
+            ctx.managing_pack_id = owners.get(&action_model.id).copied();
             ctx.target_ref = Some(action_model.r#ref.clone());
             ctx.pack_ref = Some(action_model.pack_ref.clone());
             if authz
-                .authorize(
+                .authorize_with_snapshot(
                     user,
+                    snapshot.as_ref(),
                     AuthorizationCheck {
                         resource: Resource::Actions,
                         action: Action::Execute,
                         context: ctx,
                     },
                 )
-                .await
                 .is_err()
             {
                 continue;
@@ -882,7 +990,11 @@ async fn filter_executable_actions(
         }
 
         if authz
-            .can_delegate_permission_sets(user, &action_model.default_execution_permission_set_refs)
+            .can_delegate_permission_sets_with_snapshot(
+                user,
+                snapshot.as_ref(),
+                &action_model.default_execution_permission_set_refs,
+            )
             .await?
         {
             allowed.push(action_model);
@@ -1030,7 +1142,19 @@ mod tests {
         let python_action = make_action("python_example", "python_example.echo");
         let core_action = make_action("core", "core.echo");
 
-        assert!(can_read_action_with_grants(&grants, 42, &python_action));
-        assert!(!can_read_action_with_grants(&grants, 42, &core_action));
+        assert!(can_read_action_with_grants(
+            &grants,
+            42,
+            &python_action,
+            None,
+            &Default::default()
+        ));
+        assert!(!can_read_action_with_grants(
+            &grants,
+            42,
+            &core_action,
+            None,
+            &Default::default()
+        ));
     }
 }

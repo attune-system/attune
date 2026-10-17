@@ -29,9 +29,49 @@ impl PackRetentionRepository {
     ) -> Result<PackRetentionResult> {
         let mut tx = pool.begin().await?;
         super::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx).await?;
+        // Receipt ancestors retain their own admissions even when their original
+        // executions are gone. Remove only unreferenced leaves; subsequent
+        // collection passes reclaim newly unreferenced ancestors.
+        sqlx::query("WITH dormant AS (SELECT receipt.id FROM runtime_input_receipt receipt WHERE NOT file_evidence_pinned('runtime_input_receipt',receipt.id) AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.id = receipt.execution) AND NOT EXISTS(SELECT 1 FROM runtime_input_receipt_source edge WHERE edge.source_receipt = receipt.id) AND NOT EXISTS(SELECT 1 FROM runtime_native_input_snapshot_parent parent WHERE parent.receipt=receipt.id) AND NOT EXISTS(SELECT 1 FROM runtime_secret_origin_reference origin WHERE origin.source_id = receipt.id AND origin.source_entity LIKE 'declared_input:%') ORDER BY receipt.id LIMIT $1) DELETE FROM runtime_input_receipt receipt USING dormant WHERE receipt.id = dormant.id")
+            .bind(limit.max(1)).execute(&mut *tx).await?;
+        sqlx::query("WITH dormant AS (SELECT input.id FROM runtime_accepted_input input WHERE NOT file_evidence_pinned('accepted_input',input.id) AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.id = input.execution) AND NOT EXISTS(SELECT 1 FROM runtime_input_receipt_accepted receipt WHERE receipt.accepted = input.id) ORDER BY input.id LIMIT $1) DELETE FROM runtime_accepted_input input USING dormant WHERE input.id = dormant.id")
+            .bind(limit.max(1)).execute(&mut *tx).await?;
+        sqlx::query("WITH dormant AS (SELECT input.id FROM runtime_native_input_snapshot input JOIN runtime_authority_admission a ON a.id=input.renderer_admission WHERE NOT file_evidence_pinned('runtime_native_input_snapshot',input.id) AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.id=a.owner_id) AND NOT EXISTS(SELECT 1 FROM runtime_input_receipt_snapshot receipt WHERE receipt.snapshot=input.id) AND NOT EXISTS(SELECT 1 FROM runtime_native_cache_frontier frontier WHERE frontier.predecessor=input.id) ORDER BY input.id LIMIT $1) DELETE FROM runtime_native_input_snapshot input USING dormant WHERE input.id=dormant.id")
+            .bind(limit.max(1)).execute(&mut *tx).await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::collect_cache_epochs(
+            &mut tx, limit,
+        )
+        .await?;
+        let accepted_items_installed: bool =
+            sqlx::query_scalar("SELECT to_regclass('work_queue_item_ad_hoc_dispatch') IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        let accepted_source_pin = if accepted_items_installed {
+            "AND NOT EXISTS(SELECT 1 FROM work_queue_item_ad_hoc_dispatch accepted WHERE accepted.source_admission = a.id)"
+        } else {
+            ""
+        };
+        // Runtime row retention never blocks on a descendant's authority. The
+        // delete trigger leaves referenced admission fences behind; collect only
+        // unreferenced leaves here. Ancestors become eligible on the next pass.
+        sqlx::query(&format!("WITH dormant AS (SELECT a.id FROM runtime_authority_admission a WHERE NOT file_evidence_pinned('runtime_authority_admission',a.id) AND NOT EXISTS (SELECT 1 FROM runtime_admission_dependency edge WHERE edge.dependency = a.id) AND NOT EXISTS (SELECT 1 FROM runtime_declared_input_receipt receipt WHERE receipt.source_admission = a.id) AND NOT EXISTS(SELECT 1 FROM runtime_input_receipt receipt WHERE receipt.renderer_admission = a.id OR receipt.destination_admission = a.id) AND NOT EXISTS(SELECT 1 FROM runtime_input_receipt_dependency proof WHERE proof.admission = a.id) AND NOT EXISTS(SELECT 1 FROM runtime_accepted_input input WHERE input.admission = a.id) AND NOT EXISTS(SELECT 1 FROM runtime_native_input_snapshot input WHERE input.renderer_admission=a.id) AND NOT EXISTS(SELECT 1 FROM runtime_native_input_snapshot_admission input WHERE input.admission=a.id) {accepted_source_pin} AND ((a.owner_kind = 'execution' AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.id = a.owner_id)) OR (a.owner_kind = 'enforcement' AND NOT EXISTS (SELECT 1 FROM enforcement e WHERE e.id = a.owner_id))) ORDER BY a.id FOR UPDATE OF a SKIP LOCKED LIMIT $1) DELETE FROM runtime_authority_admission a USING dormant d WHERE a.id = d.id"))
+            .bind(limit.max(1)).execute(&mut *tx).await?;
+        // The queue admission component is installed independently during the
+        // coordinated rollout. Once present, its FK is an authoritative pin,
+        // including terminal items retained for attribution and input evidence.
+        let queue_admission_installed: bool = sqlx::query_scalar(
+            "SELECT to_regclass('work_queue_item_runtime_admission') IS NOT NULL",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let queue_pin = if queue_admission_installed {
+            "AND NOT EXISTS (SELECT 1 FROM work_queue_item_runtime_admission queued WHERE queued.policy_revision = p.id)"
+        } else {
+            ""
+        };
         // Retained runtime owners keep historical authority even after completion
         // or revocation. Only dormant revisions outside the rollback window can go.
-        sqlx::query(
+        sqlx::query(&format!(
             "WITH ranked AS ( \
                  SELECT id, row_number() OVER (PARTITION BY pack ORDER BY inactive_since DESC, id DESC) AS position \
                  FROM pack_release WHERE inactive_since IS NOT NULL \
@@ -39,12 +79,19 @@ impl PackRetentionRepository {
                  SELECT p.id FROM pack_runtime_policy_revision p \
                  JOIN pack_release r ON r.id = p.release JOIN ranked x ON x.id = r.id \
                  WHERE r.inactive_since < $1 AND x.position > $2 \
-                   AND NOT EXISTS (SELECT 1 FROM pack active WHERE active.active_release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM pack active WHERE active.active_release = r.id) \
+                    AND NOT file_evidence_pinned('pack_runtime_policy_revision',p.id) \
+                    AND NOT EXISTS(SELECT 1 FROM runtime_native_input_snapshot snapshot WHERE snapshot.policy_revision=p.id) \
                    AND NOT EXISTS (SELECT 1 FROM pack_runtime_policy_current c WHERE c.revision = p.id) \
-                   AND NOT EXISTS (SELECT 1 FROM runtime_authority_admission a WHERE a.policy_revision = p.id) \
+                     AND NOT EXISTS (SELECT 1 FROM runtime_authority_admission a WHERE a.policy_revision = p.id) \
+                      AND NOT EXISTS (SELECT 1 FROM runtime_workflow_policy_dependency graph WHERE graph.dependency = p.id) \
+                      AND NOT EXISTS (SELECT 1 FROM runtime_accepted_batch_item accepted WHERE accepted.target_policy = p.id) \
+                     AND NOT EXISTS (SELECT 1 FROM runtime_declared_input_binding binding JOIN runtime_declared_input_receipt receipt ON receipt.declaration = binding.id WHERE binding.policy_revision = p.id) \
+                    AND NOT EXISTS (SELECT 1 FROM sensor_rule_structural_origin o WHERE o.dispatch_policy_revision = p.id) \
+                    {queue_pin} \
                  ORDER BY p.id FOR UPDATE OF p SKIP LOCKED LIMIT $3 \
              ) DELETE FROM pack_runtime_policy_revision p USING dormant d WHERE p.id = d.id",
-        )
+        ))
         .bind(rollback_cutoff)
         .bind(newest_inactive.max(0))
         .bind(limit.max(1))
@@ -55,9 +102,12 @@ impl PackRetentionRepository {
                  SELECT r.id, row_number() OVER (PARTITION BY r.pack ORDER BY r.inactive_since DESC, r.id DESC) AS position \
                  FROM pack_release r WHERE r.inactive_since IS NOT NULL \
              ) SELECT r.id FROM pack_release r JOIN ranked x ON x.id = r.id \
-                 WHERE r.inactive_since < $1 AND x.position > $2 \
+                  WHERE r.inactive_since < $1 AND x.position > $2 \
+                     AND NOT file_evidence_pinned('pack_release',r.id) \
                     AND NOT EXISTS (SELECT 1 FROM pack p WHERE p.active_release = r.id) \
                     AND NOT EXISTS (SELECT 1 FROM runtime_authority_release_dependency d WHERE d.release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM managed_sensor_metadata_revision m WHERE m.release = r.id) \
+                    AND NOT EXISTS (SELECT 1 FROM sensor_rule_structural_origin o WHERE o.dispatch_source_release = r.id) \
                    AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.pack_release = r.id) \
                    AND NOT EXISTS (SELECT 1 FROM enforcement e WHERE e.pack_release = r.id) \
                    AND NOT EXISTS (SELECT 1 FROM work_queue_item q WHERE q.pack_release = r.id) \
@@ -91,6 +141,8 @@ impl PackRetentionRepository {
             "DELETE FROM pack_release r WHERE r.id = ANY($1) \
                AND NOT EXISTS (SELECT 1 FROM pack p WHERE p.active_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM runtime_authority_release_dependency d WHERE d.release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM managed_sensor_metadata_revision m WHERE m.release = r.id) \
+               AND NOT EXISTS (SELECT 1 FROM sensor_rule_structural_origin o WHERE o.dispatch_source_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.pack_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM enforcement e WHERE e.pack_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM work_queue_item q WHERE q.pack_release = r.id) \
@@ -113,7 +165,8 @@ impl PackRetentionRepository {
                AND NOT EXISTS (SELECT 1 FROM workflow_definition c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM dashboard c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
                AND NOT EXISTS (SELECT 1 FROM cache_namespace c WHERE c.retired_at IS NULL AND c.managed_release = r.id) \
-              RETURNING r.digest, r.content_path",
+               AND NOT file_evidence_pinned('pack_release',r.id) \
+               RETURNING r.digest, r.content_path",
         )
         .bind(&candidate_ids)
         .fetch_all(&mut *tx)

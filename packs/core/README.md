@@ -1,5 +1,11 @@
 # Attune Core Pack
 
+Core 1.0.4 includes the canonical two-file `core.install_packs` workflow.
+See [pack installation](workflows/PACK_INSTALLATION.md) for inputs, API authority,
+candidate-test ownership and the distinction between runtime detection and
+worker environment setup. The installer uses real shipped actions and does not
+ship a separate queue.
+
 The **Core Pack** is the foundational system pack for Attune, providing essential automation components including timer triggers, HTTP utilities, and basic shell actions.
 
 ## Overview

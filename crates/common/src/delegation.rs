@@ -85,6 +85,36 @@ impl DelegationAuthority {
             .any(|grant| grant.allows(resource, action, &context))
     }
 
+    /// Purpose-specific generic input proof. Preserve private-artifact baseline
+    /// semantics while using the complete, repository-resolved target context.
+    pub fn allows_input_origin_target(
+        &self,
+        target: &crate::repositories::runtime_target::ResolvedRuntimeTarget,
+        action: Action,
+    ) -> bool {
+        let mut context = target.context().clone();
+        context.identity_id = self.identity_id;
+        context.identity_attributes = self.context.identity_attributes.clone();
+        let private = target.resource() == Resource::Artifacts
+            && context.visibility == Some(crate::models::ArtifactVisibility::Private)
+            && !(context.owner_type == Some(crate::models::OwnerType::Identity)
+                && context.owner_identity_id == Some(self.identity_id));
+        self.grants.iter().any(|grant| {
+            let explicit = grant.constraints.as_ref().is_some_and(|scope| {
+                scope.managing_pack_id.is_some()
+                    || scope.owner.is_some()
+                    || scope.owner_types.is_some()
+                    || scope.owner_refs.is_some()
+                    || scope.refs.is_some()
+                    || scope.ids.is_some()
+                    || scope.pack_refs.is_some()
+                    || scope.visibility.is_some()
+                    || scope.execution_scope.is_some()
+            });
+            (!private || explicit) && grant.allows(target.resource(), action, &context)
+        })
+    }
+
     pub fn manages_permissions(&self) -> bool {
         self.covers(&[Grant {
             resource: Resource::Permissions,
@@ -95,6 +125,31 @@ impl DelegationAuthority {
 
     pub fn key_allows(&self, origin: &crate::secret_provenance::KeyOrigin, action: Action) -> bool {
         crate::key_access::origin_action_allowed(&self.grants, &self.context, origin, action)
+    }
+
+    pub fn key_allows_verified(
+        &self,
+        origin: &crate::secret_provenance::KeyOrigin,
+        action: Action,
+        ownership: &crate::repositories::iam_ownership::VerifiedKeyOrigins,
+    ) -> bool {
+        crate::key_access::origin_action_allowed_verified(
+            &self.grants,
+            &self.context,
+            origin,
+            action,
+            ownership,
+        )
+    }
+
+    pub fn needs_key_ownership(&self) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.resource == Resource::Keys
+                && grant
+                    .constraints
+                    .as_ref()
+                    .is_some_and(|scope| scope.managing_pack_id.is_some())
+        })
     }
 
     pub async fn require_refs(&self, pool: &PgPool, refs: &[String]) -> Result<()> {

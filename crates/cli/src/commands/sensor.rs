@@ -8,6 +8,14 @@ use crate::output::{self, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum SensorCommands {
+    /// Set persistent configuration overrides or reset fields to release defaults
+    #[command(
+        after_help = "Examples:\n  attune sensor config set example.reader --null optional_value\n  attune sensor config reset example.reader interval --dry-run\n  attune sensor config reset example.reader interval --yes"
+    )]
+    Config {
+        #[command(subcommand)]
+        command: super::component_config::ConfigurationCommands,
+    },
     /// List all sensors
     List {
         /// Filter by pack name
@@ -80,6 +88,16 @@ pub async fn handle_sensor_command(
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
+        SensorCommands::Config { command } => {
+            super::component_config::handle(
+                profile,
+                api_url,
+                super::component_config::ConfigurationOwner::Sensor,
+                command,
+                output_format,
+            )
+            .await
+        }
         SensorCommands::List { pack } => handle_list(pack, profile, api_url, output_format).await,
         SensorCommands::Show { sensor_ref } => {
             handle_show(sensor_ref, profile, api_url, output_format).await

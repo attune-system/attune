@@ -67,6 +67,9 @@ pub struct CreateTriggerRequest {
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateTriggerRequest {
+    /// Allow a changed live contract despite admitted emitters. Ordinary confirmation is not acknowledgement.
+    #[serde(default)]
+    pub acknowledge_incompatible_rollout: bool,
     /// Human-readable label
     #[validate(length(min = 1, max = 255))]
     #[schema(example = "Webhook Trigger (Updated)")]
@@ -184,6 +187,29 @@ impl ToSchema for TriggerJsonPatch {
         )>,
     ) {
         TriggerJsonPatchSchema::schemas(schemas);
+    }
+}
+
+/// Response DTO for trigger information
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TriggerRolloutResponse {
+    pub trigger_id: i64,
+    pub execution_ids: Vec<i64>,
+    pub workload_ids: Vec<i64>,
+    pub requires_acknowledgement: bool,
+}
+
+impl From<attune_common::repositories::trigger_rollout::TriggerRolloutImpact>
+    for TriggerRolloutResponse
+{
+    fn from(impact: attune_common::repositories::trigger_rollout::TriggerRolloutImpact) -> Self {
+        let requires_acknowledgement = impact.requires_acknowledgement();
+        Self {
+            trigger_id: impact.trigger_id,
+            execution_ids: impact.execution_ids,
+            workload_ids: impact.workload_ids,
+            requires_acknowledgement,
+        }
     }
 }
 
@@ -508,10 +534,18 @@ pub struct UpdateSensorRequest {
     #[schema(value_type = Object, nullable = true)]
     pub param_schema: Option<SensorJsonPatch>,
 
-    /// Complete replacement configuration. Omit to preserve the current encrypted revision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Persistent overrides, replacing each supplied top-level field completely.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::common::deserialize_present_value"
+    )]
     #[schema(value_type = Object, nullable = true)]
     pub config: Option<JsonValue>,
+
+    /// Remove these top-level overrides and use current release defaults. Null is not reset.
+    #[serde(default)]
+    pub config_reset_fields: Vec<String>,
 
     /// Whether the sensor is enabled
     #[schema(example = false)]
@@ -543,6 +577,14 @@ pub struct UpdateSensorRequest {
 
     /// Patch the per-sensor retention limit override for registered stdout/stderr log artifacts.
     pub log_retention_limit: Option<LogRetentionLimitPatch>,
+}
+
+/// Explicit operational revocation, separate from disablement or human IAM edits.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SensorRuntimeRevocationRequest {
+    /// Revoke only this immutable revision. Omit to revoke every sensor generation.
+    pub metadata_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -617,6 +659,9 @@ pub struct SensorResponse {
     pub config: Option<JsonValue>,
     /// Original contract for the current configuration revision.
     pub config_schema_binding: Option<JsonValue>,
+
+    /// Current immutable executable/purpose admission over pinned code bytes.
+    pub managed_metadata_revision: Option<i64>,
 
     /// Worker labels required for this sensor process.
     pub worker_selector: BTreeMap<String, String>,
@@ -795,6 +840,7 @@ impl From<attune_common::models::trigger::Sensor> for SensorResponse {
             param_schema: sensor.param_schema,
             config,
             config_schema_binding: None,
+            managed_metadata_revision: None,
             worker_selector,
             worker_tolerations,
             worker_affinity,
@@ -901,6 +947,7 @@ mod tests {
     #[test]
     fn test_update_trigger_request_all_none() {
         let req = UpdateTriggerRequest {
+            acknowledge_incompatible_rollout: false,
             label: None,
             description: None,
             param_schema: None,
@@ -918,6 +965,7 @@ mod tests {
     #[test]
     fn test_update_sensor_request_partial() {
         let req = UpdateSensorRequest {
+            config_reset_fields: vec![],
             label: Some("Updated Sensor".to_string()),
             description: None,
             entrypoint: Some("/sensors/test_v2.py".to_string()),
@@ -934,5 +982,20 @@ mod tests {
         };
 
         assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn configuration_null_is_not_an_implicit_reset() {
+        let omitted: UpdateSensorRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(omitted.config.is_none());
+        let explicit: UpdateSensorRequest =
+            serde_json::from_value(serde_json::json!({"config":null})).unwrap();
+        assert_eq!(explicit.config, Some(serde_json::Value::Null));
+        let field: UpdateSensorRequest = serde_json::from_value(serde_json::json!({
+            "config":{"nullable":null},"config_reset_fields":["other"]
+        }))
+        .unwrap();
+        assert_eq!(field.config.unwrap()["nullable"], serde_json::Value::Null);
+        assert_eq!(field.config_reset_fields, ["other"]);
     }
 }

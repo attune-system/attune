@@ -17,6 +17,13 @@ use attune_common::{
     repositories::HealthRepository,
 };
 
+/// Release enablement gate, not an operator/metadata override. The integrator
+/// enables this only after ordinary API activation captures policy and consumes
+/// opt-in closed-context evidence, and the coordinated runtime rollout is ready.
+/// Advertising support before those hooks exist could replace an admitted core
+/// with unadmitted content before bootstrap's post-upload proof fails.
+pub use attune_common::pack_registry::deployment_admission::BOOTSTRAP_ADMISSION_ENABLED;
+
 /// Health check response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct HealthResponse {
@@ -120,6 +127,18 @@ pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     platform_health(&state, "ready").await
 }
 
+/// Admission readiness without worker/content dependencies, for bootstrap jobs.
+pub async fn bootstrap(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    let platform = platform_health(&state, "ready").await;
+    if platform.status() != StatusCode::OK {
+        return platform;
+    }
+    match HealthRepository::admitted_core(&state.db).await {
+        Ok(Some(release)) => (StatusCode::OK, Json(serde_json::json!({"status":"ready", "core":release, "bootstrap_admission":attune_common::pack_registry::deployment_admission::descriptor()}))).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status":"not_ready", "error":"core release has no current runtime admission"}))).into_response(),
+    }
+}
+
 async fn platform_health(state: &AppState, ready_status: &'static str) -> axum::response::Response {
     match HealthRepository::platform(&state.db).await {
         Ok(platform)
@@ -130,6 +149,9 @@ async fn platform_health(state: &AppState, ready_status: &'static str) -> axum::
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": ready_status,
+                    "pack_publication": attune_common::pack_registry::deployment_admission::publication_descriptor(),
+                    "bootstrap_admission_protocol": BOOTSTRAP_ADMISSION_ENABLED.then_some(1),
+                    "bootstrap_admission": attune_common::pack_registry::deployment_admission::descriptor(),
                     "catalog": {
                         "compatibility_epoch": platform.compatibility_epoch,
                         "revision": platform.catalog_revision
@@ -181,7 +203,19 @@ async fn platform_health(state: &AppState, ready_status: &'static str) -> axum::
 pub async fn content(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match HealthRepository::content(&state.db).await {
         Ok(content) => {
+            let platform_ready =
+                HealthRepository::platform(&state.db)
+                    .await
+                    .is_ok_and(|platform| {
+                        platform.compatibility_epoch == COMPATIBILITY_EPOCH
+                            && platform.catalog_revision == CATALOG_REVISION
+                    });
+            let core_admitted = HealthRepository::admitted_core(&state.db)
+                .await
+                .is_ok_and(|core| core.is_some());
             let ready = content.core_active
+                && core_admitted
+                && platform_ready
                 && content.action_host_available
                 && content.sensor_host_available;
             (
@@ -192,7 +226,7 @@ pub async fn content(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 },
                 Json(serde_json::json!({
                     "status": if ready { "ready" } else { "not_ready" },
-                    "content": { "core_active": content.core_active },
+                    "content": { "core_active": content.core_active, "core_admitted": core_admitted },
                     "capabilities": {
                         "action_host_available": content.action_host_available,
                         "sensor_host_available": content.sensor_host_available
@@ -239,6 +273,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
         .route("/health/ready", get(readiness))
+        .route("/health/bootstrap", get(bootstrap))
         .route("/health/live", get(liveness))
         .route("/health/content", get(content))
         .route("/metrics", get(metrics))

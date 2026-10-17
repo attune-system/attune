@@ -44,8 +44,10 @@ use attune_common::{
     },
 };
 
+use crate::recorded_authority::RecordedConnection;
 use crate::service::Notification;
 use crate::subscriber_manager::{ClientId, SubscriberManager, SubscriptionFilter};
+mod human_delivery;
 
 /// Role name that grants the holder unrestricted filter ACL (e.g. ability to
 /// subscribe to `User(other_id)` filters for arbitrary identities).
@@ -100,8 +102,8 @@ impl WebSocketServer {
         }
     }
 
-    /// Start the WebSocket server
-    pub async fn start(&self) -> Result<()> {
+    /// The same router is used by production and ephemeral-listener socket tests.
+    pub fn router(&self) -> Router {
         let jwt_secret = self.config.security.jwt_secret.clone().unwrap_or_else(|| {
             warn!(
                 "JWT_SECRET not set in config; falling back to default insecure secret. \
@@ -124,7 +126,7 @@ impl WebSocketServer {
         });
 
         // Build router with WebSocket endpoint
-        let app = Router::new()
+        Router::new()
             .route("/ws", get(websocket_handler))
             .route("/health", get(health_handler))
             .route("/stats", get(stats_handler))
@@ -134,7 +136,12 @@ impl WebSocketServer {
                     .allow_methods(Any)
                     .allow_headers(Any),
             )
-            .with_state(app_state);
+            .with_state(app_state)
+    }
+
+    /// Start the WebSocket server
+    pub async fn start(&self) -> Result<()> {
+        let app = self.router();
 
         let notifier_config = self
             .config
@@ -169,6 +176,7 @@ struct AppState {
 }
 
 struct VerifiedWsToken {
+    recorded: Option<RecordedConnection>,
     identity_id: i64,
     token_type: TokenType,
     token_exp: i64,
@@ -182,6 +190,7 @@ struct VerifiedWsToken {
 /// decisions can be memoized once per distinct snapshot per notification.
 #[derive(Clone)]
 pub(crate) struct WebSocketAuthContext {
+    pub(crate) recorded: Option<RecordedConnection>,
     pub(crate) identity_id: i64,
     pub(crate) token_type: TokenType,
     pub(crate) token_exp: i64,
@@ -206,6 +215,15 @@ impl WebSocketAuthContext {
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.identity_id.hash(&mut hasher);
+        self.token_exp.hash(&mut hasher);
+        if let Some(recorded) = &self.recorded {
+            recorded.binding.execution_id.hash(&mut hasher);
+            recorded.binding.admission_id.hash(&mut hasher);
+            recorded.binding.attempt.hash(&mut hasher);
+            recorded.binding.action_ref.hash(&mut hasher);
+            recorded.binding.sponsor_identity_id.hash(&mut hasher);
+            recorded.selected_refs().hash(&mut hasher);
+        }
         // TokenType has no Hash impl; its Debug form is stable and distinct.
         format!("{:?}", self.token_type).hash(&mut hasher);
         for trigger_ref in &self.sensor_trigger_refs {
@@ -243,6 +261,7 @@ impl WebSocketAuthContext {
         grants: Vec<Grant>,
     ) -> Self {
         Self {
+            recorded: None,
             identity_id,
             token_type,
             token_exp: i64::MAX,
@@ -331,6 +350,8 @@ fn verify_ws_token(
     jwt_config: &JwtConfig,
 ) -> std::result::Result<VerifiedWsToken, &'static str> {
     let claims = validate_token(token, jwt_config).map_err(|_| "invalid_or_expired_token")?;
+    let recorded =
+        RecordedConnection::from_claims(&claims).map_err(|_| "invalid_recorded_authority")?;
 
     match claims.token_type {
         TokenType::Access | TokenType::Execution | TokenType::Sensor => {}
@@ -352,6 +373,7 @@ fn verify_ws_token(
     };
 
     Ok(VerifiedWsToken {
+        recorded,
         identity_id,
         token_type: claims.token_type,
         token_exp: claims.exp,
@@ -622,7 +644,7 @@ struct ExecutionVisibilityAnchorRow {
 /// costs at most one visibility evaluation per identity regardless of how many
 /// sockets/tabs that identity has open. Filter matching still runs per
 /// subscriber; only the (potentially DB-backed) authorization step is memoized.
-pub(crate) async fn dispatch_notification(
+pub async fn dispatch_notification(
     subscriber_manager: &SubscriberManager,
     db_pool: &PgPool,
     notification: Notification,
@@ -680,6 +702,17 @@ async fn dispatch_with_authorizer<F, Fut>(
         }
 
         let mut delivery = notification.clone();
+        if candidate.auth.recorded.is_some() {
+            // Runtime notifications are invalidation hints, never an alternate
+            // plaintext result/configuration delivery channel.
+            delivery.payload = serde_json::json!({"auth_mode": "deferred"});
+            delivery.user_id = None;
+            if notification.entity_type == "event" {
+                if let Some(created) = notification.payload.get("created") {
+                    delivery.payload["created"] = created.clone();
+                }
+            }
+        }
         if candidate.auth.token_type == TokenType::Sensor
             && notification.notification_type == "rule_lifecycle_changed"
         {
@@ -733,6 +766,12 @@ async fn notification_allowed_for_identity(
     auth: &WebSocketAuthContext,
     db_pool: &PgPool,
 ) -> bool {
+    if is_token_expired(auth.token_exp, chrono::Utc::now().timestamp()) {
+        return false;
+    }
+    if let Some(recorded) = &auth.recorded {
+        return recorded.permits(db_pool, notification).await;
+    }
     if auth.token_type == TokenType::Sensor {
         return notification.notification_type == "rule_lifecycle_changed"
             && notification
@@ -767,7 +806,8 @@ fn resource_action_grant_exists(grants: &[Grant], resource: Resource, action: Ac
 }
 
 fn constraints_are_effectively_unscoped(constraints: &GrantConstraints) -> bool {
-    constraints.pack_refs.is_none()
+    constraints.managing_pack_id.is_none()
+        && constraints.pack_refs.is_none()
         && constraints.owner.is_none()
         && constraints.owner_types.is_none()
         && constraints.owner_refs.is_none()
@@ -829,13 +869,21 @@ fn build_visibility_read_scope(
         if !constraints_supported_for_visibility_projection(constraints) {
             continue;
         }
+        if constraints.ids.as_ref().is_some_and(Vec::is_empty)
+            || constraints.refs.as_ref().is_some_and(Vec::is_empty)
+            || constraints.pack_refs.as_ref().is_some_and(Vec::is_empty)
+        {
+            continue;
+        }
 
         let projection = VisibilityGrantFilter {
+            managing_pack_id: constraints.managing_pack_id,
             ids: constraints.ids.clone().unwrap_or_default(),
             refs: constraints.refs.clone().unwrap_or_default(),
             pack_refs: constraints.pack_refs.clone().unwrap_or_default(),
         };
-        if projection.ids.is_empty()
+        if projection.managing_pack_id.is_none()
+            && projection.ids.is_empty()
             && projection.refs.is_empty()
             && projection.pack_refs.is_empty()
         {
@@ -1140,51 +1188,70 @@ async fn websocket_handler(
 
     // Look up role assignments for the connecting identity. Fail-closed on DB
     // errors — a flaky DB must not silently grant admin privileges.
-    let roles = match IdentityRoleAssignmentRepository::find_role_names_by_identity(
-        &state.db_pool,
-        verified_token.identity_id,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!(
-                identity_id = verified_token.identity_id,
-                error = %e,
-                "WebSocket upgrade rejected: failed to look up identity roles"
-            );
+    let roles = if verified_token.recorded.is_some() {
+        Vec::new()
+    } else {
+        match IdentityRoleAssignmentRepository::find_role_names_by_identity(
+            &state.db_pool,
+            verified_token.identity_id,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    identity_id = verified_token.identity_id,
+                    error = %e,
+                    "WebSocket upgrade rejected: failed to look up identity roles"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "role_lookup_failed"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let effective_authz = if let Some(recorded) = &verified_token.recorded {
+        if !recorded.is_live(&state.db_pool).await {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "role_lookup_failed"})),
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "recorded_authority_unavailable"})),
             )
                 .into_response();
         }
-    };
-    let effective_authz = match load_effective_grants(
-        &state.db_pool,
-        verified_token.identity_id,
-        verified_token.token_type.clone(),
-        &roles,
-        &verified_token.permission_set_refs,
-    )
-    .await
-    {
-        Ok(grants) => grants,
-        Err(e) => {
-            error!(
-                identity_id = verified_token.identity_id,
-                error = %e,
-                "WebSocket upgrade rejected: failed to load permission grants"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "permission_lookup_failed"})),
-            )
-                .into_response();
+        EffectiveAuthorizationContext {
+            grants: Vec::new(),
+            identity_attributes: HashMap::new(),
+        }
+    } else {
+        match load_effective_grants(
+            &state.db_pool,
+            verified_token.identity_id,
+            verified_token.token_type.clone(),
+            &roles,
+            &verified_token.permission_set_refs,
+        )
+        .await
+        {
+            Ok(grants) => grants,
+            Err(e) => {
+                error!(
+                    identity_id = verified_token.identity_id,
+                    error = %e,
+                    "WebSocket upgrade rejected: failed to load permission grants"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "permission_lookup_failed"})),
+                )
+                    .into_response();
+            }
         }
     };
 
     let auth = WebSocketAuthContext {
+        recorded: verified_token.recorded,
         identity_id: verified_token.identity_id,
         token_type: verified_token.token_type,
         token_exp: verified_token.token_exp,
@@ -1265,12 +1332,13 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
     );
 
     // Share the immutable auth snapshot across the subscriber registry and the
-    // connection's receive loop. Notification authorization is evaluated in the
-    // central broadcast path (see `dispatch_notification`), not per-connection.
+    // connection loop. Recorded notifications are authorized again by the
+    // writer after dequeue and actual socket readiness.
     let auth = Arc::new(auth);
 
-    // Split the socket into sender and receiver
-    let (mut ws_sender, mut ws_receiver) = socket.split();
+    // Own the unsplit sink in this loop. SplitSink::poll_ready only reserves its
+    // intermediary slot; it cannot fence the actual socket readiness wait.
+    let mut socket = socket;
 
     // Create channel for sending notifications to this client
     let (tx, mut rx) = mpsc::unbounded_channel::<Notification>();
@@ -1286,87 +1354,61 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
         client_id: client_id.clone(),
         message: "Connected to Attune Notifier".to_string(),
     };
-    if let Ok(json) = serde_json::to_string(&welcome) {
-        let _ = ws_sender.send(Message::Text(json.into())).await;
+    if !send_checked_frame(
+        &mut socket,
+        &state.db_pool,
+        &auth,
+        OutgoingFrame::Message(welcome),
+    )
+    .await
+    {
+        state.subscriber_manager.unregister(&client_id);
+        return;
     }
 
     // Channel for control messages (errors, close frames, etc.) the receive
     // loop wants to push back to the client. Multiplexed with the
-    // notification stream by the outgoing task.
+    // notification stream by this connection loop.
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<OutgoingFrame>();
-
-    // Spawn task to handle outgoing notifications and control messages.
-    // Notifications arriving on `rx` have already been authorized for this
-    // connection's identity by the central broadcast path, so the outgoing
-    // task performs no per-message DB auth checks — it only serializes and
-    // writes frames.
-    let client_id_clone = client_id.clone();
-    let subscriber_manager_clone = state.subscriber_manager.clone();
-    let outgoing_task = tokio::spawn(async move {
-        loop {
-            let frame = tokio::select! {
-                maybe_n = rx.recv() => match maybe_n {
-                    Some(n) => OutgoingFrame::Message(ClientMessage::Notification(n)),
-                    None => break,
-                },
-                maybe_c = ctrl_rx.recv() => match maybe_c {
-                    Some(c) => c,
-                    None => continue,
-                },
-            };
-            match frame {
-                OutgoingFrame::Message(msg) => match serde_json::to_string(&msg) {
-                    Ok(json) => {
-                        if let Err(e) = ws_sender.send(Message::Text(json.into())).await {
-                            error!("Failed to send message to {}: {}", client_id_clone, e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to serialize outgoing message: {}", e);
-                    }
-                },
-                OutgoingFrame::Close { code, reason } => {
-                    let _ = ws_sender
-                        .send(Message::Close(Some(CloseFrame {
-                            code,
-                            reason: reason.into(),
-                        })))
-                        .await;
-                    break;
-                }
-            }
-        }
-        debug!("Outgoing task stopped for client: {}", client_id_clone);
-        subscriber_manager_clone.unregister(&client_id_clone);
-    });
 
     // Handle incoming messages from client (subscriptions, etc.) and
     // periodically check that the access token is still valid. The
     // periodic-tick interval is short enough that connections are torn down
     // promptly after `exp`, but long enough not to thrash.
-    let subscriber_manager_clone = state.subscriber_manager.clone();
-    let client_id_clone = client_id.clone();
     let mut exp_interval = tokio::time::interval(TOKEN_EXPIRATION_CHECK_INTERVAL);
     // Skip the immediate first tick — we already verified `exp` at upgrade time.
     exp_interval.tick().await;
     loop {
         tokio::select! {
+            notification = rx.recv() => {
+                let Some(notification) = notification else { break; };
+                if !send_checked_frame(&mut socket, &state.db_pool, &auth,
+                    OutgoingFrame::Message(ClientMessage::Notification(notification))).await { break; }
+            }
+            frame = ctrl_rx.recv() => {
+                let Some(frame) = frame else { break; };
+                if !send_checked_frame(&mut socket, &state.db_pool, &auth, frame).await { break; }
+            }
             _ = exp_interval.tick() => {
                 let now = chrono::Utc::now().timestamp();
-                if is_token_expired(auth.token_exp, now) {
+                if is_token_expired(auth.token_exp, now)
+                    || match &auth.recorded {
+                        Some(recorded) => !recorded.is_live(&state.db_pool).await,
+                        None => false,
+                    } {
                     info!(
                         "WebSocket connection {} closed due to expired token",
-                        client_id_clone
+                        client_id
                     );
-                    let _ = ctrl_tx.send(OutgoingFrame::Close {
-                        code: CLOSE_CODE_TOKEN_EXPIRED,
-                        reason: "token expired".to_string(),
-                    });
+                    let _ = send_checked_frame(&mut socket, &state.db_pool, &auth,
+                        OutgoingFrame::Close {
+                            code: CLOSE_CODE_TOKEN_EXPIRED,
+                            reason: "authorization no longer valid".into(),
+                        }).await;
                     break;
                 }
             }
-            maybe_msg = ws_receiver.next() => {
+            maybe_msg = socket.next() => {
                 let msg = match maybe_msg {
                     Some(m) => m,
                     None => break,
@@ -1374,25 +1416,25 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
                 match msg {
                     Ok(Message::Text(text)) => {
                         let ctx = ClientMessageContext {
-                            subscriber_manager: &subscriber_manager_clone,
+                            subscriber_manager: &state.subscriber_manager,
                             auth: auth.as_ref(),
                             db_pool: &state.db_pool,
                             ctrl_tx: &ctrl_tx,
                         };
-                        handle_client_message(&client_id_clone, &text, &ctx).await;
+                        handle_client_message(&client_id, &text, &ctx).await;
                     }
                     Ok(Message::Binary(_)) => {
-                        warn!("Received binary message from {}, ignoring", client_id_clone);
+                        warn!("Received binary message from {}, ignoring", client_id);
                     }
                     Ok(Message::Close(_)) => {
-                        info!("Client {} closed connection", client_id_clone);
+                        info!("Client {} closed connection", client_id);
                         break;
                     }
                     Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
                         // Handled automatically by axum
                     }
                     Err(e) => {
-                        error!("WebSocket error for {}: {}", client_id_clone, e);
+                        error!("WebSocket error for {}: {}", client_id, e);
                         break;
                     }
                 }
@@ -1401,14 +1443,93 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
     }
 
     // Clean up
-    subscriber_manager_clone.unregister(&client_id);
-    outgoing_task.abort();
-    if let Err(error) = outgoing_task.await {
-        if !error.is_cancelled() {
-            error!("Outgoing task failed for {}: {}", client_id, error);
+    state.subscriber_manager.unregister(&client_id);
+    info!("WebSocket connection closed: {}", client_id);
+}
+
+/// Check after dequeue AND actual socket readiness, not before a blocked writer.
+async fn send_checked_frame(
+    socket: &mut WebSocket,
+    pool: &PgPool,
+    auth: &WebSocketAuthContext,
+    frame: OutgoingFrame,
+) -> bool {
+    use futures::Sink;
+    use std::pin::Pin;
+    if let OutgoingFrame::Close { code, reason } = frame {
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code,
+                reason: reason.into(),
+            })))
+            .await;
+        return false;
+    }
+    let OutgoingFrame::Message(message) = frame else {
+        return false;
+    };
+    let Ok(json) = serde_json::to_string(&message) else {
+        return false;
+    };
+    if futures::future::poll_fn(|cx| Pin::new(&mut *socket).poll_ready(cx))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    if auth.token_type == TokenType::Access && !human_delivery::allowed(pool, auth, &message).await
+    {
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CLOSE_CODE_TOKEN_EXPIRED,
+                reason: "authorization no longer valid".into(),
+            })))
+            .await;
+        return false;
+    }
+    if let Some(recorded) = &auth.recorded {
+        let fence = match &message {
+            ClientMessage::Notification(notification) => {
+                recorded.notification_fence(pool, notification).await
+            }
+            _ => recorded.source_fence(pool).await,
+        };
+        let valid = if let Some(fence) = fence {
+            match pool.acquire().await {
+                Ok(mut connection) => fence.ensure_fresh_on(&mut connection).await.is_ok(),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        if !valid {
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CLOSE_CODE_TOKEN_EXPIRED,
+                    reason: "authorization no longer valid".into(),
+                })))
+                .await;
+            return false;
         }
     }
-    info!("WebSocket connection closed: {}", client_id);
+    if is_token_expired(auth.token_exp, chrono::Utc::now().timestamp()) {
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CLOSE_CODE_TOKEN_EXPIRED,
+                reason: "token expired".into(),
+            })))
+            .await;
+        return false;
+    }
+    // No await lies between the final DB-clock check and handing this frame to
+    // the ready socket. Flush only transports an already-authorized frame.
+    if Pin::new(&mut *socket)
+        .start_send(Message::Text(json.into()))
+        .is_err()
+    {
+        return false;
+    }
+    socket.flush().await.is_ok()
 }
 
 /// Push an `Error` frame back to the client via the control channel.
@@ -1444,17 +1565,26 @@ async fn handle_client_message(
                     return;
                 }
             };
-            if !filter_allowed_for_identity(
-                &subscription_filter,
-                ctx.auth.identity_id,
-                &ctx.auth.token_type,
-                &ctx.auth.sensor_trigger_refs,
-                &ctx.auth.roles,
-                &ctx.auth.grants,
-                ctx.db_pool,
-            )
-            .await
-            {
+            let allowed = if let Some(recorded) = &ctx.auth.recorded {
+                // Filters select candidates only. Every resulting entity is
+                // independently checked against structural recorded authority.
+                !matches!(
+                    subscription_filter,
+                    SubscriptionFilter::User(_) | SubscriptionFilter::TriggerRef(_)
+                ) && recorded.is_live(ctx.db_pool).await
+            } else {
+                filter_allowed_for_identity(
+                    &subscription_filter,
+                    ctx.auth.identity_id,
+                    &ctx.auth.token_type,
+                    &ctx.auth.sensor_trigger_refs,
+                    &ctx.auth.roles,
+                    &ctx.auth.grants,
+                    ctx.db_pool,
+                )
+                .await
+            };
+            if !allowed {
                 warn!(
                     identity_id = ctx.auth.identity_id,
                     requested_filter = %filter,
@@ -1562,6 +1692,49 @@ enum ServerMessage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recorded_fingerprints_separate_executions_admissions_and_attempts() {
+        use attune_common::{
+            auth::jwt::{generate_admitted_execution_token, validate_token, JwtConfig},
+            repositories::runtime_authority::RuntimeCredentialBinding,
+        };
+        attune_common::auth::install_crypto_provider();
+        let config = JwtConfig {
+            secret: "fingerprint-test".into(),
+            access_token_expiration: 60,
+            refresh_token_expiration: 60,
+        };
+        let binding = RuntimeCredentialBinding {
+            execution_id: 11,
+            admission_id: 12,
+            sponsor_identity_id: 13,
+            action_ref: "fixture.action".into(),
+            attempt: uuid::Uuid::new_v4(),
+        };
+        let fingerprint = |binding: &RuntimeCredentialBinding| {
+            let token =
+                generate_admitted_execution_token(binding, &["standard".into()], &config, Some(60))
+                    .unwrap();
+            let claims = validate_token(&token, &config).unwrap();
+            let mut context = super::WebSocketAuthContext::test_context(
+                13,
+                super::TokenType::Execution,
+                Vec::new(),
+            );
+            context.recorded = super::RecordedConnection::from_claims(&claims).unwrap();
+            context.fingerprint()
+        };
+        let original = fingerprint(&binding);
+        let mut changed = binding.clone();
+        changed.execution_id += 1;
+        assert_ne!(original, fingerprint(&changed));
+        changed = binding.clone();
+        changed.admission_id += 1;
+        assert_ne!(original, fingerprint(&changed));
+        changed = binding.clone();
+        changed.attempt = uuid::Uuid::new_v4();
+        assert_ne!(original, fingerprint(&changed));
+    }
     use super::*;
 
     #[test]
@@ -2256,6 +2429,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorded_deliveries_are_deferred_and_do_not_share_same_sponsor_permits() {
+        use attune_common::{
+            auth::jwt::generate_admitted_execution_token,
+            repositories::runtime_authority::RuntimeCredentialBinding,
+        };
+        let config = jwt_test_config();
+        let context = |execution_id| {
+            let binding = RuntimeCredentialBinding {
+                execution_id,
+                admission_id: execution_id + 10,
+                sponsor_identity_id: 13,
+                action_ref: "fixture.action".into(),
+                attempt: uuid::Uuid::new_v4(),
+            };
+            let token = generate_admitted_execution_token(
+                &binding,
+                &["standard".into()],
+                &config,
+                Some(60),
+            )
+            .unwrap();
+            let claims = validate_token(&token, &config).unwrap();
+            let mut context =
+                WebSocketAuthContext::test_context(13, TokenType::Execution, Vec::new());
+            context.recorded = RecordedConnection::from_claims(&claims).unwrap();
+            Arc::new(context)
+        };
+        let manager = SubscriberManager::new();
+        let mut allowed = register_all(&manager, context(11));
+        let mut denied = register_all(&manager, context(12));
+        let mut notification = make_notification("execution");
+        notification.payload = serde_json::json!({"result":"private content", "requester":99});
+        notification.user_id = Some(99);
+        let evaluations = AtomicUsize::new(0);
+        dispatch_with_authorizer(&manager, notification, |auth| {
+            evaluations.fetch_add(1, Ordering::SeqCst);
+            // Simulated current revocation state. This cache test does not
+            // establish connected-socket/database revocation behavior.
+            let live = auth.recorded.as_ref().unwrap().binding.execution_id == 11;
+            async move { live }
+        })
+        .await;
+        assert_eq!(evaluations.load(Ordering::SeqCst), 2);
+        let delivery = allowed.try_recv().unwrap();
+        assert_eq!(
+            delivery.payload,
+            serde_json::json!({"auth_mode":"deferred"})
+        );
+        assert_eq!(delivery.user_id, None);
+        assert!(denied.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn test_dispatch_blocks_unauthorized_identity() {
         let manager = SubscriberManager::new();
 
@@ -2309,6 +2535,7 @@ mod tests {
         let manager = SubscriberManager::new();
 
         let sensor_auth = Arc::new(WebSocketAuthContext {
+            recorded: None,
             identity_id: 99,
             token_type: TokenType::Sensor,
             token_exp: i64::MAX,

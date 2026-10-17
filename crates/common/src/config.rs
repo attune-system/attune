@@ -916,6 +916,10 @@ pub struct AgentConfig {
 /// workers/sensors and the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactsConfig {
+    /// Operator-owned native storage management API for explicit legacy audits.
+    /// Absent configuration leaves an invokable, diagnosed manual quarantine.
+    #[serde(default)]
+    pub legacy_audit_controller: Option<LegacyAuditControllerConfig>,
     /// Transport mode: "auto" (default), "volume", or "api".
     ///
     /// - `auto`: detect shared volume via sentinel file, fall back to API
@@ -927,6 +931,13 @@ pub struct ArtifactsConfig {
     /// Maximum file upload size in bytes for API transport (default: 100 MB).
     #[serde(default = "default_max_upload_size")]
     pub max_upload_size: u64,
+
+    /// Per-API-instance budget for protected file codec/response buffers.
+    #[serde(default = "default_protected_file_memory_budget_bytes")]
+    pub protected_file_memory_budget_bytes: u64,
+    /// Maximum active file publications/whole-file plaintext responses.
+    #[serde(default = "default_file_transfer_concurrency")]
+    pub file_transfer_concurrency: usize,
 
     /// Buffer flush interval in milliseconds for streaming writes (default: 500).
     #[serde(default = "default_flush_interval_ms")]
@@ -967,6 +978,20 @@ pub struct ArtifactsConfig {
     /// Sensor log rotation: number of rotated files to keep (default: 4).
     #[serde(default = "default_sensor_log_max_files")]
     pub sensor_log_max_files: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyAuditControllerConfig {
+    /// HTTPS management endpoint, not the S3 data endpoint or a caller URL.
+    pub endpoint: String,
+    pub issuer: String,
+    pub audience: String,
+    /// Pinned RS256 public key. This must not be an execution JWT signing key.
+    pub verification_key_file: PathBuf,
+    /// PEM client certificate and private key for management API mutual TLS.
+    pub client_identity_file: PathBuf,
+    pub ca_certificate_file: PathBuf,
 }
 
 /// Configuration for pack file transport and publication policy.
@@ -1049,8 +1074,11 @@ impl PackRepublishConfig {
 impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
+            legacy_audit_controller: None,
             transport: crate::artifact_transport::TransportMode::Auto,
             max_upload_size: default_max_upload_size(),
+            protected_file_memory_budget_bytes: default_protected_file_memory_budget_bytes(),
+            file_transfer_concurrency: default_file_transfer_concurrency(),
             flush_interval_ms: default_flush_interval_ms(),
             log_segment_max_bytes: default_log_segment_max_bytes(),
             log_segment_initial_bytes: default_log_segment_initial_bytes(),
@@ -1066,6 +1094,23 @@ impl Default for ArtifactsConfig {
 }
 
 impl ArtifactsConfig {
+    pub fn validate_file_memory(&self) -> crate::Result<()> {
+        let minimum = crate::runtime_file_body::allocation_budget(self.max_upload_size)
+            .ok_or_else(|| {
+                crate::Error::configuration(
+                    "artifacts.max_upload_size exceeds codec allocation accounting",
+                )
+            })?;
+        if self.protected_file_memory_budget_bytes < minimum
+            || self.protected_file_memory_budget_bytes % (1024 * 1024) != 0
+            || self.protected_file_memory_budget_bytes / (1024 * 1024) > u32::MAX as u64
+            || self.file_transfer_concurrency == 0
+            || self.file_transfer_concurrency > 1024
+        {
+            return Err(crate::Error::configuration(format!("artifacts.protected_file_memory_budget_bytes must cover {minimum} bytes for max_upload_size in whole MiB units and fit u32 permits; file_transfer_concurrency must be 1..=1024. Provision memory explicitly rather than lowering file authority or allocating unbounded buffers")));
+        }
+        Ok(())
+    }
     pub fn log_segment_writer_config(&self) -> crate::log_stream::SegmentedLogConfig {
         crate::log_stream::SegmentedLogConfig {
             initial_segment_bytes: self.log_segment_initial_bytes,
@@ -1082,6 +1127,12 @@ impl ArtifactsConfig {
 
 fn default_max_upload_size() -> u64 {
     100 * 1024 * 1024 // 100 MB
+}
+fn default_protected_file_memory_budget_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+fn default_file_transfer_concurrency() -> usize {
+    4
 }
 
 fn default_flush_interval_ms() -> u64 {
@@ -2361,6 +2412,7 @@ impl Config {
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
         self.packs.republish.validate()?;
+        self.artifacts.validate_file_memory()?;
         if let Some(worker) = &self.worker {
             crate::child_process_environment::validate_passthrough_env(&worker.passthrough_env)?;
         }

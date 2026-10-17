@@ -545,6 +545,7 @@ pub struct ArtifactVersionSummary {
 
 impl From<attune_common::models::artifact::Artifact> for ArtifactResponse {
     fn from(a: attune_common::models::artifact::Artifact) -> Self {
+        let file_body = attune_common::repositories::artifact::is_file_backed_type(a.r#type);
         Self {
             id: a.id,
             r#ref: a.r#ref,
@@ -559,7 +560,7 @@ impl From<attune_common::models::artifact::Artifact> for ArtifactResponse {
             description: a.description,
             content_type: a.content_type,
             size_bytes: a.size_bytes,
-            data: a.data,
+            data: if file_body { None } else { a.data },
             created: a.created,
             updated: a.updated,
         }
@@ -606,6 +607,7 @@ impl From<attune_common::repositories::artifact::ArtifactSummaryRow> for Artifac
 
 impl From<attune_common::models::artifact_version::ArtifactVersion> for ArtifactVersionResponse {
     fn from(v: attune_common::models::artifact_version::ArtifactVersion) -> Self {
+        let file_body = v.file_path.is_some() || v.object_key.is_some();
         Self {
             id: v.id,
             artifact: v.artifact,
@@ -613,21 +615,36 @@ impl From<attune_common::models::artifact_version::ArtifactVersion> for Artifact
             execution: v.execution,
             content_type: v.content_type,
             size_bytes: v.size_bytes,
-            content_json: v.content_json,
+            content_json: if file_body { None } else { v.content_json },
             file_path: v.file_path,
             body_state: v.body_state,
             object_key: v.object_key,
             provider_version: v.provider_version,
             sha256: v.sha256,
-            meta: v.meta,
-            created_by: v.created_by,
+            meta: if file_body { None } else { v.meta },
+            created_by: if file_body { None } else { v.created_by },
             created: v.created,
         }
     }
 }
 
+impl ArtifactVersionResponse {
+    /// File content is available only through the guarded byte reader. This
+    /// also covers old inline-file rows without a physical-storage marker.
+    pub fn projection(v: attune_common::models::ArtifactVersion, file_body: bool) -> Self {
+        let mut response = Self::from(v);
+        if file_body {
+            response.content_json = None;
+            response.meta = None;
+            response.created_by = None;
+        }
+        response
+    }
+}
+
 impl From<attune_common::models::artifact_version::ArtifactVersion> for ArtifactVersionSummary {
     fn from(v: attune_common::models::artifact_version::ArtifactVersion) -> Self {
+        let file_body = v.file_path.is_some() || v.object_key.is_some();
         Self {
             id: v.id,
             version: v.version,
@@ -639,7 +656,7 @@ impl From<attune_common::models::artifact_version::ArtifactVersion> for Artifact
             object_key: v.object_key,
             provider_version: v.provider_version,
             sha256: v.sha256,
-            created_by: v.created_by,
+            created_by: if file_body { None } else { v.created_by },
             created: v.created,
         }
     }
@@ -649,6 +666,7 @@ impl From<attune_common::repositories::artifact::ArtifactVersionSummaryRow>
     for ArtifactVersionSummary
 {
     fn from(v: attune_common::repositories::artifact::ArtifactVersionSummaryRow) -> Self {
+        let file_body = v.file_path.is_some() || v.object_key.is_some();
         Self {
             id: v.id,
             version: v.version,
@@ -660,7 +678,7 @@ impl From<attune_common::repositories::artifact::ArtifactVersionSummaryRow>
             object_key: v.object_key,
             provider_version: v.provider_version,
             sha256: v.sha256,
-            created_by: v.created_by,
+            created_by: if file_body { None } else { v.created_by },
             created: v.created,
         }
     }

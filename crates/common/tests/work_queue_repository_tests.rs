@@ -79,6 +79,155 @@ async fn create_queue_fixture() -> (
 }
 
 #[tokio::test]
+async fn batch_requester_separation_is_opt_in_and_does_not_depend_on_human_activity() {
+    for separate in [false, true] {
+        for unattributed_anchor in [false, true] {
+            let (db, queue) = create_queue_fixture().await;
+            let alice = helpers::IdentityFixture::new_unique("alice")
+                .create(&db)
+                .await
+                .unwrap();
+            let bob = helpers::IdentityFixture::new_unique("bob")
+                .create(&db)
+                .await
+                .unwrap();
+            let anchor = if unattributed_anchor {
+                None
+            } else {
+                Some(alice.id)
+            };
+            let other = if unattributed_anchor {
+                Some(alice.id)
+            } else {
+                None
+            };
+            for (index, requester) in [anchor, Some(bob.id), anchor, other, other, Some(bob.id)]
+                .into_iter()
+                .enumerate()
+            {
+                WorkQueueItemRepository::create(
+                    &db,
+                    CreateWorkQueueItemInput {
+                        queue: queue.id,
+                        queue_ref: queue.r#ref.clone(),
+                        item_key: Some(index.to_string()),
+                        priority: 10,
+                        status: WorkQueueItemStatus::Queued,
+                        payload: json!({"order_id":index}),
+                        metadata: json!({}),
+                        trace_tag: None,
+                        enqueue_source: "api".into(),
+                        requested_by_identity: requester,
+                        requested_by_execution: None,
+                        requested_by_enforcement: None,
+                        leased_execution: None,
+                        lease_token: None,
+                        lease_expires_at: None,
+                        attempt_count: 0,
+                        last_error: None,
+                        ack_summary: None,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            attune_common::repositories::identity::IdentityRepository::update(
+                &db,
+                alice.id,
+                attune_common::repositories::identity::UpdateIdentityInput {
+                    frozen: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let lease_token = Uuid::new_v4();
+            let items = WorkQueueItemRepository::lease_next_batch(
+                &db,
+                LeaseWorkQueueItemsInput {
+                    separate_requesters: separate,
+                    queue: queue.id,
+                    ready_statuses: vec![WorkQueueItemStatus::Queued],
+                    limit: 6,
+                    batch_coalescing: None,
+                    leased_execution: None,
+                    lease_token,
+                    lease_expires_at: Utc::now() + Duration::minutes(5),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(sqlx::query(
+                "UPDATE work_queue_item SET historical_requester_identity = $1 WHERE id = $2"
+            )
+            .bind(bob.id)
+            .bind(items[0].id)
+            .execute(&*db)
+            .await
+            .is_err());
+            assert_eq!(items.len(), if separate { 2 } else { 6 });
+            assert_eq!(items[0].requested_by_identity, anchor);
+            if separate {
+                assert!(items
+                    .iter()
+                    .all(|item| item.requested_by_identity == anchor));
+            } else {
+                assert!(items
+                    .iter()
+                    .any(|item| item.requested_by_identity == Some(bob.id)));
+            }
+            WorkQueueItemRepository::release_lease(
+                &db,
+                ReleaseWorkQueueLeaseInput {
+                    lease_token,
+                    new_status: WorkQueueItemStatus::Queued,
+                    leased_execution: None,
+                    last_error: None,
+                    ack_summary: None,
+                },
+            )
+            .await
+            .unwrap();
+            attune_common::repositories::identity::IdentityRepository::delete(&db, alice.id)
+                .await
+                .unwrap();
+            attune_common::repositories::identity::IdentityRepository::delete(&db, bob.id)
+                .await
+                .unwrap();
+            let retained = WorkQueueItemRepository::lease_next_batch(
+                &db,
+                LeaseWorkQueueItemsInput {
+                    separate_requesters: separate,
+                    queue: queue.id,
+                    ready_statuses: vec![WorkQueueItemStatus::Queued],
+                    limit: 6,
+                    batch_coalescing: None,
+                    leased_execution: None,
+                    lease_token: Uuid::new_v4(),
+                    lease_expires_at: Utc::now() + Duration::minutes(5),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(retained.len(), if separate { 2 } else { 6 });
+            assert!(retained
+                .iter()
+                .all(|item| item.requested_by_identity.is_none()));
+            if separate {
+                assert_eq!(
+                    retained
+                        .iter()
+                        .map(|item| item.item_key.as_deref())
+                        .collect::<Vec<_>>(),
+                    vec![Some("0"), Some("2")]
+                );
+            }
+            db.cleanup().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn queue_item_admission_binding_survives_schema_changes_and_rejects_replacement() {
     use attune_common::{
         repositories::{
@@ -352,6 +501,7 @@ async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
     let leased = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {
+            separate_requesters: false,
             queue: queue.id,
             ready_statuses: vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry],
             limit: 2,
@@ -409,6 +559,7 @@ async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
     let _expired = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {
+            separate_requesters: false,
             queue: queue.id,
             ready_statuses: vec![WorkQueueItemStatus::Queued],
             limit: 1,
@@ -558,6 +709,7 @@ async fn work_queue_item_repository_coalesces_within_same_priority_band() {
     let leased = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {
+            separate_requesters: false,
             queue: queue.id,
             ready_statuses: vec![WorkQueueItemStatus::Queued],
             limit: 3,
@@ -687,6 +839,7 @@ async fn work_queue_item_repository_can_coalesce_across_priorities() {
     let leased = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {
+            separate_requesters: false,
             queue: queue.id,
             ready_statuses: vec![WorkQueueItemStatus::Queued],
             limit: 3,
@@ -767,6 +920,7 @@ async fn work_queue_item_repository_returns_partial_batch_when_only_partial_grou
     let leased = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {
+            separate_requesters: false,
             queue: queue.id,
             ready_statuses: vec![WorkQueueItemStatus::Queued],
             limit: 3,
@@ -845,6 +999,7 @@ async fn work_queue_item_repository_falls_back_to_fifo_when_group_value_is_missi
     let leased = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {
+            separate_requesters: false,
             queue: queue.id,
             ready_statuses: vec![WorkQueueItemStatus::Queued],
             limit: 2,

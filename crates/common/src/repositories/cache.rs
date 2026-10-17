@@ -116,6 +116,9 @@ pub enum CacheGrantContext {
 /// The cache-row fields constrained by one readable RBAC grant.
 #[derive(Debug, Clone, Default)]
 pub struct CacheNamespaceGrantFilter {
+    pub pinned_targets: Option<Vec<crate::runtime_authority::BoundRuntimeTarget>>,
+    pub pinned_owners: Option<Vec<(String, Id, Option<Id>)>>,
+    pub pinned_packs: Option<Vec<Id>>,
     pub ownership: CacheOwnershipScope,
     pub context: CacheGrantContext,
     pub ids: Option<Vec<Id>>,
@@ -142,6 +145,15 @@ impl CacheNamespaceGrantFilter {
                 ..Default::default()
             });
         };
+        let ownership = if let Some(pack) = scope.managing_pack_id {
+            match ownership {
+                CacheOwnershipScope::Any => CacheOwnershipScope::ManagedPack(pack),
+                CacheOwnershipScope::ManagedPack(existing) if existing == pack => ownership,
+                _ => return None,
+            }
+        } else {
+            ownership
+        };
         if scope.encrypted.is_some()
             || scope.visibility.is_some()
             || matches!(
@@ -156,6 +168,9 @@ impl CacheNamespaceGrantFilter {
             return None;
         }
         Some(Self {
+            pinned_targets: None,
+            pinned_owners: None,
+            pinned_packs: None,
             ownership,
             context: CacheGrantContext::Recorded,
             ids: scope.ids.clone(),
@@ -1391,14 +1406,19 @@ impl CacheNamespaceRepository {
 
     /// Deletes only an already tombstoned namespace with no generations left.
     pub async fn delete_tombstoned_if_empty(pool: &PgPool, namespace_id: Id) -> Result<bool> {
+        let mut tx = pool.begin().await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
+            .await?;
         let result = sqlx::query(
             "DELETE FROM cache_namespace n \
              WHERE n.id = $1 AND n.tombstoned_at IS NOT NULL \
+             AND NOT file_evidence_pinned('cache_namespace',n.id) \
              AND NOT EXISTS (SELECT 1 FROM cache_generation g WHERE g.namespace = n.id)",
         )
         .bind(namespace_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1406,10 +1426,14 @@ impl CacheNamespaceRepository {
     /// already have no generations, including namespaces that were never populated.
     pub async fn delete_empty_tombstoned_batch(pool: &PgPool, limit: i64) -> Result<u64> {
         let limit = bounded_limit(limit, MAX_CLEANUP_SELECTION, "tombstoned namespace cleanup")?;
+        let mut tx = pool.begin().await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
+            .await?;
         let result = sqlx::query(
             "WITH candidates AS ( \
                  SELECT n.id FROM cache_namespace n \
                   WHERE n.tombstoned_at IS NOT NULL \
+                    AND NOT file_evidence_pinned('cache_namespace',n.id) \
                     AND NOT EXISTS (SELECT 1 FROM cache_generation g WHERE g.namespace = n.id) \
                   ORDER BY n.tombstoned_at, n.id LIMIT $1 \
                   FOR UPDATE OF n SKIP LOCKED \
@@ -1417,8 +1441,9 @@ impl CacheNamespaceRepository {
              DELETE FROM cache_namespace n USING candidates c WHERE n.id = c.id",
         )
         .bind(limit)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 }
@@ -2255,6 +2280,7 @@ impl CacheGenerationRepository {
             "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation g \
              WHERE (state = 'failed' \
                 OR (state = 'retired' AND readable_until IS NOT NULL AND readable_until <= NOW())) \
+                AND NOT file_evidence_cache_generation_pinned(g.id) \
                AND NOT EXISTS (SELECT 1 FROM workflow_cache_iteration i \
                                JOIN workflow_execution w ON w.id = i.workflow_execution \
                                WHERE i.generation = g.id AND i.state = 'scanning' \
@@ -2342,7 +2368,10 @@ impl CacheGenerationRepository {
             sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)")
                 .bind(format!("{remaining}ms")).execute(&mut *tx).await?;
             let admission_started = std::time::Instant::now();
-            let admission = lock_cache_admission(&mut tx).await;
+            let admission = async {
+                super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await?;
+                lock_cache_admission(&mut tx).await
+            }.await;
             tracing::info!(component="cache_storage", operation="cleanup_admission",
                 status=if admission.is_ok() { "admitted" } else { "failed" },
                 duration_ms=u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -3851,6 +3880,7 @@ fn push_cache_namespace_grant_clause(
     identity_id: Id,
     grant: &CacheNamespaceGrantFilter,
 ) {
+    let runtime_pack = format!("(CASE WHEN n.management_origin <> 'pack' OR n.managing_pack IS NOT DISTINCT FROM {CACHE_DATA_PACK_ID_SQL} THEN {CACHE_DATA_PACK_ID_SQL} ELSE NULL END)");
     query.push("(");
     let mut first = true;
 
@@ -3894,6 +3924,22 @@ fn push_cache_namespace_grant_clause(
     if let Some(ids) = &grant.ids {
         and_sep!();
         query.push("n.id = ANY(").push_bind(ids.clone()).push(")");
+    }
+    if let Some(owners) = &grant.pinned_owners {
+        and_sep!();
+        super::runtime_target_binding::push_owner_clause(query, "n", &runtime_pack, owners);
+    }
+    if let Some(targets) = &grant.pinned_targets {
+        and_sep!();
+        super::runtime_target_binding::push_target_clause(query, "n", &runtime_pack, targets);
+    }
+    if let Some(packs) = &grant.pinned_packs {
+        and_sep!();
+        query
+            .push(&runtime_pack)
+            .push(" = ANY(")
+            .push_bind(packs.clone())
+            .push(")");
     }
     if let Some(refs) = &grant.pack_refs {
         and_sep!();

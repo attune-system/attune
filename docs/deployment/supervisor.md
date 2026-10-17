@@ -195,17 +195,25 @@ performance-gate results.
 
 ### Artifact cleanup
 
-Artifact version-count retention still happens when artifact versions are inserted. The supervisor handles the complementary cleanup path for artifacts using time-based policies (`days`, `hours`, or `minutes`):
+The supervisor handles both version-count retention and time-based policies
+(`days`, `hours`, or `minutes`). Publication INSERT/Ready triggers update parent
+metadata only. They never attempt reclamation under a producer's source locks,
+even when a DELETE would match zero rows. Version-count limits are therefore
+eventually enforced by the bounded cleanup cycle, not synchronously by INSERT.
 
-1. Find expired artifact versions.
-2. Delete the file-backed bytes when a version has a `file_path`.
-3. For object-backed versions, mark the row `deleting`, wait the configured
-   safety period, delete the recorded provider version, then delete the row.
+1. Find bounded, evidence-eligible expired artifact versions.
+2. Start a separate transaction with exclusive graph admission before any
+   source/target lock. Recheck the current retention policy and version frontier;
+   the outside candidate is not deletion authority.
+3. Claim cleanup, delete file-backed bytes when there is a `file_path`, and
+   remove version metadata. Exact object cleanup is queued in its durable ledger;
+   protected-file evidence stays pinned until every physical obligation settles.
 4. Refresh artifact metadata or delete empty artifact metadata rows when no versions/data remain.
 
 This is controlled by `maintenance.artifact_cleanup_enabled` and
-`maintenance.artifact_cleanup_batch_size`. The same cycle checks abandoned
-`pending` uploads and verifies non-log `ready` rows with `HEAD`. A missing or
+`maintenance.artifact_cleanup_batch_size`. Version-count overflow remains present
+while this cleanup job is disabled. The same cycle checks abandoned `pending`
+uploads and verifies non-log `ready` rows with `HEAD`. A missing or
 mismatched ready object moves to `deleting`; it does not fall back to a bucket
 scan or an unpinned read.
 

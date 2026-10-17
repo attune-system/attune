@@ -43,6 +43,8 @@ pub struct AppState {
     pub audit_emitter: AuditEmitter,
     /// Durable immutable storage. Only the API receives provider credentials.
     pub blob_store: Arc<dyn BlobStore>,
+    pub file_transfers: crate::file_transfers::FileTransfers,
+    pub legacy_file_controller: Arc<attune_common::file_legacy_controller::StorageLegacyController>,
     /// Process-unique namespace for caches shared by multiple app states.
     pub(crate) cache_namespace: u64,
     pack_projection_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -88,7 +90,15 @@ impl AppState {
                 }),
             ),
         };
-        Self::new_with_audit_and_blob_store(db, config, audit_emitter, blob_store)
+        let controller =
+            attune_common::file_legacy_controller::StorageLegacyController::configured(
+                &config,
+                db.clone(),
+            )
+            .unwrap_or_else(|_| panic!("invalid native legacy audit controller configuration"));
+        let mut state = Self::new_with_audit_and_blob_store(db, config, audit_emitter, blob_store);
+        state.legacy_file_controller = controller;
+        state
     }
 
     /// Create application state with an already constructed durable storage backend.
@@ -130,6 +140,16 @@ impl AppState {
         );
 
         Self {
+            legacy_file_controller:
+                attune_common::file_legacy_controller::StorageLegacyController::unsupported(
+                    &config,
+                    db.clone(),
+                )
+                .expect("failed to identify custom storage audit scope"),
+            file_transfers: crate::file_transfers::FileTransfers::new(
+                config.artifacts.protected_file_memory_budget_bytes,
+                config.artifacts.file_transfer_concurrency,
+            ),
             db,
             jwt_config: Arc::new(jwt_config),
             cors_origins,

@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "../models/ActionReferenceVisibility";
 import type { CreateActionRequest } from "../models/CreateActionRequest";
+import type { ExecutionOptionsAuthoritySource } from "../models/ExecutionOptionsAuthoritySource";
 import type { PaginatedResponse_ActionSearchHit } from "../models/PaginatedResponse_ActionSearchHit";
 import type { PaginatedResponse_ActionSummary } from "../models/PaginatedResponse_ActionSummary";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
@@ -587,6 +588,47 @@ export class ActionsService {
         ref: ref,
       },
       errors: {
+        404: `Action not found`,
+      },
+    });
+  }
+  /**
+   * @returns any Server-approved permission selection choices
+   * @throws ApiError
+   */
+  public static getExecutionOptions({
+    ref,
+  }: {
+    /**
+     * Action reference
+     */
+    ref: string;
+  }): CancelablePromise<{
+    data: {
+      action_ref: string;
+      authority_source: ExecutionOptionsAuthoritySource;
+      default_permission_set_refs: Array<string>;
+      /**
+       * Informational only. Actual creation rechecks admission and revocation.
+       */
+      default_selection_available: boolean;
+      policy_revision_id?: number | null;
+      selectable_permission_set_refs: Array<string>;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/actions/{ref}/execution-options",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        401: `Authentication required`,
+        403: `Action execution is not authorized`,
         404: `Action not found`,
       },
     });

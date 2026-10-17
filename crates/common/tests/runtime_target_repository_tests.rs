@@ -398,6 +398,28 @@ async fn ad_hoc_components_do_not_inherit_pack_authority_from_namespace_associat
     .unwrap();
     assert_eq!(resolved.pack_id(), None);
     tx.commit().await.unwrap();
+    let owners =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_packs(
+            &*db,
+            ComponentTarget::Action,
+            &[action.id],
+        )
+        .await
+        .unwrap();
+    assert!(!owners.contains_key(&action.id));
+    let mut fixture = KeyFixture::new_system_unique("adhoc_owned_key", "data");
+    fixture.owner_type = OwnerType::Action;
+    fixture.owner_action = Some(action.id);
+    fixture.owner_action_ref = Some(action.r#ref.clone());
+    let key = fixture.create(&db).await.unwrap();
+    let origins =
+        attune_common::repositories::iam_ownership::VerifiedKeyOrigins::load(&*db, &[key.id])
+            .await
+            .unwrap();
+    assert_eq!(
+        origins.managing_pack(&attune_common::key_access::key_origin(&key)),
+        None
+    );
     db.cleanup().await.unwrap();
 }
 

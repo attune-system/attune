@@ -100,6 +100,7 @@ impl PackReleaseRepository {
         input: CreatePackReleaseInput,
         policy: &PacksConfig,
     ) -> Result<PackRelease> {
+        super::schema_type::SchemaTypeRepository::lock_reclamation(transaction).await?;
         // Serialize the version check and insert, including callers outside the API.
         sqlx::query("SELECT id FROM pack WHERE id = $1 FOR NO KEY UPDATE")
             .bind(input.pack)
@@ -167,6 +168,7 @@ impl PackReleaseRepository {
         pack: i64,
         release: i64,
     ) -> Result<()> {
+        super::schema_type::SchemaTypeRepository::lock_reclamation(transaction).await?;
         // Lock the pack before releases or components. Component inserts take a
         // conflicting SHARE lock while selecting their managed release.
         sqlx::query("SELECT id FROM pack WHERE id = $1 FOR NO KEY UPDATE")

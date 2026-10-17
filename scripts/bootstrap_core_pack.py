@@ -2,20 +2,39 @@
 """Publish or wait for the bundled core pack through the Attune API."""
 
 import argparse
-import base64
 import gzip
-import hashlib
 import io
 import json
 import os
-import secrets
 import tarfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+
+BOOTSTRAP_CLIENT_VERSION = 1
+BOOTSTRAP_REVISION = "authenticated-pack-publication-1"
+BOOTSTRAP_COMPONENTS = frozenset((
+    "immutable_release", "atomic_deployment",
+))
+
+
+def require_contract(ready):
+    # This checks authenticated publication, not completion of the managed-pack
+    # runtime SOW. Upload still enforces the registrar's actual authority.
+    contract = ready.get("pack_publication", {})
+    if (not isinstance(contract, dict)
+            or type(contract.get("protocol_version")) is not int
+            or contract["protocol_version"] != 1
+            or contract.get("authorization") != "registrar"
+            or type(contract.get("client_version")) is not int
+            or contract["client_version"] != BOOTSTRAP_CLIENT_VERSION
+            or contract.get("revision") != BOOTSTRAP_REVISION
+            or not isinstance(contract.get("components"), list)
+            or not all(isinstance(item, str) for item in contract["components"])
+            or set(contract["components"]) != BOOTSTRAP_COMPONENTS):
+        raise RuntimeError("API publication contract is unavailable; deploy compatible API/bootstrap versions before publishing core")
 
 
 def request(url, *, data=None, headers=None, method=None):
@@ -30,6 +49,7 @@ def wait_for_api(base_url, deadline):
         try:
             with request(f"{base_url}/health/ready") as response:
                 if response.status == 200:
+                    require_contract(json.load(response))
                     return
         except (OSError, urllib.error.URLError):
             pass
@@ -92,7 +112,15 @@ def deterministic_archive(pack_dir):
     return output.getvalue()
 
 
-def upload(base_url, token, pack_dir):
+def require_active_admission(base_url, active):
+    with request(f"{base_url}/health/bootstrap") as response:
+        core = json.load(response)["core"]
+    if (core["release_id"] != active["id"] or core["version"] != active["version"]
+            or core["digest"] != active["digest"]):
+        raise RuntimeError("core admission does not match the active release")
+
+
+def upload(base_url, token, pack_dir, expected_digest=None):
     boundary = f"attune-{uuid.uuid4().hex}"
     archive = deterministic_archive(pack_dir)
     parts = []
@@ -109,6 +137,8 @@ def upload(base_url, token, pack_dir):
 
     field("force", "true")
     field("skip_tests", "true")
+    if expected_digest:
+        field("expected_release_digest", expected_digest)
     parts.extend(
         [
             f"--{boundary}\r\n".encode(),
@@ -146,10 +176,11 @@ def reconcile(base_url, token, pack_dir, expected_version, expected_digest):
                 f"active core pack {expected_version} has digest {active['digest']}, "
                 f"expected {expected_digest}"
             )
-        print(f"core pack {expected_version} is already active; skipping upload")
+        require_active_admission(base_url, active)
+        print(f"core pack {expected_version} is already admitted; skipping upload")
         return False
 
-    upload(base_url, token, pack_dir)
+    upload(base_url, token, pack_dir, expected_digest)
     active = get_active_release(base_url, token)
     if not active or active["version"] != expected_version:
         actual = active["version"] if active else "none"
@@ -160,83 +191,8 @@ def reconcile(base_url, token, pack_dir, expected_version, expected_digest):
         raise RuntimeError(
             f"core pack upload produced digest {active['digest']}, expected {expected_digest}"
         )
+    require_active_admission(base_url, active)
     return True
-
-
-def create_bootstrap_token():
-    database_url = (
-        f"postgresql://{urllib.parse.quote(os.environ['DB_USER'], safe='')}:"
-        f"{urllib.parse.quote(os.environ['DB_PASSWORD'], safe='')}@"
-        f"{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}"
-    )
-    import psycopg2
-    from psycopg2 import sql
-
-    secret = "attune_it_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
-    token_hash = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()).decode().rstrip("=")
-    login = f"core-bootstrap-{uuid.uuid4().hex}"
-    with psycopg2.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                sql.SQL("SET search_path TO {}, public").format(
-                    sql.Identifier(os.environ["DB_SCHEMA"])
-                )
-            )
-            cursor.execute(
-                "DELETE FROM identity WHERE attributes->>'attune_bootstrap' = 'core-pack' "
-                "AND created < NOW() - INTERVAL '15 minutes' "
-                "AND NOT EXISTS (SELECT 1 FROM rule WHERE owner_identity = identity.id) "
-                "AND NOT EXISTS (SELECT 1 FROM pack WHERE installed_by = identity.id)"
-            )
-            cursor.execute(
-                "INSERT INTO identity (login, display_name, attributes) "
-                "VALUES (%s, %s, %s::jsonb) RETURNING id",
-                (login, "Core pack bootstrap", '{"attune_bootstrap":"core-pack"}'),
-            )
-            identity_id = cursor.fetchone()[0]
-            cursor.execute("SELECT id FROM permission_set WHERE ref = %s", ("core.admin",))
-            permission_set = cursor.fetchone()
-            if not permission_set:
-                raise RuntimeError("core bootstrap permission set is missing")
-            cursor.execute(
-                "INSERT INTO permission_assignment (identity, permset) VALUES (%s, %s) "
-                "ON CONFLICT (identity, permset) DO NOTHING",
-                (identity_id, permission_set[0]),
-            )
-            cursor.execute(
-                "INSERT INTO integration_token "
-                "(identity, label, description, token_hash, token_prefix, token_suffix, expires_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, NOW() + INTERVAL '10 minutes')",
-                (
-                    identity_id,
-                    "Core pack bootstrap",
-                    "Temporary Helm bootstrap credential",
-                    token_hash,
-                    secret[:18],
-                    secret[-6:],
-                ),
-            )
-    return database_url, identity_id, secret
-
-
-def delete_bootstrap_identity(database_url, identity_id):
-    import psycopg2
-    from psycopg2 import sql
-
-    with psycopg2.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                sql.SQL("SET search_path TO {}, public").format(
-                    sql.Identifier(os.environ["DB_SCHEMA"])
-                )
-            )
-            cursor.execute("DELETE FROM integration_token WHERE identity = %s", (identity_id,))
-            cursor.execute(
-                "DELETE FROM identity WHERE id = %s "
-                "AND NOT EXISTS (SELECT 1 FROM rule WHERE owner_identity = identity.id) "
-                "AND NOT EXISTS (SELECT 1 FROM pack WHERE installed_by = identity.id)",
-                (identity_id,),
-            )
 
 
 def wait_for_core(base_url, deadline):
@@ -251,6 +207,19 @@ def wait_for_core(base_url, deadline):
     raise TimeoutError("active core pack release did not appear before the deadline")
 
 
+def publish_core(base_url, pack_dir):
+    """Common admission call path for API, volume and former direct-loader jobs."""
+    timeout = min(300, max(1, int(os.environ.get("ATTUNE_BOOTSTRAP_TIMEOUT_SECONDS", "300"))))
+    wait_for_api(base_url, time.monotonic() + timeout)
+    expected_version = os.environ.get("ATTUNE_CORE_PACK_VERSION", bundled_pack_version(pack_dir))
+    expected_digest = os.environ.get("ATTUNE_CORE_PACK_DIGEST") or None
+    integration_token = os.environ.get("ATTUNE_BOOTSTRAP_TOKEN")
+    if not integration_token:
+        raise RuntimeError("ATTUNE_BOOTSTRAP_TOKEN is required: supply an existing deployment credential; bootstrap never creates identities or grants")
+    return reconcile(base_url, token_login(base_url, integration_token), pack_dir,
+                     expected_version, expected_digest)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("publish", "wait"))
@@ -260,25 +229,12 @@ def main():
         300, max(1, int(os.environ.get("ATTUNE_BOOTSTRAP_TIMEOUT_SECONDS", "300")))
     )
     deadline = time.monotonic() + timeout_seconds
-    wait_for_api(base_url, deadline)
     if args.command == "publish":
         pack_dir = Path(os.environ.get("SOURCE_PACKS_DIR", "/source/packs")) / "core"
-        expected_version = os.environ.get(
-            "ATTUNE_CORE_PACK_VERSION", bundled_pack_version(pack_dir)
-        )
-        expected_digest = os.environ.get("ATTUNE_CORE_PACK_DIGEST") or None
-        database_url, identity_id, integration_token = create_bootstrap_token()
-        try:
-            reconcile(
-                base_url,
-                token_login(base_url, integration_token),
-                pack_dir,
-                expected_version,
-                expected_digest,
-            )
-        finally:
-            delete_bootstrap_identity(database_url, identity_id)
-    wait_for_core(base_url, deadline)
+        publish_core(base_url, pack_dir)
+    else:
+        wait_for_api(base_url, deadline)
+        wait_for_core(base_url, deadline)
 
 
 if __name__ == "__main__":

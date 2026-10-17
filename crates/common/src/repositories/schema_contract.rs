@@ -179,7 +179,9 @@ impl SchemaContractRepository {
         Ok(())
     }
 
-    async fn materialize_action_pair(
+    /// Compile only the exact pinned executable's input/output declarations.
+    /// Metadata readmission must not discover task targets through current refs.
+    pub async fn materialize_action_pair(
         transaction: &mut PgConnection,
         snapshot: &crate::models::ExecutionExecutableSnapshot,
     ) -> Result<ActionSchemaBinding> {

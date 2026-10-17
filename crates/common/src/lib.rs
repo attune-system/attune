@@ -23,7 +23,9 @@ pub mod delegation;
 pub mod device_auth;
 pub mod error;
 pub mod event_schema;
+mod execution_attribution;
 pub mod execution_env;
+pub mod file_legacy_controller;
 mod http_client;
 pub mod inquiry_callback_adapter;
 pub mod inquiry_options;
@@ -51,7 +53,10 @@ pub mod repositories;
 pub mod runtime_authority;
 pub mod runtime_cache;
 pub mod runtime_detection;
+pub mod runtime_file_body;
+pub mod runtime_log_completion;
 pub mod runtime_log_mirror;
+pub mod runtime_read_log;
 pub mod scheduling;
 pub mod schema;
 pub mod schema_type;
@@ -66,6 +71,7 @@ pub mod trace_tag;
 pub mod utils;
 pub mod value_schema;
 pub mod version_matching;
+pub mod worker_delivery;
 pub mod workflow;
 
 // Re-export commonly used types

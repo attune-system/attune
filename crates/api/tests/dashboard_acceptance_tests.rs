@@ -27,6 +27,127 @@ use sqlx::types::Json;
 mod dashboard_acceptance_fixtures;
 mod helpers;
 
+#[tokio::test]
+async fn dashboard_local_event_iam_is_positive_owner_filtered_and_never_reuses_ref_cache(
+) -> Result<()> {
+    use attune_common::repositories::{
+        event::{CreateEventInput, EventRepository},
+        trigger::{CreateTriggerInput, TriggerRepository},
+        Delete,
+    };
+    let ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "local_dashboard_iam",
+        json!([{"resource":"dashboards","actions":["read"]}]),
+    )
+    .await?;
+    let claims = attune_common::auth::jwt::validate_token(&token, &ctx.state.jwt_config)?;
+    let identity: i64 = claims.sub.parse()?;
+    let local = create_test_pack(&ctx.pool, "dashboard_iam_local").await?;
+    let foreign = create_test_pack(&ctx.pool, "dashboard_iam_foreign").await?;
+    let set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: format!("{}.events", local.r#ref),
+            pack: Some(local.id),
+            pack_ref: Some(local.r#ref.clone()),
+            label: None,
+            description: None,
+            grants: json!([{"resource":"events","actions":["read"]}]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: set.id,
+        },
+    )
+    .await?;
+    AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    AuthorizationService::invalidate_permission_set_caches().await;
+    let mut local_events = Vec::new();
+    let mut local_trigger_ref = String::new();
+    for pack in [&local, &foreign] {
+        let reference = format!("{}.signal", pack.r#ref);
+        let trigger = TriggerRepository::create(
+            &ctx.pool,
+            CreateTriggerInput {
+                r#ref: reference.clone(),
+                pack: Some(pack.id),
+                pack_ref: Some(pack.r#ref.clone()),
+                label: "Signal".into(),
+                description: None,
+                enabled: true,
+                param_schema: None,
+                event_config_schema: None,
+                out_schema: None,
+                sensor: None,
+                sensor_ref: None,
+                is_adhoc: false,
+                reference_visibility: Default::default(),
+                reference_allowed_pack_refs: vec![],
+            },
+        )
+        .await?;
+        for _ in 0..2 {
+            let event = EventRepository::create(
+                &ctx.pool,
+                CreateEventInput {
+                    trigger: Some(trigger.id),
+                    trigger_ref: reference.clone(),
+                    config: None,
+                    payload: None,
+                    trace_tag: None,
+                    source: None,
+                    source_ref: None,
+                    rule: None,
+                    rule_ref: None,
+                },
+            )
+            .await?;
+            if pack.id == local.id {
+                local_events.push(event.id);
+                local_trigger_ref = reference.clone();
+            }
+        }
+    }
+    let dashboard_ref = format!("fixture.local_scope_{}", uuid::Uuid::new_v4().simple());
+    create_dashboard(
+        &ctx,
+        &dashboard_ref,
+        "Local IAM",
+        dashboard_acceptance_fixtures::dashboard_spec(
+            &[("events", "event_count")],
+            &[("events_card", "events")],
+            None,
+        ),
+    )
+    .await?;
+    let request = json!({"include_meta":true,"time_range":{"start":(Utc::now()-Duration::hours(2)).to_rfc3339(),"end":(Utc::now()+Duration::hours(1)).to_rfc3339()}});
+    let path = format!("/api/v1/dashboards/{dashboard_ref}/data");
+    let response = ctx.post(&path, request.clone(), Some(&token)).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    let source = dashboard_acceptance_fixtures::source_by_id(&body, "events");
+    assert_eq!(source["status"], "ok");
+    assert_eq!(source["data"].as_array().unwrap().len(), 1);
+    assert_eq!(source["data"][0]["series"], local_trigger_ref);
+    assert_eq!(source["data"][0]["count"], 2);
+    assert_eq!(source["meta"]["authorization_mode"], "identity_filtered");
+    for id in local_events {
+        EventRepository::delete(&ctx.pool, id).await?;
+    }
+    let body: Value = ctx.post(&path, request, Some(&token)).await?.json().await?;
+    let source = dashboard_acceptance_fixtures::source_by_id(&body, "events");
+    assert!(source["data"].as_array().unwrap().is_empty());
+    assert_eq!(source["meta"]["cache_hit"], false);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
 fn assert_time_series_sorted(data: &Value, field: &str) {
     let rows = data[field]
         .as_array()

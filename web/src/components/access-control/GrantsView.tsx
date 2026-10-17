@@ -10,6 +10,17 @@ import {
 export function ConstraintChips({ c }: { c: GrantConstraints }) {
   const chips: ReactNode[] = [];
 
+  if (c.managing_pack_id !== undefined) {
+    chips.push(
+      <span
+        key="managing_pack_id"
+        className="rounded border px-1.5 py-0.5 text-xs"
+      >
+        Structural owning pack ID: {c.managing_pack_id}
+      </span>,
+    );
+  }
+
   if (c.pack_refs?.length) {
     chips.push(
       <span

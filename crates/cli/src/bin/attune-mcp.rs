@@ -21,6 +21,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
+#[path = "attune-mcp/interoperability.rs"]
+mod interoperability;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "attune-mcp",
@@ -237,7 +240,7 @@ impl McpServer {
 
                 let tool_result = match self.call_tool_with_reauth(tool_name, &args).await {
                     Ok(value) => tool_success(value),
-                    Err(error) => tool_error(error.to_string()),
+                    Err(error) => tool_error(error),
                 };
 
                 Ok(id.map(|id| success_response(id, tool_result)))
@@ -409,6 +412,54 @@ impl McpServer {
                     .get::<Value>(&format!("/queues/{}", encode_path(queue_ref)))
                     .await
             }
+            "queues_update_requester_grouping" => {
+                let reference = required_string(args, "ref")?;
+                let grouping = required_string(args, "grouping")?;
+                anyhow::ensure!(
+                    matches!(grouping, "aggregate" | "separate"),
+                    "grouping must be aggregate or separate"
+                );
+                let path = format!("/queues/{}", encode_path(reference));
+                let queue = self.client.get::<Value>(&path).await?;
+                let body = interoperability::grouping_body(
+                    queue.get("config").cloned().unwrap_or(Value::Null),
+                    grouping,
+                )?;
+                self.client.put::<Value, _>(&path, &body).await
+            }
+            "packs_reset_config" => {
+                let reference = required_string(args, "ref")?;
+                let fields = args
+                    .get("fields")
+                    .ok_or_else(|| anyhow!("fields are required"))?;
+                let body = interoperability::reset_body(
+                    fields,
+                    args.get("confirm_reset").and_then(Value::as_bool) == Some(true),
+                )?;
+                self.client
+                    .put::<Value, _>(&format!("/packs/{}", encode_path(reference)), &body)
+                    .await
+            }
+            "permission_sets_export" => {
+                attune_cli::commands::permission::export_for_client(
+                    &mut self.client,
+                    required_string(args, "ref")?,
+                )
+                .await
+            }
+            "permission_sets_import" => {
+                let definition = args
+                    .get("definition")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("definition is required"))?;
+                attune_cli::commands::permission::import_for_client(
+                    &mut self.client,
+                    required_string(args, "ref")?,
+                    definition,
+                    args.get("confirm_import").and_then(Value::as_bool) == Some(true),
+                )
+                .await
+            }
             "queues_update_trace_tag_template" => {
                 let queue_ref = required_string(args, "ref")?;
                 let trace_tag_template = optional_nullable_string(args, "trace_tag_template")?;
@@ -496,10 +547,47 @@ impl McpServer {
                     .await
             }
             "packs_list" => self.list_catalog_path("/packs", args).await,
+            "pack_input_approval_targets_list" => {
+                let page = u32::try_from(optional_i64(args, "page")?.unwrap_or(1))
+                    .context("page must be positive")?;
+                let size = u32::try_from(optional_i64(args, "per_page")?.unwrap_or(20))
+                    .context("per_page must be 1 to 100")?;
+                let result = attune_cli::input_approval::discover(
+                    &mut self.client,
+                    required_string(args, "ref")?,
+                    optional_i64(args, "policy_revision")?,
+                    page,
+                    size,
+                )
+                .await?;
+                Ok(serde_json::to_value(result)?)
+            }
+            "pack_input_approvals_issue" => {
+                let reference = required_string(args, "ref")?;
+                let mut body = args.clone();
+                body.remove("ref");
+                let request = attune_cli::input_approval::InputApprovalRequest::parse(
+                    &serde_json::to_vec(&body)?,
+                )?;
+                attune_cli::input_approval::issue(&mut self.client, reference, &request).await
+            }
+            "pack_input_approvals_list" => {
+                let path =
+                    attune_cli::input_approval::collection_path(required_string(args, "ref")?)?;
+                self.list_catalog_path(&path, args).await
+            }
             "pack_approvals_list" => {
                 let reference = required_string(args, "ref")?;
                 let path = format!("/packs/{}/external-approvals", encode_path(reference));
                 self.list_catalog_path(&path, args).await
+            }
+            "pack_input_approvals_get" => {
+                attune_cli::input_approval::get(
+                    &mut self.client,
+                    required_string(args, "ref")?,
+                    required_i64(args, "id")?,
+                )
+                .await
             }
             "pack_approvals_get" => {
                 let reference = required_string(args, "ref")?;
@@ -532,6 +620,15 @@ impl McpServer {
                     format!("/packs/{}/external-approvals", encode_path(reference))
                 };
                 self.client.post::<Value, _>(&path, &body).await
+            }
+            "pack_input_approvals_revoke" => {
+                attune_cli::input_approval::revoke(
+                    &mut self.client,
+                    required_string(args, "ref")?,
+                    required_i64(args, "id")?,
+                    optional_bool(args, "confirm_revocation")? == Some(true),
+                )
+                .await
             }
             "pack_approvals_revoke" => {
                 let reference = required_string(args, "ref")?;
@@ -1284,6 +1381,10 @@ fn tool_defs() -> &'static [ToolDef] {
             description: "Cancel a pending inquiry created by the current execution. Requires that creator execution's execution token; access tokens are rejected by the API.",
             input_schema: id_schema,
         },
+        ToolDef { name: "queues_update_requester_grouping", title: "Set requester grouping", description: "Explicitly select aggregate or separate queue batches. Preserves unrelated queue config. Requires current queues:update authority. Example: {ref: ops.inbox, grouping: separate}.", input_schema: interoperability::grouping_schema },
+        ToolDef { name: "packs_reset_config", title: "Reset pack configuration overrides", description: "Remove named whole-field overrides using release defaults without fetching plaintext. Requires packs:configure and confirm_reset=true. Example: {ref: example, fields: [retries], confirm_reset: true}.", input_schema: interoperability::reset_schema },
+        ToolDef { name: "permission_sets_export", title: "Export authored permission definition", description: "Export the canonical authorable definition, never effective grants or current target substitutions. Requires ordinary permission management visibility. Example: {ref: example.worker}.", input_schema: interoperability::export_schema },
+        ToolDef { name: "permission_sets_import", title: "Import authored permission definition", description: "Update an existing permission set from its canonical export with confirm_import=true. Target ref must match. Platform/retired sets remain protected; server readmission validation is unchanged. No filesystem access.", input_schema: interoperability::import_schema },
         ToolDef {
             name: "queues_list",
             title: "List queues",
@@ -1340,6 +1441,11 @@ fn tool_defs() -> &'static [ToolDef] {
             input_schema: pagination_schema,
         },
         ToolDef { name: "pack_approvals_list", title: "List external approvals", description: "List a bounded page of a pack's fixed external approvals, including expired/revoked records. Requires an access token and pack read permission.", input_schema: pack_actions_schema },
+        ToolDef { name: "pack_input_approvals_issue", title: "Approve declared input", description: "Issue fixed input-only consent for an exact retained declaration. Use policy_revision plus invocation_binding BEFORE execution, or renderer_execution. Requires an access token, packs:read and current issuer coverage of the fixed keys/packs read/decrypt grants. Purpose is declaration-bound; this never selects SDK permission refs. Issuer inactivity is not revocation. Expiry and explicit revocation still deny.", input_schema: attune_cli::input_approval::issue_schema },
+        ToolDef { name: "pack_input_approval_targets_list", title: "Discover input consent targets", description: "Discover one bounded page of exact retained declaration targets before an execution exists. Requires Access-token packs:read and current source component plus actual action visibility. Hidden invocations are filtered before count and paging. Omit policy_revision for the pack's current policy. Metadata is not consent, an execution permit or SDK authority.", input_schema: input_approval_targets_schema },
+        ToolDef { name: "pack_input_approvals_list", title: "List shared approval ledger", description: "List a bounded page of the shared pack approval ledger, including input and runtime approvals and expired/revoked records. There is no input-only list filter. Requires an access token and packs:read.", input_schema: pack_actions_schema },
+        ToolDef { name: "pack_input_approvals_get", title: "Inspect input consent record", description: "Get an approval ID from the shared pack ledger. Returns the server's public fixed scope, expiry and revocation record without reconstructing private declaration proof. Requires an access token and packs:read.", input_schema: pack_approval_id_schema },
+        ToolDef { name: "pack_input_approvals_revoke", title: "Revoke input consent", description: "Explicitly revoke an approval in the shared pack ledger. Inspect the ID first. Requires confirm_revocation=true, an access token, packs:read, and permission management or current coverage of the approved grants. Human inactivity alone is not revocation.", input_schema: pack_approval_revoke_schema },
         ToolDef { name: "pack_approvals_get", title: "Inspect external approval", description: "Inspect fixed scope, issuer attribution, expiry and explicit revocation. Human issuer inactivity does not revoke runtime approval.", input_schema: pack_approval_id_schema },
         ToolDef { name: "pack_approvals_issue", title: "Issue external approval", description: "Issue fixed external grants after current issuer authority validation. No personal IAM assignment is created. Requires an access token.", input_schema: pack_approval_issue_schema },
         ToolDef { name: "pack_approvals_replace", title: "Replace external approval", description: "Issue a new fixed approval and revoke its predecessor atomically. Requires confirm_revocation=true. Existing runs do not automatically acquire the new approval.", input_schema: pack_approval_replace_schema },
@@ -1469,6 +1575,12 @@ fn tool_defs() -> &'static [ToolDef] {
 
 fn pack_approval_id_schema() -> Value {
     json!({"type": "object", "properties": {"ref": {"type": "string"}, "id": {"type": "integer", "minimum": 1}}, "required": ["ref", "id"], "additionalProperties": false})
+}
+
+fn input_approval_targets_schema() -> Value {
+    let mut schema = pack_actions_schema();
+    schema["properties"]["policy_revision"] = json!({"type":"integer","minimum":1});
+    schema
 }
 
 fn pack_approval_issue_schema() -> Value {
@@ -2094,7 +2206,11 @@ fn tool_success(value: Value) -> Value {
     })
 }
 
-fn tool_error(message: String) -> Value {
+fn tool_error(error: anyhow::Error) -> Value {
+    let message = error.to_string();
+    let diagnostic = error.downcast_ref::<attune_cli::client::ApiRequestError>()
+        .map(|error| json!({"status":error.status.as_u16(),"code":error.code,"request_id":error.request_id}))
+        .unwrap_or_else(|| json!({"code":"COMMAND_FAILED"}));
     json!({
         "content": [
             {
@@ -2102,8 +2218,31 @@ fn tool_error(message: String) -> Value {
                 "text": message
             }
         ],
-        "isError": true
+        "isError": true,
+        "structuredContent": diagnostic
     })
+}
+
+#[cfg(test)]
+mod interoperability_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn native_http_denial_retains_status_code_without_private_details() {
+        let error = attune_cli::client::ApiRequestError::from_response(
+            reqwest::StatusCode::FORBIDDEN,
+            None,
+            r#"{"error":"denied","code":"FORBIDDEN","details":{"private":"do-not-copy"}}"#,
+        );
+        let response = tool_error(error.into());
+        assert_eq!(response["isError"], true);
+        assert_eq!(response["structuredContent"]["status"], 403);
+        assert_eq!(response["structuredContent"]["code"], "FORBIDDEN");
+        assert!(response["structuredContent"].get("details").is_none());
+        assert!(response["structuredContent"].get("error").is_none());
+        let local = tool_error(anyhow!("local command failure"));
+        assert!(local["structuredContent"].get("status").is_none());
+    }
 }
 
 fn required_string<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
@@ -2934,6 +3073,116 @@ mod tests {
             pack_approval_issue_schema()["properties"]["grants"]["maxItems"],
             256
         );
+    }
+
+    #[test]
+    fn input_approval_tools_are_discoverable_with_typed_exclusive_targets() {
+        let names = tool_defs().iter().map(|tool| tool.name).collect::<Vec<_>>();
+        for name in [
+            "pack_input_approval_targets_list",
+            "pack_input_approvals_issue",
+            "pack_input_approvals_list",
+            "pack_input_approvals_get",
+            "pack_input_approvals_revoke",
+        ] {
+            assert!(names.contains(&name), "missing {name}");
+        }
+        assert_eq!(
+            input_approval_targets_schema()["properties"]["policy_revision"]["minimum"],
+            1
+        );
+        let schema = attune_cli::input_approval::issue_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            schema["properties"]["invocation_binding"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(schema["properties"].get("permission_set_refs").is_none());
+        assert!(schema["properties"].get("proof").is_none());
+        assert_eq!(
+            schema["properties"]["grants"]["items"]["properties"]["constraints"]
+                ["additionalProperties"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn input_approval_mcp_uses_typed_preexecution_request_and_shared_lifecycle() {
+        let api = MockServer::start().await;
+        let body = json!({"policy_revision":17,"invocation_binding":{"kind":"workflow_task","workflow_ref":"example.flow","task_path":"/tasks/send","action_ref":"example.send"},
+            "declaration_revision":"retained-revision","source_path":"/tasks/send/input/message","expression":"{{ keystore['foreign.token'] }}",
+            "grants":[{"resource":"keys","actions":["read","decrypt"],"scope":"external","constraints":{"refs":["foreign.token"]}}]});
+        Mock::given(method("POST"))
+            .and(path("/api/v1/packs/example/external-input-approvals"))
+            .and(wiremock::matchers::body_json(body.clone()))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(
+                    json!({"data":{"id":42,"active":true,"approval_digest":"opaque"}}),
+                ),
+            )
+            .expect(1)
+            .mount(&api)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/packs/example/external-approvals/42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"data":{"id":42,"active":true,"approval_digest":"opaque"}}),
+                ),
+            )
+            .expect(1)
+            .mount(&api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/packs/example/external-approvals/42/revoke"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":{"id":42,"active":false}})),
+            )
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server(api.uri());
+        let mut args = body.as_object().unwrap().clone();
+        args.insert("ref".into(), json!("example"));
+        assert_eq!(
+            server
+                .call_tool("pack_input_approvals_issue", &args)
+                .await
+                .unwrap()["id"],
+            42
+        );
+        let id = serde_json::from_value(json!({"ref":"example","id":42})).unwrap();
+        assert_eq!(
+            server
+                .call_tool("pack_input_approvals_get", &id)
+                .await
+                .unwrap()["approval_digest"],
+            "opaque"
+        );
+        assert!(server
+            .call_tool("pack_input_approvals_revoke", &id)
+            .await
+            .is_err());
+        let confirmed =
+            serde_json::from_value(json!({"ref":"example","id":42,"confirm_revocation":true}))
+                .unwrap();
+        assert_eq!(
+            server
+                .call_tool("pack_input_approvals_revoke", &confirmed)
+                .await
+                .unwrap()["active"],
+            false
+        );
+        args.insert("permission_set_refs".into(), json!(["standard"]));
+        assert!(server
+            .call_tool("pack_input_approvals_issue", &args)
+            .await
+            .is_err());
+        assert_eq!(api.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test]

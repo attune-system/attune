@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { PermissionGrantDefinition } from "./PermissionGrantDefinition";
 export type IssueRuntimeApprovalRequest = {
   /**
    * Omit for no automatic expiry. Explicit revocation remains available.
@@ -10,5 +11,5 @@ export type IssueRuntimeApprovalRequest = {
   /**
    * Fixed approved grants. Human-relative scopes are not accepted.
    */
-  grants: Array<Record<string, any>>;
+  grants: Array<PermissionGrantDefinition>;
 };

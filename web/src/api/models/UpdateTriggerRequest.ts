@@ -9,6 +9,10 @@ import type { TriggerStringPatch } from "./TriggerStringPatch";
  * Request DTO for updating a trigger
  */
 export type UpdateTriggerRequest = {
+  /**
+   * Allow a changed live contract despite admitted emitters. Ordinary confirmation is not acknowledgement.
+   */
+  acknowledge_incompatible_rollout?: boolean;
   description?: null | TriggerStringPatch;
   /**
    * Whether the trigger is enabled

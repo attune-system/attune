@@ -45,6 +45,7 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
 
   const [configValues, setConfigValues] =
     useState<Record<string, JsonValue>>(initialConfig);
+  const [configResetFields, setConfigResetFields] = useState<string[]>([]);
   const [confSchema, setConfSchema] = useState<FlatSchema>(
     initialConfSchema as FlatSchema,
   );
@@ -65,8 +66,13 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
 
   const schemaChanged =
     JSON.stringify(confSchema) !== JSON.stringify(initialConfSchema);
-  const configChanged =
-    JSON.stringify(configValues) !== JSON.stringify(initialConfig);
+  const changedConfig = Object.fromEntries(
+    Object.entries(configValues).filter(
+      ([field, value]) =>
+        !configResetFields.includes(field) &&
+        JSON.stringify(value) !== JSON.stringify(initialConfig[field]),
+    ),
+  );
 
   const validateForm = (): boolean => {
     const newErrors: Record<string, string> = {};
@@ -111,10 +117,10 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (configChanged && containsRedaction(configValues)) {
+    if (isEditing && containsRedaction(changedConfig)) {
       setErrors({
         config:
-          "Replace every redacted field before submitting a complete configuration. Untouched configuration stays encrypted on the server.",
+          "Replace the complete changed secret field. Untouched fields stay encrypted on the server.",
       });
       return;
     }
@@ -144,7 +150,12 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
             : { op: "clear" },
           version: version.trim(),
           ...(schemaChanged ? { conf_schema: parsedConfSchema } : {}),
-          ...(configChanged ? { config: configValues } : {}),
+          ...(Object.keys(changedConfig).length
+            ? { config: changedConfig }
+            : {}),
+          ...(configResetFields.length
+            ? { config_reset_fields: configResetFields }
+            : {}),
           meta: parsedMeta,
           tags: tagsList,
           runtime_deps: depsList,
@@ -198,6 +209,7 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
   };
 
   const handleReset = () => {
+    setConfigResetFields([]);
     setConfSchema(initialConfSchema);
     setConfigValues(initialConfig);
   };
@@ -569,9 +581,36 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
                 Configuration Values
               </h4>
               <p className="text-xs text-gray-500 mt-1">
-                Set values for the configuration parameters defined above
+                Changes persist across releases. Objects and lists replace a
+                complete field. Null is a value, not a reset.
               </p>
             </div>
+            {isEditing && (
+              <fieldset className="mb-4 space-y-2">
+                <legend className="text-sm font-medium">
+                  Use release defaults on save
+                </legend>
+                {Object.keys(confSchema).map((field) => (
+                  <label
+                    key={field}
+                    className="flex items-center gap-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={configResetFields.includes(field)}
+                      onChange={(event) =>
+                        setConfigResetFields((fields) =>
+                          event.target.checked
+                            ? [...fields, field]
+                            : fields.filter((candidate) => candidate !== field),
+                        )
+                      }
+                    />
+                    Reset {field} to release default
+                  </label>
+                ))}
+              </fieldset>
+            )}
             <ParamSchemaForm
               schema={confSchema as unknown as ParamSchema}
               contract={

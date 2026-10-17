@@ -20,6 +20,7 @@ use crate::{
 
 const EXECUTION_RETENTION_PREDICATE: &str =
     "updated < $1 AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned') \
+     AND NOT file_evidence_pinned('execution',execution.id) \
      AND NOT EXISTS ( \
          SELECT 1 FROM workflow_task_wait wait \
          WHERE wait.target_execution = execution.id AND wait.state = 'waiting' \
@@ -550,15 +551,19 @@ impl RetentionRepository {
             let fallback = managed.default_name();
             // Split DEFAULT from the boundary source range so PostgreSQL can
             // prune ALL complete old leaves, including those left by the DDL cap.
-            let count_sql = format!(
-                "SELECT COUNT(*)::BIGINT FROM (
+            let count_sql = if managed == ManagedTable::Event {
+                "SELECT COUNT(*)::BIGINT FROM (SELECT 1 FROM event WHERE created<$1 AND NOT file_evidence_pinned('event',id,created) LIMIT $2) bounded".into()
+            } else {
+                format!(
+                    "SELECT COUNT(*)::BIGINT FROM (
                     SELECT 1 FROM ONLY {fallback} WHERE {col} < $1
                     UNION ALL
                     SELECT 1 FROM {table} WHERE {col} >= date_trunc('day', $1::timestamptz, 'UTC')
                         AND {col} < $1 AND tableoid <> to_regclass('{fallback}')::oid
                     LIMIT $2
                 ) bounded",
-            );
+                )
+            };
             let count = sqlx::query_scalar::<_, i64>(&count_sql)
                 .bind(cutoff)
                 .bind(cap + 1)
@@ -622,6 +627,11 @@ impl RetentionRepository {
                 let mut tx = bounded_transaction(pool, &config.native_maintenance)
                     .await
                     .map_err(|source| failure(source, &result, true))?;
+                super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(
+                    &mut tx,
+                )
+                .await
+                .map_err(|source| failure(source, &result, true))?;
                 let deleted = sqlx::query_scalar::<_, i64>(&delete_sql)
                     .bind(cutoff)
                     .bind(config.batch_size)
@@ -656,12 +666,24 @@ impl RetentionRepository {
                     .map_err(|e| failure(e.into(), &result, true))?;
                 deleted
             } else {
-                sqlx::query_scalar::<_, i64>(&delete_sql)
+                let mut tx = bounded_transaction(pool, &config.native_maintenance)
+                    .await
+                    .map_err(|source| failure(source, &result, true))?;
+                super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(
+                    &mut tx,
+                )
+                .await
+                .map_err(|source| failure(source, &result, true))?;
+                let deleted = sqlx::query_scalar::<_, i64>(&delete_sql)
                     .bind(cutoff)
                     .bind(config.batch_size)
-                    .fetch_one(pool)
+                    .fetch_one(&mut *tx)
                     .await
-                    .map_err(|source| failure(source.into(), &result, true))?
+                    .map_err(|source| failure(source.into(), &result, true))?;
+                tx.commit()
+                    .await
+                    .map_err(|source| failure(source.into(), &result, true))?;
+                deleted
             };
             result.deleted += deleted;
             if deleted == 0 {
@@ -698,19 +720,20 @@ impl RetentionRepository {
     // internal constants, never caller-provided names.
     fn target_sql(target: RetentionTarget) -> (&'static str, &'static str, &'static str) {
         match target {
-            RetentionTarget::Events => ("event", "created < $1", "created"),
+            RetentionTarget::Events => ("event", "created < $1 AND NOT file_evidence_pinned('event',id,created)", "created"),
             RetentionTarget::ExecutionHistory => ("execution_history", "time < $1", "time"),
             RetentionTarget::WorkerHistory => ("worker_history", "time < $1", "time"),
             RetentionTarget::SensorProcessHistory => ("sensor_process_history", "time < $1", "time"),
             RetentionTarget::AuditEvents => ("audit_event", "created < $1", "created"),
-            RetentionTarget::Enforcements => ("enforcement", "created < $1 AND status <> 'created'", "created"),
+            RetentionTarget::Enforcements => ("enforcement", "created < $1 AND status <> 'created' AND NOT file_evidence_pinned('enforcement',id)", "created"),
             RetentionTarget::Executions => ("execution", EXECUTION_RETENTION_PREDICATE, "updated"),
             RetentionTarget::Notifications => ("notification", "created < $1", "created"),
             RetentionTarget::WebhookEventLogs => ("webhook_event_log", "created < $1", "created"),
-            RetentionTarget::Inquiries => ("inquiry", "updated < $1 AND status IN ('responded', 'timeout', 'cancelled')", "updated"),
+            RetentionTarget::Inquiries => ("inquiry", "updated < $1 AND status IN ('responded', 'timeout', 'cancelled') AND NOT file_evidence_pinned('inquiry',inquiry.id)", "updated"),
             RetentionTarget::WorkQueueItems => (
                 "work_queue_item",
-                "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled') \
+                 "updated < $1 AND status IN ('completed', 'failed', 'skipped', 'cancelled') \
+                 AND NOT file_evidence_pinned('work_queue_item',work_queue_item.id) \
                  AND NOT EXISTS (SELECT 1 FROM workflow_task_wait wait \
                      WHERE wait.work_queue_item = work_queue_item.id AND wait.state = 'waiting')",
                 "updated",
@@ -780,6 +803,16 @@ impl RetentionRepository {
     }
 
     fn delete_native_boundary_sql(managed: ManagedTable) -> String {
+        if managed == ManagedTable::Event {
+            // Includes old pinned leaves, not only DEFAULT/the cutoff day.
+            // Parent DELETE keeps transition-table coverage invalidation intact.
+            return Self::delete_sql(
+                "event",
+                "created<$1 AND NOT file_evidence_pinned('event',id,created)",
+                "created",
+                "ctid",
+            );
+        }
         let table = managed.table_name();
         let fallback = managed.default_name();
         let col = managed.time_column();

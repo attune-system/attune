@@ -64,6 +64,7 @@ pub async fn emit_core_alert(
 
     if let Some(publisher) = publisher {
         let payload = EventCreatedPayload {
+            event_created: Some(event.created),
             event_id: event.id,
             trigger_id: event.trigger,
             trigger_ref: event.trigger_ref.clone(),

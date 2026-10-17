@@ -51,6 +51,86 @@ use attune_common::{
 
 mod helpers;
 
+#[tokio::test]
+async fn normalized_local_cache_iam_covers_actual_point_effect_and_owner_list_targets() -> Result<()>
+{
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let local = create_test_pack(&ctx.pool, "local_cache_iam").await?;
+    let foreign = create_test_pack(&ctx.pool, "foreign_cache_iam").await?;
+    let (token, identity) = register_user(&ctx, "local-cache-operator", json!([])).await?;
+    let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: format!("{}.cache_local", local.r#ref), pack: Some(local.id), pack_ref: Some(local.r#ref.clone()),
+        label: None, description: None, grants: json!([{"resource":"caches", "actions":["read","create","update","delete"], "constraints":{"refs":["allowed"]}}]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    assert_eq!(
+        create_namespace(&ctx, &token, &local.r#ref, "allowed", json!({}))
+            .await?
+            .status(),
+        StatusCode::CREATED
+    );
+    for (owner, namespace) in [(&foreign.r#ref, "allowed"), (&local.r#ref, "other")] {
+        assert_eq!(
+            create_namespace(&ctx, &token, owner, namespace, json!({}))
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let url = format!(
+        "/api/v1/cache/namespaces/allowed?owner_type=pack&owner_ref={}",
+        local.r#ref
+    );
+    assert_eq!(ctx.get(&url, Some(&token)).await?.status(), StatusCode::OK);
+    let list: Value = ctx
+        .get(
+            &format!(
+                "/api/v1/cache/namespaces?owner_type=pack&owner_ref={}&limit=1",
+                local.r#ref
+            ),
+            Some(&token),
+        )
+        .await?
+        .json()
+        .await?;
+    assert_eq!(list["data"]["namespaces"].as_array().unwrap().len(), 1);
+    let list: Value = ctx
+        .get(
+            &format!(
+                "/api/v1/cache/namespaces?owner_type=pack&owner_ref={}&limit=1",
+                foreign.r#ref
+            ),
+            Some(&token),
+        )
+        .await?
+        .json()
+        .await?;
+    assert!(list["data"]["namespaces"].as_array().unwrap().is_empty());
+    // Refresh effects use the same locked actual namespace and do not borrow
+    // authority merely from the requested owner ref.
+    begin_generation(&ctx, &token, &local.r#ref, "allowed", "local-refresh", 0).await?;
+    let denied = ctx
+        .put(
+            "/api/v1/cache/namespaces/allowed",
+            json!({"owner_type":"pack","owner_ref":foreign.r#ref,"freshness_target_seconds":1}),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
 fn test_jwt_config() -> JwtConfig {
     JwtConfig {
         secret: "test-secret-for-testing-only-not-secure".to_string(),

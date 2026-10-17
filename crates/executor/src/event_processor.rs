@@ -26,8 +26,7 @@ use attune_common::{
         FindById, FindByRef, List,
     },
     secret_values::{
-        prepare_secret_values, redacted_paths, restore_secret_values, RenderedJson,
-        ENTITY_ENFORCEMENT_CONFIG, ENTITY_EVENT_PAYLOAD,
+        prepare_secret_values, redacted_paths, RenderedJson, ENTITY_ENFORCEMENT_CONFIG,
     },
     template_resolver::{resolve_templates_with_sensitivity, TemplateContext},
     workflow::expression::{eval_expression, is_truthy, EvalContext, EvalResult},
@@ -45,7 +44,7 @@ mod tests {
         config::Config,
         event_schema::EventSchemaBinding,
         repositories::{
-            event::CreateEventInput, event_schema::EventSchemaRepository, pack::CreatePackInput,
+            event::CreateEventInput, event_origin::EventOriginRepository, pack::CreatePackInput,
             schema_type::SchemaTypeRepository, Create,
         },
         test_database::TestDatabase,
@@ -96,9 +95,9 @@ mod tests {
             },
         )
         .await?;
-        EventSchemaRepository::attach(
+        EventOriginRepository::capture(
             &mut setup,
-            event.id,
+            &event,
             &EventSchemaBinding {
                 trigger_id: None,
                 trigger_ref: event.trigger_ref.clone(),
@@ -106,6 +105,8 @@ mod tests {
                 config: None,
                 webhook: false,
             },
+            &[],
+            &[],
         )
         .await?;
         setup.commit().await?;
@@ -314,7 +315,10 @@ impl EventProcessor {
         );
 
         // Fetch the event from database
-        let event = EventRepository::find_by_id(pool, payload.event_id)
+        let created = payload
+            .event_created
+            .ok_or_else(|| anyhow::anyhow!("Event delivery requires its created identity"))?;
+        let event = EventRepository::find_by_identity(pool, payload.event_id, created)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Event {} not found", payload.event_id))?;
 
@@ -487,15 +491,26 @@ impl EventProcessor {
         let mut tx = pool.begin().await?;
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await?;
+        if EnforcementRepository::find_by_rule_and_event_identity(
+            &mut *tx,
+            rule.id,
+            event.id,
+            event.created,
+        )
+        .await?
+        .is_some()
+        {
+            // Dedupe is identity, not a request to reauthorize or replace the
+            // original release, inputs or runtime selection.
+            tx.commit().await?;
+            return Ok(());
+        }
         let rule = RuleRepository::find_by_id_for_share(&mut tx, rule.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Rule is no longer active"))?;
         let identity_id = rule.owner_identity.ok_or_else(|| {
             anyhow::anyhow!("Rule evaluation requires an explicit owner identity")
         })?;
-        let authority =
-            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
-                .await?;
         let input_snapshot =
             attune_common::repositories::rule_authority::RuleAuthorityRepository::current(
                 &mut tx, &rule,
@@ -508,7 +523,10 @@ impl EventProcessor {
         }
         let input_authority = match &input_snapshot {
             Some(snapshot) => snapshot.input_authority(&mut tx).await?,
-            None => authority.clone(),
+            None => {
+                attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
+                    .await?
+            }
         };
         // Evaluate rule conditions
         let conditions_pass = Self::evaluate_conditions(&rule, event)?;
@@ -553,11 +571,61 @@ impl EventProcessor {
         // Select code and contracts before defaults, rendering, or secret
         // persistence. Execution handoff inherits this choice rather than
         // resolving external revisions a second time.
-        let snapshot = attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
+        let snapshot = if !rule.is_adhoc {
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
+                &mut tx, input_snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("Rule input authority unavailable"))?.pack_id,
+                attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Rule, rule.id),
+                &attune_common::runtime_authority::InvocationBinding::Rule { rule_ref: rule.r#ref.clone(), action_ref: action.r#ref.clone() },
+            ).await?
+        } else {
+            attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
             &mut *tx, action.id,
-        ).await?;
+        ).await?
+        };
         let action = &snapshot.executable.action;
-        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+        let refs = rule
+            .permission_set_refs
+            .as_deref()
+            .unwrap_or(&action.default_execution_permission_set_refs);
+        let admission = if !rule.is_adhoc {
+            use attune_common::{
+                repositories::execution_admission::ExecutionAdmissionRepository,
+                runtime_authority::{InvocationBinding, RequestAttribution},
+            };
+            Some(
+                ExecutionAdmissionRepository::select(
+                    &mut tx,
+                    input_snapshot
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Rule input authority unavailable"))?
+                        .pack_id,
+                    InvocationBinding::Rule {
+                        rule_ref: rule.r#ref.clone(),
+                        action_ref: action.r#ref.clone(),
+                    },
+                    &snapshot,
+                    refs,
+                    RequestAttribution::Rule {
+                        rule_ref: rule.r#ref.clone(),
+                    },
+                    attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                        attune_common::repositories::runtime_target::ComponentTarget::Rule,
+                        rule.id,
+                    ),
+                )
+                .await?,
+            )
+        } else {
+            input_authority
+                .require_refs_for_share(&mut tx, refs)
+                .await?;
+            None
+        };
+        let binding = if !rule.is_adhoc {
+            attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &snapshot).await?
+        } else {
+            attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?
+        };
         let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)?;
         input_contract.validate_rule_secret_templates(&rule.action_params)?;
         let parameters = if rule.action_params.is_null() {
@@ -577,11 +645,6 @@ impl EventProcessor {
         )
         .await?;
         input_contract.validate(&rendered_params.value)?;
-        let refs = rule
-            .permission_set_refs
-            .as_deref()
-            .unwrap_or(&action.default_execution_permission_set_refs);
-        authority.require_refs_for_share(&mut tx, refs).await?;
         attune_common::secret_values::validate_contract_secret_destination_paths(
             &rendered_params.value,
             &input_contract,
@@ -620,14 +683,25 @@ impl EventProcessor {
             conditions: rule.conditions.clone(),
         };
 
-        let enforcement_result = EnforcementRepository::create_or_get_by_rule_event_pinned(
+        let enforcement_result = EnforcementRepository::create_or_get_by_qualified_event_pinned(
             &mut tx,
             create_input,
             &snapshot,
+            event,
         )
         .await?;
         let enforcement = enforcement_result.enforcement;
         if enforcement_result.created {
+            if let Some(admission) = &admission {
+                admission
+                    .attach(
+                        &mut tx,
+                        attune_common::repositories::runtime_authority::RuntimeOwner::Enforcement(
+                            enforcement.id,
+                        ),
+                    )
+                    .await?;
+            }
             if let Some(snapshot) = &input_snapshot {
                 attune_common::repositories::rule_authority::RuleAuthorityRepository::attach_runtime(&mut tx, "enforcement", enforcement.id, snapshot).await?;
             }
@@ -647,6 +721,9 @@ impl EventProcessor {
                 &prepared_secrets,
             )
             .await?;
+        }
+        if let Some(admission) = &admission {
+            admission.ensure_fresh_on(&mut tx).await?;
         }
         tx.commit().await?;
 
@@ -885,13 +962,14 @@ impl EventProcessor {
         };
 
         let event_payload_secret_paths = redacted_paths(event_payload);
-        let event_payload_for_templates = Self::restore_event_payload_for_templates(
-            connection,
-            encryption_key,
-            event.id,
-            event_payload.clone(),
-        )
-        .await?;
+        let (event_payload_for_templates, event_source) =
+            Self::restore_event_payload_for_templates(
+                connection,
+                encryption_key,
+                event,
+                event_payload.clone(),
+            )
+            .await?;
 
         // Build template context from the event
         let context = TemplateContext::new(
@@ -908,7 +986,7 @@ impl EventProcessor {
         .with_event_id(event.id)
         .with_event_trigger(&event.trigger_ref)
         .with_event_created(&event.created.to_rfc3339())
-        .with_event_payload_secret_paths(event.id, event_payload_secret_paths)
+        .with_event_source_secret_paths(event_source, event_payload_secret_paths)
         .with_origin("rule", &rule.r#ref);
         let context = if let Some(revision) = pack_revision {
             context.with_bound_pack_config_secret_paths(revision, pack_secret_paths)
@@ -946,16 +1024,17 @@ impl EventProcessor {
     async fn restore_event_payload_for_templates(
         connection: &mut PgConnection,
         encryption_key: &Option<String>,
-        event_id: i64,
+        event: &Event,
         event_payload: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-            &mut *connection,
-            ENTITY_EVENT_PAYLOAD,
-            event_id,
-        )
-        .await?;
-        let restored = if secrets.is_empty() {
+    ) -> Result<(serde_json::Value, i64)> {
+        use attune_common::repositories::event_origin::EventOriginRepository;
+        let source =
+            EventOriginRepository::source_id(&mut *connection, event.id, event.created).await?;
+        let snapshot = EventOriginRepository::find(&mut *connection, source).await?;
+        if !snapshot.matches(event) {
+            return Err(anyhow::anyhow!("Exact event source mismatch"));
+        }
+        let restored = if snapshot.payload.is_empty() {
             event_payload
         } else {
             let encryption_key = encryption_key.as_ref().ok_or_else(|| {
@@ -963,14 +1042,11 @@ impl EventProcessor {
                     "Cannot restore event payload secrets for rule templates without security.encryption_key"
                 )
             })?;
-            restore_secret_values(event_payload, &secrets, encryption_key)?
+            snapshot.restore_payload(event_payload, encryption_key)?
         };
-        let binding = attune_common::repositories::event_schema::EventSchemaRepository::find(
-            connection, event_id,
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Rule event is missing its admission schema binding"))?;
-        binding.validate_payload_restored(Some(&restored))?;
-        Ok(restored)
+        snapshot
+            .binding
+            .validate_payload_restored(Some(&restored))?;
+        Ok((restored, source))
     }
 }

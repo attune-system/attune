@@ -19,7 +19,6 @@ use attune_common::{
     },
     mq::{ExecutionRequestedPayload, MessageEnvelope, MessageType, Publisher},
     repositories::{
-        action::ActionRepository,
         execution::{CreateExecutionInput, ExecutionRepository},
         execution_secret_value::ExecutionSecretValueRepository,
         key::KeyRepository,
@@ -376,30 +375,8 @@ impl WorkQueueDispatcher {
         encryption_key: Option<&str>,
         queue: &WorkQueue,
     ) -> Result<ResolvedQueueContext> {
-        let action = if let Some(action_id) = queue.dispatch_action {
-            ActionRepository::find_by_id(pool, action_id).await?
-        } else {
-            None
-        };
-        let action = match action {
-            Some(action) => Some(action),
-            None => ActionRepository::find_by_ref(pool, &queue.dispatch_action_ref).await?,
-        }
-        .ok_or_else(|| {
-            anyhow!(
-                "dispatch action '{}' for queue '{}' no longer exists",
-                queue.dispatch_action_ref,
-                queue.r#ref
-            )
-        })?;
-        if !action.enabled || action.retired_at.is_some() {
-            return Err(anyhow!(
-                "dispatch action '{}' for queue '{}' is not active",
-                queue.dispatch_action_ref,
-                queue.r#ref
-            ));
-        }
-
+        // Action lifecycle is checked at enqueue admission. Deferred work uses
+        // its pinned executable; ordinary disablement is not cancellation.
         let pack = if let Some(pack_id) = queue.pack {
             PackRepository::find_by_id(pool, pack_id).await?
         } else if let Some(pack_ref) = &queue.pack_ref {
@@ -600,6 +577,11 @@ impl WorkQueueDispatcher {
         let mut items = WorkQueueItemRepository::lease_next_batch(
             &mut *tx,
             LeaseWorkQueueItemsInput {
+                separate_requesters: context
+                    .parsed_config
+                    .dispatch
+                    .as_ref()
+                    .is_some_and(|dispatch| dispatch.separate_requesters),
                 queue: queue.id,
                 ready_statuses: vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry],
                 limit: i64::from(batch_limit),
@@ -619,6 +601,21 @@ impl WorkQueueDispatcher {
             tx.commit().await?;
             return Ok(None);
         }
+        let accepted_queue = attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::template(&mut tx, queue, &items).await?;
+        let accepted_context = if let Some(pinned) = &accepted_queue {
+            Some(ResolvedQueueContext {
+                parsed_config: serde_json::from_value(pinned.config.clone())?,
+                pack_config: JsonValue::Null,
+                pack_ref: pinned.pack_ref.clone(),
+                concurrency: context.concurrency,
+                batch_size: 1,
+                inter_execution_delay_seconds: context.inter_execution_delay_seconds,
+            })
+        } else {
+            None
+        };
+        let queue = accepted_queue.as_ref().unwrap_or(queue);
+        let context = accepted_context.as_ref().unwrap_or(context);
         for item in &mut items {
             let admitted = item.payload_binding()?;
             let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
@@ -669,13 +666,36 @@ impl WorkQueueDispatcher {
             item.pack_release != Some(dispatch_snapshot.release.id)
                 || item.pack_release_digest.as_deref()
                     != Some(dispatch_snapshot.release.digest.as_str())
+                || item.executable_snapshot != items[0].executable_snapshot
         }) {
             return Err(anyhow!(
-                "A work queue dispatch batch cannot mix pack releases"
+                "A work queue dispatch batch cannot mix pack releases or executable snapshots"
             ));
         }
         let dispatch_action = &dispatch_snapshot.executable.action;
-        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(&mut tx, &dispatch_snapshot).await?;
+        let recorded = !queue.is_adhoc || attune_common::repositories::execution_admission::ExecutionAdmissionRepository::has_queue_item_admission(&mut tx, &items).await?;
+        let admission = if recorded {
+            Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::queue_batch(&mut tx, queue, &items, &dispatch_snapshot).await?)
+        } else {
+            None
+        };
+        let permission_set_refs = admission
+            .as_ref()
+            .map(|admission| admission.authority().selected_refs.clone())
+            .unwrap_or_else(|| {
+                queue.permission_set_refs.clone().unwrap_or_else(|| {
+                    dispatch_action
+                        .default_execution_permission_set_refs
+                        .clone()
+                })
+            });
+        let binding = if accepted_queue.is_some() {
+            attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::schema(&mut tx, items[0].id).await?
+        } else if recorded {
+            attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &dispatch_snapshot).await?
+        } else {
+            attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(&mut tx, &dispatch_snapshot).await?
+        };
         let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)?;
 
         let executor_identity = {
@@ -689,17 +709,32 @@ impl WorkQueueDispatcher {
             let pack = PackRepository::find_by_ref(&mut *tx, reference)
                 .await?
                 .ok_or_else(|| anyhow!("Queue configuration owner is unavailable"))?;
-            let authority = match executor_identity {
-                Some(identity) => Some(
-                    attune_common::delegation::DelegationAuthority::load_for_share(
-                        &mut tx, identity,
-                    )
-                    .await?,
-                ),
-                None => None,
-            };
-            attune_common::repositories::component_configuration::ComponentConfigurationRepository::pack_template_values(
+            if recorded {
+                let mut authorities = Vec::new();
+                for item in &items {
+                    let authority = attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::item_authorities(&mut tx, item.id).await?;
+                    match authority {
+                        Some(item_authorities) => authorities.extend(item_authorities),
+                        None => {
+                            authorities.clear();
+                            break;
+                        }
+                    }
+                }
+                attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::pack_template_values(&mut tx, &pack, &authorities, encryption_key).await?
+            } else {
+                let authority = match executor_identity {
+                    Some(identity) => Some(
+                        attune_common::delegation::DelegationAuthority::load_for_share(
+                            &mut tx, identity,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                attune_common::repositories::component_configuration::ComponentConfigurationRepository::pack_template_values(
                 &mut tx,&pack,authority.as_ref(),encryption_key).await?
+            }
         } else {
             (JsonValue::Null, Vec::new(), None)
         };
@@ -714,19 +749,29 @@ impl WorkQueueDispatcher {
         let keys = if key_refs.is_empty() {
             std::collections::BTreeMap::new()
         } else {
-            let identity = executor_identity.ok_or_else(|| {
-                anyhow!("Queue key access requires one attributed requester per batch")
-            })?;
-            let authority =
-                attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity)
-                    .await?;
-            attune_common::key_access::resolve_explicit_keys(
-                &mut *tx,
-                &authority,
-                &key_refs,
-                encryption_key,
-            )
-            .await?
+            if recorded {
+                let mut authorities = Vec::new();
+                for item in &items {
+                    let item_authorities = attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::item_authorities(&mut tx, item.id).await?.ok_or_else(|| anyhow!("Accepted queue item input authority is unavailable"))?;
+                    authorities.extend(item_authorities);
+                }
+                attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::resolve_keys(&mut tx, &authorities, &key_refs, encryption_key).await?
+            } else {
+                let identity = executor_identity.ok_or_else(|| {
+                    anyhow!("Queue key access requires one attributed requester per batch")
+                })?;
+                let authority = attune_common::delegation::DelegationAuthority::load_for_share(
+                    &mut tx, identity,
+                )
+                .await?;
+                attune_common::key_access::resolve_explicit_keys(
+                    &mut *tx,
+                    &authority,
+                    &key_refs,
+                    encryption_key,
+                )
+                .await?
+            }
         };
 
         let rendered_config = Self::build_execution_config(
@@ -739,8 +784,15 @@ impl WorkQueueDispatcher {
             &items,
             keys,
         )?;
-        let config_with_defaults = input_contract.apply_defaults(&rendered_config.value)?;
-        input_contract.validate(&config_with_defaults)?;
+        let supplied_config = rendered_config.value.clone();
+        let config_with_defaults = if accepted_queue.is_some() {
+            rendered_config.value.clone()
+        } else {
+            input_contract.apply_defaults(&rendered_config.value)?
+        };
+        if accepted_queue.is_none() {
+            input_contract.validate(&config_with_defaults)?;
+        }
         attune_common::secret_values::validate_contract_secret_destination_paths(
             &config_with_defaults,
             &input_contract,
@@ -752,7 +804,8 @@ impl WorkQueueDispatcher {
                 &rendered_config.secret_path_sources,
                 &input_contract,
             )?;
-        let prepared_secrets = if secret_inputs.is_empty() {
+        let ad_hoc_secret_inputs = accepted_queue.as_ref().map(|_| secret_inputs.clone());
+        let mut prepared_secrets = if secret_inputs.is_empty() || ad_hoc_secret_inputs.is_some() {
             Vec::new()
         } else {
             let encryption_key = encryption_key.ok_or_else(|| {
@@ -762,12 +815,7 @@ impl WorkQueueDispatcher {
             })?;
             prepare_secret_values(secret_inputs, encryption_key)?
         };
-        let permission_set_refs = queue.permission_set_refs.clone().unwrap_or_else(|| {
-            dispatch_action
-                .default_execution_permission_set_refs
-                .clone()
-        });
-        if !permission_set_refs.is_empty() {
+        if admission.is_none() && !permission_set_refs.is_empty() {
             let identity = executor_identity.ok_or_else(|| {
                 anyhow::anyhow!("Queue API access requires one attributed requester per batch")
             })?;
@@ -787,20 +835,34 @@ impl WorkQueueDispatcher {
         let trace_tag = Self::resolve_queue_trace_tag(
             queue,
             &context.parsed_config,
-            &context.pack_config,
+            if recorded {
+                &pack_config
+            } else {
+                &context.pack_config
+            },
             &items,
             reserved_dispatch_id,
         )?;
-        let execution = ExecutionRepository::create_pinned(
+        let mut execution = ExecutionRepository::create_pinned(
             &mut *tx,
             CreateExecutionInput {
                 action: Some(dispatch_action.id),
                 action_ref: dispatch_action.r#ref.clone(),
-                config: Some(execution_config),
+                config: if accepted_queue.is_some() {
+                    None
+                } else {
+                    Some(execution_config)
+                },
                 env_vars: None,
                 parent: None,
                 enforcement: None,
-                executor: executor_identity,
+                // Batch contributors do not acquire ownership of all results.
+                // Runtime sponsor and per-item attribution live in admission.
+                executor: if admission.is_some() {
+                    None
+                } else {
+                    executor_identity
+                },
                 permission_set_refs,
                 artifact_retention_policy: dispatch_action.artifact_retention_policy,
                 artifact_retention_limit: dispatch_action.artifact_retention_limit,
@@ -819,6 +881,31 @@ impl WorkQueueDispatcher {
             &dispatch_snapshot,
         )
         .await?;
+        let mut initial_admission = None;
+        let mut accepted_batch_fence = None;
+        if let Some(admission) = &admission {
+            let record = admission
+                .attach(
+                    &mut tx,
+                    attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                        execution.id,
+                    ),
+                )
+                .await?;
+            initial_admission = Some(record.id);
+            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_queue_execution(&mut tx, execution.id, &items.iter().map(|item| item.id).collect::<Vec<_>>()).await?;
+            if accepted_queue.is_some()
+                && queue.batch_mode == attune_common::models::WorkQueueBatchMode::Batch
+            {
+                // record_admission permits only this newly staged record to be
+                // unsealed. Seal ALL accepted contributors and independent source
+                // dependencies before defaults, initialization or worker delivery
+                // can consume canonical destination authority.
+                accepted_batch_fence = Some(attune_common::repositories::accepted_batch_dependency::AcceptedBatchDependencyRepository::capture(
+                    &mut tx, record.id, &items.iter().map(|item| item.id).collect::<Vec<_>>(),
+                ).await?);
+            }
+        }
         attune_common::repositories::schema_contract::SchemaContractRepository::attach(
             &mut tx,
             attune_common::repositories::schema_contract::BindingOwner::Execution,
@@ -826,7 +913,29 @@ impl WorkQueueDispatcher {
             &binding,
         )
         .await?;
-        if !prepared_secrets.is_empty() {
+        if let Some(inputs) = ad_hoc_secret_inputs {
+            let (config, inputs) = attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_child_defaults(&mut tx, execution.id, &supplied_config, inputs, encryption_key).await?;
+            prepared_secrets = if inputs.is_empty() {
+                Vec::new()
+            } else {
+                prepare_secret_values(
+                    inputs,
+                    encryption_key.ok_or_else(|| {
+                        anyhow!("Ad-hoc dispatch input encryption is unavailable")
+                    })?,
+                )?
+            };
+            execution = ExecutionRepository::initialize_config_with_conn(
+                &mut tx,
+                execution.id,
+                initial_admission,
+                &dispatch_snapshot,
+                Some(config),
+                &prepared_secrets,
+            )
+            .await?;
+        }
+        if !prepared_secrets.is_empty() && accepted_queue.is_none() {
             ExecutionSecretValueRepository::upsert_many_with_conn(
                 &mut tx,
                 ENTITY_EXECUTION_CONFIG,
@@ -835,6 +944,13 @@ impl WorkQueueDispatcher {
             )
             .await?;
         }
+        let input_receipts = if recorded {
+            attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::seal_execution_inputs(
+                &mut tx, execution.id, encryption_key.ok_or_else(|| anyhow!("Accepted input receipt encryption is unavailable"))?,
+            ).await?
+        } else {
+            Vec::new()
+        };
 
         WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease_token, execution.id)
             .await?;
@@ -852,7 +968,25 @@ impl WorkQueueDispatcher {
         )
         .await?;
 
+        if let Some(admission) = &admission {
+            admission.ensure_fresh_on(&mut tx).await?;
+        }
+        if let Some(fence) = &accepted_batch_fence {
+            fence.ensure_fresh_on(&mut tx).await?;
+        }
+        for receipt in &input_receipts {
+            receipt.ensure_fresh_on(&mut tx).await?;
+        }
         tx.commit().await?;
+        for receipt in &input_receipts {
+            receipt.ensure_fresh()?;
+        }
+        if let Some(admission) = &admission {
+            admission.effect_fence().ensure_fresh()?;
+        }
+        if let Some(fence) = &accepted_batch_fence {
+            fence.ensure_fresh()?;
+        }
 
         Ok(Some(PreparedDispatch {
             dispatch_id: dispatch.id,
@@ -1301,6 +1435,37 @@ impl WorkQueueDispatcher {
     }
 
     async fn publish_dispatch(&self, dispatch: PreparedDispatch) -> Result<()> {
+        // Publication/recovery starts a fresh source-only transaction. Validate
+        // retained delivery proofs, never reseal with current grants or rewrite
+        // the config with a cached pre-seal ciphertext/provenance buffer.
+        let mut source = self.pool.begin().await?;
+        let record =
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+                &mut source,
+                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                    dispatch.execution_id,
+                ),
+            )
+            .await?;
+        let runtime_fence = if let Some(record) = &record {
+            Some(attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::retained_admission_fence(&mut source, record.id).await?)
+        } else {
+            None
+        };
+        let input_receipts = if record.is_some() {
+            attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::prepare_execution_input_receipts(
+                &mut source, dispatch.execution_id, self.encryption_key.as_deref().ok_or_else(|| anyhow!("Accepted input receipt encryption is unavailable"))?,
+            ).await?
+        } else if dispatch.queue.is_adhoc {
+            Vec::new()
+        } else {
+            return Err(anyhow!(
+                "Managed queue publication has no retained execution admission"
+            ));
+        };
+        for receipt in &input_receipts {
+            receipt.ensure_fresh()?;
+        }
         let queue = dispatch.queue.clone();
         let leased_item_ids = dispatch.leased_item_ids.clone();
         let dispatch_id = dispatch.dispatch_id;
@@ -1331,6 +1496,20 @@ impl WorkQueueDispatcher {
         )
         .await?;
 
+        for receipt in &input_receipts {
+            receipt.ensure_fresh_on(&mut source).await?;
+        }
+        if let Some(fence) = &runtime_fence {
+            fence.ensure_fresh_on(&mut source).await?;
+        }
+        source.commit().await?;
+        for receipt in &input_receipts {
+            receipt.ensure_fresh()?;
+        }
+        if let Some(fence) = &runtime_fence {
+            fence.ensure_fresh()?;
+        }
+
         if let Err(error) = work_queue_events::maybe_emit_queue_started(
             &self.pool,
             &self.publisher,
@@ -1352,6 +1531,12 @@ impl WorkQueueDispatcher {
             execution_id, dispatch_id
         );
 
+        for receipt in &input_receipts {
+            receipt.ensure_fresh()?;
+        }
+        if let Some(fence) = &runtime_fence {
+            fence.ensure_fresh()?;
+        }
         Ok(())
     }
 }

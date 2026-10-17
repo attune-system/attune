@@ -305,6 +305,25 @@ impl Delete for ArtifactRepository {
 }
 
 impl ArtifactRepository {
+    pub async fn find_by_id_for_update(
+        connection: &mut PgConnection,
+        id: i64,
+    ) -> Result<Option<Artifact>> {
+        // Version writers take this advisory lock before updating their parent
+        // through triggers. Match that order before taking the artifact row.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(id.to_string())
+        .execute(&mut *connection)
+        .await?;
+        let query = format!("SELECT {SELECT_COLUMNS} FROM artifact WHERE id = $1 FOR UPDATE");
+        sqlx::query_as(&query)
+            .bind(id)
+            .fetch_optional(connection)
+            .await
+            .map_err(Into::into)
+    }
     /// Create an artifact or return the row that already owns the reference.
     pub async fn create_or_get(
         connection: &mut PgConnection,
@@ -617,6 +636,24 @@ impl ArtifactRepository {
         .map_err(Into::into)
     }
 
+    /// Fetch one overflow row without allocating all retained history.
+    pub async fn linked_execution_ids_bounded<'e, E>(
+        executor: E,
+        artifact: i64,
+        limit: i64,
+    ) -> Result<Vec<i64>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if !(1..=257).contains(&limit) {
+            return Err(crate::Error::validation(
+                "Invalid artifact disclosure bound",
+            ));
+        }
+        sqlx::query_scalar("SELECT DISTINCT execution FROM artifact_version WHERE artifact = $1 AND execution IS NOT NULL ORDER BY execution LIMIT $2")
+            .bind(artifact).bind(limit).fetch_all(executor).await.map_err(Into::into)
+    }
+
     pub async fn find_by_execution<'e, E>(executor: E, execution_id: i64) -> Result<Vec<Artifact>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
@@ -876,7 +913,12 @@ fn push_owner_path_read_predicate<'a>(
         .push(artifact_alias)
         .push(".scope IN ('pack', 'action', 'sensor') AND ");
     let pack_expr = artifact_pack_ref_expr(artifact_alias);
-    push_pack_grants_predicate(query, read_ctx, &pack_expr);
+    push_pack_grants_predicate(
+        query,
+        read_ctx,
+        &pack_expr,
+        &super::iam_ownership::artifact_pack(artifact_alias),
+    );
     query.push(")");
     query.push(")");
     query.push(")");
@@ -946,6 +988,14 @@ fn push_single_artifact_grant_predicate<'a>(
             *has_term = true;
         }
     };
+
+    if let Some(pack) = constraints.managing_pack_id {
+        push_and(query, &mut has_term);
+        query
+            .push(super::iam_ownership::artifact_pack(artifact_alias))
+            .push(" = ")
+            .push_bind(pack);
+    }
 
     if let Some(pack_refs) = &constraints.pack_refs {
         if pack_refs.is_empty() {
@@ -1075,6 +1125,7 @@ fn push_pack_grants_predicate<'a>(
     query: &mut QueryBuilder<'a, Postgres>,
     read_ctx: &ArtifactReadContext,
     pack_expr: &str,
+    managing_pack_expr: &str,
 ) {
     let grants: Vec<&Grant> = read_ctx
         .grants
@@ -1095,7 +1146,7 @@ fn push_pack_grants_predicate<'a>(
         if wrote_any {
             query.push(" OR ");
         }
-        push_single_pack_grant_predicate(query, grant, pack_expr);
+        push_single_pack_grant_predicate(query, grant, pack_expr, managing_pack_expr);
         wrote_any = true;
     }
     if !wrote_any {
@@ -1108,6 +1159,7 @@ fn push_single_pack_grant_predicate<'a>(
     query: &mut QueryBuilder<'a, Postgres>,
     grant: &Grant,
     pack_expr: &str,
+    managing_pack_expr: &str,
 ) {
     let Some(constraints) = &grant.constraints else {
         query.push("TRUE");
@@ -1123,6 +1175,11 @@ fn push_single_pack_grant_predicate<'a>(
             *has_term = true;
         }
     };
+
+    if let Some(pack) = constraints.managing_pack_id {
+        push_and(query, &mut has_term);
+        query.push(managing_pack_expr).push(" = ").push_bind(pack);
+    }
 
     if let Some(pack_refs) = &constraints.pack_refs {
         if pack_refs.is_empty() {
@@ -1217,6 +1274,14 @@ fn push_single_execution_grant_predicate<'a>(
             *has_term = true;
         }
     };
+
+    if let Some(pack) = constraints.managing_pack_id {
+        push_and(query, &mut has_term);
+        query
+            .push(super::iam_ownership::execution_pack(execution_alias))
+            .push(" = ")
+            .push_bind(pack);
+    }
 
     if let Some(pack_refs) = &constraints.pack_refs {
         if pack_refs.is_empty() {
@@ -1379,6 +1444,14 @@ pub const VERSION_SUMMARY_SELECT_COLUMNS: &str =
     "id, version, execution, content_type, size_bytes, file_path, body_state, object_key, provider_version, sha256, created_by, created";
 
 impl ArtifactVersionRepository {
+    pub async fn bounded_summaries<'e, E: Executor<'e, Database = Postgres>>(
+        executor: E,
+        artifact: i64,
+    ) -> Result<Vec<ArtifactVersionSummaryRow>> {
+        sqlx::query_as(&format!("SELECT {VERSION_SUMMARY_SELECT_COLUMNS} FROM artifact_version WHERE artifact = $1 ORDER BY version DESC LIMIT 257"))
+            .bind(artifact).fetch_all(executor).await.map_err(Into::into)
+    }
+
     pub async fn page_summaries<'e, E>(
         executor: E,
         artifact_id: i64,
@@ -1686,6 +1759,74 @@ impl ArtifactVersionRepository {
     }
 
     /// Get the latest version for an artifact (without binary content)
+    pub async fn find_selected_for_share(
+        connection: &mut PgConnection,
+        artifact: i64,
+        version: Option<i32>,
+    ) -> Result<Option<ArtifactVersion>> {
+        sqlx::query_as::<_, ArtifactVersion>(&format!(
+            "SELECT {} FROM artifact_version WHERE artifact = $1 AND ($2::INTEGER IS NULL OR version = $2) ORDER BY version DESC LIMIT 1 FOR SHARE",
+            artifact_version::SELECT_COLUMNS_WITH_CONTENT,
+        )).bind(artifact).bind(version).fetch_optional(connection).await.map_err(Into::into)
+    }
+
+    pub async fn mark_encrypted_log<'e, E: Executor<'e, Database = Postgres>>(
+        executor: E,
+        version: i64,
+    ) -> Result<()> {
+        sqlx::query("UPDATE artifact_version SET meta = COALESCE(meta,'{}'::JSONB) || jsonb_build_object('log_encoding',$2::TEXT) WHERE id = $1 AND execution IS NOT NULL")
+            .bind(version).bind(crate::runtime_read_log::ENCODING).execute(executor).await?;
+        Ok(())
+    }
+
+    /// Called only in the fenced seal/Ready transaction. A Ready version may
+    /// replay its exact existing proof, never acquire or replace one afterward.
+    pub async fn set_encrypted_log_manifest(
+        connection: &mut sqlx::PgConnection,
+        version: i64,
+        authenticated: &str,
+    ) -> Result<()> {
+        let changed = sqlx::query("UPDATE artifact_version SET meta=COALESCE(meta,'{}'::jsonb) || jsonb_build_object('encrypted_log_manifest',$2::text) \
+            WHERE id=$1 AND meta->>'log_encoding'=$3 AND (meta->>'encrypted_log_manifest' IS NULL OR meta->>'encrypted_log_manifest'=$2) \
+            AND (body_state='pending' OR (body_state='ready' AND meta->>'encrypted_log_manifest'=$2))")
+            .bind(version).bind(authenticated).bind(crate::runtime_read_log::ENCODING).execute(connection).await?.rows_affected();
+        if changed != 1 {
+            return Err(crate::Error::PermissionDenied(
+                "Encrypted log completion metadata is immutable or unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn has_runtime_log_binding(
+        connection: &mut PgConnection,
+        version: i64,
+    ) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM log_stream WHERE artifact_version = $1) OR EXISTS(SELECT 1 FROM sensor_log_generation_binding WHERE artifact_version = $1) OR EXISTS(SELECT 1 FROM artifact_version WHERE id = $1 AND meta ? 'log_encoding')")
+            .bind(version).fetch_one(connection).await.map_err(Into::into)
+    }
+
+    pub async fn log_is_sealed(connection: &mut PgConnection, version: i64) -> Result<bool> {
+        let sealed: Option<bool> = sqlx::query_scalar("SELECT sealed AND sealed_at IS NOT NULL FROM log_stream WHERE artifact_version = $1 FOR SHARE")
+            .bind(version).fetch_optional(connection).await?;
+        Ok(sealed == Some(true))
+    }
+
+    pub async fn find_pinned_for_share(
+        connection: &mut PgConnection,
+        id: i64,
+    ) -> Result<Option<ArtifactVersion>> {
+        sqlx::query_as::<_, ArtifactVersion>(&format!(
+            "SELECT {} FROM artifact_version WHERE id = $1 FOR SHARE",
+            artifact_version::SELECT_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(connection)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Get the latest version for an artifact (without binary content)
     pub async fn find_latest<'e, E>(
         executor: E,
         artifact_id: i64,
@@ -1819,7 +1960,8 @@ impl ArtifactVersionRepository {
     }
 
     /// Create a new artifact version. The version number is auto-assigned
-    /// (MAX(version) + 1) and the retention trigger fires after insert.
+    /// (MAX(version) + 1). The trigger projects parent metadata only; bounded
+    /// retention runs separately under graph-first supervisor reclamation.
     pub async fn create<'e, E>(
         executor: E,
         input: CreateArtifactVersionInput,
@@ -1986,7 +2128,11 @@ impl ArtifactVersionRepository {
                 Err(err) => return Err(err),
             }
         };
-        let file_path = compute_file_path(artifact_ref, version.version, &content_type)?;
+        let file_path = format!(
+            "files/versions/{}/{}",
+            version.id,
+            compute_file_path(artifact_ref, version.version, &content_type)?
+        );
         Self::update_file_path(executor, version.id, &file_path).await?;
         version.file_path = Some(file_path);
         Ok(version)
@@ -2020,9 +2166,44 @@ impl ArtifactVersionRepository {
              FROM artifact_version WHERE artifact = $1 RETURNING {}", artifact_version::SELECT_COLUMNS))
             .bind(artifact_id).bind(execution).bind(&content_type).bind(meta).bind(created_by)
             .fetch_one(&mut *connection).await?;
-        let file_path = compute_file_path(artifact_ref, version.version, &content_type)?;
+        // Display version numbers and refs can be reused; physical staging cannot.
+        let file_path = format!(
+            "files/versions/{}/{}",
+            version.id,
+            compute_file_path(artifact_ref, version.version, &content_type)?
+        );
         Self::update_file_path(&mut *connection, version.id, &file_path).await?;
         version.file_path = Some(file_path);
+        Ok(version)
+    }
+
+    /// Allocate a runtime-log version without claiming that the body is an object.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_log_pending_with_conn(
+        connection: &mut sqlx::PgConnection,
+        artifact: i64,
+        reference: &str,
+        backend: crate::models::LogStreamBackend,
+        execution: i64,
+        meta: serde_json::Value,
+    ) -> Result<ArtifactVersion> {
+        validate_artifact_ref(reference)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(artifact.to_string())
+        .execute(&mut *connection)
+        .await?;
+        let mut version: ArtifactVersion = sqlx::query_as(&format!(
+            "INSERT INTO artifact_version (artifact,version,execution,content_type,body_state,object_key,meta,created_by) \
+             SELECT $1,COALESCE(MAX(version),0)+1,$2,'text/plain','pending', \
+             CASE WHEN $3 THEN format('artifacts/%s/uploads/%s',$1,gen_random_uuid()) END,$4,'worker' \
+             FROM artifact_version WHERE artifact=$1 RETURNING {}", artifact_version::SELECT_COLUMNS))
+            .bind(artifact).bind(execution).bind(backend == crate::models::LogStreamBackend::ObjectSegments)
+            .bind(meta).fetch_one(&mut *connection).await?;
+        let path = compute_file_path(reference, version.version, "text/plain")?;
+        Self::update_file_path(connection, version.id, &path).await?;
+        version.file_path = Some(path);
         Ok(version)
     }
 
@@ -2082,6 +2263,30 @@ impl ArtifactVersionRepository {
         Self::update_file_path(executor, version.id, &file_path).await?;
         version.file_path = Some(file_path);
         Ok(version)
+    }
+
+    /// Reserve an object-backed version before receiving its body.
+    pub async fn create_object_pending_with_conn(
+        connection: &mut sqlx::PgConnection,
+        artifact: i64,
+        execution: Option<i64>,
+        content_type: String,
+        meta: Option<serde_json::Value>,
+        created_by: Option<String>,
+    ) -> Result<ArtifactVersion> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(artifact.to_string())
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query_as(&format!(
+            "INSERT INTO artifact_version (artifact,version,execution,content_type,body_state,object_key,meta,created_by) \
+             SELECT $1,COALESCE(MAX(version),0)+1,$2,$3,'pending', \
+             format('artifacts/%s/uploads/%s',$1,gen_random_uuid()),$4,$5 \
+             FROM artifact_version WHERE artifact=$1 RETURNING {}", artifact_version::SELECT_COLUMNS))
+            .bind(artifact).bind(execution).bind(content_type).bind(meta).bind(created_by)
+            .fetch_one(connection).await.map_err(Into::into)
     }
 
     /// Reserve an object-backed version before receiving its body.
@@ -2188,7 +2393,10 @@ impl ArtifactVersionRepository {
         sqlx::query(
             "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
         )
-        .bind(artifact_id)
+        // All callers of this exact cached query use canonical decimal TEXT.
+        // Mixing i64 binary arguments with its TEXT-prepared statement sends
+        // zero bytes as UTF-8, rather than changing the advisory lock identity.
+        .bind(artifact_id.to_string())
         .execute(&mut **tx)
         .await?;
 
@@ -2226,7 +2434,7 @@ impl ArtifactVersionRepository {
         sqlx::query(
             "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
         )
-        .bind(artifact_id)
+        .bind(artifact_id.to_string())
         .execute(&mut **tx)
         .await?;
         let query = format!(

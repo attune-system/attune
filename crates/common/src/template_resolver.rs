@@ -195,6 +195,31 @@ impl TemplateContext {
         self
     }
 
+    /// The source ID is an immutable snapshot keyed by exact event (id,created),
+    /// selected by the server. A display event ID is not a source capability.
+    pub fn with_event_source_secret_paths(mut self, source: i64, paths: Vec<JsonPointer>) -> Self {
+        for path in paths {
+            let suffix = pointer_to_dot_path(&path);
+            self.secret_sources.push(ContextSecretSource {
+                path: if suffix.is_empty() {
+                    "event.payload".into()
+                } else {
+                    format!("event.payload.{suffix}")
+                },
+                pointer: pointer_join("/payload", &path),
+                source: SecretSource::Bound(crate::secret_provenance::SecretProvenance {
+                    origins: vec![crate::secret_provenance::SecretOrigin::Entity {
+                        entity_type: crate::repositories::event_origin::EVENT_SOURCE_PAYLOAD.into(),
+                        entity_id: source,
+                        path,
+                    }],
+                    templates: Vec::new(),
+                }),
+            });
+        }
+        self
+    }
+
     pub fn with_bound_pack_config_secret_paths(
         mut self,
         revision: i64,
@@ -458,6 +483,21 @@ pub fn references_pack_configuration(value: &JsonValue) -> bool {
         JsonValue::Object(values) => values.values().any(references_pack_configuration),
         _ => false,
     }
+}
+
+/// Only for repository-pinned workflow declarations. Workflow `config` is the
+/// author's pack configuration, unlike rule/event `config` namespaces.
+pub fn workflow_template_uses_namespace(expression: &str, namespace: &str) -> bool {
+    TEMPLATE_REGEX.captures_iter(expression).any(|capture| {
+        crate::workflow::expression::uses_namespace(capture[1].trim(), namespace).unwrap_or(false)
+    })
+}
+
+pub fn workflow_template_uses_lookup(expression: &str, namespace: &str) -> bool {
+    TEMPLATE_REGEX.captures_iter(expression).any(|capture| {
+        crate::workflow::expression::uses_namespace_access(capture[1].trim(), namespace)
+            .unwrap_or(false)
+    })
 }
 
 /// Resolve all template variables in a JSON value.

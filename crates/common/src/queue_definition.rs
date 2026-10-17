@@ -503,6 +503,28 @@ permission_set_refs:
     }
 
     #[test]
+    fn requester_separation_is_explicit_and_defaults_to_aggregation() {
+        let default = validate_work_queue_config(&json!({"dispatch":{}})).unwrap();
+        assert!(!default.dispatch.unwrap().separate_requesters);
+        for separate in [false, true] {
+            let config = json!({"dispatch":{"separate_requesters":separate}});
+            let parsed = validate_work_queue_config(&config).unwrap();
+            assert_eq!(
+                parsed.dispatch.as_ref().unwrap().separate_requesters,
+                separate
+            );
+            assert_eq!(
+                serde_json::to_value(parsed).unwrap()["dispatch"]["separate_requesters"],
+                separate
+            );
+        }
+        assert!(
+            validate_work_queue_config(&json!({"dispatch":{"separate_requesters":"true"}}))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn validates_batch_coalescing_config() {
         let parsed = validate_work_queue_config_for_batch_mode(
             WorkQueueBatchMode::Batch,

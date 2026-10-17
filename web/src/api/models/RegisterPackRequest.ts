@@ -12,6 +12,10 @@ export type RegisterPackRequest = {
    */
   absent_metadata_policy?: AbsentMetadataPolicy;
   /**
+   * Explicit consent to replacing contracts used by live admitted emitters.
+   */
+  acknowledge_incompatible_rollout?: boolean;
+  /**
    * Force registration even if tests fail
    */
   force?: boolean;

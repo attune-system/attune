@@ -80,7 +80,7 @@ pub use pack::{
 };
 pub use permission::{
     CreateIdentityRequest, CreateIdentityRoleAssignmentRequest, CreateIntegrationTokenRequest,
-    CreateIntegrationTokenResponse, CreatePermissionAssignmentRequest,
+    CreateIntegrationTokenResponse, CreatePermissionAssignmentRequest, CreatePermissionSetRequest,
     CreatePermissionSetRoleAssignmentRequest, IdentityQueryParams, IdentityResponse,
     IdentityRoleAssignmentResponse, IdentitySummary, IntegrationTokenResponse,
     PermissionAssignmentResponse, PermissionBindingQueryParams, PermissionBindingResponse,

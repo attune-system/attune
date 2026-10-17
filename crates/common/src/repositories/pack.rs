@@ -584,6 +584,7 @@ impl PackRepository {
         A: Acquire<'a, Database = Postgres>,
     {
         let mut transaction = acquire.begin().await?;
+        super::schema_type::SchemaTypeRepository::lock_reclamation(&mut transaction).await?;
         CacheEntryRepository::protect_transaction(
             &mut transaction,
             CacheTransactionMode::PinMutation,

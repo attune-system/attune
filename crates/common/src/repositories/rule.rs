@@ -98,11 +98,14 @@ pub struct RestoreRuleInput {
 pub struct RuleRepository;
 
 impl RuleRepository {
-    pub async fn find_disclosure_refs<'e, E>(executor: E, ids: &[i64]) -> Result<Vec<(i64, String)>>
+    pub async fn find_disclosure_refs<'e, E>(
+        executor: E,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, String, Option<i64>)>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as("SELECT id, ref FROM rule WHERE id = ANY($1) AND retired_at IS NULL")
+        sqlx::query_as("SELECT id, ref, CASE WHEN management_origin = 'pack' THEN pack END FROM rule WHERE id = ANY($1) AND retired_at IS NULL")
             .bind(ids)
             .fetch_all(executor)
             .await
@@ -638,6 +641,7 @@ impl RuleRepository {
                 "rule.id",
                 "rule.ref",
                 "rule.pack_ref",
+                &super::iam_ownership::component_pack("rule"),
                 None,
             );
             push_visibility_scope_predicate(
@@ -646,6 +650,7 @@ impl RuleRepository {
                 "rule.id",
                 "rule.ref",
                 "rule.pack_ref",
+                &super::iam_ownership::component_pack("rule"),
                 None,
             );
         }

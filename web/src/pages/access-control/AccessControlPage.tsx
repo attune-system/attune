@@ -21,6 +21,8 @@ import {
   useUnfreezeIdentity,
 } from "@/hooks/usePermissions";
 import Pagination from "@/components/executions/Pagination";
+import { useAuth } from "@/contexts/AuthContext";
+import { hasPermission } from "@/lib/permissions";
 import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 // The backend IdentitySummary includes `frozen` and `roles` but the generated client type doesn't declare them
@@ -465,6 +467,8 @@ function IdentitiesTab() {
 
 function PermissionSetsTab() {
   const [searchTerm, setSearchTerm] = useState("");
+  const { user } = useAuth();
+  const canManagePermissions = hasPermission(user, "permissions", "manage");
 
   const { data: rawData, isLoading, error } = usePermissionSets();
 
@@ -489,14 +493,25 @@ function PermissionSetsTab() {
 
   return (
     <>
-      <div className="mb-6">
-        <h2 className="text-xl font-semibold text-gray-900 flex items-center gap-2">
-          <ShieldCheck className="w-5 h-5 text-indigo-600" />
-          Permission Sets
-        </h2>
-        <p className="mt-1 text-sm text-gray-600">
-          Browse permission sets and manage their role assignments
-        </p>
+      <div className="mb-6 flex items-center justify-between gap-4">
+        <div>
+          <h2 className="text-xl font-semibold text-gray-900 flex items-center gap-2">
+            <ShieldCheck className="w-5 h-5 text-indigo-600" />
+            Permission Sets
+          </h2>
+          <p className="mt-1 text-sm text-gray-600">
+            Browse permission sets and manage their grants and role assignments
+          </p>
+        </div>
+        {canManagePermissions && (
+          <Link
+            to="/access-control/permission-sets/new"
+            className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-white transition-colors hover:bg-blue-700"
+          >
+            <Plus className="h-4 w-4" />
+            Create Permission Set
+          </Link>
+        )}
       </div>
 
       <div className="bg-white rounded-lg shadow mb-6 p-4">
@@ -547,7 +562,9 @@ function PermissionSetsTab() {
             <p className="text-sm text-gray-500 mt-1">
               {searchTerm
                 ? "Try adjusting your search"
-                : "Permission sets are defined in packs"}
+                : canManagePermissions
+                  ? "Create a permission set or define one in a pack"
+                  : "Permission sets can be created by a permission administrator or defined in packs"}
             </p>
           </div>
         ) : (

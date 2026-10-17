@@ -43,6 +43,9 @@ pub struct KeyVisibility {
 /// by the caller before reaching SQL; they are not represented here.
 #[derive(Debug, Clone, Default)]
 pub struct KeyGrantFilter {
+    pub pinned_targets: Option<Vec<crate::runtime_authority::BoundRuntimeTarget>>,
+    pub pinned_owners: Option<Vec<(String, Id, Option<Id>)>>,
+    pub pinned_packs: Option<Vec<Id>>,
     pub ownership: KeyOwnershipScope,
     pub pack_refs: Option<Vec<String>>,
     pub owner_types: Option<Vec<OwnerType>>,
@@ -85,6 +88,15 @@ impl KeyGrantFilter {
                 ..Default::default()
             });
         };
+        let ownership = if let Some(pack) = scope.managing_pack_id {
+            match ownership {
+                KeyOwnershipScope::Any => KeyOwnershipScope::ManagedPack(pack),
+                KeyOwnershipScope::ManagedPack(existing) if existing == pack => ownership,
+                _ => return None,
+            }
+        } else {
+            ownership
+        };
         if scope.visibility.is_some()
             || matches!(
                 scope.execution_scope,
@@ -98,6 +110,9 @@ impl KeyGrantFilter {
             return None;
         }
         Some(Self {
+            pinned_targets: None,
+            pinned_owners: None,
+            pinned_packs: None,
             ownership,
             pack_refs: scope.pack_refs.clone(),
             owner_types: scope.owner_types.clone(),
@@ -468,6 +483,31 @@ fn push_grant_clause(qb: &mut QueryBuilder<'_, Postgres>, identity_id: Id, grant
                 .push_bind(action)
                 .push(")");
         }
+    }
+    if let Some(owners) = &grant.pinned_owners {
+        and_sep!();
+        super::runtime_target_binding::push_owner_clause(
+            qb,
+            "key",
+            KEY_MANAGING_PACK_ID_SQL,
+            owners,
+        );
+    }
+    if let Some(targets) = &grant.pinned_targets {
+        and_sep!();
+        super::runtime_target_binding::push_target_clause(
+            qb,
+            "key",
+            KEY_MANAGING_PACK_ID_SQL,
+            targets,
+        );
+    }
+    if let Some(packs) = &grant.pinned_packs {
+        and_sep!();
+        qb.push(KEY_MANAGING_PACK_ID_SQL)
+            .push(" = ANY(")
+            .push_bind(packs.clone())
+            .push(")");
     }
     if let Some(pack_refs) = &grant.pack_refs {
         and_sep!();

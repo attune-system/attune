@@ -2,6 +2,7 @@ import { useParams, Link } from "react-router-dom";
 import { useEvent } from "@/hooks/useEvents";
 import ContractDataCard from "@/components/common/ContractDataCard";
 import { isJsonObject } from "@/components/common/curatedDataUtils";
+import EventExecutionEmitterCard from "./EventExecutionEmitterCard";
 
 export default function EventDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -164,6 +165,7 @@ export default function EventDetailPage() {
 
         {/* Right Column - Quick Links and Info */}
         <div className="space-y-6">
+          <EventExecutionEmitterCard emitter={event.execution_emitter} />
           {/* Quick Links */}
           <div className="bg-white rounded-lg shadow">
             <div className="px-6 py-4 border-b border-gray-200">

@@ -20,6 +20,15 @@ export function clientSchema(document) {
       else result.oneOf = types.map((type) => ({ type }));
       if (nullable) result.nullable = true;
     }
+    // The generator understands enum literals, but not OpenAPI 3.1 const.
+    // Keep the canonical const and add only its equivalent singleton enum.
+    if (
+      typeof result.const === "string" &&
+      stringLiteral(result) !== undefined
+    ) {
+      result.type ??= "string";
+      result.enum ??= [result.const];
+    }
     return result;
   }
   const result = visit(document);
@@ -44,9 +53,130 @@ export function clientSchema(document) {
 // Inline discriminant enums share a generated namespace and lose variants.
 // Generate these models with literal unions, retaining enums elsewhere.
 export function discriminatedModels(document) {
-  return Object.entries(document.components.schemas)
-    .filter(([, schema]) =>
-      schema.oneOf?.some((branch) => branch.properties?.op?.enum),
+  const schemas = document?.components?.schemas;
+  if (!object(schemas)) return [];
+  return Object.entries(schemas)
+    .filter(([, schema]) => taggedUnion(schema, document))
+    .map(([name]) => name)
+    .sort();
+}
+
+function object(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// Resolve local schema aliases without following external URLs, semantic $ref
+// siblings or cycles. Never guess which branch of a composition supplies a tag.
+function resolveSchema(schema, document) {
+  const seen = new Set();
+  while (object(schema) && Object.hasOwn(schema, "$ref")) {
+    const ref = schema.$ref;
+    if (typeof ref !== "string" || !ref.startsWith("#/") || seen.has(ref)) {
+      return undefined;
+    }
+    if (
+      Object.keys(schema).some(
+        (key) =>
+          ![
+            "$ref",
+            "title",
+            "description",
+            "deprecated",
+            "readOnly",
+            "writeOnly",
+            "example",
+            "examples",
+            "default",
+          ].includes(key) && !key.startsWith("x-"),
+      )
+    ) {
+      return undefined;
+    }
+    seen.add(ref);
+    let pointer;
+    try {
+      pointer = decodeURIComponent(ref.slice(1));
+    } catch {
+      return undefined;
+    }
+    schema = document;
+    for (const part of pointer.slice(1).split("/")) {
+      if (/~(?:[^01]|$)/.test(part)) return undefined;
+      const key = part.replace(/~1/g, "/").replace(/~0/g, "~");
+      if (!object(schema) || !Object.hasOwn(schema, key)) return undefined;
+      schema = schema[key];
+    }
+  }
+  return object(schema) ? schema : undefined;
+}
+
+function stringLiteral(schema) {
+  if (
+    !object(schema) ||
+    (schema.type !== undefined && schema.type !== "string") ||
+    schema.nullable === true ||
+    ["$ref", "oneOf", "anyOf", "allOf", "not"].some((key) =>
+      Object.hasOwn(schema, key),
     )
-    .map(([name]) => name);
+  ) {
+    return undefined;
+  }
+  const hasConst = Object.hasOwn(schema, "const");
+  const hasEnum = Object.hasOwn(schema, "enum");
+  if (hasConst && typeof schema.const !== "string") return undefined;
+  if (
+    hasEnum &&
+    (!Array.isArray(schema.enum) ||
+      schema.enum.length !== 1 ||
+      typeof schema.enum[0] !== "string")
+  ) {
+    return undefined;
+  }
+  if (hasConst && hasEnum && schema.const !== schema.enum[0]) return undefined;
+  return hasConst ? schema.const : hasEnum ? schema.enum[0] : undefined;
+}
+
+function taggedUnion(schema, document) {
+  const union = resolveSchema(schema, document);
+  if (!union || (union.oneOf !== undefined && union.anyOf !== undefined)) {
+    return false;
+  }
+  const alternatives = union.oneOf ?? union.anyOf;
+  if (!Array.isArray(alternatives) || alternatives.length < 2) return false;
+  const branches = alternatives.map((branch) =>
+    resolveSchema(branch, document),
+  );
+  if (
+    branches.some(
+      (branch) =>
+        !branch ||
+        (branch.type !== undefined && branch.type !== "object") ||
+        branch.nullable === true ||
+        ["oneOf", "anyOf", "allOf", "not"].some((key) =>
+          Object.hasOwn(branch, key),
+        ) ||
+        !object(branch.properties) ||
+        !Array.isArray(branch.required),
+    )
+  ) {
+    return false;
+  }
+  return branches[0].required.some((tag) => {
+    if (typeof tag !== "string") return false;
+    const values = new Set();
+    for (const branch of branches) {
+      if (
+        !branch.required.includes(tag) ||
+        !Object.hasOwn(branch.properties, tag)
+      ) {
+        return false;
+      }
+      const literal = stringLiteral(
+        resolveSchema(branch.properties[tag], document),
+      );
+      if (literal === undefined || values.has(literal)) return false;
+      values.add(literal);
+    }
+    return true;
+  });
 }

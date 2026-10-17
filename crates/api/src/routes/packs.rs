@@ -17,6 +17,7 @@ use validator::Validate;
 #[allow(dead_code)]
 #[derive(utoipa::ToSchema)]
 struct PackUploadForm {
+    acknowledge_incompatible_rollout: Option<String>,
     #[schema(format = Binary)]
     pack: String,
     force: Option<String>,
@@ -97,6 +98,8 @@ struct PackInstallationMetadata {
 }
 
 struct PackRegistrationInput {
+    acknowledge_incompatible_rollout: bool,
+    expected_release_digest: Option<String>,
     path: String,
     force: bool,
     skip_tests: bool,
@@ -822,6 +825,10 @@ pub async fn update_pack(
 
     let authorized_pack_id = existing_pack.id;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::trigger_rollout::TriggerRolloutRepository::lock_activation(
+        &mut tx,
+    )
+    .await?;
     attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref)
@@ -853,16 +860,15 @@ pub async fn update_pack(
         || request.worker_affinity.is_some();
 
     // Create update input
-    let configuration_changed = request.config.is_some() || request.conf_schema.is_some();
+    let configuration_changed = request.config.is_some()
+        || request.conf_schema.is_some()
+        || !request.config_reset_fields.is_empty();
     let supplied_config = request.config.clone();
-    if request.conf_schema.is_some() && request.config.is_none()
-        && attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(&mut *tx, "pack", existing_pack.id)
-            .await?.is_some_and(|revision| revision.config != existing_pack.config || attune_common::secret_values::redacted_paths(&revision.config).len() > 0) {
-        for action in [Action::Read, Action::Decrypt] {
-            if !pack_action_allowed(&grants, action, identity_id, &existing_pack) {
-                return Err(ApiError::Forbidden("Rebinding preserved pack configuration requires read and decrypt authority".into()));
-            }
-        }
+    let reset_fields = request.config_reset_fields.clone();
+    if configuration_changed && attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(&mut *tx,"pack",existing_pack.id).await?.is_none() {
+        attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
+            &mut tx,&existing_pack,None,state.config.security.encryption_key.as_deref(),
+        ).await?;
     }
     let update_input = UpdatePackInput {
         label: request.label,
@@ -872,7 +878,7 @@ pub async fn update_pack(
         }),
         version: request.version,
         conf_schema: request.conf_schema,
-        config: request.config,
+        config: None,
         meta: request.meta,
         tags: request.tags,
         runtime_deps: request.runtime_deps,
@@ -883,8 +889,14 @@ pub async fn update_pack(
 
     let mut pack = PackRepository::update(&mut *tx, existing_pack.id, update_input).await?;
     if configuration_changed {
-        let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
-            &mut tx, &pack, supplied_config.as_ref(), state.config.security.encryption_key.as_deref()).await?;
+        let authority =
+            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
+                .await?;
+        attune_common::repositories::component_configuration::ComponentConfigurationRepository::authorize_preserved_migration(
+            &mut tx,"pack",pack.id,&pack.r#ref,&pack,&pack.conf_schema,&authority,
+        ).await?;
+        let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::patch_pack(
+            &mut tx, &pack, supplied_config.as_ref(), &reset_fields, state.config.security.encryption_key.as_deref()).await?;
         pack.config = revision.config;
     }
     let pack = if placement_changed {
@@ -1069,6 +1081,8 @@ pub async fn delete_pack(
     }
 
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation).await?;
     PackRepository::acquire_mutation_lock(&mut tx, removal_ref).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
@@ -1660,7 +1674,9 @@ pub async fn upload_pack(
         )
     })?;
     let mut pack_archive: Option<tempfile::NamedTempFile> = None;
+    let mut expected_release_digest = None;
     let mut force = false;
+    let mut acknowledge_incompatible_rollout = false;
     let mut skip_tests = false;
     let mut absent_metadata_policy = AbsentMetadataPolicy::Remove;
 
@@ -1677,6 +1693,30 @@ pub async fn upload_pack(
         }
     })? {
         match field.name() {
+            Some("acknowledge_incompatible_rollout") => {
+                acknowledge_incompatible_rollout = field.text().await.map_err(|_|ApiError::BadRequest("Invalid rollout acknowledgement field".into()))?
+                    .trim().parse::<bool>().map_err(|_|ApiError::BadRequest("Multipart field 'acknowledge_incompatible_rollout' must be true or false".into()))?;
+            }
+            Some("expected_release_digest") => {
+                let digest = field
+                    .text()
+                    .await
+                    .map_err(|_| ApiError::BadRequest("Invalid expected release digest".into()))?;
+                if digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(ApiError::BadRequest(
+                        "Expected release digest must be lowercase SHA-256".into(),
+                    ));
+                }
+                if expected_release_digest.replace(digest).is_some() {
+                    return Err(ApiError::BadRequest(
+                        "Expected release digest must be supplied once".into(),
+                    ));
+                }
+            }
             Some("pack") => {
                 pack_archive = Some(
                     super::artifacts::stage_multipart_file(field, PACK_UPLOAD_MAX_BYTES).await?,
@@ -1812,7 +1852,9 @@ pub async fn upload_pack(
         state.clone(),
         &user,
         PackRegistrationInput {
+            acknowledge_incompatible_rollout,
             path: pack_root.to_string_lossy().to_string(),
+            expected_release_digest,
             force,
             skip_tests,
             absent_metadata_policy,
@@ -1938,7 +1980,9 @@ pub async fn register_pack(
         state.clone(),
         &user,
         PackRegistrationInput {
+            acknowledge_incompatible_rollout: request.acknowledge_incompatible_rollout,
             path: request.path.clone(),
+            expected_release_digest: None,
             force: request.force,
             skip_tests: request.skip_tests,
             absent_metadata_policy: request.absent_metadata_policy,
@@ -2004,7 +2048,15 @@ async fn authorize_pack_delegation(
     let plan = attune_common::pack_registry::permissions::PackPermissionPlan::read(path, pack_ref)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let mut connection = state.db.acquire().await?;
-    plan.validate(&mut connection, &authority).await?;
+    if attune_common::pack_registry::deployment_admission::BOOTSTRAP_ADMISSION_ENABLED {
+        // Structural validation only here. Admission and approvals are captured
+        // in the activation transaction, never from the installer's runtime IAM.
+        let _plan = attune_common::pack_registry::deployment_admission::DeploymentAdmission::read(
+            path, pack_ref,
+        )?;
+    } else {
+        plan.validate(&mut connection, &authority).await?;
+    }
     Ok(())
 }
 
@@ -2016,6 +2068,8 @@ async fn register_pack_internal(
     use std::fs;
 
     let PackRegistrationInput {
+        acknowledge_incompatible_rollout,
+        expected_release_digest,
         path,
         force,
         skip_tests,
@@ -2080,6 +2134,11 @@ async fn register_pack_internal(
         .get("conf_schema")
         .and_then(|v| serde_json::to_value(v).ok())
         .unwrap_or_else(|| serde_json::json!({}));
+    let candidate_effects_requested = pack_yaml
+        .get("testing")
+        .and_then(|testing| testing.get("candidate_api_effects"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let meta = pack_yaml
         .get("meta")
         .and_then(|v| serde_json::to_value(v).ok())
@@ -2335,6 +2394,9 @@ async fn register_pack_internal(
     let published_release = storage
         .publish_release(release_source, &pack_ref, &version)
         .map_err(|error| ApiError::from(error).in_deployment("release_publication", &pack_ref, &version, active_install_id))?;
+    if expected_release_digest.as_ref().is_some_and(|expected| expected != &published_release.digest) {
+        return Err(ApiError::Conflict("Selected release digest differs from the required deployment pin; active release is unchanged".into()));
+    }
 
     let authorized_existing = PackRepository::find_by_ref(&state.db, &pack_ref).await?;
     if let Some(existing) = &authorized_existing {
@@ -2412,7 +2474,11 @@ async fn register_pack_internal(
     // Keep local commit/publication order aligned even after the transaction's
     // cross-process advisory lock is released by commit.
     let _projection_guard = state.lock_pack_projection(&pack_ref).await;
+    let deployment_admission = attune_common::pack_registry::deployment_admission::DeploymentAdmission::read(
+        &published_release.pack_path, &pack_ref,
+    )?;
     let mut tx = state.db.begin().await?;
+    attune_common::pack_registry::deployment_admission::DeploymentAdmission::lock(&mut tx).await?;
     attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
         &mut tx,
         attune_common::repositories::cache::CacheTransactionMode::Write,
@@ -2429,13 +2495,37 @@ async fn register_pack_internal(
     )
     .await?;
     require_candidate_install_authority(&registration_authority, &pack_ref)?;
-    attune_common::pack_registry::permissions::PackPermissionPlan::read(
-        &published_release.pack_path,
-        &pack_ref,
-    )
-    .map_err(|error| ApiError::BadRequest(error.to_string()))?
-    .validate(&mut tx, &registration_authority)
-    .await?;
+    if candidate_effects_requested {
+        if let Some(install_id)=active_install_id {
+            let tested=PackInstallRepository::find_by_id_for_update(&mut tx,install_id).await?
+                .ok_or_else(||ApiError::Conflict("Candidate test evidence is unavailable".into()))?;
+            if tested.pack_ref != pack_ref || tested.pack_version != version {
+                return Err(ApiError::Conflict("Candidate test evidence belongs to another pack or version".into()));
+            }
+            // Actual worker results, including an explicitly overridden failed
+            // test, require closed isolated-context evidence. Explicit skips
+            // have no result and must not manufacture such a context.
+            if tested.test_result.is_some() || tested.assigned_worker_id.is_some() || tested.test_execution_id.is_some() {
+                use attune_common::repositories::candidate_effect::{CandidateArchiveBinding,CandidateEffectRepository};
+                let missing=||ApiError::Conflict("Candidate archive evidence is incomplete".into());
+                let archive=CandidateArchiveBinding {
+                    key:tested.candidate_object_key.as_deref().ok_or_else(missing)?,
+                    provider_version:tested.candidate_provider_version.as_deref().ok_or_else(missing)?,
+                    digest:tested.candidate_digest.as_deref().ok_or_else(missing)?,
+                };
+                CandidateEffectRepository::require_closed_context(&mut tx,install_id,&archive).await?;
+            }
+        }
+    }
+    if !attune_common::pack_registry::deployment_admission::BOOTSTRAP_ADMISSION_ENABLED {
+        attune_common::pack_registry::permissions::PackPermissionPlan::read(
+            &published_release.pack_path,
+            &pack_ref,
+        )
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?
+        .validate(&mut tx, &registration_authority)
+        .await?;
+    }
 
     // Pack metadata and every component mutation commit or roll back together.
     let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref).await?;
@@ -2446,6 +2536,12 @@ async fn register_pack_internal(
             "Pack '{}' changed while registration was being authorized",
             pack_ref
         )));
+    }
+
+    if let Some(existing) = &existing_pack {
+        attune_common::pack_registry::deployment_admission::DeploymentAdmission::preserve(
+            &mut tx, existing.id, state.config.security.encryption_key.as_deref(),
+        ).await?;
     }
 
     let pack = if let Some(existing) = existing_pack {
@@ -2554,10 +2650,13 @@ async fn register_pack_internal(
             registration_authority.clone(),
         )
         .with_absent_metadata_policy(absent_metadata_policy);
-        match component_loader
-            .load_all_in_transaction(&mut tx, &pack_path)
-            .await
-        {
+        let component_loader = component_loader.with_rollout_acknowledgement(acknowledge_incompatible_rollout);
+        let loaded = if attune_common::pack_registry::deployment_admission::BOOTSTRAP_ADMISSION_ENABLED {
+            deployment_admission.load(component_loader, &mut tx).await
+        } else {
+            component_loader.load_all_in_transaction(&mut tx, &pack_path).await
+        };
+        match loaded {
             Ok(load_result) => {
                 metadata_diagnostics.retain(|diagnostic| diagnostic.code != "schema.external_reference_unverified");
                 if load_result.total_skipped() > load_result.caches_skipped {
@@ -2636,13 +2735,9 @@ async fn register_pack_internal(
         .await?;
     }
     PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, &projections).await?;
-    attune_common::repositories::rule_authority::RuleAuthorityRepository::capture_deployment(
-        &mut tx, pack.id,
-    )
-    .await?;
-    attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_deployment(
-        &mut tx, pack.id, state.config.security.encryption_key.as_deref(), &registration_authority).await
-        .map_err(|error| ApiError::from(error).in_deployment("configuration_binding", &pack_ref, &version, active_install_id))?;
+    deployment_admission.finish(
+        &mut tx, pack.id, release.id, state.config.security.encryption_key.as_deref(), &registration_authority,
+    ).await.map_err(|error| ApiError::from(error).in_deployment("deployment_admission", &pack_ref, &version, active_install_id))?;
     if let Some(install_id) = active_install_id {
         test_install = Some(
             PackInstallRepository::finish_activation_in_transaction(&mut tx, install_id, pack.id)
@@ -4227,7 +4322,9 @@ pub async fn install_pack(
         state.clone(),
         &user,
         PackRegistrationInput {
+            acknowledge_incompatible_rollout: request.acknowledge_incompatible_rollout,
             path: installed.path.to_string_lossy().to_string(),
+            expected_release_digest: None,
             force: request.force,
             skip_tests: true,
             absent_metadata_policy: request.absent_metadata_policy,
@@ -5536,6 +5633,7 @@ pub async fn register_packs_batch(
     for pack_path in &request.pack_paths {
         // Call the existing register_pack_internal function
         let register_req = crate::dto::pack::RegisterPackRequest {
+            acknowledge_incompatible_rollout: request.acknowledge_incompatible_rollout,
             path: pack_path.clone(),
             force: request.force,
             skip_tests: request.skip_tests,
@@ -5546,7 +5644,9 @@ pub async fn register_packs_batch(
             state.clone(),
             &user,
             PackRegistrationInput {
+                acknowledge_incompatible_rollout: register_req.acknowledge_incompatible_rollout,
                 path: register_req.path.clone(),
+                expected_release_digest: None,
                 force: register_req.force,
                 skip_tests: register_req.skip_tests,
                 absent_metadata_policy: register_req.absent_metadata_policy,
@@ -5765,6 +5865,7 @@ async fn find_pack_icon(
 
 fn pack_authorization_context(identity_id: i64, pack: &Pack) -> AuthorizationContext {
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.managing_pack_id = Some(pack.id);
     ctx.target_id = Some(pack.id);
     ctx.target_ref = Some(pack.r#ref.clone());
     ctx.pack_ref = Some(pack.r#ref.clone());
@@ -5794,7 +5895,8 @@ fn constrained_pack_grant_allows(
         let Some(constraints) = &grant.constraints else {
             return false;
         };
-        let pack_scoped = constraints.owner.is_some()
+        let pack_scoped = constraints.managing_pack_id.is_some()
+            || constraints.owner.is_some()
             || constraints.pack_refs.is_some()
             || constraints.refs.is_some()
             || constraints.ids.is_some();
@@ -5835,9 +5937,17 @@ fn build_pack_visibility_filter(identity_id: i64, grants: &[Grant]) -> PackVisib
             owner: constraints.owner,
             pack_refs: constraints.pack_refs.clone(),
             refs: constraints.refs.clone(),
-            ids: constraints.ids.clone(),
+            ids: match constraints.managing_pack_id {
+                Some(pack) => Some(
+                    std::iter::once(pack)
+                        .filter(|id| constraints.ids.as_ref().is_none_or(|ids| ids.contains(id)))
+                        .collect(),
+                ),
+                None => constraints.ids.clone(),
+            },
         };
-        let pack_scoped = constraints.owner.is_some()
+        let pack_scoped = constraints.managing_pack_id.is_some()
+            || constraints.owner.is_some()
             || constraints.pack_refs.is_some()
             || constraints.refs.is_some()
             || constraints.ids.is_some();

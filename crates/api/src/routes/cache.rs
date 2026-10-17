@@ -58,7 +58,7 @@ use crate::{
         middleware::{AuthErrorResponse, AuthenticatedUser},
         RequireAuth,
     },
-    authz::{AuthorizationCheck, AuthorizationService, AuthorizationSnapshot},
+    authz::{AuthorizationService, AuthorizationSnapshot},
     dto::{
         cache::{
             ApplyLiveCacheApiResponse, ApplyLiveCacheRequest, ApplyLiveCacheResponse,
@@ -545,9 +545,13 @@ fn repository_freshness(
 // Authorization
 // ---------------------------------------------------------------------------
 
-/// This prepares an owner selector, not a recorded capability permit. Recorded
-/// writers must validate their source and resolved namespace in the effect
-/// transaction; delegation retains its existing pre-lookup authorization.
+struct PreparedCacheEffect {
+    authority: CacheAuthority,
+    namespace: String,
+}
+
+/// Load IAM once before reserving the effect connection. Target authorization
+/// happens only after resolving and locking the actual owner in that transaction.
 async fn prepare_cache_effect(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
@@ -555,7 +559,7 @@ async fn prepare_cache_effect(
     owner_type: OwnerType,
     owner_ref: Option<&str>,
     namespace: &str,
-) -> CacheResult<(i64, Option<String>)> {
+) -> CacheResult<(i64, Option<String>, Option<PreparedCacheEffect>)> {
     if let Some(binding) = user
         .claims
         .admitted_execution_credential()
@@ -564,11 +568,28 @@ async fn prepare_cache_effect(
         return Ok((
             binding.sponsor_identity_id,
             normalize_owner_selector(owner_type, owner_ref)?,
+            None,
         ));
     }
-    let (authority, owner) =
-        authorize_namespace_action(state, user, action, owner_type, owner_ref, namespace).await?;
-    Ok((authority.identity_id, owner))
+    let authority = load_cache_authority(state, user).await?;
+    if !authority
+        .grants
+        .iter()
+        .any(|grant| grant.resource == Resource::Caches && grant.actions.contains(&action))
+    {
+        return Err(CacheApiError::forbidden(
+            "Insufficient cache operation authority",
+        ));
+    }
+    let owner = normalize_owner_selector(owner_type, owner_ref)?;
+    Ok((
+        authority.identity_id,
+        owner,
+        Some(PreparedCacheEffect {
+            authority,
+            namespace: namespace.into(),
+        }),
+    ))
 }
 
 async fn begin_cache_effect_transaction<'a>(
@@ -576,10 +597,31 @@ async fn begin_cache_effect_transaction<'a>(
     user: &AuthenticatedUser,
     mode: CacheTransactionMode,
 ) -> CacheResult<(
-    sqlx::Transaction<'a, sqlx::Postgres>,
+    crate::recorded_effect::EffectTransaction<'a>,
     Option<ValidatedRuntimeAuthority>,
 )> {
     let mut transaction = begin_cache_transaction(state, user, mode).await?;
+    let authority = user.recorded_runtime_authority(&mut transaction).await?;
+    if let Some(authority) = &authority {
+        attune_common::repositories::runtime_read::RuntimeReadRepository::require_untainted(
+            &mut transaction,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+    }
+    Ok((transaction, authority))
+}
+
+/// Read-only cache delivery retains source/capture ordering without treating a
+/// previous protected read as an unprovenanced write to the namespace.
+async fn begin_cache_read_transaction<'a>(
+    state: &'a AppState,
+    user: &AuthenticatedUser,
+) -> CacheResult<(
+    crate::recorded_effect::EffectTransaction<'a>,
+    Option<ValidatedRuntimeAuthority>,
+)> {
+    let mut transaction = begin_cache_transaction(state, user, CacheTransactionMode::Read).await?;
     let authority = user.recorded_runtime_authority(&mut transaction).await?;
     Ok((transaction, authority))
 }
@@ -587,20 +629,45 @@ async fn begin_cache_effect_transaction<'a>(
 async fn resolve_cache_effect_scope(
     connection: &mut sqlx::PgConnection,
     authority: Option<&ValidatedRuntimeAuthority>,
+    delegated: Option<&PreparedCacheEffect>,
     owner_type: OwnerType,
     owner_ref: Option<&str>,
     identity: Id,
 ) -> CacheResult<CacheOwnerScope> {
-    resolve_owner_scope(connection, owner_type, owner_ref, identity)
+    let scope = resolve_owner_scope(connection, owner_type, owner_ref, identity)
         .await
         .map_err(|error| match error {
             CacheApiError::Api(ApiError::BadRequest(_) | ApiError::NotFound(_))
-                if authority.is_some() =>
+                if authority.is_some() || delegated.is_some() =>
             {
                 CacheApiError::forbidden("Cache namespace is unavailable to recorded authority")
             }
             error => error,
-        })
+        })?;
+    if let Some(prepared) = delegated {
+        use attune_common::repositories::runtime_target::{
+            ProspectiveDataOwner, ProspectiveRuntimeTarget, RuntimeTargetRepository,
+        };
+        let target = RuntimeTargetRepository::resolve_creation_target(
+            connection,
+            ProspectiveDataOwner::try_from(&scope)?,
+            ProspectiveRuntimeTarget::CacheNamespace(&prepared.namespace),
+            identity,
+        )
+        .await?
+        .ok_or_else(|| CacheApiError::forbidden("Cache owner is unavailable"))?;
+        if !target.accepts_new_effects() || !cache_owner_matches(&scope, target.context()) {
+            return Err(CacheApiError::forbidden("Cache owner is unavailable"));
+        }
+    }
+    Ok(scope)
+}
+
+fn cache_owner_matches(scope: &CacheOwnerScope, context: &AuthorizationContext) -> bool {
+    match scope.owner_type {
+        OwnerType::System | OwnerType::Identity => true,
+        _ => context.owner_ref.as_deref() == scope_owner_ref(scope),
+    }
 }
 
 async fn authorize_recorded_cache_target(
@@ -629,23 +696,71 @@ async fn authorize_recorded_cache_target(
 async fn resolve_cache_effect_target(
     connection: &mut sqlx::PgConnection,
     authority: Option<&ValidatedRuntimeAuthority>,
+    delegated: Option<&PreparedCacheEffect>,
     scope: &CacheOwnerScope,
     namespace: &str,
     action: Action,
 ) -> CacheResult<CacheNamespace> {
-    let Some(authority) = authority else {
-        return resolve_namespace_for_write(connection, scope, namespace).await;
-    };
     let record =
         CacheNamespaceRepository::resolve_including_tombstoned(&mut *connection, scope, namespace)
-            .await?
-            .ok_or_else(|| {
-                CacheApiError::forbidden("Cache namespace is unavailable to recorded authority")
-            })?;
-    authorize_recorded_cache_target(connection, authority, record.id, action).await?;
+            .await?;
+    let Some(record) = record else {
+        if let Some(prepared) = delegated {
+            authorize_cache_prospective(connection, prepared, scope, action).await?;
+        }
+        return Err(if authority.is_some() {
+            CacheApiError::forbidden("Cache namespace is unavailable to recorded authority")
+        } else {
+            CacheApiError::not_found("cache namespace not found")
+        });
+    };
+    if let Some(authority) = authority {
+        authorize_recorded_cache_target(connection, authority, record.id, action).await?;
+    } else if let Some(prepared) = delegated {
+        let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+            connection,
+            attune_common::repositories::runtime_target::RuntimeTarget::CacheNamespace(record.id),
+            prepared.authority.identity_id,
+        )
+        .await?
+        .ok_or_else(|| CacheApiError::forbidden("Cache namespace is unavailable"))?;
+        if !target.accepts_new_effects() {
+            return Err(CacheApiError::namespace_deleted());
+        }
+        let mut context = target.context().clone();
+        context.target_ref = Some(namespace.into());
+        prepared.authority.authorize_resolved(action, context)?;
+    } else {
+        return Err(CacheApiError::forbidden("Cache authority is unavailable"));
+    }
     CacheNamespaceRepository::find_by_id_for_share_conn(connection, record.id)
         .await
         .map_err(Into::into)
+}
+
+async fn authorize_cache_prospective(
+    connection: &mut sqlx::PgConnection,
+    prepared: &PreparedCacheEffect,
+    scope: &CacheOwnerScope,
+    action: Action,
+) -> CacheResult<()> {
+    use attune_common::repositories::runtime_target::{
+        ProspectiveDataOwner, ProspectiveRuntimeTarget, RuntimeTargetRepository,
+    };
+    let target = RuntimeTargetRepository::resolve_creation_target(
+        connection,
+        ProspectiveDataOwner::try_from(scope)?,
+        ProspectiveRuntimeTarget::CacheNamespace(&prepared.namespace),
+        prepared.authority.identity_id,
+    )
+    .await?
+    .ok_or_else(|| CacheApiError::forbidden("Cache owner is unavailable"))?;
+    if !target.accepts_new_effects() || !cache_owner_matches(scope, target.context()) {
+        return Err(CacheApiError::forbidden("Cache owner is unavailable"));
+    }
+    prepared
+        .authority
+        .authorize_resolved(action, target.context().clone())
 }
 
 /// The effective cache authority for one request, gated by token type.
@@ -653,29 +768,18 @@ struct CacheAuthority {
     identity_id: i64,
     grants: Vec<Grant>,
     snapshot: Option<AuthorizationSnapshot>,
-    authz: AuthorizationService,
 }
 
 impl CacheAuthority {
-    fn authorize(
+    fn authorize_resolved(
         &self,
-        user: &AuthenticatedUser,
         action: Action,
-        context: AuthorizationContext,
+        mut context: AuthorizationContext,
     ) -> CacheResult<()> {
-        if let Some(snapshot) = self.snapshot.as_ref() {
-            self.authz
-                .authorize_with_snapshot(
-                    user,
-                    Some(snapshot),
-                    AuthorizationCheck {
-                        resource: Resource::Caches,
-                        action,
-                        context,
-                    },
-                )
-                .map_err(CacheApiError::from)
-        } else if cache_action_allowed(&self.grants, action, &context) {
+        if let Some(snapshot) = &self.snapshot {
+            context.identity_attributes = snapshot.identity_attributes.clone();
+        }
+        if cache_action_allowed(&self.grants, action, &context) {
             Ok(())
         } else {
             Err(CacheApiError::forbidden(format!(
@@ -704,7 +808,6 @@ async fn load_cache_authority(
                 identity_id: snapshot.identity_id,
                 grants: snapshot.grants.clone(),
                 snapshot: Some(snapshot),
-                authz,
             })
         }
         // Sensor tokens are not evaluated by identity RBAC. They may only use a
@@ -763,7 +866,6 @@ async fn load_cache_authority(
                 identity_id,
                 grants,
                 snapshot: None,
-                authz,
             })
         }
         // Refresh and worker tokens are rejected from cache data routes.
@@ -791,6 +893,7 @@ fn sensor_cache_grants(user: &AuthenticatedUser) -> Vec<Grant> {
 /// Builds the authorization context for a cache request from request-supplied
 /// scope values (never from a database lookup) so authorization precedes any
 /// existence check.
+#[cfg(test)]
 fn cache_context(
     identity_id: i64,
     owner_type: OwnerType,
@@ -810,41 +913,16 @@ fn cache_action_allowed(grants: &[Grant], action: Action, ctx: &AuthorizationCon
     AuthorizationService::is_allowed(grants, Resource::Caches, action, ctx)
 }
 
-/// Authorizes a namespace-scoped cache action against the request scope. The
-/// caller's own identity is used for the `identity` owner scope. Returns the
-/// canonical owner scope only after authorization succeeds.
-async fn authorize_namespace_action(
-    state: &Arc<AppState>,
-    user: &AuthenticatedUser,
-    action: Action,
-    owner_type: OwnerType,
-    owner_ref: Option<&str>,
-    namespace: &str,
-) -> CacheResult<(CacheAuthority, Option<String>)> {
-    let authority = load_cache_authority(state, user).await?;
-    let owner_ref = normalize_owner_selector(owner_type, owner_ref)?;
-    let owner_identity = match owner_type {
-        OwnerType::Identity => Some(authority.identity_id),
-        _ => None,
-    };
-    let ctx = cache_context(
-        authority.identity_id,
-        owner_type,
-        owner_ref.as_deref(),
-        owner_identity,
-        Some(namespace),
-    );
-    authority.authorize(user, action, ctx)?;
-
-    Ok((authority, owner_ref))
-}
-
 async fn begin_cache_transaction<'a>(
     state: &'a AppState,
     user: &AuthenticatedUser,
     mode: CacheTransactionMode,
-) -> CacheResult<sqlx::Transaction<'a, sqlx::Postgres>> {
+) -> CacheResult<crate::recorded_effect::EffectTransaction<'a>> {
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+    // Capture admission precedes cache parent protection, which still precedes
+    // source/owner row validation. This is an ordering lock, never a permit.
+    user.lock_recorded_capture_admission(&mut tx).await?;
     CacheEntryRepository::protect_transaction(&mut tx, mode).await?;
     if user.claims.token_type == TokenType::Sensor {
         SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
@@ -872,7 +950,13 @@ async fn begin_cache_transaction<'a>(
             ));
         }
     }
-    Ok(tx)
+    let authority = user.recorded_runtime_authority(&mut tx).await?;
+    Ok(crate::recorded_effect::EffectTransaction::new(
+        tx,
+        authority
+            .as_ref()
+            .map(|authority| authority.effect_fence().clone()),
+    ))
 }
 
 fn normalize_owner_selector(
@@ -936,76 +1020,24 @@ fn normalize_namespace_list_scope(
     }
 }
 
-enum CacheNamespaceVisibility {
-    NoAccess,
-    All,
-    Refs(Vec<String>),
-}
-
-/// Compiles the namespace-ref portion of cache read grants for one explicit
-/// owner selector. The owner and all other constraints are evaluated through
-/// the same `Grant::allows` implementation used by point reads; the resulting
-/// exact namespace list is then applied by the repository query.
-fn cache_namespace_visibility(
-    authority: &CacheAuthority,
-    owner_type: OwnerType,
-    owner_ref: Option<&str>,
-) -> CacheNamespaceVisibility {
-    let identity_id = authority.identity_id;
-    let owner_identity = (owner_type == OwnerType::Identity).then_some(identity_id);
-    let mut refs = std::collections::BTreeSet::new();
-
-    for grant in authority
-        .grants
-        .iter()
-        .filter(|grant| grant.resource == Resource::Caches)
-        .filter(|grant| grant.actions.contains(&Action::Read))
-    {
-        match grant
-            .constraints
-            .as_ref()
-            .and_then(|constraints| constraints.refs.as_ref())
-        {
-            Some(grant_refs) => {
-                for namespace in grant_refs {
-                    let mut ctx = cache_context(
-                        identity_id,
-                        owner_type,
-                        owner_ref,
-                        owner_identity,
-                        Some(namespace),
-                    );
-                    if let Some(snapshot) = authority.snapshot.as_ref() {
-                        ctx.identity_attributes = snapshot.identity_attributes.clone();
-                    }
-                    if grant.allows(Resource::Caches, Action::Read, &ctx) {
-                        refs.insert(namespace.clone());
-                    }
-                }
-            }
-            None => {
-                let mut ctx = cache_context(
-                    identity_id,
-                    owner_type,
-                    owner_ref,
-                    owner_identity,
-                    Some("__cache_namespace_visibility_probe__"),
-                );
-                if let Some(snapshot) = authority.snapshot.as_ref() {
-                    ctx.identity_attributes = snapshot.identity_attributes.clone();
-                }
-                if grant.allows(Resource::Caches, Action::Read, &ctx) {
-                    return CacheNamespaceVisibility::All;
-                }
-            }
-        }
-    }
-
-    if refs.is_empty() {
-        CacheNamespaceVisibility::NoAccess
-    } else {
-        CacheNamespaceVisibility::Refs(refs.into_iter().collect())
-    }
+fn namespace_owner_filter(
+    scope: &CacheNamespaceListScope,
+    identity: Id,
+) -> CacheResult<Option<attune_common::repositories::cache::CacheNamespaceOwnerFilter>> {
+    use attune_common::repositories::cache::CacheNamespaceOwnerFilter as Filter;
+    Ok(match scope {
+        CacheNamespaceListScope::Any => None,
+        CacheNamespaceListScope::Owner {
+            owner_type,
+            owner_ref,
+        } => Some(match owner_type {
+            OwnerType::System => Filter::System,
+            OwnerType::Identity => Filter::Identity(identity),
+            OwnerType::Pack => Filter::Pack(require_owner_ref(owner_ref.as_deref(), "pack")?),
+            OwnerType::Action => Filter::Action(require_owner_ref(owner_ref.as_deref(), "action")?),
+            OwnerType::Sensor => Filter::Sensor(require_owner_ref(owner_ref.as_deref(), "sensor")?),
+        }),
+    })
 }
 
 fn compile_cache_namespace_read_visibility(
@@ -1061,6 +1093,10 @@ fn compile_cache_namespace_grant_filter(
     }
 
     Some(CacheNamespaceGrantFilter {
+        ownership: constraints
+            .managing_pack_id
+            .map(attune_common::repositories::cache::CacheOwnershipScope::ManagedPack)
+            .unwrap_or_default(),
         owner: constraints.owner,
         owner_types: constraints.owner_types.clone(),
         owner_refs: constraints.owner_refs.clone(),
@@ -1536,61 +1572,17 @@ pub async fn list_namespaces(
         let authority = authority
             .as_ref()
             .ok_or_else(|| CacheApiError::forbidden("Cache authority is unavailable"))?;
-        match scope {
-            CacheNamespaceListScope::Any => {
-                let visibility = compile_cache_namespace_read_visibility(&authority);
-                CacheNamespaceRepository::list_metadata_all_owners_visible_filtered_page(
-                    &mut *tx,
-                    &visibility,
-                    after_id,
-                    namespace_filter.as_deref(),
-                    repository_freshness(freshness),
-                    page_size,
-                )
-                .await?
-            }
-            CacheNamespaceListScope::Owner {
-                owner_type,
-                owner_ref: scoped_owner_ref,
-            } => {
-                let visibility =
-                    cache_namespace_visibility(&authority, owner_type, scoped_owner_ref.as_deref());
-                if matches!(visibility, CacheNamespaceVisibility::NoAccess) {
-                    tx.commit().await?;
-                    return Ok((
-                        StatusCode::OK,
-                        Json(ApiResponse::new(CacheNamespaceListResponse {
-                            namespaces: Vec::new(),
-                            next_cursor: None,
-                        })),
-                    )
-                        .into_response());
-                }
-
-                let owner_scope = resolve_owner_scope(
-                    &mut tx,
-                    owner_type,
-                    scoped_owner_ref.as_deref(),
-                    authority.identity_id,
-                )
-                .await?;
-                let visible_refs = match &visibility {
-                    CacheNamespaceVisibility::Refs(refs) => Some(refs.as_slice()),
-                    CacheNamespaceVisibility::All => None,
-                    CacheNamespaceVisibility::NoAccess => unreachable!(),
-                };
-                CacheNamespaceRepository::list_metadata_visible_filtered_page(
-                    &mut *tx,
-                    &owner_scope,
-                    visible_refs,
-                    after_id,
-                    namespace_filter.as_deref(),
-                    repository_freshness(freshness),
-                    page_size,
-                )
-                .await?
-            }
-        }
+        let mut visibility = compile_cache_namespace_read_visibility(authority);
+        visibility.owner_filter = namespace_owner_filter(&scope, authority.identity_id)?;
+        CacheNamespaceRepository::list_metadata_all_owners_visible_filtered_page(
+            &mut *tx,
+            &visibility,
+            after_id,
+            namespace_filter.as_deref(),
+            repository_freshness(freshness),
+            page_size,
+        )
+        .await?
     };
     let items = build_namespace_responses(&mut tx, &page.items, owner_ref.as_deref()).await?;
     tx.commit().await?;
@@ -1646,7 +1638,7 @@ pub async fn create_namespace(
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&request.namespace)?;
     validate_policy_body(&request.policy)?;
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Create,
@@ -1660,12 +1652,16 @@ pub async fn create_namespace(
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         request.owner_type,
         owner_ref.as_deref(),
         identity_id,
     )
     .await?;
 
+    if let Some(prepared) = &delegated {
+        authorize_cache_prospective(&mut tx, prepared, &scope, Action::Create).await?;
+    }
     if let Some(authority) = &recorded {
         use attune_common::repositories::runtime_target::{
             ProspectiveDataOwner, ProspectiveRuntimeTarget, RuntimeTargetRepository,
@@ -1787,7 +1783,7 @@ pub async fn update_namespace(
     Json(request): Json<UpdateCacheNamespaceRequest>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Update,
@@ -1801,6 +1797,7 @@ pub async fn update_namespace(
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         request.owner_type,
         owner_ref.as_deref(),
         identity_id,
@@ -1810,6 +1807,7 @@ pub async fn update_namespace(
     let record = resolve_cache_effect_target(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         &scope,
         &namespace,
         Action::Update,
@@ -1882,7 +1880,7 @@ pub async fn delete_namespace(
     Query(query): Query<CacheOwnerQuery>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Delete,
@@ -1896,6 +1894,7 @@ pub async fn delete_namespace(
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         query.owner_type,
         owner_ref.as_deref(),
         identity_id,
@@ -1906,6 +1905,7 @@ pub async fn delete_namespace(
         resolve_cache_effect_target(
             &mut tx,
             recorded.as_ref(),
+            delegated.as_ref(),
             &scope,
             &namespace,
             Action::Delete,
@@ -2098,94 +2098,33 @@ async fn resolve_namespace_for_read<'a>(
     owner_ref: Option<&str>,
     namespace: &str,
 ) -> CacheResult<(
-    sqlx::Transaction<'a, sqlx::Postgres>,
+    crate::recorded_effect::EffectTransaction<'a>,
     CacheOwnerScope,
     CacheNamespace,
 )> {
     let namespace = normalize_namespace(namespace)?;
-    if user
-        .claims
-        .admitted_execution_credential()
-        .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
-        .is_some()
-    {
-        // Preserve cache parent protection before execution/owner rows that a
-        // generation cleanup or pin cascade can touch. Read remains concurrent.
-        let mut tx = begin_cache_transaction(state, user, CacheTransactionMode::Read).await?;
-        let authority = user
-            .recorded_runtime_authority(&mut tx)
-            .await?
-            .ok_or_else(|| CacheApiError::forbidden("Recorded cache authority is unavailable"))?;
-        let owner_ref = normalize_owner_selector(owner_type, owner_ref)?;
-        let identity = authority.authority().owner.sponsor_identity_id;
-        let scope = resolve_owner_scope(&mut tx, owner_type, owner_ref.as_deref(), identity)
-            .await
-            .map_err(|error| match error {
-                CacheApiError::Api(ApiError::BadRequest(_) | ApiError::NotFound(_)) => {
-                    CacheApiError::forbidden("Cache namespace is unavailable to recorded authority")
-                }
-                error => error,
-            })?;
-        let record = CacheNamespaceRepository::resolve(&mut *tx, &scope, &namespace)
-            .await?
-            .ok_or_else(|| {
-                CacheApiError::forbidden("Cache namespace is unavailable to recorded authority")
-            })?;
-        let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
-            &mut tx,
-            attune_common::repositories::runtime_target::RuntimeTarget::CacheNamespace(record.id),
-            identity,
-        )
-        .await?
-        .ok_or_else(|| {
-            CacheApiError::forbidden("Cache namespace is unavailable to recorded authority")
-        })?;
-        if !authority.allows_new_effect(&target, Action::Read) {
-            return Err(CacheApiError::forbidden(
-                "Selected recorded authority does not permit caches:read",
-            ));
-        }
-        // Resolve again under the target's shared lock. In live mode the revision
-        // returned alongside entries must be the same revision that was read.
-        let record =
-            CacheNamespaceRepository::find_by_id_for_share_conn(&mut tx, record.id).await?;
-        return Ok((tx, scope, record));
-    }
-    let (authority, owner_ref) =
-        authorize_namespace_action(state, user, Action::Read, owner_type, owner_ref, &namespace)
-            .await?;
-    let mut tx = begin_cache_transaction(state, user, CacheTransactionMode::Read).await?;
-    let scope = resolve_owner_scope(
+    let (identity, owner_ref, delegated) =
+        prepare_cache_effect(state, user, Action::Read, owner_type, owner_ref, &namespace).await?;
+    let (mut tx, recorded) = begin_cache_read_transaction(state, user).await?;
+    let scope = resolve_cache_effect_scope(
         &mut tx,
+        recorded.as_ref(),
+        delegated.as_ref(),
         owner_type,
         owner_ref.as_deref(),
-        authority.identity_id,
+        identity,
     )
     .await?;
-    let record = CacheNamespaceRepository::resolve(&mut *tx, &scope, &namespace)
-        .await?
-        .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
-    let record = if record.mode == CacheMode::Live {
-        CacheNamespaceRepository::find_by_id_for_share_conn(&mut tx, record.id).await?
-    } else {
-        record
-    };
+    let record = resolve_cache_effect_target(
+        &mut tx,
+        recorded.as_ref(),
+        delegated.as_ref(),
+        &scope,
+        &namespace,
+        Action::Read,
+    )
+    .await?;
     Ok((tx, scope, record))
-}
-
-async fn resolve_namespace_for_write(
-    connection: &mut sqlx::PgConnection,
-    scope: &CacheOwnerScope,
-    namespace: &str,
-) -> CacheResult<CacheNamespace> {
-    let record =
-        CacheNamespaceRepository::resolve_including_tombstoned(&mut *connection, scope, namespace)
-            .await?
-            .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
-    if record.tombstoned_at.is_some() {
-        return Err(CacheApiError::namespace_deleted());
-    }
-    Ok(record)
 }
 
 // ---------------------------------------------------------------------------
@@ -2439,7 +2378,7 @@ pub async fn apply_live_entries(
     let request: ApplyLiveCacheRequest = serde_json::from_slice(&body)
         .map_err(|err| CacheApiError::bad_request(format!("invalid live mutation body: {err}")))?;
     let namespace = normalize_namespace(&namespace)?;
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Update,
@@ -2453,6 +2392,7 @@ pub async fn apply_live_entries(
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         request.owner_type,
         owner_ref.as_deref(),
         identity_id,
@@ -2461,6 +2401,7 @@ pub async fn apply_live_entries(
     let record = resolve_cache_effect_target(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         &scope,
         &namespace,
         Action::Update,
@@ -2790,7 +2731,7 @@ pub async fn create_generation(
     if request.client_refresh_id.trim().is_empty() {
         return Err(CacheApiError::bad_request("client_refresh_id is required"));
     }
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Create,
@@ -2799,23 +2740,12 @@ pub async fn create_generation(
         &namespace,
     )
     .await?;
-    if request.source_generation_id.is_some() {
-        // Copying existing values is a read as well as a refresh operation.
-        prepare_cache_effect(
-            &state,
-            &user.0,
-            Action::Read,
-            request.owner_type,
-            request.owner_ref.as_deref(),
-            &namespace,
-        )
-        .await?;
-    }
     let (mut tx, recorded) =
         begin_cache_effect_transaction(&state, &user.0, CacheTransactionMode::Attach).await?;
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         request.owner_type,
         owner_ref.as_deref(),
         identity_id,
@@ -2825,15 +2755,22 @@ pub async fn create_generation(
     let record = resolve_cache_effect_target(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         &scope,
         &namespace,
         Action::Create,
     )
     .await?;
     if request.source_generation_id.is_some() {
-        if let Some(authority) = &recorded {
-            authorize_recorded_cache_target(&mut tx, authority, record.id, Action::Read).await?;
-        }
+        resolve_cache_effect_target(
+            &mut tx,
+            recorded.as_ref(),
+            delegated.as_ref(),
+            &scope,
+            &namespace,
+            Action::Read,
+        )
+        .await?;
     }
 
     require_snapshot_namespace(&record)?;
@@ -2965,7 +2902,7 @@ pub async fn upload_chunk(
     let request_checksum = hex_encode(&Sha256::digest(&body));
 
     let namespace = normalize_namespace(&namespace)?;
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Update,
@@ -2979,6 +2916,7 @@ pub async fn upload_chunk(
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         request.owner_type,
         owner_ref.as_deref(),
         identity_id,
@@ -2988,6 +2926,7 @@ pub async fn upload_chunk(
     let record = resolve_cache_effect_target(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         &scope,
         &namespace,
         Action::Update,
@@ -3113,7 +3052,7 @@ pub async fn seal_generation(
     Json(request): Json<SealCacheGenerationRequest>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Update,
@@ -3127,6 +3066,7 @@ pub async fn seal_generation(
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         request.owner_type,
         owner_ref.as_deref(),
         identity_id,
@@ -3136,6 +3076,7 @@ pub async fn seal_generation(
     let record = resolve_cache_effect_target(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         &scope,
         &namespace,
         Action::Update,
@@ -3240,7 +3181,7 @@ pub async fn promote_generation(
         "promotion request",
     )?;
     let namespace = normalize_namespace(&namespace)?;
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Update,
@@ -3254,6 +3195,7 @@ pub async fn promote_generation(
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         request.owner_type,
         owner_ref.as_deref(),
         identity_id,
@@ -3263,6 +3205,7 @@ pub async fn promote_generation(
     let record = resolve_cache_effect_target(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         &scope,
         &namespace,
         Action::Update,
@@ -3371,7 +3314,7 @@ pub async fn abandon_generation(
     Json(request): Json<CacheOwnerBody>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (identity_id, owner_ref) = prepare_cache_effect(
+    let (identity_id, owner_ref, delegated) = prepare_cache_effect(
         &state,
         &user.0,
         Action::Update,
@@ -3385,6 +3328,7 @@ pub async fn abandon_generation(
     let scope = resolve_cache_effect_scope(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         request.owner_type,
         owner_ref.as_deref(),
         identity_id,
@@ -3394,6 +3338,7 @@ pub async fn abandon_generation(
     let record = resolve_cache_effect_target(
         &mut tx,
         recorded.as_ref(),
+        delegated.as_ref(),
         &scope,
         &namespace,
         Action::Update,

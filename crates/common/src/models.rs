@@ -2027,7 +2027,7 @@ pub mod identity {
         pub updated: DateTime<Utc>,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct PermissionSet {
         pub id: Id,
         pub r#ref: String,
@@ -2040,6 +2040,32 @@ pub mod identity {
         pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
+    }
+
+    impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PermissionSet {
+        fn from_row(row: &'r sqlx::postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+            use sqlx::Row;
+            let pack = row.try_get("pack")?;
+            let authored: JsonValue = row.try_get("grants")?;
+            let grants = crate::runtime_authority::normalize_iam_grants(authored, pack).map_err(
+                |error| sqlx::Error::ColumnDecode {
+                    index: "grants".into(),
+                    source: Box::new(error),
+                },
+            )?;
+            Ok(Self {
+                id: row.try_get("id")?,
+                r#ref: row.try_get("ref")?,
+                pack,
+                pack_ref: row.try_get("pack_ref")?,
+                label: row.try_get("label")?,
+                description: row.try_get("description")?,
+                grants,
+                retired_at: row.try_get("retired_at")?,
+                created: row.try_get("created")?,
+                updated: row.try_get("updated")?,
+            })
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -2591,6 +2617,10 @@ pub mod work_queue {
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct WorkQueueDispatchConfig {
+        /// Opt in to grouping batches by requester identity. The default
+        /// aggregates otherwise eligible items without transferring visibility.
+        #[serde(default)]
+        pub separate_requesters: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub concurrency: Option<WorkQueueTunableValue>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

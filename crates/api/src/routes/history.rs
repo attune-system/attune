@@ -228,11 +228,26 @@ async fn authorize_history_parent_entity(
         HistoryEntityType::Execution => {
             let Some(execution) = ExecutionRepository::find_by_id(&state.db, entity_id).await?
             else {
-                return Ok(());
+                return if has_unconstrained_read(&grants, Resource::Executions) {
+                    Ok(())
+                } else {
+                    Err(ApiError::Forbidden(
+                        "Execution history ownership is unavailable".into(),
+                    ))
+                };
             };
             let mut ctx = AuthorizationContext::new(identity_id);
             ctx.identity_attributes = identity_attributes.clone();
             ctx.target_id = Some(execution.id);
+            if grants.iter().any(|grant| {
+                grant.resource == Resource::Executions
+                    && grant
+                        .constraints
+                        .as_ref()
+                        .is_some_and(|scope| scope.managing_pack_id.is_some())
+            }) {
+                ctx.managing_pack_id = attune_common::repositories::iam_ownership::IamOwnershipRepository::execution_packs(&state.db, &[execution.id]).await?.get(&execution.id).copied();
+            }
             ctx.target_ref = Some(execution.action_ref.clone());
             ctx.pack_ref = execution
                 .action_ref
@@ -258,7 +273,13 @@ async fn authorize_history_parent_entity(
         }
         HistoryEntityType::Worker => {
             let Some(worker) = WorkerRepository::find_by_id(&state.db, entity_id).await? else {
-                return Ok(());
+                return if has_unconstrained_read(&grants, Resource::Workers) {
+                    Ok(())
+                } else {
+                    Err(ApiError::Forbidden(
+                        "Worker history ownership is unavailable".into(),
+                    ))
+                };
             };
             let mut ctx = AuthorizationContext::new(identity_id);
             ctx.identity_attributes = identity_attributes.clone();

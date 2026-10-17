@@ -11,6 +11,43 @@ use attune_common::models::{
     Id, JsonDict,
 };
 
+/// Non-secret historical execution attribution. Requester and queue-item
+/// attribution stay behind their own inspection permissions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EventExecutionEmitterResponse {
+    pub execution_id: Id,
+    pub admission_id: Id,
+    pub sponsor_identity_id: Id,
+    pub pack_id: Id,
+    pub pack_ref: String,
+    pub action_ref: String,
+    pub policy_revision_id: Id,
+    pub release_id: Id,
+    pub release_digest: String,
+    pub attempt: uuid::Uuid,
+}
+
+impl From<attune_common::repositories::execution_event_emitter::ExecutionEventEmitter>
+    for EventExecutionEmitterResponse
+{
+    fn from(
+        emitter: attune_common::repositories::execution_event_emitter::ExecutionEventEmitter,
+    ) -> Self {
+        Self {
+            execution_id: emitter.execution_id,
+            admission_id: emitter.admission_id,
+            sponsor_identity_id: emitter.sponsor_identity_id,
+            pack_id: emitter.pack_id,
+            pack_ref: emitter.pack_ref,
+            action_ref: emitter.action_ref,
+            policy_revision_id: emitter.policy_revision_id,
+            release_id: emitter.release_id,
+            release_digest: emitter.release_digest,
+            attempt: emitter.attempt,
+        }
+    }
+}
+
 /// Full event response with all details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EventResponse {
@@ -38,6 +75,11 @@ pub struct EventResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub schema_binding: Option<JsonValue>,
+
+    /// Historical emitting execution, present only with execution visibility.
+    /// After execution retention, requires unrestricted execution read authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_emitter: Option<EventExecutionEmitterResponse>,
 
     /// Source ID (sensor that generated this event)
     #[schema(example = 1)]
@@ -74,6 +116,7 @@ impl From<Event> for EventResponse {
             config: event.config,
             payload: event.payload,
             schema_binding: None,
+            execution_emitter: None,
             source: event.source,
             source_ref: event.source_ref,
             rule: event.rule,

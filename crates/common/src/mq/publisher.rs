@@ -9,7 +9,7 @@
 
 use lapin::{
     options::{BasicPublishOptions, ConfirmSelectOptions},
-    BasicProperties, Channel,
+    BasicProperties, Channel, Confirmation, PublisherConfirm,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -22,6 +22,33 @@ use super::{
 
 // Re-export for convenience
 pub use super::config::PublisherConfig;
+
+/// An unconfirmed submission is not a broker acknowledgement. Callers retain
+/// the existing configured policy; enabling confirms is never implicit here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishConfirmation {
+    Acknowledged,
+    Unconfirmed,
+}
+
+/// Classify the actual Lapin result without formatting returned message bodies.
+/// Nack and missing requested confirmation are publish failures, not connection
+/// failures that should trigger another automatic publication.
+pub fn classify_confirmation(
+    requested: bool,
+    confirmation: Confirmation,
+) -> MqResult<PublishConfirmation> {
+    match confirmation {
+        Confirmation::Ack(_) => Ok(PublishConfirmation::Acknowledged),
+        Confirmation::Nack(_) => Err(MqError::Publish(
+            "Broker negatively acknowledged publication".into(),
+        )),
+        Confirmation::NotRequested if requested => Err(MqError::Publish(
+            "Publisher confirmation was requested but was not supplied".into(),
+        )),
+        Confirmation::NotRequested => Ok(PublishConfirmation::Unconfirmed),
+    }
+}
 
 /// Message publisher for sending messages to RabbitMQ
 pub struct Publisher {
@@ -80,6 +107,22 @@ impl Publisher {
         Ok(())
     }
 
+    async fn finish_publication(
+        &self,
+        confirmation: PublisherConfirm,
+    ) -> MqResult<PublishConfirmation> {
+        if !self.config.confirm_publish {
+            // Preserve the explicit disabled policy, including the old drop
+            // behavior if another user of channel() enabled confirms itself.
+            drop(confirmation);
+            return classify_confirmation(false, Confirmation::NotRequested);
+        }
+        let confirmation = confirmation
+            .await
+            .map_err(|e| MqError::Publish(format!("Message not confirmed: {}", e)))?;
+        classify_confirmation(true, confirmation)
+    }
+
     async fn publish_envelope_once<T>(
         &self,
         envelope: &MessageEnvelope<T>,
@@ -117,24 +160,27 @@ impl Publisher {
             .await
             .map_err(|e| MqError::Publish(format!("Failed to publish message: {}", e)))?;
 
-        // Wait for confirmation if enabled
-        if self.config.confirm_publish {
-            confirmation
-                .await
-                .map_err(|e| MqError::Publish(format!("Message not confirmed: {}", e)))?;
-
-            debug!("Message {} confirmed", envelope.message_id);
+        match self.finish_publication(confirmation).await? {
+            PublishConfirmation::Acknowledged => {
+                info!(
+                    "Message {} acknowledged by broker on '{}'",
+                    envelope.message_id, exchange
+                );
+            }
+            PublishConfirmation::Unconfirmed => {
+                info!(
+                    "Message {} submitted to '{}' without publisher confirmation",
+                    envelope.message_id, exchange
+                );
+            }
         }
-
-        info!(
-            "Message {} published successfully to '{}'",
-            envelope.message_id, exchange
-        );
 
         Ok(())
     }
 
     /// Publish a message envelope to its designated exchange
+    /// With confirms enabled, success requires an actual broker Ack. With
+    /// confirms explicitly disabled, success means unconfirmed submission only.
     pub async fn publish_envelope<T>(&self, envelope: &MessageEnvelope<T>) -> MqResult<()>
     where
         T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
@@ -178,7 +224,8 @@ impl Publisher {
         }
     }
 
-    /// Publish a raw message with custom properties
+    /// Publish a raw message with custom properties under the same configured
+    /// confirmation policy as envelopes. Disabled confirms mean submission only.
     pub async fn publish_raw(
         &self,
         exchange: &str,
@@ -202,7 +249,7 @@ impl Publisher {
             )
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(confirmation) => self.finish_publication(confirmation).await.map(|_| ()),
             Err(e) => {
                 let first_err = MqError::Publish(format!("Failed to publish raw message: {}", e));
                 if !Self::is_recoverable_publish_error(&first_err) {
@@ -214,7 +261,7 @@ impl Publisher {
                 );
                 self.reset_channel().await?;
                 let retry_channel = { self.channel.read().await.clone() };
-                retry_channel
+                let confirmation = retry_channel
                     .basic_publish(
                         exchange.into(),
                         routing_key.into(),
@@ -226,7 +273,7 @@ impl Publisher {
                     .map_err(|e| {
                         MqError::Publish(format!("Failed to publish raw message: {}", e))
                     })?;
-                Ok(())
+                self.finish_publication(confirmation).await.map(|_| ())
             }
         }
     }
@@ -258,6 +305,66 @@ mod tests {
 
         assert!(config.confirm_publish);
         assert_eq!(config.timeout_secs, 5);
+    }
+
+    #[test]
+    fn actual_broker_ack_is_the_confirmed_success_case() {
+        assert_eq!(
+            classify_confirmation(true, Confirmation::Ack(None)).unwrap(),
+            PublishConfirmation::Acknowledged
+        );
+    }
+
+    #[test]
+    fn actual_broker_nack_is_a_publish_error_not_an_inline_republish_trigger() {
+        for requested in [true, false] {
+            let error = classify_confirmation(requested, Confirmation::Nack(None)).unwrap_err();
+            assert!(matches!(&error, MqError::Publish(_)));
+            assert_eq!(
+                error.to_string(),
+                "Publishing error: Broker negatively acknowledged publication"
+            );
+            assert!(error.is_retriable());
+            assert!(!Publisher::is_recoverable_publish_error(&error));
+        }
+    }
+
+    #[test]
+    fn missing_requested_confirmation_is_not_success_or_an_inline_retry() {
+        let error = classify_confirmation(true, Confirmation::NotRequested).unwrap_err();
+        assert!(matches!(&error, MqError::Publish(_)));
+        assert_eq!(
+            error.to_string(),
+            "Publishing error: Publisher confirmation was requested but was not supplied"
+        );
+        assert!(!Publisher::is_recoverable_publish_error(&error));
+    }
+
+    #[test]
+    fn explicitly_disabled_confirms_mean_unconfirmed_submission_not_ack() {
+        assert_eq!(
+            classify_confirmation(false, Confirmation::NotRequested).unwrap(),
+            PublishConfirmation::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn classifier_does_not_change_default_or_explicit_confirmation_policy() {
+        let default: PublisherConfig =
+            serde_json::from_value(serde_json::json!({"exchange":"test.exchange"})).unwrap();
+        let disabled: PublisherConfig = serde_json::from_value(
+            serde_json::json!({"exchange":"test.exchange","confirm_publish":false}),
+        )
+        .unwrap();
+        assert!(default.confirm_publish);
+        assert!(!disabled.confirm_publish);
+        assert_eq!(
+            classify_confirmation(disabled.confirm_publish, Confirmation::NotRequested).unwrap(),
+            PublishConfirmation::Unconfirmed
+        );
+        assert!(
+            classify_confirmation(default.confirm_publish, Confirmation::NotRequested).is_err()
+        );
     }
 
     // Integration tests would require a running RabbitMQ instance

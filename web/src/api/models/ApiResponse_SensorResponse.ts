@@ -51,6 +51,10 @@ export type ApiResponse_SensorResponse = {
     log_retention_limit?: number | null;
     log_retention_policy?: null | RetentionPolicyType;
     /**
+     * Current immutable executable/purpose admission over pinned code bytes.
+     */
+    managed_metadata_revision?: number | null;
+    /**
      * Pack ID (optional)
      */
     pack?: number | null;

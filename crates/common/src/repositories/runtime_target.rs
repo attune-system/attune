@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
+mod native_wait;
 
 use crate::{
     models::{ArtifactVisibility, Id, OwnerType},
@@ -27,7 +28,7 @@ pub enum ComponentTarget {
 }
 
 impl ComponentTarget {
-    fn metadata(self) -> (&'static str, Resource, bool) {
+    pub(crate) fn metadata(self) -> (&'static str, Resource, bool) {
         match self {
             Self::Action => ("action", Resource::Actions, true),
             Self::Policy => ("policy", Resource::Policies, true),
@@ -48,6 +49,8 @@ pub enum RuntimeTarget {
     Execution(Id),
     Enforcement(Id),
     QueueItem(Id),
+    /// Prospective item or queue-scoped item collection, not queue metadata.
+    QueueItems(Id),
     Inquiry(Id),
     Key(Id),
     Artifact(Id),
@@ -65,6 +68,7 @@ pub enum RuntimeTarget {
 /// Constructed only by repository resolution. Callers cannot supply a pack ID
 /// inferred from user-controlled refs and claim it is a resolved owner.
 pub struct ResolvedRuntimeTarget {
+    kind: &'static str,
     resource: Resource,
     pack_id: Option<Id>,
     owner_id: Option<Id>,
@@ -73,6 +77,30 @@ pub struct ResolvedRuntimeTarget {
 }
 
 impl ResolvedRuntimeTarget {
+    pub fn identity_kind(&self) -> &'static str {
+        self.kind
+    }
+    /// Preserve authenticated historical classification without changing the
+    /// surviving Key identity or its concrete repository-resolved ownership.
+    pub(super) fn recorded_key(
+        mut self,
+        original: &crate::secret_provenance::KeyOrigin,
+    ) -> Option<Self> {
+        if self.kind != "key"
+            || self.resource != Resource::Keys
+            || self.context.target_id != Some(original.key_id)
+            || self.context.target_ref.as_deref() != Some(original.key_ref.as_str())
+            || self.context.owner_type != Some(original.owner_type)
+            || self.context.owner_identity_id != original.owner_identity
+            || self.context.owner_ref != original.owner_ref
+        {
+            return None;
+        }
+        self.context.encrypted = Some(original.encrypted);
+        self.accepts_new_effects = false;
+        Some(self)
+    }
+
     pub fn resource(&self) -> Resource {
         self.resource
     }
@@ -102,8 +130,15 @@ pub enum ProspectiveDataOwner {
 }
 
 pub enum ProspectiveRuntimeTarget<'a> {
-    Key { local_ref: &'a str, encrypted: bool },
+    Key {
+        local_ref: &'a str,
+        encrypted: bool,
+    },
     CacheNamespace(&'a str),
+    Artifact {
+        reference: &'a str,
+        visibility: ArtifactVisibility,
+    },
 }
 
 impl TryFrom<&super::cache::CacheOwnerScope> for ProspectiveDataOwner {
@@ -124,6 +159,109 @@ impl TryFrom<&super::cache::CacheOwnerScope> for ProspectiveDataOwner {
 }
 
 impl RuntimeTargetRepository {
+    /// Resolve a proposed queue against its actual parent. The proposed ref
+    /// cannot establish local ownership, and unowned queues remain external.
+    pub async fn resolve_queue_creation(
+        connection: &mut PgConnection,
+        pack: Option<Id>,
+        reference: &str,
+        sponsor_identity: Id,
+    ) -> Result<Option<ResolvedRuntimeTarget>> {
+        positive_id(sponsor_identity)?;
+        super::schema_type::SchemaTypeRepository::lock_selection(connection).await?;
+        let mut context = AuthorizationContext::new(sponsor_identity);
+        context.target_ref = Some(reference.to_owned());
+        match pack {
+            Some(id) => match pack_ref(connection, id).await? {
+                Some(_) => {}
+                None => return Ok(None),
+            },
+            None => {}
+        }
+        // API-created queue definitions are ad hoc components. Association
+        // with a pack is not management_origin='pack' ownership. Creation
+        // therefore needs an external approval, just like later operations.
+        Ok(Some(ResolvedRuntimeTarget {
+            kind: "work_queue",
+            resource: Resource::Queues,
+            pack_id: None,
+            owner_id: None,
+            context,
+            accepts_new_effects: true,
+        }))
+    }
+    /// Cache pages keep their original generation and exact frozen namespace
+    /// owner. Pointer rotation is neither target selection nor source authority.
+    pub async fn resolve_native_cache_source(
+        connection: &mut PgConnection,
+        source: &super::native_input_disclosure::PreparedCacheSource,
+        principal: Id,
+    ) -> Result<ResolvedRuntimeTarget> {
+        source.ensure_held_on(connection).await?;
+        let mut target = Self::resolve(
+            connection,
+            RuntimeTarget::CacheNamespace(source.metadata().target().id),
+            principal,
+        )
+        .await?
+        .ok_or_else(|| {
+            Error::PermissionDenied("Native cache source owner is unavailable".into())
+        })?;
+        if super::runtime_read::RuntimeReadOwner::of(&target) != *source.metadata().read_owner() {
+            return Err(Error::PermissionDenied(
+                "Native cache source owner is unavailable".into(),
+            ));
+        }
+        source.ensure_fresh()?;
+        target.accepts_new_effects = false;
+        Ok(target)
+    }
+    /// Read-only target from authenticated native execution-wait evidence. A
+    /// raw execution may be collected; its original release/owner/admission and
+    /// output schema remain bound by the native archive and retaining receipt.
+    pub async fn resolve_execution_wait_source(
+        connection: &mut PgConnection,
+        source: &super::native_input_disclosure::PreparedWaitSource,
+        principal: Id,
+    ) -> Result<ResolvedRuntimeTarget> {
+        source.ensure_held_on(connection).await?;
+        archived_execution(
+            connection,
+            source.metadata().target(),
+            source.metadata().read_owner(),
+            source.release(),
+            source.release_digest(),
+            source.action_ref(),
+            principal,
+        )
+        .await
+    }
+
+    pub async fn resolve_native_success_source(
+        connection: &mut PgConnection,
+        source: &super::native_input_disclosure::PreparedSuccessSource,
+        principal: Id,
+    ) -> Result<Vec<ResolvedRuntimeTarget>> {
+        source.ensure_held_on(connection).await?;
+        let mut targets = Vec::new();
+        for original in source.targets() {
+            targets.push(
+                archived_execution(
+                    connection,
+                    &original.target,
+                    &original.owner,
+                    original.release,
+                    &original.release_digest,
+                    &original.action_ref,
+                    principal,
+                )
+                .await?,
+            );
+        }
+        source.ensure_fresh()?;
+        Ok(targets)
+    }
+
     /// Resolve and lock the actual prospective owner before checking creation
     /// or uniqueness. A proposed ref alone never establishes pack ownership.
     pub async fn resolve_creation_target(
@@ -201,6 +339,10 @@ impl RuntimeTargetRepository {
                 super::cache::validate_namespace_name(namespace)?;
                 (Resource::Caches, namespace.to_string(), None)
             }
+            ProspectiveRuntimeTarget::Artifact { reference, .. } => {
+                super::artifact::validate_artifact_ref(reference)?;
+                (Resource::Artifacts, reference.to_string(), None)
+            }
         };
         let mut context = AuthorizationContext::new(sponsor_identity);
         context.target_ref = Some(reference);
@@ -212,13 +354,22 @@ impl RuntimeTargetRepository {
             None
         };
         context.encrypted = encrypted;
+        if let ProspectiveRuntimeTarget::Artifact { visibility, .. } = target {
+            context.visibility = Some(visibility);
+        }
         let pack_id = if let Some(pack) = pack_id {
             context.pack_ref = pack_ref(connection, pack).await?;
             context.pack_ref.as_ref().map(|_| pack)
         } else {
             None
         };
+        context.managing_pack_id = pack_id;
         Ok(Some(ResolvedRuntimeTarget {
+            kind: if resource == Resource::Keys {
+                "key"
+            } else {
+                "cache_namespace"
+            },
             resource,
             pack_id,
             owner_id,
@@ -312,6 +463,13 @@ impl RuntimeTargetRepository {
                     .await?
                     .and_then(|parent| parent.pack);
                 (Resource::QueueItems, id, parent, true)
+            }
+            RuntimeTarget::QueueItems(id) => {
+                let Some(parent) = component(connection, ComponentTarget::Queue, id).await? else {
+                    return Ok(None);
+                };
+                context.target_ref = Some(parent.reference);
+                (Resource::QueueItems, id, parent.pack, true)
             }
             RuntimeTarget::Inquiry(id) => {
                 positive_id(id)?;
@@ -408,50 +566,68 @@ impl RuntimeTargetRepository {
             }
             RuntimeTarget::Artifact(id) => {
                 positive_id(id)?;
-                let row: Option<(String, OwnerType, String, ArtifactVisibility)> = sqlx::query_as(
-                    "SELECT ref, scope, owner, visibility FROM artifact WHERE id = $1 FOR SHARE",
+                let row: Option<(
+                    String,
+                    OwnerType,
+                    String,
+                    ArtifactVisibility,
+                    Option<Id>,
+                    Option<Id>,
+                )> = sqlx::query_as(
+                    "SELECT a.ref, a.scope, a.owner, a.visibility, b.owner_id, b.managing_pack \
+                     FROM artifact a JOIN artifact_runtime_owner_binding b \
+                       ON b.artifact = a.id AND b.owner_type = a.scope AND b.owner_ref = a.owner \
+                     WHERE a.id = $1 FOR SHARE OF a, b",
                 )
                 .bind(id)
                 .fetch_optional(&mut *connection)
                 .await?;
-                let Some((reference, scope, owner, visibility)) = row else {
+                let Some((reference, scope, owner, visibility, bound_owner, bound_pack)) = row
+                else {
                     return Ok(None);
                 };
                 context.target_ref = Some(reference);
                 context.owner_type = Some(scope);
                 context.owner_ref = Some(owner.clone());
                 context.visibility = Some(visibility);
-                let parent = match scope {
+                owner_id = bound_owner;
+                let (parent, available) = match scope {
                     OwnerType::Pack => {
-                        let pack =
-                            sqlx::query_scalar("SELECT id FROM pack WHERE ref = $1 FOR SHARE")
-                                .bind(&owner)
-                                .fetch_optional(&mut *connection)
-                                .await?;
-                        owner_id = pack;
-                        pack
+                        let current = match bound_owner {
+                            Some(id) => pack_ref(connection, id).await?,
+                            None => None,
+                        };
+                        let available = current.as_deref() == Some(owner.as_str());
+                        (if available { bound_pack } else { None }, available)
                     }
                     OwnerType::Action | OwnerType::Sensor => {
-                        let table = if scope == OwnerType::Action {
-                            "action"
+                        let kind = if scope == OwnerType::Action {
+                            ComponentTarget::Action
                         } else {
-                            "sensor"
+                            ComponentTarget::Sensor
                         };
-                        let query = format!("SELECT id, CASE WHEN management_origin = 'pack' THEN pack ELSE NULL END FROM {table} WHERE ref = $1 FOR SHARE");
-                        let component: Option<(Id, Option<Id>)> = sqlx::query_as(&query)
-                            .bind(&owner)
-                            .fetch_optional(&mut *connection)
-                            .await?;
-                        owner_id = component.as_ref().map(|(id, _)| *id);
-                        component.and_then(|(_, pack)| pack)
+                        let current = match bound_owner {
+                            Some(id) => component(connection, kind, id).await?,
+                            None => None,
+                        };
+                        match current {
+                            Some(current)
+                                if current.reference == owner && current.pack == bound_pack =>
+                            {
+                                (bound_pack, current.owner_available)
+                            }
+                            _ => (None, false),
+                        }
                     }
                     OwnerType::Identity => {
-                        context.owner_identity_id = owner.parse::<Id>().ok();
-                        None
+                        context.owner_identity_id = bound_owner;
+                        // Existing structural ownership is retained authority,
+                        // not a live dependency on a human owner account.
+                        (None, bound_owner.is_some())
                     }
-                    OwnerType::System => None,
+                    OwnerType::System => (None, true),
                 };
-                (Resource::Artifacts, id, parent, true)
+                (Resource::Artifacts, id, parent, available)
             }
             RuntimeTarget::RuntimeVersion(id) => {
                 positive_id(id)?;
@@ -491,7 +667,11 @@ impl RuntimeTargetRepository {
                 (Resource::Events, id, parent, true)
             }
         };
-        context.target_id = Some(id);
+        context.target_id = if matches!(target, RuntimeTarget::QueueItems(_)) {
+            None
+        } else {
+            Some(id)
+        };
         let pack_id = match pack_id {
             Some(id) => match pack_ref(connection, id).await? {
                 Some(reference) => {
@@ -502,7 +682,22 @@ impl RuntimeTargetRepository {
             },
             None => None,
         };
+        context.managing_pack_id = pack_id;
         Ok(Some(ResolvedRuntimeTarget {
+            kind: match target {
+                RuntimeTarget::Pack(_) => "pack",
+                RuntimeTarget::Component(component, _) => component.metadata().0,
+                RuntimeTarget::Execution(_) => "execution",
+                RuntimeTarget::Enforcement(_) => "enforcement",
+                RuntimeTarget::QueueItem(_) | RuntimeTarget::QueueItems(_) => "work_queue_item",
+                RuntimeTarget::Inquiry(_) => "inquiry",
+                RuntimeTarget::Key(_) => "key",
+                RuntimeTarget::Artifact(_) => "artifact",
+                RuntimeTarget::CacheNamespace(_) => "cache_namespace",
+                RuntimeTarget::RuntimeVersion(_) => "runtime_version",
+                RuntimeTarget::Event { .. } => "event",
+                RuntimeTarget::EventTrigger(_) => "trigger",
+            },
             resource,
             pack_id,
             owner_id,
@@ -625,4 +820,55 @@ async fn owner_pack(
         },
         OwnerType::System | OwnerType::Identity => Ok(None),
     }
+}
+
+async fn archived_execution(
+    connection: &mut PgConnection,
+    binding: &crate::runtime_authority::BoundRuntimeTarget,
+    owner: &super::runtime_read::RuntimeReadOwner,
+    release: Id,
+    digest: &str,
+    action_ref: &str,
+    principal: Id,
+) -> Result<ResolvedRuntimeTarget> {
+    let fail = || Error::PermissionDenied("Native execution source owner is unavailable".into());
+    let release = super::pack_release::PackReleaseRepository::find_by_id(&mut *connection, release)
+        .await?
+        .ok_or_else(fail)?;
+    if release.digest != digest || Some(release.pack) != binding.pack_id {
+        return Err(fail());
+    }
+    let reference = owner.execution_reference(binding, action_ref)?;
+    let current_pack = pack_ref(connection, release.pack).await?.ok_or_else(fail)?;
+    if current_pack != release.pack_ref {
+        return Err(fail());
+    }
+    let mut context = AuthorizationContext::new(principal);
+    context.target_id = Some(binding.id);
+    context.target_ref = Some(reference.to_owned());
+    context.pack_ref = Some(current_pack);
+    context.managing_pack_id = Some(release.pack);
+    let resolved = ResolvedRuntimeTarget {
+        kind: "execution",
+        resource: Resource::Executions,
+        pack_id: Some(release.pack),
+        owner_id: None,
+        context,
+        accepts_new_effects: false,
+    };
+    if super::runtime_read::RuntimeReadOwner::of(&resolved) != *owner {
+        return Err(fail());
+    }
+    if let Some(current) = RuntimeTargetRepository::resolve(
+        connection,
+        RuntimeTarget::Execution(binding.id),
+        principal,
+    )
+    .await?
+    {
+        if super::runtime_read::RuntimeReadOwner::of(&current) != *owner {
+            return Err(fail());
+        }
+    }
+    Ok(resolved)
 }

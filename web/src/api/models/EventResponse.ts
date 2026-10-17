@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { EventExecutionEmitterResponse } from "./EventExecutionEmitterResponse";
 import type { i64 } from "./i64";
 /**
  * Full event response with all details
@@ -15,6 +16,7 @@ export type EventResponse = {
    * Creation timestamp
    */
   created: string;
+  execution_emitter?: null | EventExecutionEmitterResponse;
   /**
    * Event ID
    */

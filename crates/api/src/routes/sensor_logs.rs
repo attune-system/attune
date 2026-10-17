@@ -286,6 +286,9 @@ async fn read_sensor_log_tail(
     tail: usize,
 ) -> ApiResult<String> {
     let versions = ArtifactVersionRepository::list_by_artifact(&state.db, artifact_id).await?;
+    let mut receipts =
+        crate::receipt_disclosure::HumanReceiptGuard::for_rows(state, user, &[]).await?;
+    let mut selected_versions = Vec::new();
     let mut newest_chunks = Vec::new();
     let mut bytes = 0_usize;
     let mut newlines = 0_usize;
@@ -294,8 +297,10 @@ async fn read_sensor_log_tail(
         if bytes >= SENSOR_LOG_TAIL_MAX_BYTES || newlines > tail {
             break;
         }
-        crate::secret_disclosure::authorize_sensor_runtime_log(state, user, version.id, sensor_ref)
-            .await?;
+        // Only source preparation is allowed during collection. Reader target
+        // checks run after the final selected version's sources are prepared.
+        receipts.prepare_sensor_logs(state, &[version.id]).await?;
+        selected_versions.push(version.id);
         let remaining = SENSOR_LOG_TAIL_MAX_BYTES - bytes;
         let chunk = if let Some(log_stream) =
             LogStreamRepository::find_by_artifact_version(&state.db, version.id).await?
@@ -310,9 +315,6 @@ async fn read_sensor_log_tail(
         } else {
             Vec::new()
         };
-        crate::secret_disclosure::authorize_sensor_runtime_log(state, user, version.id, sensor_ref)
-            .await?;
-        ensure_visible_sensor(state, user, sensor_ref).await?;
         bytes += chunk.len();
         newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
         if !chunk.is_empty() {
@@ -328,6 +330,21 @@ async fn read_sensor_log_tail(
     let mut result = lines[start..].join("\n");
     if !result.is_empty() {
         result.push('\n');
+    }
+    let receipts = receipts.shared();
+    for version in selected_versions {
+        crate::secret_disclosure::authorize_sensor_runtime_log_prepared(
+            state, user, version, sensor_ref, &receipts,
+        )
+        .await?;
+    }
+    ensure_visible_sensor(state, user, sensor_ref).await?;
+    let receipts = crate::receipt_disclosure::HumanReceiptGuard::finish_shared(receipts).await?;
+    receipts.ensure_fresh()?;
+    if user.claims.exp <= chrono::Utc::now().timestamp() {
+        return Err(ApiError::Unauthorized(
+            "Sensor log credential expired".into(),
+        ));
     }
     Ok(result)
 }

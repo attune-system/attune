@@ -41,7 +41,8 @@ use attune_common::{
 use crate::auth::{jwt::TokenType, middleware::AuthenticatedUser, RequireAuth};
 use crate::routes::visibility::{
     action_name, build_visibility_read_scope, has_unconstrained_resource_action,
-    is_scoped_identity_token, resource_action_grant_exists, scope_allows_resource_ref,
+    is_scoped_identity_token, resource_action_grant_exists, scope_allows_owned_resource_ref,
+    VisibilityOwners,
 };
 use crate::{
     dto::{
@@ -172,7 +173,40 @@ pub async fn create_event(
     let mut tx = state.db.begin().await?;
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut *tx)
         .await?;
-    let recorded_authority = user.0.recorded_runtime_authority(&mut tx).await?;
+    let recorded_authority = user.0.validate_recorded_runtime_authority(&mut tx).await?;
+    let mut input_receipts = Vec::new();
+    if let Some(authority) = &recorded_authority {
+        let execution = authority.credential_binding().execution_id;
+        let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+            &mut *tx,
+            attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
+            execution,
+        )
+        .await?;
+        if !secrets.is_empty() {
+            let key = state
+                .config
+                .security
+                .encryption_key
+                .as_deref()
+                .ok_or_else(|| ApiError::Forbidden("Event input receipt key unavailable".into()))?;
+            let (_, receipts) =
+                attune_common::repositories::immutable_input_origin::prepare_input_receipts(
+                    &mut tx,
+                    attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
+                    execution,
+                    &secrets,
+                    key,
+                )
+                .await?;
+            input_receipts = receipts;
+        }
+        attune_common::repositories::runtime_read::RuntimeReadRepository::lock_open(
+            &mut tx,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+    }
     if let Some(authority) = &recorded_authority {
         let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
             &mut tx,
@@ -287,6 +321,16 @@ pub async fn create_event(
     let mut event_origin_bytes = 0usize;
     if let Some(authority) = &recorded_authority {
         let execution_id = authority.credential_binding().execution_id;
+        attune_common::repositories::runtime_read::RuntimeReadRepository::lock_open(
+            &mut tx,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+        for origin in attune_common::repositories::runtime_read::RuntimeReadRepository::references_for_executions(
+            &mut *tx, &[execution_id],
+        ).await?.remove(&execution_id).unwrap_or_default() {
+            push_bounded_event_origin(&mut event_input_origins, &mut event_origin_bytes, origin)?;
+        }
         for secret in ExecutionSecretValueRepository::find_stored_by_entity(
             &mut *tx,
             attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
@@ -396,7 +440,21 @@ pub async fn create_event(
     } else {
         EventSchemaRepository::materialize_current(&mut tx, trigger.id, false).await?
     };
+    if payload.trace_tag.is_some()
+        && event_input_origins.iter().any(|origin| {
+            matches!(origin,
+        attune_common::secret_provenance::SecretOrigin::Entity { entity_type, .. }
+            if entity_type == attune_common::repositories::runtime_read::ENTITY_RUNTIME_READ)
+        })
+    {
+        return Err(ApiError::Forbidden(
+            "Runtime read material cannot be placed in event trace metadata".into(),
+        ));
+    }
     let mut redacted = binding.prepare(payload.payload, payload.config)?;
+    if recorded_authority.is_some() {
+        redacted.inherit_runtime_reads(&event_input_origins)?;
+    }
     if !event_input_origins.is_empty() {
         let count = redacted.payload_secrets.len() + redacted.config_secrets.len();
         if event_origin_bytes
@@ -517,30 +575,29 @@ pub async fn create_event(
             &mut tx, &event, authority,
         ).await?;
     }
-    EventSchemaRepository::attach(&mut tx, event.id, &binding).await?;
-    if !prepared_payload_secrets.is_empty() {
-        ExecutionSecretValueRepository::upsert_many_with_conn(
-            &mut tx,
-            ENTITY_EVENT_PAYLOAD,
-            event.id,
-            &prepared_payload_secrets,
-        )
-        .await?;
+    attune_common::repositories::event_origin::EventOriginRepository::capture(
+        &mut tx,
+        &event,
+        &binding,
+        &prepared_payload_secrets,
+        &prepared_config_secrets,
+    )
+    .await?;
+    if let Some(authority) = &recorded_authority {
+        authority.ensure_fresh_on(&mut tx).await?;
     }
-    if !prepared_config_secrets.is_empty() {
-        ExecutionSecretValueRepository::upsert_many_with_conn(
-            &mut tx,
-            ENTITY_EVENT_CONFIG,
-            event.id,
-            &prepared_config_secrets,
-        )
-        .await?;
+    for receipt in &input_receipts {
+        receipt.ensure_fresh_on(&mut tx).await?;
     }
     tx.commit().await?;
+    for receipt in &input_receipts {
+        receipt.ensure_fresh()?;
+    }
 
     // Publish EventCreated message to message queue if publisher is available
     if let Some(publisher) = state.get_publisher().await {
         let message_payload = EventCreatedPayload {
+            event_created: Some(event.created),
             event_id: event.id,
             trigger_id: event.trigger,
             trigger_ref: event.trigger_ref.clone(),
@@ -569,6 +626,16 @@ pub async fn create_event(
         }
     }
 
+    // Queue/publisher waits are not a grace period for the response handoff.
+    for receipt in &input_receipts {
+        receipt.ensure_fresh()?;
+    }
+    if let Some(authority) = &recorded_authority {
+        authority.ensure_fresh()?;
+    }
+    if user.0.claims.exp <= chrono::Utc::now().timestamp() {
+        return Err(ApiError::Unauthorized("Event credential expired".into()));
+    }
     let response = ApiResponse::new(EventResponse::from(event));
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -657,6 +724,21 @@ pub async fn list_events(
 
     let mut paginated_events: Vec<EventSummary> =
         result.rows.into_iter().map(EventSummary::from).collect();
+    let owners = VisibilityOwners::load(
+        &state.db,
+        &rule_read_scope,
+        &trigger_read_scope,
+        &paginated_events
+            .iter()
+            .filter_map(|row| row.rule)
+            .collect::<Vec<_>>(),
+        &paginated_events
+            .iter()
+            .filter_map(|row| row.trigger)
+            .collect::<Vec<_>>(),
+        &[],
+    )
+    .await?;
     for event in &mut paginated_events {
         if include_execution_context {
             event.trace_tag = event_trace_tags
@@ -669,6 +751,7 @@ pub async fn list_events(
             &rule_read_scope,
             &trigger_read_scope,
             global_event_read,
+            &owners,
         );
     }
 
@@ -874,19 +957,77 @@ pub async fn get_event(
                 .collect(),
         );
     }
+    let owners = VisibilityOwners::load(
+        &state.db,
+        &rule_read_scope,
+        &trigger_read_scope,
+        &response.rule.into_iter().collect::<Vec<_>>(),
+        &response.trigger.into_iter().collect::<Vec<_>>(),
+        &[],
+    )
+    .await?;
     apply_event_response_visibility(
         &mut response,
         &rule_read_scope,
         &trigger_read_scope,
         global_event_read,
+        &owners,
     );
     if response.trigger_ref == REDACTED_REF {
         response.schema_binding = None;
     }
+    response.execution_emitter =
+        visible_execution_emitter(&state, &user, &event, grants.as_deref()).await?;
 
     let response = ApiResponse::new(response);
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+async fn visible_execution_emitter(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    event: &attune_common::models::Event,
+    grants: Option<&[Grant]>,
+) -> ApiResult<Option<crate::dto::event::EventExecutionEmitterResponse>> {
+    // This projection is for interactive inspection, not a new runtime-token
+    // consumer. In particular, a sensor's event access is not execution access.
+    if user.claims.token_type != TokenType::Access {
+        return Ok(None);
+    }
+    let mut connection = state.db.acquire().await?;
+    let emitter = attune_common::repositories::execution_event_emitter::ExecutionEventEmitterRepository::find(
+        &mut connection, event.id, event.created,
+    ).await?;
+    drop(connection);
+    let Some(emitter) = emitter else {
+        return Ok(None);
+    };
+    if grants.is_some_and(|grants| {
+        has_unconstrained_resource_action(grants, Resource::Executions, RbacAction::Read)
+    }) {
+        return Ok(Some(emitter.into()));
+    }
+    let Some(execution) = ExecutionRepository::find_by_id(&state.db, emitter.execution_id).await?
+    else {
+        // A retained emitter is not sufficient to reconstruct a removed
+        // workflow visibility anchor, ancestry or requester ownership.
+        return Ok(None);
+    };
+    match crate::routes::executions::authorize_execution_access(
+        state,
+        user,
+        &execution,
+        RbacAction::Read,
+        None,
+        &mut crate::routes::executions::ExecutionVisibilityCache::default(),
+    )
+    .await
+    {
+        Ok(()) => Ok(Some(emitter.into())),
+        Err(ApiError::Forbidden(_) | ApiError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// List all enforcements with pagination and optional filters
@@ -982,6 +1123,21 @@ pub async fn list_enforcements(
         .into_iter()
         .map(EnforcementSummary::from)
         .collect();
+    let owners = VisibilityOwners::load(
+        &state.db,
+        &rule_read_scope,
+        &trigger_read_scope,
+        &paginated_enforcements
+            .iter()
+            .filter_map(|row| row.rule)
+            .collect::<Vec<_>>(),
+        &[],
+        &paginated_enforcements
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     for enforcement in &mut paginated_enforcements {
         if include_execution_context {
             enforcement.trace_tag = enforcement_trace_tags.get(&enforcement.id).cloned();
@@ -991,6 +1147,7 @@ pub async fn list_enforcements(
             &rule_read_scope,
             &trigger_read_scope,
             global_enforcement_read,
+            &owners,
         );
     }
 
@@ -1126,22 +1283,33 @@ fn apply_event_summary_visibility(
     rule_scope: &VisibilityReadScope,
     trigger_scope: &VisibilityReadScope,
     global_event_read: bool,
+    owners: &VisibilityOwners,
 ) {
     if global_event_read {
         return;
     }
 
-    if !scope_allows_resource_ref(rule_scope, event.rule, event.rule_ref.as_deref()) {
+    if !scope_allows_owned_resource_ref(
+        rule_scope,
+        event.rule,
+        event.rule_ref.as_deref(),
+        owners.rule_pack(event.rule, event.rule_ref.as_deref()),
+    ) {
         event.rule = None;
         event.rule_ref = None;
     }
 
-    let trigger_visible = scope_allows_resource_ref(
+    let trigger_visible = scope_allows_owned_resource_ref(
         trigger_scope,
         event.trigger,
         Some(event.trigger_ref.as_str()),
+        owners.trigger_pack(event.trigger, &event.trigger_ref),
     );
-    if !(trigger_visible || (event.rule.is_none() && trigger_scope.include_public)) {
+    if !(trigger_visible
+        || (event.rule.is_none()
+            && trigger_scope.include_public
+            && owners.trigger_public(event.trigger, &event.trigger_ref)))
+    {
         event.trigger = None;
         event.trigger_ref = REDACTED_REF.to_string();
     }
@@ -1152,22 +1320,33 @@ fn apply_event_response_visibility(
     rule_scope: &VisibilityReadScope,
     trigger_scope: &VisibilityReadScope,
     global_event_read: bool,
+    owners: &VisibilityOwners,
 ) {
     if global_event_read {
         return;
     }
 
-    if !scope_allows_resource_ref(rule_scope, event.rule, event.rule_ref.as_deref()) {
+    if !scope_allows_owned_resource_ref(
+        rule_scope,
+        event.rule,
+        event.rule_ref.as_deref(),
+        owners.rule_pack(event.rule, event.rule_ref.as_deref()),
+    ) {
         event.rule = None;
         event.rule_ref = None;
     }
 
-    let trigger_visible = scope_allows_resource_ref(
+    let trigger_visible = scope_allows_owned_resource_ref(
         trigger_scope,
         event.trigger,
         Some(event.trigger_ref.as_str()),
+        owners.trigger_pack(event.trigger, &event.trigger_ref),
     );
-    if !(trigger_visible || (event.rule.is_none() && trigger_scope.include_public)) {
+    if !(trigger_visible
+        || (event.rule.is_none()
+            && trigger_scope.include_public
+            && owners.trigger_public(event.trigger, &event.trigger_ref)))
+    {
         event.trigger = None;
         event.trigger_ref = REDACTED_REF.to_string();
     }
@@ -1178,21 +1357,29 @@ fn apply_enforcement_summary_visibility(
     rule_scope: &VisibilityReadScope,
     trigger_scope: &VisibilityReadScope,
     global_enforcement_read: bool,
+    owners: &VisibilityOwners,
 ) {
     if global_enforcement_read {
         return;
     }
 
-    if !scope_allows_resource_ref(
+    if !scope_allows_owned_resource_ref(
         rule_scope,
         enforcement.rule,
         Some(enforcement.rule_ref.as_str()),
+        owners.rule_pack(enforcement.rule, Some(&enforcement.rule_ref)),
     ) {
         enforcement.rule = None;
         enforcement.rule_ref = REDACTED_REF.to_string();
     }
 
-    if !scope_allows_resource_ref(trigger_scope, None, Some(enforcement.trigger_ref.as_str())) {
+    let (trigger, pack) = owners.enforcement_trigger(enforcement.id, &enforcement.trigger_ref);
+    if !scope_allows_owned_resource_ref(
+        trigger_scope,
+        trigger,
+        Some(enforcement.trigger_ref.as_str()),
+        pack,
+    ) {
         enforcement.trigger_ref = REDACTED_REF.to_string();
     }
 }
@@ -1202,21 +1389,29 @@ fn apply_enforcement_response_visibility(
     rule_scope: &VisibilityReadScope,
     trigger_scope: &VisibilityReadScope,
     global_enforcement_read: bool,
+    owners: &VisibilityOwners,
 ) {
     if global_enforcement_read {
         return;
     }
 
-    if !scope_allows_resource_ref(
+    if !scope_allows_owned_resource_ref(
         rule_scope,
         enforcement.rule,
         Some(enforcement.rule_ref.as_str()),
+        owners.rule_pack(enforcement.rule, Some(&enforcement.rule_ref)),
     ) {
         enforcement.rule = None;
         enforcement.rule_ref = REDACTED_REF.to_string();
     }
 
-    if !scope_allows_resource_ref(trigger_scope, None, Some(enforcement.trigger_ref.as_str())) {
+    let (trigger, pack) = owners.enforcement_trigger(enforcement.id, &enforcement.trigger_ref);
+    if !scope_allows_owned_resource_ref(
+        trigger_scope,
+        trigger,
+        Some(enforcement.trigger_ref.as_str()),
+        pack,
+    ) {
         enforcement.trigger_ref = REDACTED_REF.to_string();
     }
 }
@@ -1488,11 +1683,21 @@ pub async fn get_enforcement(
         .await?;
         emit_enforcement_secret_disclosure_audit(&state, &user, &enforcement, reveal_paths);
     }
+    let owners = VisibilityOwners::load(
+        &state.db,
+        &rule_read_scope,
+        &trigger_read_scope,
+        &response.rule.into_iter().collect::<Vec<_>>(),
+        &[],
+        &[response.id],
+    )
+    .await?;
     apply_enforcement_response_visibility(
         &mut response,
         &rule_read_scope,
         &trigger_read_scope,
         global_enforcement_read,
+        &owners,
     );
 
     let response = ApiResponse::new(response);

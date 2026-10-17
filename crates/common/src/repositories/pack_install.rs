@@ -24,6 +24,21 @@ pub const PACK_INSTALL_ACTIVE_TTL_SECS: i64 = 7 * 60 * 60;
 pub const PACK_INSTALL_ACTIVATION_TTL_SECS: i64 = 15 * 60;
 
 impl PackInstallRepository {
+    /// Freeze test/archive evidence in the activation transaction, not through a
+    /// second pool connection or a stale response projection.
+    pub async fn find_by_id_for_update(
+        connection: &mut PgConnection,
+        id: Id,
+    ) -> Result<Option<PackInstall>> {
+        sqlx::query_as(&format!(
+            "SELECT {PACK_INSTALL_COLUMNS} FROM pack_install WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(id)
+        .fetch_optional(connection)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Record the public deployment outcome independently of the candidate test outcome.
     pub async fn record_diagnostics(
         &self,

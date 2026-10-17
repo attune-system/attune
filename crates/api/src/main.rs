@@ -53,11 +53,12 @@ struct Args {
     #[arg(long)]
     migrate: bool,
 
-    /// Upgrade legacy pack releases from the configured packs directory and exit
+    /// Check for legacy packs requiring explicit API readmission and exit
     #[arg(
         long = "upgrade-pack-releases",
-        long_help = "Upgrade legacy pack releases from the configured packs directory and exit.\n\
-                     Assumes migrations are already applied unless --migrate is also passed."
+        long_help = "Check for legacy packs requiring explicit API upload/register readmission and exit.\n\
+                     Does not freeze or activate unadmitted metadata. Assumes migrations are applied unless --migrate is passed.\n\
+                     Example: attune-api --upgrade-pack-releases"
     )]
     upgrade_pack_releases: bool,
 }
@@ -418,10 +419,14 @@ async fn main() -> Result<()> {
     let stale_install_pool = database.pool().clone();
     let stale_install_packs_dir = config.packs_base_dir.clone();
     tokio::spawn(async move {
+        let candidate_effect_pool = stale_install_pool.clone();
         let repository = PackInstallRepository::new(stale_install_pool);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
+            if let Err(error) = attune_common::repositories::candidate_effect::CandidateEffectRepository::purge_expired(&candidate_effect_pool, 100).await {
+                warn!(%error, "Failed to purge expired candidate API effects");
+            }
             match repository.fail_stale_active().await {
                 Ok(installs) => {
                     for install in installs {
@@ -550,14 +555,21 @@ async fn main() -> Result<()> {
     info!("Attune API Service is ready");
 
     let shutdown_streams = state.execution_log_streams.clone();
+    let shutdown_files = state.file_transfers.clone();
+    let file_shutdown_grace =
+        std::time::Duration::from_secs(state.config.server.shutdown_grace_period);
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("Received shutdown signal");
         shutdown_streams.begin_shutdown();
+        if !shutdown_files.drain(file_shutdown_grace).await {
+            warn!("File publication shutdown canceled and joined local tasks; unresolved provider operations remain owned");
+        }
     });
 
     let server_result = server.run().await;
     state.execution_log_streams.begin_shutdown();
+    state.file_transfers.drain(file_shutdown_grace).await;
     if let Err(error) = callback_delivery_monitor.await {
         tracing::error!(%error, "Inquiry callback delivery monitor failed");
     }

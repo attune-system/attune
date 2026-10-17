@@ -126,6 +126,7 @@ impl SensorWorkloadAdmissionRepository {
         input: SensorWorkloadLeaseInput,
     ) -> Result<RenewEligibleSensorWorkloadOutcome> {
         let mut tx = pool.begin().await?;
+        super::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
         SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
         if !SensorAdmissionRepository::worker_is_eligible_for_active_workload(
             &mut tx,

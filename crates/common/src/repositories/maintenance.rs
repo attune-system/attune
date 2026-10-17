@@ -221,6 +221,29 @@ impl MaintenanceRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// An outside candidate is not deletion authority. Recheck the current
+    /// policy/version frontier only after the GC transaction entered the graph
+    /// exclusively, before claiming physical cleanup or touching any file.
+    pub async fn claim_expired_artifact_version(
+        connection: &mut sqlx::PgConnection,
+        id: i64,
+    ) -> Result<Option<ExpiredArtifactVersion>> {
+        let held: bool = sqlx::query_scalar("SELECT file_evidence_graph_held(true)")
+            .fetch_one(&mut *connection)
+            .await?;
+        if !held {
+            return Err(crate::Error::invalid_state(
+                "Artifact reclamation must enter exclusive graph admission at transaction entry",
+            ));
+        }
+        Ok(sqlx::query_as(&format!(
+            "SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version \
+             FROM artifact_version av JOIN artifact a ON a.id=av.artifact \
+             WHERE av.id=$1 AND {} FOR UPDATE OF av,a",
+            expired_artifact_version_predicate()
+        )).bind(id).fetch_optional(connection).await?)
+    }
+
     pub async fn refresh_or_delete_artifact_metadata(
         pool: &PgPool,
         artifact_id: i64,
@@ -228,9 +251,10 @@ impl MaintenanceRepository {
         let refreshed = sqlx::query(
             "WITH latest AS (
                 SELECT size_bytes, content_type
-                FROM artifact_version
-                WHERE artifact = $1
-                ORDER BY version DESC
+                 FROM artifact_version
+                 WHERE artifact = $1
+                   AND (body_state IS NULL OR body_state = 'ready')
+                 ORDER BY version DESC
                 LIMIT 1
              )
              UPDATE artifact a
@@ -452,15 +476,18 @@ impl MaintenanceRepository {
         .map_err(Into::into)
     }
 
-    pub async fn mark_execution_reschedule_attempt(
-        pool: &PgPool,
+    pub async fn mark_execution_reschedule_attempt<'e, E>(
+        executor: E,
         execution_id: Id,
         source: &str,
         reason: &str,
         max_attempts: u32,
         grace_seconds: u64,
         ignore_backoff: bool,
-    ) -> Result<Option<ExecutionRescheduleAttempt>> {
+    ) -> Result<Option<ExecutionRescheduleAttempt>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let cutoff = seconds_ago(grace_seconds);
         sqlx::query_as::<_, ExecutionRescheduleAttempt>(
             "WITH candidate AS (
@@ -516,7 +543,7 @@ impl MaintenanceRepository {
         .bind(reason)
         .bind(source)
         .bind(ignore_backoff)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(Into::into)
     }
@@ -840,17 +867,17 @@ impl MaintenanceRepository {
 }
 
 fn expired_artifact_version_predicate() -> &'static str {
-    "(av.body_state IS NULL OR av.body_state = 'ready') AND (
+    "file_evidence_version_eligible(av.id) AND (av.body_state IS NULL OR av.body_state = 'ready') AND (
         (a.retention_policy = 'days' AND av.created < NOW() - make_interval(days => a.retention_limit))
         OR (a.retention_policy = 'hours' AND av.created < NOW() - make_interval(hours => a.retention_limit))
         OR (a.retention_policy = 'minutes' AND av.created < NOW() - make_interval(mins => a.retention_limit))
         OR (
             a.retention_policy = 'versions'
             AND a.retention_limit > 0
-            AND EXISTS (
-                SELECT 1 FROM log_stream retained_stream
-                WHERE retained_stream.artifact_version = av.id
-                  AND (retained_stream.backend = 'shared_file' OR retained_stream.sealed)
+            AND NOT EXISTS (
+                SELECT 1 FROM log_stream active_stream
+                WHERE active_stream.artifact_version = av.id
+                  AND active_stream.backend <> 'shared_file' AND NOT active_stream.sealed
             )
             AND (
                 SELECT COUNT(*) FROM artifact_version newer

@@ -112,10 +112,19 @@ fi
 # Exercise the Make recipe without provisioning storage or running Cargo.
 cat > "$TMP_ROOT/ci-bin/docker" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
 printf '%s\n' "$*" >> "$CAPTURE_DIR/docker-args"
+if [[ ${1:-} == container && ${2:-} == inspect ]] ||
+   [[ ${1:-} == network && ${2:-} == inspect ]]; then
+  printf '%s\n' "$RUNTIME_LOG_HARNESS_OWNER"
+  exit 0
+fi
 if [[ $* == *list-object-versions* ]]; then
   printf '%s\n' None
+  exit 0
 fi
+echo "unexpected mocked Docker command: $*" >&2
+exit 99
 EOF
 chmod +x "$TMP_ROOT/ci-bin/docker"
 : > "$TMP_ROOT/cargo-args"

@@ -119,7 +119,7 @@ export class InternalService {
   }
   /**
    * Stream the version-pinned candidate object for an assigned pack-install test.
-   * @returns any Candidate pack archive
+   * @returns binary Candidate pack archive
    * @throws ApiError
    */
   public static downloadPackInstallCandidateArchive({
@@ -134,7 +134,7 @@ export class InternalService {
      * Attempt-scoped candidate access token
      */
     xAttunePackCandidateToken: string;
-  }): CancelablePromise<any> {
+  }): CancelablePromise<Blob> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/internal/pack-installs/{pack_install_id}/archive",
@@ -154,7 +154,7 @@ export class InternalService {
    * Return the deterministic archive for a pack's active release.
    * Used by remote workers/sensors to download pack contents when they
    * don't share a mounted volume with the API.
-   * @returns any Pack archive
+   * @returns binary Pack archive
    * @throws ApiError
    */
   public static downloadPackArchive({
@@ -164,7 +164,7 @@ export class InternalService {
      * Pack reference identifier
      */
     packRef: string;
-  }): CancelablePromise<any> {
+  }): CancelablePromise<Blob> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/internal/packs/{pack_ref}/archive",

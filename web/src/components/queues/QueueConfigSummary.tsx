@@ -294,6 +294,15 @@ function QueueConfigPreview({
       value: <span>{batchSize}</span>,
     },
     {
+      label: "Requester grouping",
+      value:
+        queue.batch_mode !== "batch"
+          ? "Single item dispatch"
+          : config.dispatch?.separate_requesters === true
+            ? "Separate batches by requester"
+            : "Aggregate across requesters, default",
+    },
+    {
       label: "Pending update",
       value: queue.allow_pending_update ? "Allowed" : "Rejected",
     },

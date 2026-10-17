@@ -1,0 +1,32 @@
+[Unit]
+Description=Disabled-by-default owned native legacy controller %i
+After=local-fs.target network.target
+ConditionPathExists=/etc/attune/native-legacy/%i/config.json
+
+[Service]
+Type=simple
+User=61124
+Group=61124
+UMask=0077
+Environment=ATTUNE_NATIVE_ACCEPTANCE_FLAGS=
+ExecStart=/usr/bin/python3 -I -B /opt/attune/native-controller/main.py serve --config /etc/attune/native-legacy/%i/config.json $ATTUNE_NATIVE_ACCEPTANCE_FLAGS
+Restart=no
+KillMode=process
+TimeoutStopSec=120
+SendSIGKILL=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=no
+PrivateMounts=no
+PrivateTmp=no
+ProtectSystem=no
+WorkingDirectory=/
+LimitNOFILE=4096
+TasksMax=64
+MemoryMax=512M
+# Host PID/mount namespace is intentional. DAC protects root-owned read-only
+# modules/config/keys. A per-start mount namespace would change pinned mount IDs.
+# The separately delegated writer leaf MUST be outside this unit's cgroup so
+# restarting this daemon cannot remove its irreversible kernel freezer barrier.
+# No [Install] section: never enable this as an ordinary boot-time service.

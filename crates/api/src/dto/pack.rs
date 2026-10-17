@@ -121,6 +121,9 @@ pub struct CreatePackRequest {
 /// Request DTO for registering a pack from local filesystem
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct RegisterPackRequest {
+    /// Explicit consent to replacing contracts used by live admitted emitters.
+    #[serde(default)]
+    pub acknowledge_incompatible_rollout: bool,
     /// Local filesystem path to the pack directory
     #[validate(length(min = 1))]
     #[schema(example = "/path/to/packs/mypack")]
@@ -144,6 +147,8 @@ pub struct RegisterPackRequest {
 /// Request DTO for installing a pack from remote source
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct InstallPackRequest {
+    #[serde(default)]
+    pub acknowledge_incompatible_rollout: bool,
     /// Repository URL or source location
     #[validate(length(min = 1))]
     #[schema(example = "https://github.com/attune/pack-slack.git")]
@@ -412,10 +417,18 @@ pub struct UpdatePackRequest {
     #[schema(value_type = Object, nullable = true)]
     pub conf_schema: Option<JsonValue>,
 
-    /// Pack configuration values
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Persistent overrides, replacing each supplied top-level field completely.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::common::deserialize_present_value"
+    )]
     #[schema(value_type = Object, nullable = true)]
     pub config: Option<JsonValue>,
+
+    /// Remove these top-level overrides and use current release defaults. Null is not reset.
+    #[serde(default)]
+    pub config_reset_fields: Vec<String>,
 
     /// Pack metadata
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -998,6 +1011,8 @@ pub struct BuildSummary {
 /// Request DTO for registering multiple packs
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct RegisterPacksRequest {
+    #[serde(default)]
+    pub acknowledge_incompatible_rollout: bool,
     /// List of pack directory paths to register
     #[validate(length(min = 1))]
     #[schema(example = json!(["/tmp/attune-packs/slack"]))]

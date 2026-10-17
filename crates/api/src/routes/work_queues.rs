@@ -1,4 +1,5 @@
 //! Work queue definition and item API routes.
+mod recorded;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -80,6 +81,12 @@ pub async fn list_queues(
     RequireAuth(user): RequireAuth,
     Query(query): Query<WorkQueueQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    if recorded::active(&user)? {
+        return Ok((
+            StatusCode::OK,
+            Json(recorded::queues(&state, &user, &query, None).await?),
+        ));
+    }
     let mut rows = WorkQueueRepository::search(
         &state.db,
         &WorkQueueSearchFilters {
@@ -147,6 +154,12 @@ pub async fn list_queues_by_pack(
     Path(pack_ref): Path<String>,
     Query(query): Query<WorkQueueQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    if recorded::active(&user)? {
+        return Ok((
+            StatusCode::OK,
+            Json(recorded::queues(&state, &user, &query, Some(&pack_ref)).await?),
+        ));
+    }
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
@@ -221,6 +234,17 @@ pub async fn get_queue(
     let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
+    if recorded::active(&user)? {
+        let mut tx = state.db.begin().await?;
+        recorded::fence(&mut tx, &user, &queue, None, false, RbacAction::Read).await?;
+        let queue = WorkQueueRepository::find_by_id_for_share(&mut tx, queue.id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Queue unavailable".into()))?;
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(recorded::queue_response(queue))),
+        ));
+    }
 
     authorize_queue_action(&state, &user, RbacAction::Read, &queue)
         .await
@@ -265,7 +289,13 @@ pub async fn create_queue(
     request.validate()?;
 
     let (pack_id, pack_ref) = resolve_pack(&state, request.pack_ref.as_deref()).await?;
-    authorize_queue_create(&state, &user, &request.r#ref, pack_ref.as_deref()).await?;
+    let mut tx = state.db.begin().await?;
+    let recorded = recorded::active(&user)?;
+    if recorded {
+        recorded::creation(&mut tx, &user, pack_id, &request.r#ref).await?;
+    } else {
+        authorize_queue_create(&state, &user, &request.r#ref, pack_ref.as_deref()).await?;
+    }
     attune_common::queue_definition::validate_work_queue_config_for_batch_mode(
         request.batch_mode,
         &request.config,
@@ -286,12 +316,20 @@ pub async fn create_queue(
     }
 
     let action = resolve_dispatch_action(&state, &request.dispatch_action_ref).await?;
+    if recorded {
+        recorded::dispatch_target(&mut tx, &user, action.id).await?;
+    }
     let trace_tag_template = request.trace_tag_template.clone();
     ensure_action_reference_allowed(&action, pack_ref.as_deref(), "work queue", &request.r#ref)?;
     let effective_permission_set_refs = request
         .permission_set_refs
         .clone()
         .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
+    if recorded && !effective_permission_set_refs.is_empty() {
+        return Err(ApiError::Forbidden(
+            "Recorded ad-hoc queue delegation requires an accepted delegation snapshot".into(),
+        ));
+    }
     if !effective_permission_set_refs.is_empty()
         && !state
             .authorization_service()
@@ -304,7 +342,7 @@ pub async fn create_queue(
     }
 
     let queue = WorkQueueRepository::create(
-        &state.db,
+        &mut *tx,
         CreateWorkQueueInput {
             r#ref: request.r#ref,
             pack: pack_id,
@@ -331,11 +369,16 @@ pub async fn create_queue(
         },
     )
     .await?;
+    tx.commit().await?;
 
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::with_message(
-            WorkQueueResponse::from(queue),
+            if recorded {
+                recorded::queue_response(queue)
+            } else {
+                WorkQueueResponse::from(queue)
+            },
             "Work queue created successfully",
         )),
     ))
@@ -367,31 +410,70 @@ pub async fn update_queue(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_action(&state, &user, RbacAction::Update, &queue).await?;
+    let authorized_managing_pack =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Queue,
+            queue.id,
+        )
+        .await?;
+    if !recorded::active(&user)? {
+        let mut context = queue_authorization_context_for_token(&user, &queue)?;
+        context.managing_pack_id = authorized_managing_pack;
+        authorize_queue_context_action(&state, &user, RbacAction::Update, context).await?;
+    }
+    let mut transaction = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(
+        &mut transaction,
+    )
+    .await?;
+    let effect_fence = recorded::fence(
+        &mut transaction,
+        &user,
+        &queue,
+        None,
+        false,
+        RbacAction::Update,
+    )
+    .await?;
+    if recorded::active(&user)? && request.pack_ref.as_ref().is_some_and(|patch| !matches!(patch, NullableStringPatch::Set(reference) if queue.pack_ref.as_deref() == Some(reference.as_str()))) {
+        return Err(ApiError::Forbidden(
+            "Recorded queue ownership transfer is not supported".into(),
+        ));
+    }
+    if recorded::active(&user)?
+        && queue.is_adhoc
+        && (request.dispatch_action_ref.is_some()
+            || request.action_params.is_some()
+            || request.item_schema.is_some()
+            || request.config.is_some()
+            || request.permission_set_refs.is_some())
+        && !matches!(&request.permission_set_refs, Some(Some(refs)) if refs.is_empty())
+        && queue
+            .permission_set_refs
+            .as_ref()
+            .is_none_or(|refs| !refs.is_empty())
+    {
+        return Err(ApiError::Forbidden("Recorded ad-hoc definition edits require credential-free dispatch or an accepted delegation snapshot".into()));
+    }
 
-    if !queue.is_adhoc {
-        let mut has_non_operational_changes = false;
-        has_non_operational_changes |= request.pack_ref.is_some();
-        has_non_operational_changes |= request.label.is_some();
-        has_non_operational_changes |= request.description.is_some();
-        has_non_operational_changes |= request.dispatch_action_ref.is_some();
-        has_non_operational_changes |= request.default_priority.is_some();
-        has_non_operational_changes |= request.allow_pending_update.is_some();
-        has_non_operational_changes |= request.update_strategy.is_some();
-        has_non_operational_changes |= request.batch_mode.is_some();
-        has_non_operational_changes |= request.item_schema.is_some();
-        has_non_operational_changes |= request.action_params.is_some();
-        has_non_operational_changes |= request.trace_tag_template.is_some();
-        has_non_operational_changes |= request.permission_set_refs.is_some();
-        has_non_operational_changes |= request.config.is_some();
-        has_non_operational_changes |= request.reference_visibility.is_some();
-        has_non_operational_changes |= request.reference_allowed_pack_refs.is_some();
-
-        if has_non_operational_changes {
-            return Err(ApiError::Forbidden(
-                "Pack-managed queues may only change operational flags through the API".to_string(),
-            ));
-        }
+    if !queue.is_adhoc && request.pack_ref.as_ref().is_some_and(|patch| !matches!(patch, NullableStringPatch::Set(reference) if queue.pack_ref.as_deref() == Some(reference.as_str()))) {
+        return Err(ApiError::Forbidden(
+            "Managed queue ownership cannot change through a component edit".into(),
+        ));
+    }
+    let metadata_changed = request.dispatch_action_ref.is_some()
+        || request.batch_mode.is_some()
+        || request.item_schema.is_some()
+        || request.action_params.is_some()
+        || request.trace_tag_template.is_some()
+        || request.permission_set_refs.is_some()
+        || request.config.is_some();
+    if recorded::active(&user)? && metadata_changed && !queue.is_adhoc {
+        return Err(ApiError::Forbidden(
+            "Recorded queue behavior edits require a typed control-plane readmission authorizer"
+                .into(),
+        ));
     }
 
     let (pack_patch, pack_ref_patch, resolved_pack_ref) = match request.pack_ref.clone() {
@@ -406,14 +488,21 @@ pub async fn update_queue(
         Some(NullableStringPatch::Clear) => (Some(Patch::Clear), Some(Patch::Clear), None),
         None => (None, None, queue.pack_ref.clone()),
     };
+    if !queue.is_adhoc && matches!(&pack_patch, Some(Patch::Set(pack)) if Some(*pack) != queue.pack)
+    {
+        return Err(ApiError::Forbidden(
+            "Managed queue ownership cannot change through a component edit".into(),
+        ));
+    }
 
-    if request.pack_ref.is_some() {
+    if request.pack_ref.is_some() && !recorded::active(&user)? {
         let identity_id = requester_identity_id(&user)?;
         if let Some(identity_id) = identity_id {
             let mut ctx = AuthorizationContext::new(identity_id);
             ctx.target_id = Some(queue.id);
             ctx.target_ref = Some(queue.r#ref.clone());
             ctx.pack_ref = resolved_pack_ref.clone();
+            ctx.managing_pack_id = authorized_managing_pack;
             authorize_queue_context_action(&state, &user, RbacAction::Update, ctx).await?;
         }
     }
@@ -421,6 +510,9 @@ pub async fn update_queue(
     let (dispatch_action_patch, dispatch_action_ref, loaded_dispatch_action) =
         if let Some(dispatch_action_ref) = request.dispatch_action_ref {
             let action = resolve_dispatch_action(&state, &dispatch_action_ref).await?;
+            if recorded::active(&user)? {
+                recorded::dispatch_target(&mut transaction, &user, action.id).await?;
+            }
             let r = action.r#ref.clone();
             (Some(Patch::Set(action.id)), Some(r), Some(action))
         } else {
@@ -468,7 +560,13 @@ pub async fn update_queue(
         _ => None,
     };
     if let Some(permission_refs_to_validate) = permission_refs_to_validate {
-        if !permission_refs_to_validate.is_empty()
+        if recorded::active(&user)? && !permission_refs_to_validate.is_empty() {
+            return Err(ApiError::Forbidden(
+                "Recorded queue delegation cannot be rebound through mutable IAM".into(),
+            ));
+        }
+        if queue.is_adhoc
+            && !permission_refs_to_validate.is_empty()
             && !state
                 .authorization_service()
                 .can_delegate_permission_sets(&user, &permission_refs_to_validate)
@@ -499,8 +597,34 @@ pub async fn update_queue(
         &effective_reference_allowed_pack_refs,
     )?;
 
+    let current = attune_common::repositories::managed_component_readmission::ManagedComponentReadmission::lock_queue(&mut transaction, queue.id).await?;
+    let current_managing_pack =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &mut *transaction,
+            attune_common::repositories::runtime_target::ComponentTarget::Queue,
+            current.id,
+        )
+        .await?;
+    if current.id != queue.id
+        || current.pack != queue.pack
+        || current.is_adhoc != queue.is_adhoc
+        || current.updated != queue.updated
+        || current_managing_pack != authorized_managing_pack
+    {
+        return Err(ApiError::Conflict(
+            "Queue changed during authorization; retry the edit".into(),
+        ));
+    }
+    let ownership_changed = match &pack_patch {
+        Some(Patch::Set(pack)) => queue.pack != Some(*pack),
+        Some(Patch::Clear) => queue.pack.is_some(),
+        None => false,
+    };
+    if queue.is_adhoc && (metadata_changed || ownership_changed) {
+        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::require_drained(&mut transaction, queue.id).await?;
+    }
     let queue = WorkQueueRepository::update(
-        &state.db,
+        &mut *transaction,
         queue.id,
         UpdateWorkQueueInput {
             pack: pack_patch,
@@ -535,11 +659,26 @@ pub async fn update_queue(
         },
     )
     .await?;
+    if metadata_changed && !queue.is_adhoc {
+        let editor = user
+            .identity_id()
+            .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+        attune_common::repositories::managed_component_readmission::ManagedComponentReadmission::queue(&mut transaction, queue.id, editor).await?
+            .ok_or_else(|| ApiError::Conflict("Managed queue admission is unavailable".into()))?;
+    }
+    if let Some(fence) = effect_fence {
+        fence.ensure_fresh_on(&mut transaction).await?;
+    }
+    transaction.commit().await?;
 
     Ok((
         StatusCode::OK,
         Json(ApiResponse::with_message(
-            WorkQueueResponse::from(queue),
+            if recorded::active(&user)? {
+                recorded::queue_response(queue)
+            } else {
+                WorkQueueResponse::from(queue)
+            },
             "Work queue updated successfully",
         )),
     ))
@@ -567,6 +706,14 @@ pub async fn delete_queue(
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
     authorize_queue_action(&state, &user, RbacAction::Delete, &queue).await?;
+    let mut tx = state.db.begin().await?;
+    // F's evidence-preserving delete trigger requires exclusive graph entry.
+    // Enter before source validation takes shared admission or target locks;
+    // upgrading behind those locks is both rejected and an inversion risk.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
+    let effect_fence =
+        recorded::fence(&mut tx, &user, &queue, None, false, RbacAction::Delete).await?;
 
     if !queue.is_adhoc {
         return Err(ApiError::Forbidden(
@@ -574,13 +721,17 @@ pub async fn delete_queue(
         ));
     }
 
-    let deleted = WorkQueueRepository::delete(&state.db, queue.id).await?;
+    let deleted = WorkQueueRepository::delete(&mut *tx, queue.id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!(
             "Work queue '{}' not found",
             queue_ref
         )));
     }
+    if let Some(fence) = effect_fence {
+        fence.ensure_fresh_on(&mut tx).await?;
+    }
+    tx.commit().await?;
 
     Ok((
         StatusCode::OK,
@@ -612,15 +763,24 @@ pub async fn list_queue_items(
     Path(queue_ref): Path<String>,
     FormQuery(query): FormQuery<WorkQueueItemQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    if recorded::active(&user)? {
+        return Ok((
+            StatusCode::OK,
+            Json(recorded::items(&state, &user, &queue_ref, &query).await?),
+        ));
+    }
+
     let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_item_action(&state, &user, RbacAction::Read, &queue).await?;
-    ensure_queue_item_visibility(&state, &user, RbacAction::Read, &queue).await?;
+    preflight_item(&state, &user, RbacAction::Read, &queue).await?;
+    let mut tx = state.db.begin().await?;
+    let effect_fence =
+        recorded::fence(&mut tx, &user, &queue, None, true, RbacAction::Read).await?;
 
-    let result = WorkQueueItemRepository::search(
-        &state.db,
+    let result = WorkQueueItemRepository::search_with_conn(
+        &mut *tx,
         &WorkQueueItemSearchFilters {
             queue: Some(queue.id),
             item_key: query.item_key.clone(),
@@ -632,7 +792,31 @@ pub async fn list_queue_items(
         },
     )
     .await?;
-    let rows = queue_item_responses_with_execution_visibility(&state, &user, result.rows).await?;
+    let mut allowed = Vec::new();
+    for item in result.rows {
+        recorded::fence(
+            &mut tx,
+            &user,
+            &queue,
+            Some(item.id),
+            true,
+            RbacAction::Read,
+        )
+        .await?;
+        if recorded::active(&user)? {
+            if let Some(current) =
+                WorkQueueItemRepository::find_by_queue_and_id(&mut *tx, queue.id, item.id).await?
+            {
+                allowed.push(current);
+            }
+        } else {
+            allowed.push(item);
+        }
+    }
+    let rows = queue_item_responses_with_execution_visibility(&state, &user, allowed).await?;
+    if let Some(fence) = effect_fence {
+        fence.ensure_fresh_on(&mut tx).await?;
+    }
 
     Ok((
         StatusCode::OK,
@@ -673,25 +857,42 @@ pub async fn get_queue_item(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_item_action(&state, &user, RbacAction::Read, &queue).await?;
-    ensure_queue_item_visibility(&state, &user, RbacAction::Read, &queue).await?;
+    preflight_item(&state, &user, RbacAction::Read, &queue).await?;
 
     let mut transaction = state.db.begin().await?;
-    let mut item = WorkQueueItemRepository::find_by_id_for_update(&mut transaction, item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Queue item '{}' not found", item_id)))?;
+    let effect_fence = recorded::fence(
+        &mut transaction,
+        &user,
+        &queue,
+        Some(item_id),
+        true,
+        RbacAction::Read,
+    )
+    .await?;
+    let mut item = if recorded::active(&user)? {
+        WorkQueueItemRepository::find_by_queue_and_id(&mut *transaction, queue.id, item_id).await?
+    } else {
+        WorkQueueItemRepository::find_by_id_for_update(&mut transaction, item_id).await?
+    }
+    .ok_or_else(|| ApiError::NotFound(format!("Queue item '{}' not found", item_id)))?;
     if item.queue != queue.id {
         return Err(ApiError::NotFound(
             "Queue item does not belong to this queue".into(),
         ));
     }
     if query.decrypt {
-        authorize_queue_item_action(&state, &user, RbacAction::Decrypt, &queue).await?;
+        if recorded::active(&user)? {
+            recorded::payload_disclosure(&mut transaction, &user, &queue, &item).await?;
+        }
+        preflight_item(&state, &user, RbacAction::Decrypt, &queue).await?;
         item.payload =
             restore_queue_payload(&state, &user, &mut transaction, &queue, &item).await?;
     }
-    transaction.commit().await?;
     let response = queue_item_response_with_execution_visibility(&state, &user, item).await?;
+    if let Some(fence) = effect_fence {
+        fence.ensure_fresh_on(&mut transaction).await?;
+    }
+    transaction.commit().await?;
 
     Ok((StatusCode::OK, Json(ApiResponse::new(response))))
 }
@@ -724,8 +925,7 @@ pub async fn enqueue_queue_item(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_item_action(&state, &user, RbacAction::Create, &queue).await?;
-    ensure_queue_item_visibility(&state, &user, RbacAction::Create, &queue).await?;
+    preflight_item(&state, &user, RbacAction::Create, &queue).await?;
     if !queue.accepting_new_items {
         return Err(ApiError::Conflict(format!(
             "Work queue '{}' is not accepting new items",
@@ -796,8 +996,7 @@ pub async fn bulk_enqueue_queue_items(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_item_action(&state, &user, RbacAction::Create, &queue).await?;
-    ensure_queue_item_visibility(&state, &user, RbacAction::Create, &queue).await?;
+    preflight_item(&state, &user, RbacAction::Create, &queue).await?;
     if !queue.accepting_new_items {
         return Err(ApiError::Conflict(format!(
             "Work queue '{}' is not accepting new items",
@@ -878,24 +1077,55 @@ pub async fn preview_queue_items_by_selector(
     request.validate()?;
     validate_selector_request(&request.selector)?;
 
+    if recorded::active(&user)? {
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(
+                recorded::preview(&state, &user, &queue_ref, &request).await?,
+            )),
+        ));
+    }
+
     let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_item_action(&state, &user, RbacAction::Read, &queue).await?;
-    ensure_queue_item_visibility(&state, &user, RbacAction::Read, &queue).await?;
+    preflight_item(&state, &user, RbacAction::Read, &queue).await?;
+    let mut tx = state.db.begin().await?;
+    recorded::fence(&mut tx, &user, &queue, None, true, RbacAction::Read).await?;
 
     let selector = selector_from_request(&request.selector);
     let result = map_selector_result(
-        WorkQueueItemRepository::preview_selected_mutable(
-            &state.db,
+        WorkQueueItemRepository::preview_selected_mutable_with_conn(
+            &mut *tx,
             queue.id,
             &selector,
             request.limit.min(100),
         )
         .await,
     )?;
-    let items = queue_item_responses_with_execution_visibility(&state, &user, result.rows).await?;
+    let mut checked = Vec::new();
+    for item in result.rows {
+        recorded::fence(
+            &mut tx,
+            &user,
+            &queue,
+            Some(item.id),
+            true,
+            RbacAction::Read,
+        )
+        .await?;
+        if recorded::active(&user)? {
+            if let Some(current) =
+                WorkQueueItemRepository::find_by_queue_and_id(&mut *tx, queue.id, item.id).await?
+            {
+                checked.push(current);
+            }
+        } else {
+            checked.push(item);
+        }
+    }
+    let items = queue_item_responses_with_execution_visibility(&state, &user, checked).await?;
 
     Ok((
         StatusCode::OK,
@@ -915,6 +1145,7 @@ pub async fn preview_queue_items_by_selector(
     request_body = ApplyWorkQueueItemsRequest,
     responses(
         (status = 200, description = "Bulk queue item operation applied", body = ApiResponse<ApplyWorkQueueItemsResponse>),
+        (status = 409, description = "Bulk target selection changed; retry the operation"),
         (status = 400, description = "Validation error or invalid SQL/JSONPath selector"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Queue not found")
@@ -931,6 +1162,22 @@ pub async fn apply_queue_items_by_selector(
     validate_selector_request(&request.selector)?;
     validate_bulk_apply_request(&request)?;
 
+    if recorded::active(&user)?
+        && matches!(
+            request.operation,
+            WorkQueueItemBulkOperation::Cancel | WorkQueueItemBulkOperation::Reprioritize
+        )
+    {
+        let result = recorded::bulk_metadata_apply(&state, &user, &queue_ref, &request).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::with_message(
+                result,
+                "Bulk queue item operation applied successfully",
+            )),
+        ));
+    }
+
     let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
@@ -941,8 +1188,17 @@ pub async fn apply_queue_items_by_selector(
             RbacAction::Update
         }
     };
-    authorize_queue_item_action(&state, &user, required_action, &queue).await?;
-    ensure_queue_item_visibility(&state, &user, required_action, &queue).await?;
+    preflight_item(&state, &user, required_action, &queue).await?;
+    if recorded::active(&user)? {
+        let result = recorded::bulk_apply(&state, &user, &queue, &request, required_action).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::with_message(
+                result,
+                "Bulk queue item operation applied successfully",
+            )),
+        ));
+    }
 
     let selector = selector_from_request(&request.selector);
     let preview = map_selector_result(
@@ -1048,10 +1304,28 @@ pub async fn update_queue_item(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_item_action(&state, &user, RbacAction::Update, &queue).await?;
-    ensure_queue_item_visibility(&state, &user, RbacAction::Update, &queue).await?;
+    preflight_item(&state, &user, RbacAction::Update, &queue).await?;
 
     let mut transaction = state.db.begin().await?;
+    let effect_fence = recorded::fence(
+        &mut transaction,
+        &user,
+        &queue,
+        Some(item_id),
+        true,
+        RbacAction::Update,
+    )
+    .await?;
+    let payload_editors = if request.payload.is_some() {
+        if queue.is_adhoc && recorded::active(&user)? {
+            attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::require_payload_binding(&mut transaction, item_id).await?;
+        }
+        let editors = queue_payload_editors(&mut transaction, &user).await?;
+        lock_unchanged_input_edit_queue(&mut transaction, &queue).await?;
+        Some(editors)
+    } else {
+        None
+    };
     let item = WorkQueueItemRepository::find_by_id_for_update(&mut transaction, item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Queue item '{}' not found", item_id)))?;
@@ -1067,6 +1341,9 @@ pub async fn update_queue_item(
         ));
     }
 
+    if let Some(editors) = &payload_editors {
+        attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::authorize_queue_payload_edit(&mut transaction, item.id, editors).await?;
+    }
     let prepared_payload = request
         .payload
         .as_ref()
@@ -1101,6 +1378,9 @@ pub async fn update_queue_item(
         attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
             &mut transaction, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
         ).await?;
+    }
+    if let Some(fence) = effect_fence {
+        fence.ensure_fresh_on(&mut transaction).await?;
     }
     transaction.commit().await?;
 
@@ -1138,10 +1418,21 @@ pub async fn delete_queue_item(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_item_action(&state, &user, RbacAction::Delete, &queue).await?;
-    ensure_queue_item_visibility(&state, &user, RbacAction::Delete, &queue).await?;
+    preflight_item(&state, &user, RbacAction::Delete, &queue).await?;
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
+    let effect_fence = recorded::fence(
+        &mut tx,
+        &user,
+        &queue,
+        Some(item_id),
+        true,
+        RbacAction::Delete,
+    )
+    .await?;
 
-    let item = WorkQueueItemRepository::find_by_queue_and_id(&state.db, queue.id, item_id)
+    let item = WorkQueueItemRepository::find_by_queue_and_id(&mut *tx, queue.id, item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Queue item '{}' not found", item_id)))?;
 
@@ -1152,7 +1443,7 @@ pub async fn delete_queue_item(
     }
 
     let deleted = WorkQueueItemRepository::delete_if_statuses(
-        &state.db,
+        &mut *tx,
         item.id,
         WorkQueueItemRepository::mutable_pending_statuses(),
     )
@@ -1163,6 +1454,10 @@ pub async fn delete_queue_item(
             "Queue item is no longer in a mutable pending state".to_string(),
         ));
     }
+    if let Some(fence) = effect_fence {
+        fence.ensure_fresh_on(&mut tx).await?;
+    }
+    tx.commit().await?;
 
     Ok((
         StatusCode::OK,
@@ -1203,6 +1498,9 @@ pub fn routes() -> Router<Arc<AppState>> {
                 .put(update_queue_item)
                 .delete(delete_queue_item),
         )
+        .route_layer(axum::Extension(
+            crate::auth::middleware::RecordedRuntimeConsumer::QueueOperations,
+        ))
 }
 
 fn map_queue_item_delete_error(error: attune_common::Error) -> ApiError {
@@ -1272,8 +1570,11 @@ async fn restore_queue_payload(
     if secrets.is_empty() {
         return Ok(item.payload.clone());
     }
-    authorize_queue_item_action(state, user, RbacAction::Read, queue).await?;
-    authorize_queue_item_action(state, user, RbacAction::Decrypt, queue).await?;
+    if recorded::active(user)? {
+        recorded::payload_disclosure(connection, user, queue, item).await?;
+    }
+    preflight_item(state, user, RbacAction::Read, queue).await?;
+    preflight_item(state, user, RbacAction::Decrypt, queue).await?;
     let encryption_key = state
         .config
         .security
@@ -1302,6 +1603,90 @@ async fn inherited_enqueue_trace_tag(
         .and_then(|execution| execution.trace_tag))
 }
 
+async fn lock_unchanged_input_edit_queue(
+    connection: &mut PgConnection,
+    authorized: &WorkQueue,
+) -> ApiResult<()> {
+    let current = WorkQueueRepository::find_by_id_for_share(connection, authorized.id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Queue edit target is unavailable".into()))?;
+    if current.r#ref != authorized.r#ref
+        || current.pack != authorized.pack
+        || current.pack_ref != authorized.pack_ref
+        || current.reference_visibility != authorized.reference_visibility
+        || current.reference_allowed_pack_refs != authorized.reference_allowed_pack_refs
+    {
+        return Err(ApiError::Conflict(
+            "Queue ownership or visibility changed during authorization; retry the request".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the editing source before taking queue/item mutation locks. These
+/// grants prove input delegation only and never replace the accepted snapshot.
+async fn queue_payload_editors(
+    connection: &mut PgConnection,
+    user: &AuthenticatedUser,
+) -> ApiResult<Vec<attune_common::delegation::DelegationAuthority>> {
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(connection)
+        .await?;
+    if let Some(authority) = user.recorded_runtime_authority(connection).await? {
+        let grants = authority
+            .authority()
+            .grants
+            .iter()
+            .filter_map(|grant| match grant {
+                attune_common::runtime_authority::AdmittedGrant::External { grant, .. } => {
+                    Some(grant.clone())
+                }
+                attune_common::runtime_authority::AdmittedGrant::PackOwned { .. } => None,
+            })
+            .collect();
+        // A naked local grant would lose its ownership envelope. Only already
+        // validated absolute approvals can prove coverage of arbitrary historic
+        // scopes here; local/standard-only proofs fail closed when insufficient.
+        return Ok(vec![attune_common::delegation::DelegationAuthority::new(
+            authority.authority().owner.sponsor_identity_id,
+            Default::default(),
+            grants,
+        )]);
+    }
+    let identity = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid editing identity".into()))?;
+    match user.claims.token_type {
+        TokenType::Access => {}
+        TokenType::Execution => {
+            let metadata = user.claims.metadata.as_ref().ok_or_else(|| {
+                ApiError::Unauthorized("Missing originating execution metadata".into())
+            })?;
+            let origin = user
+                .execution_id()
+                .ok_or_else(|| ApiError::Unauthorized("Missing originating execution".into()))?;
+            let action = metadata
+                .get("action_ref")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| ApiError::Unauthorized("Missing originating action".into()))?;
+            let refs: Vec<String> =
+                serde_json::from_value(metadata.get("permission_set_refs").cloned().ok_or_else(
+                    || ApiError::Unauthorized("Missing originating selection".into()),
+                )?)
+                .map_err(|_| ApiError::Unauthorized("Invalid originating selection".into()))?;
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::validate_legacy_origin(connection, origin, identity, action, &refs).await?;
+        }
+        _ => {
+            return Err(ApiError::Forbidden(
+                "Queue payload editing requires an access or execution credential".into(),
+            ))
+        }
+    }
+    Ok(vec![
+        attune_common::delegation::DelegationAuthority::load_for_share(connection, identity)
+            .await?,
+    ])
+}
+
 async fn enqueue_queue_item_in_transaction(
     state: &Arc<AppState>,
     connection: &mut PgConnection,
@@ -1315,12 +1700,14 @@ async fn enqueue_queue_item_in_transaction(
         &mut *connection,
     )
     .await?;
+    let payload_editors = queue_payload_editors(connection, user).await?;
+    let effect_fence =
+        recorded::fence(connection, user, queue, None, true, RbacAction::Create).await?;
     let current = WorkQueueRepository::find_by_id_for_share(&mut *connection, queue.id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Queue is no longer installed".into()))?;
     let queue = &current;
-    authorize_queue_item_action(state, user, RbacAction::Create, queue).await?;
-    ensure_queue_item_visibility(state, user, RbacAction::Create, queue).await?;
+    preflight_item(state, user, RbacAction::Create, queue).await?;
     if !queue.accepting_new_items || queue.retired_at.is_some() {
         return Err(ApiError::Conflict(
             "Queue is not accepting new items".into(),
@@ -1367,6 +1754,27 @@ async fn enqueue_queue_item_in_transaction(
             }
 
             if let Some(existing) = pending.into_iter().next() {
+                recorded::fence(
+                    connection,
+                    user,
+                    queue,
+                    Some(existing.id),
+                    true,
+                    RbacAction::Update,
+                )
+                .await?;
+                let existing = attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::authorize_queue_payload_edit(connection, existing.id, &payload_editors).await?;
+                if queue.is_adhoc && recorded::active(user)? {
+                    attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::require_payload_binding(connection, existing.id).await?;
+                }
+                if existing.queue != queue.id
+                    || existing.item_key.as_deref() != Some(item_key)
+                    || !WorkQueueItemRepository::is_mutable_pending_status(existing.status)
+                {
+                    return Err(ApiError::Conflict(
+                        "Pending queue item changed during input authorization".into(),
+                    ));
+                }
                 let updated = match queue.update_strategy {
                     attune_common::models::WorkQueueUpdateStrategy::Immutable => {
                         return Err(ApiError::Conflict(format!(
@@ -1431,6 +1839,9 @@ async fn enqueue_queue_item_in_transaction(
                     )
                 })?;
 
+                if let Some(fence) = &effect_fence {
+                    fence.ensure_fresh_on(connection).await?;
+                }
                 return Ok(EnqueueQueueItemResult {
                     item: updated,
                     created: false,
@@ -1470,7 +1881,17 @@ async fn enqueue_queue_item_in_transaction(
         contract,
     };
     let (payload, secrets) = prepare_queue_payload(state, &binding, &request.payload)?;
-    let snapshot = if let Some(action_id) = queue.dispatch_action {
+    let recorded_ad_hoc = queue.is_adhoc && recorded::active(user)?;
+    if recorded_ad_hoc {
+        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::validate_shape(queue)?;
+    }
+    let snapshot = if !queue.is_adhoc {
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
+            connection, queue.pack.ok_or_else(|| ApiError::Forbidden("Queue sponsor unavailable".into()))?,
+            attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Queue, queue.id),
+            &attune_common::runtime_authority::InvocationBinding::Queue { queue_ref: queue.r#ref.clone(), action_ref: queue.dispatch_action_ref.clone() },
+        ).await?
+    } else if let Some(action_id) = queue.dispatch_action {
         attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
             &mut *connection,
             action_id,
@@ -1483,6 +1904,29 @@ async fn enqueue_queue_item_in_transaction(
         )
         .await?
     };
+    let snapshot = if recorded_ad_hoc {
+        recorded::dispatch_target(connection, user, snapshot.executable.action.id).await?;
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(connection,
+            snapshot.executable.action.pack,
+            attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Action, snapshot.executable.action.id),
+            &attune_common::runtime_authority::InvocationBinding::Action { action_ref: snapshot.executable.action.r#ref.clone() }).await?
+    } else {
+        snapshot
+    };
+    let current_actions =
+        attune_common::repositories::action::ActionRepository::find_by_refs_for_share(
+            connection,
+            std::slice::from_ref(&snapshot.executable.action.r#ref),
+        )
+        .await?;
+    if !current_actions
+        .iter()
+        .any(|action| action.id == snapshot.executable.action.id && action.enabled)
+    {
+        return Err(ApiError::Conflict(
+            "Dispatch action is unavailable for new queue admission".into(),
+        ));
+    }
     let item = WorkQueueItemRepository::create_bound_pinned(
         &mut *connection,
         CreateWorkQueueItemInput {
@@ -1509,10 +1953,38 @@ async fn enqueue_queue_item_in_transaction(
         &binding,
     )
     .await?;
+    if recorded_ad_hoc {
+        let parent = requested_by_execution.ok_or_else(|| {
+            ApiError::Forbidden("Recorded item source execution unavailable".into())
+        })?;
+        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::accept(
+            connection, queue, &item, parent, &snapshot,
+        )
+        .await?;
+        attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(connection, "execution", parent, "queue_item", item.id).await?;
+    } else if !queue.is_adhoc {
+        let actor = requested_by_identity
+            .filter(|_| user.claims.token_type == TokenType::Access)
+            .map(
+                |identity_id| attune_common::runtime_authority::HumanAttribution {
+                    identity_id,
+                    login: user.login().to_string(),
+                },
+            );
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::admit_queue_item(connection, queue, &item, actor, &snapshot).await?;
+        if user.claims.token_type == TokenType::Access {
+            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_human(connection, "queue_item", item.id, requested_by_identity.ok_or_else(|| ApiError::Unauthorized("Input requester unavailable".into()))?).await?;
+        } else if let Some(parent) = requested_by_execution {
+            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(connection, "execution", parent, "queue_item", item.id).await?;
+        }
+    }
     attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
         &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
     ).await?;
 
+    if let Some(fence) = &effect_fence {
+        fence.ensure_fresh_on(connection).await?;
+    }
     Ok(EnqueueQueueItemResult {
         item,
         created: true,
@@ -1837,6 +2309,10 @@ async fn authorize_queue_action(
     action: RbacAction,
     queue: &attune_common::models::WorkQueue,
 ) -> Result<(), ApiError> {
+    // Recorded callers are authorized on the effect connection, not here.
+    if recorded::active(user)? {
+        return Ok(());
+    }
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
@@ -1856,12 +2332,32 @@ async fn authorize_queue_action(
     .await
 }
 
+/// Legacy preflight only. Every recorded route below performs its actual
+/// operation proof through `recorded::fence` on the effect transaction.
+async fn preflight_item(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: RbacAction,
+    queue: &WorkQueue,
+) -> ApiResult<()> {
+    if recorded::active(user)? {
+        return Ok(());
+    }
+    authorize_queue_item_action(state, user, action, queue).await?;
+    ensure_queue_item_visibility(state, user, action, queue).await
+}
+
 pub(crate) async fn authorize_queue_item_action(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     action: RbacAction,
     queue: &attune_common::models::WorkQueue,
 ) -> Result<(), ApiError> {
+    if recorded::active(user)? {
+        return Err(ApiError::Forbidden(
+            "Recorded item consumers must retain the effect transaction".into(),
+        ));
+    }
     let authz = state.authorization_service();
     let context = queue_authorization_context_for_token(user, queue)?;
     if !matches!(
@@ -1940,6 +2436,11 @@ pub(crate) async fn ensure_queue_item_visibility(
     action: RbacAction,
     queue: &attune_common::models::WorkQueue,
 ) -> Result<(), ApiError> {
+    if recorded::active(user)? {
+        return Err(ApiError::Forbidden(
+            "Recorded item visibility requires structural target authorization".into(),
+        ));
+    }
     if queue_item_visible(state, user, action, queue).await? {
         return Ok(());
     }
@@ -2124,6 +2625,9 @@ async fn queue_item_responses_with_execution_visibility(
     user: &AuthenticatedUser,
     items: Vec<WorkQueueItem>,
 ) -> ApiResult<Vec<WorkQueueItemResponse>> {
+    if recorded::active(user)? {
+        return Ok(items.into_iter().map(recorded::item_response).collect());
+    }
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -2352,12 +2856,35 @@ async fn apply_payload_patch_to_selected_items(
     patch: &JsonValue,
 ) -> Result<u64, ApiError> {
     let mut tx = state.db.begin().await?;
-    let selected = map_selector_result(
+    let effect_fence =
+        recorded::fence(&mut tx, user, queue, None, true, RbacAction::Update).await?;
+    let payload_editors = queue_payload_editors(&mut tx, user).await?;
+    lock_unchanged_input_edit_queue(&mut tx, queue).await?;
+    let mut selected = map_selector_result(
         WorkQueueItemRepository::list_selected_mutable(&mut *tx, queue.id, selector).await,
     )?;
+    selected.sort_by_key(|item| item.id);
 
     let mut updates = Vec::with_capacity(selected.len());
     for item in selected {
+        recorded::fence(
+            &mut tx,
+            user,
+            queue,
+            Some(item.id),
+            true,
+            RbacAction::Update,
+        )
+        .await?;
+        let item = attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::authorize_queue_payload_edit(&mut tx, item.id, &payload_editors).await?;
+        if queue.is_adhoc && recorded::active(user)? {
+            attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::require_payload_binding(&mut tx, item.id).await?;
+        }
+        if item.queue != queue.id
+            || !WorkQueueItemRepository::is_mutable_pending_status(item.status)
+        {
+            continue;
+        }
         let binding = admitted_item_schema(&item)?;
         let original = restore_queue_payload(state, user, &mut tx, queue, &item).await?;
         let merged_payload = merge_patch_value(original, patch);
@@ -2385,6 +2912,9 @@ async fn apply_payload_patch_to_selected_items(
         }
     }
 
+    if let Some(fence) = effect_fence {
+        fence.ensure_fresh_on(&mut tx).await?;
+    }
     tx.commit().await?;
     Ok(affected_count)
 }

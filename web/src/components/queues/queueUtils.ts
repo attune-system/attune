@@ -16,6 +16,7 @@ export interface QueueTunableValue {
 }
 
 export interface QueueDispatchConfig {
+  separate_requesters?: boolean;
   concurrency?: QueueTunableValue;
   batch_size?: QueueTunableValue;
   retry_limit?: number;

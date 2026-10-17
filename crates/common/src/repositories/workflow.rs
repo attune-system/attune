@@ -11,6 +11,23 @@ use super::{
 
 const WORKFLOW_DEFINITION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, version, param_schema, out_schema, definition, tags, retired_at, created, updated";
 
+const WORKFLOW_STATE_COLUMNS: &str = "id, execution, workflow_def, current_tasks, completed_tasks, failed_tasks, skipped_tasks, variables, task_graph, status, error_message, paused, pause_reason, created, updated";
+// The retained parent ID intentionally has no FK. Creation must nevertheless
+// serialize with cancellation's actual execution UPDATE. MATERIALIZED prevents
+// the parent/status read from being separated from the locking INSERT source;
+// FOR SHARE returns the current row version after any concurrent updater wins.
+const WORKFLOW_STATE_INSERT: &str = "WITH parent AS MATERIALIZED ( \
+    SELECT id, status FROM execution WHERE id = $1 FOR SHARE \
+    ) INSERT INTO workflow_execution (execution, workflow_def, task_graph, variables, status) \
+    SELECT id, $2, $3, $4, $5 FROM parent \
+    WHERE status IN ('requested', 'scheduling', 'scheduled', 'running')";
+
+fn workflow_parent_inadmissible() -> crate::Error {
+    crate::Error::PermissionDenied(
+        "Workflow parent is missing or no longer permits new orchestration state".into(),
+    )
+}
+
 // ============================================================================
 // Workflow Definition Search
 // ============================================================================
@@ -532,21 +549,16 @@ impl Create for WorkflowExecutionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, WorkflowExecution>(
-            "INSERT INTO workflow_execution
-             (execution, workflow_def, task_graph, variables, status)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING id, execution, workflow_def, current_tasks, completed_tasks, failed_tasks, skipped_tasks,
-                       variables, task_graph, status, error_message, paused, pause_reason, created, updated"
-        )
-        .bind(input.execution)
-        .bind(input.workflow_def)
-        .bind(&input.task_graph)
-        .bind(&input.variables)
-        .bind(input.status)
-        .fetch_one(executor)
-        .await
-        .map_err(Into::into)
+        let query = format!("{WORKFLOW_STATE_INSERT} RETURNING {WORKFLOW_STATE_COLUMNS}");
+        sqlx::query_as::<_, WorkflowExecution>(&query)
+            .bind(input.execution)
+            .bind(input.workflow_def)
+            .bind(&input.task_graph)
+            .bind(&input.variables)
+            .bind(input.status)
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(workflow_parent_inadmissible)
     }
 }
 
@@ -786,21 +798,15 @@ impl WorkflowExecutionRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let inserted = sqlx::query_as::<_, WorkflowExecution>(
-            "INSERT INTO workflow_execution
-             (execution, workflow_def, task_graph, variables, status)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (execution) DO NOTHING
-             RETURNING id, execution, workflow_def, current_tasks, completed_tasks, failed_tasks, skipped_tasks,
-                       variables, task_graph, status, error_message, paused, pause_reason, created, updated"
-        )
-        .bind(input.execution)
-        .bind(input.workflow_def)
-        .bind(&input.task_graph)
-        .bind(&input.variables)
-        .bind(input.status)
-        .fetch_optional(executor)
-        .await?;
+        let query = format!("{WORKFLOW_STATE_INSERT} ON CONFLICT (execution) DO NOTHING RETURNING {WORKFLOW_STATE_COLUMNS}");
+        let inserted = sqlx::query_as::<_, WorkflowExecution>(&query)
+            .bind(input.execution)
+            .bind(input.workflow_def)
+            .bind(&input.task_graph)
+            .bind(&input.variables)
+            .bind(input.status)
+            .fetch_optional(executor)
+            .await?;
 
         if let Some(workflow_execution) = inserted {
             return Ok(WorkflowExecutionCreateOrGetResult {
@@ -811,13 +817,39 @@ impl WorkflowExecutionRepository {
 
         let workflow_execution = Self::find_by_execution(executor, input.execution)
             .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "workflow_execution for parent execution {} disappeared after conflict",
-                    input.execution
-                )
-            })?;
+            .ok_or_else(workflow_parent_inadmissible)?;
 
+        Ok(WorkflowExecutionCreateOrGetResult {
+            workflow_execution,
+            created: false,
+        })
+    }
+
+    /// Native initialization must keep declaration rendering and variable
+    /// ciphertext in the actual creation transaction, not acquire another pool
+    /// connection through the Copy executor entry point.
+    pub async fn create_or_get_by_execution_with_conn(
+        connection: &mut sqlx::PgConnection,
+        input: CreateWorkflowExecutionInput,
+    ) -> Result<WorkflowExecutionCreateOrGetResult> {
+        let query = format!("{WORKFLOW_STATE_INSERT} ON CONFLICT (execution) DO NOTHING RETURNING {WORKFLOW_STATE_COLUMNS}");
+        let inserted = sqlx::query_as::<_, WorkflowExecution>(&query)
+            .bind(input.execution)
+            .bind(input.workflow_def)
+            .bind(input.task_graph)
+            .bind(input.variables)
+            .bind(input.status)
+            .fetch_optional(&mut *connection)
+            .await?;
+        if let Some(workflow_execution) = inserted {
+            return Ok(WorkflowExecutionCreateOrGetResult {
+                workflow_execution,
+                created: true,
+            });
+        }
+        let workflow_execution = Self::find_by_execution(&mut *connection, input.execution)
+            .await?
+            .ok_or_else(workflow_parent_inadmissible)?;
         Ok(WorkflowExecutionCreateOrGetResult {
             workflow_execution,
             created: false,

@@ -151,6 +151,101 @@ async fn scoped_install_authority_admits_only_the_named_fresh_pack() -> Result<(
 }
 
 #[tokio::test]
+async fn managed_action_api_edit_readmits_metadata_over_the_same_immutable_release() -> Result<()> {
+    use attune_common::repositories::{
+        executable_snapshot::ExecutableSnapshotRepository,
+        managed_executable::ManagedExecutableRepository,
+        runtime_authority::RuntimeAuthorityRepository,
+    };
+    let ctx = TestContext::new().await?.with_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let admin = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await?
+        .unwrap();
+    let identity = ctx.user.as_ref().unwrap().id;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: admin.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    let source = create_test_pack_dir("metadata_edit", "1.0.0")?;
+    fs::create_dir_all(source.path().join("actions"))?;
+    fs::write(
+        source.path().join("actions/run.yaml"),
+        "ref: metadata_edit.run\nrunner_type: native\nentry_point: run.sh\n",
+    )?;
+    fs::write(source.path().join("actions/run.sh"), "#!/bin/sh\nexit 0\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            source.path().join("actions/run.sh"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+    }
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_string_lossy(),"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pack = PackRepository::find_by_ref(&ctx.pool, "metadata_edit")
+        .await?
+        .unwrap();
+    let mut tx = ctx.pool.begin().await?;
+    let before = RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
+        .await?
+        .unwrap();
+    let binding = before.policy.invocations[0].binding.clone();
+    let immutable =
+        ManagedExecutableRepository::resolve_invocation(&mut tx, &before.policy, &binding).await?;
+    tx.rollback().await?;
+    let response = ctx
+        .put(
+            "/api/v1/actions/metadata_edit.run",
+            json!({"entrypoint":"actions/edited.sh"}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut tx = ctx.pool.begin().await?;
+    let after = RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
+        .await?
+        .unwrap();
+    assert_ne!(before.id, after.id);
+    assert_eq!(before.policy.release_id, after.policy.release_id);
+    let edited =
+        ManagedExecutableRepository::resolve_invocation(&mut tx, &after.policy, &binding).await?;
+    assert_eq!(edited.executable.action.entrypoint, "actions/edited.sh");
+    let old =
+        ManagedExecutableRepository::resolve_invocation(&mut tx, &before.policy, &binding).await?;
+    assert_eq!(
+        old.executable.action.entrypoint,
+        immutable.executable.action.entrypoint
+    );
+    let live =
+        ExecutableSnapshotRepository::resolve_for_action(&mut *tx, immutable.executable.action.id)
+            .await?;
+    assert_eq!(
+        live.executable.action.entrypoint,
+        edited.executable.action.entrypoint
+    );
+    tx.rollback().await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn fresh_nested_workflows_resolve_later_candidate_action_declarations() -> Result<()> {
     let ctx = TestContext::new().await?.with_pack_install_auth().await?;
     PlatformCatalogRepository::reconcile(&ctx.pool).await?;
@@ -3267,8 +3362,8 @@ async fn pack_republish_custom_suffix_replaces_the_default_suffix() -> Result<()
 }
 
 #[tokio::test]
-async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readiness() -> Result<()>
-{
+async fn legacy_pack_upgrade_requires_api_readmission_without_blocking_platform_readiness(
+) -> Result<()> {
     let ctx = TestContext::new().await?;
     attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)
         .await?;
@@ -3346,23 +3441,14 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
     let blob_store = FilesystemBlobStore::new(ctx.test_packs_dir.join("blobs"))?;
     let report =
         upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
-    assert_eq!(report.upgraded, vec!["core"]);
-    assert!(report.failures.is_empty());
-
-    let release = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
-        .await?
-        .expect("active upgraded release");
-    assert_eq!(release.manifest["pack_ref"], "core");
-    assert_eq!(release.manifest["version"], "1.2.3");
-    assert!(release.manifest["files"]
-        .as_array()
-        .is_some_and(|files| files.iter().any(|file| file["path"] == "run.sh")));
-    let object = blob_store
-        .head(&ObjectKey::new(release.object_key.as_deref().unwrap())?)
-        .await?
-        .expect("uploaded immutable archive");
-    assert_eq!(object.size as i64, release.archive_size);
-    assert_eq!(hex::encode(object.sha256), release.digest);
+    assert!(report.upgraded.is_empty());
+    assert_eq!(report.failures.len(), 1);
+    assert!(report.failures[0].error.contains("readmission"));
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
+            .await?
+            .is_none()
+    );
     assert_eq!(
         PlatformCatalogRepository::origin_by_id(
             &ctx.pool,
@@ -3372,7 +3458,7 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
         .await?,
         Some(ManagementOrigin::Pack {
             pack_id: pack.id,
-            release_id: Some(release.id),
+            release_id: None,
         })
     );
 
@@ -3392,13 +3478,13 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
 
     let report =
         upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
-    assert_eq!(report.upgraded, vec!["core"]);
-    assert!(report.failures.is_empty());
-    let upgraded_release = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
-        .await?
-        .expect("upgraded active release");
-    assert_eq!(upgraded_release.version, "1.2.4");
-    assert_ne!(upgraded_release.digest, release.digest);
+    assert!(report.upgraded.is_empty());
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
+            .await?
+            .is_none()
+    );
 
     let upgraded_ready = ctx.get("/health/ready", None).await?;
     assert_eq!(upgraded_ready.status(), axum::http::StatusCode::OK);

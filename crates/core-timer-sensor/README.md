@@ -138,6 +138,32 @@ Examples:
 - Every 1 hour: `{"type": "interval", "interval": 1, "unit": "hours"}`
 - Every 1 day: `{"type": "interval", "interval": 1, "unit": "days"}`
 
+#### Missed ticks and recovery
+
+Interval timers use a monotonic clock and first fire after one full interval.
+If scheduling resumes at least one full interval after the expected tick, the
+timer immediately attempts to publish one recovery event and logs a warning.
+It skips the remaining overdue ticks, then continues at the next future boundary
+on the original cadence. Ordinary scheduling jitter does not generate warnings.
+
+For a 10-second interval with the next tick due at second 10, resuming at second
+35 publishes once at 35 and continues at 40, 50, and 60. The warning records the
+rule ID, interval, estimated expected UTC time, recovery UTC time, delay, three
+missed ticks, and two skipped ticks. The expected UTC time is derived from the
+monotonic delay and the recovery wall clock, so it is an estimate if UTC changed.
+
+Each rule has at most one event publication in flight, including API retries.
+Slow or failed API calls do not stop future scheduling or accumulate a replay
+queue. Publication uses the existing bounded retry policy. A recovery event is
+not guaranteed to reach an unavailable API, and an ambiguous API response can
+still result in duplicate delivery on retry. `execution_count` counts publication
+cycles, not skipped ticks or individual retry attempts.
+
+Disabling, deleting, or replacing a timer cancels and joins its task, including
+pending API calls or retries. An event already accepted by the API cannot be
+retracted. Unchanged rule reconciliation preserves the cadence. Restarting the
+sensor starts a new cadence and does not replay downtime.
+
 ### DateTime Timer
 
 Fires at a specific date/time (one-time):
@@ -327,8 +353,13 @@ The service account token has exceeded its TTL (24-72 hours). This is expected b
 ### Running Tests
 
 ```bash
-cargo test --package core-timer-sensor
+ATTUNE_TEST_RUN_ID=timer-local cargo test --manifest-path crates/core-timer-sensor/Cargo.toml --locked
 ```
+
+This crate is excluded from the root workspace and must be tested explicitly.
+The regression suite includes paused-clock tests for missed ticks and warnings,
+plus a real single-thread scheduler stall with a test-owned HTTP event API. No
+running Attune services are required.
 
 ### Building
 

@@ -1110,6 +1110,7 @@ pub enum PolicyScopeFilter {
 /// matches every row (i.e. an unconstrained grant).
 #[derive(Debug, Clone, Default)]
 pub struct PolicyVisibilityScope {
+    pub managing_pack_id: Option<Id>,
     /// Allowed pack refs. A policy matches if its own `pack_ref` is in this
     /// list, or (when `pack_ref` is null) the pack portion of its
     /// `action_ref` is in this list -- mirroring how `AuthorizationContext`
@@ -1206,7 +1207,17 @@ fn push_policy_visibility_filter<'args>(
         query.push("(");
         let mut wrote = false;
 
+        if let Some(pack) = scope.managing_pack_id {
+            query
+                .push(super::iam_ownership::component_pack("policy"))
+                .push(" = ")
+                .push_bind(pack);
+            wrote = true;
+        }
         if let Some(pack_refs) = &scope.pack_refs {
+            if wrote {
+                query.push(" AND ");
+            }
             query.push("(pack_ref = ANY(");
             query.push_bind(pack_refs);
             query.push(") OR (pack_ref IS NULL AND split_part(action_ref, '.', 1) = ANY(");

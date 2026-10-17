@@ -7,7 +7,9 @@
  */
 export type UpdateWorkflowRequest = {
   /**
-   * Workflow definition
+   * Workflow definition. A task with a templated action requires a finite
+   * literal allowed_action_refs array. Rendered permissions only reduce its
+   * admitted per-target ceiling.
    */
   definition: Record<string, any> | null;
   /**

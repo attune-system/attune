@@ -48,25 +48,55 @@ fn reject_sensor_admission(failures: Vec<SensorAdmissionFailure>) -> ApiResult<(
     ))
 }
 
-async fn authorize_runtime(
+async fn runtime_snapshot(
     state: &Arc<AppState>,
     user: &crate::auth::middleware::AuthenticatedUser,
     action: Action,
-) -> ApiResult<()> {
-    let identity_id = user
-        .identity_id()
-        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    state
+) -> ApiResult<crate::authz::AuthorizationSnapshot> {
+    let snapshot = state
         .authorization_service()
-        .authorize(
-            user,
-            AuthorizationCheck {
-                resource: Resource::Runtimes,
-                action,
-                context: AuthorizationContext::new(identity_id),
-            },
-        )
-        .await
+        .load_snapshot(user)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Runtime access requires IAM authority".into()))?;
+    if !snapshot
+        .grants
+        .iter()
+        .any(|grant| grant.resource == Resource::Runtimes && grant.actions.contains(&action))
+    {
+        return Err(ApiError::Forbidden(
+            "Insufficient runtime permissions".into(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+async fn authorize_runtime_target(
+    connection: &mut sqlx::PgConnection,
+    state: &Arc<AppState>,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    snapshot: &crate::authz::AuthorizationSnapshot,
+    runtime: &RuntimeModel,
+    action: Action,
+) -> ApiResult<()> {
+    use attune_common::repositories::runtime_target::{
+        ComponentTarget, RuntimeTarget, RuntimeTargetRepository,
+    };
+    let target = RuntimeTargetRepository::resolve(
+        connection,
+        RuntimeTarget::Component(ComponentTarget::Runtime, runtime.id),
+        snapshot.identity_id,
+    )
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Runtime is unavailable".into()))?;
+    state.authorization_service().authorize_with_snapshot(
+        user,
+        Some(snapshot),
+        AuthorizationCheck {
+            resource: Resource::Runtimes,
+            action,
+            context: target.context().clone(),
+        },
+    )
 }
 
 async fn can_view_runtime_execution_config(
@@ -77,15 +107,25 @@ async fn can_view_runtime_execution_config(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let grants = state.authorization_service().effective_grants(user).await?;
+    let Some(snapshot) = state.authorization_service().load_snapshot(user).await? else {
+        return Ok(false);
+    };
 
     let mut context = AuthorizationContext::new(identity_id);
+    context.identity_attributes = snapshot.identity_attributes.clone();
     context.target_id = Some(runtime.id);
+    context.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Runtime,
+            runtime.id,
+        )
+        .await?;
     context.target_ref = Some(runtime.r#ref.clone());
     context.pack_ref = runtime.pack_ref.clone();
 
     Ok(AuthorizationService::is_allowed(
-        &grants,
+        &snapshot.grants,
         Resource::Runtimes,
         Action::Update,
         &context,
@@ -140,12 +180,17 @@ pub async fn list_runtimes(
     RequireAuth(user): RequireAuth,
     Query(query): Query<RuntimeListParams>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_runtime(&state, &user, Action::Read).await?;
+    let snapshot = runtime_snapshot(&state, &user, Action::Read).await?;
 
     let pagination = query.pagination();
     let result = RuntimeRepository::list_search(
         &state.db,
         &RuntimeSearchFilters {
+            visibility: Some(super::visibility::snapshot_visibility_scope(
+                &snapshot,
+                Resource::Runtimes,
+                Action::Read,
+            )),
             query: query.q,
             limit: pagination.limit(),
             offset: pagination.offset(),
@@ -183,24 +228,32 @@ pub async fn list_runtimes_by_pack(
     Path(pack_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_runtime(&state, &user, Action::Read).await?;
+    let snapshot = runtime_snapshot(&state, &user, Action::Read).await?;
 
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
-    let all_runtimes = RuntimeRepository::find_by_pack(&state.db, pack.id).await?;
-    let total = all_runtimes.len() as u64;
-    let rows: Vec<_> = all_runtimes
-        .into_iter()
-        .skip(pagination.offset() as usize)
-        .take(pagination.limit() as usize)
-        .collect();
+    let result = RuntimeRepository::list_search(
+        &state.db,
+        &RuntimeSearchFilters {
+            pack: Some(pack.id),
+            visibility: Some(super::visibility::snapshot_visibility_scope(
+                &snapshot,
+                Resource::Runtimes,
+                Action::Read,
+            )),
+            limit: pagination.limit(),
+            offset: pagination.offset(),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     let response = PaginatedResponse::new(
-        rows.into_iter().map(RuntimeSummary::from).collect(),
+        result.rows.into_iter().map(RuntimeSummary::from).collect(),
         &pagination,
-        total,
+        result.total,
     );
 
     Ok((StatusCode::OK, Json(response)))
@@ -222,11 +275,22 @@ pub async fn get_runtime(
     RequireAuth(user): RequireAuth,
     Path(runtime_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_runtime(&state, &user, Action::Read).await?;
+    let snapshot = runtime_snapshot(&state, &user, Action::Read).await?;
 
     let runtime = RuntimeRepository::find_by_ref(&state.db, &runtime_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Runtime '{}' not found", runtime_ref)))?;
+    let mut transaction = state.db.begin().await?;
+    authorize_runtime_target(
+        &mut transaction,
+        &state,
+        &user,
+        &snapshot,
+        &runtime,
+        Action::Read,
+    )
+    .await?;
+    transaction.commit().await?;
     let can_view_sensitive = can_view_runtime_execution_config(&state, &user, &runtime).await?;
     let runtime = if can_view_sensitive {
         runtime
@@ -258,11 +322,38 @@ pub async fn create_runtime(
     RequireAuth(user): RequireAuth,
     Json(request): Json<CreateRuntimeRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_runtime(&state, &user, Action::Create).await?;
+    let snapshot = runtime_snapshot(&state, &user, Action::Create).await?;
 
     request.validate()?;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+
+    let pack = if let Some(reference) = &request.pack_ref {
+        Some(
+            PackRepository::find_by_ref_for_share(&mut tx, reference)
+                .await?
+                .ok_or_else(|| ApiError::Forbidden("Runtime owner is unavailable".into()))?,
+        )
+    } else {
+        None
+    };
+    let mut context = AuthorizationContext::new(snapshot.identity_id);
+    context.target_ref = Some(request.r#ref.clone());
+    if let Some(pack) = &pack {
+        context.managing_pack_id = Some(pack.id);
+        context.pack_ref = Some(pack.r#ref.clone());
+    }
+    state.authorization_service().authorize_with_snapshot(
+        &user,
+        Some(&snapshot),
+        AuthorizationCheck {
+            resource: Resource::Runtimes,
+            action: Action::Create,
+            context,
+        },
+    )?;
 
     if RuntimeRepository::find_by_ref(&mut *tx, &request.r#ref)
         .await?
@@ -274,14 +365,9 @@ pub async fn create_runtime(
         )));
     }
 
-    let (pack_id, pack_ref) = if let Some(ref pack_ref_str) = request.pack_ref {
-        let pack = PackRepository::find_by_ref(&mut *tx, pack_ref_str)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref_str)))?;
-        (Some(pack.id), Some(pack.r#ref))
-    } else {
-        (None, None)
-    };
+    let (pack_id, pack_ref) = pack
+        .map(|pack| (Some(pack.id), Some(pack.r#ref)))
+        .unwrap_or_default();
 
     let runtime = RuntimeRepository::create(
         &mut *tx,
@@ -300,6 +386,8 @@ pub async fn create_runtime(
         },
     )
     .await?;
+    // Recheck the persisted management origin as well as the prospective pack.
+    authorize_runtime_target(&mut tx, &state, &user, &snapshot, &runtime, Action::Create).await?;
     tx.commit().await?;
     publish_runtime_metadata_change(&state, &runtime, "created", runtime.updated).await;
 
@@ -331,15 +419,26 @@ pub async fn update_runtime(
     Path(runtime_ref): Path<String>,
     Json(request): Json<UpdateRuntimeRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_runtime(&state, &user, Action::Update).await?;
+    let snapshot = runtime_snapshot(&state, &user, Action::Update).await?;
 
     request.validate()?;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
 
     let existing_runtime = RuntimeRepository::find_by_ref(&mut *tx, &runtime_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Runtime '{}' not found", runtime_ref)))?;
+    authorize_runtime_target(
+        &mut tx,
+        &state,
+        &user,
+        &snapshot,
+        &existing_runtime,
+        Action::Update,
+    )
+    .await?;
 
     let runtime = RuntimeRepository::update(
         &mut *tx,
@@ -396,13 +495,16 @@ pub async fn delete_runtime(
     RequireAuth(user): RequireAuth,
     Path(runtime_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_runtime(&state, &user, Action::Delete).await?;
+    let snapshot = runtime_snapshot(&state, &user, Action::Delete).await?;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
 
     let runtime = RuntimeRepository::find_by_ref(&mut *tx, &runtime_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Runtime '{}' not found", runtime_ref)))?;
+    authorize_runtime_target(&mut tx, &state, &user, &snapshot, &runtime, Action::Delete).await?;
 
     let deleted = RuntimeRepository::delete(&mut *tx, runtime.id).await?;
     if !deleted {

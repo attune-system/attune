@@ -60,6 +60,44 @@ pub struct ApiTransport {
 }
 
 impl ApiTransport {
+    async fn seal_with_manifest(
+        &self,
+        artifact_version: i64,
+        truncated: bool,
+        manifest: Option<&str>,
+    ) -> Result<()> {
+        let url = self.log_seal_url(artifact_version, truncated);
+        let response = send_with_auth_retry(
+            &self.client,
+            &self.auth_token_source,
+            |client, token| {
+                let request = client.post(&url).bearer_auth(token);
+                if let Some(manifest) = manifest {
+                    request.header("x-attune-log-final-manifest", manifest)
+                } else {
+                    request
+                }
+            },
+            "API log seal request failed",
+        )
+        .await
+        .map_err(|error| match error {
+            Error::Io(message) => Error::retryable_transport(message),
+            error => error,
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let message = format!(
+                "API log seal failed for version {artifact_version}: HTTP {status} - {body}"
+            );
+            if is_retryable_log_segment_status(status) {
+                return Err(Error::retryable_transport(message));
+            }
+            return Err(Error::Io(message));
+        }
+        Ok(())
+    }
     pub fn new(api_url: &str, auth_token: &str, artifacts_dir: &str) -> Result<Self> {
         let client = crate::http_client::build_http_client(|| {
             Client::builder().timeout(std::time::Duration::from_secs(300))
@@ -582,30 +620,18 @@ impl ArtifactFileTransport for ApiTransport {
     }
 
     async fn seal_log_stream(&self, artifact_version: i64, truncated: bool) -> Result<()> {
-        let url = self.log_seal_url(artifact_version, truncated);
-        let resp = send_with_auth_retry(
-            &self.client,
-            &self.auth_token_source,
-            |client, token| client.post(&url).bearer_auth(token),
-            "API log seal request failed",
-        )
-        .await
-        .map_err(|error| match error {
-            Error::Io(message) => Error::retryable_transport(message),
-            error => error,
-        })?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let message = format!(
-                "API log seal failed for version {artifact_version}: HTTP {status} - {body}"
-            );
-            if is_retryable_log_segment_status(status) {
-                return Err(Error::retryable_transport(message));
-            }
-            return Err(Error::Io(message));
-        }
-        Ok(())
+        self.seal_with_manifest(artifact_version, truncated, None)
+            .await
+    }
+
+    async fn seal_log_stream_with_manifest(
+        &self,
+        artifact_version: i64,
+        truncated: bool,
+        manifest: &str,
+    ) -> Result<()> {
+        self.seal_with_manifest(artifact_version, truncated, Some(manifest))
+            .await
     }
 
     async fn file_exists(&self, file_path: &str) -> Result<bool> {

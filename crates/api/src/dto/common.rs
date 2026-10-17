@@ -1,5 +1,16 @@
 //! Common DTO types used across all API endpoints
 
+/// Preserve explicit null so object patches can reject it instead of treating
+/// it as an omitted field. Missing fields use serde's default.
+pub(crate) fn deserialize_present_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::{IntoParams, ToSchema};
 

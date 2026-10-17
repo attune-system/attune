@@ -5,6 +5,8 @@
 #[path = "artifact_workload/cpu.rs"]
 mod cpu;
 mod helpers;
+#[path = "artifact_read_performance/managed_fixture.rs"]
+mod managed_fixture;
 #[path = "artifact_workload/reference.rs"]
 mod reference;
 #[path = "artifact_read_performance/source_origins.rs"]
@@ -23,7 +25,6 @@ use attune_common::{
             ArtifactReadContext, ArtifactRepository, ArtifactSearchFilters,
             ArtifactVersionRepository, CreateArtifactInput, CreateArtifactVersionInput,
         },
-        component_lifecycle::PackProjectionIds,
         execution::{CreateExecutionInput, ExecutionRepository},
         execution_secret_value::ExecutionSecretValueRepository,
         identity::{
@@ -139,24 +140,32 @@ impl Visit for QueryMetrics {
             self.graph_record_reads += 1;
         }
         if sql.starts_with("select ")
-            && sql.contains(" from execution_secret_value")
+            && (sql.contains(" from execution_secret_value")
+                || sql.contains(" from event_origin_snapshot"))
             && sql.split(" from ").next().is_some_and(|projection| {
-                projection.contains("encrypted_value") || projection.contains("encryption_key_hash")
+                projection.contains("encrypted_value")
+                    || projection.contains("encryption_key_hash")
+                    || projection
+                        .split(',')
+                        .any(|column| column.trim() == "snapshot")
             })
         {
             self.ciphertext_reads += 1;
         }
         if sql.contains(" from component_configuration_revision")
             || sql.contains(" from sensor_generation_schema_binding")
+            || sql.contains(" join sensor_rule_structural_origin")
             || matches!(
                 primary_table,
                 Some(
                     "event"
+                        | "event_origin_snapshot"
                         | "event_schema_binding"
                         | "inquiry"
                         | "inquiry_schema_binding"
                         | "sensor_generation_schema_binding"
                         | "sensor_rule_config_delivery"
+                        | "sensor_rule_structural_origin"
                         | "rule"
                         | "action"
                 )
@@ -331,6 +340,20 @@ fn query_budget_separates_connection_local_type_discovery_but_reports_every_stat
 }
 
 #[test]
+fn query_observer_counts_zipped_foreign_proof_join_as_source_metadata() {
+    let observer = RequestQueries::default();
+    let subscriber = tracing_subscriber::registry().with(observer.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::event!(target:"sqlx::query",tracing::Level::DEBUG,db.statement="SELECT p.source_entity,p.proof FROM unnest($1::TEXT[],$2::BIGINT[],$3::BIGINT[]) requested JOIN sensor_rule_structural_origin p ON (p.source_entity,p.source_id,p.rule_id)=(requested.entity,requested.id,requested.rule)");
+    });
+    let metrics = observer.0.lock().unwrap();
+    assert_eq!(metrics.application_statements(), 1);
+    assert_eq!(metrics.source_scope_reads, 1);
+    assert_eq!(metrics.ciphertext_reads, 0);
+    assert_eq!(metrics.source_payload_reads, 0);
+}
+
+#[test]
 fn query_observer_attributes_owner_subqueries_and_pool_acquisition() {
     let observer = RequestQueries::default();
     let subscriber = tracing_subscriber::registry().with(observer.clone());
@@ -435,19 +458,7 @@ async fn action(ctx: &TestContext) -> Result<String> {
         ]),
     )
     .await?;
-    let pack = helpers::create_test_pack(&ctx.pool, "artifact_perf").await?;
-    let action =
-        helpers::create_test_action(&ctx.pool, pack.id, &pack.r#ref, "artifact_perf.run").await?;
-    helpers::activate_test_pack_release_with_projections(
-        &ctx.pool,
-        &pack,
-        &PackProjectionIds {
-            actions: vec![action.id],
-            ..Default::default()
-        },
-    )
-    .await?;
-    Ok(action.r#ref)
+    managed_fixture::action_pack(ctx).await
 }
 
 async fn execution(ctx: &TestContext, action_ref: &str) -> Result<i64> {

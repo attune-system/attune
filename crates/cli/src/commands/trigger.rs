@@ -8,6 +8,14 @@ use crate::output::{self, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum TriggerCommands {
+    /// Inspect or explicitly acknowledge a current-contract rollout
+    #[command(
+        after_help = "Examples:\n  attune trigger rollout preflight example.tick --out-schema payload.json\n  attune trigger rollout apply example.tick --out-schema payload.json --yes\n\nOrdinary --yes never acknowledges incompatible live-emitter rollout."
+    )]
+    Rollout {
+        #[command(subcommand)]
+        command: super::trigger_rollout::RolloutCommands,
+    },
     /// List all triggers
     List {
         /// Filter by pack name
@@ -141,6 +149,9 @@ pub async fn handle_trigger_command(
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
+        TriggerCommands::Rollout { command } => {
+            super::trigger_rollout::handle(profile, api_url, command, output_format).await
+        }
         TriggerCommands::List { pack } => handle_list(pack, profile, api_url, output_format).await,
         TriggerCommands::Show { trigger_ref } => {
             handle_show(trigger_ref, profile, api_url, output_format).await

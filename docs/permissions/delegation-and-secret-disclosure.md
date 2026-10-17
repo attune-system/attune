@@ -89,6 +89,26 @@ authority. Installer freeze or permission-set edits do not replace captured
 input grants. Freezing the pack runtime identity stops input delivery.
 Input grants do not become execution API permissions. Changing deployed rule
 inputs requires the caller to cover its captured input grants.
+Retained workflow/default declarations use purpose-qualified input receipts.
+Execution config, execution results and workflow variables are separate entities,
+even at the same JSON pointer. A render session evaluates the exact admitted
+declaration once and retains the evaluator's selected source fields. Supplied
+strings remain literal values. Condition proofs remain control dependencies;
+they do not claim that a condition's boolean rendered a published value.
+
+An external declared Key input requires independent input-purpose consent.
+`POST /api/v1/packs/{pack_ref}/external-input-approvals` takes either an existing
+`renderer_execution`, or `policy_revision` with `invocation_binding` before any
+renderer exists. Both forms require declaration revision, source path, exact expression, read/decrypt
+grants and optional expiry. The issuer must currently cover those grants or
+manage permissions. The fixed approval applies only to that declaration, not
+selected SDK refs. Its revocation and expiry remain dependencies of propagated
+receipts after the original Key read. Human inactivity does not revoke it.
+Inspect, replace and revoke these approvals through the existing external
+approval controls. Replacement affects future reads, not receipts that depend
+on the explicitly revoked predecessor. Input-only approvals cannot be reused
+to admit runtime API grants.
+
 An encrypted key requires read and decrypt authority before arbitrary action code receives its value.
 Key-derived destination parameters must be marked `secret: true`.
 

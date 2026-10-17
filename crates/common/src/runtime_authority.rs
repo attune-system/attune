@@ -16,7 +16,7 @@ use crate::{
     Error, Result,
 };
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionScope {
     #[default]
@@ -25,21 +25,56 @@ pub enum PermissionScope {
 }
 
 /// Canonical authored grant. A grant may override its set's default scope.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionGrantDefinition {
     pub resource: Resource,
     pub actions: Vec<Action>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<AuthoredGrantConstraints>)]
     pub constraints: Option<GrantConstraints>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<PermissionScope>,
+}
+
+/// Public authoring schema. Structural ownership and database target IDs are
+/// server-owned and deliberately absent. Runtime validation remains canonical.
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredGrantConstraints {
+    pub pack_refs: Option<Vec<String>>,
+    pub owner: Option<crate::rbac::OwnerConstraint>,
+    pub owner_types: Option<Vec<OwnerType>>,
+    pub owner_refs: Option<Vec<String>>,
+    pub visibility: Option<Vec<crate::models::ArtifactVisibility>>,
+    pub execution_scope: Option<crate::rbac::ExecutionScopeConstraint>,
+    pub refs: Option<Vec<String>>,
+    pub encrypted: Option<bool>,
+    pub attributes: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl PermissionGrantDefinition {
     /// Approval endpoints are inherently external. Do not silently accept a
     /// local-scope authoring declaration as an external capability grant.
     pub fn into_external_approval_grant(self) -> Result<Grant> {
+        if self
+            .constraints
+            .as_ref()
+            .is_some_and(|scope| scope.managing_pack_id.is_some())
+        {
+            return Err(Error::validation(
+                "Authored approval cannot set server-owned structural ownership",
+            ));
+        }
+        if self
+            .constraints
+            .as_ref()
+            .is_some_and(|scope| scope.ids.is_some())
+        {
+            return Err(Error::validation(
+                "Authored approvals use refs, not database IDs",
+            ));
+        }
         if self.scope == Some(PermissionScope::Pack) {
             return Err(Error::validation(
                 "External approvals cannot contain pack-local scope declarations",
@@ -71,6 +106,45 @@ pub struct PermissionSetDefinition {
     #[serde(default)]
     pub scope: PermissionScope,
     pub grants: Vec<PermissionGrantDefinition>,
+}
+
+/// Effective IAM form. The structural envelope remains a constraint rather
+/// than being reduced to a ref prefix. SQL expansion uses the equivalent
+/// `effective_permission_set_grants` function and is tested against this form.
+pub fn normalize_iam_grants(
+    authored: serde_json::Value,
+    pack_id: Option<Id>,
+) -> Result<serde_json::Value> {
+    let definitions: Vec<PermissionGrantDefinition> = serde_json::from_value(authored)?;
+    if pack_id.is_none_or(|id| id <= 0)
+        && definitions
+            .iter()
+            .any(|grant| grant.scope == Some(PermissionScope::Pack))
+    {
+        return Err(Error::validation(
+            "Pack-local policy requires an actual managing pack",
+        ));
+    }
+    let grants = definitions
+        .into_iter()
+        .map(|definition| {
+            let scope = definition.scope.unwrap_or_default();
+            let mut grant = definition.grant();
+            if let Some(constraints) = &mut grant.constraints {
+                constraints.managing_pack_id = None;
+            }
+            if let Some(pack_id) = pack_id.filter(|id| *id > 0) {
+                if scope == PermissionScope::Pack {
+                    grant
+                        .constraints
+                        .get_or_insert_with(Default::default)
+                        .managing_pack_id = Some(pack_id);
+                }
+            }
+            grant
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_value(grants)?)
 }
 
 /// Supplied from the candidate graph or retained managing-pack records, not a ref prefix.
@@ -224,6 +298,41 @@ impl AdmittedPermissionSet {
 }
 
 impl PermissionSetDefinition {
+    /// Preserve per-grant authored scope when storing a set in the canonical
+    /// permission repository. This is authoring data, not effective IAM grants.
+    pub fn authored_grants(&self) -> Result<serde_json::Value> {
+        let grants = self
+            .grants
+            .iter()
+            .cloned()
+            .map(|mut grant| {
+                if grant
+                    .constraints
+                    .as_ref()
+                    .is_some_and(|scope| scope.managing_pack_id.is_some())
+                {
+                    return Err(Error::validation(
+                        "Structural ownership is server-owned, not an authored selector",
+                    ));
+                }
+                grant.scope = Some(grant.scope.unwrap_or(self.scope));
+                Ok(grant)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(serde_json::to_value(grants)?)
+    }
+
+    /// Naked grants are only for the transitional registrar coverage check.
+    /// They must never be used for IAM matching or runtime consumption.
+    pub(crate) fn registrar_grants(&self) -> Result<Vec<Grant>> {
+        self.authored_grants()?;
+        Ok(self
+            .grants
+            .iter()
+            .map(PermissionGrantDefinition::grant)
+            .collect())
+    }
+
     pub fn compile(
         &self,
         owner: &PackAuthorityOwner,
@@ -237,6 +346,15 @@ impl PermissionSetDefinition {
         let mut grants = Vec::with_capacity(self.grants.len());
         for authored in &self.grants {
             let grant = authored.grant();
+            if grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+            {
+                return Err(Error::validation(
+                    "Authored policy cannot set structural ownership",
+                ));
+            }
             validate_stable_grant(&grant)?;
             if grant.constraints.as_ref().is_some_and(|scope| {
                 scope.ids.is_some() || scope.pack_refs.is_some() && scope.refs.is_some()
@@ -310,7 +428,7 @@ impl PermissionSetDefinition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvocationBinding {
     Action {
@@ -372,6 +490,16 @@ impl InvocationBinding {
 #[serde(deny_unknown_fields)]
 pub struct InvocationPolicy {
     pub binding: InvocationBinding,
+    /// Actual managing action/rule/queue identity, captured by the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_template_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_revision: Option<Id>,
+    /// Foreign workflow internals retain their publisher's policy and sponsor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreign_workflow_policy: Option<crate::repositories::workflow_policy::WorkflowPolicyPin>,
     pub target_release_id: Id,
     pub target_release_digest: String,
     pub permission_sets: BTreeMap<String, AdmittedPermissionSet>,
@@ -426,6 +554,10 @@ impl InvocationPolicy {
         }
         Ok(Self {
             binding,
+            source_id: None,
+            dispatch_template_digest: None,
+            metadata_revision: None,
+            foreign_workflow_policy: None,
             target_release_id: executable.release.id,
             target_release_digest: executable.release.digest.clone(),
             permission_sets,
@@ -441,9 +573,97 @@ pub struct RuntimePolicy {
     pub release_id: Id,
     pub release_digest: String,
     pub invocations: Vec<InvocationPolicy>,
+    /// Concrete selectors are resolved during server-owned capture. Owner scopes
+    /// remain open scopes; they are not enumerations of their current children.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub concrete_targets: BTreeMap<String, GrantTargetBindings>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantTargetBindings {
+    pub targets: Option<BTreeSet<BoundRuntimeTarget>>,
+    pub owners: Option<BTreeSet<(String, Id, Option<Id>)>>,
+    pub packs: Option<BTreeSet<Id>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundRuntimeTarget {
+    pub kind: String,
+    pub id: Id,
+    pub pack_id: Option<Id>,
+    pub owner_type: Option<String>,
+    pub owner_id: Option<Id>,
 }
 
 impl RuntimePolicy {
+    /// After validating the parent's recorded admission, compare its immutable
+    /// workflow identity rather than reapplying current ordinary disablement.
+    pub fn invocation_for_retained_workflow(
+        &self,
+        binding: &InvocationBinding,
+        parent: &crate::models::ExecutionExecutableSnapshot,
+    ) -> Result<&InvocationPolicy> {
+        let InvocationBinding::WorkflowTask { workflow_ref, .. } = binding else {
+            return Err(Error::validation(
+                "Retained workflow source requires a task binding",
+            ));
+        };
+        let action = &parent.executable.action;
+        let source=self.invocations.iter().find(|entry|matches!(&entry.binding,InvocationBinding::Action {action_ref} if action_ref == workflow_ref))
+            .ok_or_else(||Error::PermissionDenied("Retained workflow source has no admitted executable".into()))?;
+        if action.pack != self.owner.pack_id
+            || action.r#ref != *workflow_ref
+            || parent.executable.workflow_definition.is_none()
+            || source.source_id != Some(action.id)
+            || source.target_release_id != parent.release.id
+            || source.target_release_digest != parent.release.digest
+        {
+            return Err(Error::PermissionDenied(
+                "Retained workflow source differs from its admitted graph".into(),
+            ));
+        }
+        self.invocations
+            .iter()
+            .find(|entry| &entry.binding == binding && entry.source_id == Some(action.id))
+            .ok_or_else(|| {
+                Error::PermissionDenied("Retained workflow task source identity mismatch".into())
+            })
+    }
+
+    pub fn invocation_for_source(
+        &self,
+        binding: &InvocationBinding,
+        source: &crate::repositories::runtime_target::ResolvedRuntimeTarget,
+    ) -> Result<&InvocationPolicy> {
+        let (kind, reference) = match binding {
+            InvocationBinding::Action { action_ref } => ("action", action_ref),
+            InvocationBinding::WorkflowTask { workflow_ref, .. } => ("action", workflow_ref),
+            InvocationBinding::Rule { rule_ref, .. } => ("rule", rule_ref),
+            InvocationBinding::Queue { queue_ref, .. } => ("work_queue", queue_ref),
+        };
+        if !source.accepts_new_effects()
+            || source.identity_kind() != kind
+            || source.pack_id() != Some(self.owner.pack_id)
+            || source.context().target_ref.as_ref() != Some(reference)
+        {
+            return Err(Error::PermissionDenied(
+                "Invocation source has no admitted structural ownership".into(),
+            ));
+        }
+        self.invocations
+            .iter()
+            .find(|entry| {
+                &entry.binding == binding && entry.source_id == source.context().target_id
+            })
+            .ok_or_else(|| {
+                Error::PermissionDenied(
+                    "Invocation source identity does not match its admitted binding".into(),
+                )
+            })
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.owner.validate()?;
         positive_id(self.release_id)?;
@@ -451,6 +671,19 @@ impl RuntimePolicy {
         let mut bindings = HashSet::new();
         for invocation in &self.invocations {
             invocation.binding.validate(&self.owner.pack_ref)?;
+            if let Some(revision) = invocation.metadata_revision {
+                positive_id(revision)?;
+            }
+            if let Some(pin) = &invocation.foreign_workflow_policy {
+                positive_id(pin.revision)?;
+                validate_digest(&pin.digest)?;
+            }
+            if let Some(source) = invocation.source_id {
+                positive_id(source)?;
+            }
+            if let Some(template) = &invocation.dispatch_template_digest {
+                validate_digest(template)?;
+            }
             positive_id(invocation.target_release_id)?;
             validate_digest(&invocation.target_release_digest)?;
             if !bindings.insert(&invocation.binding) {
@@ -554,6 +787,7 @@ pub enum RequestAttribution {
     },
     QueueBatch {
         queue_ref: String,
+        #[serde(deserialize_with = "crate::execution_attribution::deserialize_queue_items")]
         items: BTreeMap<Id, Option<HumanAttribution>>,
     },
     ParentExecution {
@@ -741,7 +975,7 @@ pub(crate) fn validate_stable_grant(grant: &Grant) -> Result<()> {
     Ok(())
 }
 
-fn pack_owned_resource(resource: Resource) -> bool {
+pub fn pack_owned_resource(resource: Resource) -> bool {
     !matches!(
         resource,
         Resource::Workers

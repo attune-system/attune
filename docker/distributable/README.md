@@ -14,14 +14,33 @@ It is designed to run Attune without building the Rust services locally:
 The compose file defaults to:
 
 - registry: `ghcr.io/attune-system`
-- tag: `latest`
+- platform tag: `latest`
+- independently selected core bootstrap image tag: `core-1.0.4`
 
 Override them with env vars:
 
 ```bash
 export ATTUNE_IMAGE_REGISTRY=ghcr.io/attune-system
 export ATTUNE_IMAGE_TAG=latest
+export ATTUNE_INIT_PACKS_IMAGE_TAG=core-1.0.4
+export ATTUNE_CORE_PACK_VERSION=1.0.4
 ```
+
+Select compatible coordinated platform and bootstrap images before deployment.
+The core tag is a required source-release target, not a claim that it has been
+built/published or that historical platform tags implement admission. Bootstrap
+requires an existing deployment integration credential in
+`ATTUNE_BOOTSTRAP_TOKEN`, supplied through operator provisioning. It receives
+no database credentials, creates no identities, and mounts no active pack,
+runtime or artifact volumes.
+
+`ATTUNE_CORE_PACK_DIGEST` is optional and defaults empty. Populate it only from
+the actual canonical immutable `pack.tar.gz` after native timer binaries for
+both architectures have been packaged. A container image digest, source-only
+tarball hash or Python upload-tarball hash is not this release digest. The
+release workflow derives the core version/image tag from `packs/core/pack.yaml`;
+no fixed external registry checksum is rewritten by this bundle. No archive
+digest or successful publication is claimed by the version defaults.
 
 If the registry requires auth:
 

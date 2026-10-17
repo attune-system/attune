@@ -135,7 +135,6 @@ async fn refresh_runtime_version_capabilities_for_registration(
 /// Worker service that manages execution lifecycle
 pub struct WorkerService {
     child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
-    #[allow(dead_code)]
     config: Config,
     db_pool: PgPool,
     registration: Arc<RwLock<WorkerRegistration>>,
@@ -1194,6 +1193,15 @@ impl WorkerService {
         let runtime_envs_dir = self.runtime_envs_dir.clone();
         let pack_transport = self.pack_transport.clone();
         let child_environment = self.child_environment.clone();
+        let candidate_api_url = std::env::var("ATTUNE_API_URL")
+            .unwrap_or_else(|_| {
+                format!(
+                    "http://{}:{}",
+                    self.config.server.host, self.config.server.port
+                )
+            })
+            .replace("://0.0.0.0", "://127.0.0.1")
+            .replace("://[::]", "://127.0.0.1");
 
         let consumer_for_task = consumer.clone();
         let handle = tokio::spawn(async move {
@@ -1209,14 +1217,18 @@ impl WorkerService {
                         let runtime_envs_dir = runtime_envs_dir.clone();
                         let pack_transport = pack_transport.clone();
                         let child_environment = child_environment.clone();
+                        let candidate_api_url = candidate_api_url.clone();
 
                         async move {
                             let payload = envelope.payload;
                             if let Err(e) = handle_pack_test(
                                 &db_pool,
                                 worker_id,
-                                packs_base_dir.as_path(),
-                                runtime_envs_dir.as_path(),
+                                PackTestLocation {
+                                    packs_base_dir: packs_base_dir.as_path(),
+                                    runtime_envs_dir: runtime_envs_dir.as_path(),
+                                    api_url: &candidate_api_url,
+                                },
                                 pack_transport.as_ref(),
                                 &payload,
                                 &child_environment,
@@ -2202,18 +2214,29 @@ impl Drop for PackTestCandidateCleanup {
     }
 }
 
+/// Worker-owned locations, never values supplied by the pack test request.
+struct PackTestLocation<'a> {
+    packs_base_dir: &'a std::path::Path,
+    runtime_envs_dir: &'a std::path::Path,
+    api_url: &'a str,
+}
+
 /// Run a pack's test suite on this worker and persist the outcome.
 async fn handle_pack_test(
     db_pool: &PgPool,
     worker_id: i64,
-    packs_base_dir: &std::path::Path,
-    runtime_envs_dir: &std::path::Path,
+    location: PackTestLocation<'_>,
     pack_transport: &dyn attune_common::pack_transport::PackFileTransport,
     payload: &PackTestRequestedPayload,
     child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
 ) -> Result<()> {
     use attune_common::test_executor::{TestConfig, TestExecutor};
     use std::path::PathBuf;
+    let PackTestLocation {
+        packs_base_dir,
+        runtime_envs_dir,
+        api_url,
+    } = location;
 
     validate_mq_pack_ref(&payload.pack_ref, "PackTestRequested")?;
 
@@ -2455,8 +2478,52 @@ async fn handle_pack_test(
         None
     };
 
-    let executor = TestExecutor::new(PathBuf::from(packs_base_dir));
-    let result = match executor
+    let mut executor = TestExecutor::new(PathBuf::from(packs_base_dir));
+    let candidate_lease = if test_config.candidate_api_effects {
+        use attune_common::repositories::candidate_effect::CandidateEffectRepository;
+        if payload.candidate_path.is_none() {
+            return Err(Error::validation(
+                "API-effect tests require a pinned candidate archive",
+            ));
+        }
+        let lease = CandidateEffectRepository::open(
+            db_pool,
+            payload.pack_install_id,
+            worker_id,
+            payload
+                .candidate_access_token
+                .as_deref()
+                .ok_or_else(|| Error::validation("Candidate archive token is missing"))?,
+            &attune_common::repositories::candidate_effect::CandidateArchiveBinding {
+                key: install
+                    .candidate_object_key
+                    .as_deref()
+                    .ok_or_else(|| Error::validation("Candidate archive key is missing"))?,
+                provider_version: install.candidate_provider_version.as_deref().ok_or_else(
+                    || Error::validation("Candidate archive provider version is missing"),
+                )?,
+                digest: install
+                    .candidate_digest
+                    .as_deref()
+                    .ok_or_else(|| Error::validation("Candidate archive digest is missing"))?,
+            },
+        )
+        .await?;
+        executor = executor.with_candidate_effects(
+            attune_common::test_executor::CandidateTestEnvironment {
+                url: format!(
+                    "{}/api/v1/candidates/{}/effects",
+                    api_url.trim_end_matches('/'),
+                    lease.id
+                ),
+                token: lease.token.clone(),
+            },
+        );
+        Some(lease)
+    } else {
+        None
+    };
+    let test_result = executor
         .execute_pack_tests_at_with_python_interpreter(
             &pack_dir,
             &payload.pack_ref,
@@ -2464,8 +2531,15 @@ async fn handle_pack_test(
             &test_config,
             python_interpreter.as_deref(),
         )
-        .await
-    {
+        .await;
+    // Revoke before interpreting/persisting the result, including runner errors.
+    if let Some(lease) = candidate_lease {
+        attune_common::repositories::candidate_effect::CandidateEffectRepository::close(
+            db_pool, lease.id,
+        )
+        .await?;
+    }
+    let result = match test_result {
         Ok(result) => result,
         Err(e) => {
             mark_pack_install_failed(db_pool, payload, &format!("Test execution failed: {e}"))

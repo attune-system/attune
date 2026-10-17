@@ -1,0 +1,29 @@
+{
+  "enabled_for_controlled_acceptance": false,
+  "generation": "00000000-0000-4000-8000-000000000001",
+  "scope": {"backend": "REPLACE_WITH_API_CANONICAL_STORAGE_AND_ARTIFACT_ROOT_DIGEST", "staging_prefix": ".attune-upload/"},
+  "service_uid": 61124,
+  "host_pid_namespace": "REPLACE_WITH_HOST_PROC_PID_NAMESPACE_INODE",
+  "roots": {"blob": "/owned/legacy-generation/blobs", "shared": "/owned/legacy-generation/shared"},
+  "cgroup": "/sys/fs/cgroup/owned-deployment/legacy-generation-writers",
+  "writer_binary": "/opt/attune/native/legacy_native_writer",
+  "writer_sha256": "REPLACE_WITH_CENTRALLY_BUILT_BINARY_SHA256",
+  "state_dir": "/owned/legacy-generation-journal",
+  "bind": "127.0.0.1",
+  "port": 9443,
+  "tls_certificate": "/run/attune-native/server-cert.pem",
+  "tls_key": "/run/attune-native/server-key.pem",
+  "tls_client_ca": "/run/attune-native/deployment-client-ca.pem",
+  "signing_key": "/run/attune-native/independent-rsa-signing-key.pem",
+  "issuer": "attune-owned-native-filesystem-controller",
+  "audience": "attune-legacy-file-audit",
+  "principals": {
+    "REPLACE_WITH_API_MANAGEMENT_CLIENT_CERT_DER_SHA256": {"role": "manager"},
+    "REPLACE_WITH_DISTINCT_DEPLOYMENT_WRITER_CLIENT_CERT_DER_SHA256": {
+      "role": "writer",
+      "native_instance": "REPLACE_WITH_ACTUAL_DEPLOYMENT_NATIVE_INSTANCE_UUID",
+      "worker_instance": "REPLACE_WITH_ACTUAL_DEPLOYMENT_WORKER_INSTANCE_UUID",
+      "execution_attempt": "REPLACE_WITH_ACTUAL_EXECUTION_ATTEMPT_UUID"
+    }
+  }
+}

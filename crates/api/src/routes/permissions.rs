@@ -24,9 +24,10 @@ use attune_common::{
     repositories::{
         identity::{
             CreateIdentityInput, CreateIdentityRoleAssignmentInput,
-            CreatePermissionAssignmentInput, CreatePermissionSetRoleAssignmentInput,
-            DeleteIdentityOutcome, IdentityRepository, IdentityRoleAssignmentRepository,
-            PermissionAssignmentRepository, PermissionBindingFilter, PermissionSetRepository,
+            CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            CreatePermissionSetRoleAssignmentInput, DeleteIdentityOutcome, IdentityRepository,
+            IdentityRoleAssignmentRepository, PermissionAssignmentRepository,
+            PermissionBindingFilter, PermissionSetRepository,
             PermissionSetRoleAssignmentRepository, UpdateIdentityInput, UpdatePermissionSetInput,
         },
         integration_token::{CreateIntegrationTokenInput, IntegrationTokenRepository},
@@ -42,12 +43,13 @@ use crate::{
         common::{PaginatedResponse, PaginationParams},
         ApiResponse, CreateIdentityRequest, CreateIdentityRoleAssignmentRequest,
         CreateIntegrationTokenRequest, CreateIntegrationTokenResponse,
-        CreatePermissionAssignmentRequest, CreatePermissionSetRoleAssignmentRequest,
-        IdentityQueryParams, IdentityResponse, IdentityRoleAssignmentResponse, IdentitySummary,
-        IntegrationTokenResponse, PermissionAssignmentResponse, PermissionBindingQueryParams,
-        PermissionBindingResponse, PermissionSetQueryParams, PermissionSetRoleAssignmentResponse,
-        PermissionSetSummary, PermissionUpdateQueryParams, RevokeIntegrationTokenRequest,
-        SuccessResponse, UpdateIdentityRequest, UpdatePermissionSetRequest,
+        CreatePermissionAssignmentRequest, CreatePermissionSetRequest,
+        CreatePermissionSetRoleAssignmentRequest, IdentityQueryParams, IdentityResponse,
+        IdentityRoleAssignmentResponse, IdentitySummary, IntegrationTokenResponse,
+        PermissionAssignmentResponse, PermissionBindingQueryParams, PermissionBindingResponse,
+        PermissionSetQueryParams, PermissionSetRoleAssignmentResponse, PermissionSetSummary,
+        PermissionUpdateQueryParams, RevokeIntegrationTokenRequest, SuccessResponse,
+        UpdateIdentityRequest, UpdatePermissionSetRequest,
     },
     middleware::{ApiError, ApiResult},
     state::AppState,
@@ -444,6 +446,89 @@ pub async fn get_permission_set(
 }
 
 #[utoipa::path(
+    post,
+    path = "/api/v1/permissions/sets",
+    tag = "permissions",
+    request_body = CreatePermissionSetRequest,
+    responses(
+        (status = 201, description = "Permission set created", body = inline(ApiResponse<PermissionSetSummary>)),
+        (status = 400, description = "Invalid reference or grants"),
+        (status = 409, description = "Permission set reference already exists"),
+        (status = 422, description = "Validation error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_permission_set(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<CreatePermissionSetRequest>,
+) -> ApiResult<impl IntoResponse> {
+    authorize_permissions(&state, &user, Resource::Permissions, Action::Manage).await?;
+    request.validate()?;
+    attune_common::schema::RefValidator::validate_component_ref(&request.r#ref)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_permission_grants(&request.grants)?;
+    let definition = attune_common::runtime_authority::PermissionSetDefinition {
+        reference: request.r#ref.clone(),
+        label: request.label.clone(),
+        description: request.description.clone(),
+        scope: request
+            .scope
+            .unwrap_or(attune_common::runtime_authority::PermissionScope::External),
+        grants: serde_json::from_value(request.grants.clone())
+            .map_err(|_| ApiError::BadRequest("Invalid canonical permission definition".into()))?,
+    };
+    let authored_grants = definition.authored_grants()?;
+    let authored_definition = serde_json::to_value(&definition)
+        .map_err(|_| ApiError::BadRequest("Invalid canonical permission definition".into()))?;
+    let mut tx = state.db.begin().await?;
+    let created = PermissionSetRepository::create(
+        &mut *tx,
+        CreatePermissionSetInput {
+            r#ref: request.r#ref,
+            pack: None,
+            pack_ref: None,
+            label: request.label,
+            description: request.description,
+            grants: authored_grants.clone(),
+        },
+    )
+    .await?;
+    PermissionSetRepository::store_authored_definition(&mut tx, created.id, &definition).await?;
+    tx.commit().await?;
+    publish_permission_set_metadata_change(&state, created.id, &created.r#ref, "created").await;
+    emit_admin_audit(
+        &state,
+        &user,
+        event_type::admin::PERMISSION_SET_CHANGED,
+        "permission_set",
+        Some(created.id),
+        Some(created.r#ref.as_str()),
+        serde_json::json!({
+            "operation": "created",
+            "permission_set_ref": created.r#ref.as_str(),
+        }),
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::new(PermissionSetSummary {
+            id: created.id,
+            r#ref: created.r#ref,
+            pack_ref: created.pack_ref,
+            label: created.label,
+            description: created.description,
+            grants: created.grants,
+            authored_grants,
+            authored_definition,
+            retired_at: created.retired_at,
+            management_origin: ManagementOriginKind::AdHoc,
+            roles: Vec::new(),
+        })),
+    ))
+}
+
+#[utoipa::path(
     put,
     path = "/api/v1/permissions/sets/{id}",
     tag = "permissions",
@@ -487,31 +572,57 @@ pub async fn update_permission_set(
             existing.r#ref
         )));
     }
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
+    let previous = PermissionSetRepository::authored_definition(&mut tx, &existing.r#ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Permission authoring is unavailable".into()))?;
+    let mut definition = attune_common::runtime_authority::PermissionSetDefinition {
+        reference: existing.r#ref.clone(),
+        label: request.label.clone().or(existing.label.clone()),
+        description: request.description.clone().or(existing.description.clone()),
+        scope: request.scope.unwrap_or(previous.scope),
+        grants: serde_json::from_value(request.grants.clone())
+            .map_err(|_| ApiError::BadRequest("Invalid canonical permission definition".into()))?,
+    };
+    let authored_grants = definition.authored_grants()?;
+    let policy_changed = authored_grants != preview.authored_grants;
+    let updated = PermissionSetRepository::update(
+        &mut *tx,
+        existing.id,
+        UpdatePermissionSetInput {
+            label: request.label,
+            description: request.description,
+            grants: Some(authored_grants.clone()),
+        },
+    )
+    .await?;
+    definition.label = updated.label.clone();
+    definition.description = updated.description.clone();
+    PermissionSetRepository::store_authored_definition(&mut tx, updated.id, &definition).await?;
+    if policy_changed {
+        attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::readmit_permission_set(
+        &mut tx, &updated.r#ref, user.identity_id().map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?,
+    ).await?;
+        attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::readmit_permission_set(
+            &mut tx, &updated.r#ref,
+            user.identity_id().map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?,
+            state.config.security.encryption_key.as_deref(),
+        ).await?;
+    }
+    preview.permission_set = updated.clone();
+    preview.authored_grants = authored_grants;
+    preview.authored_definition = serde_json::to_value(&definition)
+        .map_err(|_| ApiError::BadRequest("Invalid canonical permission definition".into()))?;
     if query.dry_run {
-        if let Some(label) = request.label {
-            preview.permission_set.label = Some(label);
-        }
-        if let Some(description) = request.description {
-            preview.permission_set.description = Some(description);
-        }
-        preview.permission_set.grants = request.grants;
+        tx.rollback().await?;
         return Ok((
             StatusCode::OK,
             Json(ApiResponse::new(PermissionSetSummary::from(preview))),
         ));
     }
-
-    let updated = PermissionSetRepository::update(
-        &state.db,
-        existing.id,
-        UpdatePermissionSetInput {
-            label: request.label,
-            description: request.description,
-            grants: Some(request.grants),
-        },
-    )
-    .await?;
-    preview.permission_set = updated.clone();
+    tx.commit().await?;
     publish_permission_set_metadata_change(&state, updated.id, &updated.r#ref, "updated").await;
 
     emit_admin_audit(
@@ -1302,7 +1413,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/identities/roles/{id}",
             delete(delete_identity_role_assignment),
         )
-        .route("/permissions/sets", get(list_permission_sets))
+        .route(
+            "/permissions/sets",
+            get(list_permission_sets).post(create_permission_set),
+        )
         .route(
             "/permissions/sets/by-ref/{permission_set_ref}",
             get(get_permission_set),
@@ -1390,12 +1504,24 @@ fn validate_permission_grants(grants: &serde_json::Value) -> ApiResult<()> {
         ));
     }
 
-    let parsed = serde_json::from_value::<Vec<attune_common::rbac::Grant>>(grants.clone())
-        .map_err(|e| ApiError::BadRequest(format!("Invalid permission grant schema: {}", e)))?;
+    let parsed = serde_json::from_value::<
+        Vec<attune_common::runtime_authority::PermissionGrantDefinition>,
+    >(grants.clone())
+    .map_err(|e| ApiError::BadRequest(format!("Invalid permission grant schema: {}", e)))?;
 
-    for grant in parsed {
+    for definition in parsed {
+        let grant = attune_common::rbac::Grant {
+            resource: definition.resource,
+            actions: definition.actions,
+            constraints: definition.constraints,
+        };
         validate_grant_actions(&grant)?;
         if let Some(constraints) = &grant.constraints {
+            if constraints.managing_pack_id.is_some() {
+                return Err(ApiError::BadRequest(
+                    "Structural ownership is server-owned".into(),
+                ));
+            }
             if constraints.ids.is_some() {
                 return Err(ApiError::BadRequest(
                     "Permission set grants cannot be scoped by database IDs; use metadata refs instead"

@@ -52,12 +52,263 @@ struct CompanionActionUpdate<'a> {
     reference_allowed_pack_refs: Option<&'a [String]>,
 }
 
+// Only builder presentation/identity metadata is ignored. In particular, do not
+// recursively strip similarly named keys from parameters, variables or payloads.
+// Comparing only a typed reserialization would discard unknown authored fields.
+// Normalize known parser defaults in place instead, retaining opaque fields.
+fn workflow_behavior_definition(
+    definition: &serde_json::Value,
+    input: Option<&serde_json::Value>,
+    output: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    fn optional(object: &mut serde_json::Map<String, serde_json::Value>, fields: &[&str]) {
+        for field in fields {
+            if object.get(*field).is_some_and(serde_json::Value::is_null) {
+                object.remove(*field);
+            }
+        }
+    }
+    fn tasks(collection: &mut serde_json::Value) {
+        fn task(value: &mut serde_json::Value) {
+            if let Some(value) = value.as_object_mut() {
+                value.remove("__chart_meta__");
+                optional(
+                    value,
+                    &[
+                        "action",
+                        "action_ref",
+                        "permission_set_refs",
+                        "permission_set_ref",
+                        "trace_tag_template",
+                        "worker_selector",
+                        "worker_tolerations",
+                        "worker_affinity",
+                        "when",
+                        "delay",
+                        "with_items",
+                        "iterate_cache",
+                        "batch_size",
+                        "concurrency",
+                        "retry",
+                        "timeout",
+                        "join",
+                        "wait_for",
+                        "on_success",
+                        "on_failure",
+                        "on_complete",
+                        "on_timeout",
+                        "decision",
+                        "publish",
+                        "tasks",
+                    ],
+                );
+                // The loader serializes the typed parser's defaults. File PUT
+                // also accepts their authored omission, without changing task
+                // behavior. Keep every non-default value and opaque payload.
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("action") {
+                    value.remove("type");
+                }
+                for field in ["input", "params"] {
+                    if value
+                        .get(field)
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(serde_json::Map::is_empty)
+                    {
+                        value.remove(field);
+                    }
+                }
+                for field in ["next", "decision", "publish"] {
+                    if value
+                        .get(field)
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(Vec::is_empty)
+                    {
+                        value.remove(field);
+                    }
+                }
+                if let Some(serde_json::Value::Object(retry)) = value.get_mut("retry") {
+                    optional(retry, &["max_delay", "on_error"]);
+                    if retry.get("backoff").and_then(serde_json::Value::as_str) == Some("constant")
+                    {
+                        retry.remove("backoff");
+                    }
+                }
+                if let Some(serde_json::Value::Object(cache)) = value.get_mut("iterate_cache") {
+                    optional(
+                        cache,
+                        &[
+                            "owner_type",
+                            "owner_ref",
+                            "generation",
+                            "page_size",
+                            "require_fresh",
+                        ],
+                    );
+                    for (field, default) in [
+                        ("generation", serde_json::json!("active")),
+                        ("page_size", serde_json::json!(100)),
+                        ("require_fresh", serde_json::json!(false)),
+                    ] {
+                        if cache.get(field) == Some(&default) {
+                            cache.remove(field);
+                        }
+                    }
+                }
+                if let Some(serde_json::Value::Array(transitions)) = value.get_mut("next") {
+                    for transition in transitions {
+                        if let Some(transition) = transition.as_object_mut() {
+                            transition.remove("__chart_meta__");
+                            optional(transition, &["when", "publish", "do"]);
+                            for field in ["publish", "do"] {
+                                if transition
+                                    .get(field)
+                                    .and_then(serde_json::Value::as_array)
+                                    .is_some_and(Vec::is_empty)
+                                {
+                                    transition.remove(field);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(children) = value.get_mut("tasks") {
+                    tasks(children);
+                }
+            }
+        }
+        match collection {
+            serde_json::Value::Array(values) => values.iter_mut().for_each(task),
+            serde_json::Value::Object(values) => values.values_mut().for_each(task),
+            _ => {}
+        }
+    }
+    let mut definition = definition.clone();
+    if let Some(root) = definition.as_object_mut() {
+        for field in ["ref", "label", "description", "tags", "version"] {
+            root.remove(field);
+        }
+        optional(root, &["parameters", "output", "vars", "output_map"]);
+        if root
+            .get("parameters")
+            .is_some_and(|schema| Some(schema) == input)
+        {
+            root.remove("parameters");
+        }
+        if root
+            .get("output")
+            .is_some_and(|schema| Some(schema) == output)
+        {
+            root.remove("output");
+        }
+        for field in ["vars", "output_map"] {
+            if root
+                .get(field)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                root.remove(field);
+            }
+        }
+        if root
+            .get("cancellation_policy")
+            .and_then(serde_json::Value::as_str)
+            == Some("allow_finish")
+        {
+            root.remove("cancellation_policy");
+        }
+        if let Some(collection) = root.get_mut("tasks") {
+            tasks(collection);
+        }
+    }
+    definition
+}
+
+fn workflow_editor(user: &AuthenticatedUser) -> ApiResult<i64> {
+    user.identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))
+}
+
+async fn authorize_workflow_update(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    workflow: &attune_common::models::workflow::WorkflowDefinition,
+) -> ApiResult<Option<(i64, i64, bool, Option<i64>)>> {
+    let companion = ActionRepository::find_by_workflow_def(&state.db, workflow.id).await?;
+    if companion.as_ref().is_some_and(|action| {
+        action.pack != workflow.pack
+            || action.r#ref != workflow.r#ref
+            || action.pack_ref != workflow.pack_ref
+    }) {
+        return Err(ApiError::Conflict(
+            "Workflow companion action has a different structural owner or reference".into(),
+        ));
+    }
+    let mut context = AuthorizationContext::new(workflow_editor(user)?);
+    context.target_id = companion.as_ref().map(|action| action.id);
+    context.target_ref = Some(workflow.r#ref.clone());
+    context.pack_ref = Some(workflow.pack_ref.clone());
+    let managing_pack = match &companion {
+        Some(action) => {
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                &state.db,
+                attune_common::repositories::runtime_target::ComponentTarget::Action,
+                action.id,
+            )
+            .await?
+        }
+        None => None,
+    };
+    context.managing_pack_id = managing_pack;
+    state
+        .authorization_service()
+        .authorize(
+            user,
+            crate::authz::AuthorizationCheck {
+                resource: Resource::Actions,
+                action: Action::Update,
+                context,
+            },
+        )
+        .await?;
+    Ok(companion.map(|action| (action.id, action.pack, action.is_adhoc, managing_pack)))
+}
+
+async fn check_authorized_companion(
+    connection: &mut sqlx::PgConnection,
+    workflow: i64,
+    authorized: Option<(i64, i64, bool, Option<i64>)>,
+) -> ApiResult<()> {
+    let current = ActionRepository::find_by_workflow_def(&mut *connection, workflow).await?;
+    let managing_pack = match &current {
+        Some(action) => {
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                &mut *connection,
+                attune_common::repositories::runtime_target::ComponentTarget::Action,
+                action.id,
+            )
+            .await?
+        }
+        None => None,
+    };
+    let current = current.map(|action| (action.id, action.pack, action.is_adhoc, managing_pack));
+    if current != authorized {
+        return Err(ApiError::Conflict(
+            "Workflow action ownership changed during authorization".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn can_read_workflow_with_grants(
     grants: &[attune_common::rbac::Grant],
     identity_id: i64,
     workflow: &attune_common::models::workflow::WorkflowDefinition,
+    managing_pack_id: Option<i64>,
+    attributes: &std::collections::HashMap<String, serde_json::Value>,
 ) -> bool {
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.managing_pack_id = managing_pack_id;
+    ctx.identity_attributes = attributes.clone();
     ctx.target_id = Some(workflow.id);
     ctx.target_ref = Some(workflow.r#ref.clone());
     ctx.pack_ref = Some(workflow.pack_ref.clone());
@@ -70,7 +321,33 @@ async fn filter_api_visible_workflows(
     workflows: Vec<attune_common::models::workflow::WorkflowDefinition>,
 ) -> ApiResult<Vec<attune_common::models::workflow::WorkflowDefinition>> {
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
+    let snapshot = authz.load_snapshot(user).await?;
+    let grants = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.grants.as_slice())
+        .unwrap_or_default();
+    let attributes = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.identity_attributes.clone())
+        .unwrap_or_default();
+    let owners = if grants.iter().any(|grant| {
+        grant.resource == Resource::Actions
+            && grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+    }) {
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::workflow_packs(
+            &state.db,
+            &workflows
+                .iter()
+                .map(|workflow| workflow.id)
+                .collect::<Vec<_>>(),
+        )
+        .await?
+    } else {
+        Default::default()
+    };
     let identity_id = user.identity_id().ok();
 
     let mut visible = Vec::with_capacity(workflows.len());
@@ -83,7 +360,15 @@ async fn filter_api_visible_workflows(
             .as_ref()
             .is_none_or(|action| action.reference_visibility == ActionReferenceVisibility::Public);
         if is_public
-            || identity_id.is_some_and(|id| can_read_workflow_with_grants(&grants, id, &workflow))
+            || identity_id.is_some_and(|id| {
+                can_read_workflow_with_grants(
+                    grants,
+                    id,
+                    &workflow,
+                    owners.get(&workflow.id).copied(),
+                    &attributes,
+                )
+            })
         {
             visible.push(workflow);
         }
@@ -310,8 +595,9 @@ pub async fn create_workflow(
     let workflow = WorkflowDefinitionRepository::create(&state.db, workflow_input).await?;
 
     // Create a companion action record so the workflow appears in action lists
+    let mut connection = state.db.acquire().await?;
     create_companion_action(
-        &state.db,
+        &mut connection,
         &workflow.r#ref,
         pack.id,
         &pack.r#ref,
@@ -352,7 +638,7 @@ pub async fn create_workflow(
 )]
 pub async fn update_workflow(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(workflow_ref): Path<String>,
     Json(request): Json<UpdateWorkflowRequest>,
 ) -> ApiResult<impl IntoResponse> {
@@ -363,6 +649,7 @@ pub async fn update_workflow(
     let existing_workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
+    let authorized_companion = authorize_workflow_update(&state, &user, &existing_workflow).await?;
     if let Some(definition) = &request.definition {
         validate_workflow_action_references(
             &state,
@@ -373,6 +660,24 @@ pub async fn update_workflow(
         .await?;
     }
 
+    let metadata_changed = request.definition.is_some()
+        || request.param_schema.is_some()
+        || request.out_schema.is_some();
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
+    let current = WorkflowDefinitionRepository::find_by_ref(&mut *tx, &workflow_ref)
+        .await?
+        .ok_or_else(|| ApiError::Conflict("Workflow changed during authorization".into()))?;
+    if current.id != existing_workflow.id
+        || current.pack != existing_workflow.pack
+        || current.updated != existing_workflow.updated
+    {
+        return Err(ApiError::Conflict(
+            "Workflow ownership changed during authorization".into(),
+        ));
+    }
+    check_authorized_companion(&mut tx, existing_workflow.id, authorized_companion).await?;
     // Create update input
     let update_input = UpdateWorkflowDefinitionInput {
         label: request.label.clone(),
@@ -385,11 +690,11 @@ pub async fn update_workflow(
     };
 
     let workflow =
-        WorkflowDefinitionRepository::update(&state.db, existing_workflow.id, update_input).await?;
+        WorkflowDefinitionRepository::update(&mut *tx, existing_workflow.id, update_input).await?;
 
     // Update the companion action record if it exists
     update_companion_action(
-        &state.db,
+        &mut tx,
         existing_workflow.id,
         CompanionActionUpdate {
             label: request.label.as_deref(),
@@ -401,6 +706,14 @@ pub async fn update_workflow(
         },
     )
     .await?;
+    if metadata_changed {
+        if let Some(action) =
+            ActionRepository::find_by_workflow_def(&mut *tx, existing_workflow.id).await?
+        {
+            attune_common::repositories::managed_component_readmission::ManagedComponentReadmission::workflow(&mut tx, action.id, workflow_editor(&user)?).await?;
+        }
+    }
+    tx.commit().await?;
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),
@@ -527,8 +840,9 @@ pub async fn save_workflow_file(
 
     // Create a companion action record so the workflow appears in action lists and palettes
     let entrypoint = format!("workflows/{}.workflow.yaml", request.name);
+    let mut connection = state.db.acquire().await?;
     create_companion_action(
-        &state.db,
+        &mut connection,
         &workflow_ref,
         pack.id,
         &pack.r#ref,
@@ -572,7 +886,7 @@ pub async fn save_workflow_file(
 )]
 pub async fn update_workflow_file(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(workflow_ref): Path<String>,
     Json(request): Json<SaveWorkflowFileRequest>,
 ) -> ApiResult<impl IntoResponse> {
@@ -582,6 +896,14 @@ pub async fn update_workflow_file(
     let existing_workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
+    let authorized_companion = authorize_workflow_update(&state, &user, &existing_workflow).await?;
+    if request.pack_ref != existing_workflow.pack_ref
+        || format!("{}.{}", request.pack_ref, request.name) != workflow_ref
+    {
+        return Err(ApiError::BadRequest(
+            "Workflow file edits cannot change component ownership or reference".into(),
+        ));
+    }
 
     // Verify pack exists
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
@@ -591,9 +913,28 @@ pub async fn update_workflow_file(
     validate_workflow_action_references(&state, &pack.r#ref, &workflow_ref, &request.definition)
         .await?;
 
-    // Write updated YAML file to disk
+    // Publish files only after database admission commits. Never write into an
+    // immutable release content directory.
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
-    write_workflow_yaml(&packs_base_dir, &request.pack_ref, &request).await?;
+    let file_request = request.clone();
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
+    let current = WorkflowDefinitionRepository::find_by_ref(&mut *tx, &workflow_ref)
+        .await?
+        .ok_or_else(|| ApiError::Conflict("Workflow changed during authorization".into()))?;
+    if current.id != existing_workflow.id
+        || current.pack != existing_workflow.pack
+        || current.updated != existing_workflow.updated
+    {
+        return Err(ApiError::Conflict(
+            "Workflow ownership changed during authorization".into(),
+        ));
+    }
+    check_authorized_companion(&mut tx, existing_workflow.id, authorized_companion).await?;
+
+    let previous_companion =
+        ActionRepository::find_by_workflow_def(&mut *tx, existing_workflow.id).await?;
 
     // Update workflow in database
     let definition_json = serde_json::to_value(&request.definition).map_err(|e| {
@@ -611,28 +952,75 @@ pub async fn update_workflow_file(
     };
 
     let workflow =
-        WorkflowDefinitionRepository::update(&state.db, existing_workflow.id, update_input).await?;
+        WorkflowDefinitionRepository::update(&mut *tx, existing_workflow.id, update_input).await?;
 
     // Update the companion action record, or create it if it doesn't exist yet
     // (handles workflows that were created before this fix was deployed)
-    let entrypoint = format!("workflows/{}.workflow.yaml", request.name);
-    ensure_companion_action(
-        &state.db,
+    update_companion_action(
+        &mut tx,
         existing_workflow.id,
-        &workflow_ref,
-        pack.id,
-        &pack.r#ref,
-        &request.label,
-        request.description.as_deref(),
-        &entrypoint,
-        request.param_schema.as_ref(),
-        request.out_schema.as_ref(),
-        request
-            .reference_visibility
-            .unwrap_or(ActionReferenceVisibility::Public),
-        &request.reference_allowed_pack_refs,
+        CompanionActionUpdate {
+            label: Some(&request.label),
+            description: request.description.as_deref(),
+            param_schema: request.param_schema.as_ref(),
+            out_schema: request.out_schema.as_ref(),
+            reference_visibility: request.reference_visibility,
+            reference_allowed_pack_refs: Some(&request.reference_allowed_pack_refs),
+        },
     )
     .await?;
+    let action = ActionRepository::find_by_workflow_def(&mut *tx, existing_workflow.id).await?;
+    if action.is_none() {
+        create_companion_action(
+            &mut tx,
+            &workflow_ref,
+            pack.id,
+            &pack.r#ref,
+            &request.label,
+            request.description.as_deref(),
+            &format!("workflows/{}.workflow.yaml", request.name),
+            request.param_schema.as_ref(),
+            request.out_schema.as_ref(),
+            request
+                .reference_visibility
+                .unwrap_or(ActionReferenceVisibility::Public),
+            &request.reference_allowed_pack_refs,
+            existing_workflow.id,
+        )
+        .await?;
+    }
+    if let Some(action) = &action {
+        let metadata_changed = workflow_behavior_definition(
+            &existing_workflow.definition,
+            existing_workflow.param_schema.as_ref(),
+            existing_workflow.out_schema.as_ref(),
+        ) != workflow_behavior_definition(
+            &workflow.definition,
+            workflow.param_schema.as_ref(),
+            workflow.out_schema.as_ref(),
+        ) || existing_workflow.param_schema != workflow.param_schema
+            || existing_workflow.out_schema != workflow.out_schema
+            || previous_companion.as_ref().is_none_or(|previous| {
+                previous.param_schema != action.param_schema
+                    || previous.out_schema != action.out_schema
+                    || previous.reference_visibility != action.reference_visibility
+                    || previous.reference_allowed_pack_refs != action.reference_allowed_pack_refs
+            });
+        if metadata_changed {
+            attune_common::repositories::managed_component_readmission::ManagedComponentReadmission::workflow(&mut tx, action.id, workflow_editor(&user)?).await?;
+        }
+    }
+    tx.commit().await?;
+    // Managed graph edits live in immutable metadata, not mutable code bytes.
+    if action.as_ref().is_none_or(|action| action.is_adhoc) {
+        write_workflow_yaml(&packs_base_dir, &file_request.pack_ref, &file_request)
+            .await
+            .map_err(|_| {
+                ApiError::InternalServerError(
+                    "Workflow metadata committed; file publication failed".into(),
+                )
+            })?;
+    }
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),
@@ -872,7 +1260,7 @@ fn validate_reference_visibility_request(
 /// `workflow_def` FK.
 #[allow(clippy::too_many_arguments)]
 async fn create_companion_action(
-    db: &sqlx::PgPool,
+    db: &mut sqlx::PgConnection,
     workflow_ref: &str,
     pack_id: i64,
     pack_ref: &str,
@@ -913,7 +1301,7 @@ async fn create_companion_action(
         timeout_seconds: None,
     };
 
-    let action = ActionRepository::create(db, action_input)
+    let action = ActionRepository::create(&mut *db, action_input)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -958,6 +1346,7 @@ async fn validate_workflow_action_references(
     workflow_ref: &str,
     definition: &serde_json::Value,
 ) -> Result<(), ApiError> {
+    attune_common::pack_registry::runtime_policy::CandidateRuntimePolicyPlan::validate_workflow_targets(definition, pack_ref, workflow_ref, "api/workflows")?;
     let errors =
         attune_common::execution_env::component_environment_errors("workflows", definition);
     if !errors.is_empty() {
@@ -991,11 +1380,11 @@ async fn validate_workflow_action_references(
 /// Finds the action linked to the workflow definition and updates its metadata
 /// to stay in sync with the workflow definition.
 async fn update_companion_action(
-    db: &sqlx::PgPool,
+    db: &mut sqlx::PgConnection,
     workflow_def_id: i64,
     update: CompanionActionUpdate<'_>,
 ) -> Result<(), ApiError> {
-    let existing_action = ActionRepository::find_by_workflow_def(db, workflow_def_id)
+    let existing_action = ActionRepository::find_by_workflow_def(&mut *db, workflow_def_id)
         .await
         .map_err(|e| {
             tracing::warn!(
@@ -1064,97 +1453,6 @@ async fn update_companion_action(
     Ok(())
 }
 
-/// Ensure a companion action record exists for a workflow definition.
-///
-/// If the action already exists, update it. If it doesn't exist (e.g., for workflows
-/// created before the companion-action fix), create it.
-#[allow(clippy::too_many_arguments)]
-async fn ensure_companion_action(
-    db: &sqlx::PgPool,
-    workflow_def_id: i64,
-    workflow_ref: &str,
-    pack_id: i64,
-    pack_ref: &str,
-    label: &str,
-    description: Option<&str>,
-    entrypoint: &str,
-    param_schema: Option<&serde_json::Value>,
-    out_schema: Option<&serde_json::Value>,
-    reference_visibility: ActionReferenceVisibility,
-    reference_allowed_pack_refs: &[String],
-) -> Result<(), ApiError> {
-    let existing_action = ActionRepository::find_by_workflow_def(db, workflow_def_id)
-        .await
-        .map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to look up companion action: {}", e))
-        })?;
-
-    if let Some(action) = existing_action {
-        // Update existing companion action
-        let update_input = UpdateActionInput {
-            label: Some(label.to_string()),
-            description: Some(match description {
-                Some(description) => Patch::Set(description.to_string()),
-                None => Patch::Clear,
-            }),
-            entrypoint: Some(entrypoint.to_string()),
-            runtime: None,
-            enabled: None,
-            runtime_version_constraint: None,
-            required_worker_runtimes: None,
-            worker_selector: None,
-            worker_tolerations: None,
-            worker_affinity: None,
-            param_schema: param_schema.cloned(),
-            out_schema: out_schema.cloned(),
-            parameter_delivery: None,
-            parameter_format: None,
-            output_format: None,
-            accesses_mcp: None,
-            default_execution_permission_set_refs: None,
-            reference_visibility: Some(reference_visibility),
-            reference_allowed_pack_refs: Some(reference_allowed_pack_refs.to_vec()),
-            artifact_retention_policy: None,
-            artifact_retention_limit: None,
-            log_retention_policy: None,
-            log_retention_limit: None,
-            timeout_seconds: None,
-        };
-
-        ActionRepository::update(db, action.id, update_input)
-            .await
-            .map_err(|e| {
-                ApiError::InternalServerError(format!("Failed to update companion action: {}", e))
-            })?;
-
-        tracing::debug!(
-            "Updated companion action '{}' (ID: {}) for workflow definition (ID: {})",
-            action.r#ref,
-            action.id,
-            workflow_def_id
-        );
-    } else {
-        // Create new companion action (backfill for pre-fix workflows)
-        create_companion_action(
-            db,
-            workflow_ref,
-            pack_id,
-            pack_ref,
-            label,
-            description,
-            entrypoint,
-            param_schema,
-            out_schema,
-            reference_visibility,
-            reference_allowed_pack_refs,
-            workflow_def_id,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
 /// Create workflow routes
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -1168,4 +1466,94 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/workflows/{ref}/file", put(update_workflow_file))
         .route("/packs/{pack_ref}/workflows", get(list_workflows_by_pack))
         .route("/packs/{pack_ref}/workflow-files", post(save_workflow_file))
+}
+
+#[cfg(test)]
+mod metadata_comparison_tests {
+    use super::workflow_behavior_definition;
+    use serde_json::json;
+
+    #[test]
+    fn actual_loader_parser_round_trip_matches_label_layout_only_file_edits(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use attune_common::workflow::parser::parse_workflow_yaml;
+        let authored = json!({"version":"1.0","vars":{"__chart_meta__":"authored variable"},"tasks":[{
+            "name":"run","action":"example.one","input":{"label":"authored input","type":"action","when":null},
+            "retry":{"count":2,"delay":0}
+        }]});
+        // This is the loader's actual parse/serialize path, not a hand-built
+        // approximation of the fields emitted by its typed representation.
+        let loaded =
+            serde_json::to_value(parse_workflow_yaml(&serde_yaml_ng::to_string(&authored)?)?)?;
+        assert_ne!(loaded, authored);
+        assert_eq!(loaded["tasks"][0]["type"], "action");
+        assert_eq!(loaded["tasks"][0]["retry"]["backoff"], "constant");
+        let expected = workflow_behavior_definition(&loaded, None, None);
+        let mut edited = authored.clone();
+        edited["label"] = json!("Presentation only");
+        edited["tasks"][0]["__chart_meta__"] = json!({"position":{"x":10,"y":20}});
+        assert_eq!(expected, workflow_behavior_definition(&edited, None, None));
+        for (field, value) in [
+            ("action", json!("example.two")),
+            (
+                "input",
+                json!({"label":"changed","type":"action","when":null}),
+            ),
+            ("permission_set_refs", json!([])),
+            ("worker_selector", json!({})),
+            ("worker_tolerations", json!([])),
+            ("worker_affinity", json!({})),
+            ("when", json!("{{ parameters.enabled }}")),
+            ("trace_tag_template", json!("new-trace")),
+            (
+                "retry",
+                json!({"count":2,"delay":0,"backoff":"exponential"}),
+            ),
+            (
+                "retry",
+                json!({"count":2,"delay":0,"on_error":"{{ failed() }}"}),
+            ),
+            ("opaque_extension", json!({"label":"not presentation"})),
+        ] {
+            let mut changed = authored.clone();
+            changed["tasks"][0][field] = value;
+            assert_ne!(
+                expected,
+                workflow_behavior_definition(&changed, None, None),
+                "behavioral task field {field} was ignored"
+            );
+        }
+        let mut changed = authored;
+        changed["vars"]["__chart_meta__"] = json!("changed variable");
+        assert_ne!(expected, workflow_behavior_definition(&changed, None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn file_label_layout_and_default_serialization_do_not_recapture_authority() {
+        let schema = json!({"target":{"type":"string"}});
+        let old = json!({"tasks":[{"name":"run", "action":"example.one", "allowed_action_refs":["example.one"], "input":{}, "permission_set_refs":null,"with_items":null,"next":[],"retry":{"count":2,"delay":0,"max_delay":null}}],"parameters":null,"vars":{},"output_map":null,"cancellation_policy":"allow_finish"});
+        let edited = json!({"ref":"example.flow", "label":"New label", "version":"1.0", "parameters":schema, "tasks":[{"name":"run", "action":"example.one", "allowed_action_refs":["example.one"],"retry":{"count":2,"delay":0},"__chart_meta__":{"position":{"x":10,"y":20}}}]});
+        assert_eq!(
+            workflow_behavior_definition(&old, Some(&schema), None),
+            workflow_behavior_definition(&edited, Some(&schema), None)
+        );
+    }
+
+    #[test]
+    fn comparison_preserves_target_and_permission_ceilings_and_metadata_named_payloads() {
+        let original = json!({"tasks":{"__chart_meta__":{"action":"{{ parameters.target }}","allowed_action_refs":["example.one"],"input":{"__chart_meta__":"authored value"}}}});
+        let normalized = workflow_behavior_definition(&original, None, None);
+        assert!(normalized["tasks"]["__chart_meta__"].is_object());
+        for edited in [
+            json!({"tasks":{"__chart_meta__":{"action":"{{ parameters.target }}","allowed_action_refs":["example.two"],"input":{"__chart_meta__":"authored value"}}}}),
+            json!({"tasks":{"__chart_meta__":{"action":"{{ parameters.target }}","allowed_action_refs":["example.one"],"permission_set_refs":[],"input":{"__chart_meta__":"authored value"}}}}),
+            json!({"tasks":{"__chart_meta__":{"action":"{{ parameters.target }}","allowed_action_refs":["example.one"],"input":{"__chart_meta__":"different value"}}}}),
+        ] {
+            assert_ne!(
+                normalized,
+                workflow_behavior_definition(&edited, None, None)
+            );
+        }
+    }
 }

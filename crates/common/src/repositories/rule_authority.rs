@@ -2,8 +2,8 @@
 use super::{
     action::ActionRepository,
     identity::{
-        CreateIdentityInput, CreatePermissionAssignmentInput, IdentityRepository,
-        PermissionAssignmentRepository, PermissionSetRepository,
+        CreatePermissionAssignmentInput, IdentityRepository, PermissionAssignmentRepository,
+        PermissionSetRepository,
     },
     pack::PackRepository,
     rule::RuleRepository,
@@ -314,33 +314,10 @@ impl RuleAuthorityRepository {
         let release_id = pack
             .active_release
             .ok_or_else(|| Error::validation("Rule authority requires a deployed release"))?;
-        let identity_id = match sqlx::query_scalar::<_, i64>(
-            "SELECT identity FROM pack_runtime_identity WHERE pack = $1",
-        )
-        .bind(pack_id)
-        .fetch_optional(&mut *connection)
-        .await?
-        {
-            Some(identity) => identity,
-            None => {
-                let identity = IdentityRepository::create(
-                    &mut *connection,
-                    CreateIdentityInput {
-                        login: format!("attune-pack:{}:{}", pack.r#ref, uuid::Uuid::new_v4()),
-                        display_name: Some(format!("Pack: {}", pack.r#ref)),
-                        password_hash: None,
-                        attributes: json!({"type":"pack","pack_ref":pack.r#ref}),
-                    },
-                )
-                .await?;
-                sqlx::query("INSERT INTO pack_runtime_identity (pack,identity) VALUES ($1,$2)")
-                    .bind(pack_id)
-                    .bind(identity.id)
-                    .execute(&mut *connection)
-                    .await?;
-                identity.id
-            }
-        };
+        let identity_id =
+            super::runtime_authority::RuntimeAuthorityRepository::ensure_owner(connection, pack_id)
+                .await?
+                .sponsor_identity_id;
         for rule in RuleRepository::find_by_pack(&mut *connection, pack_id)
             .await?
             .into_iter()

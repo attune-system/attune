@@ -5,6 +5,49 @@ Status: implementation and controlled local acceptance pass. Historical/deployed
 
 ## Implementation checkpoint
 
+### Latest storage cycle, PostgreSQL 18 only
+
+The user limited the remainder of this cycle to PostgreSQL 18 to avoid repeating
+the already long database matrix. Earlier PostgreSQL 16 evidence is retained;
+that lane was not rerun after this instruction. Supported database versions and CI
+defaults were not changed.
+
+`/tmp/opencode/artifact-pg18-storage-fixed-source-20261015/evidence.json` passed
+direct S3 upload, all nine storage correctness cases, and the 20-stream load test
+on PostgreSQL 18.6. Source hashes stayed unchanged. No fixture databases or sessions
+remained, and PostgreSQL/RustFS teardown completed without errors. There were 20
+peak readers and zero leaked readers. `sse-helper-evidence.json` also records the
+pure helper regression passing against the already-built executable, without
+recompilation or another database fixture.
+
+Production sources in this cycle were copied unchanged from the accepted
+`artifact-sow-verified-final-20261015` snapshot. The manifest explicitly records
+the sole test overlay, `crates/api/tests/runtime_log_replica_tests.rs`. This isolates
+artifact verification from concurrent queue/permission work in the live checkout;
+it is not a certificate for those later edits.
+
+The storage test exposed a fixture ordering race. It marked the execution complete
+before publishing its first segment, so slow publication could exceed the existing
+two-second terminal grace. A controlled reproduction with a three-second provider
+delay returned `log_stream_incomplete`. The corrected fixture retains that delay
+but awaits publication and sealing before completion. A separate real-route test
+proves that genuine early completion still reports the bounded incomplete-stream
+error and closes. No production grace period or performance target was extended.
+
+SSE test helpers now report error codes and timeout stages instead of discarding
+error frames and surfacing only opaque EOF. The helper regression was red before
+the correction and green afterward. A subsequent generic timeout did not reproduce
+after stage diagnostics were added; its failed run remains at
+`/tmp/opencode/artifact-sow-verified-storage-20261015`. Do not erase that result or
+claim the passing fixed-source cycle explains every prior host/runtime timeout.
+Staging load and recovery soak remain production acceptance work.
+
+The live checkout's latest `cargo check --all-targets --workspace` passed without
+warnings, and `git diff --check` passed. A new concurrent formatting-only diff in
+`crates/api/tests/recorded_execution_events_tests.rs` prevents the latest full
+format check from passing. That file was outside the six files the user authorized
+for unrelated formatting cleanup and was left untouched.
+
 ### 2026-10-15 continuation
 
 The missing executable latency gate now has an opt-in controlled reference. The

@@ -436,6 +436,18 @@ async fn authorize_policy_action(
     ctx.pack_ref = pack_ref.map(str::to_string);
     ctx.owner_ref = action_ref.map(str::to_string);
     ctx.target_ref = target_ref.map(str::to_string);
+    if let Some(reference) = target_ref {
+        if let Some(policy) = PolicyRepository::find_by_ref(&state.db, reference).await? {
+            ctx.target_id = Some(policy.id);
+            ctx.managing_pack_id =
+                attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                    &state.db,
+                    attune_common::repositories::runtime_target::ComponentTarget::Policy,
+                    policy.id,
+                )
+                .await?;
+        }
+    }
     state
         .authorization_service()
         .authorize(
@@ -502,6 +514,7 @@ fn build_policy_visibility_filter(grants: &[Grant]) -> PolicyVisibilityFilter {
             continue;
         }
         scopes.push(PolicyVisibilityScope {
+            managing_pack_id: constraints.managing_pack_id,
             pack_refs: constraints.pack_refs.clone(),
             action_refs: constraints.owner_refs.clone(),
             refs: constraints.refs.clone(),

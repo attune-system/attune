@@ -1,0 +1,5 @@
+ref: f_native_settlement
+label: Owned native settlement producer
+description: Controlled acceptance source declaration; install only in the owned central fixture.
+version: "1.0.0"
+author: Attune

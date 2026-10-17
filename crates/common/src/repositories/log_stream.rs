@@ -8,6 +8,49 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 pub struct LogStreamRepository;
 
 impl LogStreamRepository {
+    pub async fn segments_with_conn(
+        connection: &mut PgConnection,
+        stream: i64,
+    ) -> Result<Vec<LogSegment>> {
+        sqlx::query_as(&format!(
+            "SELECT {SEGMENT_COLUMNS} FROM log_segment WHERE stream=$1 ORDER BY sequence"
+        ))
+        .bind(stream)
+        .fetch_all(connection)
+        .await
+        .map_err(Into::into)
+    }
+    pub async fn find_by_artifact_version_with_conn(
+        connection: &mut PgConnection,
+        version: i64,
+    ) -> Result<Option<LogStream>> {
+        sqlx::query_as(&format!(
+            "SELECT {STREAM_COLUMNS} FROM log_stream WHERE artifact_version=$1"
+        ))
+        .bind(version)
+        .fetch_optional(connection)
+        .await
+        .map_err(Into::into)
+    }
+    pub async fn create_with_backend_with_conn(
+        connection: &mut PgConnection,
+        artifact_version: i64,
+        backend: LogStreamBackend,
+        max_unflushed_bytes: u64,
+        max_unflushed_milliseconds: u64,
+    ) -> Result<LogStream> {
+        if max_unflushed_bytes == 0 || max_unflushed_milliseconds == 0 {
+            return Err(Error::validation(
+                "log flush limits must be greater than zero",
+            ));
+        }
+        sqlx::query_as(&format!("INSERT INTO log_stream(artifact_version,backend,max_unflushed_bytes,max_unflushed_milliseconds) \
+            VALUES($1,$2,$3,$4) RETURNING {STREAM_COLUMNS}"))
+            .bind(artifact_version).bind(backend)
+            .bind(i64::try_from(max_unflushed_bytes).map_err(|_| Error::validation("log byte limit too large"))?)
+            .bind(i64::try_from(max_unflushed_milliseconds).map_err(|_| Error::validation("log time limit too large"))?)
+            .fetch_one(connection).await.map_err(Into::into)
+    }
     pub async fn create(
         pool: &PgPool,
         artifact_version: i64,

@@ -42,6 +42,7 @@ impl ExecutionKeyReadRepository {
         origin: &KeyOrigin,
     ) -> Result<()> {
         let admission = authority.credential_binding().admission_id;
+        super::runtime_read::RuntimeReadRepository::lock_open(connection, admission).await?;
         let body = serde_json::to_value(origin)?;
         let bytes: i64 = sqlx::query_scalar("SELECT octet_length($1::JSONB::TEXT)::BIGINT")
             .bind(&body)

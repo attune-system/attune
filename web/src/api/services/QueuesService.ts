@@ -352,6 +352,7 @@ export class QueuesService {
         400: `Validation error or invalid SQL/JSONPath selector`,
         403: `Insufficient permissions`,
         404: `Queue not found`,
+        409: `Bulk target selection changed; retry the operation`,
       },
     });
   }

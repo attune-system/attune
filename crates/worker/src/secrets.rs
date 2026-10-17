@@ -53,42 +53,82 @@ impl SecretManager {
         execution_id: i64,
         redacted_config: JsonValue,
     ) -> Result<JsonValue> {
+        let mut transaction = self.pool.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+            &mut transaction,
+        )
+        .await?;
         let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-            &self.pool,
+            &mut *transaction,
             ENTITY_EXECUTION_CONFIG,
             execution_id,
         )
         .await?;
-        if secrets.is_empty() {
-            return Ok(redacted_config);
-        }
-
         use attune_common::repositories::FindById;
         let execution = attune_common::repositories::execution::ExecutionRepository::find_by_id(
-            &self.pool,
+            &mut *transaction,
             execution_id,
         )
         .await?
         .ok_or_else(|| Error::invalid_state("Execution secret owner is unavailable"))?;
-        attune_common::key_access::authorize_execution_parameter_key_origins(
-            &self.pool,
-            execution_id,
-            execution.executor,
-            &secrets,
-        )
-        .await?;
+        if secrets.is_empty() {
+            attune_common::key_access::authorize_execution_parameter_key_origins_with_conn(
+                &mut transaction,
+                execution_id,
+                execution.executor,
+                &secrets,
+            )
+            .await?;
+            transaction.commit().await?;
+            return Ok(redacted_config);
+        }
 
         let encryption_key = self
             .encryption_key
             .as_ref()
             .ok_or_else(|| Error::Internal("No encryption key configured".to_string()))?;
 
-        restore_secret_values(redacted_config, &secrets, encryption_key).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to restore secret parameters for execution {}: {}",
-                execution_id, e
-            ))
-        })
+        let (ordinary, receipts) =
+            attune_common::repositories::immutable_input_origin::prepare_input_receipts(
+                &mut transaction,
+                ENTITY_EXECUTION_CONFIG,
+                execution_id,
+                &secrets,
+                encryption_key,
+            )
+            .await?;
+        if !ordinary.is_empty() {
+            attune_common::key_access::authorize_execution_parameter_key_origins_with_conn(
+                &mut transaction,
+                execution_id,
+                execution.executor,
+                &ordinary,
+            )
+            .await?;
+        }
+        attune_common::repositories::immutable_input_origin::bind_input_receipt_buffers(
+            &mut transaction,
+            ENTITY_EXECUTION_CONFIG,
+            execution_id,
+            &secrets,
+        )
+        .await?;
+
+        let restored =
+            restore_secret_values(redacted_config, &secrets, encryption_key).map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to restore secret parameters for execution {}: {}",
+                    execution_id, e
+                ))
+            })?;
+        for receipt in &receipts {
+            receipt.ensure_fresh_on(&mut transaction).await?;
+        }
+        transaction.commit().await?;
+        for receipt in &receipts {
+            receipt.ensure_fresh()?;
+        }
+        Ok(restored)
     }
 
     /// Compute hash of the encryption key.
