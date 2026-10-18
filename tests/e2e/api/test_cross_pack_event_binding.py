@@ -11,6 +11,7 @@ import time
 import uuid
 
 import pytest
+import requests
 
 
 def _upload(client, reference, files):
@@ -178,7 +179,7 @@ def test_uploaded_empty_iteration_preserves_result_and_completes(client, success
             {
                 "name": "after",
                 "action": f"{reference}.echo",
-                "input": {"items": "{{ task.each.items }}"},
+                "input": {"items": "{{ parameters.items }}"},
             }
         )
     response = _upload(
@@ -216,7 +217,7 @@ def test_uploaded_empty_iteration_preserves_result_and_completes(client, success
                 {
                     "version": "1.0.0",
                     "tasks": tasks,
-                    "output_map": {"items": "{{ task.each.items }}"},
+                    "output_map": {"items": "{{ parameters.items }}"},
                 }
             ),
         },
@@ -242,28 +243,42 @@ def test_uploaded_empty_iteration_preserves_result_and_completes(client, success
         time.sleep(0.25)
     assert execution["status"] == "completed", execution
     assert execution["result"]["items"] == []
+    response = client.session.get(
+        f"{client.base_url}/api/v1/executions/{execution_id}/children", timeout=10
+    )
+    response.raise_for_status()
+    children = response.json()["data"]
+    assert not any((child.get("workflow_task") or {}).get("task_name") == "each" for child in children)
+    after = [child for child in children if (child.get("workflow_task") or {}).get("task_name") == "after"]
+    assert len(after) == int(successor), children
+    if successor:
+        assert after[0]["status"] == "completed", after[0]
 
 
 @pytest.mark.api
-def test_uploaded_terminal_wait_without_recovery_settles_failed(client):
+@pytest.mark.parametrize("predecessor_condition", ["{{ timed_out() }}", None], ids=["condition", "unconditional"])
+def test_uploaded_terminal_wait_without_recovery_settles_failed(client, predecessor_condition):
     reference = f"terminal_wait_{uuid.uuid4().hex[:12]}"
-    response = client.session.post(
-        f"{client.base_url}/api/v1/keys",
-        json={
-            "local_ref": reference,
-            "name": "Owned release wait target",
-            "owner_type": "system",
-            "value": 0,
-            "encrypted": False,
-        },
-        timeout=15,
-    )
-    assert response.status_code == 201, response.text
-    key_ref = response.json()["data"]["ref"]
+    key_ref = f"pack.{reference}.target"
+    transition = {"do": ["guarded"]}
+    if predecessor_condition is not None:
+        transition["when"] = predecessor_condition
     response = _upload(
         client,
         reference,
         {
+            "permission_sets/wait_reads.yaml": json.dumps(
+                {
+                    "ref": f"{reference}.wait_reads",
+                    "grants": [
+                        {
+                            "resource": "executions",
+                            "actions": ["read", "decrypt"],
+                            "constraints": {"pack_refs": [reference]},
+                        }
+                    ],
+                }
+            ),
             "actions/request.sh": "#!/bin/sh\nsleep 60\n",
             "actions/request.yaml": json.dumps(
                 {
@@ -298,11 +313,12 @@ def test_uploaded_terminal_wait_without_recovery_settles_failed(client):
                         {
                             "name": "request",
                             "action": f"{reference}.request",
-                            "next": [{"when": "{{ timed_out() }}", "do": ["guarded"]}],
+                            "next": [transition],
                         },
                         {
                             "name": "guarded",
                             "action": f"{reference}.guarded",
+                            "permission_set_refs": [f"{reference}.wait_reads", "standard"],
                             "wait_for": {"execution": "{{ keystore['" + key_ref + "'] }}"},
                         }
                     ],
@@ -311,6 +327,20 @@ def test_uploaded_terminal_wait_without_recovery_settles_failed(client):
         },
     )
     assert response.status_code == 201, response.text
+    response = client.session.post(
+        f"{client.base_url}/api/v1/keys",
+        json={
+            "local_ref": "target",
+            "name": "Owned release wait target",
+            "owner_type": "pack",
+            "owner_pack_ref": reference,
+            "value": 0,
+            "encrypted": False,
+        },
+        timeout=15,
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["data"]["ref"] == key_ref
     response = client.session.post(
         f"{client.base_url}/api/v1/executions/execute",
         json={
@@ -373,3 +403,94 @@ def test_uploaded_terminal_wait_without_recovery_settles_failed(client):
     assert not any(child["action_ref"] == f"{reference}.guarded" for child in children), (
         "a timed-out prerequisite must not run its guarded action"
     )
+    response = client.session.get(
+        f"{client.base_url}/api/v1/executions/{execution_id}/workflow-task-waits", timeout=10
+    )
+    response.raise_for_status()
+    waits = response.json()["data"]
+    assert len(waits) == 1, waits
+    assert waits[0]["task_name"] == "guarded"
+    assert waits[0]["state"] == "timed_out"
+    assert waits[0]["target_id"] == request_id
+    assert waits[0]["resolved_at"] is not None
+    assert execution["result"].get("$attune_secret") is True
+    key_grant = {"resource": "keys", "actions": ["read"], "constraints": {"refs": [key_ref]}}
+    cases = [
+        ("root_only", [{"resource": "executions", "actions": ["read", "decrypt"],
+                         "constraints": {"refs": [f"{reference}.run"]}}], "redacted"),
+        ("source_read_only", [
+            {"resource": "executions", "actions": ["read", "decrypt"],
+             "constraints": {"refs": [f"{reference}.run"]}},
+            {"resource": "executions", "actions": ["read"],
+             "constraints": {"refs": [f"{reference}.request"]}},
+        ], "redacted"),
+        ("source_only", [{"resource": "executions", "actions": ["read", "decrypt"],
+                           "constraints": {"refs": [f"{reference}.request"]}}], "forbidden"),
+        ("both", [{"resource": "executions", "actions": ["read", "decrypt"],
+                    "constraints": {"refs": [f"{reference}.run", f"{reference}.request"]}}], "plaintext"),
+    ]
+    for label, grants, expected in cases:
+        reader, assignment = _scoped_reader(client, label, [*grants, key_grant])
+        try:
+            response = reader.get(
+                f"{client.base_url}/api/v1/executions/{execution_id}",
+                params={"include_secret_values": "true"}, timeout=10,
+            )
+            if expected == "forbidden":
+                assert response.status_code == 403, response.text
+                continue
+            assert response.status_code == 200, response.text
+            value = response.json()["data"]["result"]
+            if expected == "redacted":
+                assert value.get("$attune_secret") is True, label
+            else:
+                assert value["succeeded"] is False
+                assert "guarded" in value["error"]
+                removed = client.session.delete(
+                    f"{client.base_url}/api/v1/identities/roles/{assignment}", timeout=10,
+                )
+                assert removed.status_code in (200, 204), removed.text
+                denied = reader.get(
+                    f"{client.base_url}/api/v1/executions/{execution_id}",
+                    params={"include_secret_values": "true"}, timeout=10,
+                )
+                assert denied.status_code == 403, denied.text
+        finally:
+            reader.close()
+
+
+def _scoped_reader(client, label, grants):
+    suffix = uuid.uuid4().hex[:12]
+    login = f"wait_{label}_{suffix}@example.com"
+    password = f"Disposable-{uuid.uuid4().hex}"
+    registered = client.register(login=login, password=password, display_name="Wait reader")
+    identity = registered["user"]["id"]
+    response = client.session.post(
+        f"{client.base_url}/api/v1/permissions/sets",
+        json={"ref": f"wait_{suffix}.reader", "label": "Scoped Wait reader", "grants": grants},
+        timeout=10,
+    )
+    assert response.status_code == 201, response.text
+    permission_set = response.json()["data"]["id"]
+    role = f"wait_reader_{suffix}"
+    response = client.session.post(
+        f"{client.base_url}/api/v1/permissions/sets/{permission_set}/roles",
+        json={"role": role}, timeout=10,
+    )
+    assert response.status_code in (200, 201), response.text
+    response = client.session.post(
+        f"{client.base_url}/api/v1/identities/{identity}/roles", json={"role": role}, timeout=10,
+    )
+    assert response.status_code in (200, 201), response.text
+    assignment = response.json()["data"]["id"]
+    reader = requests.Session()
+    try:
+        login_response = reader.post(
+            f"{client.base_url}/auth/login", json={"login": login, "password": password}, timeout=10,
+        )
+        assert login_response.status_code == 200, "Scoped reader login failed"
+        reader.headers["Authorization"] = "Bearer " + login_response.json()["data"]["access_token"]
+    except BaseException:
+        reader.close()
+        raise
+    return reader, assignment
