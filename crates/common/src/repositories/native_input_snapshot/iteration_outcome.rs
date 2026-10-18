@@ -190,6 +190,16 @@ pub struct PreparedNativeIterationOutcome {
     pub(crate) fence: ApprovalEffectFence,
 }
 impl PreparedNativeIterationOutcome {
+    pub(in crate::repositories) fn held_deadline(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        Ok(self
+            .source
+            .held_deadline()?
+            .into_iter()
+            .chain(self.fence.approval_deadline())
+            .min())
+    }
     pub fn snapshot(&self) -> Id {
         self.snapshot
     }

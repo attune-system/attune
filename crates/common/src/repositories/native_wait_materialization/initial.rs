@@ -15,7 +15,7 @@ pub struct PreparedNativeInitialWait {
     context: Context,
     original_secrets: Vec<StoredSecretValue>,
     observation: Option<Observation>,
-    bound: Option<RegisteredInitialWait>,
+    bound: std::sync::Arc<OnceLock<RegisteredInitialWait>>,
     admission: ExecutionAdmission,
     child: Option<Child>,
     child_fence: Option<ApprovalEffectFence>,
@@ -33,6 +33,50 @@ impl NativeInitialWaitMaterializationRepository {
         task_name: &str,
         key: Option<&str>,
         triggered_by: Option<&str>,
+    ) -> Result<Option<PreparedNativeInitialWait>> {
+        Self::prepare_with_predecessor(conn, workflow, task_name, key, triggered_by, None).await
+    }
+
+    pub async fn prepare_successor(
+        conn: &mut PgConnection,
+        predecessor: std::sync::Arc<
+            super::super::native_transition_materialization::PreparedNativeWaitPredecessor,
+        >,
+        key: &str,
+    ) -> Result<PreparedNativeInitialWait> {
+        predecessor.ensure_fresh_on(conn).await?;
+        let task_name = predecessor.target().to_owned();
+        let triggered_by = predecessor
+            .completed()
+            .workflow_task
+            .as_ref()
+            .ok_or_else(denied)?
+            .task_name
+            .clone();
+        let workflow = predecessor.original().id;
+        Self::prepare_with_predecessor(
+            conn,
+            workflow,
+            &task_name,
+            Some(key),
+            Some(&triggered_by),
+            Some(predecessor),
+        )
+        .await?
+        .ok_or_else(denied)
+    }
+
+    async fn prepare_with_predecessor(
+        conn: &mut PgConnection,
+        workflow: Id,
+        task_name: &str,
+        key: Option<&str>,
+        triggered_by: Option<&str>,
+        predecessor: Option<
+            std::sync::Arc<
+                super::super::native_transition_materialization::PreparedNativeWaitPredecessor,
+            >,
+        >,
     ) -> Result<Option<PreparedNativeInitialWait>> {
         let workflow = Workflows::find_by_id(&mut *conn, workflow)
             .await?
@@ -90,7 +134,19 @@ impl NativeInitialWaitMaterializationRepository {
             .into_iter()
             .map(|binding| (binding.source_path.clone(), binding))
             .collect();
+        let workflow = if let Some(predecessor) = &predecessor {
+            if serde_json::to_value(&workflow)? != serde_json::to_value(predecessor.original())?
+                || serde_json::to_value(&parent)? != serde_json::to_value(predecessor.parent())?
+                || task_name != predecessor.target()
+            {
+                return Err(denied());
+            }
+            predecessor.projected().clone()
+        } else {
+            workflow
+        };
         let context = Context {
+            predecessor,
             parent,
             workflow,
             task,
@@ -153,7 +209,7 @@ impl NativeInitialWaitMaterializationRepository {
             "work_queue_item" => crate::models::WorkflowTaskWaitTarget::WorkQueueItem(id),
             _ => return Err(denied()),
         };
-        let registration = Snapshots::prepare_initial_wait(
+        let mut registration = Snapshots::prepare_initial_wait(
             conn,
             context.parent.id,
             context.workflow.id,
@@ -164,6 +220,9 @@ impl NativeInitialWaitMaterializationRepository {
             key,
         )
         .await?;
+        if let Some(predecessor) = &context.predecessor {
+            registration.bind_predecessor_projection(predecessor)?;
+        }
         let recover = registration
             .state()
             .is_some_and(|state| state != "released");
@@ -173,8 +232,24 @@ impl NativeInitialWaitMaterializationRepository {
             Waits::find_by_workflow_task(&mut *conn, context.workflow.id, task_name)
                 .await?
                 .is_some();
+        let bound = std::sync::Arc::new(OnceLock::new());
         let recovery = if recover && !duplicate_only {
-            Some(super::recovery::Recovery::prepare(conn, &context, &observation, key).await?)
+            Some(
+                super::recovery::Recovery::prepare(
+                    conn,
+                    &context,
+                    &observation,
+                    bound.clone(),
+                    key,
+                )
+                .await
+                .map_err(|error| match error {
+                    Error::PermissionDenied(message) => {
+                        Error::PermissionDenied(format!("Initial Wait recovery: {message}"))
+                    }
+                    other => other,
+                })?,
+            )
         } else {
             None
         };
@@ -226,7 +301,7 @@ impl NativeInitialWaitMaterializationRepository {
             context,
             original_secrets,
             observation: Some(observation),
-            bound: None,
+            bound,
             admission,
             child,
             child_fence,
@@ -239,16 +314,28 @@ impl NativeInitialWaitMaterializationRepository {
 }
 
 impl PreparedNativeInitialWait {
+    pub fn completions(&self) -> &[Execution] {
+        self.recovery
+            .as_ref()
+            .map(|recovery| recovery.completions())
+            .unwrap_or(&[])
+    }
     pub fn workflow(&self) -> Id {
         self.context.workflow.id
     }
     pub fn terminal_wait(&self) -> Option<Id> {
         self.recovery.as_ref()?;
-        Some(self.bound.as_ref()?.wait().id)
+        Some(self.bound.get()?.wait().id)
     }
     pub async fn apply(&mut self, conn: &mut PgConnection, key: &str) -> Result<InitialWaitApply> {
-        if self.bound.is_some() {
+        if let Some(predecessor) = &self.context.predecessor {
+            predecessor.ensure_fresh_on(conn).await?;
+        }
+        if self.bound.get().is_some() {
             return Err(denied());
+        }
+        if let Some(recovery) = &self.recovery {
+            recovery.guard_original(conn, &self.context).await?;
         }
         let Observation::Prospective(registration) = self.observation.take().ok_or_else(denied)?
         else {
@@ -256,7 +343,7 @@ impl PreparedNativeInitialWait {
         };
         let bound = registration.bind(conn).await?;
         if !bound.created() {
-            self.bound = Some(bound);
+            self.bound.set(bound).map_err(|_| denied())?;
             return Ok(InitialWaitApply::Existing);
         }
         if self.duplicate_only {
@@ -276,11 +363,11 @@ impl PreparedNativeInitialWait {
         {
             return Err(denied());
         }
-        self.bound = Some(bound);
+        self.bound.set(bound).map_err(|_| denied())?;
         if let Some(recovery) = &mut self.recovery {
             let state = self
                 .bound
-                .as_ref()
+                .get()
                 .and_then(|bound| bound.released())
                 .ok_or_else(denied)?
                 .state();
@@ -296,7 +383,7 @@ impl PreparedNativeInitialWait {
         let child = if let Some(child) = &mut self.child {
             if self
                 .bound
-                .as_ref()
+                .get()
                 .and_then(|bound| bound.released())
                 .is_none()
             {
@@ -369,8 +456,11 @@ impl PreparedNativeInitialWait {
         Ok(InitialWaitApply::Registered(child))
     }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
+        if let Some(predecessor) = &self.context.predecessor {
+            predecessor.ensure_fresh_on(conn).await?;
+        }
         self.bound
-            .as_ref()
+            .get()
             .ok_or_else(denied)?
             .ensure_fresh_on(conn)
             .await?;
@@ -387,7 +477,10 @@ impl PreparedNativeInitialWait {
         Ok(())
     }
     pub fn ensure_fresh(&self) -> Result<()> {
-        self.bound.as_ref().ok_or_else(denied)?.ensure_fresh()?;
+        if let Some(predecessor) = &self.context.predecessor {
+            predecessor.ensure_fresh()?;
+        }
+        self.bound.get().ok_or_else(denied)?.ensure_fresh()?;
         self.admission.effect_fence().ensure_fresh()?;
         if let Some(recovery) = &self.recovery {
             recovery.ensure_fresh()?;

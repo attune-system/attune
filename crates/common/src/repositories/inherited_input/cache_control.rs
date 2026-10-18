@@ -47,7 +47,7 @@ impl CacheControlPublication {
 }
 
 impl InheritedInputRepository {
-    async fn held_graph_accounting(
+    pub(super) async fn held_graph_accounting(
         conn: &mut PgConnection,
         context: &ReceiptContext,
         key: &str,
@@ -69,6 +69,7 @@ impl InheritedInputRepository {
             key,
             &context.wait_reads,
             &context.result_reads,
+            &context.empty_reads,
             admissions,
         )
         .await?;
@@ -120,24 +121,13 @@ impl InheritedInputRepository {
         sources: &[PreparedInputSource],
         key: &str,
     ) -> Result<(usize, usize)> {
-        let mut bytes = 0usize;
-        let mut nodes = BTreeSet::new();
-        let mut admissions = RetainedReceiptAdmissions::default();
-        for context in contexts
+        let contexts: Vec<_> = contexts
             .iter()
             .copied()
             .chain(sources.iter().map(|source| &source.receipt))
-        {
-            let accounting =
-                Self::held_graph_accounting(conn, context, key, &mut admissions).await?;
-            bytes = bytes.checked_add(accounting.bytes).ok_or_else(denied)?;
-            nodes.extend(accounting.nodes.iter().copied());
-            // Reserve one node for the owning EOF snapshot.
-            if bytes > 1024 * 1024 || nodes.len() >= 256 {
-                return Err(denied());
-            }
-        }
-        Ok((bytes, nodes.len()))
+            .collect();
+        let budget = Self::prepared_input_graph_budget(conn, &[], &contexts, key).await?;
+        Ok((budget.bytes(), budget.node_count()))
     }
     /// Issue an opaque Control only from the canonical single evaluation of a
     /// retained iterate_cache selector. This is not authored/literal input and
@@ -270,8 +260,10 @@ pub(super) async fn staged_storage_bytes(conn: &mut PgConnection, receipt: Id) -
         })
         .transpose()
         .map(|charge| charge.unwrap_or(0))?;
+    let metadata_bytes = super::empty_task_control::storage_bytes(conn, receipt).await?;
     staged
         .checked_add(super::iteration_control::storage_bytes(conn, receipt).await?)
+        .and_then(|bytes| bytes.checked_add(metadata_bytes))
         .ok_or_else(denied)
 }
 

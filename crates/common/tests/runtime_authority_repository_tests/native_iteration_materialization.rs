@@ -26,6 +26,8 @@ use serde_json::Value;
 
 const KEY: &str = "0123456789abcdef0123456789abcdef";
 const LITERAL: &str = "{{ keystore['system.must_not_be_reparsed'] }}";
+#[path = "native_iteration_materialization/empty_ordinary_cases.rs"]
+mod empty_ordinary_cases;
 
 // Use the owning production parser/builder for I's persisted graph contract,
 // rather than fabricating a nodes/retry table in a repository fixture.
@@ -55,7 +57,7 @@ async fn setup_graph(
     Id,
     Option<Execution>,
 ) {
-    setup_graph_kind(items, batch, expiring, successors, pending, None).await
+    setup_graph_kind(items, batch, expiring, successors, pending, None, false).await
 }
 
 async fn setup_graph_kind(
@@ -65,6 +67,49 @@ async fn setup_graph_kind(
     successors: usize,
     pending: bool,
     group: Option<(bool, bool)>,
+    deadline_controls: bool,
+) -> (
+    TestDatabase,
+    Execution,
+    WorkflowExecution,
+    Id,
+    Option<Execution>,
+) {
+    setup_graph_contract(
+        items,
+        batch,
+        expiring,
+        successors,
+        pending,
+        group,
+        deadline_controls,
+        EmptyProgram::None,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum EmptyProgram {
+    None,
+    IterationSuccessor,
+    OrdinarySuccessor,
+    DynamicOrdinarySuccessor,
+    UnconditionalOrdinarySuccessor,
+    BudgetOrdinarySuccessor,
+    InputGraphBudget(usize),
+    InvalidOrdinaryInput(&'static str),
+    Terminal,
+}
+
+async fn setup_graph_contract(
+    items: Value,
+    batch: Option<usize>,
+    expiring: bool,
+    successors: usize,
+    pending: bool,
+    group: Option<(bool, bool)>,
+    deadline_controls: bool,
+    empty_program: EmptyProgram,
 ) -> (
     TestDatabase,
     Execution,
@@ -146,9 +191,96 @@ async fn setup_graph_kind(
             {"when":"{{ succeeded() }}","do":["ordinary_success"],"publish":if expect_failed {unselected.clone()} else {selected.clone()}},
             {"when":"{{ failed() }}","do":["ordinary_failure"],"publish":if expect_failed {selected} else {unselected}}
         ]);
+        if deadline_controls {
+            definition["tasks"][0]["next"][0]["when"] =
+                json!("{{ succeeded() and keystore['system.true_control_gate'] == 'permit' }}");
+            definition["tasks"][0]["next"][1]["when"] =
+                json!("{{ keystore['system.false_control_gate'] == 'permit' }}");
+            helpers::KeyFixture::new_system("true_control_gate", "permit")
+                .create(&db)
+                .await
+                .unwrap();
+            helpers::KeyFixture::new_system("false_control_gate", "reject")
+                .create(&db)
+                .await
+                .unwrap();
+        }
         if retry {
             definition["tasks"][0]["retry"] = json!({"count":1,"delay":0});
         }
+        if matches!(empty_program, EmptyProgram::IterationSuccessor) {
+            definition["tasks"][1]["with_items"] = json!("{{ [workflow.carried] }}");
+        }
+    }
+    match empty_program {
+        EmptyProgram::OrdinarySuccessor
+        | EmptyProgram::DynamicOrdinarySuccessor
+        | EmptyProgram::UnconditionalOrdinarySuccessor
+        | EmptyProgram::BudgetOrdinarySuccessor
+        | EmptyProgram::InputGraphBudget(_)
+        | EmptyProgram::InvalidOrdinaryInput(_) => {
+            let target = definition["tasks"][1].as_object_mut().unwrap();
+            target.remove("with_items");
+            target.remove("concurrency");
+            target.insert(
+                "input".into(),
+                json!({
+                    "payload":{"selected":"{{ workflow.carried }}", "saved":"{{ workflow.saved }}"},
+                    "ordinal":0,
+                }),
+            );
+            definition["output_map"] = json!({"empty":"{{ parameters.items }}"});
+            if let EmptyProgram::InvalidOrdinaryInput(expression) = empty_program {
+                definition["tasks"][1]["input"]["payload"]["selected"] = json!(expression);
+            }
+            if matches!(
+                empty_program,
+                EmptyProgram::DynamicOrdinarySuccessor
+                    | EmptyProgram::UnconditionalOrdinarySuccessor
+            ) {
+                definition["tasks"][1]["timeout"] =
+                    json!("{{ keystore['system.ordinary_timeout'] }}");
+                helpers::KeyFixture::new_system("ordinary_timeout", "17")
+                    .create(&db)
+                    .await
+                    .unwrap();
+            }
+            if matches!(empty_program, EmptyProgram::UnconditionalOrdinarySuccessor) {
+                definition["tasks"][0]["next"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("when");
+            }
+            if matches!(empty_program, EmptyProgram::BudgetOrdinarySuccessor) {
+                definition["tasks"][1]["worker_selector"] = Value::Object(
+                    (0..128)
+                        .map(|index| (format!("zone_{index}"), json!("{{ 'zone' }}")))
+                        .collect(),
+                );
+            }
+        }
+        EmptyProgram::Terminal => {
+            definition["tasks"] = json!([definition["tasks"][0].clone()]);
+            definition["tasks"][0]["next"] = json!([]);
+            definition["output_map"] = json!({"empty":"{{ parameters.items }}"});
+        }
+        EmptyProgram::None | EmptyProgram::IterationSuccessor => {}
+    }
+    if let EmptyProgram::InputGraphBudget(count) = empty_program {
+        assert!(count > 0 && count <= 32);
+        definition["tasks"][1]["timeout"] = json!(17);
+        definition["tasks"][1]["worker_selector"] = json!({"zone":"literal-placement"});
+        definition["tasks"][1]["trace_tag_template"] = json!("literal-budget-trace");
+        let target = definition["tasks"][1].clone();
+        let mut selected = vec!["ordinary_success".to_owned()];
+        for index in 1..count {
+            let name = format!("ordinary_budget_{index}");
+            let mut next = target.clone();
+            next["name"] = json!(name);
+            definition["tasks"].as_array_mut().unwrap().push(next);
+            selected.push(name);
+        }
+        definition["tasks"][0]["next"][0]["do"] = json!(selected);
     }
     if let Some(producer) = &producer {
         if pending {
@@ -227,11 +359,20 @@ async fn setup_graph_kind(
             });
         }
     }
-    if group.is_some() {
+    if group.is_some() && !matches!(empty_program, EmptyProgram::Terminal) {
         for name in ["ordinary_success", "ordinary_failure"] {
             bindings.push(InvocationBinding::WorkflowTask {
                 workflow_ref: graph_action.r#ref.clone(),
                 task_path: format!("/tasks/{name}"),
+                action_ref: leaf.r#ref.clone(),
+            });
+        }
+    }
+    if let EmptyProgram::InputGraphBudget(count) = empty_program {
+        for index in 1..count {
+            bindings.push(InvocationBinding::WorkflowTask {
+                workflow_ref: graph_action.r#ref.clone(),
+                task_path: format!("/tasks/ordinary_budget_{index}"),
                 action_ref: leaf.r#ref.clone(),
             });
         }
@@ -244,10 +385,22 @@ async fn setup_graph_kind(
         invocations: bindings
             .into_iter()
             .map(|binding| {
+                let standard = ["standard".to_owned()];
                 InvocationPolicy::from_executable(
                     binding.clone(),
                     &snapshots[binding.action_ref()],
-                    Some(&[]),
+                    Some(
+                        if matches!(
+                            empty_program,
+                            EmptyProgram::DynamicOrdinarySuccessor
+                                | EmptyProgram::UnconditionalOrdinarySuccessor
+                        ) && binding == root_binding
+                        {
+                            &standard
+                        } else {
+                            &[]
+                        },
+                    ),
                     &BTreeMap::new(),
                 )
                 .unwrap()
@@ -1534,6 +1687,7 @@ async fn group_activation_fixture(
         0,
         false,
         Some((failed, retry)),
+        false,
     )
     .await;
     let mut tx = db.begin().await.unwrap();
@@ -1779,6 +1933,836 @@ async fn native_ordinary_iteration_group_member_changes_before_target_apply_are_
             .unwrap()
             .len(),
         2
+    );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_held_deadline_has_no_expiry_only_for_unbounded_source() {
+    let (db, root, _, _) = terminal_source_fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let source = Iteration::prepare_completion(&mut tx, root.id, "ordinary", KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.held_deadline().unwrap(), None);
+    source.require_source_current(&mut tx).await.unwrap();
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_held_deadline_keeps_earlier_false_control_without_child_value() {
+    let (db, root, workflow, human, _) = setup_graph_kind(
+        json!([1, 2]),
+        None,
+        false,
+        0,
+        false,
+        Some((false, false)),
+        true,
+    )
+    .await;
+    let grants = json!([{"resource":"keys","actions":["read"],"constraints":{"refs":["system.true_control_gate","system.false_control_gate"]}}]);
+    let set = PermissionSetRepository::create(
+        db.pool(),
+        CreatePermissionSetInput {
+            r#ref: "fixture.deadline_issuer".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: grants.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    PermissionAssignmentRepository::create(
+        db.pool(),
+        CreatePermissionAssignmentInput {
+            identity: human,
+            permset: set.id,
+        },
+    )
+    .await
+    .unwrap();
+    let mut consent = db.begin().await.unwrap();
+    let bindings = DeclaredInputRepository::bindings(&mut consent, root.id)
+        .await
+        .unwrap();
+    let mut recorded = Vec::new();
+    for (site, hours) in [
+        ("/workflow/tasks/0/next/0/when", 2),
+        ("/workflow/tasks/0/next/1/when", 1),
+    ] {
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.source_path == site)
+            .unwrap();
+        let approval = Inputs::approve_external_input(
+            &mut consent,
+            root.id,
+            &binding.declaration_revision,
+            &binding.source_path,
+            &binding.expression,
+            human,
+            serde_json::from_value(grants.clone()).unwrap(),
+            Some(Utc::now() + Duration::hours(hours)),
+        )
+        .await
+        .unwrap();
+        recorded.push(
+            RuntimeAuthorityRepository::find_approval(&mut consent, approval)
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_at
+                .unwrap(),
+        );
+    }
+    assert!(recorded[1] < recorded[0]);
+    consent.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let mut initial = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    let members = initial.apply(&mut tx, KEY).await.unwrap().requested;
+    assert_eq!(members.len(), 2);
+    for member in &members {
+        ExecutionRepository::update(
+            &mut *tx,
+            member.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let delivered = ExecutionRepository::find_by_id(&mut *tx, members[1].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut activation = Iteration::prepare_iteration_activation(&mut tx, &root, &delivered, KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    let children = activation.apply(&mut tx, KEY).await.unwrap();
+    assert_eq!(children.len(), 2);
+    let state = Workflows::find_by_id(&mut *tx, workflow.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.current_tasks, vec!["ordinary_success".to_owned()]);
+    for child in &children {
+        ExecutionRepository::update(
+            &mut *tx,
+            child.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let source = Iteration::prepare_completion(&mut tx, root.id, "ordinary_success", KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    // Only the true branch produced children. Its input graphs must also retain
+    // the earlier independent FALSE decision's approval, not a child/result Value.
+    assert!(source
+        .input_receipts()
+        .iter()
+        .any(|receipt| receipt.approval_deadline() == Some(recorded[1])));
+    assert_eq!(source.held_deadline().unwrap(), Some(recorded[1]));
+    source.require_source_current(&mut tx).await.unwrap();
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+async fn empty_program_fixture(controls: bool) -> (TestDatabase, Execution, WorkflowExecution, Id) {
+    let (db, root, workflow, human, _) = setup_graph_contract(
+        json!([]),
+        None,
+        false,
+        0,
+        false,
+        Some((false, false)),
+        controls,
+        EmptyProgram::IterationSuccessor,
+    )
+    .await;
+    (db, root, workflow, human)
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_completion_creates_one_real_ordinary_successor() {
+    let (db, root, workflow, _, _) = setup_graph_contract(
+        json!([]),
+        None,
+        false,
+        0,
+        false,
+        Some((false, false)),
+        false,
+        EmptyProgram::OrdinarySuccessor,
+    )
+    .await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let source = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    assert!(source.needs_empty_activation());
+    let mut activation = Iteration::prepare_empty_activation(&mut tx, source, KEY)
+        .await
+        .unwrap();
+    let children = activation.apply(&mut tx, KEY).await.unwrap();
+    assert_eq!(children.len(), 1);
+    let child = &children[0];
+    assert!(child.id > 0);
+    let metadata = child.workflow_task.as_ref().unwrap();
+    assert_eq!(metadata.task_name, "ordinary_success");
+    assert_eq!(metadata.workflow_execution, workflow.id);
+    assert!(metadata.task_index.is_none());
+    let restored = Native::capture_with_key(&mut tx, child.id, &[], Some(KEY))
+        .await
+        .unwrap()
+        .restore_prepared(
+            &mut tx,
+            ENTITY_EXECUTION_CONFIG,
+            child.id,
+            child.config.clone().unwrap(),
+            Some(KEY),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restored,
+        json!({"payload":{"selected":[],"saved":LITERAL},"ordinal":0})
+    );
+    assert_eq!(
+        ExecutionRepository::find_by_parent(&mut *tx, root.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    activation.ensure_fresh_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    activation.ensure_fresh().unwrap();
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let mut recovery = Iteration::recover_empty_activation(&mut tx, &root, "ordinary", KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    let recovered = recovery.apply(&mut tx, KEY).await.unwrap();
+    assert_eq!(
+        recovered.iter().map(|child| child.id).collect::<Vec<_>>(),
+        vec![child.id]
+    );
+    recovery.ensure_fresh_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    recovery.ensure_fresh().unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_completion_records_typed_terminal_root() {
+    let (db, root, workflow, _, _) = setup_graph_contract(
+        json!([]),
+        None,
+        false,
+        0,
+        false,
+        Some((false, false)),
+        false,
+        EmptyProgram::Terminal,
+    )
+    .await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let mut source = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    let result = source.apply(&mut tx, KEY).await.unwrap();
+    assert!(result.requested.is_empty());
+    let completed = result
+        .completed_parent
+        .expect("empty terminal task must physically settle its root");
+    assert_eq!(completed.id, root.id);
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert!(ExecutionRepository::find_by_parent(&mut *tx, root.id)
+        .await
+        .unwrap()
+        .is_empty());
+    let state = Workflows::find_by_id(&mut *tx, workflow.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.status, ExecutionStatus::Completed);
+    assert_eq!(state.completed_tasks, vec!["ordinary"]);
+    assert!(state.current_tasks.is_empty());
+    let fields = Secrets::find_stored_by_entity(&mut *tx, "execution_result", root.id)
+        .await
+        .unwrap();
+    assert!(
+        !fields.is_empty(),
+        "generated success requires typed receipt-backed output"
+    );
+    let (ordinary, receipts) =
+        attune_common::repositories::immutable_input_origin::prepare_input_receipts(
+            &mut tx,
+            "execution_result",
+            root.id,
+            &fields,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(ordinary.is_empty());
+    assert!(!receipts.is_empty());
+    source.ensure_fresh_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    source.ensure_fresh().unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_completion_ordinary_rejects_foreign_transaction_before_locks(
+) {
+    let (db, root, _, _, _) = setup_graph_contract(
+        json!([]),
+        None,
+        false,
+        0,
+        false,
+        Some((false, false)),
+        false,
+        EmptyProgram::OrdinarySuccessor,
+    )
+    .await;
+    let mut issuing = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut issuing, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let source = Iteration::prepare(&mut issuing, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    let mut activation = Iteration::prepare_empty_activation(&mut issuing, source, KEY)
+        .await
+        .unwrap();
+    let mut foreign = db.begin().await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        activation.apply(&mut foreign, KEY),
+    )
+    .await
+    .expect("foreign transaction must reject before workflow target locks");
+    assert!(matches!(
+        result,
+        Err(attune_common::Error::PermissionDenied(_))
+    ));
+    foreign.rollback().await.unwrap();
+    // Rejection must not consume or mutate the genuine issuing capability.
+    let children = activation.apply(&mut issuing, KEY).await.unwrap();
+    assert_eq!(children.len(), 1);
+    assert!(children[0]
+        .workflow_task
+        .as_ref()
+        .unwrap()
+        .task_index
+        .is_none());
+    activation.ensure_fresh_on(&mut issuing).await.unwrap();
+    issuing.rollback().await.unwrap();
+    assert!(ExecutionRepository::find_by_parent(&*db, root.id)
+        .await
+        .unwrap()
+        .is_empty());
+    db.cleanup().await.unwrap();
+}
+
+async fn approve_empty_conditions(
+    db: &TestDatabase,
+    root: &Execution,
+    human: Id,
+    expires: chrono::DateTime<Utc>,
+) -> Vec<Id> {
+    let grants = json!([{"resource":"keys","actions":["read"],"constraints":{"refs":["system.true_control_gate","system.false_control_gate"]}}]);
+    let set = PermissionSetRepository::create(
+        db.pool(),
+        CreatePermissionSetInput {
+            r#ref: "fixture.empty_issuer".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: grants.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    PermissionAssignmentRepository::create(
+        db.pool(),
+        CreatePermissionAssignmentInput {
+            identity: human,
+            permset: set.id,
+        },
+    )
+    .await
+    .unwrap();
+    let mut tx = db.begin().await.unwrap();
+    let bindings = DeclaredInputRepository::bindings(&mut tx, root.id)
+        .await
+        .unwrap();
+    let mut approvals = Vec::new();
+    for (index, site) in [
+        "/workflow/tasks/0/next/0/when",
+        "/workflow/tasks/0/next/1/when",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.source_path == site)
+            .unwrap();
+        approvals.push(
+            Inputs::approve_external_input(
+                &mut tx,
+                root.id,
+                &binding.declaration_revision,
+                &binding.source_path,
+                &binding.expression,
+                human,
+                serde_json::from_value(grants.clone()).unwrap(),
+                Some(if index == 0 {
+                    expires + Duration::hours(1)
+                } else {
+                    expires
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    tx.commit().await.unwrap();
+    approvals
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_recipe_records_zero_children_and_typed_storage_replay() {
+    use attune_common::repositories::native_input_snapshot::NativeInputSnapshotRepository as Snapshots;
+    let (db, root, workflow, _) = setup(json!([]), None, false).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let mut plan = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    let snapshot = plan.empty_outcome().unwrap().snapshot();
+    assert!(Snapshots::storage_evidence(&mut tx, snapshot)
+        .await
+        .is_err());
+    let result = plan.apply(&mut tx, KEY).await.unwrap();
+    assert!(result.requested.is_empty());
+    assert!(ExecutionRepository::find_by_parent(&mut *tx, root.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        Iteration::prepare_completion(&mut tx, root.id, "ordinary", KEY)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stored = Snapshots::storage_evidence(&mut tx, snapshot)
+        .await
+        .unwrap();
+    assert_eq!(stored.metadata().source_kind(), "empty_iteration_outcome");
+    let release = stored.empty_iteration_release().unwrap();
+    assert_eq!(release.execution(), root.id);
+    assert_eq!(release.workflow(), workflow.id);
+    assert!(release.control() > 0);
+    assert!(stored.cache().is_none());
+    assert!(stored.wait_release().is_none());
+    let evidence = Snapshots::source_evidence(&mut tx, stored.metadata(), KEY)
+        .await
+        .unwrap();
+    assert!(evidence.contract().is_none());
+    plan.ensure_fresh_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    plan.ensure_fresh().unwrap();
+    let mut replay = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut replay, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let stored = Snapshots::storage_evidence(&mut replay, snapshot)
+        .await
+        .unwrap();
+    Snapshots::source_evidence(&mut replay, stored.metadata(), KEY)
+        .await
+        .unwrap();
+    replay.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_program_activates_real_successors_and_recovers_original_ids(
+) {
+    let (db, root, workflow, _) = empty_program_fixture(false).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let plan = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    assert!(plan.needs_empty_activation());
+    let mut activation = Iteration::prepare_empty_activation(&mut tx, plan, KEY)
+        .await
+        .unwrap();
+    let pending_conditions: Vec<(Id, String)> = sqlx::query_as(
+        "SELECT id,destination_path FROM runtime_input_receipt WHERE execution=$1 AND destination_purpose='condition' ORDER BY id",
+    ).bind(root.id).fetch_all(&mut *tx).await.unwrap();
+    assert!(!pending_conditions.is_empty());
+    for (id, path) in &pending_conditions {
+        let site = attune_common::repositories::inherited_input::InputSite {
+            execution: root.id,
+            kind: attune_common::repositories::inherited_input::InputEntityKind::WorkflowVariables,
+            purpose: attune_common::repositories::inherited_input::InputSitePurpose::Condition,
+            path: path.clone(),
+        };
+        let origin = attune_common::secret_provenance::SecretOrigin::Entity {
+            entity_type: "declared_input:workflow_variables:condition".into(),
+            entity_id: *id,
+            path: path.clone(),
+        };
+        assert!(
+            matches!(
+                Inputs::receipt_context(&mut tx, &site, &origin, KEY).await,
+                Err(attune_common::Error::PermissionDenied(_))
+            ),
+            "ordinary receipt reader must not inherit private empty staging authority"
+        );
+    }
+    let children = activation.apply(&mut tx, KEY).await.unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(
+        children[0].workflow_task.as_ref().unwrap().task_name,
+        "ordinary_success"
+    );
+    let members = ExecutionRepository::find_by_parent(&mut *tx, root.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        members.len(),
+        1,
+        "the empty source must have NO synthetic child"
+    );
+    let state = Workflows::find_by_id(&mut *tx, workflow.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.completed_tasks.contains(&"ordinary".into()));
+    assert_eq!(state.current_tasks, vec!["ordinary_success".to_owned()]);
+    activation.ensure_fresh_on(&mut tx).await.unwrap();
+    for (id, path) in &pending_conditions {
+        let site = attune_common::repositories::inherited_input::InputSite {
+            execution: root.id,
+            kind: attune_common::repositories::inherited_input::InputEntityKind::WorkflowVariables,
+            purpose: attune_common::repositories::inherited_input::InputSitePurpose::Condition,
+            path: path.clone(),
+        };
+        let origin = attune_common::secret_provenance::SecretOrigin::Entity {
+            entity_type: "declared_input:workflow_variables:condition".into(),
+            entity_id: *id,
+            path: path.clone(),
+        };
+        Inputs::receipt_context(&mut tx, &site, &origin, KEY)
+            .await
+            .unwrap()
+            .ensure_fresh_on(&mut tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    activation.ensure_fresh().unwrap();
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let mut recovery = Iteration::recover_empty_activation(&mut tx, &root, "ordinary", KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    let recovered = recovery.apply(&mut tx, KEY).await.unwrap();
+    assert_eq!(
+        recovered.iter().map(|row| row.id).collect::<Vec<_>>(),
+        children.iter().map(|row| row.id).collect::<Vec<_>>()
+    );
+    recovery.ensure_fresh_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    recovery.ensure_fresh().unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_recipe_rejects_changed_original_list_before_publication() {
+    let (db, root, workflow, _, completed) = setup_graph(json!([]), None, false, 1, true).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let mut activation = Iteration::prepare_successors(&mut tx, &root, &completed.unwrap(), KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    Workflows::update(
+        &mut *tx,
+        workflow.id,
+        UpdateWorkflowExecutionInput {
+            variables: Some(json!({"selected":["changed"]})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(activation.apply(&mut tx, KEY).await.is_err());
+    tx.rollback().await.unwrap();
+    let rows = ExecutionRepository::find_by_parent(db.pool(), root.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the original real predecessor may remain"
+    );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_false_control_fence_reaches_actual_successor_seal() {
+    let (db, root, _, human) = empty_program_fixture(true).await;
+    let expires = chrono::DateTime::from_timestamp_micros(
+        (Utc::now() + Duration::hours(1)).timestamp_micros(),
+    )
+    .unwrap();
+    approve_empty_conditions(&db, &root, human, expires).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let plan = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    let mut activation = Iteration::prepare_empty_activation(&mut tx, plan, KEY)
+        .await
+        .unwrap();
+    assert_eq!(activation.held_deadline().unwrap(), Some(expires));
+    let children = activation.apply(&mut tx, KEY).await.unwrap();
+    assert_eq!(children.len(), 1);
+    let child = ExecutionRepository::update(
+        &mut *tx,
+        children[0].id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let source = Iteration::prepare_completion(
+        &mut tx,
+        root.id,
+        &child.workflow_task.as_ref().unwrap().task_name,
+        KEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(source
+        .input_receipts()
+        .iter()
+        .any(|receipt| receipt.approval_deadline() == Some(expires)));
+    assert_eq!(source.held_deadline().unwrap(), Some(expires));
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_revoked_source_blocks_release_and_successor_writes() {
+    let (db, root, _, _) = empty_program_fixture(false).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let plan = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    let mut activation = Iteration::prepare_empty_activation(&mut tx, plan, KEY)
+        .await
+        .unwrap();
+    let admission = RuntimeAuthorityRepository::execution_admission(&mut tx, root.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        RuntimeAuthorityRepository::revoke_admission(&mut tx, admission.id)
+            .await
+            .unwrap()
+    );
+    assert!(activation.apply(&mut tx, KEY).await.is_err());
+    tx.rollback().await.unwrap();
+    assert!(ExecutionRepository::find_by_parent(db.pool(), root.id)
+        .await
+        .unwrap()
+        .is_empty());
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_wrong_recipe_cannot_bind_value_or_issue_nonempty_group() {
+    use attune_common::repositories::inherited_input::InputSitePurpose;
+    let (db, root, _, _) = empty_program_fixture(false).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let plan = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    assert!(
+        Iteration::prepare_completion(&mut tx, root.id, "ordinary", KEY)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let declaration = DeclaredInputRepository::bindings(&mut tx, root.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|binding| binding.source_path == "/workflow/tasks/0/with_items")
+        .unwrap();
+    let mut session = Inputs::begin_render(
+        &mut tx,
+        root.id,
+        &declaration.declaration_revision,
+        &declaration.source_path,
+        &declaration.expression,
+        InputSitePurpose::Control,
+    )
+    .await
+    .unwrap();
+    assert!(
+        Inputs::bind_empty_iteration_outcome(&mut session, plan.empty_outcome().unwrap()).is_err()
+    );
+    tx.rollback().await.unwrap();
+    let (other_db, other, _, _) = setup(json!([1]), None, false).await;
+    // A real nonempty preparation has no empty recipe to pass to any binder.
+    let mut other_tx = other_db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut other_tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    assert!(
+        Iteration::prepare(&mut other_tx, &other, "ordinary", None, KEY)
+            .await
+            .unwrap()
+            .empty_outcome()
+            .is_none()
+    );
+    other_tx.rollback().await.unwrap();
+    other_db.cleanup().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_expired_false_control_blocks_actual_apply() {
+    let (db, root, _, human) = empty_program_fixture(true).await;
+    let expires = Utc::now() + Duration::seconds(10);
+    let approvals = approve_empty_conditions(&db, &root, human, expires).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let plan = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    let mut activation = Iteration::prepare_empty_activation(&mut tx, plan, KEY)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+    loop {
+        let expired: bool = sqlx::query_scalar(
+            "SELECT expires_at <= clock_timestamp() FROM runtime_external_approval WHERE id=$1",
+        )
+        .bind(approvals[1])
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        if expired {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "false Control did not reach its actual approval deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(activation.apply(&mut tx, KEY).await.is_err());
+    tx.rollback().await.unwrap();
+    assert!(ExecutionRepository::find_by_parent(db.pool(), root.id)
+        .await
+        .unwrap()
+        .is_empty());
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_recipe_cannot_release_in_a_replacement_transaction() {
+    let (db, root, _, _) = setup(json!([]), None, false).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let mut plan = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut other = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut other, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    assert!(plan.apply(&mut other, KEY).await.is_err());
+    other.rollback().await.unwrap();
+    assert!(ExecutionRepository::find_by_parent(db.pool(), root.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        ExecutionRepository::find_by_id(db.pool(), root.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Running
     );
     db.cleanup().await.unwrap();
 }

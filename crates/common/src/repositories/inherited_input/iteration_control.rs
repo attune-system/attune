@@ -12,6 +12,12 @@ pub struct PreparedIterationControl {
     original_checked: std::sync::OnceLock<()>,
 }
 impl PreparedIterationControl {
+    pub(crate) fn held_receipt(&self) -> &ReceiptContext {
+        &self.receipt
+    }
+    pub(crate) fn held_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.receipt.approval_deadline()
+    }
     pub fn value(&self) -> &Value {
         &self.receipt.value
     }
@@ -79,7 +85,9 @@ impl InheritedInputRepository {
     ) -> Result<PreparedIterationControl> {
         require_transaction(conn, &rendered.transaction).await?;
         if rendered.native.is_some() || rendered.renderer.owner_kind != "execution" {
-            return Err(denied());
+            return Err(Error::PermissionDenied(
+                "Iteration control renderer shape denied".into(),
+            ));
         }
         let path = match (rendered.declaration, &rendered.literal) {
             (Some(id), None) if rendered.purpose == InputSitePurpose::Control => {
@@ -99,11 +107,17 @@ impl InheritedInputRepository {
             }
             (None, Some(literal)) if rendered.purpose == InputSitePurpose::Value => {
                 if literal_value(conn, &rendered.renderer, literal).await? != rendered.value {
-                    return Err(denied());
+                    return Err(Error::PermissionDenied(
+                        "Iteration control original literal mismatch".into(),
+                    ));
                 }
                 literal.path.clone()
             }
-            _ => return Err(denied()),
+            _ => {
+                return Err(Error::PermissionDenied(
+                    "Iteration control render purpose denied".into(),
+                ))
+            }
         };
         if !with_items_path(&path) {
             return Err(denied());
@@ -122,6 +136,7 @@ impl InheritedInputRepository {
         }
         let source = RenderedReceiptContext {
             result_reads: rendered.result_reads.clone(),
+            empty_reads: rendered.empty_reads.clone(),
             wait_reads: rendered.wait_reads.clone(),
             native: None,
             transaction: rendered.transaction.clone(),
@@ -139,7 +154,9 @@ impl InheritedInputRepository {
             purpose: InputSitePurpose::Control,
             path,
         };
-        let destination = Self::prepare_destination(conn, &source, &site, key).await?;
+        let destination = Self::prepare_destination(conn, &source, &site, key)
+            .await
+            .map_err(|error| control_phase(error, "destination"))?;
         let receipt = Self::record_prepared_inner(
             conn,
             &source,
@@ -149,20 +166,27 @@ impl InheritedInputRepository {
             key,
             true,
         )
-        .await?;
+        .await
+        .map_err(|error| control_phase(error, "private staging"))?;
         sqlx::query("INSERT INTO runtime_native_iteration_control(receipt,execution,workflow,workflow_definition,task_path,batch_size) VALUES($1,$2,$3,$4,$5,$6)").bind(receipt.id).bind(site.execution).bind(workflow.id).bind(definition).bind(&site.path).bind(stored_batch).execute(&mut *conn).await?;
         sqlx::query("INSERT INTO runtime_input_receipt_staged(receipt) VALUES($1)")
             .bind(receipt.id)
             .execute(&mut *conn)
             .await?;
-        let mut receipt = Self::preparation_receipt_context_with_wait_reads(
+        // Reopen through the same bounded graph walker with every genuine
+        // carried source capability, not just the Wait subset.
+        let mut receipt = Self::preparation_receipt_context_with_admissions(
             conn,
             &site,
             &receipt.origin(),
             key,
             &receipt.wait_reads,
+            &receipt.result_reads,
+            &receipt.empty_reads,
+            &mut RetainedReceiptAdmissions::default(),
         )
-        .await?;
+        .await
+        .map_err(|error| control_phase(error, "canonical staging reopen"))?;
         receipt.newly_recorded = true;
         Ok(PreparedIterationControl {
             renderer: rendered.renderer.id,
@@ -185,6 +209,15 @@ impl InheritedInputRepository {
             batch_size: control.batch_size,
             value: iteration_value(control.value(), ordinal, control.batch_size)?,
         })
+    }
+}
+
+fn control_phase(error: Error, phase: &str) -> Error {
+    match error {
+        Error::PermissionDenied(_) => {
+            Error::PermissionDenied(format!("Iteration control {phase} denied"))
+        }
+        other => other,
     }
 }
 

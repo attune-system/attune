@@ -77,6 +77,28 @@ bash scripts/benchmark-rust-integration-tests.sh \
 
 The Rust image uses a small runtime stage and stores stripped test executables, not the Rust toolchain or Cargo's incremental directory. Its `inventory.tsv` is the exact runnable-test fingerprint. A normal runtime invocation executes those binaries directly and does not compile. Changes limited to the entrypoint or other runtime Docker fixtures do not invalidate the workspace compile layer.
 
+The full-stack runner starts the API and test identity before core-pack
+publication. If no `ATTUNE_BOOTSTRAP_TOKEN` is supplied, it creates an owned
+integration token through the authenticated API. The token stays in a mode-0600
+file inside a private, Docker-shared `.scratch/e2e-bootstrap-*` directory. It is
+never printed. The runner revokes it after worker admission, or during cleanup
+if startup fails, and checks that `/auth/token-login` rejects the raw revoked
+credential with HTTP 401.
+It removes the private files on exit, including with
+`--no-teardown`. If revocation fails, the runner exits nonzero, deletes the secret
+file, and retains the private non-secret `credential.json` descriptor for a
+retry. It reports that descriptor's path. A caller-supplied bootstrap token is
+not revoked by the runner.
+This setup does not enable managed execution credentials or change normal
+deployment authentication. Attach mode does not provision credentials or mutate
+the existing stack.
+
+Offline bootstrap credential checks:
+
+```bash
+python3 -m unittest discover -s tests/unit -p 'test_e2e_bootstrap.py' -v
+```
+
 The Docker lane intentionally uses libtest rather than cargo-nextest. An earlier 0.9.145 prototype matched the then-ignored database-test identities but was 7.2% slower by median test time across three equal 591-test common-crate samples. The stock nextest archive was also larger than the complete runtime image. See [Test concurrency reliability](../plans/test-concurrency-reliability.md#cargo-nextest-scheduler-investigation) for the coverage map and measurements.
 
 The database/broker lane excludes tests that declare additional API, S3, installed-CLI, or high-load prerequisites. Those identities remain in the image and in their owning CI/E2E lanes; they are not silently discovered or conditionally skipped. To run them after provisioning every prerequisite:

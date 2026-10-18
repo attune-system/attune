@@ -171,6 +171,7 @@ impl InheritedInputRepository {
         merge_result_reads(&mut reads, &[view.issued_result_read(&site.path)?])?;
         let pending = RenderedReceiptContext {
             result_reads: reads,
+            empty_reads: rendered.empty_reads.clone(),
             wait_reads: rendered.wait_reads.clone(),
             native: None,
             transaction: rendered.transaction.clone(),

@@ -3,6 +3,7 @@
 //! True and false decisions retain opaque CONTROL tokens, never Boolean variable
 //! values. Owning cache/ordinary/wait writers retain their separate target phases.
 use super::native_cache_materialization::profile::{measure, Operation as Op};
+mod wait_held;
 use super::{
     declared_input::{DeclaredInputBinding, DeclaredInputRepository},
     execution::ExecutionRepository,
@@ -46,7 +47,13 @@ pub(super) struct Field {
     pub(super) paths: Vec<String>,
     pub(super) source: Option<PreparedInputSource>,
 }
+mod empty_iteration;
+mod held;
+pub use empty_iteration::PreparedNativeEmptyTransitions;
+
 pub(super) struct Sources {
+    empty_iteration:
+        Option<std::sync::Arc<super::native_iteration_materialization::PreparedNativeIteration>>,
     transaction: String,
     parent: Execution,
     encryption_key_hash: String,
@@ -126,6 +133,9 @@ pub struct PreparedNativeTransitions {
     cache_sources: std::sync::Arc<Sources>,
     cache_publication: std::sync::OnceLock<PublishedCacheFrame>,
 }
+
+mod wait_successor;
+pub use wait_successor::PreparedNativeWaitPredecessor;
 
 struct PublishedCacheFrame {
     variables: Value,
@@ -897,8 +907,8 @@ impl NativeTransitionMaterializationRepository {
         Self::prepare_completion(conn, completed, key, false).await
     }
 
-    // Only the owning cache activation planner may select this mode, after it
-    // proves the actual successor graph and before any outer target locks.
+    // Owning successor planners select this mode only after proving the actual
+    // successor graph and before acquiring any outer target locks.
     pub(super) async fn prepare_cache_activation(
         conn: &mut PgConnection,
         completed: &Execution,
@@ -917,10 +927,14 @@ impl NativeTransitionMaterializationRepository {
             return Ok(None);
         };
         if metadata.task_index.is_some()
-            || !matches!(
+            || !(matches!(
                 completed.status,
                 ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Timeout
-            )
+            ) || successor_activation
+                && matches!(
+                    completed.status,
+                    ExecutionStatus::Cancelled | ExecutionStatus::Abandoned
+                ))
         {
             return Ok(None);
         }
@@ -1392,6 +1406,12 @@ fn attach_literal_controls(
     sources: &Sources,
     controls: &[&PreparedInputSource],
 ) -> Result<()> {
+    if let Some(empty) = &sources.empty_iteration {
+        Inputs::attach_empty_iteration_control(
+            rendered,
+            empty.empty_outcome().ok_or_else(changed)?,
+        )?;
+    }
     if let Some(group) = &sources.iteration {
         Inputs::attach_native_iteration_control(rendered, &group.proof)?;
     }
@@ -1737,6 +1757,7 @@ pub(super) async fn prepare_sources(
         return Err(changed());
     }
     Ok(Some(Sources {
+        empty_iteration: None,
         iteration: None,
         completion_task: None,
         ordinary_task_path: None,
@@ -2146,6 +2167,14 @@ async fn evaluate_with_cache(
         bind_evaluation_sources(conn, &mut session, binding, sources, controls, prior, key),
     )
     .await?;
+    if purpose == InputSitePurpose::Condition {
+        if let Some(empty) = &sources.empty_iteration {
+            Inputs::bind_empty_iteration_outcome(
+                &mut session,
+                empty.empty_outcome().ok_or_else(changed)?,
+            )?;
+        }
+    }
     if let Some(cache) = cache {
         Inputs::bind_cache_input(&mut session, cache)?;
     }
@@ -2164,6 +2193,12 @@ async fn evaluate_with_cache(
         .await
         .map_err(|error| source_phase_error(error, "evaluate value", &binding.source_path))
     }?;
+    if let Some(empty) = &sources.empty_iteration {
+        Inputs::attach_empty_iteration_control(
+            &mut rendered,
+            empty.empty_outcome().ok_or_else(changed)?,
+        )?;
+    }
     if let Some(group) = &sources.iteration {
         Inputs::attach_native_iteration_control(&mut rendered, &group.proof)?;
     }

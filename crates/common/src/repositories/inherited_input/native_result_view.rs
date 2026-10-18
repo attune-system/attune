@@ -14,6 +14,9 @@ pub struct PreparedNativeValueDestination {
     target_binding: String,
 }
 impl PreparedNativeValueDestination {
+    pub(crate) fn held_deadline(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.destination.held_deadline()
+    }
     pub fn ensure_fresh(&self) -> Result<()> {
         self.destination.fence.ensure_fresh()
     }

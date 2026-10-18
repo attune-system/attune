@@ -7,6 +7,8 @@ use attune_common::repositories::Update;
 #[derive(Clone, Copy)]
 pub(crate) enum InitialCase {
     Terminal,
+    TerminalOutput,
+    Successor(u8),
     InProgress,
     WrongTransaction,
     MissingRelease,
@@ -30,6 +32,14 @@ pub(crate) async fn initial_lifecycle(
     mode: InitialCase,
     expiry: chrono::DateTime<Utc>,
 ) {
+    if let InitialCase::Successor(mode) = mode {
+        super::successor_cases::run(pool, workflow, parent, task, target, key, mode, expiry).await;
+        return;
+    }
+    if matches!(mode, InitialCase::TerminalOutput) {
+        super::output_release_cases::complete(pool, workflow, parent, task, target, key).await;
+        return;
+    }
     if let InitialCase::Recovery(state) = mode {
         initial_recovery(
             pool, workflow, parent, task, target, key, state, None, false,

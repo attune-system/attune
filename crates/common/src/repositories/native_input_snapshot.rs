@@ -24,6 +24,11 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
+pub(in crate::repositories) mod empty_iteration;
+pub(crate) use empty_iteration::ReleasedNativeEmptyIteration;
+pub use empty_iteration::{
+    NativeEmptyIterationStorageRelease, PreparedNativeEmptyIterationOutcome,
+};
 mod completion;
 mod success_metadata;
 use success_metadata::SuccessSource;
@@ -35,6 +40,7 @@ mod pending_result;
 mod pending_wait;
 pub(crate) use pending_result::IssuedResultRead;
 mod result_view;
+mod wait_completion;
 use completion::CompletionSource;
 pub use completion::{NativeCompletionSource, PreparedNativeCompletionMetadata};
 use iteration_outcome::IterationOutcomeSource;
@@ -47,6 +53,9 @@ use result_view::ResultViewSource;
 pub use result_view::{
     NativeResultContractKind, NativeResultPointerMapping, PreparedNativeResultView,
 };
+pub(crate) use wait_completion::PreparedWaitCompletionOutput;
+use wait_completion::WaitCompletionSource;
+pub use wait_completion::{NativeWaitCompletionEvidence, NativeWaitCompletionRegistration};
 
 const MAX_BYTES: usize = 1024 * 1024;
 mod prospective_wait;
@@ -87,6 +96,8 @@ struct CacheFrontierPlan {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Source {
+    EmptyIteration(empty_iteration::EmptyIterationArchive),
+    WaitCompletion(WaitCompletionSource),
     SuccessMetadata(SuccessSource),
     IterationOutcome(IterationOutcomeSource),
     Cache(CacheSource),
@@ -269,6 +280,7 @@ pub struct ReleasedWaitInput {
 /// Frozen source parents for C/F, never current reader permission. Cache readers
 /// additionally retain the original task's source-freshness policy through IO.
 pub struct NativeSourceEvidence {
+    wait_completion: Option<NativeWaitCompletionEvidence>,
     success_metadata: Option<NativeSuccessMetadataEvidence>,
     iteration_outcome: Option<NativeIterationOutcomeEvidence>,
     completion_sources: Vec<NativeCompletionSource>,
@@ -532,6 +544,8 @@ impl NativeStorageWaitRelease {
 /// Storage authentication only. Private fields/no serde; no key or current IAM.
 /// C's separate source_evidence path still owns current-reader authorization.
 pub struct NativeSnapshotStorageEvidence {
+    empty_iteration: Option<NativeEmptyIterationStorageRelease>,
+    wait_completion: Option<NativeWaitCompletionEvidence>,
     success_metadata: Option<NativeSuccessMetadataEvidence>,
     iteration_outcome: Option<NativeIterationOutcomeEvidence>,
     completion_sources: Vec<NativeCompletionSource>,
@@ -556,6 +570,12 @@ pub struct NativeSnapshotStorageEvidence {
     bytes: usize,
 }
 impl NativeSnapshotStorageEvidence {
+    pub fn empty_iteration_release(&self) -> Option<&NativeEmptyIterationStorageRelease> {
+        self.empty_iteration.as_ref()
+    }
+    pub fn wait_completion(&self) -> Option<&NativeWaitCompletionEvidence> {
+        self.wait_completion.as_ref()
+    }
     pub fn success_metadata(&self) -> Option<&NativeSuccessMetadataEvidence> {
         self.success_metadata.as_ref()
     }
@@ -627,6 +647,9 @@ impl NativeSnapshotStorageEvidence {
     }
 }
 impl NativeSourceEvidence {
+    pub fn wait_completion(&self) -> Option<&NativeWaitCompletionEvidence> {
+        self.wait_completion.as_ref()
+    }
     pub fn success_metadata(&self) -> Option<&NativeSuccessMetadataEvidence> {
         self.success_metadata.as_ref()
     }
@@ -1700,6 +1723,72 @@ impl NativeInputSnapshotRepository {
         key: &str,
     ) -> Result<ReleasedWaitInput> {
         let record = DeclaredInputRepository::require_source(conn, renderer).await?;
+        Self::observe_released_wait(conn, renderer, task_path, wait, key, record).await
+    }
+
+    /// Observe the original Wait only through its authenticated, released root
+    /// completion receipt. This cannot admit new inputs to a terminal producer.
+    pub(crate) async fn prepare_completed_wait_observation(
+        conn: &mut PgConnection,
+        context: &ReceiptContext,
+        key: &str,
+    ) -> Result<ReleasedWaitInput> {
+        use super::FindById;
+        context.ensure_fresh_on(conn).await?;
+        let site = context.site();
+        if site.kind != super::inherited_input::InputEntityKind::ExecutionResult
+            || site.purpose != super::inherited_input::InputSitePurpose::Value
+            || !site.path.is_empty()
+        {
+            return Err(denied());
+        }
+        let mut outputs = context
+            .native_source_metadata()
+            .iter()
+            .filter(|metadata| metadata.source_kind() == "wait_completion_metadata");
+        let metadata = outputs.next().ok_or_else(denied)?;
+        if outputs.next().is_some() {
+            return Err(denied());
+        }
+        let evidence = Self::source_evidence(conn, metadata, key).await?;
+        let output = evidence.wait_completion().ok_or_else(denied)?;
+        let record = RuntimeAuthorityRepository::execution_admission(conn, site.execution)
+            .await?
+            .ok_or_else(denied)?;
+        let parent = super::execution::ExecutionRepository::find_by_id(&mut *conn, site.execution)
+            .await?
+            .ok_or_else(denied)?;
+        if output.execution() != site.execution
+            || output.original_renderer_admission() != record.id
+            || parent.status != crate::models::ExecutionStatus::Failed
+            || parent.result.as_ref() != Some(&crate::secret_values::redaction_marker())
+        {
+            return Err(denied());
+        }
+        let released = Self::observe_released_wait(
+            conn,
+            site.execution,
+            output.original_task_path(),
+            output.original_wait(),
+            key,
+            record,
+        )
+        .await?;
+        if released.outcome_binding()?.snapshot != output.original_snapshot() {
+            return Err(denied());
+        }
+        context.ensure_fresh_on(conn).await?;
+        Ok(released)
+    }
+
+    async fn observe_released_wait(
+        conn: &mut PgConnection,
+        renderer: Id,
+        task_path: &str,
+        wait: Id,
+        key: &str,
+        record: super::runtime_authority::RuntimeAdmissionRecord,
+    ) -> Result<ReleasedWaitInput> {
         let snapshot: Id =
             sqlx::query_scalar("SELECT snapshot FROM runtime_native_wait_release WHERE wait=$1")
                 .bind(wait)
@@ -2035,7 +2124,9 @@ impl NativeInputSnapshotRepository {
         if body.renderer != renderer
             || (!matches!(
                 &body.source,
-                Source::ResultView(_)
+                Source::EmptyIteration(_)
+                    | Source::ResultView(_)
+                    | Source::WaitCompletion(_)
                     | Source::SuccessMetadata(_)
                     | Source::Completion(_)
                     | Source::IterationOutcome(_)
@@ -2044,9 +2135,19 @@ impl NativeInputSnapshotRepository {
             return Err(denied());
         }
         let record = RuntimeAuthorityRepository::require_retained_admission(conn, renderer).await?;
-        if matches!(
+        if matches!(&body.source, Source::EmptyIteration(_)) {
+            empty_iteration::require_empty_identity(conn, &record, &body)
+                .await
+                .map_err(|error| match error {
+                    Error::PermissionDenied(message) => {
+                        Error::PermissionDenied(format!("Empty iteration identity: {message}"))
+                    }
+                    other => other,
+                })?;
+        } else if matches!(
             &body.source,
             Source::ResultView(_)
+                | Source::WaitCompletion(_)
                 | Source::SuccessMetadata(_)
                 | Source::Completion(_)
                 | Source::IterationOutcome(_)
@@ -2066,6 +2167,25 @@ impl NativeInputSnapshotRepository {
                 body.approval_deadline,
             )?);
         let (origins, parents) = match &body.source {
+            Source::EmptyIteration(source) => {
+                if !value.is_null() {
+                    return Err(denied());
+                }
+                empty_iteration::require_empty_evidence(conn, snapshot, source, allow_pending, key)
+                    .await
+                    .map_err(|error| match error {
+                        Error::PermissionDenied(message) => Error::PermissionDenied(format!(
+                            "Empty iteration original control: {message}"
+                        )),
+                        other => other,
+                    })?;
+                empty_iteration::empty_selection(source, declaration_path, context_path)
+                    .map_err(|error| match error {
+                        Error::PermissionDenied(message) => Error::PermissionDenied(format!("Empty iteration selection at {declaration_path}, {context_path}: {message}")),
+                        other => other,
+                    })?;
+                (Vec::new(), source.parents.clone())
+            }
             Source::SuccessMetadata(source) => {
                 if declaration_path != "$native/value" || context_path != "$native/value" {
                     return Err(denied());
@@ -2079,6 +2199,30 @@ impl NativeInputSnapshotRepository {
                     );
                 }
                 (success_metadata::origins(snapshot), source.parents.clone())
+            }
+            Source::WaitCompletion(source) => {
+                if context_path != "$native/value" || declaration_path != "$native/value" {
+                    return Err(denied());
+                }
+                wait_completion::require_release(conn, snapshot, source).await?;
+                wait_completion::validate_value(conn, source, &value, key).await?;
+                for admission in wait_completion::admissions(source)? {
+                    fence = fence.intersect(
+                        &RuntimeAuthorityRepository::retained_admission_fence(conn, admission)
+                            .await?,
+                    );
+                }
+                fence = fence.intersect(
+                    &RuntimeAuthorityRepository::selected_effect_fence(
+                        conn,
+                        source.original_authority(),
+                    )
+                    .await?,
+                );
+                (
+                    wait_completion::origins(snapshot, source),
+                    source.parents.clone(),
+                )
             }
             Source::IterationOutcome(source) => {
                 iteration_outcome::selection_scope(source, declaration_path, context_path)?;
@@ -2203,6 +2347,51 @@ impl NativeInputSnapshotRepository {
             return Err(denied());
         }
         match &body.source {
+            Source::EmptyIteration(source) => {
+                let record =
+                    RuntimeAuthorityRepository::require_retained_admission(conn, body.renderer)
+                        .await?;
+                empty_iteration::require_empty_identity(conn, &record, &body).await?;
+                empty_iteration::require_empty_evidence(
+                    conn,
+                    metadata.snapshot,
+                    source,
+                    false,
+                    key,
+                )
+                .await?;
+                RuntimeAuthorityRepository::retained_admission_fence(conn, body.renderer)
+                    .await?
+                    .intersect(
+                        &RuntimeAuthorityRepository::selected_effect_fence(conn, &body.authority)
+                            .await?,
+                    )
+                    .intersect(&ApprovalEffectFence::from_input_approval(
+                        body.approval_deadline,
+                    )?)
+                    .ensure_fresh_on(conn)
+                    .await?;
+                if !value.is_null() {
+                    return Err(denied());
+                }
+                Ok(NativeSourceEvidence {
+                    wait_completion: None,
+                    success_metadata: None,
+                    iteration_outcome: None,
+                    completion_sources: Vec::new(),
+                    cache_read_policy: None,
+                    contributors: Vec::new(),
+                    renderer: body.renderer,
+                    policy: body.authority.policy_id,
+                    approvals: body.authority.approval_ids().into_iter().collect(),
+                    admissions: Vec::new(),
+                    fields: Vec::new(),
+                    origins: Vec::new(),
+                    parents: source.parents.iter().map(|(id, _)| *id).collect(),
+                    contract: None,
+                    bytes,
+                })
+            }
             Source::SuccessMetadata(source) => {
                 success_metadata::require_release(conn, metadata.snapshot, source).await?;
                 success_metadata::validate_value(conn, metadata.snapshot, source, &value, key)
@@ -2217,6 +2406,7 @@ impl NativeInputSnapshotRepository {
                         .await?;
                 }
                 Ok(NativeSourceEvidence {
+                    wait_completion: None,
                     success_metadata: Some(NativeSuccessMetadataEvidence::new(
                         metadata.snapshot,
                         source,
@@ -2236,6 +2426,30 @@ impl NativeInputSnapshotRepository {
                     bytes,
                 })
             }
+            Source::WaitCompletion(source) => {
+                wait_completion::require_release(conn, metadata.snapshot, source).await?;
+                wait_completion::validate_value(conn, source, &value, key).await?;
+                Ok(NativeSourceEvidence {
+                    success_metadata: None,
+                    wait_completion: Some(NativeWaitCompletionEvidence::new(
+                        metadata.snapshot,
+                        source,
+                    )),
+                    iteration_outcome: None,
+                    completion_sources: vec![],
+                    cache_read_policy: None,
+                    contributors: vec![],
+                    renderer: body.renderer,
+                    policy: body.authority.policy_id,
+                    approvals: body.authority.approval_ids().into_iter().collect(),
+                    admissions: wait_completion::admissions(source)?,
+                    fields: vec![],
+                    origins: wait_completion::origins(metadata.snapshot, source),
+                    parents: source.parents.iter().map(|(id, _)| *id).collect(),
+                    contract: source.contract.output.clone(),
+                    bytes,
+                })
+            }
             Source::IterationOutcome(source) => {
                 iteration_outcome::require_release(conn, metadata.snapshot, source).await?;
                 if value != iteration_outcome::values(source)? {
@@ -2248,6 +2462,7 @@ impl NativeInputSnapshotRepository {
                         .await?;
                 }
                 Ok(NativeSourceEvidence {
+                    wait_completion: None,
                     success_metadata: None,
                     iteration_outcome: Some(iteration_outcome::evidence(source)),
                     completion_sources: Vec::new(),
@@ -2271,6 +2486,7 @@ impl NativeInputSnapshotRepository {
                 completion::require_release(conn, metadata.snapshot, source).await?;
                 completion::validate_value(conn, metadata.snapshot, source, &value, key).await?;
                 Ok(NativeSourceEvidence {
+                    wait_completion: None,
                     success_metadata: None,
                     iteration_outcome: None,
                     completion_sources: source
@@ -2304,6 +2520,7 @@ impl NativeInputSnapshotRepository {
                     .ensure_fresh_on(conn)
                     .await?;
                 Ok(NativeSourceEvidence {
+                    wait_completion: None,
                     success_metadata: None,
                     iteration_outcome: None,
                     completion_sources: Vec::new(),
@@ -2330,6 +2547,7 @@ impl NativeInputSnapshotRepository {
                 let cache_read_policy =
                     cache_reader_policy(conn, &body, source, fresh_until).await?;
                 Ok(NativeSourceEvidence {
+                    wait_completion: None,
                     success_metadata: None,
                     iteration_outcome: None,
                     completion_sources: Vec::new(),
@@ -2350,6 +2568,7 @@ impl NativeInputSnapshotRepository {
                 validate_wait_release(conn, metadata.snapshot, source).await?;
                 validate_wait_value(conn, metadata.snapshot, source, &value, key).await?;
                 Ok(NativeSourceEvidence {
+                    wait_completion: None,
                     success_metadata: None,
                     iteration_outcome: None,
                     completion_sources: Vec::new(),
@@ -2426,6 +2645,21 @@ impl NativeInputSnapshotRepository {
         let (cache, contributors, contract, receipts, admissions, release, origins) = match &body
             .source
         {
+            Source::EmptyIteration(source) => {
+                if !archived.is_empty() {
+                    return Err(denied());
+                }
+                empty_iteration::require_empty_release(conn, snapshot, source).await?;
+                (
+                    None,
+                    Vec::new(),
+                    None,
+                    source.parents.clone(),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                )
+            }
             Source::SuccessMetadata(source) => {
                 success_metadata::require_release(conn, snapshot, source).await?;
                 success_metadata::validate_normalized(conn, snapshot, source).await?;
@@ -2440,6 +2674,21 @@ impl NativeInputSnapshotRepository {
                     success_metadata::admissions(source, body.renderer),
                     None,
                     success_metadata::origins(snapshot),
+                )
+            }
+            Source::WaitCompletion(source) => {
+                wait_completion::require_release(conn, snapshot, source).await?;
+                if !archived.is_empty() {
+                    return Err(denied());
+                }
+                (
+                    None,
+                    vec![],
+                    source.contract.output.clone(),
+                    source.parents.clone(),
+                    wait_completion::admissions(source)?,
+                    None,
+                    wait_completion::origins(snapshot, source),
                 )
             }
             Source::IterationOutcome(source) => {
@@ -2580,6 +2829,18 @@ impl NativeInputSnapshotRepository {
             }
         };
         Ok(NativeSnapshotStorageEvidence {
+            empty_iteration: match &body.source {
+                Source::EmptyIteration(source) => {
+                    Some(empty_iteration::storage_release(snapshot, source))
+                }
+                _ => None,
+            },
+            wait_completion: match &body.source {
+                Source::WaitCompletion(source) => {
+                    Some(NativeWaitCompletionEvidence::new(snapshot, source))
+                }
+                _ => None,
+            },
             success_metadata: match &body.source {
                 Source::SuccessMetadata(source) => {
                     Some(NativeSuccessMetadataEvidence::new(snapshot, source))
@@ -2640,6 +2901,9 @@ impl NativeInputSnapshotRepository {
     /// whose immutable source proof was already prepared under held fences.
     pub(crate) async fn require_finalized(conn: &mut PgConnection, snapshot: Id) -> Result<()> {
         let (body, _, _, _) = load_encrypted(conn, snapshot).await?;
+        if let Source::WaitCompletion(source) = &body.source {
+            wait_completion::require_release(conn, snapshot, source).await?;
+        }
         if let Source::SuccessMetadata(source) = &body.source {
             success_metadata::require_release(conn, snapshot, source).await?;
         }
@@ -2654,6 +2918,9 @@ impl NativeInputSnapshotRepository {
         }
         if let Source::Cache(source) = &body.source {
             cache_binding(conn, snapshot, source, true).await?;
+        }
+        if let Source::EmptyIteration(source) = &body.source {
+            empty_iteration::require_empty_release(conn, snapshot, source).await?;
         }
         if let Source::Wait(source) = body.source {
             let saved:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_native_wait_release WHERE snapshot=$1 AND wait=$2)").bind(snapshot).bind(source.wait).fetch_one(conn).await?;
@@ -3060,6 +3327,12 @@ fn storage_physical_parents(
     );
     let (target, parents, extra_nodes): (&BoundRuntimeTarget, &[(Id, InputSite)], usize) =
         match &body.source {
+            Source::EmptyIteration(source) => {
+                result.push(NativeStorageParent::WorkflowExecution {
+                    workflow: source.workflow,
+                });
+                (&source.target, &source.parents, 1)
+            }
             Source::SuccessMetadata(source) => {
                 snapshot_storage_step(
                     success_metadata::validate_storage(source),
@@ -3074,6 +3347,24 @@ fn storage_physical_parents(
                     &source.parents,
                     success_metadata::nodes(source),
                 )
+            }
+            Source::WaitCompletion(source) => {
+                wait_completion::validate_storage(source)?;
+                // The whole original WaitSource remains an independent native
+                // node with its own frozen owner, policy, contributors and fields.
+                result.push(NativeStorageParent::NativeSnapshot {
+                    snapshot: source.original_snapshot,
+                });
+                result.push(NativeStorageParent::WorkflowExecution {
+                    workflow: source.workflow,
+                });
+                let evidence = NativeWaitCompletionEvidence::new(snapshot, source);
+                result.extend(storage_physical_parents(
+                    source.original_snapshot,
+                    source.original_body(),
+                    &storage_owner(evidence.original_read_owner())?,
+                )?);
+                (&source.target, &source.parents, source.storage_nodes()?)
             }
             Source::IterationOutcome(source) => {
                 iteration_outcome::validate_storage(source)?;
@@ -3277,7 +3568,11 @@ fn storage_physical_parents(
 // and receipt sites are additionally charged by save/load for their stored copies.
 fn storage_associations(body: &Body) -> Value {
     match &body.source {
+        Source::EmptyIteration(source) => {
+            empty_iteration::empty_associations(body.renderer, source)
+        }
         Source::SuccessMetadata(source) => success_metadata::associations(source, body.renderer),
+        Source::WaitCompletion(source) => wait_completion::associations(source, body.renderer),
         Source::IterationOutcome(source) => iteration_outcome::associations(source, body.renderer),
         Source::Completion(source) => {
             json!({"budget":body.renderer,"admissions":completion::admissions(source),"release":null,"completion_release":[Id::MAX,source.execution,source.completed,source.transaction]})
@@ -3306,6 +3601,7 @@ fn storage_associations(body: &Body) -> Value {
 }
 fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
     match &body.source {
+        Source::EmptyIteration(source) => empty_iteration::empty_metadata(snapshot, source),
         Source::SuccessMetadata(source) => NativeSnapshotMetadata {
             snapshot,
             source_kind: "ordinary_success_metadata".into(),
@@ -3313,6 +3609,17 @@ fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
             read_owner: source.read_owner.clone(),
             generation: None,
             read_version: success_metadata::read_version(source),
+            source_site: Some(("execution_result".into(), source.execution, String::new())),
+            result_mappings: None,
+            result_contract_kind: None,
+        },
+        Source::WaitCompletion(source) => NativeSnapshotMetadata {
+            snapshot,
+            source_kind: "wait_completion_metadata".into(),
+            target: source.target.clone(),
+            read_owner: source.read_owner.clone(),
+            generation: None,
+            read_version: json!({"original_snapshot":source.original_snapshot,"transaction":source.transaction,"workflow":source.workflow,"failed":source.projected.failed_tasks}),
             source_site: Some(("execution_result".into(), source.execution, String::new())),
             result_mappings: None,
             result_contract_kind: None,
@@ -3999,8 +4306,10 @@ async fn load_encrypted(
 ) -> Result<(Body, Value, usize, Option<chrono::DateTime<chrono::Utc>>)> {
     let (body, encrypted, mut bytes) = load_encrypted_one(conn, id).await?;
     let mut fresh_until = match &body.source {
+        Source::EmptyIteration(_) => None,
         Source::Cache(source) => source.frontier.as_ref().and_then(|plan| plan.fresh_until),
         Source::Wait(_)
+        | Source::WaitCompletion(_)
         | Source::SuccessMetadata(_)
         | Source::ResultView(_)
         | Source::Completion(_)
@@ -4090,6 +4399,19 @@ async fn load_encrypted_one(conn: &mut PgConnection, id: Id) -> Result<(Body, Va
         return Err(denied());
     }
     let body: Body = serde_json::from_value(body)?;
+    let has_wait_completion: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM runtime_native_wait_completion_release WHERE snapshot=$1)",
+    )
+    .bind(id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if has_wait_completion && !matches!(&body.source, Source::WaitCompletion(_)) {
+        return Err(denied());
+    }
+    if let Source::WaitCompletion(source) = &body.source {
+        bytes = wait_completion::charged_bytes(bytes, &source.parents)?;
+        wait_completion::validate_normalized(conn, id, &body, source).await?;
+    }
     if let Source::SuccessMetadata(source) = &body.source {
         success_metadata::validate_body(&body, source)?;
         success_metadata::validate_normalized(conn, id, source).await?;
@@ -4121,7 +4443,22 @@ async fn load_encrypted_one(conn: &mut PgConnection, id: Id) -> Result<(Body, Va
     if bytes > MAX_BYTES {
         return Err(denied());
     }
-    if let Source::IterationOutcome(source) = &body.source {
+    if let Source::EmptyIteration(source) = &body.source {
+        empty_iteration::require_empty_normalized(conn, id, source)
+            .await
+            .map_err(|error| match error {
+                Error::PermissionDenied(message) => Error::PermissionDenied(format!(
+                    "Empty iteration normalized archive: {message}"
+                )),
+                other => other,
+            })?;
+        bytes = bytes
+            .checked_add(serde_json::to_vec(&source.parents)?.len())
+            .ok_or_else(denied)?;
+        if bytes > MAX_BYTES {
+            return Err(denied());
+        }
+    } else if let Source::IterationOutcome(source) = &body.source {
         bytes = bytes
             .checked_add(serde_json::to_vec(iteration_outcome::parents(source))?.len() + 2)
             .ok_or_else(denied)?;

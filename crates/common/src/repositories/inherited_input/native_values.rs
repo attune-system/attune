@@ -11,6 +11,9 @@ use super::*;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "recipe", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum NativeValueRecipe {
+    WaitCompletion {
+        snapshot: Id,
+    },
     OrdinarySuccess {
         snapshot: Id,
     },
@@ -26,6 +29,7 @@ pub(super) enum NativeValueRecipe {
 impl NativeValueRecipe {
     pub(super) fn snapshot(&self) -> Id {
         match self {
+            Self::WaitCompletion { snapshot } => *snapshot,
             Self::OrdinarySuccess { snapshot } => *snapshot,
             Self::OrdinaryFailure { snapshot } => *snapshot,
             Self::ResultShorthand { snapshot, .. } => *snapshot,
@@ -101,11 +105,13 @@ impl InheritedInputRepository {
         let mut fence = view.fence.clone();
         let mut firing_control = None;
         let mut wait_reads = Vec::new();
+        let mut empty_reads = Vec::new();
         let mut result_reads = view.prospective_result_reads("$native/value")?;
         for control in controls {
             for receipt in std::iter::once(&control.receipt).chain(&control.controls) {
                 merge_wait_reads(&mut wait_reads, &receipt.wait_reads)?;
                 merge_result_reads(&mut result_reads, &receipt.result_reads)?;
+                merge_empty_reads(&mut empty_reads, &receipt.empty_reads)?;
             }
             for (receipt, site, control_fence) in
                 Self::native_control_dependencies(conn, renderer.id, control).await?
@@ -133,6 +139,7 @@ impl InheritedInputRepository {
         }
         let rendered = RenderedReceiptContext {
             result_reads,
+            empty_reads,
             wait_reads,
             native: Some(NativeValueRecipe::ResultShorthand {
                 snapshot: view.snapshot,
@@ -214,6 +221,7 @@ impl InheritedInputRepository {
         }
         let rendered = RenderedReceiptContext {
             result_reads: Vec::new(),
+            empty_reads: Vec::new(),
             wait_reads: Vec::new(),
             native: Some(NativeValueRecipe::OrdinaryFailure {
                 snapshot: source.snapshot,
@@ -407,6 +415,10 @@ pub(super) async fn validate_recipe(
     }
     if let NativeValueRecipe::OrdinarySuccess { snapshot } = recipe {
         return Snapshots::validate_native_success_recipe(conn, renderer.id, *snapshot, plaintext)
+            .await;
+    }
+    if let NativeValueRecipe::WaitCompletion { snapshot } = recipe {
+        return Snapshots::validate_wait_completion_recipe(conn, renderer.id, *snapshot, plaintext)
             .await;
     }
     Snapshots::validate_native_completion_recipe(

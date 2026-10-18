@@ -2,41 +2,55 @@
 //! publishes once; all list/input preparation happens before outer target locks.
 use super::*;
 use crate::repositories::native_transition_materialization::{
-    NativeTransitionMaterializationRepository as Transitions, PreparedNativeIterationTransitions,
-    PreparedNativeOrdinaryTransitions, RecordedNativeTransitions,
+    NativeTransitionMaterializationRepository as Transitions, PreparedNativeEmptyTransitions,
+    PreparedNativeIterationTransitions, PreparedNativeOrdinaryTransitions,
+    RecordedNativeTransitions,
 };
 
-enum ActivationFrame {
+pub(super) enum ActivationFrame {
+    Empty(Arc<PreparedNativeEmptyTransitions>),
     Ordinary(Arc<PreparedNativeOrdinaryTransitions>),
     Iteration(Arc<PreparedNativeIterationTransitions>),
 }
 impl ActivationFrame {
+    fn held_deadline(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        match self {
+            Self::Empty(frame) => frame.held_deadline(),
+            Self::Ordinary(frame) => frame.held_deadline(),
+            Self::Iteration(frame) => frame.held_deadline(),
+        }
+    }
     fn workflow(&self) -> &WorkflowExecution {
         match self {
+            Self::Empty(frame) => frame.workflow(),
             Self::Ordinary(frame) => frame.workflow(),
             Self::Iteration(frame) => frame.workflow(),
         }
     }
     fn as_frame(&self) -> &dyn NativeTransitionRenderFrame {
         match self {
+            Self::Empty(frame) => frame.as_ref(),
             Self::Ordinary(frame) => frame.as_ref(),
             Self::Iteration(frame) => frame.as_ref(),
         }
     }
     fn render_frame(&self) -> Arc<dyn NativeTransitionRenderFrame> {
         match self {
+            Self::Empty(frame) => frame.clone(),
             Self::Ordinary(frame) => frame.clone(),
             Self::Iteration(frame) => frame.clone(),
         }
     }
     fn target_path(&self, name: &str) -> Result<&str> {
         match self {
+            Self::Empty(frame) => frame.target_path(name),
             Self::Ordinary(frame) => frame.target_path(name),
             Self::Iteration(frame) => frame.target_path(name),
         }
     }
     async fn require_source_current(&self, conn: &mut PgConnection) -> Result<()> {
         match self {
+            Self::Empty(frame) => frame.require_source_current(conn).await,
             Self::Ordinary(frame) => frame.require_source_current(conn).await,
             Self::Iteration(frame) => frame.require_source_current(conn).await,
         }
@@ -48,12 +62,14 @@ impl ActivationFrame {
         key: &str,
     ) -> Result<RecordedNativeTransitions> {
         match self {
+            Self::Empty(frame) => frame.record(conn, actual, key).await,
             Self::Ordinary(frame) => frame.record(conn, actual, key).await,
             Self::Iteration(frame) => frame.record(conn, actual, key).await,
         }
     }
     async fn require_members_current(&self, conn: &mut PgConnection) -> Result<()> {
         match self {
+            Self::Empty(frame) => frame.require_members_current(conn).await,
             Self::Ordinary(frame) => frame.as_ref().ensure_fresh_on(conn).await,
             Self::Iteration(frame) => frame.require_members_current(conn).await,
         }
@@ -338,7 +354,7 @@ impl NativeIterationMaterializationRepository {
     }
 }
 
-async fn prepare_targets(
+pub(super) async fn prepare_targets(
     conn: &mut PgConnection,
     parent: &Execution,
     source: &str,
@@ -360,6 +376,10 @@ async fn prepare_targets(
             Some(source),
             key,
             frame.map(ActivationFrame::render_frame),
+            frame
+                .map(ActivationFrame::held_deadline)
+                .transpose()?
+                .flatten(),
         )
         .await?;
         if let Some(frame) = frame {
@@ -391,12 +411,18 @@ async fn prepare_targets(
                 "Ordinary successor fan-out exceeds its source/materialization bound",
             ));
         }
-        // Empty logical transitions need a genuine aggregate outcome, not a
-        // parent-as-item or synthetic child. Keep that factory separate.
+        // An actual empty Control now issues a distinct constructive recipe.
+        // This boundary settles leaf empties, not an invented member group.
         if target.total() == 0 {
-            return Err(Error::validation(
-                "Empty successor requires the whole-iteration outcome adapter",
-            ));
+            if target.empty_outcome.is_none()
+                || target.context.task.get("next").is_some_and(|next| {
+                    !next.is_null() && !next.as_array().is_some_and(Vec::is_empty)
+                })
+            {
+                return Err(Error::validation(
+                    "Empty successor transition program requires its empty-source frame",
+                ));
+            }
         }
         targets.push(target);
     }
@@ -463,6 +489,9 @@ impl PreparedNativeIterationActivation {
         }
         self.ensure_fresh_on(conn).await?;
         for target in &self.targets {
+            if let Some(empty) = &target.empty_outcome {
+                empty.guard_original(conn).await?;
+            }
             if let Some(control) = &target.iteration_control {
                 control.require_original_workflow(&baseline)?;
             }
@@ -527,6 +556,18 @@ impl PreparedNativeIterationActivation {
             if result.remaining > 0 && !current.contains(&target.context.task_name) {
                 current.push(target.context.task_name.clone());
             }
+            if target.total() == 0 {
+                target
+                    .empty_outcome
+                    .as_ref()
+                    .ok_or_else(changed)?
+                    .require_released(conn)
+                    .await?;
+                if !completed.contains(&target.context.task_name) {
+                    completed.push(target.context.task_name.clone());
+                }
+                current.retain(|name| name != &target.context.task_name);
+            }
             requested.extend(result.requested);
         }
         Workflows::update(
@@ -548,7 +589,7 @@ impl PreparedNativeIterationActivation {
     }
 }
 
-async fn committed_successors(
+pub(super) async fn committed_successors(
     conn: &mut PgConnection,
     parent: Id,
     workflow: Id,

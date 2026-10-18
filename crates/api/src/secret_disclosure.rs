@@ -817,6 +817,8 @@ struct RuntimeOriginBudget {
     trace_file_origins: bool,
     trace_native_origins: bool,
     iam_checked: bool,
+    wait_scopes: BTreeSet<(String, i64, String)>,
+    charged_wait_outputs: BTreeSet<i64>,
     nodes: usize,
     bytes: usize,
     receipt_freshness: attune_common::repositories::immutable_input_origin::ReceiptFreshness,
@@ -880,6 +882,72 @@ struct OriginAuthorization<'a> {
 }
 
 impl OriginAuthorization<'_> {
+    async fn authorize_wait_output(
+        &mut self,
+        guard: &mut crate::receipt_disclosure::HumanReceiptGuard,
+        source: &attune_common::repositories::native_input_disclosure::PreparedWaitCompletionSource,
+    ) -> ApiResult<bool> {
+        if self.user.claims.token_type != attune_common::auth::jwt::TokenType::Access {
+            return Ok(self
+                .runtime_budget
+                .file_denied(HumanFileOriginStage::NativeTokenKind));
+        }
+        for parent in source.parents() {
+            if !self.records.frozen_parent_matches(parent) {
+                return Ok(self
+                    .runtime_budget
+                    .file_denied(HumanFileOriginStage::NativeParent));
+            }
+        }
+        if self
+            .runtime_budget
+            .charged_wait_outputs
+            .insert(source.metadata().snapshot())
+        {
+            self.runtime_budget.nodes = self
+                .runtime_budget
+                .nodes
+                .checked_add(source.retained_nodes())
+                .ok_or_else(|| {
+                    ApiError::Forbidden("Receipt disclosure exceeds its bound".into())
+                })?;
+            self.runtime_budget.bytes = self
+                .runtime_budget
+                .bytes
+                .checked_add(source.retained_bytes())
+                .ok_or_else(|| {
+                    ApiError::Forbidden("Receipt disclosure exceeds its bound".into())
+                })?;
+            if self.runtime_budget.nodes > 256 || self.runtime_budget.bytes > 1024 * 1024 {
+                return Ok(self
+                    .runtime_budget
+                    .file_denied(HumanFileOriginStage::NativeBounds));
+            }
+        }
+        let targets = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve_native_wait_completion_source(
+            guard.connection(), source, self.caller.identity_id).await?;
+        for target in targets {
+            let mut context = target.context().clone();
+            context.identity_attributes = self.caller.identity_attributes.clone();
+            for action in [Action::Read, Action::Decrypt] {
+                if !self
+                    .grants
+                    .iter()
+                    .any(|grant| grant.allows(target.resource(), action, &context))
+                {
+                    return Ok(self.runtime_budget.file_denied(if action == Action::Read {
+                        HumanFileOriginStage::NativeRead
+                    } else {
+                        HumanFileOriginStage::NativeDecrypt
+                    }));
+                }
+            }
+        }
+        source.ensure_fresh()?;
+        guard.frontier().ensure_fresh()?;
+        Ok(true)
+    }
+
     fn allow<'a>(
         &'a mut self,
         source: (&'a str, Option<&'a str>),
@@ -1006,7 +1074,27 @@ impl OriginAuthorization<'_> {
                     if self.runtime_budget.bytes > 1024 * 1024 {
                         return Ok(false);
                     }
-                    if let Some(source) = &source {
+                    let wait_output = if let Some(source) = &source {
+                        let guard = shared.lock().await;
+                        guard.frontier().prepared_wait_completion_receipt_source(
+                            leaves.as_ref().unwrap_or(&classification),
+                            &self.runtime_budget.wait_scopes,
+                            source,
+                        )?
+                    } else {
+                        None
+                    };
+                    let mut added_wait_scope = None;
+                    if let Some(native) = &wait_output {
+                        let mut guard = shared.lock().await;
+                        if !self.authorize_wait_output(&mut guard, native).await? {
+                            return Ok(false);
+                        }
+                        let scope = native.scope_node();
+                        if self.runtime_budget.wait_scopes.insert(scope.clone()) {
+                            added_wait_scope = Some(scope);
+                        }
+                    } else if let Some(source) = &source {
                         let execution_id = source.site().execution;
                         self.records
                             .load_executions(&state.db, &[execution_id])
@@ -1114,6 +1202,9 @@ impl OriginAuthorization<'_> {
                         }
                         guard.frontier().ensure_fresh()?;
                     }
+                    if let Some(scope) = added_wait_scope {
+                        self.runtime_budget.wait_scopes.remove(&scope);
+                    }
                     continue;
                 }
                 match origin {
@@ -1198,6 +1289,63 @@ impl OriginAuthorization<'_> {
                                 path: path.clone(),
                             };
                             let mut guard = shared.lock().await;
+                            if let Some(source) = guard.frontier().prepared_wait_completion_source(
+                                Some(leaves),
+                                &self.runtime_budget.wait_scopes,
+                                &origin,
+                            )? {
+                                let node = (entity_type.clone(), entity_id, path.clone());
+                                if !visited.insert(node.clone()) {
+                                    return Ok(false);
+                                }
+                                if !self.authorize_wait_output(&mut guard, &source).await? {
+                                    return Ok(false);
+                                }
+                                let scope = source.scope_node();
+                                let added_scope =
+                                    self.runtime_budget.wait_scopes.insert(scope.clone());
+                                let rows = source.rows_for(&origin)?;
+                                drop(guard);
+                                for row in rows {
+                                    let site = source.row_site(&row)?;
+                                    let mut records = DisclosureRecords::default();
+                                    records.inherit_frozen_parents(self.records)?;
+                                    records
+                                        .prepare(
+                                            &state.db,
+                                            user,
+                                            grants,
+                                            [(&*row.source_kind, row.source_ref.as_deref())],
+                                        )
+                                        .await?;
+                                    let mut child = OriginAuthorization {
+                                        state,
+                                        user,
+                                        caller,
+                                        grants,
+                                        records: &mut records,
+                                        runtime_budget: &mut *self.runtime_budget,
+                                    };
+                                    if !child
+                                        .allow_classified(
+                                            (&row.source_kind, row.source_ref.as_deref()),
+                                            visited,
+                                            depth + 1,
+                                            site,
+                                            Some(leaves.clone()),
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(false);
+                                    }
+                                }
+                                if added_scope {
+                                    self.runtime_budget.wait_scopes.remove(&scope);
+                                }
+                                visited.remove(&node);
+                                source.ensure_fresh()?;
+                                continue;
+                            }
                             if let Some(source) =
                                 guard.frontier().prepared_cache_source(leaves, &origin)?
                             {

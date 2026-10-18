@@ -25,6 +25,8 @@ mod iteration_outcome;
 pub use iteration_control::PreparedIterationControl;
 mod native_result_view;
 mod native_values;
+mod wait_completion;
+pub use wait_completion::PreparedNativeWaitCompletionDestination;
 mod success_metadata;
 pub use success_metadata::PreparedNativeSuccessDestination;
 mod pending_result;
@@ -138,6 +140,7 @@ struct BoundValue {
     source: SelectionSource,
 }
 pub struct RenderSession {
+    empty_reads: Vec<super::native_input_snapshot::empty_iteration::IssuedEmptyRead>,
     result_reads: Vec<super::native_input_snapshot::IssuedResultRead>,
     wait_reads: Vec<IssuedWaitRead>,
     transaction: String,
@@ -148,6 +151,7 @@ pub struct RenderSession {
     controls: Vec<ReadSelection>,
 }
 pub struct RenderedReceiptContext {
+    empty_reads: Vec<super::native_input_snapshot::empty_iteration::IssuedEmptyRead>,
     result_reads: Vec<super::native_input_snapshot::IssuedResultRead>,
     wait_reads: Vec<IssuedWaitRead>,
     native: Option<NativeValueRecipe>,
@@ -184,6 +188,7 @@ impl RenderedReceiptContext {
     }
 }
 pub struct ReceiptContext {
+    empty_reads: Vec<super::native_input_snapshot::empty_iteration::IssuedEmptyRead>,
     // Issued only by the authenticated graph reader in this exact transaction.
     // Accounting consumes these facts, not another authorization traversal.
     graph_accounting: Option<std::sync::Arc<ReceiptGraphAccounting>>,
@@ -253,6 +258,14 @@ pub struct PreparedStagedValue {
     receipt: ReceiptContext,
 }
 impl PreparedStagedValue {
+    pub(crate) fn held_native_metadata(
+        &self,
+    ) -> &[super::native_input_snapshot::NativeSnapshotMetadata] {
+        self.receipt.native_source_metadata()
+    }
+    pub(crate) fn approval_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.receipt.fence.approval_deadline()
+    }
     pub fn value(&self) -> &Value {
         &self.receipt.value
     }
@@ -305,6 +318,9 @@ impl PreparedIterationItem {
     }
 }
 impl PreparedSystemSnapshot {
+    pub(crate) fn held_effect_fence(&self) -> &ApprovalEffectFence {
+        &self.fence
+    }
     pub fn value(&self) -> &Value {
         &self.value
     }
@@ -354,6 +370,7 @@ impl PreparedWorkflowOutcome {
     }
 }
 pub struct PreparedReceiptDestination {
+    empty_reads: Vec<super::native_input_snapshot::empty_iteration::IssuedEmptyRead>,
     transaction: String,
     result_reads: Vec<super::native_input_snapshot::IssuedResultRead>,
     wait_reads: Vec<IssuedWaitRead>,
@@ -370,6 +387,25 @@ pub struct PreparedReceiptDestination {
     fence: ApprovalEffectFence,
 }
 impl PreparedReceiptDestination {
+    pub(in crate::repositories) async fn ensure_fresh_on(
+        &self,
+        conn: &mut PgConnection,
+    ) -> Result<()> {
+        require_transaction(conn, &self.transaction).await?;
+        self.fence.ensure_fresh_on(conn).await?;
+        for source in &self.source_receipts {
+            source.ensure_fresh_on(conn).await?;
+        }
+        self.ensure_fresh()
+    }
+    pub(in crate::repositories) fn ensure_fresh(&self) -> Result<()> {
+        self.held_deadline()?;
+        self.fence.ensure_fresh()?;
+        for source in &self.source_receipts {
+            source.ensure_fresh()?;
+        }
+        Ok(())
+    }
     /// Complete retained destination closure, not merely its rendered value or
     /// one receipt date. No source/transaction/field authority is reissued.
     pub fn held_deadline(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
@@ -455,6 +491,19 @@ impl InputReceiptParents {
     }
 }
 impl PreparedInputSource {
+    pub(crate) fn held_native_metadata(
+        &self,
+    ) -> Vec<&super::native_input_snapshot::NativeSnapshotMetadata> {
+        self.receipt
+            .native_source_metadata()
+            .iter()
+            .chain(
+                self.controls
+                    .iter()
+                    .flat_map(|control| control.native_source_metadata()),
+            )
+            .collect()
+    }
     /// Check every held decision/source fence without reopening receipt data.
     pub fn ensure_fresh(&self) -> Result<()> {
         self.receipt.ensure_fresh()?;
@@ -475,6 +524,15 @@ impl PreparedInputSource {
         let mut reads = self.receipt.result_reads.clone();
         for control in &self.controls {
             merge_result_reads(&mut reads, &control.result_reads)?;
+        }
+        Ok(reads)
+    }
+    fn issued_empty_reads(
+        &self,
+    ) -> Result<Vec<super::native_input_snapshot::empty_iteration::IssuedEmptyRead>> {
+        let mut reads = self.receipt.empty_reads.clone();
+        for control in &self.controls {
+            merge_empty_reads(&mut reads, &control.empty_reads)?;
         }
         Ok(reads)
     }
@@ -504,6 +562,11 @@ impl PreparedInputSource {
     }
 }
 impl ReceiptContext {
+    /// Read-only observation of the complete fence captured by this receipt.
+    /// It is not a credential or a replacement for transaction freshness checks.
+    pub fn approval_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.fence.approval_deadline()
+    }
     pub(crate) fn issued_wait_reads(&self) -> &[IssuedWaitRead] {
         &self.wait_reads
     }
@@ -578,6 +641,7 @@ impl ReceiptContext {
             graph_accounting: self.graph_accounting.clone(),
             wait_reads: self.wait_reads.clone(),
             result_reads: self.result_reads.clone(),
+            empty_reads: self.empty_reads.clone(),
             source_receipts: self.source_receipts.clone(),
             native_sources: self.native_sources.clone(),
             newly_recorded: false,
@@ -664,6 +728,11 @@ struct LiteralLeaf {
     path: String,
 }
 
+mod empty_iteration;
+mod empty_task_control;
+pub(crate) use empty_task_control::PreparedEmptyTaskControl;
+mod prepared_graph;
+pub(crate) use prepared_graph::PreparedSourceGraphBudget;
 pub struct InheritedInputRepository;
 impl InheritedInputRepository {
     /// Source phase only: retain a successful canonical Condition as CONTROL.
@@ -793,6 +862,7 @@ impl InheritedInputRepository {
         session.fence = session.fence.intersect(&source.fence);
         merge_wait_reads(&mut session.wait_reads, &source.wait_reads)?;
         merge_result_reads(&mut session.result_reads, &source.result_reads)?;
+        merge_empty_reads(&mut session.empty_reads, &source.empty_reads)?;
         insert(
             session,
             path,
@@ -1452,6 +1522,7 @@ impl InheritedInputRepository {
         let fence = permit.effect_fence.clone();
         Ok(RenderSession {
             result_reads: Vec::new(),
+            empty_reads: Vec::new(),
             wait_reads: Vec::new(),
             transaction: transaction(conn).await?,
             permit,
@@ -1553,6 +1624,7 @@ impl InheritedInputRepository {
         };
         let source = RenderedReceiptContext {
             result_reads: rendered.result_reads.clone(),
+            empty_reads: rendered.empty_reads.clone(),
             wait_reads: rendered.wait_reads.clone(),
             native: rendered.native.clone(),
             transaction: rendered.transaction.clone(),
@@ -1593,6 +1665,7 @@ impl InheritedInputRepository {
         session.fence = session.fence.intersect(&item.receipt.fence);
         merge_wait_reads(&mut session.wait_reads, &item.receipt.wait_reads)?;
         merge_result_reads(&mut session.result_reads, &item.receipt.result_reads)?;
+        merge_empty_reads(&mut session.empty_reads, &item.receipt.empty_reads)?;
         let source = SelectionSource::Iteration {
             receipt: item.receipt.id,
             site: item.receipt.site.clone(),
@@ -2089,6 +2162,7 @@ impl InheritedInputRepository {
             receipt: ReceiptContext {
                 graph_accounting: receipt.graph_accounting.clone(),
                 result_reads: receipt.result_reads.clone(),
+                empty_reads: receipt.empty_reads.clone(),
                 wait_reads: receipt.wait_reads.clone(),
                 source_receipts: receipt.source_receipts.clone(),
                 native_sources: receipt.native_sources.clone(),
@@ -2123,6 +2197,7 @@ impl InheritedInputRepository {
         session.fence = session.fence.intersect(&prepared.receipt.fence);
         merge_wait_reads(&mut session.wait_reads, &prepared.issued_wait_reads()?)?;
         merge_result_reads(&mut session.result_reads, &prepared.issued_result_reads()?)?;
+        merge_empty_reads(&mut session.empty_reads, &prepared.issued_empty_reads()?)?;
         for source in &prepared.controls {
             source.fence.ensure_fresh()?;
             session.fence = session.fence.intersect(&source.fence);
@@ -2161,6 +2236,7 @@ impl InheritedInputRepository {
         session.fence = session.fence.intersect(&prepared.receipt.fence);
         merge_wait_reads(&mut session.wait_reads, &prepared.issued_wait_reads()?)?;
         merge_result_reads(&mut session.result_reads, &prepared.issued_result_reads()?)?;
+        merge_empty_reads(&mut session.empty_reads, &prepared.issued_empty_reads()?)?;
         session.controls.push(ReadSelection {
             context_path: "$control".into(),
             source: SelectionSource::Control {
@@ -2314,6 +2390,7 @@ impl InheritedInputRepository {
         session.fence.ensure_fresh_on(conn).await?;
         Ok(RenderedReceiptContext {
             result_reads: session.result_reads,
+            empty_reads: session.empty_reads,
             wait_reads: session.wait_reads,
             native: None,
             transaction: session.transaction,
@@ -2379,6 +2456,7 @@ impl InheritedInputRepository {
         fence.ensure_fresh_on(conn).await?;
         Ok(RenderedReceiptContext {
             result_reads: Vec::new(),
+            empty_reads: Vec::new(),
             wait_reads: Vec::new(),
             native: None,
             transaction: transaction(conn).await?,
@@ -2413,6 +2491,7 @@ impl InheritedInputRepository {
         fence.ensure_fresh_on(conn).await?;
         Ok(RenderedReceiptContext {
             result_reads: Vec::new(),
+            empty_reads: Vec::new(),
             wait_reads: Vec::new(),
             native: None,
             transaction: transaction(conn).await?,
@@ -2440,6 +2519,7 @@ impl InheritedInputRepository {
         for receipt in std::iter::once(&source.receipt).chain(&source.controls) {
             merge_wait_reads(&mut rendered.wait_reads, &receipt.wait_reads)?;
             merge_result_reads(&mut rendered.result_reads, &receipt.result_reads)?;
+            merge_empty_reads(&mut rendered.empty_reads, &receipt.empty_reads)?;
             receipt.fence.ensure_fresh()?;
             rendered.fence = rendered.fence.intersect(&receipt.fence);
             let selected = ReadSelection {
@@ -2452,6 +2532,35 @@ impl InheritedInputRepository {
             if !rendered.selections.contains(&selected) {
                 rendered.selections.push(selected);
             }
+        }
+        if rendered.selections.len() > 256 {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    /// Retain an actual owning completion as CONTROL, including unconditional
+    /// handoffs. This issues no authored Condition or result VALUE.
+    pub(in crate::repositories) fn attach_workflow_outcome_control(
+        rendered: &mut RenderedReceiptContext,
+        outcome: &PreparedWorkflowOutcome,
+    ) -> Result<()> {
+        if outcome.renderer != rendered.renderer.id || outcome.transaction != rendered.transaction {
+            return Err(denied());
+        }
+        outcome.ensure_fresh()?;
+        rendered.fence = rendered.fence.intersect(&outcome.fence);
+        let selection = ReadSelection {
+            context_path: "$control".into(),
+            source: SelectionSource::NativeOutcome {
+                admission: outcome.source.id,
+                execution: outcome.source.owner_id,
+                status: outcome.status.clone(),
+                timed_out: outcome.timed_out,
+            },
+        };
+        if !rendered.selections.contains(&selection) {
+            rendered.selections.push(selection);
         }
         if rendered.selections.len() > 256 {
             return Err(denied());
@@ -2475,6 +2584,7 @@ impl InheritedInputRepository {
         for receipt in std::iter::once(&source.receipt).chain(&source.controls) {
             merge_wait_reads(&mut destination.wait_reads, &receipt.wait_reads)?;
             merge_result_reads(&mut destination.result_reads, &receipt.result_reads)?;
+            merge_empty_reads(&mut destination.empty_reads, &receipt.empty_reads)?;
             destination.fence = destination.fence.intersect(&receipt.fence);
             collect_source_receipts(receipt, &mut destination.source_receipts)?;
             for origin in &receipt.origins {
@@ -2543,6 +2653,22 @@ impl InheritedInputRepository {
         destination: &InputSite,
         encryption_key: &str,
     ) -> Result<PreparedReceiptDestination> {
+        Ok(
+            Self::prepare_destination_with_graph_facts(conn, rendered, destination, encryption_key)
+                .await?
+                .0,
+        )
+    }
+
+    async fn prepare_destination_with_graph_facts(
+        conn: &mut PgConnection,
+        rendered: &RenderedReceiptContext,
+        destination: &InputSite,
+        encryption_key: &str,
+    ) -> Result<(
+        PreparedReceiptDestination,
+        Vec<Option<std::sync::Arc<ReceiptGraphAccounting>>>,
+    )> {
         require_transaction(conn, &rendered.transaction).await?;
         if let Some(recipe) = &rendered.native {
             if rendered.declaration.is_some() || rendered.literal.is_some() {
@@ -2583,6 +2709,7 @@ impl InheritedInputRepository {
         let mut native_sources = Vec::new();
         let mut snapshot_parents = BTreeSet::new();
         let mut source_receipts = Vec::new();
+        let mut graph_accounting = Vec::new();
         let mut admissions = RetainedReceiptAdmissions::default();
         for selected in &rendered.selections {
             let group = matches!(
@@ -2611,7 +2738,16 @@ impl InheritedInputRepository {
                     {
                         "$native/value".into()
                     } else {
-                        return Err(denied());
+                        let literal = rendered.literal.as_ref().ok_or_else(denied)?;
+                        if selected.context_path != "$control"
+                            || literal_value(conn, &rendered.renderer, literal).await?
+                                != rendered.value
+                        {
+                            return Err(denied());
+                        }
+                        super::native_input_snapshot::NativeInputSnapshotRepository::require_empty_literal_control_snapshot(
+                            conn, *snapshot, rendered.renderer.id, &literal.path).await?;
+                        literal.path.clone()
                     };
                     let evidence = if let Some(read) = rendered
                         .wait_reads
@@ -2663,6 +2799,11 @@ impl InheritedInputRepository {
                         return Err(denied());
                     }
                     fence = fence.intersect(&evidence.fence);
+                    graph_accounting.push(Some(std::sync::Arc::new(ReceiptGraphAccounting {
+                        bytes: evidence.bytes,
+                        nodes: BTreeSet::from([(true, *snapshot)]),
+                        key_hash: crate::crypto::hash_encryption_key(encryption_key),
+                    })));
                     for (parent, site) in &evidence.parents {
                         let origin = SecretOrigin::Entity {
                             entity_type: site.kind.origin_kind(site.purpose),
@@ -2676,10 +2817,12 @@ impl InheritedInputRepository {
                             encryption_key,
                             &rendered.wait_reads,
                             &rendered.result_reads,
+                            &rendered.empty_reads,
                             &mut admissions,
                         )
                         .await?;
                         collect_source_receipts(&context, &mut source_receipts)?;
+                        graph_accounting.push(context.graph_accounting.clone());
                         fence = fence.intersect(&context.fence);
                         snapshot_parents.insert(*parent);
                         for origin in context.origins {
@@ -2772,10 +2915,12 @@ impl InheritedInputRepository {
                         encryption_key,
                         &rendered.wait_reads,
                         &rendered.result_reads,
+                        &rendered.empty_reads,
                         &mut admissions,
                     )
                     .await?;
                     collect_source_receipts(&source, &mut source_receipts)?;
+                    graph_accounting.push(source.graph_accounting.clone());
                     fence = fence.intersect(&source.fence);
                     for site in source.public_sources {
                         if !public_sources.contains(&site) {
@@ -2828,40 +2973,53 @@ impl InheritedInputRepository {
             return Err(denied());
         }
         fence.ensure_fresh_on(conn).await?;
-        Ok(PreparedReceiptDestination {
-            transaction: rendered.transaction.clone(),
-            result_reads: rendered
-                .result_reads
-                .iter()
-                .filter(|read| {
-                    native_sources
-                        .iter()
-                        .any(|source| source.snapshot() == read.snapshot())
-                })
-                .cloned()
-                .collect(),
-            wait_reads: rendered
-                .issued_wait_reads()
-                .iter()
-                .filter(|read| {
-                    native_sources
-                        .iter()
-                        .any(|source| source.snapshot() == read.snapshot())
-                })
-                .cloned()
-                .collect(),
-            source_receipts,
-            snapshot_parents: snapshot_parents.into_iter().collect(),
-            native_sources,
-            renderer: rendered.renderer.id,
-            render_digest: render_digest(rendered)?,
-            site: destination.clone(),
-            admission: destination_admission.id,
-            origins,
-            public_sources,
-            outcomes,
-            fence,
-        })
+        Ok((
+            PreparedReceiptDestination {
+                empty_reads: rendered
+                    .empty_reads
+                    .iter()
+                    .filter(|read| {
+                        native_sources
+                            .iter()
+                            .any(|source| source.snapshot() == read.snapshot())
+                    })
+                    .cloned()
+                    .collect(),
+                transaction: rendered.transaction.clone(),
+                result_reads: rendered
+                    .result_reads
+                    .iter()
+                    .filter(|read| {
+                        native_sources
+                            .iter()
+                            .any(|source| source.snapshot() == read.snapshot())
+                    })
+                    .cloned()
+                    .collect(),
+                wait_reads: rendered
+                    .issued_wait_reads()
+                    .iter()
+                    .filter(|read| {
+                        native_sources
+                            .iter()
+                            .any(|source| source.snapshot() == read.snapshot())
+                    })
+                    .cloned()
+                    .collect(),
+                source_receipts,
+                snapshot_parents: snapshot_parents.into_iter().collect(),
+                native_sources,
+                renderer: rendered.renderer.id,
+                render_digest: render_digest(rendered)?,
+                site: destination.clone(),
+                admission: destination_admission.id,
+                origins,
+                public_sources,
+                outcomes,
+                fence,
+            },
+            graph_accounting,
+        ))
     }
 
     pub async fn record_prepared(
@@ -2906,6 +3064,22 @@ impl InheritedInputRepository {
             require_published_sources(conn, &prepared.source_receipts).await?;
         }
         for native in &prepared.native_sources {
+            if staging {
+                if let Some(read) = prepared
+                    .empty_reads
+                    .iter()
+                    .find(|read| read.snapshot() == native.snapshot())
+                {
+                    read.require_stage(
+                        conn,
+                        native.snapshot(),
+                        rendered.renderer.id,
+                        encryption_key,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
             if staging {
                 if let Some(read) = prepared
                     .wait_reads
@@ -3009,6 +3183,7 @@ impl InheritedInputRepository {
         let fence = rendered.fence.intersect(&prepared.fence);
         fence.ensure_fresh_on(conn).await?;
         Ok(ReceiptContext {
+            empty_reads: prepared.empty_reads.clone(),
             graph_accounting: None,
             result_reads: prepared.result_reads.clone(),
             wait_reads: prepared.wait_reads.clone(),
@@ -3111,6 +3286,7 @@ impl InheritedInputRepository {
             encryption_key,
             wait_reads,
             &[],
+            &[],
             &mut RetainedReceiptAdmissions::default(),
         )
         .await
@@ -3122,6 +3298,7 @@ impl InheritedInputRepository {
         encryption_key: &str,
         wait_reads: &[IssuedWaitRead],
         result_reads: &[super::native_input_snapshot::IssuedResultRead],
+        empty_reads: &[super::native_input_snapshot::empty_iteration::IssuedEmptyRead],
         admissions: &mut RetainedReceiptAdmissions,
     ) -> Result<ReceiptContext> {
         Self::counted_preparation_receipt_context(
@@ -3131,6 +3308,7 @@ impl InheritedInputRepository {
             encryption_key,
             wait_reads,
             result_reads,
+            empty_reads,
             admissions,
         )
         .await
@@ -3146,6 +3324,7 @@ impl InheritedInputRepository {
         encryption_key: &str,
         wait_reads: &[IssuedWaitRead],
         result_reads: &[super::native_input_snapshot::IssuedResultRead],
+        empty_reads: &[super::native_input_snapshot::empty_iteration::IssuedEmptyRead],
         admissions: &mut RetainedReceiptAdmissions,
     ) -> Result<(ReceiptContext, usize, BTreeSet<(bool, Id)>)> {
         check_site(site)?;
@@ -3372,6 +3551,20 @@ impl InheritedInputRepository {
                 match selected.source {
                     SelectionSource::NativeSnapshot { snapshot }
                     | SelectionSource::NativeIterationOutcome { snapshot } => {
+                        let empty_literal = if !group
+                            && declaration.is_none()
+                            && proof.native.is_none()
+                        {
+                            let literal = proof.literal.as_ref().ok_or_else(denied)?;
+                            if selected.context_path != "$control" {
+                                return Err(denied());
+                            }
+                            super::native_input_snapshot::NativeInputSnapshotRepository::require_empty_literal_control_snapshot(
+                                conn, snapshot, renderer, &literal.path).await?;
+                            Some(literal.path.as_str())
+                        } else {
+                            None
+                        };
                         let declaration_path = declaration
                             .as_ref()
                             .map(|declaration| declaration.source_path.as_str())
@@ -3389,6 +3582,7 @@ impl InheritedInputRepository {
                                     .filter(|native| native.snapshot() == snapshot)
                                     .map(|_| "$native/value")
                             })
+                            .or(empty_literal)
                             .ok_or_else(denied)?;
                         let evidence = if let Some(read) =
                             wait_reads.iter().find(|read| read.snapshot() == snapshot)
@@ -3404,6 +3598,18 @@ impl InheritedInputRepository {
                             .await?
                         } else if let Some(read) =
                             result_reads.iter().find(|read| read.snapshot() == snapshot)
+                        {
+                            read.evidence(
+                                conn,
+                                snapshot,
+                                renderer,
+                                declaration_path,
+                                &selected.context_path,
+                                encryption_key,
+                            )
+                            .await?
+                        } else if let Some(read) =
+                            empty_reads.iter().find(|read| read.snapshot() == snapshot)
                         {
                             read.evidence(
                                 conn,
@@ -3756,6 +3962,11 @@ impl InheritedInputRepository {
             .collect();
         Ok((
             ReceiptContext {
+                empty_reads: empty_reads
+                    .iter()
+                    .filter(|read| snapshot_seen.contains(&read.snapshot()))
+                    .cloned()
+                    .collect(),
                 graph_accounting: Some(std::sync::Arc::new(ReceiptGraphAccounting {
                     bytes,
                     nodes: graph_nodes.clone(),
@@ -3865,6 +4076,28 @@ fn merge_wait_reads(target: &mut Vec<IssuedWaitRead>, sources: &[IssuedWaitRead]
         }
     }
     if target.len() > 256 {
+        return Err(denied());
+    }
+    Ok(())
+}
+
+fn merge_empty_reads(
+    destination: &mut Vec<super::native_input_snapshot::empty_iteration::IssuedEmptyRead>,
+    sources: &[super::native_input_snapshot::empty_iteration::IssuedEmptyRead],
+) -> Result<()> {
+    for source in sources {
+        if let Some(existing) = destination
+            .iter()
+            .find(|read| read.snapshot() == source.snapshot())
+        {
+            if !existing.same_source(source) {
+                return Err(denied());
+            }
+        } else {
+            destination.push(source.clone());
+        }
+    }
+    if destination.len() > 256 {
         return Err(denied());
     }
     Ok(())

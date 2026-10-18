@@ -95,6 +95,7 @@ enum OriginDenialStage {
     SourceExecutionTarget,
     NativeWaitReader,
     NativeSuccessReader,
+    NativeWaitCompletionReader,
     NativeCacheReader,
     ReadArtifactTarget,
     ReadVersionUnavailable,
@@ -253,6 +254,7 @@ pub(crate) async fn authorize_origins_bounded(
     let mut pending = Vec::new();
     let mut receipt_parents = std::collections::BTreeMap::new();
     let mut success_archives = BTreeSet::new();
+    let mut wait_completion_archives = BTreeSet::new();
     for row in rows {
         let provenance: SecretProvenance =
             serde_json::from_str(row.source_ref.as_deref().ok_or_else(denied)?)
@@ -407,7 +409,26 @@ pub(crate) async fn authorize_origins_bounded(
                     // the authenticated ORIGINAL execution, even if this leaf's
                     // closure contains only Keys and no execution wrapper.
                     let execution = source.site().execution;
-                    if let Some(success) = receipt_frontier.prepared_success_receipt_source(
+                    if let Some(wait_completion) = receipt_frontier
+                        .prepared_wait_completion_receipt_source(
+                            leaves.as_ref().ok_or_else(denied)?,
+                            &source_ancestry,
+                            source,
+                        )?
+                    {
+                        authorize_wait_completion_source(
+                            conn,
+                            authority,
+                            &wait_completion,
+                            retained.as_ref(),
+                            captured_parents,
+                            &mut wait_completion_archives,
+                            nodes,
+                            bytes,
+                        )
+                        .await?;
+                        source_ancestry.insert(wait_completion.scope_node());
+                    } else if let Some(success) = receipt_frontier.prepared_success_receipt_source(
                         leaves.as_ref().ok_or_else(denied)?,
                         &source_ancestry,
                         source,
@@ -532,6 +553,48 @@ pub(crate) async fn authorize_origins_bounded(
                         entity_id,
                         path: path.clone(),
                     };
+                    if let Some(wait_completion) = receipt_frontier
+                        .prepared_wait_completion_source(
+                            leaves.as_ref(),
+                            &ancestry,
+                            &normalized_origin,
+                        )?
+                    {
+                        authorize_wait_completion_source(
+                            conn,
+                            authority,
+                            &wait_completion,
+                            retained.as_ref(),
+                            captured_parents,
+                            &mut wait_completion_archives,
+                            nodes,
+                            bytes,
+                        )
+                        .await?;
+                        ancestry.insert(wait_completion.scope_node());
+                        for row in wait_completion.rows_for(&normalized_origin)? {
+                            let provenance: SecretProvenance =
+                                serde_json::from_str(row.source_ref.as_deref().ok_or_else(denied)?)
+                                    .map_err(|_| denied())?;
+                            if provenance.origins.is_empty() {
+                                continue;
+                            }
+                            let site = wait_completion.row_site(&row)?;
+                            pending.push((
+                                row.source_kind,
+                                row.source_ref,
+                                depth + 1,
+                                ancestry.clone(),
+                                retained.clone(),
+                                site,
+                                leaves.clone(),
+                            ));
+                        }
+                        if pending.len() + *nodes > MAX_ORIGIN_NODES {
+                            return Err(denied_at(OriginDenialStage::Bounds));
+                        }
+                        continue;
+                    }
                     if let Some(success) = receipt_frontier.prepared_success_source(
                         leaves.as_ref(),
                         &ancestry,
@@ -1057,6 +1120,67 @@ async fn authorize_success_source(
             .any(|action| !authority.allows_target(&target, action))
         {
             return Err(denied_at(OriginDenialStage::NativeSuccessReader));
+        }
+    }
+    for parent in source.parents() {
+        let key = (
+            parent.entity_type.clone(),
+            parent.entity_id,
+            parent.path.clone(),
+        );
+        if let Some(retained) = retained {
+            if retained.get(&key) != Some(&parent.provenance) {
+                return Err(denied_at(OriginDenialStage::FrozenParentConflict));
+            }
+        } else if let Some(saved) = parents.get(&key) {
+            if saved != &parent.provenance {
+                return Err(denied_at(OriginDenialStage::FrozenParentConflict));
+            }
+        } else {
+            if parents.len() >= MAX_ORIGIN_NODES {
+                return Err(denied_at(OriginDenialStage::Bounds));
+            }
+            parents.insert(key, parent.provenance.clone());
+        }
+    }
+    authority.ensure_fresh_on(conn).await?;
+    source.ensure_fresh()?;
+    Ok(())
+}
+
+async fn authorize_wait_completion_source(
+    conn: &mut PgConnection,
+    authority: &ValidatedRuntimeAuthority,
+    source: &attune_common::repositories::native_input_disclosure::PreparedWaitCompletionSource,
+    retained: Option<&std::collections::BTreeMap<(String, i64, String), SecretProvenance>>,
+    parents: &mut std::collections::BTreeMap<(String, i64, String), SecretProvenance>,
+    charged: &mut BTreeSet<i64>,
+    nodes: &mut usize,
+    bytes: &mut usize,
+) -> ApiResult<()> {
+    if charged.insert(source.metadata().snapshot()) {
+        *nodes = nodes
+            .checked_add(source.retained_nodes())
+            .ok_or_else(denied)?;
+        *bytes = bytes
+            .checked_add(source.retained_bytes())
+            .ok_or_else(denied)?;
+        if *nodes > MAX_ORIGIN_NODES || *bytes > MAX_ORIGIN_BYTES {
+            return Err(denied_at(OriginDenialStage::Bounds));
+        }
+    }
+    for target in RuntimeTargetRepository::resolve_native_wait_completion_source(
+        conn,
+        source,
+        authority.credential_binding().sponsor_identity_id,
+    )
+    .await?
+    {
+        if [Action::Read, Action::Decrypt]
+            .into_iter()
+            .any(|action| !authority.allows_target(&target, action))
+        {
+            return Err(denied_at(OriginDenialStage::NativeWaitCompletionReader));
         }
     }
     for parent in source.parents() {

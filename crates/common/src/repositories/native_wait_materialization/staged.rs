@@ -16,17 +16,41 @@ pub(super) struct Program {
 }
 
 impl Program {
+    pub(super) fn issued_values(&self) -> impl Iterator<Item = &PreparedStagedValue> {
+        self.publications
+            .iter()
+            .flat_map(|publication| publication.fields.iter())
+            .map(|(_, value)| value)
+    }
+    pub(super) fn held_native_metadata(
+        &self,
+    ) -> Vec<&super::super::native_input_snapshot::NativeSnapshotMetadata> {
+        self.controls
+            .iter()
+            .flat_map(|control| control.held_native_metadata())
+            .chain(
+                self.issued_values()
+                    .flat_map(|stage| stage.held_native_metadata()),
+            )
+            .collect()
+    }
+    pub(super) fn held_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.controls
+            .iter()
+            .filter_map(|control| control.approval_deadline())
+            .chain(
+                self.issued_values()
+                    .filter_map(|stage| stage.approval_deadline()),
+            )
+            .min()
+    }
     pub(super) async fn prepare(
         conn: &mut PgConnection,
         context: &Context,
         observation: &Observation,
         key: &str,
     ) -> Result<Self> {
-        let next = context
-            .task
-            .get("next")
-            .and_then(Value::as_array)
-            .ok_or_else(denied)?;
+        let next = super::program_shape::transitions(&context.task)?;
         let mut program = Self {
             controls: vec![],
             publications: vec![],
@@ -100,11 +124,7 @@ impl Program {
                     fields,
                 });
             }
-            for name in transition
-                .get("do")
-                .and_then(Value::as_array)
-                .ok_or_else(denied)?
-            {
+            for name in super::program_shape::successors(transition)? {
                 let name = name.as_str().ok_or_else(denied)?;
                 if !program.successors.iter().any(|saved| saved == name) {
                     program.successors.push(name.into());

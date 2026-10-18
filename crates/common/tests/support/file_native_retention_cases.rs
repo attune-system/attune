@@ -61,10 +61,10 @@ mod iteration_outcome_cases;
 #[path = "file_success_metadata_custody_cases.rs"]
 mod success_metadata_custody_cases;
 
-struct Held {
-    version: Id,
-    object: StoredObject,
-    staging: String,
+pub(super) struct Held {
+    pub(super) version: Id,
+    pub(super) object: StoredObject,
+    pub(super) staging: String,
 }
 
 async fn native_file_producer_fixture() -> (TestDatabase, Fixture) {
@@ -192,7 +192,7 @@ struct FileProducer<'a> {
 }
 
 async fn hold_for_producer(
-    db: &TestDatabase,
+    db: &sqlx::PgPool,
     producer: &FileProducer<'_>,
     receipt: &ReceiptContext,
     directory: &std::path::Path,
@@ -374,11 +374,9 @@ async fn hold_for_producer(
         )
         .await
         .unwrap();
-    Evidence::finish_put(db.pool(), put, Some(&object))
-        .await
-        .unwrap();
+    Evidence::finish_put(db, put, Some(&object)).await.unwrap();
     ArtifactVersionRepository::mark_body_ready(
-        db.pool(),
+        db,
         version.id,
         object.provider_version.as_stored(),
         object.size as i64,
@@ -1260,4 +1258,31 @@ async fn native_storage_custody_case(prospective: bool) {
         prospective_cases::assert_released(&db, iteration).await;
     }
     db.cleanup().await.unwrap();
+}
+
+/// Storage custody only. The caller supplies a genuine root receipt and an
+/// independently admitted, running writer; this never grants reader authority.
+pub(super) async fn hold_wait_output(
+    pool: &sqlx::PgPool,
+    credential: &RuntimeCredentialBinding,
+    human_id: Id,
+    pack_ref: &str,
+    key: &str,
+    receipt: &ReceiptContext,
+    directory: &std::path::Path,
+    store: &FilesystemBlobStore,
+) -> Held {
+    hold_for_producer(
+        pool,
+        &FileProducer {
+            credential,
+            human_id,
+            pack_ref,
+            key,
+        },
+        receipt,
+        directory,
+        store,
+    )
+    .await
 }

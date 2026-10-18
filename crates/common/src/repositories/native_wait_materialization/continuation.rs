@@ -29,6 +29,8 @@ pub(super) struct Recovery {
 }
 
 pub struct PreparedNativeWaitContinuation {
+    completion: Option<std::sync::Arc<PreparedNativeWaitCompletion>>,
+    output: Option<super::super::inherited_input::PreparedNativeWaitCompletionDestination>,
     context: Context,
     original: WorkflowTaskWait,
     original_secrets: Vec<StoredSecretValue>,
@@ -120,6 +122,7 @@ impl NativeWaitContinuationRepository {
             .await?
             .ok_or_else(denied)?;
         let context = Context {
+            predecessor: None,
             parent,
             workflow,
             task,
@@ -247,6 +250,8 @@ impl NativeWaitContinuationRepository {
             }
         }
         let mut plan = PreparedNativeWaitContinuation {
+            completion: None,
+            output: None,
             context,
             original: wait.clone(),
             original_secrets,
@@ -291,7 +296,8 @@ impl NativeWaitContinuationRepository {
             .as_ref()
             .ok_or_else(denied)?
             .definition;
-        if needs_staged(&plan.context.task)?
+        if super::program_shape::may_finish_without_recovery(&plan.context.task)?
+            || needs_staged(&plan.context.task)?
             || has_cache_successor(&plan.context.task, graph)?
             || recovery_reads_publications(&plan.context.task, graph)?
         {
@@ -305,11 +311,9 @@ impl NativeWaitContinuationRepository {
                 .await
                 .map_err(|error| wait_cache_stage(error, "staged-program"))?,
             );
-            if program.successors.is_empty() {
-                return Err(denied());
-            }
             let frame = std::sync::Arc::new(
                 super::cache_frame::Frame::new(
+                    conn,
                     &plan.context,
                     &plan.original,
                     plan.observation.as_ref().ok_or_else(denied)?,
@@ -317,8 +321,25 @@ impl NativeWaitContinuationRepository {
                     plan.released.clone(),
                     key,
                 )
+                .await
                 .map_err(|error| wait_cache_stage(error, "cache-frame"))?,
             );
+            if program.successors.is_empty() {
+                let source = std::sync::Arc::new(
+                    PreparedNativeWaitCompletion::prepare(
+                        conn,
+                        &plan.context,
+                        plan.observation.as_ref().ok_or_else(denied)?,
+                        program.clone(),
+                        frame.clone(),
+                        key,
+                    )
+                    .await?,
+                );
+                plan.output =
+                    Some(Inputs::prepare_native_wait_completion(conn, source.clone(), key).await?);
+                plan.completion = Some(source);
+            }
             for name in &program.successors {
                 let task = unique_task(graph, name)?;
                 if task
@@ -349,7 +370,7 @@ impl NativeWaitContinuationRepository {
                 return Err(denied());
             }
             plan.staged = Some(program);
-            if !plan.caches.is_empty() {
+            if !plan.caches.is_empty() || plan.completion.is_some() {
                 plan.cache_frame = Some(frame);
             }
             plan.ensure_prepared_on(conn).await?;
@@ -684,6 +705,9 @@ impl PreparedNativeWaitContinuation {
         {
             return Err(denied());
         }
+        if let Some(output) = &self.output {
+            super::completion_writer::require_original_targets(conn, &self.context, output).await?;
+        }
         for cache in &self.replay_caches {
             cache.ensure_fresh_on(conn).await?;
         }
@@ -696,6 +720,24 @@ impl PreparedNativeWaitContinuation {
             return Err(denied());
         }
         self.released.set(released).map_err(|_| denied())?;
+        if let Some(source) = &self.completion {
+            let (receipt, completed) = super::completion_writer::finish(
+                conn,
+                &self.context,
+                &self.original_secrets,
+                source,
+                self.staged.as_ref().ok_or_else(denied)?,
+                self.cache_frame.as_ref().ok_or_else(denied)?,
+                self.output.as_ref().ok_or_else(denied)?,
+                key,
+            )
+            .await?;
+            self.receipts.push(receipt);
+            self.completions.push(completed);
+            self.applied = true;
+            self.ensure_fresh_on(conn).await?;
+            return Ok(vec![]);
+        }
         if !self.replay.is_empty() || !self.replay_caches.is_empty() {
             let mut pending = Vec::new();
             for child in &self.replay {
@@ -864,6 +906,9 @@ impl PreparedNativeWaitContinuation {
         Ok(pending)
     }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
+        if let Some(output) = &self.output {
+            output.ensure_fresh_on(conn).await?;
+        }
         if !self.applied {
             return Err(denied());
         }
@@ -904,6 +949,9 @@ impl PreparedNativeWaitContinuation {
         Ok(())
     }
     pub fn ensure_fresh(&self) -> Result<()> {
+        if let Some(output) = &self.output {
+            output.ensure_fresh()?;
+        }
         if !self.applied {
             return Err(denied());
         }
@@ -936,6 +984,9 @@ impl PreparedNativeWaitContinuation {
 
 impl PreparedNativeWaitContinuation {
     async fn ensure_prepared_on(&self, conn: &mut PgConnection) -> Result<()> {
+        if let Some(output) = &self.output {
+            output.ensure_fresh_on(conn).await?;
+        }
         let binding = match self.observation.as_ref().ok_or_else(denied)? {
             Observation::Pending(wait) => wait.outcome_binding()?,
             Observation::Released(wait) => wait.outcome_binding()?,
@@ -990,11 +1041,7 @@ async fn collect_controls(
     controls: &mut BTreeMap<usize, super::super::inherited_input::PreparedInputSource>,
     key: &str,
 ) -> Result<()> {
-    let next = context
-        .task
-        .get("next")
-        .and_then(Value::as_array)
-        .ok_or_else(denied)?;
+    let next = super::program_shape::transitions(&context.task)?;
     for receipt in receipts {
         for index in 0..next.len() {
             let path = format!("{}/next/{index}/when", context.path);
@@ -1408,37 +1455,18 @@ pub(super) fn supported_program(task: &Value, graph: &Value) -> Result<bool> {
     if !ordinary(task) {
         return Ok(false);
     }
-    let Some(next) = task
-        .get("next")
-        .and_then(Value::as_array)
-        .filter(|next| !next.is_empty() && next.len() <= 128)
-    else {
-        return Ok(false);
-    };
-    let mut covered = std::collections::BTreeSet::new();
+    let next = super::program_shape::transitions(task)?;
     let mut recovery_tasks = std::collections::BTreeSet::new();
     let mut publication_leaves = 0usize;
     for transition in next {
         let Some(expression) = transition.get("when").and_then(Value::as_str) else {
             return Ok(false);
         };
-        let expression = expression
-            .trim()
-            .strip_prefix("{{")
-            .and_then(|value| value.strip_suffix("}}"))
-            .unwrap_or(expression)
-            .trim();
-        let Some(successors) = transition
-            .get("do")
-            .and_then(Value::as_array)
-            .filter(|tasks| !tasks.is_empty())
-        else {
-            return Ok(false);
-        };
+        let _ = expression;
+        let successors = super::program_shape::successors(transition)?;
         if successors.len() > 128 {
             return Ok(false);
         }
-        covered.insert(expression);
         for (_, _, value) in super::staged::publications(transition)? {
             let mut leaves = Vec::new();
             collect_leaves(value, String::new(), &mut leaves, 0)?;
@@ -1523,9 +1551,7 @@ pub(super) fn supported_program(task: &Value, graph: &Value) -> Result<bool> {
             }
         }
     }
-    Ok(["failed()", "timed_out()", "cancelled()"]
-        .iter()
-        .all(|function| covered.contains(function)))
+    Ok(true)
 }
 fn calls_outcome(expression: &str) -> Result<bool> {
     Ok(
@@ -1538,10 +1564,7 @@ fn calls_outcome(expression: &str) -> Result<bool> {
 }
 
 fn needs_staged(task: &Value) -> Result<bool> {
-    let next = task
-        .get("next")
-        .and_then(Value::as_array)
-        .ok_or_else(denied)?;
+    let next = super::program_shape::transitions(task)?;
     let mut written = std::collections::BTreeSet::new();
     for transition in next {
         for (_, name, _) in super::staged::publications(transition)? {
@@ -1584,16 +1607,8 @@ fn needs_staged(task: &Value) -> Result<bool> {
 }
 
 fn has_cache_successor(task: &Value, graph: &Value) -> Result<bool> {
-    for transition in task
-        .get("next")
-        .and_then(Value::as_array)
-        .ok_or_else(denied)?
-    {
-        for name in transition
-            .get("do")
-            .and_then(Value::as_array)
-            .ok_or_else(denied)?
-        {
+    for transition in super::program_shape::transitions(task)? {
+        for name in super::program_shape::successors(transition)? {
             if unique_task(graph, name.as_str().ok_or_else(denied)?)?
                 .get("iterate_cache")
                 .is_some_and(|value| !value.is_null())
@@ -1606,10 +1621,7 @@ fn has_cache_successor(task: &Value, graph: &Value) -> Result<bool> {
 }
 
 fn recovery_reads_publications(task: &Value, graph: &Value) -> Result<bool> {
-    let next = task
-        .get("next")
-        .and_then(Value::as_array)
-        .ok_or_else(denied)?;
+    let next = super::program_shape::transitions(task)?;
     let mut written = std::collections::BTreeSet::new();
     for transition in next {
         for (_, name, _) in super::staged::publications(transition)? {
@@ -1617,11 +1629,7 @@ fn recovery_reads_publications(task: &Value, graph: &Value) -> Result<bool> {
         }
     }
     for transition in next {
-        for name in transition
-            .get("do")
-            .and_then(Value::as_array)
-            .ok_or_else(denied)?
-        {
+        for name in super::program_shape::successors(transition)? {
             let successor = unique_task(graph, name.as_str().ok_or_else(denied)?)?;
             let mut leaves = vec![];
             collect_leaves(

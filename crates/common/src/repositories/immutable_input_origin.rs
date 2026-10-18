@@ -393,6 +393,29 @@ pub fn freeze_receipt_context(
 }
 
 impl InputReceiptFrontier {
+    pub fn prepared_wait_completion_source(
+        &self,
+        leaves: Option<&ReceiptDisclosureLeaves>,
+        ancestry: &BTreeSet<Node>,
+        origin: &SecretOrigin,
+    ) -> Result<Option<Arc<super::native_input_disclosure::PreparedWaitCompletionSource>>> {
+        let direct = if let Some(leaves) = leaves {
+            self.native_waits.wait_completion(&leaves.native, origin)?
+        } else {
+            None
+        };
+        let scoped = self
+            .native_waits
+            .wait_completion_in_scope(ancestry, origin)?;
+        if direct
+            .as_ref()
+            .zip(scoped.as_ref())
+            .is_some_and(|(a, b)| a.metadata() != b.metadata())
+        {
+            return Err(denied());
+        }
+        Ok(direct.or(scoped))
+    }
     pub fn prepared_success_source(
         &self,
         leaves: Option<&ReceiptDisclosureLeaves>,
@@ -413,6 +436,15 @@ impl InputReceiptFrontier {
             return Err(denied());
         }
         Ok(direct.or(scoped))
+    }
+    pub fn prepared_wait_completion_receipt_source(
+        &self,
+        leaves: &ReceiptDisclosureLeaves,
+        ancestry: &BTreeSet<Node>,
+        descriptor: &super::inherited_input::ReceiptSourceDescriptor,
+    ) -> Result<Option<Arc<super::native_input_disclosure::PreparedWaitCompletionSource>>> {
+        self.native_waits
+            .wait_completion_receipt(&leaves.native, ancestry, descriptor)
     }
     pub fn prepared_success_receipt_source(
         &self,
@@ -539,6 +571,15 @@ impl InputReceiptFrontier {
                             .as_ref()
                             .ok_or_else(denied)?
                             .source_receipt(&origin)?;
+                        if let Some(wait_completion) = self
+                            .prepared_wait_completion_receipt_source(
+                                leaves.as_ref().ok_or_else(denied)?,
+                                &receipt_ancestry,
+                                source,
+                            )?
+                        {
+                            receipt_ancestry.insert(wait_completion.scope_node());
+                        }
                         if let Some(success) = self.prepared_success_receipt_source(
                             leaves.as_ref().ok_or_else(denied)?,
                             &receipt_ancestry,
@@ -569,6 +610,7 @@ impl InputReceiptFrontier {
                                 | "queue_item_result"
                                 | "cache"
                                 | "ordinary_success_metadata"
+                                | "wait_completion_metadata"
                         )
                     }) {
                         let (native_nodes, native_bytes) = self
@@ -622,6 +664,32 @@ impl InputReceiptFrontier {
                     entity_id,
                     path: path.clone(),
                 };
+                if let Some(wait_completion) = self.prepared_wait_completion_source(
+                    leaves.as_ref(),
+                    &ancestry,
+                    &normalized_origin,
+                )? {
+                    ancestry.insert(wait_completion.scope_node());
+                    for row in wait_completion.rows_for(&normalized_origin)? {
+                        let provenance: SecretProvenance =
+                            serde_json::from_str(row.source_ref.as_deref().ok_or_else(denied)?)?;
+                        if provenance.origins.is_empty() {
+                            continue;
+                        }
+                        pending.push((
+                            provenance,
+                            wait_completion.row_site(&row)?,
+                            parents.clone(),
+                            depth + 1,
+                            ancestry.clone(),
+                            leaves.clone(),
+                        ));
+                    }
+                    if pending.len() + nodes > 256 {
+                        return Err(denied());
+                    }
+                    continue;
+                }
                 if let Some(success) =
                     self.prepared_success_source(leaves.as_ref(), &ancestry, &normalized_origin)?
                 {

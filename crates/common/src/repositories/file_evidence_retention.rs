@@ -385,6 +385,8 @@ struct Closure {
     pending_iteration_origins: Vec<SecretOrigin>,
     success_metadata_origins: Vec<SecretOrigin>,
     pending_success_metadata_origins: Vec<SecretOrigin>,
+    wait_completion_origins: Vec<SecretOrigin>,
+    pending_wait_completion_origins: Vec<SecretOrigin>,
     native_physical: BTreeSet<Node>,
     archived_sites: Vec<SecretOrigin>,
     pending_sites: Vec<(SecretOrigin, usize)>,
@@ -536,6 +538,26 @@ impl Closure {
                 path,
             } = origin
             {
+                if entity_type == "wait_completion_metadata" {
+                    if *entity_id <= 0 || !path.is_empty() {
+                        return Err(denied());
+                    }
+                    if !self.wait_completion_origins.contains(origin)
+                        && !self.pending_wait_completion_origins.contains(origin)
+                    {
+                        self.rows(1)?;
+                        self.pending_wait_completion_origins.push(origin.clone());
+                        self.push("runtime_native_input_snapshot", *entity_id, depth + 1)?;
+                    }
+                    continue;
+                }
+            }
+            if let SecretOrigin::Entity {
+                entity_type,
+                entity_id,
+                path,
+            } = origin
+            {
                 if entity_type == "ordinary_success_metadata" {
                     if *entity_id <= 0 || !path.is_empty() {
                         return Err(denied());
@@ -656,6 +678,35 @@ impl Closure {
         {
             return Err(denied());
         }
+        self.archived_source_fields(kind, execution, fields, depth)
+    }
+
+    fn archived_wait_fields(
+        &mut self,
+        wait: &super::native_input_snapshot::NativeWaitCompletionEvidence,
+        depth: usize,
+    ) -> Result<()> {
+        let (kind, id, path) = wait.original_source_site();
+        if id <= 0
+            || !path.is_empty()
+            || !["execution_result", "inquiry_response", "queue_item_result"].contains(&kind)
+            || wait.original_metadata().source_site() != Some((kind, id, path))
+        {
+            return Err(denied());
+        }
+        self.archived_source_fields(kind, id, &wait.original_fields(), depth)
+    }
+
+    // Only callers above choose entity kinds. The Wait caller requires A's
+    // authenticated typed evidence; inquiry/queue fields never become execution
+    // VALUE sites or inherit the root workflow's delivery authority.
+    fn archived_source_fields(
+        &mut self,
+        kind: &str,
+        execution: i64,
+        fields: &[crate::secret_values::StoredSecretValue],
+        depth: usize,
+    ) -> Result<()> {
         self.rows(fields.len())?;
         for field in fields {
             let site = SecretOrigin::Entity {
@@ -1140,6 +1191,10 @@ impl FileEvidenceRetentionRepository {
                 .pending_success_metadata_origins
                 .iter()
                 .any(|origin| !closure.success_metadata_origins.contains(origin))
+            || closure
+                .pending_wait_completion_origins
+                .iter()
+                .any(|origin| !closure.wait_completion_origins.contains(origin))
         {
             return Err(denied());
         }
@@ -1221,12 +1276,35 @@ impl FileEvidenceRetentionRepository {
             let evidence = NativeInputSnapshotRepository::storage_evidence(conn, snapshot).await?;
             let bytes = evidence.retained_bytes();
             c.native_bytes.insert(snapshot, bytes);
+            let archive_dependencies = evidence
+                .wait_completion()
+                .map(|wait| BTreeSet::from([wait.original_snapshot()]));
+            if let Some(dependencies) = &archive_dependencies {
+                let actual = evidence
+                    .physical_parents()
+                    .iter()
+                    .filter_map(|parent| match parent {
+                        super::native_input_snapshot::NativeStorageParent::NativeSnapshot {
+                            snapshot,
+                        } => Some(*snapshot),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                if &actual != dependencies
+                    || dependencies.iter().any(|id| *id <= 0 || *id >= snapshot)
+                {
+                    return Err(denied());
+                }
+            }
             let mut predecessor = None;
             for parent in evidence.physical_parents() {
                 if let super::native_input_snapshot::NativeStorageParent::NativeSnapshot {
                     snapshot: parent,
                 } = parent
                 {
+                    if archive_dependencies.is_some() {
+                        continue;
+                    }
                     if *parent <= 0 || *parent >= snapshot || predecessor.replace(*parent).is_some()
                     {
                         return Err(denied());
@@ -1246,6 +1324,125 @@ impl FileEvidenceRetentionRepository {
                 };
                 if !c.archived_sites.contains(&site) {
                     c.archived_sites.push(site);
+                }
+            }
+            if let Some(wait) = evidence.wait_completion() {
+                let own = SecretOrigin::Entity {
+                    entity_type: "wait_completion_metadata".into(),
+                    entity_id: snapshot,
+                    path: String::new(),
+                };
+                if wait.snapshot() != snapshot || !evidence.origins().contains(&own) {
+                    return Err(denied());
+                }
+                if !c.wait_completion_origins.contains(&own) {
+                    c.wait_completion_origins.push(own);
+                }
+                c.rows(
+                    1 + wait.contributor_manifests().len()
+                        + wait.original_receipt_edges().len()
+                        + wait.receipt_edges().len()
+                        + wait.controls().len()
+                        + wait.issued_values().len(),
+                )?;
+                // Original wait Body remains a separate archive/byte charge,
+                // never a predecessor-frontier subtraction or child ResultView.
+                c.push(
+                    "runtime_native_input_snapshot",
+                    wait.original_snapshot(),
+                    depth + 1,
+                )?;
+                c.push(
+                    "runtime_authority_admission",
+                    wait.original_renderer_admission(),
+                    depth + 1,
+                )?;
+                c.push(
+                    "runtime_authority_admission",
+                    wait.original_source_admission(),
+                    depth + 1,
+                )?;
+                c.push(
+                    "runtime_authority_admission",
+                    wait.original_registration().renderer_admission(),
+                    depth + 1,
+                )?;
+                c.proof(&serde_json::to_value(wait.original_authority())?, depth + 1)?;
+                c.proof(
+                    &serde_json::to_value(wait.original_output_contract())?,
+                    depth + 1,
+                )?;
+                if let Some(contract) = wait.original_source_contract() {
+                    c.proof(contract, depth + 1)?;
+                }
+                let (kind, id, path) = wait.original_source_site();
+                let site = SecretOrigin::Entity {
+                    entity_type: kind.into(),
+                    entity_id: id,
+                    path: path.into(),
+                };
+                if !c.archived_sites.contains(&site) {
+                    c.archived_sites.push(site);
+                }
+                c.archived_wait_fields(wait, depth)?;
+                for (kind, present) in [
+                    ("execution_config", wait.original_parent().config.is_some()),
+                    ("execution_result", wait.original_parent().result.is_some()),
+                ] {
+                    if present {
+                        let site = SecretOrigin::Entity {
+                            entity_type: kind.into(),
+                            entity_id: wait.execution(),
+                            path: String::new(),
+                        };
+                        if !c.archived_sites.contains(&site) {
+                            c.archived_sites.push(site);
+                        }
+                    }
+                }
+                c.archived_fields(
+                    "execution_config",
+                    wait.execution(),
+                    &wait.original_config_fields(),
+                    depth,
+                )?;
+                c.archived_fields(
+                    "execution_result",
+                    wait.execution(),
+                    &wait.original_result_fields(),
+                    depth,
+                )?;
+                c.archived_fields(
+                    "workflow_variables",
+                    wait.original_workflow().execution,
+                    &wait.original_variable_fields(),
+                    depth,
+                )?;
+                let site = SecretOrigin::Entity {
+                    entity_type: "workflow_variables".into(),
+                    entity_id: wait.original_workflow().execution,
+                    path: String::new(),
+                };
+                if !c.archived_sites.contains(&site) {
+                    c.archived_sites.push(site);
+                }
+                c.origins(
+                    &SecretProvenance {
+                        origins: wait.original_origins().to_vec(),
+                        templates: vec![],
+                    },
+                    depth + 1,
+                )?;
+                // Controls and ordered VALUEs keep their genuine receipt sites
+                // and purposes. No Condition -> VALUE conversion or grant union.
+                for (receipt, _) in wait
+                    .original_receipt_edges()
+                    .iter()
+                    .chain(wait.receipt_edges())
+                    .chain(wait.controls())
+                    .chain(wait.issued_values())
+                {
+                    c.push("runtime_input_receipt", *receipt, depth + 1)?;
                 }
             }
             if let Some(success) = evidence.success_metadata() {
@@ -1476,7 +1673,8 @@ impl FileEvidenceRetentionRepository {
                 let parent_depth = if matches!(
                     parent,
                     super::native_input_snapshot::NativeStorageParent::NativeSnapshot { .. }
-                ) {
+                ) && archive_dependencies.is_none()
+                {
                     // Native chain depth has A's independent 128-row bound, while
                     // nested receipt/source edges keep F's existing depth bound.
                     depth
@@ -1487,6 +1685,7 @@ impl FileEvidenceRetentionRepository {
             }
             c.rows(
                 evidence.receipt_edges().len()
+                    + usize::from(evidence.empty_iteration_release().is_some())
                     + evidence.admission_edges().len()
                     + evidence.archive_fields().len()
                     + evidence.contributor_manifests().len()
@@ -1988,6 +2187,57 @@ mod success_custody_dispatch_tests {
             let provenance = SecretProvenance {
                 origins: vec![SecretOrigin::Entity {
                     entity_type: "ordinary_success_metadata".into(),
+                    entity_id: id,
+                    path: path.into(),
+                }],
+                templates: vec![],
+            };
+            assert!(Closure::default().origins(&provenance, 0).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod wait_completion_custody_tests {
+    use super::*;
+    #[test]
+    fn wait_completion_origin_is_distinct_and_original_archive_bytes_are_independent() {
+        let origin = SecretOrigin::Entity {
+            entity_type: "wait_completion_metadata".into(),
+            entity_id: 59,
+            path: String::new(),
+        };
+        let provenance = SecretProvenance {
+            origins: vec![origin.clone()],
+            templates: vec![],
+        };
+        let mut closure = Closure::default();
+        closure.origins(&provenance, 0).unwrap();
+        assert_eq!(
+            closure.pop().unwrap().unwrap().0,
+            Node::new("runtime_native_input_snapshot", 59)
+        );
+        assert_eq!(
+            closure.pending_wait_completion_origins,
+            vec![origin.clone()]
+        );
+        assert!(closure.wait_completion_origins.is_empty());
+        assert!(closure.success_metadata_origins.is_empty());
+        assert!(closure.iteration_archive_origins.is_empty());
+        closure.wait_completion_origins.push(origin);
+        closure.origins(&provenance, 0).unwrap();
+        assert!(closure.pop().unwrap().is_none());
+        closure.native_bytes.insert(41, 120);
+        closure.native_bytes.insert(59, 180);
+        closure.native_predecessors.insert(41, None);
+        closure.native_predecessors.insert(59, None);
+        assert_eq!(closure.charge_native(59).unwrap(), 180);
+        assert_eq!(closure.charge_native(41).unwrap(), 120);
+        assert_eq!(closure.charge_native(41).unwrap(), 0);
+        for (id, path) in [(0, ""), (59, "/fake-child")] {
+            let provenance = SecretProvenance {
+                origins: vec![SecretOrigin::Entity {
+                    entity_type: "wait_completion_metadata".into(),
                     entity_id: id,
                     path: path.into(),
                 }],

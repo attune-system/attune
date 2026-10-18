@@ -94,18 +94,57 @@ impl ExecutionScheduler {
                 }
             }
         }
+        if let Some(mut recovery) =
+            Iteration::recover_empty_activation(&mut tx, &actual, task, key).await?
+        {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(recovery.workflow())
+                .execute(&mut *tx)
+                .await?;
+            let requested = recovery.apply(&mut tx, key).await?;
+            recovery.ensure_fresh_on(&mut tx).await?;
+            tx.commit().await?;
+            recovery.ensure_fresh()?;
+            for child in requested {
+                recovery.ensure_fresh()?;
+                Self::publish_native_iteration_child(pool, publisher, actual.id, child, key)
+                    .await?;
+                recovery.ensure_fresh()?;
+            }
+            recovery.ensure_fresh()?;
+            return Ok(true);
+        }
         let mut prepared = Iteration::prepare(&mut tx, &actual, task, triggered_by, key).await?;
+        if prepared.needs_empty_activation() {
+            let mut activation =
+                Iteration::prepare_empty_activation(&mut tx, prepared, key).await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(activation.workflow())
+                .execute(&mut *tx)
+                .await?;
+            let requested = activation.apply(&mut tx, key).await?;
+            activation.ensure_fresh_on(&mut tx).await?;
+            tx.commit().await?;
+            activation.ensure_fresh()?;
+            for child in requested {
+                activation.ensure_fresh()?;
+                Self::publish_native_iteration_child(pool, publisher, actual.id, child, key)
+                    .await?;
+                activation.ensure_fresh()?;
+            }
+            activation.ensure_fresh()?;
+            return Ok(true);
+        }
         let whole = if completed.is_some() {
             Iteration::prepare_completion(&mut tx, actual.id, task, key).await?
         } else {
             None
         };
-        // Autonomous empty tasks with no declared/generated output can settle
-        // real state using their retained list Control. Rich empty result()
-        // projections require a native value constructor, never a fake child.
+        // The constructive empty recipe authorizes lifecycle progress. Root
+        // generated result Values still belong to the A/H finalizer.
         if prepared.total() == 0 && !prepared.can_complete_empty() {
             return Err(anyhow::anyhow!(
-                "Empty ordinary iteration successors/outputs require a retained native outcome adapter"
+                "Empty ordinary iteration root output requires the typed root finalizer"
             ));
         }
         sqlx::query("SELECT pg_advisory_xact_lock($1)")

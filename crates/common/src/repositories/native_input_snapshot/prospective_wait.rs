@@ -59,6 +59,26 @@ pub struct RegisteredInitialWait {
 }
 
 impl PreparedWaitRegistration {
+    pub(in crate::repositories) fn bind_predecessor_projection(
+        &mut self,
+        predecessor: &super::super::native_transition_materialization::PreparedNativeWaitPredecessor,
+    ) -> Result<()> {
+        if serde_json::to_value(&self.workflow)? != serde_json::to_value(predecessor.original())?
+            || serde_json::to_value(&self.parent)? != serde_json::to_value(predecessor.parent())?
+            || self.recipe.task_name != predecessor.target()
+        {
+            return Err(denied());
+        }
+        predecessor.ensure_fresh()?;
+        self.workflow = predecessor.projected().clone();
+        Ok(())
+    }
+    pub(crate) fn held_effect_fence(&self) -> &ApprovalEffectFence {
+        &self.fence
+    }
+    pub(crate) fn reserved_wait(&self) -> Id {
+        self.reserved
+    }
     pub(crate) fn prepared_input(&self) -> Option<&PreparedWaitInput> {
         self.observation.as_ref()
     }
@@ -287,6 +307,17 @@ impl PreparedWaitRegistration {
 }
 
 impl RegisteredInitialWait {
+    pub(crate) fn held_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.fence
+            .approval_deadline()
+            .into_iter()
+            .chain(
+                self.released
+                    .as_ref()
+                    .and_then(|released| released.binding().6.approval_deadline()),
+            )
+            .min()
+    }
     pub fn wait(&self) -> &WorkflowTaskWait {
         &self.wait
     }

@@ -109,6 +109,70 @@ impl NativeIterationMaterializationRepository {
 }
 
 impl PreparedNativeIterationCompletion {
+    /// Read-only export of every independently held source deadline. This date
+    /// is not a credential or replacement for transaction/member/freshness checks.
+    pub fn held_deadline(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let source = &self.source;
+        // This factory issues retained nonempty completions, not new/pending
+        // materialization plans. Fail closed if that contract is extended without
+        // extending the deadline fold for the newly held capability types too.
+        if self.ordinal_count() == 0
+            || source.original_children.len() != self.ordinal_count()
+            || source.observed_outcomes.len() != self.ordinal_count()
+            || !source.children.is_empty()
+            || source.array.is_some()
+            || source.iteration_control.is_some()
+            || source.context.frame.is_some()
+            || source.empty_control.is_some()
+            || source.empty_outcome.is_some()
+        {
+            return Err(changed());
+        }
+        let expected_inputs: BTreeSet<_> = source
+            .original_children
+            .iter()
+            .map(|child| child.id)
+            .chain(source.observations.iter().map(|member| member.execution))
+            .collect();
+        let held_inputs: BTreeSet<_> = source
+            .observed_inputs
+            .iter()
+            .map(|input| input.source.id)
+            .collect();
+        if expected_inputs != held_inputs || source.observed_inputs.len() != expected_inputs.len() {
+            return Err(changed());
+        }
+        let mut deadlines = vec![
+            Ok(source.parent_fence.approval_deadline()),
+            source.context.sources.held_deadline(),
+        ];
+        if let Some(outcome) = &source.context.outcome {
+            deadlines.push(Ok(outcome.approval_deadline()));
+        }
+        deadlines.extend(
+            source
+                .controls
+                .iter()
+                .chain(&source.receipts)
+                .map(|receipt| Ok(receipt.approval_deadline())),
+        );
+        // Includes canonical acceptance/admission fences for ORIGINAL and latest
+        // retry inputs, not merely the outcome for a delivered or selected item.
+        deadlines.extend(
+            source
+                .recovery_fences
+                .iter()
+                .map(|fence| Ok(fence.approval_deadline())),
+        );
+        deadlines.extend(
+            source
+                .observed_outcomes
+                .iter()
+                .chain(&source.original_outcomes)
+                .map(|outcome| Ok(outcome.approval_deadline())),
+        );
+        complete_held_deadline(deadlines)
+    }
     pub fn original_parent(&self) -> &Execution {
         &self.source.context.parent
     }
@@ -202,5 +266,46 @@ impl PreparedNativeIterationCompletion {
             return Err(changed());
         }
         self.ensure_fresh_on(conn).await
+    }
+}
+
+fn complete_held_deadline(
+    deadlines: impl IntoIterator<Item = Result<Option<chrono::DateTime<chrono::Utc>>>>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    deadlines.into_iter().try_fold(None, |earliest, next| {
+        Ok(earliest.into_iter().chain(next?).min())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn held_deadline_includes_independent_false_control_and_acceptance_fences() {
+        let late = chrono::DateTime::from_timestamp(4_000_000_000, 0).unwrap();
+        let early = chrono::DateTime::from_timestamp(3_900_000_000, 0).unwrap();
+        let parent = ApprovalEffectFence::from_input_approval(None).unwrap();
+        let acceptance = ApprovalEffectFence::from_input_approval(Some(late)).unwrap();
+        // No Boolean/child Value is constructed or consulted by the fold. A
+        // retained false decision's independent fence is just as binding.
+        let false_control = ApprovalEffectFence::from_input_approval(Some(early)).unwrap();
+        assert_eq!(
+            complete_held_deadline([
+                Ok(parent.approval_deadline()),
+                Ok(acceptance.approval_deadline()),
+                Ok(false_control.approval_deadline())
+            ])
+            .unwrap(),
+            Some(early)
+        );
+    }
+
+    #[test]
+    fn held_deadline_none_requires_all_components_known_unbounded() {
+        assert_eq!(complete_held_deadline([Ok(None), Ok(None)]).unwrap(), None);
+        assert!(complete_held_deadline([Ok(None), Err(changed())]).is_err());
+        let known = chrono::DateTime::from_timestamp(4_000_000_000, 0).unwrap();
+        assert!(complete_held_deadline([Ok(Some(known)), Err(changed())]).is_err());
     }
 }

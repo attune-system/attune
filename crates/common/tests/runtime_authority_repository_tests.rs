@@ -6752,6 +6752,26 @@ async fn native_wait_snapshot_fixture(
         definition["tasks"][5]["params"] = json!({"token":"{{ item.value.token }}"});
         native_wait_materialization::seed_cache(&db, owner.pack_id, &owner.pack_ref, empty).await;
     }
+    if matches!(
+        &caller_case,
+        Some(native_wait_materialization::Case::Initial(
+            _,
+            native_wait_materialization::InitialCase::Successor(_)
+        ))
+    ) {
+        definition["tasks"][4]["next"] = if matches!(
+            &caller_case,
+            Some(native_wait_materialization::Case::Initial(
+                _,
+                native_wait_materialization::InitialCase::Successor(3)
+            ))
+        ) {
+            json!([{"do":["observed_execution"]}])
+        } else {
+            json!([{"when":"{{ timed_out() }}", "do":["observed_execution"]}])
+        };
+        definition["tasks"][0]["next"] = json!([]);
+    }
     let graph = WorkflowDefinitionRepository::create(
         &db,
         CreateWorkflowDefinitionInput {
@@ -7002,7 +7022,18 @@ async fn native_wait_snapshot_fixture(
         InvocationPolicy::from_executable(
             leaf_binding.clone(),
             &snapshots[&leaf.r#ref],
-            Some(&[]),
+            Some(&if matches!(
+                &caller_case,
+                Some(native_wait_materialization::Case::Initial(
+                    _,
+                    native_wait_materialization::InitialCase::TerminalOutput
+                        | native_wait_materialization::InitialCase::Successor(0 | 3)
+                ))
+            ) {
+                vec!["standard".into()]
+            } else {
+                vec![]
+            }),
             &sets,
         )
         .unwrap(),
@@ -7956,6 +7987,84 @@ async fn native_wait_snapshot_fixture(
 }
 
 #[tokio::test]
+async fn native_wait_successor_timeout_uses_real_predecessor_and_settles_root() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            0,
+            native_wait_materialization::InitialCase::Successor(0),
+        )),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_wait_successor_rejects_changed_original_workflow() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            0,
+            native_wait_materialization::InitialCase::Successor(1),
+        )),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_wait_successor_rejects_foreign_source_transaction() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            0,
+            native_wait_materialization::InitialCase::Successor(2),
+        )),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_wait_successor_unconditional_retains_real_outcome_control() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            0,
+            native_wait_materialization::InitialCase::Successor(3),
+        )),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_wait_successor_expiry_after_actual_target_wait_rolls_back_handoff() {
+    native_wait_snapshot_fixture(
+        true,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            0,
+            native_wait_materialization::InitialCase::Successor(4),
+        )),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_wait_successor_does_not_resurrect_completed_target_or_rerender() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            0,
+            native_wait_materialization::InitialCase::Successor(5),
+        )),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn human_deletion_preserves_recorded_approval_and_requester_attribution() {
     let (db, fixture) = fixture().await;
     assert!(IdentityRepository::delete(&db, fixture.human_id)
@@ -8283,4 +8392,41 @@ async fn database_guards_keep_grants_immutable_and_revocation_irreversible() {
     assert!(error.to_string().contains("immutable"));
     tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_wait_no_recovery_execution_timeout_records_typed_output() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            0,
+            native_wait_materialization::InitialCase::TerminalOutput,
+        )),
+    )
+    .await;
+}
+#[tokio::test]
+async fn native_wait_no_recovery_inquiry_cancel_records_typed_output() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            1,
+            native_wait_materialization::InitialCase::TerminalOutput,
+        )),
+    )
+    .await;
+}
+#[tokio::test]
+async fn native_wait_no_recovery_queue_failure_records_typed_output() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::Initial(
+            2,
+            native_wait_materialization::InitialCase::TerminalOutput,
+        )),
+    )
+    .await;
 }

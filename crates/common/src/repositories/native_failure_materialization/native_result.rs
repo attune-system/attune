@@ -29,6 +29,11 @@ pub(in crate::repositories) enum ResultOutputDestination {
     Native(PreparedNativeValueDestination),
 }
 impl PreparedNativeResult {
+    pub(in crate::repositories) fn approval_deadline(
+        &self,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.view.fence.approval_deadline()
+    }
     pub fn required(parent: &Execution, task: &str) -> Result<bool> {
         let graph = &parent
             .executable_snapshot
@@ -232,6 +237,11 @@ impl PreparedNativeResult {
     }
 }
 impl PreparedResultShorthand {
+    pub(in crate::repositories) fn approval_deadline(
+        &self,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.stage.receipt().approval_deadline()
+    }
     pub fn value(&self) -> &Value {
         self.stage.receipt().accepted_value()
     }

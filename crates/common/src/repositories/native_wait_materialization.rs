@@ -39,9 +39,17 @@ use std::{collections::BTreeMap, sync::OnceLock};
 
 mod cache_frame;
 mod cache_replay;
+mod completion;
 mod continuation;
 mod initial;
+mod program_shape;
 mod recovery;
+pub use completion::{PreparedNativeWaitCompletion, WaitCompletionOutcome};
+mod completion_replay;
+mod completion_writer;
+pub use completion_replay::{
+    NativeWaitCompletionReplayRepository, PreparedNativeWaitCompletionReplay,
+};
 mod staged;
 pub use continuation::{NativeWaitContinuationRepository, PreparedNativeWaitContinuation};
 pub use initial::{
@@ -70,6 +78,9 @@ impl Observation {
     }
 }
 struct Context {
+    predecessor: Option<
+        std::sync::Arc<super::native_transition_materialization::PreparedNativeWaitPredecessor>,
+    >,
     parent: Execution,
     workflow: WorkflowExecution,
     task: Value,
@@ -132,7 +143,11 @@ impl Context {
             if purpose != InputSitePurpose::Value || contains_template(authored) {
                 return Err(denied());
             }
-            return Inputs::literal(conn, self.parent.id, &self.revision, &path).await;
+            let mut rendered = Inputs::literal(conn, self.parent.id, &self.revision, &path).await?;
+            if let Some(predecessor) = &self.predecessor {
+                predecessor.attach_rendered_control(&mut rendered)?;
+            }
+            return Ok(rendered);
         };
         let mut session = Inputs::begin_render(
             conn,
@@ -144,6 +159,8 @@ impl Context {
         )
         .await?;
         let names = expression_names(&binding.expression)?;
+        // The predecessor seals the handoff, not this task's expression view.
+        // In particular its outcome must never replace the Wait observation.
         for field in &self.sources.fields {
             for slot in &field.paths {
                 let namespace = slot
@@ -182,11 +199,15 @@ impl Context {
         {
             Inputs::attach_prepared_control(&mut session, source)?;
         }
-        if purpose == InputSitePurpose::Condition {
-            Inputs::evaluate_condition_with_keys(conn, session, key).await
+        let mut rendered = if purpose == InputSitePurpose::Condition {
+            Inputs::evaluate_condition_with_keys(conn, session, key).await?
         } else {
-            Inputs::evaluate_with_keys(conn, session, key).await
+            Inputs::evaluate_with_keys(conn, session, key).await?
+        };
+        if let Some(predecessor) = &self.predecessor {
+            predecessor.attach_rendered_control(&mut rendered)?;
         }
+        Ok(rendered)
     }
 }
 
@@ -321,6 +342,7 @@ impl NativeWaitMaterializationRepository {
             .map(|decl| (decl.source_path.clone(), decl))
             .collect();
         let context = Context {
+            predecessor: None,
             parent,
             workflow,
             task,

@@ -1,3 +1,7 @@
+#[path = "native_wait_materialization/output_release_cases.rs"]
+mod output_release_cases;
+#[path = "native_wait_materialization/successor_cases.rs"]
+mod successor_cases;
 use super::*;
 #[path = "native_wait_materialization/cache_cases.rs"]
 mod cache_cases;

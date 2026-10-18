@@ -168,6 +168,11 @@ impl NativeTransitionMaterializationRepository {
 }
 
 impl PreparedNativeOrdinaryTransitions {
+    pub(in crate::repositories) fn held_deadline(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.inner.held_deadline()
+    }
     pub fn completed_execution(&self) -> &Execution {
         &self.completed
     }

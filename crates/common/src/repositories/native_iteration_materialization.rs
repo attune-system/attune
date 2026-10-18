@@ -47,7 +47,12 @@ use std::sync::Arc;
 mod activation;
 pub use activation::PreparedNativeIterationActivation;
 mod completion;
+mod empty;
+mod empty_activation;
+mod empty_ordinary;
 pub use completion::{NativeIterationCompletionMember, PreparedNativeIterationCompletion};
+pub use empty::NativeEmptyIterationSource;
+pub use empty_activation::{PreparedNativeEmptyActivation, PreparedNativeEmptyRecovery};
 
 // Ordinary iteration already creates its complete sibling set at activation.
 // Bound that set and its proof buffers instead of loading retry/result history.
@@ -65,8 +70,10 @@ struct Context {
     sources: Sources,
     outcome: Option<PreparedWorkflowOutcome>,
     frame: Option<Arc<dyn NativeTransitionRenderFrame>>,
+    frame_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 struct Field {
+    graph_budget: super::inherited_input::PreparedSourceGraphBudget,
     path: String,
     rendered: RenderedReceiptContext,
     destination: PreparedReceiptDestination,
@@ -96,20 +103,24 @@ struct IterationObservation {
 }
 
 struct ObservedInputState {
-    execution: Id,
+    source: Execution,
     fields: Vec<StoredSecretValue>,
     schema: ActionSchemaBinding,
 }
 impl ObservedInputState {
     async fn require_current(&self, conn: &mut PgConnection) -> Result<()> {
+        let current = Executions::find_by_id(&mut *conn, self.source.id)
+            .await?
+            .ok_or_else(changed)?;
+        super::accepted_execution_source::same_execution(&self.source, &current)?;
         if Secrets::find_stored_by_entity(
             &mut *conn,
             crate::secret_values::ENTITY_EXECUTION_CONFIG,
-            self.execution,
+            self.source.id,
         )
         .await?
             != self.fields
-            || Schemas::find(conn, BindingOwner::Execution, self.execution)
+            || Schemas::find(conn, BindingOwner::Execution, self.source.id)
                 .await?
                 .as_ref()
                 != Some(&self.schema)
@@ -121,6 +132,8 @@ impl ObservedInputState {
 }
 
 pub struct PreparedNativeIteration {
+    empty_control: Option<ReceiptContext>,
+    empty_outcome: Option<super::native_input_snapshot::PreparedNativeEmptyIterationOutcome>,
     context: Context,
     array: Option<RenderedReceiptContext>,
     iteration_control: Option<PreparedIterationControl>,
@@ -140,6 +153,7 @@ pub struct PreparedNativeIteration {
     incomplete_attempts: i64,
     observations: Vec<IterationObservation>,
     observed_outcomes: Vec<PreparedWorkflowOutcome>,
+    original_outcomes: Vec<PreparedWorkflowOutcome>,
     observed_inputs: Vec<ObservedInputState>,
 }
 
@@ -155,6 +169,7 @@ pub struct NativeIterationResult {
 }
 
 pub struct PreparedIterationControlDelivery {
+    empty: Option<super::native_input_snapshot::ReleasedNativeEmptyIteration>,
     receipts: Vec<ReceiptContext>,
     outcomes: Vec<PreparedWorkflowOutcome>,
     fence: ApprovalEffectFence,
@@ -163,6 +178,9 @@ pub struct PreparedIterationControlDelivery {
 }
 impl PreparedIterationControlDelivery {
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
+        if let Some(empty) = &self.empty {
+            empty.ensure_fresh_on(conn).await?;
+        }
         self.fence.ensure_fresh_on(conn).await?;
         for input in &self.observed_inputs {
             input.require_current(conn).await?;
@@ -179,6 +197,9 @@ impl PreparedIterationControlDelivery {
         Ok(())
     }
     pub fn ensure_fresh(&self) -> Result<()> {
+        if let Some(empty) = &self.empty {
+            empty.ensure_fresh()?;
+        }
         self.fence.ensure_fresh()?;
         for fence in &self.source_fences {
             fence.ensure_fresh()?;
@@ -213,6 +234,17 @@ impl Context {
                 .map_err(|error| preparation_error(error, "literal-site"))?;
             if let Some(frame) = &self.frame {
                 frame.attach_literal(&mut literal)?;
+            } else if relative == "/with_items" && authored.as_array().is_some_and(Vec::is_empty) {
+                // A literal empty list reads no item, but its outcome must keep
+                // the complete independently held accepted source closure.
+                for source in self
+                    .sources
+                    .fields
+                    .iter()
+                    .filter_map(|field| field.source.as_ref())
+                {
+                    Inputs::attach_rendered_control(&mut literal, source)?;
+                }
             }
             return Ok(literal);
         };
@@ -379,7 +411,7 @@ impl NativeIterationMaterializationRepository {
         triggered_by: Option<&str>,
         key: &str,
     ) -> Result<PreparedNativeIteration> {
-        Self::prepare_inner(conn, parent, task_name, triggered_by, key, None).await
+        Self::prepare_inner(conn, parent, task_name, triggered_by, key, None, None).await
     }
     async fn prepare_inner(
         conn: &mut PgConnection,
@@ -388,6 +420,7 @@ impl NativeIterationMaterializationRepository {
         triggered_by: Option<&str>,
         key: &str,
         frame: Option<Arc<dyn NativeTransitionRenderFrame>>,
+        frame_deadline: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<PreparedNativeIteration> {
         let admitted = Admissions::require(conn, RuntimeOwner::Execution(parent.id)).await?;
         let snapshot = parent.executable_snapshot.as_ref().ok_or_else(changed)?;
@@ -525,6 +558,7 @@ impl NativeIterationMaterializationRepository {
             sources,
             outcome,
             frame,
+            frame_deadline,
         };
         let original_secrets =
             Secrets::find_stored_by_entity(&mut *conn, ENTITY_WORKFLOW_VARIABLES, parent.id)
@@ -577,6 +611,8 @@ impl NativeIterationMaterializationRepository {
         .await?
         .in_flight;
         let mut plan = PreparedNativeIteration {
+            empty_control: None,
+            empty_outcome: None,
             context,
             array: None,
             iteration_control: None,
@@ -596,6 +632,7 @@ impl NativeIterationMaterializationRepository {
             incomplete_attempts,
             observations,
             observed_outcomes,
+            original_outcomes: vec![],
             observed_inputs: vec![],
         };
         if !plan.original_children.is_empty() {
@@ -619,14 +656,31 @@ impl NativeIterationMaterializationRepository {
                 {
                     return Err(changed());
                 }
+                let (input, fence, receipts) = observe_accepted_inputs(conn, child, key).await?;
+                plan.observed_inputs.push(input);
+                plan.recovery_fences.push(fence);
                 if child.status != ExecutionStatus::Requested {
-                    let (input, fence, receipts) =
-                        observe_accepted_inputs(conn, child, key).await?;
-                    plan.observed_inputs.push(input);
-                    plan.recovery_fences.push(fence);
                     plan.receipts.extend(receipts);
+                    if observed.execution != child.id
+                        && matches!(
+                            child.status,
+                            ExecutionStatus::Completed
+                                | ExecutionStatus::Failed
+                                | ExecutionStatus::Timeout
+                                | ExecutionStatus::Cancelled
+                                | ExecutionStatus::Abandoned
+                        )
+                    {
+                        let original = Inputs::prepare_outcome(conn, parent.id, child.id).await?;
+                        if original.execution() != child.id || original.task_name() != task_name {
+                            return Err(changed());
+                        }
+                        plan.original_outcomes.push(original);
+                    }
                     continue;
                 }
+                // The Requested branch below retains the delivery views of the
+                // same accepted receipt graph, without duplicating its roots.
                 let admission =
                     Admissions::require(conn, RuntimeOwner::Execution(child.id)).await?;
                 plan.recovery_fences
@@ -635,6 +689,36 @@ impl NativeIterationMaterializationRepository {
                     Materialize::prepare_execution_input_receipts(conn, child.id, key).await?,
                 );
                 plan.recovered.push(child.clone());
+            }
+            // A latest retry has its own accepted input/schema/admission scope.
+            // Original input equality does not make that independent scope or
+            // its deadline disappear. Hold both without reevaluating any data.
+            for observation in &plan.observations {
+                if observation.execution == observation.original {
+                    continue;
+                }
+                let latest = Executions::find_by_id(&mut *conn, observation.execution)
+                    .await?
+                    .ok_or_else(changed)?;
+                if latest.parent != Some(parent.id)
+                    || latest.original_execution != Some(observation.original)
+                    || latest.created != observation.created
+                    || latest.status != observation.status
+                    || latest.retry_count != observation.attempt
+                    || latest.workflow_task.as_ref().is_none_or(|metadata| {
+                        metadata.workflow_execution != plan.context.workflow.id
+                            || metadata.task_name != task_name
+                            || metadata.task_index != Some(observation.ordinal)
+                            || metadata.task_batch != observation.batch
+                            || metadata.retry_count != observation.metadata_attempt
+                    })
+                {
+                    return Err(changed());
+                }
+                let (input, fence, receipts) = observe_accepted_inputs(conn, &latest, key).await?;
+                plan.observed_inputs.push(input);
+                plan.recovery_fences.push(fence);
+                plan.receipts.extend(receipts);
             }
             plan.ensure_fresh_on(conn).await?;
             return Ok(plan);
@@ -665,7 +749,7 @@ impl NativeIterationMaterializationRepository {
             ));
         }
         let array_path = format!("{}/with_items", plan.context.path);
-        if plan.context.frame.is_some() {
+        if plan.context.frame.is_some() || value_count == 0 {
             // A selected condition can itself still be pending, even when the
             // list reads only committed parameters. The official constructor
             // retains those parents; public record/replay must stay closed.
@@ -674,6 +758,10 @@ impl NativeIterationMaterializationRepository {
                 .map_err(|error| preparation_error(error, "prepare-list-control"))?;
             if control.batch_size() != batch || control.item_count() != value_count {
                 return Err(changed());
+            }
+            if value_count == 0 {
+                plan.empty_control =
+                    Some(Inputs::empty_iteration_control(conn, &control, key).await?);
             }
             plan.iteration_control = Some(control);
         } else if plan.context.bindings.contains_key(&array_path) {
@@ -890,7 +978,7 @@ impl NativeIterationMaterializationRepository {
                     )
                     .await?;
                 *value.pointer_mut(&path).ok_or_else(changed)? = rendered.value().clone();
-                let destination = Inputs::prepare_destination(
+                let (destination, graph_budget) = Inputs::prepare_destination_with_graph_budget(
                     conn,
                     &rendered,
                     &InputSite {
@@ -904,6 +992,7 @@ impl NativeIterationMaterializationRepository {
                 .await
                 .map_err(|error| preparation_error(error, "prepare-input-destination"))?;
                 let mut field = Field {
+                    graph_budget,
                     path,
                     rendered,
                     destination,
@@ -921,6 +1010,13 @@ impl NativeIterationMaterializationRepository {
                         &mut field.destination,
                         &source,
                     )?;
+                    Inputs::include_prepared_control_graph_budget(
+                        conn,
+                        &mut field.graph_budget,
+                        &source,
+                        key,
+                    )
+                    .await?;
                 }
                 fields.push(field);
             }
@@ -970,6 +1066,12 @@ impl NativeIterationMaterializationRepository {
                 defaults,
             });
         }
+        if plan.total == 0 {
+            let outcome = super::native_input_snapshot::NativeInputSnapshotRepository::prepare_empty_iteration(
+                conn, &plan.empty_source()?, key,
+            ).await?;
+            plan.empty_outcome = Some(outcome);
+        }
         plan.ensure_fresh_on(conn).await?;
         Ok(plan)
     }
@@ -984,6 +1086,7 @@ impl PreparedNativeIteration {
     }
     pub fn can_complete_empty(&self) -> bool {
         self.total == 0
+            && self.empty_outcome.is_some()
             && self.can_finalize_status_only()
             && self.context.workflow.failed_tasks.is_empty()
     }
@@ -1046,6 +1149,10 @@ impl PreparedNativeIteration {
         let mut receipts = Vec::new();
         let mut source_fences = Vec::new();
         let mut observed_inputs = Vec::new();
+        let mut outcomes = Vec::new();
+        for input in &self.observed_inputs {
+            input.require_current(conn).await?;
+        }
         for control in &self.controls {
             receipts
                 .push(Inputs::receipt_context(conn, control.site(), &control.origin(), key).await?);
@@ -1056,6 +1163,22 @@ impl PreparedNativeIteration {
             observed_inputs.push(input);
             source_fences.push(fence);
             receipts.extend(observed);
+            if self
+                .observations
+                .iter()
+                .any(|latest| latest.original == child.id && latest.execution != child.id)
+                && matches!(
+                    child.status,
+                    ExecutionStatus::Completed
+                        | ExecutionStatus::Failed
+                        | ExecutionStatus::Timeout
+                        | ExecutionStatus::Cancelled
+                        | ExecutionStatus::Abandoned
+                )
+            {
+                outcomes
+                    .push(Inputs::prepare_outcome(conn, self.context.parent.id, child.id).await?);
+            }
         }
         let actual = latest_observations(
             conn,
@@ -1067,7 +1190,18 @@ impl PreparedNativeIteration {
         if actual != self.observations {
             return Err(changed());
         }
-        let mut outcomes = Vec::new();
+        for observation in &self.observations {
+            if observation.execution == observation.original {
+                continue;
+            }
+            let latest = Executions::find_by_id(&mut *conn, observation.execution)
+                .await?
+                .ok_or_else(changed)?;
+            let (input, fence, observed) = observe_accepted_inputs(conn, &latest, key).await?;
+            observed_inputs.push(input);
+            source_fences.push(fence);
+            receipts.extend(observed);
+        }
         for observation in &self.observations {
             let outcome =
                 Inputs::prepare_outcome(conn, self.context.parent.id, observation.execution)
@@ -1080,6 +1214,12 @@ impl PreparedNativeIteration {
             .ok_or_else(changed)?;
         let fence = Authority::retained_admission_fence(conn, admission.id).await?;
         Ok(PreparedIterationControlDelivery {
+            empty: if self.empty_outcome.is_some() {
+                Some(super::native_input_snapshot::NativeInputSnapshotRepository::reopen_empty_iteration(
+                    conn, self.context.parent.id, &self.context.task_name, key).await?.ok_or_else(changed)?)
+            } else {
+                None
+            },
             receipts,
             outcomes,
             fence,
@@ -1091,10 +1231,16 @@ impl PreparedNativeIteration {
         if let Some(frame) = &self.context.frame {
             frame.ensure_fresh_on(conn).await?;
         }
+        if let Some(control) = &self.empty_control {
+            control.ensure_fresh_on(conn).await?;
+        }
         for input in &self.observed_inputs {
             input.require_current(conn).await?;
         }
         self.parent_fence.ensure_fresh_on(conn).await?;
+        if let Some(empty) = &self.empty_outcome {
+            empty.ensure_fresh_on(conn).await?;
+        }
         if let Some(array) = &self.array {
             array.ensure_fresh_on(conn).await?;
         }
@@ -1113,7 +1259,7 @@ impl PreparedNativeIteration {
         for fence in &self.recovery_fences {
             fence.ensure_fresh_on(conn).await?;
         }
-        for outcome in &self.observed_outcomes {
+        for outcome in self.observed_outcomes.iter().chain(&self.original_outcomes) {
             outcome.ensure_fresh_on(conn).await?;
         }
         Ok(())
@@ -1125,6 +1271,12 @@ impl PreparedNativeIteration {
         self.ensure_source_fresh()
     }
     fn ensure_source_fresh(&self) -> Result<()> {
+        if let Some(control) = &self.empty_control {
+            control.ensure_fresh()?;
+        }
+        if let Some(empty) = &self.empty_outcome {
+            empty.ensure_fresh()?;
+        }
         if let Some(frame) = &self.context.frame {
             frame.ensure_fresh()?;
         }
@@ -1141,7 +1293,7 @@ impl PreparedNativeIteration {
         for fence in &self.recovery_fences {
             fence.ensure_fresh()?;
         }
-        for outcome in &self.observed_outcomes {
+        for outcome in self.observed_outcomes.iter().chain(&self.original_outcomes) {
             outcome.ensure_fresh()?;
         }
         Ok(())
@@ -1169,6 +1321,11 @@ impl PreparedNativeIteration {
             return Err(changed());
         }
         self.applied = true;
+        if published.is_none() {
+            if let Some(empty) = &self.empty_outcome {
+                empty.guard_original(conn).await?;
+            }
+        }
         let current = Workflows::find_by_id_for_update(&mut *conn, self.context.workflow.id)
             .await?
             .ok_or_else(changed)?;
@@ -1177,7 +1334,7 @@ impl PreparedNativeIteration {
             .ok_or_else(changed)?;
         let (expected_workflow, expected_secrets) =
             published.unwrap_or((&self.context.workflow, &self.original_secrets));
-        if serde_json::to_value(current)? != serde_json::to_value(expected_workflow)?
+        if serde_json::to_value(&current)? != serde_json::to_value(expected_workflow)?
             || serde_json::to_value(parent)? != serde_json::to_value(&self.context.parent)?
             || Secrets::find_stored_by_entity(
                 &mut *conn,
@@ -1233,6 +1390,15 @@ impl PreparedNativeIteration {
             return Err(changed());
         }
         self.ensure_fresh_on(conn).await?;
+        if let Some(empty) = &self.empty_outcome {
+            let source = self.empty_source()?;
+            if published.is_none() {
+                source.control().require_original_workflow(&current)?;
+                source.control().finalize(conn).await?;
+            }
+            empty.release(conn, &source).await?;
+            empty.require_released(conn).await?;
+        }
         for child in &mut self.children {
             Executions::bind_prepared_workflow_task(conn, &child.row).await?;
             let mut sources = child.defaults.clone();
@@ -1451,7 +1617,7 @@ async fn observe_accepted_inputs(
     fence.ensure_fresh_on(conn).await?;
     Ok((
         ObservedInputState {
-            execution: source.id,
+            source: source.clone(),
             fields,
             schema,
         },
@@ -1505,7 +1671,8 @@ fn changed() -> Error {
 fn preparation_error(error: Error, stage: &'static str) -> Error {
     match error {
         Error::PermissionDenied(message)
-            if !message.starts_with("Ordinary iteration preparation [") =>
+            if !message.starts_with("Ordinary iteration preparation [")
+                && !message.starts_with("Iteration control ") =>
         {
             Error::PermissionDenied(format!("Ordinary iteration preparation [{stage}] denied"))
         }

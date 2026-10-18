@@ -723,6 +723,7 @@ struct PendingExecutionCompleted {
 }
 
 enum NativeWaitCheckpoint {
+    CompletionReplay(attune_common::repositories::native_wait_materialization::PreparedNativeWaitCompletionReplay),
     Delivery(attune_common::repositories::native_wait_materialization::PreparedNativeWait),
     Continuation(
         attune_common::repositories::native_wait_materialization::PreparedNativeWaitContinuation,
@@ -737,6 +738,9 @@ impl NativeWaitCheckpoint {
         use attune_common::repositories::native_wait_materialization::{
             NativeWaitContinuationRepository, NativeWaitMaterializationRepository,
         };
+        if let Some(plan) = attune_common::repositories::native_wait_materialization::NativeWaitCompletionReplayRepository::prepare(conn, wait, key).await? {
+            return Ok(Some(Self::CompletionReplay(plan)));
+        }
         if let Some(plan) = NativeWaitMaterializationRepository::prepare(conn, wait, key).await? {
             return Ok(Some(Self::Delivery(plan)));
         }
@@ -746,18 +750,21 @@ impl NativeWaitCheckpoint {
     }
     fn workflow(&self) -> i64 {
         match self {
+            Self::CompletionReplay(plan) => plan.workflow(),
             Self::Delivery(plan) => plan.workflow(),
             Self::Continuation(plan) => plan.workflow(),
         }
     }
     async fn apply(&mut self, conn: &mut PgConnection, key: &str) -> Result<Vec<Execution>> {
         Ok(match self {
+            Self::CompletionReplay(plan) => plan.apply(conn, key).await?,
             Self::Delivery(plan) => plan.apply(conn, key).await?.into_iter().collect(),
             Self::Continuation(plan) => plan.apply(conn, key).await?,
         })
     }
     async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
         match self {
+            Self::CompletionReplay(plan) => plan.ensure_fresh_on(conn).await?,
             Self::Delivery(plan) => plan.ensure_fresh_on(conn).await?,
             Self::Continuation(plan) => plan.ensure_fresh_on(conn).await?,
         };
@@ -765,6 +772,7 @@ impl NativeWaitCheckpoint {
     }
     fn ensure_fresh(&self) -> Result<()> {
         match self {
+            Self::CompletionReplay(plan) => plan.ensure_fresh()?,
             Self::Delivery(plan) => plan.ensure_fresh()?,
             Self::Continuation(plan) => plan.ensure_fresh()?,
         };
@@ -772,12 +780,14 @@ impl NativeWaitCheckpoint {
     }
     fn terminal_wait(&self) -> Option<i64> {
         match self {
+            Self::CompletionReplay(plan) => Some(plan.wait()),
             Self::Delivery(_) => None,
             Self::Continuation(plan) => Some(plan.wait()),
         }
     }
     fn completions(&self) -> &[Execution] {
         match self {
+            Self::CompletionReplay(plan) => plan.completions(),
             Self::Delivery(_) => &[],
             Self::Continuation(plan) => plan.completions(),
         }
@@ -1811,7 +1821,7 @@ impl ExecutionScheduler {
         } else {
             None
         };
-        let workflow_execution_result =
+        let mut workflow_execution_result =
             WorkflowExecutionRepository::create_or_get_by_execution_with_conn(
                 &mut initialization,
                 CreateWorkflowExecutionInput {
@@ -1826,6 +1836,20 @@ impl ExecutionScheduler {
                 },
             )
             .await?;
+        if workflow_execution_result.created {
+            // Publish actual canonical entry-task state before any child source
+            // factory captures its original workflow. Resumes must keep their
+            // persisted state rather than resetting to the entry points.
+            workflow_execution_result.workflow_execution = WorkflowExecutionRepository::update(
+                &mut *initialization,
+                workflow_execution_result.workflow_execution.id,
+                attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
+                    current_tasks: Some(graph.entry_points.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
         if let Some(prepared) = &prepared_initial {
             if !workflow_execution_result.created {
                 // Do not commit the loser's proposed receipts or reinterpret
@@ -2651,7 +2675,16 @@ impl ExecutionScheduler {
             .await?
             .is_some()
             {
-                Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_with_key(&mut transaction, consumer, &[entity_id], encryption_key).await?)
+                // The root config is already prepared by capture_with_key. Its
+                // external sources must remain strict descendants, never the root.
+                let sources = if entity_type == ENTITY_EXECUTION_CONFIG && entity_id == consumer {
+                    vec![]
+                } else {
+                    vec![entity_id]
+                };
+                Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_with_key(
+                    &mut transaction, consumer, &sources, encryption_key,
+                ).await?)
             } else {
                 None
             }
@@ -6779,6 +6812,98 @@ impl ExecutionScheduler {
         Ok(context)
     }
 
+    /// The real predecessor is prepared before outer targets. A selected Wait
+    /// never enters legacy synthetic-failure advancement.
+    async fn checkpoint_native_wait_successor(
+        pool: &PgPool,
+        publisher: &Publisher,
+        completed: &Execution,
+        key: Option<&str>,
+    ) -> Result<bool> {
+        use attune_common::repositories::{
+            native_transition_materialization::NativeTransitionMaterializationRepository as Transitions,
+            native_wait_materialization::{
+                InitialWaitApply, NativeInitialWaitMaterializationRepository as Initial,
+            },
+        };
+        let Some(key) = key else { return Ok(false) };
+        let mut tx = pool.begin().await?;
+        CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+            .await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
+        let Some(predecessor) =
+            Transitions::prepare_wait_successor(&mut tx, completed, key).await?
+        else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let mut plan = Initial::prepare_successor(&mut tx, predecessor.clone(), key).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(plan.workflow())
+            .execute(&mut *tx)
+            .await?;
+        predecessor.publish(&mut tx, key).await?;
+        let children = match plan.apply(&mut tx, key).await? {
+            InitialWaitApply::Existing => {
+                tx.rollback().await?;
+                return Ok(true);
+            }
+            InitialWaitApply::Registered(child) => child.into_iter().collect(),
+            InitialWaitApply::Recovered(children) => children,
+        };
+        predecessor.ensure_fresh_on(&mut tx).await?;
+        plan.ensure_fresh_on(&mut tx).await?;
+        tx.commit().await?;
+        predecessor.ensure_fresh()?;
+        plan.ensure_fresh()?;
+        for child in children {
+            predecessor.ensure_fresh()?;
+            plan.ensure_fresh()?;
+            Self::publish_execution_requested_payload(
+                publisher,
+                PendingExecutionRequested {
+                    execution_id: child.id,
+                    action_id: child
+                        .action
+                        .ok_or_else(|| anyhow::anyhow!("Wait successor action is absent"))?,
+                    action_ref: child.action_ref,
+                    parent_id: child
+                        .parent
+                        .ok_or_else(|| anyhow::anyhow!("Wait successor parent is absent"))?,
+                    enforcement_id: child.enforcement,
+                    config: child.config,
+                    release_id: child.pack_release,
+                    release_digest: child.pack_release_digest,
+                },
+            )
+            .await?;
+            predecessor.ensure_fresh()?;
+            plan.ensure_fresh()?;
+        }
+        for completed in plan.completions() {
+            predecessor.ensure_fresh()?;
+            plan.ensure_fresh()?;
+            Self::publish_execution_completed_payload(
+                publisher,
+                PendingExecutionCompleted {
+                    execution_id: completed.id,
+                    action_id: completed
+                        .action
+                        .ok_or_else(|| anyhow::anyhow!("Wait completion action is absent"))?,
+                    action_ref: completed.action_ref.clone(),
+                    status: completed.status,
+                    result: completed.result.clone(),
+                    completed_at: completed.updated,
+                },
+            )
+            .await?;
+            predecessor.ensure_fresh()?;
+            plan.ensure_fresh()?;
+        }
+        Ok(true)
+    }
+
     /// Native initial registration must precede the legacy workflow/FK locks.
     async fn checkpoint_initial_native_wait(
         pool: &PgPool,
@@ -6866,6 +6991,21 @@ impl ExecutionScheduler {
                 };
                 plan.ensure_fresh()?;
                 Self::publish_execution_requested_payload(publisher, pending).await?;
+                plan.ensure_fresh()?;
+            }
+            for completed in plan.completions() {
+                let pending = PendingExecutionCompleted {
+                    execution_id: completed.id,
+                    action_id: completed.action.ok_or_else(|| {
+                        anyhow::anyhow!("Native initial wait completion action is absent")
+                    })?,
+                    action_ref: completed.action_ref.clone(),
+                    status: completed.status,
+                    result: completed.result.clone(),
+                    completed_at: Utc::now(),
+                };
+                plan.ensure_fresh()?;
+                Self::publish_execution_completed_payload(publisher, pending).await?;
                 plan.ensure_fresh()?;
             }
             if let Some(wait) = plan.terminal_wait() {
@@ -7214,6 +7354,11 @@ impl ExecutionScheduler {
                     return Ok(());
                 }
             }
+        }
+        if Self::checkpoint_native_wait_successor(pool, publisher, execution, encryption_key)
+            .await?
+        {
+            return Ok(());
         }
         let logger = WorkflowLogger::new(workflow_execution_id, workflow_log_segment_max_bytes);
 

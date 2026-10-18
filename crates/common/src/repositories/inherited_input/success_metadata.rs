@@ -154,6 +154,7 @@ impl InheritedInputRepository {
             purpose: InputSitePurpose::Value,
             wait_reads: Vec::new(),
             result_reads: Vec::new(),
+            empty_reads: Vec::new(),
         };
         // No prepare_destination call under target locks. Preserve every held
         // receipt descriptor and its independent ceiling instead of recapturing
@@ -211,6 +212,7 @@ impl InheritedInputRepository {
                 path: String::new(),
             },
             result_reads: Vec::new(),
+            empty_reads: Vec::new(),
             wait_reads: Vec::new(),
             source_receipts,
             snapshot_parents: parents.into_iter().collect(),

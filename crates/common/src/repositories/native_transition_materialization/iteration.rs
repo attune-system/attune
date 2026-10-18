@@ -197,6 +197,18 @@ impl NativeTransitionMaterializationRepository {
 }
 
 impl PreparedNativeIterationTransitions {
+    pub(in crate::repositories) fn held_deadline(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        Ok([
+            self.inner.held_deadline()?,
+            self.source.held_deadline()?,
+            self.group.held_deadline()?,
+        ]
+        .into_iter()
+        .flatten()
+        .min())
+    }
     pub fn workflow(&self) -> &WorkflowExecution {
         self.inner.workflow()
     }

@@ -17,18 +17,64 @@ pub(super) struct Frame {
     program: Arc<super::staged::Program>,
     // Independent original observation fence, not a fence inferred from b.
     fence: ApprovalEffectFence,
-    released: Arc<OnceLock<ReleasedWaitInput>>,
+    released: ReleaseOwner,
     published: OnceLock<Published>,
+    native_sources: Vec<super::super::native_input_snapshot::NativeSourceEvidence>,
 }
 struct Published {
+    workflow: WorkflowExecution,
     variables: Value,
     fields: Vec<crate::secret_values::PreparedSecretValue>,
     wait: Value,
     release_transaction: String,
 }
+enum ReleaseOwner {
+    Registered(Arc<OnceLock<ReleasedWaitInput>>),
+    Initial(Arc<OnceLock<super::super::native_input_snapshot::RegisteredInitialWait>>),
+}
+impl ReleaseOwner {
+    fn held_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::Registered(owner) => owner
+                .get()
+                .and_then(|released| released.binding().6.approval_deadline()),
+            Self::Initial(owner) => owner.get().and_then(|bound| bound.held_deadline()),
+        }
+    }
+    fn get(&self) -> Option<&ReleasedWaitInput> {
+        match self {
+            Self::Registered(owner) => owner.get(),
+            Self::Initial(owner) => owner.get()?.released(),
+        }
+    }
+}
 
 impl Frame {
-    pub(super) fn new(
+    pub(super) async fn require_sealed_state(
+        &self,
+        conn: &mut PgConnection,
+    ) -> Result<(WorkflowExecution, Vec<StoredSecretValue>)> {
+        self.require_published(conn).await?;
+        let seal = self.published.get().ok_or_else(denied)?;
+        let workflow = Workflows::find_by_id(&mut *conn, self.workflow.id)
+            .await?
+            .ok_or_else(denied)?;
+        if serde_json::to_value(&workflow)? != serde_json::to_value(&seal.workflow)? {
+            return Err(denied());
+        }
+        let fields =
+            Secrets::find_stored_by_entity(&mut *conn, ENTITY_WORKFLOW_VARIABLES, self.parent.id)
+                .await?;
+        Ok((workflow, fields))
+    }
+    pub(super) fn source_identity(&self) -> (Id, Id) {
+        (self.wait, self.snapshot)
+    }
+    pub(super) fn released_observation(&self) -> Result<&ReleasedWaitInput> {
+        self.released.get().ok_or_else(denied)
+    }
+    pub(super) async fn new(
+        conn: &mut PgConnection,
         context: &Context,
         wait: &WorkflowTaskWait,
         observation: &Observation,
@@ -45,6 +91,7 @@ impl Frame {
             return Err(denied());
         }
         Ok(Self {
+            native_sources: Self::hold_native_sources(conn, context, &program, key).await?,
             parent: context.parent.clone(),
             workflow: context.workflow.clone(),
             key_hash: crate::crypto::hash_encryption_key(key),
@@ -55,9 +102,81 @@ impl Frame {
             sources: context.sources.clone(),
             program,
             fence: binding.fence.clone(),
-            released,
+            released: ReleaseOwner::Registered(released),
             published: OnceLock::new(),
         })
+    }
+
+    pub(super) async fn prospective(
+        conn: &mut PgConnection,
+        context: &Context,
+        registration: &super::super::native_input_snapshot::PreparedWaitRegistration,
+        program: Arc<super::staged::Program>,
+        bound: Arc<OnceLock<super::super::native_input_snapshot::RegisteredInitialWait>>,
+        key: &str,
+    ) -> Result<Self> {
+        let binding = registration
+            .prepared_input()
+            .ok_or_else(denied)?
+            .outcome_binding()?;
+        if binding.task_path != context.path
+            || registration.workflow() != context.workflow.id
+            || context.task.get("name").and_then(Value::as_str) != Some(registration.task_name())
+            || registration.reserved_wait() <= 0
+        {
+            return Err(denied());
+        }
+        Ok(Self {
+            native_sources: Self::hold_native_sources(conn, context, &program, key).await?,
+            parent: context.parent.clone(),
+            workflow: context.workflow.clone(),
+            key_hash: crate::crypto::hash_encryption_key(key),
+            transaction: binding.transaction.into(),
+            wait: registration.reserved_wait(),
+            task: registration.task_name().into(),
+            snapshot: binding.snapshot,
+            sources: context.sources.clone(),
+            program,
+            fence: registration.held_effect_fence().intersect(binding.fence),
+            released: ReleaseOwner::Initial(bound),
+            published: OnceLock::new(),
+        })
+    }
+
+    async fn hold_native_sources(
+        conn: &mut PgConnection,
+        context: &Context,
+        program: &super::staged::Program,
+        key: &str,
+    ) -> Result<Vec<super::super::native_input_snapshot::NativeSourceEvidence>> {
+        let mut metadata = BTreeMap::new();
+        for source in context
+            .sources
+            .fields
+            .iter()
+            .filter_map(|field| field.source.as_ref())
+            .flat_map(|source| source.held_native_metadata())
+            .chain(program.held_native_metadata())
+        {
+            if source.source_kind() == "cache" {
+                if metadata
+                    .insert(source.snapshot(), source)
+                    .is_some_and(|previous| previous != source)
+                {
+                    return Err(denied());
+                }
+            }
+        }
+        let mut held = vec![];
+        for source in metadata.into_values() {
+            let evidence = Snapshots::source_evidence(conn, source, key).await?;
+            evidence
+                .cache_read_policy()
+                .ok_or_else(denied)?
+                .ensure_fresh()?;
+            held.push(evidence);
+        }
+        Ok(held)
     }
 
     pub(super) async fn seal(
@@ -80,6 +199,9 @@ impl Frame {
         let release_transaction = self.release(conn).await?;
         self.published
             .set(Published {
+                workflow: Workflows::find_by_id(&mut *conn, self.workflow.id)
+                    .await?
+                    .ok_or_else(denied)?,
                 variables: variables.clone(),
                 fields: fields.to_vec(),
                 wait: serde_json::to_value(wait)?,
@@ -112,6 +234,23 @@ impl Frame {
     }
 }
 
+impl Frame {
+    pub(super) fn held_deadline(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let mut deadlines = vec![
+            Ok(self.fence.approval_deadline()),
+            self.sources.held_wait_deadline(),
+            Ok(self.program.held_deadline()),
+            Ok(self.released.held_deadline()),
+        ];
+        for source in &self.native_sources {
+            deadlines.push(Ok(source
+                .cache_read_policy()
+                .ok_or_else(denied)?
+                .fresh_until()));
+        }
+        earliest_held(deadlines)
+    }
+}
 #[async_trait::async_trait]
 impl NativeCacheRenderFrame for Frame {
     fn execution(&self) -> Id {
@@ -163,6 +302,13 @@ impl NativeCacheRenderFrame for Frame {
             return Err(denied());
         }
         self.fence.ensure_fresh_on(conn).await?;
+        self.sources.ensure_wait_sources_on(conn).await?;
+        for source in &self.native_sources {
+            source
+                .cache_read_policy()
+                .ok_or_else(denied)?
+                .ensure_fresh()?;
+        }
         self.program.ensure_fresh_on(conn).await?;
         if let Some(released) = self.released.get() {
             released.ensure_fresh_on(conn).await?;
@@ -171,6 +317,13 @@ impl NativeCacheRenderFrame for Frame {
     }
     fn ensure_fresh(&self) -> Result<()> {
         self.fence.ensure_fresh()?;
+        self.sources.ensure_wait_sources()?;
+        for source in &self.native_sources {
+            source
+                .cache_read_policy()
+                .ok_or_else(denied)?
+                .ensure_fresh()?;
+        }
         self.program.ensure_fresh()?;
         if let Some(released) = self.released.get() {
             released.ensure_fresh()?;
@@ -213,5 +366,32 @@ impl NativeCacheRenderFrame for Frame {
             return Err(denied());
         }
         Ok(())
+    }
+}
+
+fn earliest_held(
+    deadlines: impl IntoIterator<Item = Result<Option<chrono::DateTime<chrono::Utc>>>>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    deadlines.into_iter().try_fold(None, |earliest, next| {
+        Ok(earliest.into_iter().chain(next?).min())
+    })
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[test]
+    fn independent_controls_and_sources_bound_no_child_frames() {
+        let early = chrono::DateTime::from_timestamp(40, 0).unwrap();
+        let late = chrono::DateTime::from_timestamp(90, 0).unwrap();
+        assert_eq!(
+            earliest_held([Ok(None), Ok(Some(late)), Ok(Some(early)), Ok(None)]).unwrap(),
+            Some(early)
+        );
+        assert_eq!(earliest_held([Ok(None), Ok(None)]).unwrap(), None);
+    }
+    #[test]
+    fn unsupported_source_deadline_is_not_known_unbounded() {
+        assert!(earliest_held([Ok(None), Err(denied())]).is_err());
     }
 }

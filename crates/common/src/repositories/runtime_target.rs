@@ -237,6 +237,32 @@ impl RuntimeTargetRepository {
         .await
     }
 
+    pub async fn resolve_native_wait_completion_source(
+        connection: &mut PgConnection,
+        source: &super::native_input_disclosure::PreparedWaitCompletionSource,
+        principal: Id,
+    ) -> Result<Vec<ResolvedRuntimeTarget>> {
+        source.ensure_held_on(connection).await?;
+        let original = source.root();
+        let root = archived_execution(
+            connection,
+            &original.target,
+            &original.owner,
+            original.release,
+            &original.release_digest,
+            &original.action_ref,
+            principal,
+        )
+        .await?;
+        let observer = if source.original().metadata().source_kind() == "execution_result" {
+            Self::resolve_execution_wait_source(connection, source.original(), principal).await?
+        } else {
+            Self::resolve_related_wait_source(connection, source.original(), principal).await?
+        };
+        source.ensure_fresh()?;
+        Ok(vec![root, observer])
+    }
+
     pub async fn resolve_native_success_source(
         connection: &mut PgConnection,
         source: &super::native_input_disclosure::PreparedSuccessSource,

@@ -20,6 +20,8 @@ use std::{
     sync::Arc,
 };
 
+mod wait_completion;
+pub use wait_completion::PreparedWaitCompletionSource;
 mod success;
 pub use success::PreparedSuccessSource;
 
@@ -122,6 +124,7 @@ pub struct NativeWaitSources {
     executions: BTreeMap<Id, Arc<PreparedWaitSource>>,
     caches: BTreeMap<Id, Arc<PreparedCacheSource>>,
     successes: BTreeMap<Id, Arc<PreparedSuccessSource>>,
+    wait_completions: BTreeMap<Id, Arc<PreparedWaitCompletionSource>>,
 }
 
 /// Authenticated original cache page and its original task freshness policy.
@@ -186,7 +189,10 @@ impl PreparedCacheSource {
 
 impl NativeWaitSources {
     fn source_count(&self) -> usize {
-        self.executions.len() + self.caches.len() + self.successes.len()
+        self.executions.len()
+            + self.caches.len()
+            + self.successes.len()
+            + self.wait_completions.len()
     }
 
     /// Called only before capture/consumer target locks. Returns new graph
@@ -202,6 +208,20 @@ impl NativeWaitSources {
         let mut nodes = 0usize;
         let mut bytes = 0usize;
         for metadata in context.native_source_metadata() {
+            if metadata.source_kind() == "wait_completion_metadata" {
+                let charges = self
+                    .prepare_wait_completion(conn, context, metadata, key, depth)
+                    .await
+                    .map_err(|error| match error {
+                        Error::PermissionDenied(message) => {
+                            Error::PermissionDenied(format!("Wait completion reader: {message}"))
+                        }
+                        other => other,
+                    })?;
+                nodes = nodes.checked_add(charges.0).ok_or_else(denied)?;
+                bytes = bytes.checked_add(charges.1).ok_or_else(denied)?;
+                continue;
+            }
             if metadata.source_kind() == "ordinary_success_metadata" {
                 let charges = self
                     .prepare_success(conn, context, metadata, key, depth)
@@ -278,7 +298,14 @@ impl NativeWaitSources {
             lock_execution_wait_snapshot(conn, metadata.snapshot()).await?;
             let evidence =
                 NativeInputSnapshotRepository::source_evidence(conn, metadata, key).await?;
-            let prepared = prepare_wait_source(conn, metadata, evidence, context).await?;
+            let prepared = prepare_wait_source(conn, metadata, evidence, context)
+                .await
+                .map_err(|error| match error {
+                    Error::PermissionDenied(message) => {
+                        Error::PermissionDenied(format!("Native original observer: {message}"))
+                    }
+                    other => other,
+                })?;
             if depth.saturating_add(prepared.ceiling_depth) >= 32 {
                 return Err(denied());
             }
@@ -329,6 +356,11 @@ impl NativeWaitSources {
                     .values()
                     .map(|source| source.retained_bytes()),
             )
+            .chain(
+                self.wait_completions
+                    .values()
+                    .map(|source| source.retained_bytes()),
+            )
             .try_fold(0usize, |total, bytes| {
                 total.checked_add(bytes).ok_or_else(denied)
             })?;
@@ -338,6 +370,11 @@ impl NativeWaitSources {
             .map(|source| source.retained_nodes())
             .chain(
                 self.successes
+                    .values()
+                    .map(|source| source.retained_nodes()),
+            )
+            .chain(
+                self.wait_completions
                     .values()
                     .map(|source| source.retained_nodes()),
             )
@@ -351,6 +388,9 @@ impl NativeWaitSources {
     }
 
     pub fn ensure_fresh(&self) -> Result<()> {
+        for source in self.wait_completions.values() {
+            source.ensure_fresh()?;
+        }
         for source in self.successes.values() {
             source.ensure_fresh()?;
         }
@@ -364,6 +404,9 @@ impl NativeWaitSources {
     }
 
     pub async fn ensure_held_on(&self, conn: &mut PgConnection) -> Result<()> {
+        for source in self.wait_completions.values() {
+            source.ensure_held_on(conn).await?;
+        }
         for source in self.successes.values() {
             source.ensure_held_on(conn).await?;
         }
