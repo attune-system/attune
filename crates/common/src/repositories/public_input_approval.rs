@@ -99,12 +99,13 @@ impl PublicInputApprovalRepository {
                 let mut targets = Vec::new();
                 for retained in retained {
                     let policy_id = retained.policy_revision();
-                    if !policies.contains_key(&policy_id) {
+                    if let std::collections::btree_map::Entry::Vacant(e) = policies.entry(policy_id)
+                    {
                         let policy = metadata(
                             RuntimeAuthorityRepository::find_policy(connection, policy_id).await,
                         )?
                         .ok_or_else(invalid)?;
-                        policies.insert(policy_id, policy);
+                        e.insert(policy);
                     }
                     let declaration = retained.declaration().clone();
                     if declaration.pack != approval.subject_pack {
@@ -227,84 +228,6 @@ impl PublicInputApprovalRepository {
             );
         }
         Ok((targets, total))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn hidden_or_collected_input_targets_keep_the_input_only_marker() {
-        let value =
-            serde_json::to_value(ApprovalPurpose::DeclaredInput { targets: vec![] }).unwrap();
-        assert_eq!(value, json!({"kind":"declared_input","targets":[]}));
-        assert_ne!(
-            value,
-            serde_json::to_value(ApprovalPurpose::Runtime).unwrap()
-        );
-    }
-
-    #[test]
-    fn retained_declaration_digest_is_required_and_private_fields_are_not_public_data() {
-        let declaration = DeclaredInputBinding {
-            action: 1,
-            pack: 2,
-            release: 3,
-            metadata_revision: None,
-            declaration_revision: "a".repeat(64),
-            source_path: "/workflow/vars/token".into(),
-            expression: "{{ keystore['foreign.token'] }}".into(),
-        };
-        let body = serde_json::to_value(&declaration).unwrap();
-        assert!(decode(body.clone(), &"0".repeat(64)).is_err());
-        assert_eq!(
-            decode(body.clone(), &digest(&body).unwrap()).unwrap(),
-            declaration
-        );
-        let target = DeclaredInputApprovalTarget {
-            policy_revision: 4,
-            invocation_binding: InvocationBinding::Action {
-                action_ref: "example.flow".into(),
-            },
-            action_id: 1,
-            action_ref: "example.flow".into(),
-            pack_id: 2,
-            pack_ref: "example".into(),
-            release_id: 3,
-            metadata_revision: None,
-            declaration_revision: declaration.declaration_revision,
-            source_path: declaration.source_path,
-            expression: declaration.expression,
-        };
-        let mut public = serde_json::to_value(target).unwrap();
-        let fields = public.as_object().unwrap();
-        for private in [
-            "proof",
-            "origin",
-            "value",
-            "config",
-            "ciphertext",
-            "source_admission",
-            "permission_set_refs",
-            "concrete_targets",
-        ] {
-            assert!(!fields.contains_key(private));
-        }
-        public["proof"] = json!({"origin":"not public metadata"});
-        assert!(serde_json::from_value::<DeclaredInputApprovalTarget>(public).is_err());
-    }
-
-    #[test]
-    fn metadata_decoder_errors_do_not_quote_private_retained_values() {
-        let raw = serde_json::from_value::<DeclaredInputBinding>(
-            json!({"action":"PRIVATE_GRAPH_CANARY"}),
-        )
-        .unwrap_err();
-        let error = metadata::<()>(Err(raw.into())).unwrap_err();
-        assert!(matches!(&error, Error::Internal(_)));
-        assert!(!error.to_string().contains("PRIVATE_GRAPH_CANARY"));
     }
 }
 
@@ -469,4 +392,82 @@ async fn target(
         source_path: declaration.source_path,
         expression: declaration.expression,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn hidden_or_collected_input_targets_keep_the_input_only_marker() {
+        let value =
+            serde_json::to_value(ApprovalPurpose::DeclaredInput { targets: vec![] }).unwrap();
+        assert_eq!(value, json!({"kind":"declared_input","targets":[]}));
+        assert_ne!(
+            value,
+            serde_json::to_value(ApprovalPurpose::Runtime).unwrap()
+        );
+    }
+
+    #[test]
+    fn retained_declaration_digest_is_required_and_private_fields_are_not_public_data() {
+        let declaration = DeclaredInputBinding {
+            action: 1,
+            pack: 2,
+            release: 3,
+            metadata_revision: None,
+            declaration_revision: "a".repeat(64),
+            source_path: "/workflow/vars/token".into(),
+            expression: "{{ keystore['foreign.token'] }}".into(),
+        };
+        let body = serde_json::to_value(&declaration).unwrap();
+        assert!(decode(body.clone(), &"0".repeat(64)).is_err());
+        assert_eq!(
+            decode(body.clone(), &digest(&body).unwrap()).unwrap(),
+            declaration
+        );
+        let target = DeclaredInputApprovalTarget {
+            policy_revision: 4,
+            invocation_binding: InvocationBinding::Action {
+                action_ref: "example.flow".into(),
+            },
+            action_id: 1,
+            action_ref: "example.flow".into(),
+            pack_id: 2,
+            pack_ref: "example".into(),
+            release_id: 3,
+            metadata_revision: None,
+            declaration_revision: declaration.declaration_revision,
+            source_path: declaration.source_path,
+            expression: declaration.expression,
+        };
+        let mut public = serde_json::to_value(target).unwrap();
+        let fields = public.as_object().unwrap();
+        for private in [
+            "proof",
+            "origin",
+            "value",
+            "config",
+            "ciphertext",
+            "source_admission",
+            "permission_set_refs",
+            "concrete_targets",
+        ] {
+            assert!(!fields.contains_key(private));
+        }
+        public["proof"] = json!({"origin":"not public metadata"});
+        assert!(serde_json::from_value::<DeclaredInputApprovalTarget>(public).is_err());
+    }
+
+    #[test]
+    fn metadata_decoder_errors_do_not_quote_private_retained_values() {
+        let raw = serde_json::from_value::<DeclaredInputBinding>(
+            json!({"action":"PRIVATE_GRAPH_CANARY"}),
+        )
+        .unwrap_err();
+        let error = metadata::<()>(Err(raw.into())).unwrap_err();
+        assert!(matches!(&error, Error::Internal(_)));
+        assert!(!error.to_string().contains("PRIVATE_GRAPH_CANARY"));
+    }
 }

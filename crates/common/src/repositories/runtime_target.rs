@@ -171,12 +171,10 @@ impl RuntimeTargetRepository {
         super::schema_type::SchemaTypeRepository::lock_selection(connection).await?;
         let mut context = AuthorizationContext::new(sponsor_identity);
         context.target_ref = Some(reference.to_owned());
-        match pack {
-            Some(id) => match pack_ref(connection, id).await? {
-                Some(_) => {}
-                None => return Ok(None),
-            },
-            None => {}
+        if let Some(id) = pack {
+            if pack_ref(connection, id).await?.is_none() {
+                return Ok(None);
+            }
         }
         // API-created queue definitions are ad hoc components. Association
         // with a pack is not management_origin='pack' ownership. Creation
@@ -592,14 +590,15 @@ impl RuntimeTargetRepository {
             }
             RuntimeTarget::Artifact(id) => {
                 positive_id(id)?;
-                let row: Option<(
+                type ArtifactTargetRow = (
                     String,
                     OwnerType,
                     String,
                     ArtifactVisibility,
                     Option<Id>,
                     Option<Id>,
-                )> = sqlx::query_as(
+                );
+                let row: Option<ArtifactTargetRow> = sqlx::query_as(
                     "SELECT a.ref, a.scope, a.owner, a.visibility, b.owner_id, b.managing_pack \
                      FROM artifact a JOIN artifact_runtime_owner_binding b \
                        ON b.artifact = a.id AND b.owner_type = a.scope AND b.owner_ref = a.owner \

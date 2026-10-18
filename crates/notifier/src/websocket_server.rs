@@ -65,6 +65,7 @@ const TOKEN_EXPIRATION_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const CLOSE_CODE_TOKEN_EXPIRED: u16 = 4401;
 
 /// WebSocket server for handling client connections
+#[derive(Clone)]
 pub struct WebSocketServer {
     config: Config,
     pub notification_tx: broadcast::Sender<Notification>,
@@ -88,17 +89,6 @@ impl WebSocketServer {
             subscriber_manager,
             shutdown,
             db_pool,
-        }
-    }
-
-    /// Clone method for spawning tasks
-    pub fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            notification_tx: self.notification_tx.clone(),
-            subscriber_manager: self.subscriber_manager.clone(),
-            shutdown: self.shutdown.clone(),
-            db_pool: self.db_pool.clone(),
         }
     }
 

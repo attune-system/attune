@@ -150,11 +150,16 @@ impl Drop for Guard {
         if let Some((profile, op, started)) = &self.active {
             let counters = &profile.0[*op as usize];
             let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let _ = counters
-                .micros
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                    Some(old.saturating_add(micros))
-                });
+            // Saturate on both the pinned Docker toolchain and current stable.
+            let mut previous = counters.micros.load(Ordering::Relaxed);
+            while let Err(current) = counters.micros.compare_exchange_weak(
+                previous,
+                previous.saturating_add(micros),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                previous = current;
+            }
             counters.max_micros.fetch_max(micros, Ordering::Relaxed);
             if self.finished {
                 counters.finished.fetch_add(1, Ordering::Relaxed);

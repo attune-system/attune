@@ -528,6 +528,10 @@ async fn fixture_with_original_input(
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Exercise independent source deadlines and grants without hiding their combinations"
+)]
 async fn fixture_with_original_input_deadlines(
     standard_only: bool,
     workflow_context: bool,

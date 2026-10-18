@@ -17,25 +17,6 @@ pub struct TriggerRolloutImpact {
     pub workload_ids: Vec<i64>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ordinary_confirmation_cannot_replace_explicit_incompatible_rollout_acknowledgement() {
-        let impact = TriggerRolloutImpact {
-            trigger_id: 9,
-            execution_ids: vec![11],
-            workload_ids: vec![4],
-        };
-        assert!(impact.require_drained_or_acknowledged(false).is_err());
-        assert!(impact.require_drained_or_acknowledged(true).is_ok());
-        assert!(TriggerRolloutImpact::default()
-            .require_drained_or_acknowledged(false)
-            .is_ok());
-    }
-}
-
 impl TriggerRolloutImpact {
     pub fn requires_acknowledgement(&self) -> bool {
         !self.execution_ids.is_empty() || !self.workload_ids.is_empty()
@@ -143,5 +124,24 @@ impl TriggerRolloutRepository {
         impact.workload_ids = sqlx::query_scalar("SELECT w.id FROM sensor_workload w JOIN sensor_workload_assignment a ON a.workload = w.id JOIN sensor_generation_schema_binding b ON b.workload = a.workload AND b.generation = a.generation WHERE b.binding->'triggers' ? $1 AND a.worker IS NOT NULL AND a.lease_expires_at > clock_timestamp() ORDER BY w.id")
             .bind(&trigger.r#ref).fetch_all(connection).await?;
         Ok(impact)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_confirmation_cannot_replace_explicit_incompatible_rollout_acknowledgement() {
+        let impact = TriggerRolloutImpact {
+            trigger_id: 9,
+            execution_ids: vec![11],
+            workload_ids: vec![4],
+        };
+        assert!(impact.require_drained_or_acknowledged(false).is_err());
+        assert!(impact.require_drained_or_acknowledged(true).is_ok());
+        assert!(TriggerRolloutImpact::default()
+            .require_drained_or_acknowledged(false)
+            .is_ok());
     }
 }

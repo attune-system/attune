@@ -811,6 +811,10 @@ impl SensorSchemaRepository {
         Ok(triggers)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Persist one admitted workload with independent executable, schema, trigger, metadata, and encryption inputs"
+    )]
     async fn persist_admitted_generation(
         connection: &mut PgConnection,
         workload: &OwnedSensorWorkload,

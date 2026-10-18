@@ -242,9 +242,20 @@ def test_uploaded_empty_iteration_preserves_result_and_completes(client, success
             break
         time.sleep(0.25)
     assert execution["status"] == "completed", execution
-    assert execution["result"]["items"] == []
+    assert execution["result"] == {"$attune_secret": True, "redacted": True}
     response = client.session.get(
-        f"{client.base_url}/api/v1/executions/{execution_id}/children", timeout=10
+        f"{client.base_url}/api/v1/executions/{execution_id}",
+        params={"include_secret_values": "true"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    revealed = response.json()["data"]
+    assert revealed["status"] == "completed", revealed["status"]
+    assert revealed["result"].get("items") == [], revealed["result"]
+    response = client.session.get(
+        f"{client.base_url}/api/v1/executions",
+        params={"parent": execution_id},
+        timeout=10,
     )
     response.raise_for_status()
     children = response.json()["data"]

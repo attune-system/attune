@@ -172,7 +172,7 @@ async fn installed_private_types_are_discoverable_and_assignable_without_pack_de
         .unwrap()
         .is_some());
     let (rows, total) = SchemaTypeRepository::list_installed(
-        &mut *db.acquire().await.unwrap(),
+        &mut db.acquire().await.unwrap(),
         Some(&pack.r#ref),
         Some("private value"),
         10,

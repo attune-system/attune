@@ -704,10 +704,7 @@ async fn compare_source_current(conn: &mut PgConnection, source: &WaitSource) ->
             (
                 json!(row.updated),
                 json!({"id":row.id,"status":row.status,"result":row.result}),
-                binding
-                    .output
-                    .map(|contract| serde_json::to_value(contract))
-                    .transpose()?,
+                binding.output.map(serde_json::to_value).transpose()?,
             )
         }
         "inquiry" => {

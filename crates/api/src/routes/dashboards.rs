@@ -613,7 +613,7 @@ pub async fn list_dashboards(
                 .split_once('.')
                 .map(|(pack_ref, _)| pack_ref.to_string());
             ctx.owner_identity_id = dashboard.owner_identity;
-            AuthorizationService::is_allowed(&grants, Resource::Dashboards, RbacAction::Read, &ctx)
+            AuthorizationService::is_allowed(grants, Resource::Dashboards, RbacAction::Read, &ctx)
         })
         .map(DashboardListItemResponse::from)
         .collect::<Vec<_>>();
@@ -2861,6 +2861,10 @@ fn key_owner_ref(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep source selection, filters, current grants, and decrypt consent separate"
+)]
 async fn build_key_value_source_data(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,

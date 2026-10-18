@@ -145,15 +145,25 @@ pub fn extract_zip<R: Read + Seek>(
         let mut entry = archive
             .by_index(index)
             .map_err(|error| Error::validation(format!("Invalid ZIP entry: {error}")))?;
+        // ZIP's language-encoding flag promises UTF-8. Do not let a decoding
+        // fallback silently change a malformed archive member's identity.
+        if entry.flags().as_u16() & (1 << 11) != 0 {
+            std::str::from_utf8(entry.name_raw())
+                .map_err(|error| Error::validation(format!("Invalid ZIP entry name: {error}")))?;
+        }
+        let name = entry
+            .name()
+            .map_err(|error| Error::validation(format!("Invalid ZIP entry name: {error}")))?
+            .into_owned();
+        let path = Path::new(&name);
         let mode_type = entry.unix_mode().unwrap_or(0) & 0o170000;
-        let member = display_member(Path::new(entry.name()));
+        let member = display_member(path);
         state
             .next_entry()
             .map_err(|error| archive_error(error, &member))?;
         if mode_type != 0 && mode_type != 0o040000 && mode_type != 0o100000 {
             return Err(archive_error(Error::validation("ZIP archive contains a symlink or special file. Remove this member and rebuild the archive."), &member));
         }
-        let path = Path::new(entry.name());
         let is_directory = entry.is_dir() || mode_type == 0o040000;
         if is_directory {
             if entry.size() != 0 {
@@ -707,6 +717,49 @@ mod tests {
             max_total_bytes: 512,
         };
         assert!(extract_zip(Cursor::new(bomb), dest.path(), limits).is_err());
+    }
+
+    #[test]
+    fn zip_rejects_invalid_utf8_entry_names() {
+        let mut bytes = zip_with_file("entry", b"data");
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"\x50\x4b\x01\x02")
+            .unwrap();
+        for flags_offset in [6, central + 8] {
+            let flags = u16::from_le_bytes([bytes[flags_offset], bytes[flags_offset + 1]]);
+            bytes[flags_offset..flags_offset + 2]
+                .copy_from_slice(&(flags | (1 << 11)).to_le_bytes());
+        }
+        bytes[30] = 0xff;
+        bytes[central + 46] = 0xff;
+        let dest = tempfile::tempdir().unwrap();
+        assert!(extract_zip(
+            Cursor::new(bytes),
+            dest.path(),
+            SafeExtractionLimits::default()
+        )
+        .is_err());
+        assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn zip_accepts_cp437_names_without_utf8_flag() {
+        let mut bytes = zip_with_file("entry", b"data");
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"\x50\x4b\x01\x02")
+            .unwrap();
+        bytes[30] = 0x82;
+        bytes[central + 46] = 0x82;
+        let dest = tempfile::tempdir().unwrap();
+        extract_zip(
+            Cursor::new(bytes),
+            dest.path(),
+            SafeExtractionLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(dest.path().join("éntry")).unwrap(), b"data");
     }
 
     #[test]

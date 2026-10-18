@@ -160,9 +160,7 @@ pub fn inspect_definition(
         }
         for keyword in ARRAY_SCHEMAS {
             if let Some(children) = map.get_mut(*keyword).and_then(Value::as_array_mut) {
-                for child in children {
-                    *child = Value::Bool(true);
-                }
+                children.fill(Value::Bool(true));
             }
         }
         for keyword in SINGLE_SCHEMAS {
@@ -554,7 +552,8 @@ impl Compiler<'_> {
                 pointer(path, "$schema"),
             ));
         }
-        for keyword in ["secret"] {
+        {
+            let keyword = "secret";
             if map.get(keyword).is_some_and(|value| !value.is_boolean()) {
                 return Err(error(ErrorCode::InvalidDefinition, pointer(path, keyword)));
             }

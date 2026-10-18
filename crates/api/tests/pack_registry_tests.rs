@@ -3203,7 +3203,7 @@ async fn dev_version_republish_applies_to_install_upload_and_registration() -> R
         .get_pinned(
             &ObjectKey::new(first.object_key.unwrap())?,
             &attune_common::blob_store::ProviderVersion::from_stored(
-                &first.provider_version.unwrap(),
+                first.provider_version.unwrap(),
             )?,
             first.archive_size as u64,
             hex::decode(&first.digest)?.try_into().unwrap(),

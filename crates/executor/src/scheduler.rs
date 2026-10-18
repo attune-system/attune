@@ -722,6 +722,10 @@ struct PendingExecutionCompleted {
     completed_at: DateTime<Utc>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Consume one owned native checkpoint proof without changing inline custody across variants"
+)]
 enum NativeWaitCheckpoint {
     CompletionReplay(attune_common::repositories::native_wait_materialization::PreparedNativeWaitCompletionReplay),
     Delivery(attune_common::repositories::native_wait_materialization::PreparedNativeWait),
@@ -5644,7 +5648,7 @@ impl ExecutionScheduler {
                 &mut child_transaction, parent_execution.id, task_snapshot,
             ).await?;
             let item_ctx = Self::bind_workflow_task_keys(
-                &mut *child_transaction,
+                &mut child_transaction,
                 parent_execution,
                 task_node,
                 &item_ctx,
@@ -6590,7 +6594,7 @@ impl ExecutionScheduler {
             })?;
 
             let restored_parent_config = Self::restore_secret_entity(
-                &mut *transaction,
+                &mut transaction,
                 encryption_key,
                 ENTITY_EXECUTION_CONFIG,
                 parent_execution.id,
@@ -6616,7 +6620,7 @@ impl ExecutionScheduler {
                     continue;
                 }
                 let result = Self::restore_secret_entity(
-                    &mut *transaction,
+                    &mut transaction,
                     encryption_key,
                     ENTITY_EXECUTION_RESULT,
                     child.id,

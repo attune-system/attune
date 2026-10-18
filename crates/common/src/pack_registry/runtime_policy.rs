@@ -313,9 +313,9 @@ impl CandidateRuntimePolicyPlan {
                     .cloned(),
             );
             let snapshot_for_binding = executable.clone();
-            if !bound_executables.contains_key(&binding_key) {
-                bound_executables.insert(binding_key, snapshot_for_binding);
-            }
+            bound_executables
+                .entry(binding_key)
+                .or_insert(snapshot_for_binding);
         }
         let external_refs = required_refs
             .into_iter()

@@ -1102,7 +1102,9 @@ impl ArtifactsConfig {
                 )
             })?;
         if self.protected_file_memory_budget_bytes < minimum
-            || self.protected_file_memory_budget_bytes % (1024 * 1024) != 0
+            || !self
+                .protected_file_memory_budget_bytes
+                .is_multiple_of(1024 * 1024)
             || self.protected_file_memory_budget_bytes / (1024 * 1024) > u32::MAX as u64
             || self.file_transfer_concurrency == 0
             || self.file_transfer_concurrency > 1024

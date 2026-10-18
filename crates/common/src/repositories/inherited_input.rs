@@ -209,7 +209,15 @@ pub struct ReceiptContext {
 struct ReceiptGraphAccounting {
     bytes: usize,
     nodes: BTreeSet<(bool, Id)>,
+    charges: std::collections::BTreeMap<ReceiptGraphCharge, usize>,
     key_hash: String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReceiptGraphCharge {
+    Receipt(Id),
+    Snapshot(Id),
+    Accepted(Id),
+    EmptyRootRecipe(Id),
 }
 /// An original source reached by the authenticated receipt graph. This is not
 /// a current destination-field claim, a reader permission or an API capability.
@@ -636,7 +644,7 @@ impl ReceiptContext {
         }
         self.fence.ensure_fresh_on(conn).await
     }
-    fn copy_held(&self) -> Self {
+    pub(crate) fn copy_held(&self) -> Self {
         Self {
             graph_accounting: self.graph_accounting.clone(),
             wait_reads: self.wait_reads.clone(),
@@ -721,6 +729,28 @@ struct RenderProof {
     accepted: Option<Id>,
     selections: Vec<ReadSelection>,
 }
+#[derive(Clone)]
+struct PreparedReceiptArchive {
+    body: Value,
+    encrypted: Value,
+    key_hash: String,
+    value_digest: String,
+}
+impl PreparedReceiptArchive {
+    fn new(proof: &RenderProof, value: &Value, key: &str) -> Result<Self> {
+        let body = serde_json::to_value(proof)?;
+        bounded(&body)?;
+        Ok(Self {
+            body,
+            encrypted: crate::crypto::encrypt_json(value, key)?,
+            key_hash: crate::crypto::hash_encryption_key(key),
+            value_digest: hash(value)?,
+        })
+    }
+    fn bytes(&self) -> Result<usize> {
+        Ok(serde_json::to_vec(&self.body)?.len() + serde_json::to_vec(&self.encrypted)?.len())
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LiteralLeaf {
@@ -732,7 +762,10 @@ mod empty_iteration;
 mod empty_task_control;
 pub(crate) use empty_task_control::PreparedEmptyTaskControl;
 mod prepared_graph;
+pub(crate) use prepared_graph::PreparedArchiveGraphBudget;
 pub(crate) use prepared_graph::PreparedSourceGraphBudget;
+mod empty_root;
+pub(crate) use empty_root::PreparedEmptyRoot;
 pub struct InheritedInputRepository;
 impl InheritedInputRepository {
     /// Source phase only: retain a successful canonical Condition as CONTROL.
@@ -1034,6 +1067,12 @@ impl InheritedInputRepository {
             .await?;
         }
         let mut receipts = BTreeSet::new();
+        if let Some(NativeValueRecipe::EmptyRoot { snapshot }) = &proof.native {
+            let (parents, charge) =
+                empty_root::recipe_parents(conn, renderer, *snapshot, None).await?;
+            receipts.extend(parents.into_iter().map(|(id, _)| id));
+            bytes = bytes.checked_add(charge).ok_or_else(denied)?;
+        }
         let mut direct = BTreeSet::new();
         let mut origins = Vec::new();
         let mut accepted_inputs = vec![];
@@ -1424,6 +1463,10 @@ impl InheritedInputRepository {
     /// Independent, explicit consent for ONE retained declaration. This issues a
     /// fixed approval using the issuer's control-plane authority, not the selected
     /// SDK refs. Later reads never inspect the issuer's identity or assignments.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Consent identifies one exact declaration independently of issuer grants and expiry"
+    )]
     pub async fn approve_external_input(
         conn: &mut PgConnection,
         renderer: Id,
@@ -1447,6 +1490,10 @@ impl InheritedInputRepository {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep retained declaration identity separate from the approving issuer and grant"
+    )]
     pub async fn approve_external_declaration(
         conn: &mut PgConnection,
         policy: Id,
@@ -2802,6 +2849,10 @@ impl InheritedInputRepository {
                     graph_accounting.push(Some(std::sync::Arc::new(ReceiptGraphAccounting {
                         bytes: evidence.bytes,
                         nodes: BTreeSet::from([(true, *snapshot)]),
+                        charges: std::collections::BTreeMap::from([(
+                            ReceiptGraphCharge::Snapshot(*snapshot),
+                            evidence.bytes,
+                        )]),
                         key_hash: crate::crypto::hash_encryption_key(encryption_key),
                     })));
                     for (parent, site) in &evidence.parents {
@@ -3050,6 +3101,32 @@ impl InheritedInputRepository {
         encryption_key: &str,
         staging: bool,
     ) -> Result<ReceiptContext> {
+        Self::record_prepared_archive(
+            conn,
+            rendered,
+            prepared,
+            actual,
+            selected,
+            encryption_key,
+            staging,
+            None,
+        )
+        .await
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Archive publication checks the rendered value, destination, selection, and custody independently"
+    )]
+    async fn record_prepared_archive(
+        conn: &mut PgConnection,
+        rendered: &RenderedReceiptContext,
+        prepared: &PreparedReceiptDestination,
+        actual: &Value,
+        selected: &[ReadSelection],
+        encryption_key: &str,
+        staging: bool,
+        archive: Option<&PreparedReceiptArchive>,
+    ) -> Result<ReceiptContext> {
         require_transaction(conn, &rendered.transaction).await?;
         let destination = &prepared.site;
         if prepared.renderer != rendered.renderer.id
@@ -3132,7 +3209,17 @@ impl InheritedInputRepository {
         };
         let body = serde_json::to_value(&proof)?;
         bounded(&body)?;
-        let encrypted = crate::crypto::encrypt_json(actual, encryption_key)?;
+        let encrypted = if let Some(archive) = archive {
+            if archive.body != body
+                || archive.key_hash != crate::crypto::hash_encryption_key(encryption_key)
+                || archive.value_digest != hash(actual)?
+            {
+                return Err(denied());
+            }
+            archive.encrypted.clone()
+        } else {
+            crate::crypto::encrypt_json(actual, encryption_key)?
+        };
         let id:Id = sqlx::query_scalar("INSERT INTO runtime_input_receipt(execution,entity_kind,destination_purpose,destination_path,destination_admission,renderer_admission,declaration,proof,proof_digest,encrypted_value,encryption_key_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id")
             .bind(destination.execution).bind(destination.kind.as_str()).bind(destination.purpose.as_str()).bind(&destination.path).bind(prepared.admission).bind(proof.renderer).bind(proof.declaration).bind(&body).bind(hash(&body)?).bind(encrypted).bind(crate::crypto::hash_encryption_key(encryption_key)).fetch_one(&mut *conn).await?;
         for parent in &prepared.snapshot_parents {
@@ -3291,6 +3378,10 @@ impl InheritedInputRepository {
         )
         .await
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Wait, result, and empty-source witnesses are distinct opaque admission types"
+    )]
     async fn preparation_receipt_context_with_admissions(
         conn: &mut PgConnection,
         site: &InputSite,
@@ -3317,6 +3408,10 @@ impl InheritedInputRepository {
 
     /// The same authenticated graph traversal also supplies its byte charge.
     /// Pending native sources still require the original opaque issued reads.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Count the same authenticated graph with distinct wait, result, and empty-source witnesses"
+    )]
     async fn counted_preparation_receipt_context(
         conn: &mut PgConnection,
         site: &InputSite,
@@ -3352,6 +3447,7 @@ impl InheritedInputRepository {
         let mut root_value = None;
         let mut fence: Option<ApprovalEffectFence> = None;
         let mut bytes = 0usize;
+        let mut charges = std::collections::BTreeMap::new();
         while let Some((id, expected_site)) = pending.pop() {
             // Check every incoming site's identity even for an already verified
             // node, but do not reacquire its staged proof for every graph edge.
@@ -3374,7 +3470,20 @@ impl InheritedInputRepository {
                     return Err(denied());
                 }
             }
-            let row:Option<(Id,String,String,String,Id,Id,Option<Id>,Value,String,Value,String)> = sqlx::query_as("SELECT execution,entity_kind,destination_purpose,destination_path,destination_admission,renderer_admission,declaration,proof,proof_digest,encrypted_value,encryption_key_hash FROM runtime_input_receipt WHERE id = $1")
+            type RetainedReceiptRow = (
+                Id,
+                String,
+                String,
+                String,
+                Id,
+                Id,
+                Option<Id>,
+                Value,
+                String,
+                Value,
+                String,
+            );
+            let row:Option<RetainedReceiptRow> = sqlx::query_as("SELECT execution,entity_kind,destination_purpose,destination_path,destination_admission,renderer_admission,declaration,proof,proof_digest,encrypted_value,encryption_key_hash FROM runtime_input_receipt WHERE id = $1")
                 .bind(id).fetch_optional(&mut *conn).await?;
             let (
                 execution,
@@ -3393,6 +3502,7 @@ impl InheritedInputRepository {
                 + serde_json::to_vec(&encrypted)?.len()
                 + cache_control::staged_storage_bytes(conn, id).await?;
             bytes = bytes.checked_add(charge).ok_or_else(denied)?;
+            charges.insert(ReceiptGraphCharge::Receipt(id), charge);
             if bytes > 1024 * 1024 {
                 return Err(denied());
             }
@@ -3452,6 +3562,7 @@ impl InheritedInputRepository {
                         )
                         .await?;
                     bytes = bytes.checked_add(charge).ok_or_else(denied)?;
+                    charges.insert(ReceiptGraphCharge::Accepted(accepted), charge);
                     if bytes > 1024 * 1024 {
                         return Err(denied());
                     }
@@ -3498,6 +3609,13 @@ impl InheritedInputRepository {
                         .any(|read| read.snapshot() == native.snapshot()),
                 )
                 .await?;
+                if let NativeValueRecipe::EmptyRoot { snapshot } = native {
+                    let (parents, charge) =
+                        empty_root::recipe_parents(conn, renderer, *snapshot, None).await?;
+                    accepted_sources = parents;
+                    bytes = bytes.checked_add(charge).ok_or_else(denied)?;
+                    charges.insert(ReceiptGraphCharge::EmptyRootRecipe(*snapshot), charge);
+                }
                 None
             } else {
                 let leaf = proof.literal.as_ref().ok_or_else(denied)?;
@@ -3646,6 +3764,7 @@ impl InheritedInputRepository {
                         fence = Some(fence.ok_or_else(denied)?.intersect(&evidence.fence));
                         if snapshot_seen.insert(snapshot) {
                             bytes += evidence.bytes;
+                            charges.insert(ReceiptGraphCharge::Snapshot(snapshot), evidence.bytes);
                             if bytes > 1024 * 1024 {
                                 return Err(denied());
                             }
@@ -3970,6 +4089,7 @@ impl InheritedInputRepository {
                 graph_accounting: Some(std::sync::Arc::new(ReceiptGraphAccounting {
                     bytes,
                     nodes: graph_nodes.clone(),
+                    charges,
                     key_hash: crate::crypto::hash_encryption_key(encryption_key),
                 })),
                 result_reads: result_reads
@@ -4286,7 +4406,7 @@ impl AsyncEvalContext for LoadingContext<'_> {
                 .iter()
                 .find(|value| value.path == path)
                 .map(|value| Some(value.value.clone()))
-                .ok_or_else(|| EvalError::VariableNotFound(path))
+                .ok_or(EvalError::VariableNotFound(path))
         })
     }
 }
@@ -4319,7 +4439,7 @@ impl EvalContext for TraceContext<'_> {
         }
         root.pointer(&path)
             .cloned()
-            .ok_or_else(|| EvalError::VariableNotFound(path))
+            .ok_or(EvalError::VariableNotFound(path))
     }
     fn call_workflow_function(&self, name: &str, args: &[Value]) -> EvalResult<Option<Value>> {
         if name == "result" && args.is_empty() {
@@ -4602,7 +4722,12 @@ fn transition_condition(path: &str) -> bool {
         return false;
     }
     let task = &tokens[..tokens.len() - 3];
-    task.len() % 2 == 0 && task.chunks_exact(2).all(|pair| pair[0] == "tasks")
+    task.len() % 2 == 0
+        && task
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|pair| pair[0] == "tasks")
 }
 async fn literal_value(
     conn: &mut PgConnection,
@@ -5014,6 +5139,88 @@ async fn require_transaction(conn: &mut PgConnection, expected: &str) -> Result<
         return Err(denied());
     }
     Ok(())
+}
+
+async fn locked_approval(
+    conn: &mut PgConnection,
+    declaration: Id,
+    pack: Id,
+    approval: Id,
+) -> Result<super::runtime_authority::ExternalApprovalRecord> {
+    let exists:Option<Id>=sqlx::query_scalar("SELECT a.id FROM runtime_external_approval a JOIN runtime_declared_input_approval binding ON binding.approval = a.id WHERE binding.declaration = $1 AND a.id = $2 FOR SHARE OF a")
+        .bind(declaration).bind(approval).fetch_optional(&mut *conn).await?;
+    if exists.is_none() {
+        return Err(denied());
+    }
+    let approval = RuntimeAuthorityRepository::find_approval(conn, approval)
+        .await?
+        .ok_or_else(denied)?;
+    if approval.subject_pack != pack || !approval.is_active(chrono::Utc::now()) {
+        return Err(denied());
+    }
+    approval.approval()?;
+    Ok(approval)
+}
+
+async fn input_approval(
+    conn: &mut PgConnection,
+    declaration: Id,
+    pack: Id,
+    approval: Id,
+    target: &super::runtime_target::ResolvedRuntimeTarget,
+    key: Id,
+    encrypted: bool,
+) -> Result<Option<ApprovalEffectFence>> {
+    let approval = locked_approval(conn, declaration, pack, approval).await?;
+    let mut required = vec![crate::rbac::Action::Read];
+    if encrypted {
+        required.push(crate::rbac::Action::Decrypt);
+    }
+    for action in required {
+        let mut allowed = false;
+        for grant in approval.grants.iter() {
+            if !grant.allows(crate::rbac::Resource::Keys, action, target.context()) {
+                continue;
+            }
+            let binding:Option<sqlx::types::Json<crate::runtime_authority::GrantTargetBindings>>=sqlx::query_scalar("SELECT binding FROM runtime_external_approval_target_binding WHERE approval = $1 AND grant_digest = $2")
+                .bind(approval.id).bind(hash(&serde_json::to_value(grant)?)?).fetch_optional(&mut *conn).await?;
+            if binding
+                .as_ref()
+                .is_some_and(|binding| super::runtime_target_binding::matches(&binding.0, target))
+            {
+                allowed = true;
+                break;
+            }
+        }
+        if !allowed {
+            return Ok(None);
+        }
+    }
+    if target.resource() != crate::rbac::Resource::Keys || key <= 0 {
+        return Err(denied());
+    }
+    Ok(Some(ApprovalEffectFence::from_input_approval(
+        approval.expires_at,
+    )?))
+}
+
+async fn retained_input_approval(
+    conn: &mut PgConnection,
+    declaration: Id,
+    pack: Id,
+    approval: Id,
+    origin: &SecretOrigin,
+    target: &crate::runtime_authority::BoundRuntimeTarget,
+) -> Result<ApprovalEffectFence> {
+    let approval = locked_approval(conn, declaration, pack, approval).await?;
+    let body = serde_json::to_value(origin)?;
+    let proof:Option<(Value,Value)>=sqlx::query_as("SELECT origin,target FROM runtime_declared_input_key_read WHERE declaration = $1 AND approval = $2 AND origin_digest = $3")
+        .bind(declaration).bind(approval.id).bind(hash(&body)?).fetch_optional(&mut *conn).await?;
+    let (saved_origin, saved_target) = proof.ok_or_else(denied)?;
+    if saved_origin != body || saved_target != serde_json::to_value(target)? {
+        return Err(denied());
+    }
+    ApprovalEffectFence::from_input_approval(approval.expires_at)
 }
 
 #[cfg(test)]
@@ -5458,86 +5665,4 @@ mod tests {
         ));
         assert!(!transition_condition("/workflow/vars/next/0/when"));
     }
-}
-
-async fn locked_approval(
-    conn: &mut PgConnection,
-    declaration: Id,
-    pack: Id,
-    approval: Id,
-) -> Result<super::runtime_authority::ExternalApprovalRecord> {
-    let exists:Option<Id>=sqlx::query_scalar("SELECT a.id FROM runtime_external_approval a JOIN runtime_declared_input_approval binding ON binding.approval = a.id WHERE binding.declaration = $1 AND a.id = $2 FOR SHARE OF a")
-        .bind(declaration).bind(approval).fetch_optional(&mut *conn).await?;
-    if exists.is_none() {
-        return Err(denied());
-    }
-    let approval = RuntimeAuthorityRepository::find_approval(conn, approval)
-        .await?
-        .ok_or_else(denied)?;
-    if approval.subject_pack != pack || !approval.is_active(chrono::Utc::now()) {
-        return Err(denied());
-    }
-    approval.approval()?;
-    Ok(approval)
-}
-
-async fn input_approval(
-    conn: &mut PgConnection,
-    declaration: Id,
-    pack: Id,
-    approval: Id,
-    target: &super::runtime_target::ResolvedRuntimeTarget,
-    key: Id,
-    encrypted: bool,
-) -> Result<Option<ApprovalEffectFence>> {
-    let approval = locked_approval(conn, declaration, pack, approval).await?;
-    let mut required = vec![crate::rbac::Action::Read];
-    if encrypted {
-        required.push(crate::rbac::Action::Decrypt);
-    }
-    for action in required {
-        let mut allowed = false;
-        for grant in approval.grants.iter() {
-            if !grant.allows(crate::rbac::Resource::Keys, action, target.context()) {
-                continue;
-            }
-            let binding:Option<sqlx::types::Json<crate::runtime_authority::GrantTargetBindings>>=sqlx::query_scalar("SELECT binding FROM runtime_external_approval_target_binding WHERE approval = $1 AND grant_digest = $2")
-                .bind(approval.id).bind(hash(&serde_json::to_value(grant)?)?).fetch_optional(&mut *conn).await?;
-            if binding
-                .as_ref()
-                .is_some_and(|binding| super::runtime_target_binding::matches(&binding.0, target))
-            {
-                allowed = true;
-                break;
-            }
-        }
-        if !allowed {
-            return Ok(None);
-        }
-    }
-    if target.resource() != crate::rbac::Resource::Keys || key <= 0 {
-        return Err(denied());
-    }
-    Ok(Some(ApprovalEffectFence::from_input_approval(
-        approval.expires_at,
-    )?))
-}
-
-async fn retained_input_approval(
-    conn: &mut PgConnection,
-    declaration: Id,
-    pack: Id,
-    approval: Id,
-    origin: &SecretOrigin,
-    target: &crate::runtime_authority::BoundRuntimeTarget,
-) -> Result<ApprovalEffectFence> {
-    let approval = locked_approval(conn, declaration, pack, approval).await?;
-    let body = serde_json::to_value(origin)?;
-    let proof:Option<(Value,Value)>=sqlx::query_as("SELECT origin,target FROM runtime_declared_input_key_read WHERE declaration = $1 AND approval = $2 AND origin_digest = $3")
-        .bind(declaration).bind(approval.id).bind(hash(&body)?).fetch_optional(&mut *conn).await?;
-    let (saved_origin, saved_target) = proof.ok_or_else(denied)?;
-    if saved_origin != body || saved_target != serde_json::to_value(target)? {
-        return Err(denied());
-    }
-    ApprovalEffectFence::from_input_approval(approval.expires_at)
 }

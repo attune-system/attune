@@ -100,11 +100,9 @@ impl Recovery {
             );
         }
         let bytes = children.iter().try_fold(program.bytes()?, |bytes, child| {
-            Ok::<_, Error>(
-                bytes
-                    .checked_add(serde_json::to_vec(&child.child.value)?.len())
-                    .ok_or_else(denied)?,
-            )
+            bytes
+                .checked_add(serde_json::to_vec(&child.child.value)?.len())
+                .ok_or_else(denied)
         })?;
         if bytes > 1024 * 1024 {
             return Err(denied());

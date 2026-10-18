@@ -1085,8 +1085,12 @@ mod receipt_snapshot_tests {
 }
 
 #[cfg(test)]
-mod success_tests;
+pub(crate) mod success_tests;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Disclosure checks the exact source, origin, traversal budget, and actor independently"
+)]
 async fn authorize_success_source(
     conn: &mut PgConnection,
     authority: &ValidatedRuntimeAuthority,
@@ -1148,6 +1152,10 @@ async fn authorize_success_source(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Wait disclosure keeps source identity, origin, traversal budget, and actor checks explicit"
+)]
 async fn authorize_wait_completion_source(
     conn: &mut PgConnection,
     authority: &ValidatedRuntimeAuthority,

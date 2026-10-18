@@ -50,9 +50,11 @@ mod completion;
 mod empty;
 mod empty_activation;
 mod empty_ordinary;
+mod empty_root;
 pub use completion::{NativeIterationCompletionMember, PreparedNativeIterationCompletion};
 pub use empty::NativeEmptyIterationSource;
 pub use empty_activation::{PreparedNativeEmptyActivation, PreparedNativeEmptyRecovery};
+pub use empty_root::PreparedEmptyRootReplay;
 
 // Ordinary iteration already creates its complete sibling set at activation.
 // Bound that set and its proof buffers instead of loading retry/result history.
@@ -132,6 +134,7 @@ impl ObservedInputState {
 }
 
 pub struct PreparedNativeIteration {
+    empty_root: Option<super::inherited_input::PreparedEmptyRoot>,
     empty_control: Option<ReceiptContext>,
     empty_outcome: Option<super::native_input_snapshot::PreparedNativeEmptyIterationOutcome>,
     context: Context,
@@ -163,8 +166,8 @@ pub struct NativeIterationResult {
     pub requested: Vec<Execution>,
     pub total: usize,
     pub remaining: i64,
-    /// A real parent row, never a synthetic child/outcome. Autonomous terminal
-    /// aggregation changes lifecycle state only and manufactures no Value.
+    /// A real terminal parent, never a synthetic child/outcome. Empty roots use
+    /// their finite output recipe; nonempty aggregation remains status-only.
     pub completed_parent: Option<Execution>,
 }
 
@@ -611,6 +614,7 @@ impl NativeIterationMaterializationRepository {
         .await?
         .in_flight;
         let mut plan = PreparedNativeIteration {
+            empty_root: None,
             empty_control: None,
             empty_outcome: None,
             context,
@@ -1071,6 +1075,9 @@ impl NativeIterationMaterializationRepository {
                 conn, &plan.empty_source()?, key,
             ).await?;
             plan.empty_outcome = Some(outcome);
+            if plan.is_terminal_empty_root() && plan.context.frame.is_none() {
+                plan.empty_root = Some(plan.prepare_empty_root(conn, key).await?);
+            }
         }
         plan.ensure_fresh_on(conn).await?;
         Ok(plan)
@@ -1085,10 +1092,7 @@ impl PreparedNativeIteration {
         self.total
     }
     pub fn can_complete_empty(&self) -> bool {
-        self.total == 0
-            && self.empty_outcome.is_some()
-            && self.can_finalize_status_only()
-            && self.context.workflow.failed_tasks.is_empty()
+        self.empty_root.is_some()
     }
     /// Successful or failed item aggregation may change real lifecycle state,
     /// but must not manufacture a result view while A/H own that Value seam.
@@ -1228,6 +1232,9 @@ impl PreparedNativeIteration {
         })
     }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
+        if let Some(root) = &self.empty_root {
+            root.ensure_fresh_on(conn).await?;
+        }
         if let Some(frame) = &self.context.frame {
             frame.ensure_fresh_on(conn).await?;
         }
@@ -1271,6 +1278,9 @@ impl PreparedNativeIteration {
         self.ensure_source_fresh()
     }
     fn ensure_source_fresh(&self) -> Result<()> {
+        if let Some(root) = &self.empty_root {
+            root.ensure_fresh()?;
+        }
         if let Some(control) = &self.empty_control {
             control.ensure_fresh()?;
         }
@@ -1317,6 +1327,9 @@ impl PreparedNativeIteration {
         key: &str,
         published: Option<(&WorkflowExecution, &[StoredSecretValue])>,
     ) -> Result<NativeIterationResult> {
+        // Reject foreign/expired source tokens before taking target locks or
+        // consuming the genuine issuing plan.
+        self.ensure_fresh_on(conn).await?;
         if self.applied {
             return Err(changed());
         }
@@ -1438,7 +1451,8 @@ impl PreparedNativeIteration {
             self.receipts
                 .extend(Materialize::seal_execution_inputs(conn, child.row.id, key).await?);
         }
-        let settled = self.can_finalize_status_only()
+        let settled = (self.empty_root.is_some()
+            || (self.total != 0 && self.can_finalize_status_only()))
             && remaining == 0
             && (self.total == 0 || self.observations.len() == self.total);
         let succeeded = self
@@ -1446,6 +1460,35 @@ impl PreparedNativeIteration {
             .iter()
             .all(|outcome| outcome.status == ExecutionStatus::Completed);
         let completed_parent = if settled {
+            let root_output = if let Some(root) = &self.empty_root {
+                let receipt = Inputs::record_empty_root(
+                    conn,
+                    root,
+                    self.empty_outcome.as_ref().ok_or_else(changed)?,
+                    key,
+                )
+                .await?;
+                let sources = vec![SecretPathSource {
+                    path: String::new(),
+                    source: SecretSource::Bound(receipt.provenance()),
+                }];
+                let (value, secrets) = crate::secret_values::redact_secret_path_sources(
+                    root.value().clone(),
+                    &sources,
+                );
+                let secrets = crate::secret_values::prepare_secret_values(secrets, key)?;
+                Secrets::replace_entity_with_conn(
+                    &mut *conn,
+                    "execution_result",
+                    self.context.parent.id,
+                    &secrets,
+                )
+                .await?;
+                self.receipts.push(receipt);
+                Some(value)
+            } else {
+                None
+            };
             let mut completed_tasks = self.context.workflow.completed_tasks.clone();
             let mut failed_tasks = self.context.workflow.failed_tasks.clone();
             if succeeded && !completed_tasks.contains(&self.context.task_name) {
@@ -1482,8 +1525,8 @@ impl PreparedNativeIteration {
                 },
             )
             .await?;
-            // There is deliberately no synthesized result(), {items: []}, or
-            // {succeeded: true} VALUE. Declared/generated outputs stay with H.
+            // Nonempty aggregation keeps its status-only contract. Empty output
+            // above comes from the finite recipe, never an invented child VALUE.
             super::runtime_read::RuntimeReadRepository::close_execution(
                 conn,
                 self.context.parent.id,
@@ -1495,6 +1538,7 @@ impl PreparedNativeIteration {
                     self.context.parent.id,
                     UpdateExecutionInput {
                         status: Some(status),
+                        result: root_output,
                         ..Default::default()
                     },
                 )

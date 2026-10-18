@@ -25,7 +25,7 @@ impl EventSchemaRepository {
         use super::{Create, FindByRef};
         use crate::secret_values::prepare_secret_values;
         let mut tx = pool.begin().await?;
-        SchemaTypeRepository::lock_selection(&mut *tx).await?;
+        SchemaTypeRepository::lock_selection(&mut tx).await?;
         let Some(trigger) = TriggerRepository::find_by_ref(&mut *tx, &input.trigger_ref).await?
         else {
             return Ok(None);

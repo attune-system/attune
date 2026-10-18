@@ -546,6 +546,10 @@ impl SourceCacheCompletion {
         self.require_terminal_frontier(conn).await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Completion preparation requires independent EOF, control, issued-input, and frame custody"
+    )]
     pub(super) async fn prepare(
         conn: &mut PgConnection,
         context: &Context,

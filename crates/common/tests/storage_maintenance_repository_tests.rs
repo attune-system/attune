@@ -61,13 +61,11 @@ async fn collect_version_overflow(pool: &sqlx::PgPool, artifact: i64) -> usize {
                 .await
                 .unwrap()
                 == [candidate.id]
-        {
-            if ArtifactVersionRepository::delete(&mut *tx, candidate.id)
+            && ArtifactVersionRepository::delete(&mut *tx, candidate.id)
                 .await
                 .unwrap()
-            {
-                deleted += 1;
-            }
+        {
+            deleted += 1;
         }
         tx.commit().await.unwrap();
     }

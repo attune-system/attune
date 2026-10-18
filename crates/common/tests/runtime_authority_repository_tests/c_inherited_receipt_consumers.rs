@@ -116,9 +116,13 @@ async fn immutable_configuration_root_keeps_original_field_and_independent_input
         entity_id: original.id,
         path: "/token".into(),
     };
-    Origins::require(&mut tx, &[authority.clone()], &[origin.clone()])
-        .await
-        .unwrap();
+    Origins::require(
+        &mut tx,
+        std::slice::from_ref(&authority),
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
     let narrowed = DelegationAuthority::new(
         fixture.human_id,
         Default::default(),
@@ -128,7 +132,12 @@ async fn immutable_configuration_root_keeps_original_field_and_independent_input
         .unwrap(),
     );
     assert_denied(
-        Origins::require(&mut tx, &[authority.clone(), narrowed], &[origin.clone()]).await,
+        Origins::require(
+            &mut tx,
+            &[authority.clone(), narrowed],
+            std::slice::from_ref(&origin),
+        )
+        .await,
     );
     let current = Configurations::bind_pack(
         &mut tx,
@@ -139,9 +148,13 @@ async fn immutable_configuration_root_keeps_original_field_and_independent_input
     .await
     .unwrap();
     assert_ne!(current.id, original.id);
-    Origins::require(&mut tx, &[authority.clone()], &[origin.clone()])
-        .await
-        .unwrap();
+    Origins::require(
+        &mut tx,
+        std::slice::from_ref(&authority),
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         Configurations::restore(&mut tx, &original, Some(key))
             .await
@@ -182,7 +195,7 @@ async fn immutable_configuration_root_keeps_original_field_and_independent_input
         assert_denied(
             Origins::require(
                 &mut tx,
-                &[authority.clone()],
+                std::slice::from_ref(&authority),
                 &[SecretOrigin::Entity {
                     entity_type: kind.into(),
                     entity_id: original.id,
@@ -197,7 +210,7 @@ async fn immutable_configuration_root_keeps_original_field_and_independent_input
         entity_id: current.id,
         path: "/later".into(),
     };
-    Origins::require(&mut tx, &[authority.clone()], &[later])
+    Origins::require(&mut tx, std::slice::from_ref(&authority), &[later])
         .await
         .unwrap();
     IdentityRepository::update(
@@ -322,8 +335,7 @@ async fn native_outcome_receipt_reaches_delivery_and_disclosure_frontier_without
         .unwrap();
     let mut executions = Vec::new();
     let mut workflow_execution = None;
-    for index in 0..2 {
-        let binding = &bindings[index];
+    for (index, binding) in bindings.iter().enumerate().take(2) {
         let pin = ManagedExecutableRepository::resolve_invocation(&mut tx, &policy.policy, binding)
             .await
             .unwrap();

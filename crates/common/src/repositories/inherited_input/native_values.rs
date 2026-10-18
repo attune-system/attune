@@ -11,6 +11,9 @@ use super::*;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "recipe", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum NativeValueRecipe {
+    EmptyRoot {
+        snapshot: Id,
+    },
     WaitCompletion {
         snapshot: Id,
     },
@@ -29,6 +32,7 @@ pub(super) enum NativeValueRecipe {
 impl NativeValueRecipe {
     pub(super) fn snapshot(&self) -> Id {
         match self {
+            Self::EmptyRoot { snapshot } => *snapshot,
             Self::WaitCompletion { snapshot } => *snapshot,
             Self::OrdinarySuccess { snapshot } => *snapshot,
             Self::OrdinaryFailure { snapshot } => *snapshot,
@@ -397,6 +401,24 @@ pub(super) async fn validate_recipe(
             }
             _ => return Err(denied()),
         }
+        return Ok(());
+    }
+    if let NativeValueRecipe::EmptyRoot { snapshot } = recipe {
+        if site.execution != renderer.owner_id
+            || site.kind != InputEntityKind::ExecutionResult
+            || site.purpose != InputSitePurpose::Value
+            || !site.path.is_empty()
+            || selections
+                != [ReadSelection {
+                    context_path: "$control".into(),
+                    source: SelectionSource::NativeSnapshot {
+                        snapshot: *snapshot,
+                    },
+                }]
+        {
+            return Err(denied());
+        }
+        super::empty_root::recipe_parents(conn, renderer.id, *snapshot, plaintext).await?;
         return Ok(());
     }
     if site.execution != renderer.owner_id

@@ -692,9 +692,8 @@ impl SchemaContractRepository {
                 } else {
                     sources.insert(target_pack.into(), selected.clone());
                 }
-                if !views.contains_key(&selected.id) {
-                    views.insert(
-                        selected.id,
+                if let std::collections::btree_map::Entry::Vacant(e) = views.entry(selected.id) {
+                    e.insert(
                         SchemaTypeRepository::release_view(
                             &mut *transaction,
                             selected.id,

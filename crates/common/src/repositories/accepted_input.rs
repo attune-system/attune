@@ -821,6 +821,10 @@ async fn normalize_delivered(
     }
     Ok(())
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Validate each recorded queue identity and provenance field explicitly"
+)]
 async fn validate_local_queue_source(
     conn: &mut PgConnection,
     queue: Id,

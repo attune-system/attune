@@ -25,6 +25,10 @@ use std::sync::OnceLock;
 
 pub struct RequestedExecutionPublicationRepository;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Publication consumes the complete owned standalone or workflow proof exactly once"
+)]
 enum Continuation {
     Standalone {
         schema: ActionSchemaBinding,

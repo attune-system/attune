@@ -2923,10 +2923,10 @@ async fn register_pack_internal(
                     details.release_id = committed_release_id;
                     if projection_ready {
                         details.outcome = "activation_committed_cleanup_failed".into();
-                        *source = Box::new(ApiError::InternalServerError("The release was activated and its filesystem projection is available, but storage finalization failed. Ask the operator to clean up pack storage; do not blindly reinstall.".into()));
+                        **source = ApiError::InternalServerError("The release was activated and its filesystem projection is available, but storage finalization failed. Ask the operator to clean up pack storage; do not blindly reinstall.".into());
                     } else {
                         details.outcome = "activation_committed_projection_unavailable".into();
-                        *source = Box::new(ApiError::InternalServerError("The database release was activated, but its filesystem projection is unavailable. Ask the operator to reconcile pack storage; do not blindly reinstall.".into()));
+                        **source = ApiError::InternalServerError("The database release was activated, but its filesystem projection is unavailable. Ask the operator to reconcile pack storage; do not blindly reinstall.".into());
                     }
                 }
             }

@@ -93,7 +93,9 @@ mod runtime_read_event_tests {
             payload_secrets: vec![],
             config_secrets: vec![],
         };
-        sections.inherit_runtime_reads(&[origin.clone()]).unwrap();
+        sections
+            .inherit_runtime_reads(std::slice::from_ref(&origin))
+            .unwrap();
         for (value, inputs) in [
             (sections.payload, sections.payload_secrets),
             (sections.config, sections.config_secrets),

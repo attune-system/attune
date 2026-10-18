@@ -780,7 +780,7 @@ pub async fn list_queue_items(
         recorded::fence(&mut tx, &user, &queue, None, true, RbacAction::Read).await?;
 
     let result = WorkQueueItemRepository::search_with_conn(
-        &mut *tx,
+        &mut tx,
         &WorkQueueItemSearchFilters {
             queue: Some(queue.id),
             item_key: query.item_key.clone(),
@@ -1097,7 +1097,7 @@ pub async fn preview_queue_items_by_selector(
     let selector = selector_from_request(&request.selector);
     let result = map_selector_result(
         WorkQueueItemRepository::preview_selected_mutable_with_conn(
-            &mut *tx,
+            &mut tx,
             queue.id,
             &selector,
             request.limit.min(100),

@@ -9,6 +9,10 @@ use attune_common::repositories::{
     Update,
 };
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Successor cases keep workflow, parent, admission, wait, and deadline identities separate"
+)]
 pub(super) async fn run(
     pool: &sqlx::PgPool,
     workflow: Id,

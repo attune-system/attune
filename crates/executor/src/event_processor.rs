@@ -4,7 +4,7 @@
 //! finds matching rules for the event's trigger, evaluates conditions, and
 //! creates enforcement records for rules that match.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use sqlx::{PgConnection, PgPool};
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,169 +35,6 @@ use std::time::Duration;
 
 struct EventConditionContext {
     event: serde_json::Value,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use attune_common::{
-        config::Config,
-        event_schema::EventSchemaBinding,
-        repositories::{
-            event::CreateEventInput, event_origin::EventOriginRepository, pack::CreatePackInput,
-            schema_type::SchemaTypeRepository, Create,
-        },
-        test_database::TestDatabase,
-    };
-    use serde_json::json;
-
-    #[tokio::test]
-    async fn rule_rendering_finishes_while_graph_reclamation_waits() -> Result<()> {
-        let config = Config::load_from_file(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../config.test.yaml")
-                .to_str()
-                .unwrap(),
-        )?;
-        let database = TestDatabase::create(&config.database).await?;
-        let pool = database.pool();
-        let pack = PackRepository::create(
-            pool,
-            CreatePackInput {
-                r#ref: "graph_renderer".into(),
-                label: "Graph Renderer".into(),
-                description: None,
-                version: "1.0.0".into(),
-                conf_schema: json!({"region":{"type":"string"}}),
-                config: json!({"region":"fixture-region"}),
-                meta: json!({}),
-                tags: vec![],
-                runtime_deps: vec![],
-                dependencies: vec![],
-                is_standard: false,
-                installers: json!({}),
-            },
-        )
-        .await?;
-        let mut setup = pool.begin().await?;
-        let event = EventRepository::create(
-            &mut *setup,
-            CreateEventInput {
-                trigger: None,
-                trigger_ref: "graph_renderer.input".into(),
-                config: None,
-                payload: Some(json!({"message":"fixture-message"})),
-                trace_tag: None,
-                source: None,
-                source_ref: None,
-                rule: None,
-                rule_ref: None,
-            },
-        )
-        .await?;
-        EventOriginRepository::capture(
-            &mut setup,
-            &event,
-            &EventSchemaBinding {
-                trigger_id: None,
-                trigger_ref: event.trigger_ref.clone(),
-                payload: None,
-                config: None,
-                webhook: false,
-            },
-            &[],
-            &[],
-        )
-        .await?;
-        setup.commit().await?;
-        let now = chrono::Utc::now();
-        let rule = Rule {
-            id: 1,
-            r#ref: "graph_renderer.rule".into(),
-            pack: pack.id,
-            pack_ref: pack.r#ref.clone(),
-            label: "Graph Renderer Rule".into(),
-            description: None,
-            action: None,
-            action_ref: "graph_renderer.action".into(),
-            trigger: None,
-            trigger_ref: event.trigger_ref.clone(),
-            conditions: json!({}),
-            action_params: json!({}),
-            trigger_params: json!({}),
-            sensor_worker_selector: json!({}),
-            sensor_worker_tolerations: json!([]),
-            sensor_worker_affinity: json!({}),
-            trace_tag_template: None,
-            permission_set_refs: None,
-            enabled: true,
-            enabled_override: None,
-            is_adhoc: true,
-            owner_identity: Some(1),
-            retired_at: None,
-            created: now,
-            updated: now,
-        };
-        let authority =
-            attune_common::delegation::DelegationAuthority::new(1, Default::default(), vec![]);
-        let mut admission = pool.begin().await?;
-        SchemaTypeRepository::lock_selection(&mut admission).await?;
-        let writer_pool = pool.clone();
-        let (ready, pending) = tokio::sync::oneshot::channel();
-        let writer = tokio::spawn(async move {
-            let mut transaction = writer_pool.begin().await?;
-            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut *transaction)
-                .await?;
-            let _ = ready.send(pid);
-            SchemaTypeRepository::lock_reclamation(&mut transaction).await?;
-            transaction.commit().await?;
-            Ok::<_, anyhow::Error>(())
-        });
-        let pid = pending.await?;
-        let queued = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
-                ).bind(pid).fetch_one(pool).await?;
-                if waiting {return Ok::<_, sqlx::Error>(());}
-                tokio::task::yield_now().await;
-            }
-        }).await;
-        let parameters =
-            json!({"region":"{{ pack.config.region }}", "message":"{{ event.payload.message }}"});
-        let rendered = if queued.as_ref().is_ok_and(|ready| ready.is_ok()) {
-            Some(
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    EventProcessor::resolve_action_params(
-                        &mut admission,
-                        &None,
-                        &rule,
-                        &event,
-                        event.payload.as_ref().unwrap(),
-                        &authority,
-                        &parameters,
-                    ),
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-        admission.rollback().await?;
-        tokio::time::timeout(Duration::from_secs(5), writer).await???;
-        database.cleanup().await?;
-        queued??;
-        let rendered = rendered.unwrap().expect(
-            "Rule rendering must not reacquire graph admission through a second connection",
-        )?;
-        assert_eq!(
-            rendered.value,
-            json!({"region":"fixture-region","message":"fixture-message"})
-        );
-        Ok(())
-    }
 }
 
 impl EvalContext for EventConditionContext {
@@ -577,6 +414,12 @@ impl EventProcessor {
                 attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Rule, rule.id),
                 &attune_common::runtime_authority::InvocationBinding::Rule { rule_ref: rule.r#ref.clone(), action_ref: action.r#ref.clone() },
             ).await?
+        } else if !action.is_adhoc {
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
+                &mut tx, action.pack,
+                attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Action, action.id),
+                &attune_common::runtime_authority::InvocationBinding::Action { action_ref: action.r#ref.clone() },
+            ).await?
         } else {
             attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
             &mut *tx, action.id,
@@ -619,9 +462,47 @@ impl EventProcessor {
             input_authority
                 .require_refs_for_share(&mut tx, refs)
                 .await?;
-            None
+            if action.is_adhoc {
+                None
+            } else {
+                use attune_common::{
+                    rbac::{Action as PermissionAction, Resource},
+                    repositories::{
+                        execution_admission::ExecutionAdmissionRepository,
+                        runtime_target::{ComponentTarget, RuntimeTarget, RuntimeTargetRepository},
+                    },
+                    runtime_authority::{InvocationBinding, RequestAttribution},
+                };
+                let source = RuntimeTarget::Component(ComponentTarget::Action, action.id);
+                let target = RuntimeTargetRepository::resolve(&mut tx, source, identity_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Rule target action is unavailable"))?;
+                if !input_authority.allows(
+                    Resource::Actions,
+                    PermissionAction::Execute,
+                    target.context().clone(),
+                ) {
+                    bail!("Rule owner cannot execute the target action");
+                }
+                Some(
+                    ExecutionAdmissionRepository::select(
+                        &mut tx,
+                        action.pack,
+                        InvocationBinding::Action {
+                            action_ref: action.r#ref.clone(),
+                        },
+                        &snapshot,
+                        refs,
+                        RequestAttribution::Rule {
+                            rule_ref: rule.r#ref.clone(),
+                        },
+                        source,
+                    )
+                    .await?,
+                )
+            }
         };
-        let binding = if !rule.is_adhoc {
+        let binding = if admission.is_some() {
             attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &snapshot).await?
         } else {
             attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?
@@ -1048,5 +929,168 @@ impl EventProcessor {
             .binding
             .validate_payload_restored(Some(&restored))?;
         Ok((restored, source))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attune_common::{
+        config::Config,
+        event_schema::EventSchemaBinding,
+        repositories::{
+            event::CreateEventInput, event_origin::EventOriginRepository, pack::CreatePackInput,
+            schema_type::SchemaTypeRepository, Create,
+        },
+        test_database::TestDatabase,
+    };
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn rule_rendering_finishes_while_graph_reclamation_waits() -> Result<()> {
+        let config = Config::load_from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config.test.yaml")
+                .to_str()
+                .unwrap(),
+        )?;
+        let database = TestDatabase::create(&config.database).await?;
+        let pool = database.pool();
+        let pack = PackRepository::create(
+            pool,
+            CreatePackInput {
+                r#ref: "graph_renderer".into(),
+                label: "Graph Renderer".into(),
+                description: None,
+                version: "1.0.0".into(),
+                conf_schema: json!({"region":{"type":"string"}}),
+                config: json!({"region":"fixture-region"}),
+                meta: json!({}),
+                tags: vec![],
+                runtime_deps: vec![],
+                dependencies: vec![],
+                is_standard: false,
+                installers: json!({}),
+            },
+        )
+        .await?;
+        let mut setup = pool.begin().await?;
+        let event = EventRepository::create(
+            &mut *setup,
+            CreateEventInput {
+                trigger: None,
+                trigger_ref: "graph_renderer.input".into(),
+                config: None,
+                payload: Some(json!({"message":"fixture-message"})),
+                trace_tag: None,
+                source: None,
+                source_ref: None,
+                rule: None,
+                rule_ref: None,
+            },
+        )
+        .await?;
+        EventOriginRepository::capture(
+            &mut setup,
+            &event,
+            &EventSchemaBinding {
+                trigger_id: None,
+                trigger_ref: event.trigger_ref.clone(),
+                payload: None,
+                config: None,
+                webhook: false,
+            },
+            &[],
+            &[],
+        )
+        .await?;
+        setup.commit().await?;
+        let now = chrono::Utc::now();
+        let rule = Rule {
+            id: 1,
+            r#ref: "graph_renderer.rule".into(),
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            label: "Graph Renderer Rule".into(),
+            description: None,
+            action: None,
+            action_ref: "graph_renderer.action".into(),
+            trigger: None,
+            trigger_ref: event.trigger_ref.clone(),
+            conditions: json!({}),
+            action_params: json!({}),
+            trigger_params: json!({}),
+            sensor_worker_selector: json!({}),
+            sensor_worker_tolerations: json!([]),
+            sensor_worker_affinity: json!({}),
+            trace_tag_template: None,
+            permission_set_refs: None,
+            enabled: true,
+            enabled_override: None,
+            is_adhoc: true,
+            owner_identity: Some(1),
+            retired_at: None,
+            created: now,
+            updated: now,
+        };
+        let authority =
+            attune_common::delegation::DelegationAuthority::new(1, Default::default(), vec![]);
+        let mut admission = pool.begin().await?;
+        SchemaTypeRepository::lock_selection(&mut admission).await?;
+        let writer_pool = pool.clone();
+        let (ready, pending) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let mut transaction = writer_pool.begin().await?;
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *transaction)
+                .await?;
+            let _ = ready.send(pid);
+            SchemaTypeRepository::lock_reclamation(&mut transaction).await?;
+            transaction.commit().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let pid = pending.await?;
+        let queued = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
+                ).bind(pid).fetch_one(pool).await?;
+                if waiting {return Ok::<_, sqlx::Error>(());}
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        let parameters =
+            json!({"region":"{{ pack.config.region }}", "message":"{{ event.payload.message }}"});
+        let rendered = if queued.as_ref().is_ok_and(|ready| ready.is_ok()) {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    EventProcessor::resolve_action_params(
+                        &mut admission,
+                        &None,
+                        &rule,
+                        &event,
+                        event.payload.as_ref().unwrap(),
+                        &authority,
+                        &parameters,
+                    ),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        admission.rollback().await?;
+        tokio::time::timeout(Duration::from_secs(5), writer).await???;
+        database.cleanup().await?;
+        queued??;
+        let rendered = rendered.unwrap().expect(
+            "Rule rendering must not reacquire graph admission through a second connection",
+        )?;
+        assert_eq!(
+            rendered.value,
+            json!({"region":"fixture-region","message":"fixture-message"})
+        );
+        Ok(())
     }
 }

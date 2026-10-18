@@ -235,7 +235,7 @@ impl PreparedWaitRegistration {
                     || source.target_id != original.target_id
                     || source.target_kind != original.target_kind
                     || source.prepared_transaction != release_tx
-                    || serde_json::to_value(&wait.state)?.as_str() != Some(source.state.as_str())
+                    || serde_json::to_value(wait.state)?.as_str() != Some(source.state.as_str())
                     || source.source_admission != original.source_admission
                     || wait.result.as_ref() != Some(&source.raw_projection)
                     || !same_selection(&body.authority, &original.task_authority)
@@ -435,6 +435,10 @@ impl NativeInputSnapshotRepository {
 
     /// Prepare the real registration before inserting any wait/workflow FK.
     /// The reserved positive ID is internal and cannot be chosen by the caller.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Bind the prospective wait to its renderer, workflow, task, admission, and target control"
+    )]
     pub async fn prepare_initial_wait(
         conn: &mut PgConnection,
         renderer: Id,

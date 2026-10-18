@@ -870,7 +870,14 @@ impl PermissionSetRepository {
         connection: &mut PgConnection,
         reference: &str,
     ) -> Result<Option<crate::runtime_authority::PermissionSetDefinition>> {
-        let row: Option<(Option<Id>, Option<String>, Option<String>, serde_json::Value,Option<serde_json::Value>)> = sqlx::query_as(
+        type PermissionSetDefinitionRow = (
+            Option<Id>,
+            Option<String>,
+            Option<String>,
+            serde_json::Value,
+            Option<serde_json::Value>,
+        );
+        let row: Option<PermissionSetDefinitionRow> = sqlx::query_as(
             "SELECT ps.pack,ps.label,ps.description,ps.grants,authored.definition FROM permission_set ps LEFT JOIN permission_set_authoring_definition authored ON authored.permission_set = ps.id WHERE ps.ref = $1 AND ps.retired_at IS NULL FOR SHARE OF ps",
         ).bind(reference).fetch_optional(connection).await?;
         row.map(|(pack, label, description, grants, authored)| {

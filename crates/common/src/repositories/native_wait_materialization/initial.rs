@@ -4,6 +4,10 @@ use super::super::native_input_snapshot::RegisteredInitialWait;
 use super::*;
 use crate::repositories::Update;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve the inline single-child outcome distinct from recovered child collections"
+)]
 pub enum InitialWaitApply {
     Registered(Option<Execution>),
     Recovered(Vec<Execution>),

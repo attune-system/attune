@@ -37,6 +37,10 @@ pub mod state;
 pub mod validation;
 pub mod webhook_security;
 
+// Cross-crate reader fixtures share one database lifecycle implementation.
+#[cfg(test)]
+pub(crate) use recorded_disclosure::success_tests::source::helpers;
+
 // Re-export commonly used items for convenience
 pub use server::Server;
 pub use state::AppState;

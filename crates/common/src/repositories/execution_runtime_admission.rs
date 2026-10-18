@@ -23,69 +23,6 @@ pub struct ExecutionAdmission {
     effect_fence: ApprovalEffectFence,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ExecutionAdmissionRepository;
-    use serde_json::json;
-
-    #[test]
-    fn task_binding_resolves_authored_array_identity() {
-        let definition = json!({"tasks": [{"name": "first"}, {"name": "next"}]});
-        assert!(ExecutionAdmissionRepository::workflow_task_matches(
-            &definition,
-            "/tasks/1",
-            "next"
-        ));
-        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
-            &definition,
-            "/tasks/0",
-            "next"
-        ));
-    }
-
-    #[test]
-    fn task_binding_resolves_normalized_named_and_nested_identity() {
-        let definition = json!({"tasks": [{"name": "group/name", "tasks": [{"name": "leaf"}]}]});
-        assert!(ExecutionAdmissionRepository::workflow_task_matches(
-            &definition,
-            "/tasks/group~1name/tasks/0",
-            "leaf"
-        ));
-        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
-            &definition,
-            "/tasks/other/tasks/0",
-            "leaf"
-        ));
-    }
-
-    #[test]
-    fn task_binding_rejects_unrelated_pointer_structure() {
-        let definition = json!({"tasks": {"next": {"action": "pack.leaf"}}});
-        assert!(ExecutionAdmissionRepository::workflow_task_matches(
-            &definition,
-            "/tasks/next",
-            "next"
-        ));
-        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
-            &definition,
-            "/variables/next",
-            "next"
-        ));
-        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
-            &definition,
-            "/tasks/next/action",
-            "next"
-        ));
-        let ambiguous = json!({"tasks": [{"name": "first"}, {"name": "0"}]});
-        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
-            &ambiguous, "/tasks/0", "0"
-        ));
-        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
-            &ambiguous, "/tasks/0", "first"
-        ));
-    }
-}
-
 impl ExecutionAdmission {
     pub fn effect_fence(&self) -> &ApprovalEffectFence {
         &self.effect_fence
@@ -332,7 +269,8 @@ impl ExecutionAdmissionRepository {
         refs: &[String],
     ) -> Result<()> {
         super::schema_type::SchemaTypeRepository::lock_selection(&mut *connection).await?;
-        let row: Option<(String, Option<Id>, String, Vec<String>, bool)> = sqlx::query_as(
+        type ExecutionSelectionRow = (String, Option<Id>, String, Vec<String>, bool);
+        let row: Option<ExecutionSelectionRow> = sqlx::query_as(
             "SELECT status::text,executor,action_ref,permission_set_refs,COALESCE((executable_snapshot->'executable'->'action'->>'is_adhoc')::boolean,FALSE) FROM execution WHERE id = $1 FOR SHARE",
         ).bind(execution).fetch_optional(&mut *connection).await?;
         let Some((status, owner, action_ref, selected, adhoc)) = row else {
@@ -522,7 +460,7 @@ impl ExecutionAdmissionRepository {
         )
         .await?;
         let authority = &admission.authority;
-        let digest = crate::value_schema::digest(&serde_json::to_value(&authority)?)
+        let digest = crate::value_schema::digest(&serde_json::to_value(authority)?)
             .map_err(|_| Error::validation("Invalid queue authority"))?;
         sqlx::query("INSERT INTO work_queue_item_runtime_admission (item,policy_revision,authority,authority_digest) VALUES ($1,$2,$3,$4)")
             .bind(item.id).bind(authority.policy_id).bind(sqlx::types::Json(&authority)).bind(digest).execute(&mut *connection).await?;
@@ -1252,7 +1190,7 @@ impl ExecutionAdmissionRepository {
             return false;
         }
         let mut nodes = vec![(definition, None::<String>)];
-        for pair in tokens.chunks_exact(2) {
+        for pair in tokens.as_chunks::<2>().0 {
             if pair[0] != "tasks" {
                 return false;
             }
@@ -1311,5 +1249,68 @@ impl ExecutionAdmissionRepository {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecutionAdmissionRepository;
+    use serde_json::json;
+
+    #[test]
+    fn task_binding_resolves_authored_array_identity() {
+        let definition = json!({"tasks": [{"name": "first"}, {"name": "next"}]});
+        assert!(ExecutionAdmissionRepository::workflow_task_matches(
+            &definition,
+            "/tasks/1",
+            "next"
+        ));
+        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
+            &definition,
+            "/tasks/0",
+            "next"
+        ));
+    }
+
+    #[test]
+    fn task_binding_resolves_normalized_named_and_nested_identity() {
+        let definition = json!({"tasks": [{"name": "group/name", "tasks": [{"name": "leaf"}]}]});
+        assert!(ExecutionAdmissionRepository::workflow_task_matches(
+            &definition,
+            "/tasks/group~1name/tasks/0",
+            "leaf"
+        ));
+        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
+            &definition,
+            "/tasks/other/tasks/0",
+            "leaf"
+        ));
+    }
+
+    #[test]
+    fn task_binding_rejects_unrelated_pointer_structure() {
+        let definition = json!({"tasks": {"next": {"action": "pack.leaf"}}});
+        assert!(ExecutionAdmissionRepository::workflow_task_matches(
+            &definition,
+            "/tasks/next",
+            "next"
+        ));
+        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
+            &definition,
+            "/variables/next",
+            "next"
+        ));
+        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
+            &definition,
+            "/tasks/next/action",
+            "next"
+        ));
+        let ambiguous = json!({"tasks": [{"name": "first"}, {"name": "0"}]});
+        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
+            &ambiguous, "/tasks/0", "0"
+        ));
+        assert!(!ExecutionAdmissionRepository::workflow_task_matches(
+            &ambiguous, "/tasks/0", "first"
+        ));
     }
 }

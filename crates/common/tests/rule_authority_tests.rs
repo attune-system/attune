@@ -67,7 +67,7 @@ async fn deployed_rule_input_authority_survives_installer_freeze_and_is_not_exec
     )
     .await
     .unwrap();
-    RuleAuthorityRepository::set_input_refs(&mut tx, rule.id, &[set.r#ref.clone()])
+    RuleAuthorityRepository::set_input_refs(&mut tx, rule.id, std::slice::from_ref(&set.r#ref))
         .await
         .unwrap();
     let release = PackReleaseRepository::create_or_get(

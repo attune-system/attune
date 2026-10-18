@@ -922,10 +922,10 @@ impl WorkflowContext {
 
     pub fn rendered_condition_truth(value: &JsonValue) -> bool {
         match value {
-            JsonValue::String(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "false" | "0" | "no" | "" => false,
-                _ => true,
-            },
+            JsonValue::String(value) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | ""
+            ),
             value => is_truthy(value),
         }
     }

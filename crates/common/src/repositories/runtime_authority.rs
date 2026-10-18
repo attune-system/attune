@@ -2015,13 +2015,14 @@ async fn lock_runtime_owner(
             "SELECT executable_snapshot->'executable'->'action'->>'ref', pack_release, pack_release_digest, status::text, NULL::TEXT[] FROM enforcement WHERE id = $1 FOR SHARE", id
         ),
     };
-    let row: Option<(
+    type RetainedExecutionRow = (
         Option<String>,
         Option<Id>,
         Option<String>,
         String,
         Option<Vec<String>>,
-    )> = sqlx::query_as(query)
+    );
+    let row: Option<RetainedExecutionRow> = sqlx::query_as(query)
         .bind(id)
         .fetch_optional(connection)
         .await?;

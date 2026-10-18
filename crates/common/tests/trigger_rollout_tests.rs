@@ -116,7 +116,7 @@ async fn live_admitted_emitter_requires_explicit_acknowledgement_until_drained()
         .select(
             policy.id,
             &binding,
-            &[set_ref.clone()],
+            std::slice::from_ref(&set_ref),
             RequestAttribution::Human {
                 actor: HumanAttribution {
                     identity_id: human.id,

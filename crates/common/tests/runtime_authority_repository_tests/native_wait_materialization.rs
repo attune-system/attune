@@ -52,6 +52,10 @@ impl Case {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The test consumes the same inline owned delivery or terminal proof as production"
+)]
 enum Witness {
     Delivery(PreparedNativeWait),
     Terminal(PreparedNativeWaitContinuation),
@@ -582,6 +586,10 @@ async fn original_child_acceptance(
     );
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Test independent wait, parent, authority, deadline, and dependency controls"
+)]
 async fn terminal_controls(
     conn: &mut sqlx::PgConnection,
     wait: Id,

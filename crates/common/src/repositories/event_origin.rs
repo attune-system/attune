@@ -388,7 +388,8 @@ impl EventOriginRepository {
         if sources.len() > 256 {
             return Err(denied());
         }
-        let rows: Vec<(Id, Id, DateTime<Utc>, Option<serde_json::Value>, String)> = sqlx::query_as(
+        type RetainedEvidenceRow = (Id, Id, DateTime<Utc>, Option<serde_json::Value>, String);
+        let rows: Vec<RetainedEvidenceRow> = sqlx::query_as(
             "SELECT id,event,event_created,CASE WHEN SUM(octet_length(evidence::TEXT)) OVER (ORDER BY id) <= 1048576 THEN evidence ELSE NULL END,evidence_digest FROM event_origin_snapshot WHERE id = ANY($1) ORDER BY id LIMIT 257")
             .bind(sources).fetch_all(executor).await?;
         let mut result = Vec::new();
@@ -427,7 +428,16 @@ impl EventOriginRepository {
             .iter()
             .map(|(_, evidence)| evidence.created)
             .collect::<Vec<_>>();
-        let rows: Vec<(Id, Id, DateTime<Utc>, Option<Id>, String, Option<Id>, Option<String>)> = sqlx::query_as(
+        type EventProvenanceRow = (
+            Id,
+            Id,
+            DateTime<Utc>,
+            Option<Id>,
+            String,
+            Option<Id>,
+            Option<String>,
+        );
+        let rows: Vec<EventProvenanceRow> = sqlx::query_as(
             "SELECT q.source,e.id,e.created,e.trigger,e.trigger_ref,p.id,p.ref FROM unnest($1::BIGINT[],$2::BIGINT[],$3::TIMESTAMPTZ[]) q(source,event,created) \
              JOIN event e ON e.id = q.event AND e.created = q.created \
              LEFT JOIN trigger t ON t.id = e.trigger LEFT JOIN pack p ON p.id = t.pack AND t.management_origin = 'pack' FOR SHARE OF e")

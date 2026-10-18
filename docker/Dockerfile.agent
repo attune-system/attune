@@ -125,6 +125,7 @@ ENV SQLX_OFFLINE=true
 # the other active Dockerfiles in this directory.
 # ---------------------------------------------------------------------------
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ ./vendor/
 COPY crates/common/Cargo.toml ./crates/common/Cargo.toml
 COPY crates/api/Cargo.toml ./crates/api/Cargo.toml
 COPY crates/executor/Cargo.toml ./crates/executor/Cargo.toml

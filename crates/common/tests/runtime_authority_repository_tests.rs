@@ -4,7 +4,8 @@ mod c_inherited_receipt_consumers;
 mod cache_selector_composition;
 #[path = "support/file_native_retention_cases.rs"]
 mod file_native_retention_cases;
-mod helpers;
+// The reused success fixture owns this executable's single database helper module.
+use file_native_retention_cases::success_metadata_custody_cases::source::helpers;
 #[path = "runtime_authority_repository_tests/native_cache_activation.rs"]
 mod native_cache_activation;
 #[path = "runtime_authority_repository_tests/native_cache_checkpoint.rs"]
@@ -2712,7 +2713,7 @@ async fn fixture_with_approval_lifetime(
         .select(
             policy.id,
             &binding,
-            &[set_ref.clone()],
+            std::slice::from_ref(&set_ref),
             RequestAttribution::Human {
                 actor: HumanAttribution {
                     identity_id: human.id,
@@ -3927,7 +3928,7 @@ async fn foreign_workflow_handoff_pins_publisher_policy_graph_metadata_and_revoc
     let snapshots = ExecutableSnapshotRepository::resolve_release_actions(&mut tx, release.id)
         .await
         .unwrap();
-    let bindings = vec![
+    let bindings = [
         InvocationBinding::Action {
             action_ref: workflow.r#ref.clone(),
         },
@@ -7319,7 +7320,7 @@ async fn native_wait_snapshot_fixture(
             owner.pack_id,
             task_bindings[index].clone(),
             &snapshots[&leaf.r#ref],
-            &[set_ref.clone()],
+            std::slice::from_ref(&set_ref),
             RequestAttribution::ParentExecution {
                 execution_id: root.id,
             },

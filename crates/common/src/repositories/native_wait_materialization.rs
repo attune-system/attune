@@ -56,6 +56,10 @@ pub use initial::{
     InitialWaitApply, NativeInitialWaitMaterializationRepository, PreparedNativeInitialWait,
 };
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Retain distinct owned pending, released, and prospective wait witnesses inline"
+)]
 enum Observation {
     Pending(PreparedWaitInput),
     Released(ReleasedWaitInput),
@@ -143,7 +147,7 @@ impl Context {
             if purpose != InputSitePurpose::Value || contains_template(authored) {
                 return Err(denied());
             }
-            let mut rendered = Inputs::literal(conn, self.parent.id, &self.revision, &path).await?;
+            let mut rendered = Inputs::literal(conn, self.parent.id, &self.revision, path).await?;
             if let Some(predecessor) = &self.predecessor {
                 predecessor.attach_rendered_control(&mut rendered)?;
             }
@@ -153,7 +157,7 @@ impl Context {
             conn,
             self.parent.id,
             &binding.declaration_revision,
-            &path,
+            path,
             &binding.expression,
             purpose,
         )

@@ -413,16 +413,15 @@ pub(super) async fn prepare_targets(
         }
         // An actual empty Control now issues a distinct constructive recipe.
         // This boundary settles leaf empties, not an invented member group.
-        if target.total() == 0 {
-            if target.empty_outcome.is_none()
+        if target.total() == 0
+            && (target.empty_outcome.is_none()
                 || target.context.task.get("next").is_some_and(|next| {
                     !next.is_null() && !next.as_array().is_some_and(Vec::is_empty)
-                })
-            {
-                return Err(Error::validation(
-                    "Empty successor transition program requires its empty-source frame",
-                ));
-            }
+                }))
+        {
+            return Err(Error::validation(
+                "Empty successor transition program requires its empty-source frame",
+            ));
         }
         targets.push(target);
     }

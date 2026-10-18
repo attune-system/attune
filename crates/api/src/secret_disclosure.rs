@@ -23,6 +23,10 @@ use crate::{
     state::AppState,
 };
 
+#[cfg(test)]
+#[path = "secret_disclosure_empty_root_tests.rs"]
+mod empty_root_tests;
+
 pub async fn reveal_authorized(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
@@ -131,7 +135,6 @@ pub async fn reveal_authorized(
         .runtime_budget
         .receipt_freshness
         .ensure_fresh()?;
-    drop(authorization);
     drop(runtime_budget);
     let receipts =
         crate::receipt_disclosure::HumanReceiptGuard::finish_shared(receipt_guard).await?;
@@ -273,7 +276,6 @@ pub(crate) async fn authorize_file_origin_with_receipts(
             ApiError::Forbidden("File source grants are unavailable".into()),
         ));
     }
-    drop(authorization);
     drop(budget);
     Ok(receipts)
 }
@@ -807,7 +809,6 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
     }
     let freshness = std::mem::take(&mut authorization.runtime_budget.receipt_freshness);
     freshness.ensure_fresh()?;
-    drop(authorization);
     drop(runtime_budget);
     Ok(())
 }
@@ -819,6 +820,8 @@ struct RuntimeOriginBudget {
     iam_checked: bool,
     wait_scopes: BTreeSet<(String, i64, String)>,
     charged_wait_outputs: BTreeSet<i64>,
+    success_scopes: BTreeSet<(String, i64, String)>,
+    charged_success_outputs: BTreeSet<i64>,
     nodes: usize,
     bytes: usize,
     receipt_freshness: attune_common::repositories::immutable_input_origin::ReceiptFreshness,
@@ -882,6 +885,65 @@ struct OriginAuthorization<'a> {
 }
 
 impl OriginAuthorization<'_> {
+    async fn authorize_success_output(
+        &mut self,
+        guard: &mut crate::receipt_disclosure::HumanReceiptGuard,
+        source: &attune_common::repositories::native_input_disclosure::PreparedSuccessSource,
+    ) -> ApiResult<bool> {
+        if self.user.claims.token_type != attune_common::auth::jwt::TokenType::Access {
+            return Ok(self
+                .runtime_budget
+                .file_denied(HumanFileOriginStage::NativeTokenKind));
+        }
+        if source
+            .parents()
+            .iter()
+            .any(|parent| !self.records.frozen_parent_matches(parent))
+        {
+            return Ok(self
+                .runtime_budget
+                .file_denied(HumanFileOriginStage::NativeParent));
+        }
+        if self
+            .runtime_budget
+            .charged_success_outputs
+            .insert(source.metadata().snapshot())
+        {
+            self.runtime_budget.nodes = self
+                .runtime_budget
+                .nodes
+                .checked_add(source.retained_nodes())
+                .ok_or_else(|| {
+                    ApiError::Forbidden("Receipt disclosure exceeds its bound".into())
+                })?;
+            self.runtime_budget.bytes = self
+                .runtime_budget
+                .bytes
+                .checked_add(source.retained_bytes())
+                .ok_or_else(|| {
+                    ApiError::Forbidden("Receipt disclosure exceeds its bound".into())
+                })?;
+            if self.runtime_budget.nodes > 256 || self.runtime_budget.bytes > 1024 * 1024 {
+                return Ok(self
+                    .runtime_budget
+                    .file_denied(HumanFileOriginStage::NativeBounds));
+            }
+        }
+        for target in attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve_native_success_source(
+            guard.connection(), source, self.caller.identity_id).await? {
+            let mut context = target.context().clone();
+            context.identity_attributes = self.caller.identity_attributes.clone();
+            for action in [Action::Read, Action::Decrypt] {
+                if !self.grants.iter().any(|grant| grant.allows(target.resource(), action, &context)) {
+                    return Ok(self.runtime_budget.file_denied(if action == Action::Read { HumanFileOriginStage::NativeRead } else { HumanFileOriginStage::NativeDecrypt }));
+                }
+            }
+        }
+        source.ensure_fresh()?;
+        guard.frontier().ensure_fresh()?;
+        Ok(true)
+    }
+
     async fn authorize_wait_output(
         &mut self,
         guard: &mut crate::receipt_disclosure::HumanReceiptGuard,
@@ -1085,6 +1147,20 @@ impl OriginAuthorization<'_> {
                         None
                     };
                     let mut added_wait_scope = None;
+                    let success_output = if let Some(source) = &source {
+                        shared
+                            .lock()
+                            .await
+                            .frontier()
+                            .prepared_success_receipt_source(
+                                leaves.as_ref().unwrap_or(&classification),
+                                &self.runtime_budget.success_scopes,
+                                source,
+                            )?
+                    } else {
+                        None
+                    };
+                    let mut added_success_scope = None;
                     if let Some(native) = &wait_output {
                         let mut guard = shared.lock().await;
                         if !self.authorize_wait_output(&mut guard, native).await? {
@@ -1093,6 +1169,15 @@ impl OriginAuthorization<'_> {
                         let scope = native.scope_node();
                         if self.runtime_budget.wait_scopes.insert(scope.clone()) {
                             added_wait_scope = Some(scope);
+                        }
+                    } else if let Some(native) = &success_output {
+                        let mut guard = shared.lock().await;
+                        if !self.authorize_success_output(&mut guard, native).await? {
+                            return Ok(false);
+                        }
+                        let scope = native.scope_node();
+                        if self.runtime_budget.success_scopes.insert(scope.clone()) {
+                            added_success_scope = Some(scope);
                         }
                     } else if let Some(source) = &source {
                         let execution_id = source.site().execution;
@@ -1204,6 +1289,9 @@ impl OriginAuthorization<'_> {
                     }
                     if let Some(scope) = added_wait_scope {
                         self.runtime_budget.wait_scopes.remove(&scope);
+                    }
+                    if let Some(scope) = added_success_scope {
+                        self.runtime_budget.success_scopes.remove(&scope);
                     }
                     continue;
                 }
@@ -1341,6 +1429,63 @@ impl OriginAuthorization<'_> {
                                 }
                                 if added_scope {
                                     self.runtime_budget.wait_scopes.remove(&scope);
+                                }
+                                visited.remove(&node);
+                                source.ensure_fresh()?;
+                                continue;
+                            }
+                            if let Some(source) = guard.frontier().prepared_success_source(
+                                Some(leaves),
+                                &self.runtime_budget.success_scopes,
+                                &origin,
+                            )? {
+                                let node = (entity_type.clone(), entity_id, path.clone());
+                                if !visited.insert(node.clone()) {
+                                    return Ok(false);
+                                }
+                                if !self.authorize_success_output(&mut guard, &source).await? {
+                                    return Ok(false);
+                                }
+                                let scope = source.scope_node();
+                                let added =
+                                    self.runtime_budget.success_scopes.insert(scope.clone());
+                                let rows = source.rows_for(&origin)?;
+                                drop(guard);
+                                for row in rows {
+                                    let site = source.row_site(&row)?;
+                                    let mut records = DisclosureRecords::default();
+                                    records.inherit_frozen_parents(self.records)?;
+                                    records
+                                        .prepare(
+                                            &state.db,
+                                            user,
+                                            grants,
+                                            [(&*row.source_kind, row.source_ref.as_deref())],
+                                        )
+                                        .await?;
+                                    let mut child = OriginAuthorization {
+                                        state,
+                                        user,
+                                        caller,
+                                        grants,
+                                        records: &mut records,
+                                        runtime_budget: &mut *self.runtime_budget,
+                                    };
+                                    if !child
+                                        .allow_classified(
+                                            (&row.source_kind, row.source_ref.as_deref()),
+                                            visited,
+                                            depth + 1,
+                                            site,
+                                            Some(leaves.clone()),
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(false);
+                                    }
+                                }
+                                if added {
+                                    self.runtime_budget.success_scopes.remove(&scope);
                                 }
                                 visited.remove(&node);
                                 source.ensure_fresh()?;
@@ -2192,6 +2337,10 @@ fn sensor_delivery_cached_scope(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare every recorded sensor and rule ownership field against current caller grants"
+)]
 fn sensor_delivery_scope_allows(
     caller: &AuthorizationContext,
     grants: &[Grant],

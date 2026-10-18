@@ -143,7 +143,20 @@ impl InheritedInputRepository {
 }
 
 pub(super) async fn storage_bytes(conn: &mut PgConnection, receipt: Id) -> Result<usize> {
-    let row: Option<(Id,Id,Id,Id,String,String,Option<Id>,String,Option<String>,String,Option<String>)> = sqlx::query_as("SELECT binding.execution,binding.workflow,binding.workflow_definition,binding.source_snapshot,binding.task_name,binding.task_path,binding.child,binding.prepared_transaction,binding.publication_transaction,stage.prepared_transaction,stage.publication_transaction FROM runtime_native_empty_task_control binding JOIN runtime_input_receipt receipt ON receipt.id=binding.receipt JOIN runtime_input_receipt_staged stage ON stage.receipt=receipt.id JOIN runtime_native_input_snapshot source ON source.id=binding.source_snapshot WHERE receipt.id=$1 AND receipt.entity_kind='workflow_variables' AND receipt.destination_purpose='control' AND receipt.execution=binding.execution AND receipt.renderer_admission=receipt.destination_admission AND source.renderer_admission=receipt.renderer_admission AND source.body#>>'{source,kind}'='empty_iteration' AND source.body#>>'{source,execution}'=binding.execution::TEXT AND source.body#>>'{source,workflow}'=binding.workflow::TEXT AND source.body#>>'{source,definition}'=binding.workflow_definition::TEXT AND source.body#>>'{source,transaction}'=binding.prepared_transaction")
+    type EmptyTaskControlRow = (
+        Id,
+        Id,
+        Id,
+        Id,
+        String,
+        String,
+        Option<Id>,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    );
+    let row: Option<EmptyTaskControlRow> = sqlx::query_as("SELECT binding.execution,binding.workflow,binding.workflow_definition,binding.source_snapshot,binding.task_name,binding.task_path,binding.child,binding.prepared_transaction,binding.publication_transaction,stage.prepared_transaction,stage.publication_transaction FROM runtime_native_empty_task_control binding JOIN runtime_input_receipt receipt ON receipt.id=binding.receipt JOIN runtime_input_receipt_staged stage ON stage.receipt=receipt.id JOIN runtime_native_input_snapshot source ON source.id=binding.source_snapshot WHERE receipt.id=$1 AND receipt.entity_kind='workflow_variables' AND receipt.destination_purpose='control' AND receipt.execution=binding.execution AND receipt.renderer_admission=receipt.destination_admission AND source.renderer_admission=receipt.renderer_admission AND source.body#>>'{source,kind}'='empty_iteration' AND source.body#>>'{source,execution}'=binding.execution::TEXT AND source.body#>>'{source,workflow}'=binding.workflow::TEXT AND source.body#>>'{source,definition}'=binding.workflow_definition::TEXT AND source.body#>>'{source,transaction}'=binding.prepared_transaction")
         .bind(receipt).fetch_optional(&mut *conn).await?;
     let Some((
         execution,

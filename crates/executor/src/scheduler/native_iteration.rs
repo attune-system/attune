@@ -202,7 +202,7 @@ impl ExecutionScheduler {
             let controls = prepared
                 .prepare_control_delivery(&mut delivery, key)
                 .await?;
-            let current = ExecutionRepository::find_by_id_for_update(&mut *delivery, completed.id)
+            let current = ExecutionRepository::find_by_id_for_update(&mut delivery, completed.id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Ordinary terminal completion is absent"))?;
             if serde_json::to_value(&current)? != serde_json::to_value(&completed)? {
@@ -334,14 +334,14 @@ impl ExecutionScheduler {
         let fence=attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::retained_admission_fence(&mut delivery,admission.id).await?;
         let receipts=attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::prepare_execution_input_receipts(
             &mut delivery,child.id,key).await?;
-        let current_parent = ExecutionRepository::find_by_id_for_update(&mut *delivery, parent)
+        let current_parent = ExecutionRepository::find_by_id_for_update(&mut delivery, parent)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Ordinary iteration publication parent disappeared"))?;
         if current_parent.status != ExecutionStatus::Running {
             delivery.rollback().await?;
             return Ok(());
         }
-        let current = ExecutionRepository::find_by_id_for_update(&mut *delivery, child.id)
+        let current = ExecutionRepository::find_by_id_for_update(&mut delivery, child.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Ordinary iteration publication child disappeared"))?;
         if current.status != ExecutionStatus::Requested {

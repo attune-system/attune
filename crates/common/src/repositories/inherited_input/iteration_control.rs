@@ -232,12 +232,25 @@ pub(super) fn with_items_path(path: &str) -> bool {
     !tokens.is_empty()
         && tokens.len() % 2 == 0
         && tokens
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .all(|pair| pair[0] == "tasks" && !pair[1].is_empty())
 }
 
 pub(super) async fn storage_bytes(conn: &mut PgConnection, receipt: Id) -> Result<usize> {
-    let row:Option<(Id,Id,Id,String,Option<i64>,String,Option<String>,String,Option<String>)>=sqlx::query_as("SELECT binding.execution,binding.workflow,binding.workflow_definition,binding.task_path,binding.batch_size,binding.prepared_transaction,binding.publication_transaction,stage.prepared_transaction,stage.publication_transaction FROM runtime_native_iteration_control binding JOIN runtime_input_receipt receipt ON receipt.id=binding.receipt JOIN runtime_input_receipt_staged stage ON stage.receipt=receipt.id WHERE receipt.id=$1 AND receipt.entity_kind='workflow_variables' AND receipt.destination_purpose='control' AND receipt.execution=binding.execution AND receipt.destination_path=binding.task_path AND receipt.renderer_admission=receipt.destination_admission").bind(receipt).fetch_optional(&mut *conn).await?;
+    type IterationControlRow = (
+        Id,
+        Id,
+        Id,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    );
+    let row:Option<IterationControlRow>=sqlx::query_as("SELECT binding.execution,binding.workflow,binding.workflow_definition,binding.task_path,binding.batch_size,binding.prepared_transaction,binding.publication_transaction,stage.prepared_transaction,stage.publication_transaction FROM runtime_native_iteration_control binding JOIN runtime_input_receipt receipt ON receipt.id=binding.receipt JOIN runtime_input_receipt_staged stage ON stage.receipt=receipt.id WHERE receipt.id=$1 AND receipt.entity_kind='workflow_variables' AND receipt.destination_purpose='control' AND receipt.execution=binding.execution AND receipt.destination_path=binding.task_path AND receipt.renderer_admission=receipt.destination_admission").bind(receipt).fetch_optional(&mut *conn).await?;
     let Some((
         execution,
         workflow,

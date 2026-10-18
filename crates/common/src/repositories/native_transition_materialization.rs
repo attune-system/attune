@@ -83,6 +83,10 @@ struct Publication {
     value: Value,
     leaves: Vec<(String, PublicationProof)>,
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Inline variants retain distinct prepared publication proofs without introducing shared ownership"
+)]
 enum PublicationProof {
     WholeResult(PreparedResultShorthand),
     Staged(PreparedStagedValue),
@@ -119,6 +123,7 @@ impl ConditionProof {
 }
 
 pub struct PreparedNativeTransitions {
+    empty_completion: Option<super::native_input_snapshot::PreparedEmptySuccessWitness>,
     workflow: WorkflowExecution,
     task_name: Option<String>,
     // Canonical comparison structure, possibly parser-derived for legacy tasks.
@@ -471,6 +476,9 @@ impl PreparedNativeTransitions {
         Ok(())
     }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
+        if let Some(empty) = &self.empty_completion {
+            empty.ensure_fresh_on(conn).await?;
+        }
         if let Some(group) = &self.cache_sources.iteration {
             group.proof.ensure_fresh_on(conn).await?;
         }
@@ -523,6 +531,9 @@ impl PreparedNativeTransitions {
         Ok(())
     }
     pub fn ensure_fresh(&self) -> Result<()> {
+        if let Some(empty) = &self.empty_completion {
+            empty.ensure_fresh()?;
+        }
         if let Some(group) = &self.cache_sources.iteration {
             group.proof.ensure_fresh()?;
         }
@@ -880,6 +891,7 @@ impl NativeTransitionMaterializationRepository {
         )
         .await?;
         let plan = PreparedNativeTransitions {
+            empty_completion: None,
             workflow,
             task_name: None,
             authored: Vec::new(),
@@ -981,9 +993,20 @@ impl NativeTransitionMaterializationRepository {
             .as_ref()
             .ok_or_else(changed)?
             .definition;
-        if !successor_activation && !plain_tasks(graph)? {
-            return Ok(None);
-        }
+        let empty_completion = if !successor_activation && !plain_tasks(graph)? {
+            let Some((empty, ordinary)) = super::native_failure_materialization::NativeFailureMaterializationRepository::empty_success_tasks(graph)? else { return Ok(None); };
+            if metadata.task_name != ordinary
+                || metadata.triggered_by.as_deref() != Some(empty.as_str())
+                || completed.parent != Some(parent.id)
+                || completed.status != ExecutionStatus::Completed
+            {
+                return Ok(None);
+            }
+            Some(super::native_input_snapshot::NativeInputSnapshotRepository::prepare_empty_success_witness(
+                conn, &parent, &workflow, &empty, key).await?)
+        } else {
+            None
+        };
         let bindings = DeclaredInputRepository::bindings(conn, parent.id).await?;
         let task_path = super::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_task_site_path(
             conn, parent.id, &metadata.task_name, &completed.action_ref,
@@ -1009,7 +1032,8 @@ impl NativeTransitionMaterializationRepository {
         if completion_task.legacy_publish() && completed.status != ExecutionStatus::Completed {
             return Ok(None);
         }
-        let staged = completion_uses_stages(graph, completed.status, successor_activation)?;
+        let staged = completion_uses_stages(graph, completed.status, successor_activation)?
+            || empty_completion.is_some();
         let terminal_output_only = next.is_empty()
             && (completed.status == ExecutionStatus::Completed
                 || graph
@@ -1090,6 +1114,7 @@ impl NativeTransitionMaterializationRepository {
         .await?;
         drop(output_controls);
         let plan = PreparedNativeTransitions {
+            empty_completion,
             workflow,
             task_name: Some(metadata.task_name.clone()),
             authored: next.to_vec(),
@@ -1108,6 +1133,10 @@ impl NativeTransitionMaterializationRepository {
 
     // One canonical ordered program for genuine child and genuine group sources.
     // The caller has authenticated the owning retained task and source kind.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The canonical ordered program binds task identity, declarations, source proofs, and staging mode explicitly"
+    )]
     async fn prepare_sequence(
         conn: &mut PgConnection,
         execution: Id,
@@ -1170,7 +1199,7 @@ impl NativeTransitionMaterializationRepository {
                     conn,
                     execution,
                     binding,
-                    &sources,
+                    sources,
                     &controls,
                     &all_publications(&transitions, &[]),
                     InputSitePurpose::Condition,
@@ -1249,7 +1278,7 @@ impl NativeTransitionMaterializationRepository {
                                 conn,
                                 execution,
                                 binding,
-                                &sources,
+                                sources,
                                 &controls,
                                 &prior,
                                 InputSitePurpose::Value,
@@ -1263,9 +1292,9 @@ impl NativeTransitionMaterializationRepository {
                             render_literal(
                                 conn,
                                 execution,
-                                &revision,
+                                revision,
                                 &declaration,
-                                &sources,
+                                sources,
                                 &controls,
                             )
                             .await?
@@ -2122,6 +2151,10 @@ pub(super) async fn append_fields(
     Ok(true)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "One evaluation binds its exact declaration, sources, controls, prior publications, and purpose"
+)]
 async fn evaluate(
     conn: &mut PgConnection,
     execution: Id,
@@ -2207,7 +2240,7 @@ async fn evaluate_with_cache(
 
 async fn bind_evaluation_sources(
     conn: &mut PgConnection,
-    mut session: &mut RenderSession,
+    session: &mut RenderSession,
     binding: &DeclaredInputBinding,
     sources: &Sources,
     controls: &[&PreparedInputSource],
@@ -2222,7 +2255,7 @@ async fn bind_evaluation_sources(
         || expression_functions(&binding.expression)?.contains("result");
     if let Some(result) = &sources.native_result {
         if native_result {
-            result.bind(&mut session)?;
+            result.bind(session)?;
         }
     }
     let mut latest = BTreeMap::new();
@@ -2270,9 +2303,9 @@ async fn bind_evaluation_sources(
                 continue;
             }
             if let Some(source) = &field.source {
-                Inputs::bind_prepared(&mut session, path, source, source.value())?;
+                Inputs::bind_prepared(session, path, source, source.value())?;
             } else {
-                Inputs::bind_public_field(conn, &mut session, path, &field.site).await?;
+                Inputs::bind_public_field(conn, session, path, &field.site).await?;
             }
         }
     }
@@ -2282,13 +2315,13 @@ async fn bind_evaluation_sources(
                 if names.contains(namespace) {
                     match proof {
                         PublicationProof::Staged(staged) => Inputs::bind_staged_value(
-                            &mut session,
+                            session,
                             format!("/{namespace}/{}{suffix}", escape(name)),
                             staged,
                         )?,
                         PublicationProof::WholeResult(shorthand) if suffix.is_empty() => shorthand
                             .bind(
-                                &mut session,
+                                session,
                                 match namespace {
                                     "workflow" => {
                                         super::inherited_input::NativeResultStageBinding::Workflow
@@ -2309,13 +2342,13 @@ async fn bind_evaluation_sources(
             if names.contains(name) && !reserved(name) {
                 match proof {
                     PublicationProof::Staged(staged) => Inputs::bind_staged_value(
-                        &mut session,
+                        session,
                         format!("/{}{suffix}", escape(name)),
                         staged,
                     )?,
                     PublicationProof::WholeResult(shorthand) if suffix.is_empty() => shorthand
                         .bind(
-                            &mut session,
+                            session,
                             super::inherited_input::NativeResultStageBinding::Direct,
                         )?,
                     _ => return Err(changed()),
@@ -2324,7 +2357,7 @@ async fn bind_evaluation_sources(
         }
     }
     if let Some(outcome) = &sources.outcome {
-        Inputs::bind_outcome(&mut session, outcome)?;
+        Inputs::bind_outcome(session, outcome)?;
     }
     if let Some(group) = &sources.iteration {
         if binding
@@ -2332,14 +2365,14 @@ async fn bind_evaluation_sources(
             .strip_prefix(&group.task_path)
             .is_some_and(|suffix| suffix.starts_with("/next/") && suffix.ends_with("/when"))
         {
-            Inputs::bind_native_iteration_outcome(&mut session, &group.proof)?;
+            Inputs::bind_native_iteration_outcome(session, &group.proof)?;
         }
     }
     if names.contains("system") {
-        Inputs::bind_prepared_system(&mut session, &sources.system)?;
+        Inputs::bind_prepared_system(session, &sources.system)?;
     }
     if binding.uses_pack_configuration() {
-        Inputs::bind_configuration(conn, &mut session, key)
+        Inputs::bind_configuration(conn, session, key)
             .await
             .map_err(|error| {
                 source_phase_error(error, "bind pack configuration", &binding.source_path)
@@ -2354,10 +2387,10 @@ async fn bind_evaluation_sources(
         .iter()
         .filter_map(|field| field.source.as_ref())
     {
-        Inputs::attach_prepared_control(&mut session, source)?;
+        Inputs::attach_prepared_control(session, source)?;
     }
     for source in controls {
-        Inputs::attach_prepared_control(&mut session, source)?;
+        Inputs::attach_prepared_control(session, source)?;
     }
     Ok(())
 }
@@ -2497,7 +2530,7 @@ mod tests {
     #[test]
     fn shorthand_order_matches_the_canonical_saved_whole_result_directive() {
         let authored = json!({"publish":["whole"]});
-        assert!(eligible(&[authored.clone()]).unwrap());
+        assert!(eligible(std::slice::from_ref(&authored)).unwrap());
         let saved = json!({"publish":[{"name":"whole","value":"{{ result() }}"}]});
         let ordered = publication_order(&authored, Some(&saved)).unwrap();
         assert_eq!(ordered[0], (0, "whole", &json!("whole")));

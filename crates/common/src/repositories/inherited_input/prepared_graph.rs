@@ -2,6 +2,81 @@
 //! or authorization traversal is repeated to calculate a materialization budget.
 use super::*;
 
+/// A union of the canonical reader's immutable per-object charges. Unlike the
+/// ordinary activation reservation, shared ancestors are counted exactly once.
+#[derive(Clone, Default)]
+pub(crate) struct PreparedArchiveGraphBudget {
+    charges: std::collections::BTreeMap<ReceiptGraphCharge, usize>,
+    nodes: BTreeSet<(bool, Id)>,
+    key_hash: Option<String>,
+}
+impl PreparedArchiveGraphBudget {
+    fn include_accounting(&mut self, facts: &ReceiptGraphAccounting, key: &str) -> Result<()> {
+        let key_hash = crate::crypto::hash_encryption_key(key);
+        if facts.key_hash != key_hash
+            || self.key_hash.as_ref().is_some_and(|held| held != &key_hash)
+            || facts
+                .charges
+                .values()
+                .try_fold(0usize, |sum, charge| sum.checked_add(*charge))
+                .ok_or_else(denied)?
+                != facts.bytes
+        {
+            return Err(denied());
+        }
+        self.key_hash = Some(key_hash);
+        self.nodes.extend(facts.nodes.iter().copied());
+        for (object, charge) in &facts.charges {
+            if self
+                .charges
+                .insert(*object, *charge)
+                .is_some_and(|held| held != *charge)
+            {
+                return Err(denied());
+            }
+        }
+        self.require_capacity(0, 0)
+    }
+    pub(crate) fn include_snapshot(&mut self, snapshot: Id, bytes: usize) -> Result<()> {
+        if self
+            .charges
+            .insert(ReceiptGraphCharge::Snapshot(snapshot), bytes)
+            .is_some_and(|held| held != bytes)
+        {
+            return Err(denied());
+        }
+        self.nodes.insert((true, snapshot));
+        self.require_capacity(0, 0)
+    }
+    pub(crate) fn require_capacity(
+        &self,
+        additional_bytes: usize,
+        additional_nodes: usize,
+    ) -> Result<()> {
+        let bytes = self
+            .charges
+            .values()
+            .try_fold(additional_bytes, |sum, charge| sum.checked_add(*charge))
+            .ok_or_else(denied)?;
+        let retained_nodes = self.nodes.len()
+            + self
+                .charges
+                .keys()
+                .filter(|charge| matches!(charge, ReceiptGraphCharge::Accepted(_)))
+                .count();
+        if bytes > 1024 * 1024
+            || retained_nodes
+                .checked_add(additional_nodes)
+                .is_none_or(|nodes| nodes > 256)
+        {
+            return Err(Error::PermissionDenied(
+                "Prepared archive graph budget exceeded".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PreparedSourceGraphBudget {
     bytes: usize,
@@ -58,6 +133,33 @@ impl PreparedSourceGraphBudget {
 }
 
 impl InheritedInputRepository {
+    pub(crate) async fn prepared_archive_graph_budget(
+        conn: &mut PgConnection,
+        contexts: &[&ReceiptContext],
+        key: &str,
+    ) -> Result<PreparedArchiveGraphBudget> {
+        let mut budget = PreparedArchiveGraphBudget::default();
+        let mut admissions = RetainedReceiptAdmissions::default();
+        for context in contexts {
+            let facts = Self::held_graph_accounting(conn, context, key, &mut admissions).await?;
+            budget.include_accounting(&facts, key)?;
+        }
+        Ok(budget)
+    }
+    pub(super) async fn prepare_archive_destination(
+        conn: &mut PgConnection,
+        rendered: &RenderedReceiptContext,
+        site: &InputSite,
+        budget: &mut PreparedArchiveGraphBudget,
+        key: &str,
+    ) -> Result<PreparedReceiptDestination> {
+        let (destination, facts) =
+            Self::prepare_destination_with_graph_facts(conn, rendered, site, key).await?;
+        for facts in facts {
+            budget.include_accounting(facts.as_ref().ok_or_else(denied)?, key)?;
+        }
+        Ok(destination)
+    }
     pub(crate) async fn prepare_destination_with_graph_budget(
         conn: &mut PgConnection,
         rendered: &RenderedReceiptContext,

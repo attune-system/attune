@@ -308,7 +308,7 @@ pub(crate) async fn execution_content_frontier(
         self_log.filter(|_| authority.credential_binding().execution_id == execution_id),
     )
     .await?;
-    crate::recorded_disclosure::authorize_origins_bounded(conn, &authority, &origins, &mut budget)
+    crate::recorded_disclosure::authorize_origins_bounded(conn, authority, &origins, &mut budget)
         .await?;
     crate::secret_disclosure::runtime_log_requires_disclosure(&binding, &origins)?;
     authority.ensure_fresh_on(conn).await?;
@@ -508,7 +508,7 @@ pub(crate) async fn artifact_read(
         }
         // Missing retained bindings never become evidence of non-sensitivity.
         let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
-            &mut *tx,
+            &mut tx,
             attune_common::repositories::schema_contract::BindingOwner::Execution,
             execution,
         )

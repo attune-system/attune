@@ -13,7 +13,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 - **Internal contracts still matter**: keep API ↔ web UI and service ↔ service expectations coherent.
 
 ## Critical Guardrails (Read First)
-1. **NEVER** create agent commits on `main` or in the primary integration checkout. With explicit user authorization, agents may create local commits in isolated task worktrees. Integrate their work without committing in the primary checkout; pushing still requires authorization.
+1. **ALWAYS** validate the exact repository state being committed with the standard CI validations defined in `.github/workflows/`. Agents may commit only after all applicable required checks pass; failed, skipped, blocked, or stale checks do not satisfy this requirement. Committing and pushing still require explicit user authorization. See `docs/testing/running-tests.md` for local validation procedures.
 2. **ALWAYS** use the repository layer for DB access. Do **not** bypass it with ad hoc service queries.
 3. **NEVER** hardcode schema prefixes in SQL. Rely on PostgreSQL `search_path`.
 4. **ALWAYS** apply `RequireAuth` to protected Axum routes.

@@ -64,13 +64,10 @@ pub(super) async fn bind_execution_targets(
             let mut targets = std::collections::BTreeSet::new();
             let mut packs = std::collections::BTreeSet::new();
             for id in *ids {
-                let target = RuntimeTargetRepository::resolve(
-                    &mut **tx,
-                    RuntimeTarget::Execution(*id),
-                    principal,
-                )
-                .await?
-                .unwrap();
+                let target =
+                    RuntimeTargetRepository::resolve(tx, RuntimeTarget::Execution(*id), principal)
+                        .await?
+                        .unwrap();
                 assert_eq!(target.identity_kind(), "execution");
                 assert_eq!(target.context().target_id, Some(*id));
                 assert!(grant.grant().actions.iter().all(|action| grant.allows(
@@ -972,7 +969,7 @@ pub(super) async fn execution_wait(
         .collect::<Vec<_>>();
     attune_common::repositories::immutable_input_origin::ImmutableInputOriginRepository::require(
         &mut tx,
-        &[strong.clone()],
+        std::slice::from_ref(&strong),
         &retained_keys,
     )
     .await?;

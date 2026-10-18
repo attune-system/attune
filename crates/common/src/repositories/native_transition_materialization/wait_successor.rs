@@ -238,7 +238,8 @@ impl PreparedNativeWaitPredecessor {
         // A result view may accompany the real predecessor even when this
         // handoff only selects status. Retain its independently held fence.
         // Groups, root outputs and publication stages remain separate owners.
-        if sources.iteration.is_some()
+        if self.transitions.empty_completion.is_some()
+            || sources.iteration.is_some()
             || sources.empty_iteration.is_some()
             || self.transitions.output.is_some()
             || self

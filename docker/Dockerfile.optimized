@@ -34,6 +34,7 @@ ENV RUST_MIN_STACK=67108864
 # Copy dependency metadata first so `cargo fetch` layer is cached
 # when only source code changes (Cargo.toml/Cargo.lock stay the same)
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ ./vendor/
 COPY crates/common/Cargo.toml ./crates/common/Cargo.toml
 COPY crates/api/Cargo.toml ./crates/api/Cargo.toml
 COPY crates/executor/Cargo.toml ./crates/executor/Cargo.toml

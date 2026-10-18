@@ -36,7 +36,7 @@ impl FileTransfers {
     pub fn new(budget: u64, concurrency: usize) -> Self {
         assert!(
             budget >= UNIT
-                && budget % UNIT == 0
+                && budget.is_multiple_of(UNIT)
                 && budget / UNIT <= u32::MAX as u64
                 && (1..=1024).contains(&concurrency),
             "invalid file transfer resource configuration"

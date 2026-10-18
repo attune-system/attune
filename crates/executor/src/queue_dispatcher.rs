@@ -1001,6 +1001,10 @@ impl WorkQueueDispatcher {
         }))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Render queue config with distinct template, batch, event, schema, and authorized key inputs"
+    )]
     fn build_execution_config(
         queue: &WorkQueue,
         parsed_config: &WorkQueueConfig,

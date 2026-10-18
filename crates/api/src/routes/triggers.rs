@@ -223,7 +223,7 @@ async fn filter_api_visible_triggers(
                     ctx.target_ref = Some(trigger.r#ref.clone());
                     ctx.pack_ref = trigger.pack_ref.clone();
                     AuthorizationService::is_allowed(
-                        &grants,
+                        grants,
                         Resource::Triggers,
                         Action::Update,
                         &ctx,
@@ -414,7 +414,7 @@ async fn filter_api_visible_sensors(
                 ctx.target_id = Some(sensor.id);
                 ctx.target_ref = Some(sensor.r#ref.clone());
                 ctx.pack_ref = sensor.pack_ref.clone();
-                AuthorizationService::is_allowed(&grants, Resource::Triggers, Action::Update, &ctx)
+                AuthorizationService::is_allowed(grants, Resource::Triggers, Action::Update, &ctx)
             })
         })
         .collect())

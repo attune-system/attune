@@ -1450,8 +1450,7 @@ impl ActionExecutor {
         if recorded != delivery.is_some() {
             return Err(Error::PermissionDenied(
                 "Execution admission changed during log preparation".into(),
-            )
-            .into());
+            ));
         }
         let (stdout_path, stdout_version, stderr_path, stderr_version) =
             if let Some(context) = &delivery {

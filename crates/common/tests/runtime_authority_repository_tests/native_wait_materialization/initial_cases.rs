@@ -22,6 +22,10 @@ pub(crate) enum InitialCase {
     RecoveryArray,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Check initial wait lifecycle boundaries with explicit workflow, parent, admission, and expiry"
+)]
 pub(crate) async fn initial_lifecycle(
     pool: &sqlx::PgPool,
     workflow: Id,
@@ -461,6 +465,10 @@ pub(crate) async fn initial_lifecycle(
     assert_eq!(count, 1);
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Recovery fixtures vary identities, expiry, and graph shape independently"
+)]
 async fn initial_recovery(
     pool: &sqlx::PgPool,
     workflow: Id,

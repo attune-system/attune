@@ -340,6 +340,15 @@ impl NativeWaitSources {
             .await?;
             roots.push(target.root_origin().clone());
             let mut ordinary = Vec::new();
+            for field in source.original_child_input_fields(child.execution()) {
+                collect_field(
+                    &mut fields,
+                    "execution_config",
+                    child.execution(),
+                    &field,
+                    &mut ordinary,
+                )?;
+            }
             for field in child.original_fields() {
                 collect_field(
                     &mut fields,
@@ -351,7 +360,8 @@ impl NativeWaitSources {
             }
             if ordinary
                 .iter()
-                .any(|origin| !child.origins().contains(origin))
+                .any(|origin| !child.origins().contains(origin)
+                    && !source.receipt_edges().iter().any(|(id, site)| matches!(origin, SecretOrigin::Entity {entity_type, entity_id, path} if *entity_id == *id && *entity_type == site.kind.origin_kind(site.purpose) && *path == site.path)))
             {
                 return Err(denied());
             }
@@ -371,7 +381,7 @@ impl NativeWaitSources {
         let mut closure_origins = Vec::new();
         let mut leaves = Vec::new();
         let mut leaf_rows = Vec::new();
-        let receipts = source.receipt_edges().to_vec();
+        let mut receipts = source.receipt_edges().to_vec();
         if source
             .controls()
             .iter()
@@ -388,6 +398,20 @@ impl NativeWaitSources {
             let origin = descriptor.origin();
             if !closure_origins.contains(&origin) {
                 closure_origins.push(origin);
+            }
+        }
+        // These are descendants authenticated by the same root receipt graph,
+        // not newest receipts at familiar paths. Keep their CONFIG purpose and
+        // original execution targets when the raw ordinary child is collected.
+        for descriptor in context.source_receipts() {
+            let site = descriptor.site();
+            if site.kind == super::super::inherited_input::InputEntityKind::ExecutionConfig
+                && (site.execution == source.execution() || seen.contains(&site.execution))
+            {
+                let edge = (descriptor.receipt(), site.clone());
+                if !receipts.contains(&edge) {
+                    receipts.push(edge);
+                }
             }
         }
         let mut leaf_paths = BTreeSet::new();

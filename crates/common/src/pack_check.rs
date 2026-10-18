@@ -33,10 +33,21 @@ const MAX_METADATA_FILES: usize = 2_000;
 const MAX_DIAGNOSTICS: usize = 1_000;
 
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, utoipa::ToSchema,
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum PackDiagnosticSeverity {
+    #[default]
     Error,
     Warning,
 }
@@ -62,12 +73,6 @@ pub struct PackDiagnostic {
     pub component_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reference_chain: Vec<String>,
-}
-
-impl Default for PackDiagnosticSeverity {
-    fn default() -> Self {
-        Self::Error
-    }
 }
 
 impl PackDiagnostic {
@@ -766,7 +771,7 @@ impl PackChecker {
             );
         }
         match triggers {
-            Some(YamlValue::String(value)) if field == "trigger_type" => {
+            Some(YamlValue::String(value, _)) if field == "trigger_type" => {
                 self.add_reference_at(rel, "sensor", "trigger", value, "/trigger_type")
             }
             Some(YamlValue::Sequence(values)) => {
@@ -915,7 +920,7 @@ impl PackChecker {
                 let mut fields = Mapping::new();
                 match serde_yaml_ng::to_value(&queue.item_schema) {
                     Ok(schema) => {
-                        fields.insert(YamlValue::String("item_schema".into()), schema);
+                        fields.insert(YamlValue::from("item_schema"), schema);
                         self.check_flat_schema(&fields, "item_schema", rel);
                     }
                     Err(_) => self.error(
@@ -1332,7 +1337,7 @@ impl PackChecker {
 
     fn required_string(&mut self, map: &Mapping, field: &str, rel: &str) -> Option<String> {
         match yaml_get(map, field) {
-            Some(YamlValue::String(value)) if !value.trim().is_empty() => {
+            Some(YamlValue::String(value, _)) if !value.trim().is_empty() => {
                 Some(value.trim().to_string())
             }
             Some(_) => {
@@ -1359,7 +1364,9 @@ impl PackChecker {
     fn optional_string(&mut self, map: &Mapping, field: &str, rel: &str) -> Option<String> {
         let value = yaml_get(map, field)?;
         match value {
-            YamlValue::String(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+            YamlValue::String(value, _) if !value.trim().is_empty() => {
+                Some(value.trim().to_string())
+            }
             _ => {
                 self.error_at(
                     rel,
@@ -1709,7 +1716,7 @@ impl PackChecker {
 }
 
 fn yaml_get<'a>(map: &'a Mapping, field: &str) -> Option<&'a YamlValue> {
-    map.get(YamlValue::String(field.to_string()))
+    map.get(YamlValue::from(field))
 }
 
 fn is_yaml(path: &Path) -> bool {

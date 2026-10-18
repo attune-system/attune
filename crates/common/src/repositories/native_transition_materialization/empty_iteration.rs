@@ -96,6 +96,7 @@ impl NativeTransitionMaterializationRepository {
         let revision = crate::value_schema::digest(&serde_json::to_value(&snapshot.executable)?)
             .map_err(|_| changed())?;
         let mut inner = PreparedNativeTransitions {
+            empty_completion: None,
             workflow: workflow.clone(),
             task_name: Some(evidence.task_name().into()),
             authored: next.clone(),

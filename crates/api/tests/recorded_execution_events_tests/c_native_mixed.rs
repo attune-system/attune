@@ -101,6 +101,10 @@ pub(super) async fn setup(fixture: &Fixture, pack: Id, pack_ref: &str) -> Result
 }
 
 impl Cache {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The fixture independently varies source and destination identities, paths, purpose, and keys"
+    )]
     pub(super) async fn prepare_variable(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

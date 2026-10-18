@@ -67,14 +67,11 @@ impl RecordedConnection {
         // and ambiguous event IDs cannot establish a structural owner.
         let target = match notification.entity_type.as_str() {
             "event" => {
-                let Some(created) = notification
+                let created = notification
                     .payload
                     .get("created")
                     .and_then(|value| value.as_str())
-                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                else {
-                    return None;
-                };
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
                 RuntimeTarget::Event {
                     id: notification.entity_id,
                     created: created.with_timezone(&chrono::Utc),

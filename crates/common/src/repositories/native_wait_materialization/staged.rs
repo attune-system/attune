@@ -134,11 +134,9 @@ impl Program {
                 .publications
                 .iter()
                 .try_fold(0usize, |bytes, publication| {
-                    Ok::<_, Error>(
-                        bytes
-                            .checked_add(serde_json::to_vec(&publication.value)?.len())
-                            .ok_or_else(denied)?,
-                    )
+                    bytes
+                        .checked_add(serde_json::to_vec(&publication.value)?.len())
+                        .ok_or_else(denied)
                 })?;
             if bytes > 1024 * 1024 {
                 return Err(denied());
@@ -171,6 +169,10 @@ impl Program {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Render one exact authored site and purpose with its admitted observation and secret context"
+    )]
     pub(super) async fn render_at(
         &self,
         conn: &mut PgConnection,
@@ -322,9 +324,9 @@ impl Program {
         self.publications
             .iter()
             .try_fold(0usize, |bytes, publication| {
-                Ok(bytes
+                bytes
                     .checked_add(serde_json::to_vec(&publication.value)?.len())
-                    .ok_or_else(denied)?)
+                    .ok_or_else(denied)
             })
     }
 

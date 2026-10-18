@@ -45,7 +45,7 @@ pub fn task_at_authored_path<'a>(
         return None;
     }
     let mut node = definition;
-    for pair in tokens.chunks_exact(2) {
+    for pair in tokens.as_chunks::<2>().0 {
         if pair[0] != "tasks" {
             return None;
         }

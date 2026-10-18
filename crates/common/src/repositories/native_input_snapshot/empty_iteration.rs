@@ -13,16 +13,16 @@ pub(super) struct EmptyIterationArchive {
     pub(super) execution: Id,
     pub(super) workflow: Id,
     definition: Id,
-    task_name: String,
-    task_path: String,
+    pub(super) task_name: String,
+    pub(super) task_path: String,
     transaction: String,
-    control: Id,
-    control_site: InputSite,
+    pub(super) control: Id,
+    pub(super) control_site: InputSite,
     control_proof: String,
     control_ciphertext: String,
     pub(super) parents: Vec<(Id, InputSite)>,
-    schema: ActionSchemaBinding,
-    executable: crate::models::ExecutionExecutableSnapshot,
+    pub(super) schema: ActionSchemaBinding,
+    pub(super) executable: crate::models::ExecutionExecutableSnapshot,
     pub(super) target: BoundRuntimeTarget,
     read_owner: super::super::runtime_read::RuntimeReadOwner,
 }
@@ -39,6 +39,7 @@ pub struct PreparedNativeEmptyIterationOutcome {
     original_fields: Vec<crate::secret_values::StoredSecretValue>,
     guarded: std::sync::OnceLock<()>,
     released: std::sync::OnceLock<()>,
+    archive_budget: super::super::inherited_input::PreparedArchiveGraphBudget,
 }
 
 /// Non-serializable authority to compose this actual empty source before its
@@ -147,6 +148,11 @@ pub(super) fn storage_release(
 }
 
 impl PreparedNativeEmptyIterationOutcome {
+    pub(crate) fn archive_budget(
+        &self,
+    ) -> &super::super::inherited_input::PreparedArchiveGraphBudget {
+        &self.archive_budget
+    }
     pub(in crate::repositories) fn issued_read(&self) -> Result<IssuedEmptyRead> {
         self.ensure_fresh()?;
         Ok(IssuedEmptyRead {
@@ -389,6 +395,7 @@ impl NativeInputSnapshotRepository {
             receipts.push(receipt);
         }
         Ok(Some(ReleasedNativeEmptyIteration {
+            snapshot: ids[0],
             workflow: source.workflow,
             transaction: transaction(conn).await?,
             fence,
@@ -471,6 +478,21 @@ impl NativeInputSnapshotRepository {
             source: Source::EmptyIteration(archive.clone()),
         };
         let snapshot = save(conn, &body, &Value::Null, key).await?;
+        // Preserve the exact issuer ciphertext and canonical reader charge.
+        // This is immutable storage accounting, not another authorization walk.
+        let (stored_body, stored_value, digest, key_hash): (Value, Value, String, String) = sqlx::query_as(
+            "SELECT body,encrypted_value,body_digest,encryption_key_hash FROM runtime_native_input_snapshot WHERE id=$1")
+            .bind(snapshot).fetch_one(&mut *conn).await?;
+        let charge = serde_json::to_vec(&stored_body)?.len()
+            + serde_json::to_vec(&stored_value)?.len()
+            + digest.len()
+            + key_hash.len()
+            + serde_json::to_vec(&storage_associations(&body))?.len()
+            + serde_json::to_vec(&archive.parents)?.len();
+        let contexts: Vec<_> = std::iter::once(control).chain(source.receipts()).collect();
+        let mut archive_budget =
+            InheritedInputRepository::prepared_archive_graph_budget(conn, &contexts, key).await?;
+        archive_budget.include_snapshot(snapshot, charge)?;
         for (receipt, _) in &archive.parents {
             sqlx::query(
                 "INSERT INTO runtime_native_input_snapshot_parent(snapshot,receipt) VALUES($1,$2)",
@@ -486,12 +508,14 @@ impl NativeInputSnapshotRepository {
             original_fields: super::super::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
                 &mut *conn, crate::secret_values::ENTITY_WORKFLOW_VARIABLES, source.parent().id).await?,
             guarded: std::sync::OnceLock::new(), released: std::sync::OnceLock::new(),
+            archive_budget,
         })
     }
 }
 
 pub(crate) struct ReleasedNativeEmptyIteration {
     selected_targets: Vec<String>,
+    snapshot: Id,
     workflow: Id,
     transaction: String,
     fence: ApprovalEffectFence,
@@ -510,6 +534,12 @@ impl ReleasedNativeEmptyIteration {
             )
             .flatten()
             .min()
+    }
+    pub(super) fn snapshot(&self) -> Id {
+        self.snapshot
+    }
+    pub(super) fn receipts(&self) -> &[ReceiptContext] {
+        &self.receipts
     }
     pub(crate) fn workflow(&self) -> Id {
         self.workflow
@@ -533,7 +563,7 @@ impl ReleasedNativeEmptyIteration {
     }
 }
 
-async fn require_empty_dispatch(
+pub(super) async fn require_empty_dispatch(
     conn: &mut PgConnection,
     source: &EmptyIterationArchive,
 ) -> Result<()> {
@@ -579,7 +609,18 @@ async fn require_empty_control(
     {
         return Err(denied());
     }
-    let row: Option<(Id, Id, Id, String, String, Option<String>, Value, String, Value)> = sqlx::query_as(
+    type EmptyIterationControlRow = (
+        Id,
+        Id,
+        Id,
+        String,
+        String,
+        Option<String>,
+        Value,
+        String,
+        Value,
+    );
+    let row: Option<EmptyIterationControlRow> = sqlx::query_as(
         "SELECT binding.execution,binding.workflow,binding.workflow_definition,binding.task_path,binding.prepared_transaction,binding.publication_transaction,receipt.proof,receipt.proof_digest,receipt.encrypted_value FROM runtime_native_iteration_control binding JOIN runtime_input_receipt receipt ON receipt.id=binding.receipt WHERE binding.receipt=$1")
         .bind(source.control).fetch_optional(&mut *conn).await?;
     let (
@@ -709,6 +750,9 @@ pub(super) fn empty_selection(
     declaration: &str,
     context: &str,
 ) -> Result<()> {
+    if context == "$control" && declaration == "$native/value" {
+        return Ok(());
+    }
     if context == "$control" && declaration.starts_with("/workflow/tasks/") {
         return Ok(());
     }

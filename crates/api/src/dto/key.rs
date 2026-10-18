@@ -307,6 +307,18 @@ fn default_per_page() -> u32 {
     50
 }
 
+impl KeyQueryParams {
+    /// Get the offset for pagination
+    pub fn offset(&self) -> u32 {
+        (self.page - 1) * self.per_page
+    }
+
+    /// Get the limit for pagination
+    pub fn limit(&self) -> u32 {
+        self.per_page
+    }
+}
+
 #[cfg(test)]
 mod schema_tests {
     use super::*;
@@ -322,17 +334,5 @@ mod schema_tests {
                 .unwrap();
         assert_eq!(explicit.value, Some(JsonValue::Null));
         assert_eq!(explicit.value_schema, Some(JsonValue::Null));
-    }
-}
-
-impl KeyQueryParams {
-    /// Get the offset for pagination
-    pub fn offset(&self) -> u32 {
-        (self.page - 1) * self.per_page
-    }
-
-    /// Get the limit for pagination
-    pub fn limit(&self) -> u32 {
-        self.per_page
     }
 }

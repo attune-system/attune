@@ -49,6 +49,9 @@ impl Sources {
 impl PreparedNativeTransitions {
     pub(in crate::repositories) fn held_deadline(&self) -> Result<Deadline> {
         let mut dates = vec![self.cache_sources.held_deadline()?];
+        if let Some(empty) = &self.empty_completion {
+            dates.push(empty.held_deadline());
+        }
         for transition in &self.transitions {
             if let Some(condition) = &transition.condition {
                 dates.push(condition.source().approval_deadline());

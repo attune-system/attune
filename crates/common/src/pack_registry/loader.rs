@@ -1076,7 +1076,7 @@ impl TransactionalPackComponentLoader<'_> {
         let versions = data
             .get("versions")
             .and_then(|value| value.as_sequence())
-            .map(Vec::as_slice)
+            .map(|values| values.as_slice())
             .unwrap_or_default();
 
         info!(
@@ -2217,7 +2217,7 @@ impl TransactionalPackComponentLoader<'_> {
             }
 
             let queue_yaml: serde_yaml_ng::Value =
-                serde_yaml_ng::from_str(content).unwrap_or(serde_yaml_ng::Value::Null);
+                serde_yaml_ng::from_str(content).unwrap_or(serde_yaml_ng::Value::Null(None));
             let enabled = queue_yaml.get("enabled").and_then(|value| value.as_bool());
             let accepting_new_items = queue_yaml
                 .get("accepting_new_items")
@@ -3007,13 +3007,13 @@ impl TransactionalPackComponentLoader<'_> {
         // Fall back to the workflow file's own schemas only if the action
         // YAML doesn't define them.
         let param_schema = crate::schema_type::read_schema_field(
-            &action_data,
+            action_data,
             crate::schema_type::PARAM_SCHEMA_FIELDS,
         )?
         .or_else(|| workflow_yaml.parameters.clone());
 
         let out_schema = crate::schema_type::read_schema_field(
-            &action_data,
+            action_data,
             crate::schema_type::OUTPUT_SCHEMA_FIELDS,
         )?
         .or_else(|| workflow_yaml.output.clone());
@@ -4186,7 +4186,7 @@ fn parse_optional_permission_set_refs(
     };
 
     let refs = match value {
-        serde_yaml_ng::Value::String(permission_set_ref) => {
+        serde_yaml_ng::Value::String(permission_set_ref, _) => {
             vec![permission_set_ref.trim().to_string()]
         }
         serde_yaml_ng::Value::Sequence(values) => values
@@ -4199,7 +4199,7 @@ fn parse_optional_permission_set_refs(
                     .ok_or_else(|| Error::validation("permission_set_refs entries must be strings"))
             })
             .collect::<Result<Vec<_>>>()?,
-        serde_yaml_ng::Value::Null => return Ok(None),
+        serde_yaml_ng::Value::Null(_) => return Ok(None),
         _ => {
             return Err(Error::validation(
                 "permission_set_refs must be a string, an array of strings, or null",
@@ -4312,7 +4312,7 @@ mod tests {
     fn test_parse_optional_permission_set_refs() {
         assert_eq!(parse_optional_permission_set_refs(None).unwrap(), None);
 
-        let single = serde_yaml_ng::Value::String(" standard ".to_string());
+        let single = serde_yaml_ng::Value::from(" standard ");
         assert_eq!(
             parse_optional_permission_set_refs(Some(&single)).unwrap(),
             Some(vec!["standard".to_string()])
@@ -4325,7 +4325,7 @@ mod tests {
             Some(vec!["standard".to_string(), "elevated".to_string()])
         );
 
-        let null = serde_yaml_ng::Value::Null;
+        let null = serde_yaml_ng::Value::Null(None);
         assert_eq!(
             parse_optional_permission_set_refs(Some(&null)).unwrap(),
             None
@@ -4334,14 +4334,14 @@ mod tests {
 
     #[test]
     fn test_parse_optional_permission_set_refs_rejects_invalid_values() {
-        let empty = serde_yaml_ng::Value::String(" ".to_string());
+        let empty = serde_yaml_ng::Value::from(" ");
         assert!(parse_optional_permission_set_refs(Some(&empty)).is_err());
 
         let non_string_entry: serde_yaml_ng::Value =
             serde_yaml_ng::from_str("- standard\n- 42\n").unwrap();
         assert!(parse_optional_permission_set_refs(Some(&non_string_entry)).is_err());
 
-        let invalid = serde_yaml_ng::Value::Bool(true);
+        let invalid = serde_yaml_ng::Value::from(true);
         assert!(parse_optional_permission_set_refs(Some(&invalid)).is_err());
     }
 

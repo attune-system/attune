@@ -1140,6 +1140,10 @@ async fn pending_result_case(
     (site, recorded.origin(), view.snapshot())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Exercise pending iteration witnesses with explicit database, authority, and target identities"
+)]
 async fn pending_iteration_case(
     db: &TestDatabase,
     conn: &mut sqlx::PgConnection,

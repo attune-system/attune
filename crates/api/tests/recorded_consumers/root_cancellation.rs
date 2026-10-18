@@ -688,27 +688,22 @@ async fn scheduler_spawn_committed_during_workflow_lock_wait_rejects_stale_tree_
     let (mut fixture, tree) = fixture_and_tree(3, false).await?;
     cancel_source(&mut fixture, None).await?;
     let mut blocker = Some(fixture.ctx.pool.begin().await?);
-    SchemaTypeRepository::lock_selection(&mut **blocker.as_mut().unwrap()).await?;
+    SchemaTypeRepository::lock_selection(blocker.as_mut().unwrap()).await?;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut **blocker.as_mut().unwrap())
         .await?;
-    WorkflowExecutionRepository::acquire_advisory_lock(
-        &mut **blocker.as_mut().unwrap(),
-        tree.workflow,
-    )
-    .await?;
+    WorkflowExecutionRepository::acquire_advisory_lock(blocker.as_mut().unwrap(), tree.workflow)
+        .await?;
     let mut effect = Some(request(&fixture, &tree));
     let outcome: Result<()> = async {
         blocked(&fixture.ctx.pool, pid, "pg_advisory_xact_lock").await?;
-        let policy = RuntimeAuthorityRepository::find_policy(
-            &mut **blocker.as_mut().unwrap(),
-            fixture.policy_id,
-        )
-        .await?
-        .unwrap();
+        let policy =
+            RuntimeAuthorityRepository::find_policy(blocker.as_mut().unwrap(), fixture.policy_id)
+                .await?
+                .unwrap();
         let spawned = child(
             &fixture,
-            &mut **blocker.as_mut().unwrap(),
+            blocker.as_mut().unwrap(),
             &policy,
             tree.ids[0],
             tree.workflow,

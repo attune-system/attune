@@ -1718,9 +1718,6 @@ async fn commit_log_segment(
             .await
             .map_err(map_repository_error)?
             .ok_or_else(|| (StatusCode::CONFLICT, "Log artifact disappeared".to_string()))?;
-    if locked_version.body_state != Some(ArtifactBodyState::Pending) {
-        return Err((StatusCode::CONFLICT, "Log artifact is not pending".into()));
-    }
     let locked = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
@@ -1745,7 +1742,7 @@ async fn commit_log_segment(
     let existing = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
         .await
         .map_err(map_repository_error)?;
-    match log_segment_commit_decision(
+    let decision = log_segment_commit_decision(
         existing
             .as_ref()
             .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
@@ -1754,7 +1751,9 @@ async fn commit_log_segment(
         sequence,
         &digest_hex,
         bytes.len() as i64,
-    )? {
+    )?;
+    check_log_segment_body_state(locked_version.body_state, locked.sealed, decision)?;
+    match decision {
         LogSegmentCommitDecision::Retry => {
             complete_proxy_log_grant(
                 &mut transaction,
@@ -1817,6 +1816,10 @@ async fn commit_log_segment(
     Ok(StatusCode::CREATED)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Reserve an exact authorized version, stream, sequence, size, digest, and object key"
+)]
 async fn reserve_proxy_log_upload(
     state: &AppState,
     user: &AuthenticatedUser,
@@ -1837,15 +1840,12 @@ async fn reserve_proxy_log_upload(
         .await
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::FORBIDDEN, "Artifact version unavailable".into()))?;
-    let effect = authorize_version_mutation(&state, &mut transaction, user, &initial).await?;
+    let effect = authorize_version_mutation(state, &mut transaction, user, &initial).await?;
     let version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
             .map_err(map_repository_error)?
             .ok_or_else(|| (StatusCode::CONFLICT, "Log artifact disappeared".to_string()))?;
-    if version.body_state != Some(ArtifactBodyState::Pending) {
-        return Err((StatusCode::CONFLICT, "Log artifact is not pending".into()));
-    }
     let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
@@ -1873,6 +1873,7 @@ async fn reserve_proxy_log_upload(
         sha256,
         size,
     )?;
+    check_log_segment_body_state(version.body_state, locked_stream.sealed, decision)?;
     if decision == LogSegmentCommitDecision::Retry {
         effect
             .ensure_fresh_on(&mut transaction)
@@ -1990,10 +1991,25 @@ fn log_segment_retry_matches(
     existing_sha256 == retry_sha256 && existing_size == retry_size
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum LogSegmentCommitDecision {
     Retry,
     Commit,
+}
+
+fn check_log_segment_body_state(
+    state: Option<ArtifactBodyState>,
+    sealed: bool,
+    decision: LogSegmentCommitDecision,
+) -> Result<(), (StatusCode, String)> {
+    if state == Some(ArtifactBodyState::Pending)
+        || (state == Some(ArtifactBodyState::Ready)
+            && sealed
+            && decision == LogSegmentCommitDecision::Retry)
+    {
+        return Ok(());
+    }
+    Err((StatusCode::CONFLICT, "Log artifact is not pending".into()))
 }
 
 fn log_segment_commit_decision(
@@ -2644,7 +2660,7 @@ async fn publish_stream_owned(
     use attune_common::runtime_file_body;
     use futures::TryStreamExt;
     let mut preparation = state.db.begin().await.map_err(map_sqlx_error)?;
-    let effect = authorize_version_mutation(&state, &mut preparation, user, version).await?;
+    let effect = authorize_version_mutation(state, &mut preparation, user, version).await?;
     let source = FileOriginRepository::find(&mut preparation, version.id)
         .await
         .map_err(map_transport_error)?;
@@ -2839,7 +2855,7 @@ async fn publish_stream_owned(
     let stored = result?;
     let digest_hex = hex_digest(&digest);
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
-    let effect = authorize_version_mutation(&state, &mut transaction, user, version).await?;
+    let effect = authorize_version_mutation(state, &mut transaction, user, version).await?;
     if LogStreamRepository::find_by_artifact_version_with_conn(&mut transaction, version.id)
         .await
         .map_err(map_repository_error)?
@@ -3015,7 +3031,7 @@ async fn reserve_proxy_artifact_upload(
     )
     .await
     .map_err(map_transport_error)?;
-    let effect = authorize_version_mutation(&state, &mut transaction, user, version).await?;
+    let effect = authorize_version_mutation(state, &mut transaction, user, version).await?;
     if LogStreamRepository::find_by_artifact_version_with_conn(&mut transaction, version.id)
         .await
         .map_err(map_repository_error)?
@@ -4335,7 +4351,7 @@ async fn authorize_file_transfer(
                 "File version belongs to another execution".into(),
             ));
         }
-        let effect = authorize_version_mutation(&state, &mut tx, user, &version).await?;
+        let effect = authorize_version_mutation(state, &mut tx, user, &version).await?;
         effect
             .ensure_fresh_on(&mut tx)
             .await
@@ -4352,8 +4368,7 @@ async fn authorize_file_transfer(
                         .await
                         .map_err(map_repository_error)?
                 {
-                    let effect =
-                        authorize_version_mutation(&state, &mut tx, user, &version).await?;
+                    let effect = authorize_version_mutation(state, &mut tx, user, &version).await?;
                     effect
                         .ensure_fresh_on(&mut tx)
                         .await
@@ -4774,6 +4789,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ready_log_bodies_allow_only_identical_retries_on_sealed_streams() {
+        assert!(check_log_segment_body_state(
+            Some(ArtifactBodyState::Ready),
+            true,
+            LogSegmentCommitDecision::Retry
+        )
+        .is_ok());
+        for (state, sealed, decision) in [
+            (
+                Some(ArtifactBodyState::Ready),
+                false,
+                LogSegmentCommitDecision::Retry,
+            ),
+            (
+                Some(ArtifactBodyState::Ready),
+                true,
+                LogSegmentCommitDecision::Commit,
+            ),
+            (None, true, LogSegmentCommitDecision::Retry),
+        ] {
+            assert_eq!(
+                check_log_segment_body_state(state, sealed, decision)
+                    .unwrap_err()
+                    .0,
+                StatusCode::CONFLICT
+            );
+        }
+    }
+
     #[tokio::test]
     async fn resolved_shared_file_snapshot_drives_range_read_without_another_lookup() {
         let directory = tempfile::tempdir().unwrap();
@@ -4961,6 +5006,15 @@ mod tests {
         .expect("identical retry after seal")
         .into_response();
         assert_eq!(retry.status(), StatusCode::OK);
+
+        let conflicting_retry = commit_log_segment(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path((version.id, 0)),
+            Body::from("other bytes"),
+        )
+        .await;
+        assert_status_error(conflicting_retry, StatusCode::CONFLICT);
 
         let after_seal = commit_log_segment(
             State(state.clone()),

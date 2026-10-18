@@ -183,7 +183,7 @@ impl RotatingLogWriter {
         let versioning = &self.versioning;
         let mut tx = versioning.pool.begin().await?;
         let version = ArtifactVersionRepository::create_file_backed_with_conn(
-            &mut *tx,
+            &mut tx,
             versioning.target.artifact_id,
             &versioning.target.artifact_ref,
             "text/plain".to_string(),

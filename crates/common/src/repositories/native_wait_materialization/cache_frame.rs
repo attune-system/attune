@@ -158,13 +158,12 @@ impl Frame {
             .flat_map(|source| source.held_native_metadata())
             .chain(program.held_native_metadata())
         {
-            if source.source_kind() == "cache" {
-                if metadata
+            if source.source_kind() == "cache"
+                && metadata
                     .insert(source.snapshot(), source)
                     .is_some_and(|previous| previous != source)
-                {
-                    return Err(denied());
-                }
+            {
+                return Err(denied());
             }
         }
         let mut held = vec![];

@@ -654,9 +654,13 @@ mod runtime_read_result_tests {
     fn undeclared_data_errors_and_acknowledgements_inherit_reads_and_encrypt() {
         let original = json!({"succeeded":true,"data":{"public":"sdk-secret"},"stdout":"sdk-secret","stderr":"sdk-secret","error":"sdk-secret","queue_ack":{"value":"sdk-secret"}});
         let read = crate::repositories::runtime_read::RuntimeReadRepository::reference(42);
-        let (redacted, inputs) =
-            protect_runtime_read_result(&original, original.clone(), vec![], &[read.clone()])
-                .unwrap();
+        let (redacted, inputs) = protect_runtime_read_result(
+            &original,
+            original.clone(),
+            vec![],
+            std::slice::from_ref(&read),
+        )
+        .unwrap();
         assert!(!redacted.to_string().contains("sdk-secret"));
         assert_eq!(inputs.len(), 5);
         for input in &inputs {

@@ -171,8 +171,7 @@ pub async fn create_event(
     }
 
     let mut tx = state.db.begin().await?;
-    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut *tx)
-        .await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     let recorded_authority = user.0.validate_recorded_runtime_authority(&mut tx).await?;
     let mut input_receipts = Vec::new();
     if let Some(authority) = &recorded_authority {

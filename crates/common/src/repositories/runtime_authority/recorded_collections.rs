@@ -174,6 +174,10 @@ fn static_match(grant: &Grant, resource: Resource, action: Action, identity: i64
     residual.allows(resource, action, &AuthorizationContext::new(identity))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bind each SQL target column and owned-pack constraint explicitly"
+)]
 fn push_grant(
     query: &mut QueryBuilder<'_, Postgres>,
     grant: &Grant,

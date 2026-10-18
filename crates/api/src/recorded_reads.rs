@@ -111,7 +111,7 @@ pub(crate) async fn artifact(
         )
         .await?;
         let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
-            &mut *tx,
+            &mut tx,
             attune_common::repositories::schema_contract::BindingOwner::Execution,
             *execution,
         )
@@ -325,7 +325,7 @@ pub(crate) async fn version(
         )
         .await?;
         let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
-            &mut *tx,
+            &mut tx,
             attune_common::repositories::schema_contract::BindingOwner::Execution,
             execution,
         )
@@ -550,6 +550,62 @@ where
     )
 }
 
+pub(crate) fn encrypted_manifest(version: &ArtifactVersion) -> Option<&str> {
+    version
+        .meta
+        .as_ref()?
+        .get("encrypted_log_manifest")?
+        .as_str()
+}
+
+pub(crate) async fn sealed_log_response(
+    state: &std::sync::Arc<crate::state::AppState>,
+    version: &ArtifactVersion,
+) -> ApiResult<axum::response::Response> {
+    use attune_common::runtime_read_log::open_final_manifest;
+    let key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(denied)?;
+    let encrypted = encrypted_manifest(version).ok_or_else(denied)?;
+    let execution = version.execution.ok_or_else(denied)?;
+    let manifest =
+        open_final_manifest(key, encrypted, execution, version.id).map_err(|_| denied())?;
+    if version.body_state != Some(ArtifactBodyState::Ready)
+        || version
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("log_encoding"))
+            .and_then(serde_json::Value::as_str)
+            != Some(attune_common::runtime_read_log::ENCODING)
+        || version.size_bytes != i64::try_from(manifest.ciphertext_bytes).ok()
+        || version.sha256.as_deref() != Some(manifest.ciphertext_sha256.as_str())
+    {
+        return Err(denied());
+    }
+    let mut connection = state.db.acquire().await?;
+    if !ArtifactVersionRepository::log_is_sealed(&mut connection, version.id).await? {
+        return Err(denied());
+    }
+    drop(connection);
+    let reader = crate::log_decoder::sealed_ciphertext(state.clone(), version).await?;
+    let stream = crate::log_decoder::verified_plaintext(reader, key.to_owned(), manifest);
+    // A ciphertext range cannot establish complete-stream proof. Serve the full
+    // plaintext with successful EOF gated on manifest verification, never an
+    // early Content-Length/206 completion for an unchecked prefix.
+    axum::response::Response::builder()
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
+        .header(axum::http::header::CACHE_CONTROL, "private, no-store")
+        .header(axum::http::header::ACCEPT_RANGES, "none")
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|_| denied())
+}
+
 #[cfg(test)]
 mod delivery_tests {
     use super::guarded_chunks;
@@ -625,60 +681,4 @@ mod delivery_tests {
         }
         assert!(guarded.try_next().await.unwrap().is_none());
     }
-}
-
-pub(crate) fn encrypted_manifest(version: &ArtifactVersion) -> Option<&str> {
-    version
-        .meta
-        .as_ref()?
-        .get("encrypted_log_manifest")?
-        .as_str()
-}
-
-pub(crate) async fn sealed_log_response(
-    state: &std::sync::Arc<crate::state::AppState>,
-    version: &ArtifactVersion,
-) -> ApiResult<axum::response::Response> {
-    use attune_common::runtime_read_log::open_final_manifest;
-    let key = state
-        .config
-        .security
-        .encryption_key
-        .as_deref()
-        .ok_or_else(denied)?;
-    let encrypted = encrypted_manifest(version).ok_or_else(denied)?;
-    let execution = version.execution.ok_or_else(denied)?;
-    let manifest =
-        open_final_manifest(key, encrypted, execution, version.id).map_err(|_| denied())?;
-    if version.body_state != Some(ArtifactBodyState::Ready)
-        || version
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get("log_encoding"))
-            .and_then(serde_json::Value::as_str)
-            != Some(attune_common::runtime_read_log::ENCODING)
-        || version.size_bytes != i64::try_from(manifest.ciphertext_bytes).ok()
-        || version.sha256.as_deref() != Some(manifest.ciphertext_sha256.as_str())
-    {
-        return Err(denied());
-    }
-    let mut connection = state.db.acquire().await?;
-    if !ArtifactVersionRepository::log_is_sealed(&mut connection, version.id).await? {
-        return Err(denied());
-    }
-    drop(connection);
-    let reader = crate::log_decoder::sealed_ciphertext(state.clone(), version).await?;
-    let stream = crate::log_decoder::verified_plaintext(reader, key.to_owned(), manifest);
-    // A ciphertext range cannot establish complete-stream proof. Serve the full
-    // plaintext with successful EOF gated on manifest verification, never an
-    // early Content-Length/206 completion for an unchecked prefix.
-    axum::response::Response::builder()
-        .header(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; charset=utf-8",
-        )
-        .header(axum::http::header::CACHE_CONTROL, "private, no-store")
-        .header(axum::http::header::ACCEPT_RANGES, "none")
-        .body(axum::body::Body::from_stream(stream))
-        .map_err(|_| denied())
 }

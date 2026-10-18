@@ -43,6 +43,8 @@ impl NativeSuccessOutputLeaf {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SuccessSource {
+    empty_sources: Vec<super::empty_success::EmptySuccessWitness>,
+    child_input_fields: Vec<(Id, Vec<ArchivedField>)>,
     renderer: Id,
     pub(super) execution: Id,
     pub(super) workflow: Id,
@@ -84,6 +86,17 @@ pub struct NativeSuccessMetadataEvidence {
     source: SuccessSource,
 }
 impl NativeSuccessMetadataEvidence {
+    pub fn original_child_input_fields(
+        &self,
+        execution: Id,
+    ) -> Vec<crate::secret_values::StoredSecretValue> {
+        self.source
+            .child_input_fields
+            .iter()
+            .find(|(id, _)| *id == execution)
+            .map(|(_, fields)| fields.iter().map(ArchivedField::stored).collect())
+            .unwrap_or_default()
+    }
     pub(super) fn new(snapshot: Id, source: &SuccessSource) -> Self {
         Self {
             snapshot,
@@ -181,6 +194,87 @@ pub struct PreparedNativeSuccessMetadata {
     recorded: std::sync::OnceLock<Id>,
 }
 impl PreparedNativeSuccessMetadata {
+    /// Source-only size reservation for the existing empty-to-real-child shape.
+    /// Maximum-width future IDs are sizing facts, never accepted receipt proof.
+    pub(crate) async fn reserve_mixed_archive(
+        &self,
+        conn: &mut PgConnection,
+        leaves: &[(String, Value, Value, String)],
+        encrypted_value: &Value,
+        key: &str,
+    ) -> Result<usize> {
+        require_transaction(conn, &self.source.transaction).await?;
+        self.ensure_fresh_on(conn).await?;
+        if self.source.empty_sources.is_empty() {
+            return Err(denied());
+        }
+        let mut source = self.source.clone();
+        for (path, proof, encrypted, key_hash) in leaves {
+            let site = InputSite {
+                execution: source.execution,
+                kind: super::super::inherited_input::InputEntityKind::ExecutionResult,
+                purpose: InputSitePurpose::Value,
+                path: path.clone(),
+            };
+            source.parents.push((Id::MAX, site));
+            source.leaves.push(NativeSuccessOutputLeaf {
+                path: path.clone(),
+                receipt: Id::MAX,
+                proof: proof.clone(),
+                proof_digest: hash(proof)?,
+                encrypted_value: encrypted.clone(),
+                key_hash: key_hash.clone(),
+            });
+        }
+        let body = Body {
+            renderer: self.renderer.id,
+            execution: source.execution,
+            task_path: String::new(),
+            authority: self.renderer.authority.0.clone(),
+            approval_deadline: self.fence.approval_deadline(),
+            source: Source::SuccessMetadata(source.clone()),
+        };
+        let associations = storage_associations(&body);
+        let owner = storage_owner(metadata(Id::MAX, &body).read_owner())?;
+        let physical = storage_physical_parents(Id::MAX, &body, &owner)?;
+        // All future leaf IDs use the same width placeholder, but the actual
+        // receipts are distinct. Reserve their unique physical nodes as well.
+        if physical.len() + source.parents.len() + nodes(&source) + leaves.len() > 256 {
+            return Err(Error::PermissionDenied(
+                "Mixed success archive reservation exceeds node budget".into(),
+            ));
+        }
+        let body_value = serde_json::to_value(&body)?;
+        let digest = hash(&body_value)?;
+        let key_hash = crate::crypto::hash_encryption_key(key);
+        let reader_bytes = serde_json::to_vec(&body_value)?.len()
+            + serde_json::to_vec(encrypted_value)?.len()
+            + digest.len()
+            + key_hash.len()
+            + serde_json::to_vec(&source.parents)?.len()
+            + serde_json::to_vec(&associations)?.len();
+        if reader_bytes > MAX_BYTES || source.parents.len() + source.leaves.len() > 256 {
+            return Err(Error::PermissionDenied(
+                "Mixed success archive reservation exceeds reader budget".into(),
+            ));
+        }
+        // The owning store also charges JSONB's spaced serialization. Reserve
+        // that exact charge now rather than discovering it behind target locks.
+        let storage_bytes: i64 = sqlx::query_scalar("SELECT (octet_length($1::JSONB::TEXT)+octet_length($2::JSONB::TEXT)+octet_length(COALESCE($1::JSONB#>'{source,fields}','[]'::JSONB)::TEXT)+octet_length(COALESCE($1::JSONB#>'{source,parents}','[]'::JSONB)::TEXT)+octet_length($3::JSONB::TEXT)+octet_length($4::TEXT)+octet_length($5::TEXT))::BIGINT")
+            .bind(&body_value).bind(encrypted_value).bind(&associations).bind(&digest).bind(&key_hash).fetch_one(&mut *conn).await?;
+        let (count, existing): (i64, i64) = sqlx::query_as("SELECT count(*),COALESCE(sum(octet_length(body::TEXT)+octet_length(encrypted_value::TEXT)+octet_length(COALESCE(body#>'{source,fields}','[]'::JSONB)::TEXT)+octet_length(COALESCE(body#>'{source,parents}','[]'::JSONB)::TEXT)+octet_length(body_digest)+octet_length(encryption_key_hash)+octet_length(native_snapshot_storage_associations(body,renderer_admission)::TEXT)),0)::BIGINT FROM runtime_native_input_snapshot WHERE renderer_admission=$1")
+            .bind(self.renderer.id).fetch_one(&mut *conn).await?;
+        if count >= 128
+            || existing
+                .checked_add(storage_bytes)
+                .is_none_or(|bytes| bytes > MAX_BYTES as i64)
+        {
+            return Err(Error::PermissionDenied(
+                "Mixed success archive reservation exceeds storage budget".into(),
+            ));
+        }
+        Ok(reader_bytes.max(usize::try_from(storage_bytes).map_err(|_| denied())?))
+    }
     pub fn execution(&self) -> Id {
         self.source.execution
     }
@@ -326,6 +420,36 @@ impl NativeInputSnapshotRepository {
         let mut child_contracts = Vec::new();
         let mut edges = Vec::new();
         let mut held = Vec::new();
+        for context in state.empty_child_inputs() {
+            context.ensure_fresh_on(conn).await?;
+            fence = fence.intersect(context.accepted_fence());
+            let SecretOrigin::Entity { entity_id: id, .. } = context.origin() else {
+                return Err(denied());
+            };
+            let edge = (id, context.site().clone());
+            if !edges.contains(&edge) {
+                edges.push(edge);
+                held.push(context.copy_held());
+            }
+        }
+        for empty in state.empty_sources() {
+            empty.ensure_fresh_on(conn).await?;
+            fence = fence.intersect(&ApprovalEffectFence::from_input_approval(
+                empty.held_deadline(),
+            )?);
+            for context in empty.receipts() {
+                context.ensure_fresh_on(conn).await?;
+                fence = fence.intersect(context.accepted_fence());
+                let SecretOrigin::Entity { entity_id: id, .. } = context.origin() else {
+                    return Err(denied());
+                };
+                let edge = (id, context.site().clone());
+                if !edges.contains(&edge) {
+                    edges.push(edge);
+                    held.push(context.copy_held());
+                }
+            }
+        }
         for actual in state.source_executions() {
             let (child, _, child_fence) =
                 Self::prepare_result_source(conn, &renderer, actual.id, key).await?;
@@ -421,6 +545,16 @@ impl NativeInputSnapshotRepository {
             state.output_contract().output.as_ref(),
         )?;
         let source = SuccessSource {
+            child_input_fields: state
+                .empty_child_fields()
+                .iter()
+                .map(|(id, fields)| (*id, fields.iter().map(ArchivedField::from).collect()))
+                .collect(),
+            empty_sources: state
+                .empty_sources()
+                .iter()
+                .map(|source| source.archive())
+                .collect(),
             renderer: renderer.id,
             execution: state.execution(),
             workflow: state.workflow().id,
@@ -661,7 +795,7 @@ fn publication_step<T>(result: Result<T>, stage: &'static str) -> Result<T> {
     })
 }
 
-fn compose<'a>(
+pub(super) fn compose<'a>(
     graph: &Value,
     leaves: impl Iterator<Item = (&'a str, &'a Value)>,
     contract: Option<&crate::value_schema::Contract>,
@@ -700,68 +834,6 @@ fn compose<'a>(
     bounded(&candidate)?;
     Ok(candidate)
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn generated_status_needs_no_authored_leaf() {
-        assert_eq!(
-            compose(&json!({}), std::iter::empty(), None).unwrap(),
-            json!({"succeeded":true})
-        );
-    }
-    #[test]
-    fn canonical_original_contract_derives_warning_from_actual_leaf() {
-        let contract = crate::value_schema::compile_inline(
-            "success.test",
-            crate::value_schema::SchemaContext::FlatDocument,
-            &json!({"value":{"type":"integer"},"succeeded":{"type":"boolean"}}),
-        )
-        .unwrap();
-        let graph = json!({"output_map":{"value":"{{ task().result }}"}});
-        let actual = json!("literal output");
-        let candidate = json!({"value":"literal output","succeeded":true});
-        let compiled = crate::value_schema::CompiledContract::new(&contract).unwrap();
-        let error = compiled.validate(&candidate).unwrap_err();
-        let result = compose(
-            &graph,
-            std::iter::once(("/value", &actual)),
-            Some(&contract),
-        )
-        .unwrap();
-        assert_eq!(
-            result["output_validation_warning"],
-            json!({"code":error.code,"path":error.path})
-        );
-        assert_eq!(result["value"], actual);
-        assert_eq!(result["succeeded"], true);
-    }
-    #[test]
-    fn authored_status_is_preserved_and_diagnostics_cannot_be_supplied() {
-        assert_eq!(
-            compose(
-                &json!({"output_map":{"succeeded":false}}),
-                std::iter::empty(),
-                None
-            )
-            .unwrap(),
-            json!({"succeeded":false})
-        );
-        assert!(compose(
-            &json!({"output_map":{"output_validation_warning":null}}),
-            std::iter::empty(),
-            None
-        )
-        .is_err());
-        assert!(compose(&json!({"output_map":[]}), std::iter::empty(), None).is_err());
-        assert!(compose(
-            &json!({"output_map":{}}),
-            std::iter::once(("/missing", &Value::Null)),
-            None
-        )
-        .is_err());
-    }
-}
 fn graph(source: &SuccessSource) -> Result<&Value> {
     Ok(&source
         .parent
@@ -795,7 +867,13 @@ pub(super) fn associations(source: &SuccessSource, renderer: Id) -> Value {
     json!({"budget":renderer,"admissions":admissions(source,renderer),"release":null,"success_metadata_observation":[Id::MAX,source],"success_metadata_release":[Id::MAX,source.execution,source.workflow,source.completed,source.transaction]})
 }
 pub(super) fn nodes(source: &SuccessSource) -> usize {
-    source.leaves.len()
+    source
+        .child_input_fields
+        .iter()
+        .map(|(_, fields)| fields.len())
+        .sum::<usize>()
+        + source.empty_sources.len()
+        + source.leaves.len()
         + source.children.len()
         + source.config_fields.len()
         + source.result_fields.len()
@@ -811,6 +889,11 @@ pub(super) fn physical_parents(source: &SuccessSource) -> Result<Vec<NativeStora
     let mut parents = vec![NativeStorageParent::WorkflowExecution {
         workflow: source.workflow,
     }];
+    for empty in &source.empty_sources {
+        parents.push(NativeStorageParent::NativeSnapshot {
+            snapshot: empty.snapshot,
+        });
+    }
     for child in &source.children {
         parents.extend([
             NativeStorageParent::Execution {
@@ -828,6 +911,21 @@ pub(super) fn physical_parents(source: &SuccessSource) -> Result<Vec<NativeStora
     Ok(parents)
 }
 pub(super) fn validate_storage(source: &SuccessSource) -> Result<()> {
+    if source.empty_sources.is_empty() != source.child_input_fields.is_empty() {
+        return Err(denied());
+    }
+    if !source.child_input_fields.is_empty()
+        && (source.child_input_fields.len() != 1
+            || source.children.len() != 1
+            || source.child_input_fields[0].0 != source.children[0].execution)
+    {
+        return Err(denied());
+    }
+    for (_, fields) in &source.child_input_fields {
+        for field in fields {
+            field.provenance()?;
+        }
+    }
     if source.renderer <= 0
         || source.execution <= 0
         || source.workflow <= 0
@@ -864,8 +962,58 @@ pub(super) fn validate_storage(source: &SuccessSource) -> Result<()> {
         .get("tasks")
         .and_then(Value::as_array)
         .ok_or_else(denied)?;
-    if tasks.len() != source.children.len()
+    let mut empty_names = BTreeSet::new();
+    if !source.empty_sources.is_empty()
+        && (source.empty_sources.len() != 1 || tasks.len() != 2 || source.children.len() != 1)
+    {
+        return Err(denied());
+    }
+    for empty in &source.empty_sources {
+        super::empty_success::validate(
+            empty,
+            source.execution,
+            source.workflow,
+            source
+                .parent
+                .executable_snapshot
+                .as_ref()
+                .ok_or_else(denied)?,
+        )?;
+        if !empty_names.insert(super::empty_success::name(empty).to_owned()) {
+            return Err(denied());
+        }
+    }
+    if tasks.len() != source.children.len() + empty_names.len()
         || tasks.iter().any(|task| {
+            if task
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| empty_names.contains(name))
+            {
+                return task.get("with_items").is_none_or(Value::is_null)
+                    || ["wait_for", "tasks"]
+                        .iter()
+                        .any(|field| task.get(*field).is_some_and(|value| !value.is_null()))
+                    || task
+                        .get("iterate_cache")
+                        .is_some_and(|value| !value.is_null())
+                    || task
+                        .get("next")
+                        .and_then(Value::as_array)
+                        .is_none_or(|next| {
+                            next.is_empty()
+                                || next.iter().any(|transition| {
+                                    transition.get("do").and_then(Value::as_array).is_none_or(
+                                        |targets| {
+                                            targets.iter().any(|target| {
+                                                target.as_str()
+                                                    != Some(source.children[0].task_name.as_str())
+                                            })
+                                        },
+                                    )
+                                })
+                        });
+            }
             ["with_items", "iterate_cache", "wait_for"]
                 .iter()
                 .any(|name| task.get(*name).is_some_and(|value| !value.is_null()))
@@ -912,20 +1060,21 @@ pub(super) fn validate_storage(source: &SuccessSource) -> Result<()> {
             }
         }
     }
+    let all_names: BTreeSet<_> = names.union(&empty_names).cloned().collect();
     if !ids.contains(&source.completed)
         || source.child_contracts.len() != ids.len()
         || tasks.iter().any(|task| {
             task.get("name")
                 .and_then(Value::as_str)
-                .is_none_or(|name| !names.contains(name))
+                .is_none_or(|name| !all_names.contains(name))
         })
         || source
             .projected_completed
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>()
-            != names
-        || source.projected_completed.len() != names.len()
+            != all_names
+        || source.projected_completed.len() != all_names.len()
     {
         return Err(denied());
     }
@@ -959,6 +1108,9 @@ pub(super) async fn validate_normalized(
     source: &SuccessSource,
 ) -> Result<()> {
     validate_storage(source)?;
+    for empty in &source.empty_sources {
+        super::empty_success::normalized(conn, empty).await?;
+    }
     let original: Value = sqlx::query_scalar(
         "SELECT observation FROM runtime_native_success_metadata_observation WHERE snapshot=$1",
     )
@@ -1036,4 +1188,66 @@ pub(super) fn validate_body(body: &Body, source: &SuccessSource) -> Result<()> {
         return Err(denied());
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn generated_status_needs_no_authored_leaf() {
+        assert_eq!(
+            compose(&json!({}), std::iter::empty(), None).unwrap(),
+            json!({"succeeded":true})
+        );
+    }
+    #[test]
+    fn canonical_original_contract_derives_warning_from_actual_leaf() {
+        let contract = crate::value_schema::compile_inline(
+            "success.test",
+            crate::value_schema::SchemaContext::FlatDocument,
+            &json!({"value":{"type":"integer"},"succeeded":{"type":"boolean"}}),
+        )
+        .unwrap();
+        let graph = json!({"output_map":{"value":"{{ task().result }}"}});
+        let actual = json!("literal output");
+        let candidate = json!({"value":"literal output","succeeded":true});
+        let compiled = crate::value_schema::CompiledContract::new(&contract).unwrap();
+        let error = compiled.validate(&candidate).unwrap_err();
+        let result = compose(
+            &graph,
+            std::iter::once(("/value", &actual)),
+            Some(&contract),
+        )
+        .unwrap();
+        assert_eq!(
+            result["output_validation_warning"],
+            json!({"code":error.code,"path":error.path})
+        );
+        assert_eq!(result["value"], actual);
+        assert_eq!(result["succeeded"], true);
+    }
+    #[test]
+    fn authored_status_is_preserved_and_diagnostics_cannot_be_supplied() {
+        assert_eq!(
+            compose(
+                &json!({"output_map":{"succeeded":false}}),
+                std::iter::empty(),
+                None
+            )
+            .unwrap(),
+            json!({"succeeded":false})
+        );
+        assert!(compose(
+            &json!({"output_map":{"output_validation_warning":null}}),
+            std::iter::empty(),
+            None
+        )
+        .is_err());
+        assert!(compose(&json!({"output_map":[]}), std::iter::empty(), None).is_err());
+        assert!(compose(
+            &json!({"output_map":{}}),
+            std::iter::once(("/missing", &Value::Null)),
+            None
+        )
+        .is_err());
+    }
 }

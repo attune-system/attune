@@ -1311,6 +1311,10 @@ async fn handle_uninstall(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "CLI dispatch forwards independently parsed upload and rollout safety flags"
+)]
 async fn handle_upload(
     acknowledge_incompatible_rollout: bool,
     profile: &Option<String>,
@@ -1517,6 +1521,10 @@ fn append_dir_to_tar<W: std::io::Write>(tar: &mut tar::Builder<W>, base: &Path) 
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "CLI dispatch forwards independently parsed registration and rollout safety flags"
+)]
 async fn handle_register(
     acknowledge_incompatible_rollout: bool,
     profile: &Option<String>,

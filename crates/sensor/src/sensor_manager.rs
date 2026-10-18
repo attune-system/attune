@@ -517,7 +517,7 @@ async fn read_sensor_stderr_excerpt_from_transport(
     sensor_ref: &str,
     relative_path: &str,
 ) -> Option<String> {
-    let size = match transport.file_size(&relative_path).await {
+    let size = match transport.file_size(relative_path).await {
         Ok(Some(size)) => size,
         Err(e) => {
             debug!(

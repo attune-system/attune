@@ -1102,7 +1102,7 @@ async fn ad_hoc_literal_dispatch_case(
         .await?
         .unwrap();
     let items = WorkQueueItemRepository::search_with_conn(
-        &mut *tx,
+        &mut tx,
         &attune_common::repositories::work_queue::WorkQueueItemSearchFilters {
             queue: Some(queue.id),
             limit: 10,
@@ -1580,15 +1580,15 @@ async fn generic_contributor_proof_uses_frozen_parents_and_never_unions_input_au
     );
     assert!(RecordedInputOriginRepository::require_runtime_reads(
         &mut tx,
-        &[denied.clone()],
-        &[read.clone()]
+        std::slice::from_ref(&denied),
+        std::slice::from_ref(&read)
     )
     .await
     .is_err());
     RecordedInputOriginRepository::require_runtime_reads(
         &mut tx,
-        &[allowed.clone()],
-        &[read.clone()],
+        std::slice::from_ref(&allowed),
+        std::slice::from_ref(&read),
     )
     .await?;
     assert!(RecordedInputOriginRepository::require_runtime_reads(

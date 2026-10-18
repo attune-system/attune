@@ -12,6 +12,9 @@ use crate::{
 /// Issued only from persisted IDs plus B's genuine source plan. No Clone,
 /// Deserialize, supplied payload, warning list, success flag or public setter.
 pub struct PreparedNativeSuccess<'a> {
+    empty_child_inputs: Vec<super::super::inherited_input::ReceiptContext>,
+    empty_child_fields: Vec<(Id, Vec<StoredSecretValue>)>,
+    empty_sources: Vec<super::super::native_input_snapshot::PreparedEmptySuccessWitness>,
     transaction: String,
     completed: Id,
     parent: Execution,
@@ -27,6 +30,10 @@ pub struct PreparedNativeSuccess<'a> {
 }
 
 impl NativeFailureMaterializationRepository {
+    /// Syntax only. The caller must separately obtain the original empty proof.
+    pub(crate) fn empty_success_tasks(graph: &Value) -> Result<Option<(String, String)>> {
+        empty_success_names(graph)
+    }
     /// Source phase, before any target effects. A receives this token and B's
     /// opaque leaves/decisions, never a caller's representation of those facts.
     pub async fn prepare_native_success<'a>(
@@ -35,6 +42,26 @@ impl NativeFailureMaterializationRepository {
         workflow_id: Id,
         completed: Id,
         plan: &'a PreparedNativeTransitions,
+    ) -> Result<Option<PreparedNativeSuccess<'a>>> {
+        Self::prepare_success_inventory(conn, root, workflow_id, completed, plan, None).await
+    }
+    pub(super) async fn prepare_native_empty_success<'a>(
+        conn: &mut PgConnection,
+        root: Id,
+        workflow_id: Id,
+        completed: Id,
+        plan: &'a PreparedNativeTransitions,
+        key: &str,
+    ) -> Result<Option<PreparedNativeSuccess<'a>>> {
+        Self::prepare_success_inventory(conn, root, workflow_id, completed, plan, Some(key)).await
+    }
+    async fn prepare_success_inventory<'a>(
+        conn: &mut PgConnection,
+        root: Id,
+        workflow_id: Id,
+        completed: Id,
+        plan: &'a PreparedNativeTransitions,
+        empty_key: Option<&str>,
     ) -> Result<Option<PreparedNativeSuccess<'a>>> {
         plan.require_source_phase()?;
         let parent = ExecutionRepository::find_by_id(&mut *conn, root)
@@ -79,8 +106,19 @@ impl NativeFailureMaterializationRepository {
         if definition.id != workflow.workflow_def {
             return Err(changed());
         }
-        let Some(names) = success_task_names(&definition.definition)? else {
-            return Ok(None);
+        let mut empty_sources = Vec::new();
+        let names = if let Some(key) = empty_key {
+            let Some((empty, ordinary)) = empty_success_names(&definition.definition)? else {
+                return Ok(None);
+            };
+            empty_sources.push(super::super::native_input_snapshot::NativeInputSnapshotRepository::prepare_empty_success_witness(
+                conn, &parent, &workflow, &empty, key).await?);
+            BTreeSet::from([ordinary])
+        } else {
+            let Some(names) = success_task_names(&definition.definition)? else {
+                return Ok(None);
+            };
+            names
         };
         let Some(task) = current.workflow_task.as_ref() else {
             return Err(changed());
@@ -116,6 +154,8 @@ impl NativeFailureMaterializationRepository {
         plan.require_original_child_rows(&rows)?;
         let mut observed = BTreeSet::new();
         let mut children = Vec::new();
+        let mut empty_child_inputs = Vec::new();
+        let mut empty_child_fields = Vec::new();
         let mut bytes = 0;
         add_held_bytes(&mut bytes, &parent)?;
         add_held_bytes(&mut bytes, &workflow)?;
@@ -128,6 +168,13 @@ impl NativeFailureMaterializationRepository {
         }
         for row in rows {
             let metadata = row.workflow_task.as_ref().ok_or_else(changed)?;
+            if !empty_sources.is_empty()
+                && !empty_sources
+                    .iter()
+                    .any(|source| metadata.triggered_by.as_deref() == Some(source.name()))
+            {
+                return Err(changed());
+            }
             if row.parent != Some(root)
                 || metadata.workflow_execution != workflow_id
                 || !names.contains(&metadata.task_name)
@@ -143,6 +190,39 @@ impl NativeFailureMaterializationRepository {
                 || !observed.insert(metadata.task_name.clone())
             {
                 return Ok(None);
+            }
+            if let Some(key) = empty_key {
+                let input_schema = original_contract(conn, &row).await?;
+                let input_fence =
+                    super::super::accepted_input::AcceptedInputRepository::revalidate_execution(
+                        conn, row.id, key,
+                    )
+                    .await?;
+                let (input_fields, contexts) =
+                    super::super::accepted_execution_source::prepare_observation(
+                        conn,
+                        &row,
+                        &input_schema,
+                        key,
+                    )
+                    .await?;
+                fences.push(input_fence);
+                account_fields(&mut bytes, &input_fields)?;
+                if !empty_sources.iter().all(|empty| {
+                    contexts.iter().any(|context| {
+                        context.native_source_metadata().iter().any(|metadata| {
+                            metadata.snapshot() == empty.snapshot()
+                                && metadata.source_kind() == "empty_iteration_outcome"
+                        })
+                    })
+                }) {
+                    return Err(changed());
+                }
+                for context in &contexts {
+                    context.ensure_fresh_on(conn).await?;
+                }
+                empty_child_inputs.extend(contexts);
+                empty_child_fields.push((row.id, input_fields));
             }
             let outcome = Inputs::prepare_outcome(conn, root, row.id).await?;
             if outcome.execution() != row.id
@@ -181,11 +261,29 @@ impl NativeFailureMaterializationRepository {
         if observed != names {
             return Ok(None);
         }
-        let Some(projected_completed) = project_success_tasks(&workflow, &names, &task.task_name)?
+        if let Some(key) = empty_key {
+            let contexts: Vec<_> = empty_child_inputs
+                .iter()
+                .chain(empty_sources.iter().flat_map(|source| source.receipts()))
+                .collect();
+            let (charge, _) =
+                Inputs::prepared_source_graph_bounds(conn, &contexts, &[], key).await?;
+            bytes = bytes.checked_add(charge).ok_or_else(changed)?;
+            if bytes > MAX_BYTES {
+                return Err(changed());
+            }
+        }
+        let mut all_names = names.clone();
+        all_names.extend(empty_sources.iter().map(|source| source.name().to_owned()));
+        let Some(projected_completed) =
+            project_success_tasks(&workflow, &all_names, &task.task_name)?
         else {
             return Ok(None);
         };
         let prepared = PreparedNativeSuccess {
+            empty_child_inputs,
+            empty_child_fields,
+            empty_sources,
             transaction,
             completed,
             parent,
@@ -205,6 +303,17 @@ impl NativeFailureMaterializationRepository {
 }
 
 impl<'a> PreparedNativeSuccess<'a> {
+    pub(crate) fn empty_child_inputs(&self) -> &[super::super::inherited_input::ReceiptContext] {
+        &self.empty_child_inputs
+    }
+    pub(crate) fn empty_child_fields(&self) -> &[(Id, Vec<StoredSecretValue>)] {
+        &self.empty_child_fields
+    }
+    pub(crate) fn empty_sources(
+        &self,
+    ) -> &[super::super::native_input_snapshot::PreparedEmptySuccessWitness] {
+        &self.empty_sources
+    }
     pub fn execution(&self) -> Id {
         self.parent.id
     }
@@ -344,6 +453,13 @@ impl<'a> PreparedNativeSuccess<'a> {
     pub async fn require_original_sources_on(&self, conn: &mut PgConnection) -> Result<()> {
         self.ensure_fresh_on(conn).await?;
         self.plan.require_original_result_view_on(conn).await?;
+        for (child, fields) in &self.empty_child_fields {
+            if Secrets::find_stored_by_entity(&mut *conn, ENTITY_EXECUTION_CONFIG, *child).await?
+                != *fields
+            {
+                return Err(changed());
+            }
+        }
         let rows = ExecutionRepository::find_by_parent(&mut *conn, self.parent.id).await?;
         self.plan.require_original_child_rows(&rows)?;
         if rows.len() != self.children.len()
@@ -360,6 +476,12 @@ impl<'a> PreparedNativeSuccess<'a> {
         Ok(())
     }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
+        for receipt in &self.empty_child_inputs {
+            receipt.ensure_fresh_on(conn).await?;
+        }
+        for source in &self.empty_sources {
+            source.ensure_fresh_on(conn).await?;
+        }
         let current: String = sqlx::query_scalar("SELECT pg_current_xact_id()::TEXT")
             .fetch_one(&mut *conn)
             .await?;
@@ -373,12 +495,102 @@ impl<'a> PreparedNativeSuccess<'a> {
         Ok(())
     }
     pub fn ensure_fresh(&self) -> Result<()> {
+        for receipt in &self.empty_child_inputs {
+            receipt.ensure_fresh()?;
+        }
+        for source in &self.empty_sources {
+            source.ensure_fresh()?;
+        }
         self.plan.ensure_fresh()?;
         for fence in &self.fences {
             fence.ensure_fresh()?;
         }
         Ok(())
     }
+}
+
+// The ordinary closed-program classifier above stays unchanged. This separate
+// slice has one authenticated empty predecessor and one actual ordinary child.
+fn empty_success_names(graph: &Value) -> Result<Option<(String, String)>> {
+    bounded(graph)?;
+    let Some(tasks) = graph
+        .get("tasks")
+        .and_then(Value::as_array)
+        .filter(|tasks| tasks.len() == 2)
+    else {
+        return Ok(None);
+    };
+    let empty: Vec<_> = tasks
+        .iter()
+        .filter(|task| task.get("with_items").is_some_and(|value| !value.is_null()))
+        .collect();
+    let [empty] = empty.as_slice() else {
+        return Ok(None);
+    };
+    let ordinary = tasks
+        .iter()
+        .find(|task| !std::ptr::eq(*task, *empty))
+        .ok_or_else(changed)?;
+    if ["with_items", "iterate_cache", "wait_for", "tasks"]
+        .iter()
+        .any(|field| ordinary.get(*field).is_some_and(|value| !value.is_null()))
+        || ordinary
+            .get("next")
+            .and_then(Value::as_array)
+            .is_some_and(|next| {
+                next.iter().any(|transition| {
+                    transition.get("do").is_some_and(|value| {
+                        !value.is_null()
+                            && value.as_array().is_none_or(|targets| !targets.is_empty())
+                    })
+                })
+            })
+    {
+        return Ok(None);
+    }
+    if ["wait_for", "tasks"]
+        .iter()
+        .any(|field| empty.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        return Ok(None);
+    }
+    if empty
+        .get("iterate_cache")
+        .is_some_and(|value| !value.is_null())
+        || CanonicalCompletionTask::prepare(ordinary)?.is_none()
+    {
+        return Ok(None);
+    }
+    let empty_name = empty
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(changed)?;
+    let ordinary_name = ordinary
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(changed)?;
+    if empty_name.is_empty() || ordinary_name.is_empty() || empty_name == ordinary_name {
+        return Err(changed());
+    }
+    let Some(next) = empty
+        .get("next")
+        .and_then(Value::as_array)
+        .filter(|next| !next.is_empty())
+    else {
+        return Ok(None);
+    };
+    for transition in next {
+        let Some(targets) = transition.get("do").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        if targets
+            .iter()
+            .any(|target| target.as_str() != Some(ordinary_name))
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some((empty_name.into(), ordinary_name.into())))
 }
 
 fn success_task_names(graph: &Value) -> Result<Option<BTreeSet<String>>> {

@@ -28,9 +28,13 @@ impl NativeFailureMaterializationRepository {
         plan: &'a PreparedNativeTransitions,
         key: &str,
     ) -> Result<Option<PreparedNativeSuccessOutput<'a>>> {
-        let Some(state) =
-            Self::prepare_native_success(conn, root, workflow, completed, plan).await?
-        else {
+        let state = Self::prepare_native_success(conn, root, workflow, completed, plan).await?;
+        let state = if state.is_some() {
+            state
+        } else {
+            Self::prepare_native_empty_success(conn, root, workflow, completed, plan, key).await?
+        };
+        let Some(state) = state else {
             return Ok(None);
         };
         let destination = Inputs::prepare_native_success_metadata(conn, &state, key).await?;

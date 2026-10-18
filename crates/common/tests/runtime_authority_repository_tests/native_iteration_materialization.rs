@@ -31,6 +31,10 @@ mod empty_ordinary_cases;
 
 // Use the owning production parser/builder for I's persisted graph contract,
 // rather than fabricating a nodes/retry table in a repository fixture.
+#[path = "native_iteration_materialization/empty_root_budget_cases.rs"]
+mod empty_root_budget_cases;
+#[path = "native_iteration_materialization/empty_root_custody.rs"]
+mod empty_root_custody;
 #[path = "../../../executor/src/workflow/graph.rs"]
 #[allow(dead_code)] // Graph inspection helpers are not all needed by this fixture.
 mod executor_task_graph;
@@ -98,9 +102,18 @@ enum EmptyProgram {
     BudgetOrdinarySuccessor,
     InputGraphBudget(usize),
     InvalidOrdinaryInput(&'static str),
+    OrdinaryTerminalSuccessor,
     Terminal,
+    TerminalBudget(usize, usize),
+    TerminalInheritedBudget(usize, usize),
+    TerminalInventory(usize),
+    OrdinaryTerminalBudget(usize, usize),
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The graph fixture varies each contract and iteration boundary independently"
+)]
 async fn setup_graph_contract(
     items: Value,
     batch: Option<usize>,
@@ -144,11 +157,17 @@ async fn setup_graph_contract(
     } else {
         None
     };
+    let mut param_schema = json!({"items":{"type":item_type},"literal":{"type":"string"}});
+    if matches!(empty_program, EmptyProgram::TerminalInventory(_)) {
+        for index in 0..100 {
+            param_schema[format!("unselected_{index:03}")] = json!({"type":"string","secret":true});
+        }
+    }
     attune_common::repositories::action::ActionRepository::update(
         &db,
         graph_action.id,
         attune_common::repositories::action::UpdateActionInput {
-            param_schema: Some(json!({"items":{"type":item_type},"literal":{"type":"string"}})),
+            param_schema: Some(param_schema.clone()),
             ..Default::default()
         },
     )
@@ -214,6 +233,8 @@ async fn setup_graph_contract(
     }
     match empty_program {
         EmptyProgram::OrdinarySuccessor
+        | EmptyProgram::OrdinaryTerminalSuccessor
+        | EmptyProgram::OrdinaryTerminalBudget(_, _)
         | EmptyProgram::DynamicOrdinarySuccessor
         | EmptyProgram::UnconditionalOrdinarySuccessor
         | EmptyProgram::BudgetOrdinarySuccessor
@@ -258,11 +279,67 @@ async fn setup_graph_contract(
                         .collect(),
                 );
             }
+            if matches!(
+                empty_program,
+                EmptyProgram::OrdinaryTerminalSuccessor
+                    | EmptyProgram::OrdinaryTerminalBudget(_, _)
+            ) {
+                definition["tasks"].as_array_mut().unwrap().truncate(2);
+                definition["tasks"][0]["next"]
+                    .as_array_mut()
+                    .unwrap()
+                    .truncate(1);
+                if let EmptyProgram::OrdinaryTerminalBudget(fields, _) = empty_program {
+                    definition["output_map"] = Value::Object(
+                        (0..fields)
+                            .map(|index| {
+                                (
+                                    format!("field_{index:02}"),
+                                    json!("{{ parameters.literal }}"),
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+            }
         }
-        EmptyProgram::Terminal => {
+        EmptyProgram::Terminal
+        | EmptyProgram::TerminalBudget(_, _)
+        | EmptyProgram::TerminalInheritedBudget(_, _)
+        | EmptyProgram::TerminalInventory(_) => {
             definition["tasks"] = json!([definition["tasks"][0].clone()]);
             definition["tasks"][0]["next"] = json!([]);
             definition["output_map"] = json!({"empty":"{{ parameters.items }}"});
+            if let EmptyProgram::TerminalBudget(fields, _) = empty_program {
+                definition["output_map"] = Value::Object(
+                    (0..fields)
+                        .map(|index| {
+                            (
+                                format!("field_{index:02}"),
+                                json!("{{ parameters.literal }}"),
+                            )
+                        })
+                        .collect(),
+                );
+                // Keep the repeated input in one original parameter receipt.
+                definition["vars"] = json!({});
+            }
+            if let EmptyProgram::TerminalInheritedBudget(fields, _) = empty_program {
+                definition["output_map"] = Value::Object(
+                    (0..fields)
+                        .map(|index| (format!("field_{index:02}"), json!("{{ workflow.saved }}")))
+                        .collect(),
+                );
+            }
+            if let EmptyProgram::TerminalInventory(fields) = empty_program {
+                definition["tasks"][0]["with_items"] = json!("{{ [] }}");
+                definition["vars"] = json!({});
+                definition["output_map"] = Value::Object(
+                    (0..fields)
+                        .map(|index| (format!("field_{index:03}"), json!("{{ 'literal output' }}")))
+                        .collect(),
+                );
+            }
         }
         EmptyProgram::None | EmptyProgram::IterationSuccessor => {}
     }
@@ -359,8 +436,25 @@ async fn setup_graph_contract(
             });
         }
     }
-    if group.is_some() && !matches!(empty_program, EmptyProgram::Terminal) {
+    if group.is_some()
+        && !matches!(
+            empty_program,
+            EmptyProgram::Terminal
+                | EmptyProgram::TerminalBudget(_, _)
+                | EmptyProgram::TerminalInheritedBudget(_, _)
+                | EmptyProgram::TerminalInventory(_)
+        )
+    {
         for name in ["ordinary_success", "ordinary_failure"] {
+            if name == "ordinary_failure"
+                && matches!(
+                    empty_program,
+                    EmptyProgram::OrdinaryTerminalSuccessor
+                        | EmptyProgram::OrdinaryTerminalBudget(_, _)
+                )
+            {
+                continue;
+            }
             bindings.push(InvocationBinding::WorkflowTask {
                 workflow_ref: graph_action.r#ref.clone(),
                 task_path: format!("/tasks/{name}"),
@@ -385,22 +479,26 @@ async fn setup_graph_contract(
         invocations: bindings
             .into_iter()
             .map(|binding| {
-                let standard = ["standard".to_owned()];
+                let allowed = if binding == root_binding
+                    && matches!(
+                        empty_program,
+                        EmptyProgram::Terminal
+                            | EmptyProgram::TerminalBudget(_, _)
+                            | EmptyProgram::TerminalInheritedBudget(_, _)
+                            | EmptyProgram::TerminalInventory(_)
+                            | EmptyProgram::OrdinaryTerminalSuccessor
+                            | EmptyProgram::OrdinaryTerminalBudget(_, _)
+                            | EmptyProgram::DynamicOrdinarySuccessor
+                            | EmptyProgram::UnconditionalOrdinarySuccessor
+                    ) {
+                    vec!["standard".to_owned()]
+                } else {
+                    Vec::new()
+                };
                 InvocationPolicy::from_executable(
                     binding.clone(),
                     &snapshots[binding.action_ref()],
-                    Some(
-                        if matches!(
-                            empty_program,
-                            EmptyProgram::DynamicOrdinarySuccessor
-                                | EmptyProgram::UnconditionalOrdinarySuccessor
-                        ) && binding == root_binding
-                        {
-                            &standard
-                        } else {
-                            &[]
-                        },
-                    ),
+                    Some(&allowed),
                     &BTreeMap::new(),
                 )
                 .unwrap()
@@ -452,13 +550,25 @@ async fn setup_graph_contract(
     Schemas::attach(&mut tx, BindingOwner::Execution, root.id, &schema)
         .await
         .unwrap();
+    let mut config = json!({"items":items,"literal":match empty_program {
+        EmptyProgram::TerminalBudget(_, size) | EmptyProgram::TerminalInheritedBudget(_, size) | EmptyProgram::OrdinaryTerminalBudget(_, size) => "x".repeat(size),
+        _ => LITERAL.to_owned(),
+    }});
+    if matches!(empty_program, EmptyProgram::TerminalInventory(_)) {
+        for index in 0..100 {
+            config[format!("unselected_{index:03}")] = json!(format!("recorded input {index}"));
+        }
+    }
+    let (config, secrets) =
+        attune_common::secret_values::redact_secret_parameters(config, Some(&param_schema));
+    let secrets = attune_common::secret_values::prepare_secret_values(secrets, KEY).unwrap();
     root = ExecutionRepository::initialize_config_with_conn(
         &mut tx,
         root.id,
         Some(admission.id),
         &snapshot,
-        Some(json!({"items":items,"literal":LITERAL})),
-        &[],
+        Some(config),
+        &secrets,
     )
     .await
     .unwrap();
@@ -655,10 +765,29 @@ async fn run(items: Value, batch: Option<usize>) {
             .expect("real autonomous empty completion");
         assert_eq!(completed.id, root.id);
         assert_eq!(completed.status, ExecutionStatus::Completed);
-        assert!(
-            completed.result.is_none(),
-            "status-only empty completion must not invent a native VALUE"
+        assert_eq!(
+            completed.result,
+            Some(attune_common::secret_values::redaction_marker())
         );
+        let fields = Secrets::find_stored_by_entity(&mut *tx, "execution_result", root.id)
+            .await
+            .unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            attune_common::crypto::decrypt_json(&fields[0].encrypted_value, KEY).unwrap(),
+            json!({"succeeded":true})
+        );
+        let original: Value = sqlx::query_scalar("SELECT snapshot.encrypted_value FROM runtime_native_input_snapshot snapshot JOIN runtime_native_empty_root_release released ON released.snapshot=snapshot.id WHERE released.execution=$1")
+            .bind(root.id).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(
+            attune_common::crypto::decrypt_json(&original, KEY).unwrap(),
+            Value::Null,
+            "the original empty prerequisite remains CONTROL-only, not a generated VALUE"
+        );
+        let replay = Iteration::prepare_empty_root_replay(&mut tx, root.id, KEY)
+            .await
+            .unwrap();
+        assert_eq!(replay.completed_parent().id, root.id);
         assert_eq!(
             Workflows::find_by_id(&mut *tx, workflow.id)
                 .await
@@ -2183,7 +2312,7 @@ async fn native_ordinary_iteration_empty_completion_creates_one_real_ordinary_su
 
 #[tokio::test]
 async fn native_ordinary_iteration_empty_completion_records_typed_terminal_root() {
-    let (db, root, workflow, _, _) = setup_graph_contract(
+    let (db, root, workflow, human, _) = setup_graph_contract(
         json!([]),
         None,
         false,
@@ -2194,6 +2323,7 @@ async fn native_ordinary_iteration_empty_completion_records_typed_terminal_root(
         EmptyProgram::Terminal,
     )
     .await;
+    let writer = empty_root_custody::writer(&db, &root, human).await;
     let mut tx = db.begin().await.unwrap();
     CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
         .await
@@ -2201,6 +2331,18 @@ async fn native_ordinary_iteration_empty_completion_records_typed_terminal_root(
     let mut source = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
         .await
         .unwrap();
+    let mut foreign = db.begin().await.unwrap();
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        source.apply(&mut foreign, KEY),
+    )
+    .await
+    .expect("foreign root capability must reject before target locks");
+    assert!(matches!(
+        rejected,
+        Err(attune_common::Error::PermissionDenied(_))
+    ));
+    foreign.rollback().await.unwrap();
     let result = source.apply(&mut tx, KEY).await.unwrap();
     assert!(result.requested.is_empty());
     let completed = result
@@ -2241,6 +2383,342 @@ async fn native_ordinary_iteration_empty_completion_records_typed_terminal_root(
     source.ensure_fresh_on(&mut tx).await.unwrap();
     tx.commit().await.unwrap();
     source.ensure_fresh().unwrap();
+    // Drop every preparation object before replay. A new connection must read
+    // the finite root recipe, original output leaves and original empty Control.
+    drop(source);
+    let mut cold = db.begin().await.unwrap();
+    let replay = Iteration::prepare_empty_root_replay(&mut cold, root.id, KEY)
+        .await
+        .unwrap();
+    assert_eq!(replay.completed_parent().id, root.id);
+    replay.ensure_fresh_on(&mut cold).await.unwrap();
+    let fields = Secrets::find_stored_by_entity(&mut *cold, "execution_result", root.id)
+        .await
+        .unwrap();
+    let (ordinary, receipts) =
+        attune_common::repositories::immutable_input_origin::prepare_input_receipts(
+            &mut cold,
+            "execution_result",
+            root.id,
+            &fields,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(ordinary.is_empty());
+    assert!(!receipts.is_empty());
+    assert!(fields
+        .iter()
+        .any(
+            |field| attune_common::crypto::decrypt_json(&field.encrypted_value, KEY).unwrap()
+                == json!({"empty":[],"succeeded":true})
+        ));
+    for receipt in &receipts {
+        receipt.ensure_fresh_on(&mut cold).await.unwrap();
+    }
+    let snapshot: Id = sqlx::query_scalar(
+        "SELECT snapshot FROM runtime_native_empty_root_release WHERE execution=$1",
+    )
+    .bind(root.id)
+    .fetch_one(&mut *cold)
+    .await
+    .unwrap();
+    cold.rollback().await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store =
+        attune_common::blob_store::FilesystemBlobStore::new(directory.path().join("objects"))
+            .unwrap();
+    let held = super::file_native_retention_cases::hold_wait_output(
+        &db,
+        &writer,
+        human,
+        &root
+            .executable_snapshot
+            .as_ref()
+            .unwrap()
+            .executable
+            .action
+            .pack_ref,
+        KEY,
+        &receipts[0],
+        directory.path(),
+        &store,
+    )
+    .await;
+    let pins: Vec<(String, Id)> =
+        sqlx::query_as("SELECT kind,source FROM file_evidence_pin WHERE owner=$1")
+            .bind(held.version)
+            .fetch_all(&*db)
+            .await
+            .unwrap();
+    assert!(pins.contains(&("runtime_native_input_snapshot".into(), snapshot)));
+    let attune_common::secret_provenance::SecretOrigin::Entity {
+        entity_id: output_receipt,
+        ..
+    } = receipts[0].origin()
+    else {
+        panic!("root receipt origin required");
+    };
+    assert!(pins.contains(&("runtime_input_receipt".into(), output_receipt)));
+    let mut gc = db.begin().await.unwrap();
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut gc).await.unwrap();
+    assert!(
+        !ExecutionRepository::delete(&mut *gc, root.id)
+            .await
+            .unwrap(),
+        "physical custody still owns the terminal root's original field scopes"
+    );
+    gc.commit().await.unwrap();
+    empty_root_custody::settle(&db, held, directory.path(), &store, snapshot).await;
+    let mut gc = db.begin().await.unwrap();
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut gc).await.unwrap();
+    assert!(ExecutionRepository::delete(&mut *gc, root.id)
+        .await
+        .unwrap());
+    gc.commit().await.unwrap();
+    assert!(ExecutionRepository::find_by_id(&*db, root.id)
+        .await
+        .unwrap()
+        .is_none());
+    let mut cold = db.begin().await.unwrap();
+    let retained =
+        Inputs::receipt_context(&mut cold, receipts[0].site(), &receipts[0].origin(), KEY)
+            .await
+            .unwrap();
+    retained.ensure_fresh_on(&mut cold).await.unwrap();
+    cold.commit().await.unwrap();
+    // Exercise the owning collector after physical settlement. In particular,
+    // an output leaf may not be reclaimed ahead of its normalized root recipe.
+    for _ in 0..32 {
+        PackRetentionRepository::collect(
+            &db,
+            directory.path(),
+            Utc::now() - Duration::days(30),
+            1,
+            256,
+        )
+        .await
+        .unwrap();
+        let left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM runtime_native_input_snapshot WHERE id=$1")
+                .bind(snapshot)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        if left == 0 {
+            break;
+        }
+    }
+    let archived: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM runtime_native_input_snapshot WHERE id=$1")
+            .bind(snapshot)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+    assert_eq!(archived, 0);
+    directory.close().unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_iteration_empty_completion_real_child_finishes_typed_root() {
+    use attune_common::repositories::{
+        file_evidence_retention::FileEvidenceRetentionRepository as Evidence,
+        native_failure_materialization::NativeFailureMaterializationRepository as Success,
+        native_transition_materialization::NativeTransitionMaterializationRepository as Transitions,
+    };
+    let (db, root, workflow, human, _) = setup_graph_contract(
+        json!([]),
+        None,
+        false,
+        0,
+        false,
+        Some((false, false)),
+        false,
+        EmptyProgram::OrdinaryTerminalSuccessor,
+    )
+    .await;
+    let writer = empty_root_custody::writer(&db, &root, human).await;
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let source = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
+        .await
+        .unwrap();
+    let mut activation = Iteration::prepare_empty_activation(&mut tx, source, KEY)
+        .await
+        .unwrap();
+    let children = activation.apply(&mut tx, KEY).await.unwrap();
+    assert_eq!(children.len(), 1);
+    let child = ExecutionRepository::update(
+        &mut *tx,
+        children[0].id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            result: Some(json!({"data":{"ordinary":"real"}})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(child.workflow_task.as_ref().unwrap().task_index.is_none());
+    activation.ensure_fresh_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    drop(activation);
+    let mut tx = db.begin().await.unwrap();
+    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+        .await
+        .unwrap();
+    let current = Workflows::find_by_id(&mut *tx, workflow.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let plan = Transitions::prepare_for_completion(&mut tx, &child, KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    let output =
+        Success::prepare_success_output(&mut tx, root.id, workflow.id, child.id, &plan, KEY)
+            .await
+            .unwrap()
+            .expect("a real child after an authenticated empty predecessor must finalize its root");
+    output.require_completed_execution(&child).unwrap();
+    output.require_original_rows(&root, &current).unwrap();
+    let recorded = plan.record(&mut tx, &current, KEY).await.unwrap();
+    let projected = Workflows::update(
+        &mut *tx,
+        workflow.id,
+        UpdateWorkflowExecutionInput {
+            variables: Some(recorded.variables),
+            completed_tasks: Some(vec!["ordinary".into(), "ordinary_success".into()]),
+            current_tasks: Some(vec![]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (value, sources) = output.record(&mut tx, &projected, KEY).await.unwrap();
+    assert_eq!(value, json!({"empty":[],"succeeded":true}));
+    let (public, fields) =
+        attune_common::secret_values::redact_secret_path_sources(value, &sources);
+    let fields = attune_common::secret_values::prepare_secret_values(fields, KEY).unwrap();
+    Secrets::replace_entity_with_conn(&mut tx, "execution_result", root.id, &fields)
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        root.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            result: Some(public),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    Workflows::update(
+        &mut *tx,
+        workflow.id,
+        UpdateWorkflowExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    output.ensure_fresh_on(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    drop(output);
+    drop(plan);
+    let mut read = db.begin().await.unwrap();
+    let fields = Secrets::find_stored_by_entity(&mut *read, "execution_result", root.id)
+        .await
+        .unwrap();
+    let (ordinary, receipts) =
+        attune_common::repositories::immutable_input_origin::prepare_input_receipts(
+            &mut read,
+            "execution_result",
+            root.id,
+            &fields,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(ordinary.is_empty());
+    let success = receipts[0]
+        .native_source_metadata()
+        .iter()
+        .find(|source| source.source_kind() == "ordinary_success_metadata")
+        .unwrap()
+        .snapshot();
+    let empty: Id = sqlx::query_scalar(
+        "SELECT snapshot FROM runtime_native_empty_iteration_release WHERE execution=$1",
+    )
+    .bind(root.id)
+    .fetch_one(&mut *read)
+    .await
+    .unwrap();
+    read.commit().await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store =
+        attune_common::blob_store::FilesystemBlobStore::new(directory.path().join("objects"))
+            .unwrap();
+    let held = super::file_native_retention_cases::hold_wait_output(
+        &db,
+        &writer,
+        human,
+        &root
+            .executable_snapshot
+            .as_ref()
+            .unwrap()
+            .executable
+            .action
+            .pack_ref,
+        KEY,
+        &receipts[0],
+        directory.path(),
+        &store,
+    )
+    .await;
+    let pins: Vec<Id> = sqlx::query_scalar("SELECT source FROM file_evidence_pin WHERE owner=$1 AND kind='runtime_native_input_snapshot'")
+        .bind(held.version).fetch_all(&*db).await.unwrap();
+    assert!(pins.contains(&empty) && pins.contains(&success));
+    let mut gc = db.begin().await.unwrap();
+    Evidence::lock_reclamation(&mut gc).await.unwrap();
+    assert!(ExecutionRepository::delete(&mut *gc, child.id)
+        .await
+        .unwrap());
+    gc.commit().await.unwrap();
+    assert!(ExecutionRepository::find_by_id(&*db, child.id)
+        .await
+        .unwrap()
+        .is_none());
+    let mut cold = db.begin().await.unwrap();
+    let fields = Secrets::find_stored_by_entity(&mut *cold, "execution_result", root.id)
+        .await
+        .unwrap();
+    let (ordinary, receipts) =
+        attune_common::repositories::immutable_input_origin::prepare_input_receipts(
+            &mut cold,
+            "execution_result",
+            root.id,
+            &fields,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(ordinary.is_empty());
+    let mut reader =
+        attune_common::repositories::native_input_disclosure::NativeWaitSources::default();
+    reader
+        .prepare_context(&mut cold, &receipts[0], KEY, 0)
+        .await
+        .unwrap();
+    reader.ensure_held_on(&mut cold).await.unwrap();
+    cold.commit().await.unwrap();
+    empty_root_custody::settle(&db, held, directory.path(), &store, empty).await;
+    directory.close().unwrap();
     db.cleanup().await.unwrap();
 }
 

@@ -53,82 +53,6 @@ struct RetainedSourceRow {
     source_ref: Option<String>,
 }
 
-#[cfg(test)]
-mod retained_source_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn reservation() -> (FileOrigin, RuntimeReadOrigin) {
-        let original: RuntimeReadOrigin = serde_json::from_value(json!({
-            "target":{"kind":"artifact_version","artifact":1,"version":2,"execution":3,"owner":{}},
-            "provenance":[],"parents":[],
-        }))
-        .unwrap();
-        let receipts = json!([
-            {"entity_type":"execution_config","entity_id":3,"json_path":"/input","source_kind":"provenance",
-             "source_ref":"original caller receipt at its exact input site"},
-            {"entity_type":"execution_runtime_read","entity_id":9,"json_path":"","source_kind":"provenance",
-             "source_ref":"actual acquired read reference, never the pending sink"}
-        ]);
-        let source_digest = digest(&json!({"origin":original,"receipts":receipts})).unwrap();
-        (
-            FileOrigin {
-                artifact_version: 2,
-                origin_read: 8,
-                admission: 7,
-                execution: 3,
-                attempt: uuid::Uuid::nil(),
-                sponsor: 4,
-                max_plaintext_bytes: 1024,
-                source_digest,
-                receipts,
-            },
-            original,
-        )
-    }
-
-    #[test]
-    fn publication_sources_keep_original_sites_and_acquired_reads_not_the_destination() {
-        let (retained, original) = reservation();
-        let rows = FileOriginRepository::decode_retained_sources(&retained, &original).unwrap();
-        assert_eq!(
-            FileOriginRepository::receipts(&rows).unwrap(),
-            retained.receipts
-        );
-        assert_eq!(rows[0].entity_type, "execution_config");
-        assert_eq!(rows[0].entity_id, 3);
-        assert_eq!(rows[0].json_path, "/input");
-        assert_eq!(rows[1].entity_id, 9);
-        assert_ne!(rows[1].entity_id, retained.origin_read);
-    }
-
-    #[test]
-    fn changed_sources_or_destination_bindings_cannot_be_rebased() {
-        let (mut retained, original) = reservation();
-        retained.receipts[0]["entity_id"] = json!(300);
-        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
-        let (mut retained, original) = reservation();
-        retained.execution = 300;
-        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
-        let (mut retained, original) = reservation();
-        retained.artifact_version = 200;
-        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
-    }
-
-    #[test]
-    fn frozen_rows_must_have_the_exact_bounded_reservation_shape() {
-        let (mut retained, original) = reservation();
-        retained.receipts[0]["unexpected"] = json!(true);
-        retained.source_digest =
-            digest(&json!({"origin":original,"receipts":retained.receipts})).unwrap();
-        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
-        let (mut retained, original) = reservation();
-        retained.receipts = json!(vec![retained.receipts[0].clone(); 257]);
-        retained.source_digest =
-            digest(&json!({"origin":original,"receipts":retained.receipts})).unwrap();
-        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
-    }
-}
 fn denied() -> Error {
     Error::PermissionDenied("Exact file source or body proof is unavailable".into())
 }
@@ -286,6 +210,10 @@ impl FileOriginRepository {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Bind physical file custody to every execution credential and provenance field"
+    )]
     pub async fn reserve(
         conn: &mut PgConnection,
         version: i64,
@@ -412,5 +340,82 @@ impl FileOriginRepository {
             return Err(denied());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retained_source_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn reservation() -> (FileOrigin, RuntimeReadOrigin) {
+        let original: RuntimeReadOrigin = serde_json::from_value(json!({
+            "target":{"kind":"artifact_version","artifact":1,"version":2,"execution":3,"owner":{}},
+            "provenance":[],"parents":[],
+        }))
+        .unwrap();
+        let receipts = json!([
+            {"entity_type":"execution_config","entity_id":3,"json_path":"/input","source_kind":"provenance",
+             "source_ref":"original caller receipt at its exact input site"},
+            {"entity_type":"execution_runtime_read","entity_id":9,"json_path":"","source_kind":"provenance",
+             "source_ref":"actual acquired read reference, never the pending sink"}
+        ]);
+        let source_digest = digest(&json!({"origin":original,"receipts":receipts})).unwrap();
+        (
+            FileOrigin {
+                artifact_version: 2,
+                origin_read: 8,
+                admission: 7,
+                execution: 3,
+                attempt: uuid::Uuid::nil(),
+                sponsor: 4,
+                max_plaintext_bytes: 1024,
+                source_digest,
+                receipts,
+            },
+            original,
+        )
+    }
+
+    #[test]
+    fn publication_sources_keep_original_sites_and_acquired_reads_not_the_destination() {
+        let (retained, original) = reservation();
+        let rows = FileOriginRepository::decode_retained_sources(&retained, &original).unwrap();
+        assert_eq!(
+            FileOriginRepository::receipts(&rows).unwrap(),
+            retained.receipts
+        );
+        assert_eq!(rows[0].entity_type, "execution_config");
+        assert_eq!(rows[0].entity_id, 3);
+        assert_eq!(rows[0].json_path, "/input");
+        assert_eq!(rows[1].entity_id, 9);
+        assert_ne!(rows[1].entity_id, retained.origin_read);
+    }
+
+    #[test]
+    fn changed_sources_or_destination_bindings_cannot_be_rebased() {
+        let (mut retained, original) = reservation();
+        retained.receipts[0]["entity_id"] = json!(300);
+        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
+        let (mut retained, original) = reservation();
+        retained.execution = 300;
+        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
+        let (mut retained, original) = reservation();
+        retained.artifact_version = 200;
+        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
+    }
+
+    #[test]
+    fn frozen_rows_must_have_the_exact_bounded_reservation_shape() {
+        let (mut retained, original) = reservation();
+        retained.receipts[0]["unexpected"] = json!(true);
+        retained.source_digest =
+            digest(&json!({"origin":original,"receipts":retained.receipts})).unwrap();
+        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
+        let (mut retained, original) = reservation();
+        retained.receipts = json!(vec![retained.receipts[0].clone(); 257]);
+        retained.source_digest =
+            digest(&json!({"origin":original,"receipts":retained.receipts})).unwrap();
+        assert!(FileOriginRepository::decode_retained_sources(&retained, &original).is_err());
     }
 }

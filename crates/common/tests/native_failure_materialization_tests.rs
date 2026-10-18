@@ -1,6 +1,6 @@
 //! Actual ordinary task source preparation. Final generated-output receipts and
 //! completion caller cases extend this target after A's opaque API is published.
-mod helpers;
+pub(crate) mod helpers;
 #[path = "native_failure_materialization_tests/native_success.rs"]
 mod native_success;
 use attune_common::{

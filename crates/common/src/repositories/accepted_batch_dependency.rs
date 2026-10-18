@@ -66,7 +66,8 @@ impl AcceptedBatchDependencyRepository {
         // before taking item/target protection. B's creation transaction must
         // already hold the same source fence before its execution insert.
         for item in &ids {
-            let row:Option<(Id,Id,Value,String,Value,String,Value,String,Value)> = sqlx::query_as(
+            type AcceptedDispatchRow = (Id, Id, Value, String, Value, String, Value, String, Value);
+            let row: Option<AcceptedDispatchRow> = sqlx::query_as(
                 "SELECT a.source_admission,r.policy_revision,r.authority,r.authority_digest,a.template,a.template_digest,a.schema_binding,a.schema_digest,i.executable_snapshot FROM work_queue_item_ad_hoc_dispatch a JOIN work_queue_item_runtime_admission r ON r.item = a.item JOIN work_queue_item i ON i.id = a.item WHERE a.item = $1 AND i.queue = (a.template->>'id')::BIGINT AND i.queue_ref = a.template->>'ref'")
                 .bind(item).fetch_optional(&mut *conn).await?;
             let (

@@ -316,7 +316,7 @@ async fn broker_callback_row_lock_wait_is_bounded_and_unknown_ack_remains_recove
     let mut callback = tokio::spawn(async move {
         start.await.unwrap();
         let mut callback = pool.begin().await.unwrap();
-        ExecutionRepository::find_by_id_for_update(&mut *callback, id)
+        ExecutionRepository::find_by_id_for_update(&mut callback, id)
             .await
             .unwrap()
             .unwrap();

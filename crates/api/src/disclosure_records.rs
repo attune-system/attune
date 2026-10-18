@@ -112,10 +112,12 @@ mod frozen_parent_tests {
     }
 }
 
+type FrozenParentOrigins =
+    std::sync::Arc<std::collections::BTreeMap<(String, i64, String), SecretProvenance>>;
+
 #[derive(Default)]
 pub(crate) struct DisclosureRecords {
-    frozen_parents:
-        Option<std::sync::Arc<std::collections::BTreeMap<(String, i64, String), SecretProvenance>>>,
+    frozen_parents: Option<FrozenParentOrigins>,
     receipt_freshness: attune_common::repositories::immutable_input_origin::ReceiptFreshness,
     pub(crate) exact_events:
         HashMap<i64, attune_common::repositories::event_origin::EventOriginEvidence>,

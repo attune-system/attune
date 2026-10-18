@@ -93,45 +93,47 @@ describe("artifact reconciliation lifecycle", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
-  it(
-    "recovers missed updates and unnotified deletion while the browser socket stays connected",
-    async () => {
-      const client = new QueryClient({
-        defaultOptions: { queries: { retry: false, gcTime: Infinity } },
-      });
-      const key = ["artifacts", "execution", 42];
-      let serverRows = [1, 2];
-      const fetch = vi.fn(async () => [...serverRows]);
-      const observer = new QueryObserver(client, {
-        queryKey: key,
-        queryFn: fetch,
-        initialData: [...serverRows],
-        staleTime: Infinity,
-      });
-      const unsubscribe = observer.subscribe(() => {});
-      const wrapper = ({ children }: { children: ReactNode }) => (
-        <QueryClientProvider client={client}>{children}</QueryClientProvider>
-      );
-      const hook = renderHook(
-        () => useArtifactReconciliation({ scope: "execution", id: 42, isRunning: true }),
-        { wrapper },
-      );
-      cleanup.push(() => {
-        hook.unmount();
-        unsubscribe();
-        client.clear();
-      });
+  it("recovers missed updates and unnotified deletion while the browser socket stays connected", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+    });
+    const key = ["artifacts", "execution", 42];
+    let serverRows = [1, 2];
+    const fetch = vi.fn(async () => [...serverRows]);
+    const observer = new QueryObserver(client, {
+      queryKey: key,
+      queryFn: fetch,
+      initialData: [...serverRows],
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const hook = renderHook(
+      () =>
+        useArtifactReconciliation({
+          scope: "execution",
+          id: 42,
+          isRunning: true,
+        }),
+      { wrapper },
+    );
+    cleanup.push(() => {
+      hook.unmount();
+      unsubscribe();
+      client.clear();
+    });
 
-      // The server changes but no notification reaches the browser. A healthy
-      // browser connection cannot distinguish any of these loss mechanisms.
-      serverRows = [2, 3];
-      await act(() => vi.advanceTimersByTimeAsync(29999));
-      expect(client.getQueryData(key)).toEqual([1, 2]);
-      expect(fetch).not.toHaveBeenCalled();
-      await act(() => vi.advanceTimersByTimeAsync(501));
-      expect(socket.connected).toBe(true);
-      expect(fetch).toHaveBeenCalledOnce();
-      expect(client.getQueryData(key)).toEqual([2, 3]);
-    },
-  );
+    // The server changes but no notification reaches the browser. A healthy
+    // browser connection cannot distinguish any of these loss mechanisms.
+    serverRows = [2, 3];
+    await act(() => vi.advanceTimersByTimeAsync(29999));
+    expect(client.getQueryData(key)).toEqual([1, 2]);
+    expect(fetch).not.toHaveBeenCalled();
+    await act(() => vi.advanceTimersByTimeAsync(501));
+    expect(socket.connected).toBe(true);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(client.getQueryData(key)).toEqual([2, 3]);
+  });
 });

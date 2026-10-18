@@ -178,10 +178,7 @@ impl Access {
                 case_nonce,
             } if ["action", "workflow_task", "rule", "queue"].contains(&binding_kind.as_str())
                 && case_nonce.len() == 24
-                && case_nonce.bytes().all(|b| b.is_ascii_hexdigit()) =>
-            {
-                ()
-            }
+                && case_nonce.bytes().all(|b| b.is_ascii_hexdigit()) => {}
             Operation::QueueBatch {
                 queue_ref,
                 item_ids,
@@ -193,10 +190,7 @@ impl Access {
                 && !item_ids.is_empty()
                 && item_ids.len() <= 16
                 && item_ids.iter().all(|id| *id > 0)
-                && item_ids.iter().collect::<BTreeSet<_>>().len() == item_ids.len() =>
-            {
-                ()
-            }
+                && item_ids.iter().collect::<BTreeSet<_>>().len() == item_ids.len() => {}
             _ => return Err(denied()),
         }
         Ok(())

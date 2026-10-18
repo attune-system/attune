@@ -4,7 +4,7 @@ use super::*;
 #[path = "../native_failure_materialization_tests.rs"]
 // Reuse H's owning fixture. Its other repository cases are not invoked here.
 #[allow(dead_code)]
-mod source;
+pub(crate) mod source;
 use attune_common::{
     blob_store::settle_atomic_file_put,
     repositories::{

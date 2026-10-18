@@ -59,7 +59,7 @@ mod completion_cases;
 mod iteration_outcome_cases;
 
 #[path = "file_success_metadata_custody_cases.rs"]
-mod success_metadata_custody_cases;
+pub(crate) mod success_metadata_custody_cases;
 
 pub(super) struct Held {
     pub(super) version: Id,
@@ -863,7 +863,7 @@ async fn native_storage_custody_case(prospective: bool) {
     tx.commit().await.unwrap();
     let mut receipts = Vec::new();
     let mut snapshots = Vec::new();
-    for index in 0..2 {
+    for (index, binding) in bindings.iter().enumerate().take(2) {
         let mut tx = db.begin().await.unwrap();
         let refs = if index == 0 {
             vec!["standard".into()]
@@ -873,7 +873,7 @@ async fn native_storage_custody_case(prospective: bool) {
         let task = Admissions::select(
             &mut tx,
             owner.pack_id,
-            bindings[index].clone(),
+            binding.clone(),
             &executables[&leaf.r#ref],
             &refs,
             RequestAttribution::ParentExecution {
@@ -1262,6 +1262,10 @@ async fn native_storage_custody_case(prospective: bool) {
 
 /// Storage custody only. The caller supplies a genuine root receipt and an
 /// independently admitted, running writer; this never grants reader authority.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the fixture's credential, actor, artifact, wait, and physical storage owners explicit"
+)]
 pub(super) async fn hold_wait_output(
     pool: &sqlx::PgPool,
     credential: &RuntimeCredentialBinding,

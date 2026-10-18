@@ -447,14 +447,14 @@ mod tests {
         let mut requested = held.clone();
         requested.constraints.as_mut().unwrap().ids = Some(vec![8]);
         assert!(can_delegate_grants(
-            &[held.clone()],
+            std::slice::from_ref(&held),
             &[requested.clone()],
             &context
         ));
         for pack in [None, Some(18)] {
             requested.constraints.as_mut().unwrap().managing_pack_id = pack;
             assert!(!can_delegate_grants(
-                &[held.clone()],
+                std::slice::from_ref(&held),
                 &[requested.clone()],
                 &context
             ));

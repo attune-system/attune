@@ -25,6 +25,10 @@ pub(super) async fn require_original_targets(
     output.require_original_rows(conn).await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The writer verifies independent source, program, frame, destination, and original-field custody"
+)]
 pub(super) async fn finish(
     conn: &mut PgConnection,
     context: &Context,

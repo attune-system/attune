@@ -107,6 +107,7 @@ impl NativeTransitionMaterializationRepository {
         )
         .await?;
         let mut inner = PreparedNativeTransitions {
+            empty_completion: None,
             workflow: workflow.clone(),
             task_name: Some(source.task_name().to_owned()),
             authored: next.clone(),

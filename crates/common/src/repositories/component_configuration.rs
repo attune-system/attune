@@ -661,6 +661,10 @@ impl ComponentConfigurationRepository {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep owner, release, schema, and secret inputs explicit at the binding boundary"
+    )]
     async fn bind(
         connection: &mut PgConnection,
         kind: &str,
@@ -692,6 +696,10 @@ impl ComponentConfigurationRepository {
 
     /// Caller holds graph admission and the owner mutation lock in a transaction.
     /// `release_defaults` replaces authored defaults, never operator overrides.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Authored defaults, overrides, resets, and release identity are independent binding inputs"
+    )]
     pub async fn bind_layers(
         connection: &mut PgConnection,
         kind: &str,
@@ -760,6 +768,10 @@ impl ComponentConfigurationRepository {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Forward independent configuration layers under the caller's admitted transaction"
+    )]
     async fn bind_admitted_layers(
         connection: &mut PgConnection,
         kind: &str,
@@ -1019,6 +1031,10 @@ impl ComponentConfigurationRepository {
         Ok(revision)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Persist defaults with explicit owner, release, schema, and encryption context"
+    )]
     async fn store_defaults(
         connection: &mut PgConnection,
         kind: &str,
@@ -1070,6 +1086,10 @@ impl ComponentConfigurationRepository {
         Ok(id)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep owner, release, schema, and encryption context explicit when recording a value"
+    )]
     async fn bind_value(
         connection: &mut PgConnection,
         kind: &str,

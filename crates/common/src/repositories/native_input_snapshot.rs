@@ -25,10 +25,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
 pub(in crate::repositories) mod empty_iteration;
+mod empty_root;
+mod empty_success;
 pub(crate) use empty_iteration::ReleasedNativeEmptyIteration;
 pub use empty_iteration::{
     NativeEmptyIterationStorageRelease, PreparedNativeEmptyIterationOutcome,
 };
+pub(crate) use empty_success::PreparedEmptySuccessWitness;
 mod completion;
 mod success_metadata;
 use success_metadata::SuccessSource;
@@ -95,6 +98,10 @@ struct CacheFrontierPlan {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep bounded authenticated source proofs inline without changing archive construction or ownership"
+)]
 enum Source {
     EmptyIteration(empty_iteration::EmptyIterationArchive),
     WaitCompletion(WaitCompletionSource),
@@ -858,6 +865,10 @@ pub struct NativeInputSnapshotRepository;
 impl NativeInputSnapshotRepository {
     /// Compose actual selector Controls with pending VALUE ancestry, before all
     /// outer targets. The ordinary committed-context constructor remains intact.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Initial cache selection binds independent workflow, admission, budget, and control witnesses"
+    )]
     pub async fn prepare_cache_initial_from_controls(
         conn: &mut PgConnection,
         renderer: Id,
@@ -938,6 +949,10 @@ impl NativeInputSnapshotRepository {
         Ok(prepared)
     }
     /// Source phase of atomic first activation. No iteration exists yet.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "First activation keeps retained workflow identity, byte budget, and controls explicit"
+    )]
     pub async fn prepare_cache_initial(
         conn: &mut PgConnection,
         renderer: Id,
@@ -1261,6 +1276,10 @@ impl NativeInputSnapshotRepository {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep live and prospective wait evidence separate from task and renderer admission"
+    )]
     async fn prepare_wait_inner(
         conn: &mut PgConnection,
         renderer: Id,
@@ -1876,6 +1895,10 @@ impl NativeInputSnapshotRepository {
         )
         .await
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Cache preparation separately authenticates iteration, task, admission, budget, and controls"
+    )]
     pub async fn prepare_cache_with_controls(
         conn: &mut PgConnection,
         renderer: Id,
@@ -3813,7 +3836,7 @@ fn canonical_task_path(definition: &Value, path: &str) -> Option<String> {
     }
     let mut node = definition;
     let mut canonical = String::new();
-    for pair in tokens.chunks_exact(2) {
+    for pair in tokens.as_chunks::<2>().0 {
         if pair[0] != "tasks" {
             return None;
         }
@@ -3834,7 +3857,7 @@ fn canonical_task_path(definition: &Value, path: &str) -> Option<String> {
             Value::Object(tasks) => {
                 node = tasks.get(&selector)?;
                 canonical.push_str("/tasks/");
-                canonical.push_str(&pair[1]);
+                canonical.push_str(pair[1]);
             }
             _ => return None,
         }
@@ -3852,7 +3875,7 @@ fn bound_target(
         owner_type: target
             .context()
             .owner_type
-            .map(|kind| serde_json::to_value(kind))
+            .map(serde_json::to_value)
             .transpose()?
             .and_then(|kind| kind.as_str().map(str::to_owned)),
         owner_id: target.owner_id(),
@@ -4197,7 +4220,8 @@ async fn cache_binding(
         }
         return Ok(source.iteration);
     };
-    let row:Option<(Option<Id>,String,Option<Id>,Option<String>,i64)>=sqlx::query_as("SELECT predecessor,prepared_transaction,bound_iteration,bound_transaction,ordinal FROM runtime_native_cache_frontier WHERE snapshot=$1").bind(snapshot).fetch_optional(&mut *conn).await?;
+    type CacheFrontierRow = (Option<Id>, String, Option<Id>, Option<String>, i64);
+    let row:Option<CacheFrontierRow>=sqlx::query_as("SELECT predecessor,prepared_transaction,bound_iteration,bound_transaction,ordinal FROM runtime_native_cache_frontier WHERE snapshot=$1").bind(snapshot).fetch_optional(&mut *conn).await?;
     let (predecessor, prepared, iteration, bound, ordinal) = row.ok_or_else(denied)?;
     if ordinal != source.ordinal
         || predecessor != plan.predecessor
@@ -4318,10 +4342,7 @@ async fn load_encrypted(
     let mut current = id;
     let mut child = body.clone();
     let mut count = 1usize;
-    loop {
-        let Source::Cache(source) = &child.source else {
-            break;
-        };
+    while let Source::Cache(source) = &child.source {
         let Some(plan) = &source.frontier else {
             break;
         };

@@ -2,7 +2,7 @@
 use super::*;
 #[path = "../../../common/tests/native_failure_materialization_tests.rs"]
 #[allow(dead_code)]
-mod source;
+pub(crate) mod source;
 
 use attune_common::{
     models::{Execution, ExecutionStatus},

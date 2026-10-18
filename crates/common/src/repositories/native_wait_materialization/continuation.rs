@@ -360,11 +360,9 @@ impl NativeWaitContinuationRepository {
                 .children
                 .iter()
                 .try_fold(program.bytes()?, |bytes, child| {
-                    Ok::<_, Error>(
-                        bytes
-                            .checked_add(serde_json::to_vec(&child.child.value)?.len())
-                            .ok_or_else(denied)?,
-                    )
+                    bytes
+                        .checked_add(serde_json::to_vec(&child.child.value)?.len())
+                        .ok_or_else(denied)
                 })?;
             if bytes > 1024 * 1024 {
                 return Err(denied());
@@ -491,7 +489,7 @@ impl NativeWaitContinuationRepository {
                         .map(|recovery| serde_json::to_vec(&recovery.child.value)),
                 )
                 .try_fold(0usize, |total, bytes| {
-                    Ok::<_, Error>(total.checked_add(bytes?.len()).ok_or_else(denied)?)
+                    total.checked_add(bytes?.len()).ok_or_else(denied)
                 })?;
             if bytes > 1024 * 1024 {
                 return Err(denied());
@@ -1207,6 +1205,10 @@ pub(super) async fn prepare_recovery_from_program(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Child preparation keeps observed outcome, trigger, defaults, and staged program distinct"
+)]
 pub(super) async fn prepare_wait_child(
     conn: &mut PgConnection,
     context: &Context,
