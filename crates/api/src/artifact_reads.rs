@@ -48,15 +48,27 @@ impl<'a> ArtifactReads<'a> {
         state: &'a Arc<AppState>,
         user: &'a AuthenticatedUser,
     ) -> ApiResult<Self> {
-        Ok(Self {
+        Ok(Self::with_context(
             state,
             user,
-            context: crate::routes::artifacts::artifact_read_context_for_user(state, user).await?,
+            crate::routes::artifacts::artifact_read_context_for_user(state, user).await?,
+        ))
+    }
+
+    fn with_context(
+        state: &'a Arc<AppState>,
+        user: &'a AuthenticatedUser,
+        context: Option<ArtifactReadContext>,
+    ) -> Self {
+        Self {
+            state,
+            user,
+            context,
             disclosure_snapshot: None,
             execution_disclosure: HashMap::new(),
             source_records: DisclosureRecords::default(),
             receipt_guard: None,
-        })
+        }
     }
 
     pub(crate) async fn global_summaries(
@@ -85,20 +97,26 @@ impl<'a> ArtifactReads<'a> {
     /// Consume this request-local cache so a later transport wait retains every
     /// receipt deadline, rather than reusing a cached bool without its fence.
     pub(crate) async fn authorize_detail_with_receipts(
-        self,
+        state: &'a Arc<AppState>,
+        user: &'a AuthenticatedUser,
         artifact: &Artifact,
     ) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
         let executions =
-            ArtifactRepository::linked_execution_ids_bounded(&self.state.db, artifact.id, 257)
-                .await?;
-        let guard = crate::receipt_disclosure::HumanReceiptGuard::for_executions(
-            self.state,
-            self.user,
-            &executions,
-        )
-        .await?
-        .shared();
-        self.authorize_detail_with_prepared_receipts(artifact, guard)
+            ArtifactRepository::linked_execution_ids_bounded(&state.db, artifact.id, 257).await?;
+        let guard =
+            crate::receipt_disclosure::HumanReceiptGuard::for_executions(state, user, &executions)
+                .await?
+                .shared();
+        // Access callers already have held IAM rows. Do not load a second
+        // mutable/cached snapshot only to replace it at the protected boundary.
+        let has_held_iam = guard.lock().await.iam_snapshot().is_some();
+        let reads = if has_held_iam {
+            Self::with_context(state, user, None)
+        } else {
+            Self::new(state, user).await?
+        };
+        reads
+            .authorize_detail_with_prepared_receipts(artifact, guard)
             .await
     }
 
@@ -107,7 +125,17 @@ impl<'a> ArtifactReads<'a> {
         artifact: &Artifact,
         guard: crate::receipt_disclosure::SharedHumanReceiptGuard,
     ) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
-        self.disclosure_snapshot = guard.lock().await.iam_snapshot();
+        if let Some(snapshot) = guard.lock().await.iam_snapshot() {
+            self.context = Some(ArtifactReadContext {
+                identity_id: snapshot.identity_id,
+                identity_attributes: snapshot.identity_attributes.clone(),
+                grants: snapshot.grants.clone(),
+            });
+            let mut caller = attune_common::rbac::AuthorizationContext::new(snapshot.identity_id);
+            caller.identity_attributes = snapshot.identity_attributes.clone();
+            self.source_records.sensor_caller = Some(caller);
+            self.disclosure_snapshot = Some(snapshot);
+        }
         self.receipt_guard = Some(guard.clone());
         self.authorize_header(artifact.id, artifact.classification)
             .await?;

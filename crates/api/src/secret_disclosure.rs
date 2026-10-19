@@ -597,12 +597,16 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
             .ok_or_else(|| {
                 ApiError::Forbidden("Sensor log disclosure requires its admitted generation".into())
             })?;
-    let generation = SensorSchemaRepository::find_disclosure_rows(&state.db, &[id])
-        .await?
-        .into_iter()
-        .next()
+    let mut records = DisclosureRecords::default();
+    // Use the same prepared generation proof as recursive sensor origins.
+    // Seeding a decoded row alone would skip its structural owner evidence.
+    records.load_generations(&state.db, &[id]).await?;
+    let binding = records
+        .generations
+        .get(&id)
+        .and_then(Option::as_ref)
+        .map(|generation| generation.binding.clone())
         .ok_or_else(|| ApiError::Forbidden("Sensor log generation has expired".into()))?;
-    let binding = &generation.binding;
     if binding.executable.sensor.r#ref != sensor_ref || binding.binding_digest()? != expected_digest
     {
         return Err(ApiError::Forbidden("Sensor log generation mismatch".into()));
@@ -625,8 +629,6 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
             secrets.push(row);
         }
     }
-    let mut records = DisclosureRecords::default();
-    records.generations.insert(id, Some(generation.clone()));
     let deliveries =
         SensorSchemaRepository::log_delivery_origins(&state.db, artifact_version).await?;
     for batch in deliveries.chunks(64) {

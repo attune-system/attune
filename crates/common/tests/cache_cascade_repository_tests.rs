@@ -15,7 +15,7 @@ use attune_common::{
             CreateCacheGenerationInput, CreateCacheGenerationResult, CreateCacheNamespaceInput,
         },
         event::{CreateEnforcementInput, EnforcementRepository},
-        execution::{CreateExecutionInput, ExecutionRepository},
+        execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
         retention::RetentionRepository,
         workflow::{
             CreateWorkflowDefinitionInput, CreateWorkflowExecutionInput,
@@ -24,7 +24,7 @@ use attune_common::{
         workflow_cache_iteration::{
             CreateWorkflowCacheIterationInput, WorkflowCacheIterationRepository,
         },
-        Create, FindById, PackRepository,
+        Create, FindById, PackRepository, Update,
     },
     test_database::TestDatabase,
 };
@@ -71,7 +71,7 @@ impl Fixture {
             pool,
             CreateExecutionInput {
                 action_ref: format!("{}.workflow", pack.r#ref),
-                status: ExecutionStatus::Completed,
+                status: ExecutionStatus::Running,
                 ..Default::default()
             },
         )
@@ -141,6 +141,18 @@ impl Fixture {
             iterations.push(iteration.id);
         }
         pins.commit().await.unwrap();
+        // Establish orchestration and its pins while the parent is admissible,
+        // then retain the original completed-parent deletion scenario.
+        ExecutionRepository::update(
+            pool,
+            execution.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         publish(pool, namespace.id, "replacement", Some(generation)).await;
         sqlx::query("UPDATE cache_generation SET retired=NOW()-INTERVAL '1 day', readable_until=NOW()-INTERVAL '1 hour' WHERE id=$1")
             .bind(generation).execute(pool).await.unwrap();

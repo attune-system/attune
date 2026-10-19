@@ -82,8 +82,9 @@ async fn standalone_sensor_log_disclosure_batches_foreign_delivery_owners_origin
         assert_eq!(metrics.source_payload_reads, 0);
         assert!(
             metrics.application_statements() <= if count <= 64 { 25 } else { 40 },
-            "{count}: {}",
-            metrics.application_statements()
+            "{count}: {}; metrics={}",
+            metrics.application_statements(),
+            serde_json::to_string(&metrics)?
         );
         scopes.push(metrics.source_scope_reads);
         reports.push(json!({"origins":count,"application_queries":metrics.application_statements(),"driver_catalog_queries":metrics.driver_metadata_reads(),"queries":metrics}));
@@ -309,8 +310,9 @@ async fn ordinary_foreign_sensor_origin_cold_queries_are_chunk_bounded_and_proof
         assert_eq!(sample.queries.source_payload_reads, 0);
         assert!(
             sample.queries.application_statements() <= if count <= 64 { 25 } else { 40 },
-            "{count}: {}",
-            sample.queries.application_statements()
+            "{count}: {}; metrics={}",
+            sample.queries.application_statements(),
+            serde_json::to_string(&sample.queries)?
         );
         samples.push((count, sample));
     }

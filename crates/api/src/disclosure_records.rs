@@ -1008,7 +1008,11 @@ impl DisclosureRecords {
         Ok(())
     }
 
-    async fn load_generations(&mut self, db: &sqlx::PgPool, ids: &[i64]) -> ApiResult<()> {
+    pub(crate) async fn load_generations(
+        &mut self,
+        db: &sqlx::PgPool,
+        ids: &[i64],
+    ) -> ApiResult<()> {
         let mut missing = ids
             .iter()
             .copied()

@@ -1807,9 +1807,7 @@ async fn authorize_artifact_read_with_receipts(
     user: &AuthenticatedUser,
     artifact: &attune_common::models::artifact::Artifact,
 ) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
-    crate::artifact_reads::ArtifactReads::new(state, user)
-        .await?
-        .authorize_detail_with_receipts(artifact)
+    crate::artifact_reads::ArtifactReads::authorize_detail_with_receipts(state, user, artifact)
         .await
 }
 
