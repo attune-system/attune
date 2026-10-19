@@ -500,14 +500,16 @@ impl InputReceiptFrontier {
         rows: &[super::execution_secret_value::SecretProvenanceRow],
         encryption_key: Option<&str>,
     ) -> Result<()> {
-        let mut pending = Vec::new();
+        // Visit one source frontier before its descendants so sibling chains
+        // share the same bounded record reads. Ancestry remains per edge.
+        let mut pending = std::collections::VecDeque::new();
         for row in rows {
             if row.source_kind != "provenance" {
                 return Err(denied());
             }
             let provenance: SecretProvenance =
                 serde_json::from_str(row.source_ref.as_deref().ok_or_else(denied)?)?;
-            pending.push((
+            pending.push_back((
                 provenance,
                 input_value_site(&row.entity_type, row.entity_id, &row.json_path).ok(),
                 None::<Parents>,
@@ -525,7 +527,7 @@ impl InputReceiptFrontier {
         let mut loaded_sites = BTreeSet::new();
         let mut loaded_events = BTreeSet::new();
         let mut source_bytes = 0usize;
-        while let Some((provenance, site, parents, depth, ancestry, leaves)) = pending.pop() {
+        while let Some((provenance, site, parents, depth, ancestry, leaves)) = pending.pop_front() {
             bytes = bytes
                 .checked_add(serde_json::to_vec(&provenance)?.len())
                 .ok_or_else(denied)?;
@@ -672,7 +674,7 @@ impl InputReceiptFrontier {
                         if bytes > 1024 * 1024 {
                             return Err(denied());
                         }
-                        pending.push((
+                        pending.push_back((
                             underlying,
                             None,
                             parents.clone(),
@@ -712,7 +714,7 @@ impl InputReceiptFrontier {
                         if provenance.origins.is_empty() {
                             continue;
                         }
-                        pending.push((
+                        pending.push_back((
                             provenance,
                             wait_completion.row_site(&row)?,
                             parents.clone(),
@@ -736,7 +738,7 @@ impl InputReceiptFrontier {
                         if provenance.origins.is_empty() {
                             continue;
                         }
-                        pending.push((
+                        pending.push_back((
                             provenance,
                             success.row_site(&row)?,
                             parents.clone(),
@@ -815,7 +817,7 @@ impl InputReceiptFrontier {
                             } else {
                                 None
                             };
-                            pending.push((
+                            pending.push_back((
                                 provenance,
                                 site,
                                 Some(Arc::clone(&frozen)),
@@ -826,7 +828,7 @@ impl InputReceiptFrontier {
                         }
                     } else {
                         for provenance in read.provenance {
-                            pending.push((
+                            pending.push_back((
                                 provenance,
                                 None,
                                 Some(Arc::clone(&frozen)),
@@ -896,7 +898,9 @@ impl InputReceiptFrontier {
                                 .cloned()
                                 .chain(std::iter::once(node.clone()))
                                 .collect();
-                            for batch in sites.into_iter().collect::<Vec<_>>().chunks(64) {
+                            // Multiple fields from the same 64-entity frontier
+                            // still fit the existing 256-source node ceiling.
+                            for batch in sites.into_iter().collect::<Vec<_>>().chunks(256) {
                                 for row in super::execution_secret_value::ExecutionSecretValueRepository::find_bounded_provenance_by_sites(&mut *conn, batch).await? {
                                     source_bytes = source_bytes.checked_add(row.source_ref.as_ref().map_or(0, String::len)).ok_or_else(denied)?;
                                     if source_bytes > 1024 * 1024 {
@@ -916,7 +920,7 @@ impl InputReceiptFrontier {
                         }
                         serde_json::from_str(row.source_ref.as_deref().ok_or_else(denied)?)?
                     };
-                    pending.push((
+                    pending.push_back((
                         parent,
                         input_value_site(&entity_type, entity_id, &path).ok(),
                         parents.clone(),

@@ -780,7 +780,10 @@ fn handle_check(path: String, output_format: OutputFormat) -> Result<()> {
     if report.valid {
         Ok(())
     } else {
-        anyhow::bail!("Pack check failed with {} error(s)", report.errors)
+        Err(
+            output::ReportedFailure(format!("Pack check failed with {} error(s)", report.errors))
+                .into(),
+        )
     }
 }
 

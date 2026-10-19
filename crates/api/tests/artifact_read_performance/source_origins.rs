@@ -1124,8 +1124,10 @@ async fn distinct_workflow_ancestries_keep_source_queries_constant_within_a_batc
         samples[1].1.queries.graph_record_reads
     );
     save_report("distinct-ancestry-frontiers", &samples)?;
+    // A newly acquired pool connection may still discover PostgreSQL enum
+    // types. Report those statements, but keep the application budget separate.
     assert!(
-        samples[1].1.queries.statements <= 20,
+        samples[1].1.queries.application_statements() <= 20,
         "distinct ancestry statement ceiling exceeded: {}",
         serde_json::to_string(&samples[1])?
     );

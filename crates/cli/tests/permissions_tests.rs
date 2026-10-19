@@ -34,7 +34,9 @@ fn permission_set() -> Value {
         "id": SET_ID, "ref": "deploy.operator", "pack_ref": "deploy",
         "label": "Deployment operator", "description": "Run deployment actions",
         "grants": [{"resource": "actions", "actions": ["read", "execute"],
-                    "constraints": {"refs": ["deploy.release"]}}],
+                     "constraints": {"refs": ["deploy.release"]}}],
+        "authored_grants": [{"resource": "actions", "actions": ["read", "execute"],
+                              "constraints": {"refs": ["deploy.release"]}}],
         "retired_at": null, "management_origin": "pack", "roles": []
     })
 }
@@ -75,7 +77,8 @@ async fn run_json(fixture: &TestFixture, args: &[&str]) -> Value {
         .unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
@@ -159,10 +162,11 @@ async fn export_is_authorable_yaml_and_update_replaces_grants_from_stdin() {
     definition["grants"] = json!([{ "resource": "actions", "actions": ["read"], "constraints": {"pack_refs": ["deploy"]}}]);
     let mut updated = original.clone();
     updated["grants"] = definition["grants"].clone();
+    updated["authored_grants"] = definition["grants"].clone();
     Mock::given(method("PUT"))
         .and(path(format!("/api/v1/permissions/sets/{SET_ID}")))
         .and(query_param("dry_run", "true"))
-        .and(body_json(json!({"label": definition["label"], "description": definition["description"], "grants": definition["grants"]})))
+        .and(body_json(json!({"label": definition["label"], "description": definition["description"], "scope": definition["scope"], "grants": definition["grants"]})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": updated})))
         .expect(1).mount(&fixture.mock_server).await;
     let mut update = command(&fixture);
@@ -445,7 +449,11 @@ async fn forbidden_assignment_is_not_reported_as_success() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("permissions:manage"));
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("permissions:manage"));
 }
 
 #[tokio::test]

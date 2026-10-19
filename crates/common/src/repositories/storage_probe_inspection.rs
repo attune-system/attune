@@ -43,9 +43,9 @@ pub struct InspectionRequest {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InspectionOperation {
-    Pins,
-    Version,
-    Backend,
+    Pins {},
+    Version {},
+    Backend {},
     Protected { identity: ObservedFileIdentity },
     Ledger { identity: ObservedFileIdentity },
     Released { identity: ObservedFileIdentity },
@@ -371,7 +371,7 @@ impl StorageProbeInspectionRepository {
         let mut identity = None;
         let mut legacy_identity = None;
         let data = match request.operation {
-            InspectionOperation::Pins => {
+            InspectionOperation::Pins {} => {
                 let query = format!("SELECT {} FROM execution e JOIN runtime_authority_admission a ON a.owner_kind='execution' AND a.owner_id=e.id JOIN pack_release r ON r.id=e.pack_release AND r.digest=e.pack_release_digest JOIN pack_runtime_policy_revision p ON p.id=a.policy_revision AND p.revoked_at IS NULL WHERE e.id=$1 AND octet_length(e.pack_release_digest)<=256 AND octet_length(a.authority_digest)<=256 AND octet_length(p.policy_digest)<=256", Pins::SELECT_COLUMNS);
                 serde_json::to_value(
                     sqlx::query_as::<_, Pins>(&query)
@@ -380,7 +380,7 @@ impl StorageProbeInspectionRepository {
                         .await?,
                 )?
             }
-            InspectionOperation::Version => {
+            InspectionOperation::Version {} => {
                 let query = format!("SELECT {} FROM artifact_version v JOIN artifact a ON a.id=v.artifact JOIN file_evidence_owner o ON o.version=v.id WHERE v.execution=$1 AND a.ref=$2 AND v.meta->>'f_probe_run'=$3 AND octet_length(COALESCE(v.file_path,''))<=4096 AND octet_length(COALESCE(v.object_key,''))<=4096 AND octet_length(COALESCE(v.provider_version,''))<=4096 AND octet_length(COALESCE(o.staging_path,''))<=4096 ORDER BY v.id LIMIT 2", FileRecord::SELECT_COLUMNS);
                 let rows = sqlx::query_as::<_, FileRecord>(&query)
                     .bind(scope.execution_id)
@@ -402,7 +402,7 @@ impl StorageProbeInspectionRepository {
                     }
                 }
             }
-            InspectionOperation::Backend => {
+            InspectionOperation::Backend {} => {
                 let rows: Vec<String> = sqlx::query_scalar("SELECT DISTINCT s.backend::TEXT FROM log_stream s JOIN artifact_version v ON v.id=s.artifact_version WHERE v.execution=$1 LIMIT 2")
                     .bind(scope.execution_id).fetch_all(&mut *tx).await?;
                 if rows.len() > 1 {
@@ -532,7 +532,13 @@ mod tests {
     #[test]
     fn protocol_has_no_sql_or_secret_projection_escape() {
         assert!(serde_json::from_value::<InspectionRequest>(serde_json::json!({"scope":scope(),"operation":{"kind":"sql","query":"SELECT anything"}})).is_err());
-        assert!(serde_json::from_value::<InspectionRequest>(serde_json::json!({"scope":scope(),"operation":{"kind":"pins","query":"SELECT anything"}})).is_err());
+        for kind in ["pins", "version", "backend"] {
+            assert!(serde_json::from_value::<InspectionRequest>(
+                serde_json::json!({"scope":scope(),"operation":{"kind":kind}})
+            )
+            .is_ok());
+            assert!(serde_json::from_value::<InspectionRequest>(serde_json::json!({"scope":scope(),"operation":{"kind":kind,"query":"SELECT anything"}})).is_err());
+        }
         assert!(serde_json::from_value::<InspectionRequest>(
             serde_json::json!({"scope":scope(),"operation":{"kind":"pins"},"include_secrets":true})
         )

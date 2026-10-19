@@ -3,7 +3,7 @@ use crate::{
     config::CliConfig,
     output::{self, OutputFormat},
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use attune_common::build_info::BuildInfo;
 use serde::Serialize;
 use std::time::Duration;
@@ -131,7 +131,9 @@ pub async fn handle(
         _ => output::print_output(&report, format)?,
     }
     if !report.server_available() {
-        bail!("Could not fetch server build information");
+        return Err(
+            output::ReportedFailure("Could not fetch server build information".into()).into(),
+        );
     }
     Ok(())
 }

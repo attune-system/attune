@@ -644,7 +644,10 @@ fn schema_sources(
             if let Some(contract) = &contract {
                 let compiled =
                     crate::value_schema::CompiledContract::new(contract).map_err(|_| denied())?;
-                match compiled.secret_paths(restored) {
+                match compiled
+                    .validate(restored)
+                    .and_then(|_| compiled.secret_paths(restored))
+                {
                     Ok(_) => {
                         crate::secret_values::merge_contract_secret_redactions(
                             restored.clone(),

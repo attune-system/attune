@@ -305,7 +305,7 @@ async fn main() {
         if e.is::<attune_cli::wait::WatchCancelled>() {
             process::exit(130);
         }
-        if output_format == output::OutputFormat::Table {
+        if output_format == output::OutputFormat::Table || e.is::<output::ReportedFailure>() {
             eprintln!("Error: {e}");
         } else {
             let envelope = e

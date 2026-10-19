@@ -74,7 +74,8 @@ async fn standalone_sensor_log_disclosure_batches_foreign_delivery_owners_origin
             &sensor_ref,
         )
         .with_subscriber(subscriber)
-        .await?;
+        .await
+        .map_err(|error| format!("Sensor disclosure with {count} delivery origins: {error}"))?;
         let metrics = observer.0.lock().unwrap().clone();
         assert!(metrics.statements > 0);
         assert_eq!(metrics.ciphertext_reads, 0);

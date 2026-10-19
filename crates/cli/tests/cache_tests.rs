@@ -382,13 +382,13 @@ async fn apply_reused_refresh_never_uploads_seals_promotes_or_abandons() {
             } else {
                 cmd.arg(&input);
             }
-            cmd.assert()
-                .failure()
-                .stderr(predicate::str::contains("reused generation 42"))
-                .stderr(predicate::str::contains("9876543210"))
-                .stderr(predicate::str::contains(
-                    "attune cache generation show users 42 --owner-type system",
-                ));
+            let output = cmd.assert().failure().get_output().stdout.clone();
+            let error: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(error["code"], "COMMAND_FAILED");
+            let message = error["error"].as_str().unwrap();
+            assert!(message.contains("reused generation 42"));
+            assert!(message.contains("9876543210"));
+            assert!(message.contains("attune cache generation show users 42 --owner-type system"));
             let requests = fixture.mock_server.received_requests().await.unwrap();
             assert_eq!(
                 requests.len(),
