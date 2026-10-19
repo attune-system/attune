@@ -468,6 +468,14 @@ impl EnforcementProcessor {
         if execution_result.created {
             if let Some(input_authority) = &input_snapshot {
                 attune_common::repositories::rule_authority::RuleAuthorityRepository::attach_runtime(&mut tx, "execution", execution.id, input_authority).await?;
+            } else if rule.is_adhoc && admission.is_some() {
+                // An ad-hoc rule has no deployment-owned input snapshot. Capture
+                // its active owner's read/decrypt ceiling in this creation
+                // transaction before sealing, just as for a manual invocation.
+                // Runtime API grants still come only from the inherited admission.
+                attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_human(
+                    &mut tx, "execution", execution.id, executor_identity,
+                ).await?;
             }
             if let Some(admission) = &admission {
                 admission

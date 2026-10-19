@@ -518,11 +518,47 @@ impl InputReceiptFrontier {
         }
         let mut nodes = 0usize;
         let mut bytes = 0usize;
+        // Cache source records, not authorization decisions. Every edge still
+        // traverses its own ancestry, depth, receipt classification and budget.
+        let mut source_rows = BTreeMap::new();
+        let mut source_events = BTreeMap::new();
+        let mut loaded_sites = BTreeSet::new();
+        let mut loaded_events = BTreeSet::new();
+        let mut source_bytes = 0usize;
         while let Some((provenance, site, parents, depth, ancestry, leaves)) = pending.pop() {
             bytes = bytes
                 .checked_add(serde_json::to_vec(&provenance)?.len())
                 .ok_or_else(denied)?;
             if depth >= 32 || bytes > 1024 * 1024 {
+                return Err(denied());
+            }
+            let candidates: BTreeSet<Node> = provenance
+                .origins
+                .iter()
+                // Archived sources must be classified before any live-row
+                // lookup. Prefetch only ordinary, unretained frontiers.
+                .filter(|_| parents.is_none() && leaves.is_none())
+                .chain(
+                    pending
+                        .iter()
+                        .filter(|(_, _, parents, _, _, leaves)| {
+                            parents.is_none() && leaves.is_none()
+                        })
+                        .flat_map(|(provenance, ..)| provenance.origins.iter()),
+                )
+                .filter(|origin| !is_input_receipt(origin))
+                .filter_map(|origin| match origin {
+                    SecretOrigin::Entity {
+                        entity_type,
+                        entity_id,
+                        path,
+                    } if entity_type != ENTITY_RUNTIME_READ => {
+                        Some((entity_type.clone(), *entity_id, path.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if candidates.len() > 256 {
                 return Err(denied());
             }
             for origin in provenance.origins {
@@ -805,8 +841,39 @@ impl InputReceiptFrontier {
                         entity_type.as_str(),
                         EVENT_SOURCE_CONFIG | EVENT_SOURCE_PAYLOAD
                     ) {
-                        EventOriginRepository::evidence(&mut *conn, entity_id)
-                            .await?
+                        if !loaded_events.contains(&entity_id) {
+                            let ids: BTreeSet<_> = candidates
+                                .iter()
+                                .filter(|(kind, id, _)| {
+                                    matches!(
+                                        kind.as_str(),
+                                        EVENT_SOURCE_CONFIG | EVENT_SOURCE_PAYLOAD
+                                    ) && !loaded_events.contains(id)
+                                })
+                                .map(|(_, id, _)| *id)
+                                .chain(std::iter::once(entity_id))
+                                .collect();
+                            for batch in ids.into_iter().collect::<Vec<_>>().chunks(64) {
+                                for (id, evidence) in
+                                    EventOriginRepository::evidence_many(&mut *conn, batch).await?
+                                {
+                                    source_bytes = source_bytes
+                                        .checked_add(serde_json::to_vec(&evidence)?.len())
+                                        .ok_or_else(denied)?;
+                                    if source_bytes > 1024 * 1024 {
+                                        return Err(denied());
+                                    }
+                                    source_events.insert(id, evidence);
+                                }
+                                loaded_events.extend(batch.iter().copied());
+                                if loaded_events.len() + loaded_sites.len() > 256 {
+                                    return Err(denied());
+                                }
+                            }
+                        }
+                        source_events
+                            .get(&entity_id)
+                            .ok_or_else(denied)?
                             .parent(&entity_type, &path)?
                             .clone()
                     } else if let Some(parents) = &parents {
@@ -815,9 +882,35 @@ impl InputReceiptFrontier {
                             .cloned()
                             .ok_or_else(denied)?
                     } else {
-                        let row = super::execution_secret_value::ExecutionSecretValueRepository::find_bounded_provenance(
-                            &mut *conn, &[entity_type.as_str()], &[entity_id],
-                        ).await?.into_iter().find(|row| row.json_path == path).ok_or_else(denied)?;
+                        let node = (entity_type.clone(), entity_id, path.clone());
+                        if !loaded_sites.contains(&node) {
+                            let sites: BTreeSet<_> = candidates
+                                .iter()
+                                .filter(|(kind, _, _)| {
+                                    !matches!(
+                                        kind.as_str(),
+                                        EVENT_SOURCE_CONFIG | EVENT_SOURCE_PAYLOAD
+                                    )
+                                })
+                                .filter(|site| !loaded_sites.contains(*site))
+                                .cloned()
+                                .chain(std::iter::once(node.clone()))
+                                .collect();
+                            for batch in sites.into_iter().collect::<Vec<_>>().chunks(64) {
+                                for row in super::execution_secret_value::ExecutionSecretValueRepository::find_bounded_provenance_by_sites(&mut *conn, batch).await? {
+                                    source_bytes = source_bytes.checked_add(row.source_ref.as_ref().map_or(0, String::len)).ok_or_else(denied)?;
+                                    if source_bytes > 1024 * 1024 {
+                                        return Err(denied());
+                                    }
+                                    source_rows.insert((row.entity_type.clone(), row.entity_id, row.json_path.clone()), row);
+                                }
+                                loaded_sites.extend(batch.iter().cloned());
+                                if loaded_events.len() + loaded_sites.len() > 256 {
+                                    return Err(denied());
+                                }
+                            }
+                        }
+                        let row = source_rows.get(&node).ok_or_else(denied)?;
                         if row.source_kind != "provenance" {
                             return Err(denied());
                         }

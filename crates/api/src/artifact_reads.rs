@@ -107,6 +107,7 @@ impl<'a> ArtifactReads<'a> {
         artifact: &Artifact,
         guard: crate::receipt_disclosure::SharedHumanReceiptGuard,
     ) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
+        self.disclosure_snapshot = guard.lock().await.iam_snapshot();
         self.receipt_guard = Some(guard.clone());
         self.authorize_header(artifact.id, artifact.classification)
             .await?;

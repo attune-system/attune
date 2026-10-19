@@ -597,9 +597,12 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
             .ok_or_else(|| {
                 ApiError::Forbidden("Sensor log disclosure requires its admitted generation".into())
             })?;
-    let (binding, _) = SensorSchemaRepository::find_by_binding_id(&state.db, id)
+    let generation = SensorSchemaRepository::find_disclosure_rows(&state.db, &[id])
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| ApiError::Forbidden("Sensor log generation has expired".into()))?;
+    let binding = &generation.binding;
     if binding.executable.sensor.r#ref != sensor_ref || binding.binding_digest()? != expected_digest
     {
         return Err(ApiError::Forbidden("Sensor log generation mismatch".into()));
@@ -623,6 +626,7 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
         }
     }
     let mut records = DisclosureRecords::default();
+    records.generations.insert(id, Some(generation.clone()));
     let deliveries =
         SensorSchemaRepository::log_delivery_origins(&state.db, artifact_version).await?;
     for batch in deliveries.chunks(64) {
@@ -657,13 +661,17 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
     {
         return Ok(());
     }
-    let snapshot = state
-        .authorization_service()
-        .load_snapshot(user)
-        .await?
-        .ok_or_else(|| {
-            ApiError::Forbidden("Sensor log secret disclosure requires identity access".into())
-        })?;
+    let held_snapshot = receipt_guard.lock().await.iam_snapshot();
+    let snapshot = match held_snapshot {
+        Some(snapshot) => snapshot,
+        None => state
+            .authorization_service()
+            .load_snapshot(user)
+            .await?
+            .ok_or_else(|| {
+                ApiError::Forbidden("Sensor log secret disclosure requires identity access".into())
+            })?,
+    };
     let mut caller = AuthorizationContext::new(snapshot.identity_id);
     caller.identity_attributes = snapshot.identity_attributes;
     let mut key_ownership =

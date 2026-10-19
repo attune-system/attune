@@ -85,9 +85,9 @@ impl HumanReceiptGuard {
         }
         let mut guard = Self::begin(state, user).await?;
         let mut rows = Vec::new();
-        for execution in executions {
+        for batch in executions.chunks(64) {
             rows.extend(
-                crate::recorded_disclosure::execution_origins(&mut guard.transaction, execution)
+                crate::recorded_disclosure::execution_origins_many(&mut guard.transaction, batch)
                     .await?,
             );
             if rows.len() > 256 {
@@ -109,6 +109,12 @@ impl HumanReceiptGuard {
 
     pub(crate) fn frontier(&self) -> &InputReceiptFrontier {
         &self.frontier
+    }
+
+    /// Reuse the IAM rows held by this disclosure transaction rather than
+    /// loading a second, potentially stale authorization-cache snapshot.
+    pub(crate) fn iam_snapshot(&self) -> Option<crate::authz::AuthorizationSnapshot> {
+        self.iam.as_ref().map(iam::HeldIam::snapshot)
     }
     pub(crate) fn matches_iam(
         &self,

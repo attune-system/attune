@@ -136,6 +136,16 @@ pub(crate) async fn execution_origins(
     conn: &mut PgConnection,
     execution: i64,
 ) -> ApiResult<Vec<SecretProvenanceRow>> {
+    execution_origins_many(conn, &[execution]).await
+}
+
+pub(crate) async fn execution_origins_many(
+    conn: &mut PgConnection,
+    executions: &[i64],
+) -> ApiResult<Vec<SecretProvenanceRow>> {
+    if executions.len() > MAX_ORIGIN_NODES {
+        return Err(denied());
+    }
     let mut rows = ExecutionSecretValueRepository::find_bounded_provenance(
         &mut *conn,
         &[
@@ -143,10 +153,10 @@ pub(crate) async fn execution_origins(
             ENTITY_EXECUTION_RESULT,
             "workflow_variables",
         ],
-        &[execution],
+        executions,
     )
     .await?;
-    for (_, origins) in attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(&mut *conn, &[execution]).await? {
+    for (execution, origins) in attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(&mut *conn, executions).await? {
         for (index, origin) in origins.into_iter().enumerate() {
             rows.push(SecretProvenanceRow {
                 entity_type: "execution_runtime_key_read".into(), entity_id: execution,
@@ -158,28 +168,27 @@ pub(crate) async fn execution_origins(
     if rows.len() > MAX_ORIGIN_NODES {
         return Err(denied());
     }
-    for origin in
+    for (execution, origins) in
         attune_common::repositories::runtime_read::RuntimeReadRepository::references_for_executions(
-            &mut *conn,
-            &[execution],
+            &mut *conn, executions,
         )
         .await?
-        .remove(&execution)
-        .unwrap_or_default()
     {
-        rows.push(SecretProvenanceRow {
-            entity_type: attune_common::repositories::runtime_read::ENTITY_RUNTIME_READ.into(),
-            entity_id: execution,
-            json_path: String::new(),
-            source_kind: "provenance".into(),
-            source_ref: Some(
-                serde_json::to_string(&SecretProvenance {
-                    origins: vec![origin],
-                    templates: vec![],
-                })
-                .map_err(|_| denied())?,
-            ),
-        });
+        for origin in origins {
+            rows.push(SecretProvenanceRow {
+                entity_type: attune_common::repositories::runtime_read::ENTITY_RUNTIME_READ.into(),
+                entity_id: execution,
+                json_path: String::new(),
+                source_kind: "provenance".into(),
+                source_ref: Some(
+                    serde_json::to_string(&SecretProvenance {
+                        origins: vec![origin],
+                        templates: vec![],
+                    })
+                    .map_err(|_| denied())?,
+                ),
+            });
+        }
     }
     if rows.len() > MAX_ORIGIN_NODES {
         return Err(denied());

@@ -33,7 +33,7 @@ use attune_common::{
         },
         Create,
     },
-    secret_provenance::{KeyOrigin, SecretOrigin, SecretProvenance},
+    secret_provenance::{SecretOrigin, SecretProvenance},
     secret_values::{prepare_secret_values, SecretValueInput, ENTITY_EXECUTION_CONFIG},
 };
 use axum::http::StatusCode;
@@ -568,6 +568,35 @@ fn local_origin() -> SecretOrigin {
 }
 
 #[tokio::test]
+async fn provenance_frontiers_match_exact_kind_id_and_path_tuples() -> Result<()> {
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let action_ref = action(&ctx).await?;
+    let first = execution(&ctx, &action_ref).await?;
+    let second = execution(&ctx, &action_ref).await?;
+    secret_origins(&ctx, first, vec![local_origin()]).await?;
+    secret_origins(&ctx, second, vec![local_origin()]).await?;
+    let mut conn = ctx.pool.acquire().await?;
+    let sites = vec![
+        ("execution_result".into(), first, "/private".into()),
+        (ENTITY_EXECUTION_CONFIG.into(), second, "/private".into()),
+    ];
+    let rows =
+        ExecutionSecretValueRepository::find_bounded_provenance_by_sites(&mut conn, &sites).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].entity_type, ENTITY_EXECUTION_CONFIG);
+    assert_eq!(rows[0].entity_id, second);
+    let absent = vec![(ENTITY_EXECUTION_CONFIG.into(), second, "/missing".into())];
+    assert!(
+        ExecutionSecretValueRepository::find_bounded_provenance_by_sites(&mut conn, &absent)
+            .await?
+            .is_empty()
+    );
+    drop(conn);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn distinct_execution_origins_and_workflow_children_use_frontier_batches() -> Result<()> {
     let ctx = TestContext::new().await?.with_auth().await?;
     let action_ref = action(&ctx).await?;
@@ -1032,6 +1061,7 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
 
 #[tokio::test]
 async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result<()> {
+    use attune_common::repositories::{key::KeyRepository, Delete};
     let ctx = TestContext::new().await?.with_auth().await?;
     let action_ref = action(&ctx).await?;
     let id = execution(&ctx, &action_ref).await?;
@@ -1043,17 +1073,36 @@ async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result
     )
     .await?;
     link(&ctx, log, id).await?;
-    let origin = SecretProvenance {
-        origins: vec![SecretOrigin::Key(KeyOrigin {
-            key_id: 9981,
-            key_ref: "system.fixture_private".into(),
+    // Disclosure retains the actual Key identity. A fabricated ID and owner
+    // tuple cannot stand in for a source whose grants are being tested.
+    let key = attune_common::repositories::key::KeyRepository::create(
+        &ctx.pool,
+        attune_common::repositories::key::CreateKeyInput {
+            local_ref: "fixture_private".into(),
             owner_type: OwnerType::System,
             owner_identity: None,
-            owner_ref: Some("system".into()),
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Owned disclosure source".into(),
             encrypted: true,
-        })],
-        templates: vec![],
-    };
+            encryption_key_hash: None,
+            value: attune_common::crypto::encrypt_json(
+                &json!("fixture material"),
+                ctx.state
+                    .config
+                    .security
+                    .encryption_key
+                    .as_deref()
+                    .ok_or("fixture key missing")?,
+            )?,
+        },
+    )
+    .await?;
+    let origin = SecretProvenance::key(attune_common::key_access::key_origin(&key));
     let prepared = prepare_secret_values(
         vec![SecretValueInput {
             json_path: "/private".into(),
@@ -1099,6 +1148,14 @@ async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result
             .await?
             .status(),
         StatusCode::OK
+    );
+    assert!(KeyRepository::delete(&ctx.pool, key.id).await?);
+    assert_eq!(
+        ctx.get(&format!("/api/v1/artifacts/{log}"), ctx.token())
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND,
+        "A grant must not replace missing source identity evidence",
     );
     ctx.cleanup().await?;
     Ok(())

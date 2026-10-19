@@ -15,6 +15,14 @@ pub(super) struct HeldIam {
 }
 
 impl HeldIam {
+    pub(super) fn snapshot(&self) -> crate::authz::AuthorizationSnapshot {
+        crate::authz::AuthorizationSnapshot {
+            identity_id: self.identity,
+            identity_attributes: self.attributes.clone(),
+            grants: self.grants.clone(),
+        }
+    }
+
     pub(super) async fn retain(conn: &mut sqlx::PgConnection, identity: Id) -> ApiResult<Self> {
         let current = IdentityRepository::find_by_id_for_share(&mut *conn, identity)
             .await?
