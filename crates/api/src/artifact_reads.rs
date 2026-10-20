@@ -89,9 +89,18 @@ impl<'a> ArtifactReads<'a> {
         )
     }
 
-    pub(crate) async fn authorize_detail(&mut self, artifact: &Artifact) -> ApiResult<()> {
-        self.authorize_header(artifact.id, artifact.classification)
-            .await
+    pub(crate) async fn authorize_detail(
+        state: &'a Arc<AppState>,
+        user: &'a AuthenticatedUser,
+        artifact: &Artifact,
+    ) -> ApiResult<()> {
+        let guard = Self::authorize_detail_with_receipts(state, user, artifact).await?;
+        let freshness = crate::receipt_disclosure::HumanReceiptGuard::finish_shared(guard).await?;
+        freshness.ensure_fresh()?;
+        if user.claims.exp <= chrono::Utc::now().timestamp() {
+            return Err(ApiError::Unauthorized("Artifact credential expired".into()));
+        }
+        Ok(())
     }
 
     /// Consume this request-local cache so a later transport wait retains every
@@ -294,23 +303,41 @@ impl<'a> ArtifactReads<'a> {
                 .into_iter()
                 .collect::<HashMap<_, _>>();
         let mut secrets = HashMap::<i64, Vec<SecretProvenanceRow>>::new();
-        for row in ExecutionSecretValueRepository::find_provenance_by_entities(
-            &self.state.db,
-            &[
-                ENTITY_EXECUTION_CONFIG,
-                ENTITY_EXECUTION_RESULT,
-                "workflow_variables",
-            ],
-            ids,
-        )
-        .await?
-        {
-            secrets.entry(row.entity_id).or_default().push(row);
+        let mut missing_origins = Vec::new();
+        if let Some(guard) = &self.receipt_guard {
+            let guard = guard.lock().await;
+            for id in ids {
+                if let Some(rows) = guard.execution_origins(*id) {
+                    secrets.insert(*id, rows.to_vec());
+                } else {
+                    missing_origins.push(*id);
+                }
+            }
+        } else {
+            missing_origins.extend_from_slice(ids);
         }
-        for row in
-            crate::secret_disclosure::runtime_key_read_provenance(&self.state.db, ids).await?
-        {
-            secrets.entry(row.entity_id).or_default().push(row);
+        if !missing_origins.is_empty() {
+            for row in ExecutionSecretValueRepository::find_provenance_by_entities(
+                &self.state.db,
+                &[
+                    ENTITY_EXECUTION_CONFIG,
+                    ENTITY_EXECUTION_RESULT,
+                    "workflow_variables",
+                ],
+                &missing_origins,
+            )
+            .await?
+            {
+                secrets.entry(row.entity_id).or_default().push(row);
+            }
+            for row in crate::secret_disclosure::runtime_key_read_provenance(
+                &self.state.db,
+                &missing_origins,
+            )
+            .await?
+            {
+                secrets.entry(row.entity_id).or_default().push(row);
+            }
         }
         self.source_records
             .seed_executions(executions.values().cloned());

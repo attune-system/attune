@@ -573,11 +573,20 @@ async fn main() -> Result<()> {
     if let Err(error) = callback_delivery_monitor.await {
         tracing::error!(%error, "Inquiry callback delivery monitor failed");
     }
+    // Also covers listener-bind/startup failure before Server's drain path.
+    let cancellation_shutdown = state
+        .reclamation_cancellation
+        .shutdown(tokio::time::Instant::now() + file_shutdown_grace)
+        .await;
+    if cancellation_shutdown.is_err() {
+        tracing::error!("Reclamation cancellation shutdown did not acknowledge cleanup");
+    }
     if let Err(error) = server_result {
         tracing::error!(%error, "Server error");
         return Err(error);
     }
 
+    cancellation_shutdown?;
     info!("Shutting down Attune API Service");
 
     Ok(())

@@ -174,6 +174,7 @@ impl Server {
             Instant::now() + Duration::from_secs(self.state.config.server.shutdown_grace_period)
         };
 
+        self.state.reclamation_cancellation.begin_shutdown();
         drop(server);
         if tokio::time::timeout_at(
             release_deadline,
@@ -184,9 +185,20 @@ impl Server {
         {
             tracing::warn!("Execution log stream lease release drain timed out");
         }
+        // Request drain can consume its entire grace. Cancellation owns a
+        // separate bounded teardown window, not an already-expired deadline.
+        let cancellation_shutdown = self
+            .state
+            .reclamation_cancellation
+            .shutdown(Instant::now() + Duration::from_secs(10))
+            .await;
+        if cancellation_shutdown.is_err() {
+            tracing::error!("Reclamation cancellation shutdown did not acknowledge cleanup");
+        }
         if let Some(result) = server_result {
             result?;
         }
+        cancellation_shutdown?;
 
         Ok(())
     }

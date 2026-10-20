@@ -32,7 +32,9 @@ use serde_json::{json, Value};
 #[tokio::test]
 async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze() -> Result<()> {
     use attune_common::repositories::{
+        component_configuration::ComponentConfigurationRepository,
         identity::CreateIdentityInput,
+        managed_sensor_metadata::ManagedSensorMetadataRepository,
         runtime::{CreateRuntimeInput, CreateWorkerInput, RuntimeRepository, WorkerRepository},
         sensor_schema::SensorSchemaRepository,
         sensor_workload::{
@@ -49,7 +51,7 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
     let permission = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
         r#ref: format!("{}.signer_use", pack.r#ref), pack: Some(pack.id), pack_ref: Some(pack.r#ref.clone()),
         label: None, description: None,
-        grants: json!([{"resource":"keys","actions":["use"],"constraints":{"refs":["system.sensor_signer"]}}]),
+        grants: json!([{"resource":"keys","actions":["use"],"scope":"external","constraints":{"refs":["system.sensor_signer"]}}]),
     }).await?;
     let runtime = RuntimeRepository::create(
         &ctx.pool,
@@ -124,6 +126,101 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
         },
     )
     .await?;
+    let key = system_key(&ctx, "sensor_signer", json!({
+        "private_key_pem": include_str!("../../common/tests/fixtures/jwt_signing_test_private.pem"),
+        "profiles":{"sensor":{"issuer":"approved-client","audience":"https://example.test",
+            "subjects":["approved-subject"],"pack_refs":[pack.r#ref],"sensor_refs":[sensor.r#ref],"max_ttl_seconds":120}}
+    })).await?;
+    assert_eq!(key.owner_type, OwnerType::System);
+    assert!(key.owner_pack.is_none());
+
+    // A declaration is not consent to operate on a system-owned private key.
+    let mut denied = ctx.pool.begin().await?;
+    ComponentConfigurationRepository::bind_sensor(
+        &mut denied,
+        &sensor,
+        None,
+        ctx.state.config.security.encryption_key.as_deref(),
+    )
+    .await?;
+    let missing_approval = ManagedSensorMetadataRepository::readmit(
+        &mut denied,
+        &sensor,
+        installer,
+        ctx.state.config.security.encryption_key.as_deref(),
+    )
+    .await;
+    assert!(matches!(missing_approval,
+        Err(attune_common::Error::PermissionDenied(ref message))
+            if message.contains("External runtime scope requires separate approval")));
+    denied.rollback().await?;
+    assert!(
+        ManagedSensorMetadataRepository::current_revision(&ctx.pool, sensor.id)
+            .await?
+            .is_none()
+    );
+
+    // The registrar can consent only to this approved operation on this key.
+    grant(
+        &ctx,
+        installer,
+        "fixture.sensor_signer_consent",
+        json!([
+            {"resource":"keys","actions":["use"],"constraints":{"refs":[key.r#ref]}}
+        ]),
+    )
+    .await?;
+    let mut deployment = ctx.pool.begin().await?;
+    ComponentConfigurationRepository::bind_sensor(
+        &mut deployment,
+        &sensor,
+        None,
+        ctx.state.config.security.encryption_key.as_deref(),
+    )
+    .await?;
+    let sensor_revision = ManagedSensorMetadataRepository::readmit(
+        &mut deployment,
+        &sensor,
+        installer,
+        ctx.state.config.security.encryption_key.as_deref(),
+    )
+    .await?;
+    deployment.commit().await?;
+    assert_eq!(
+        ManagedSensorMetadataRepository::current_revision(&ctx.pool, sensor.id).await?,
+        Some(sensor_revision)
+    );
+    let mut approval_reader = ctx.pool.begin().await?;
+    let (approvals, approval_count) =
+        attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::list_approvals(
+            &mut approval_reader,
+            pack.id,
+            10,
+            0,
+        )
+        .await?;
+    approval_reader.commit().await?;
+    assert_eq!(approval_count, 1);
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].issuer_identity, installer);
+    assert_eq!(approvals[0].subject_pack, pack.id);
+    assert_eq!(approvals[0].grants.0.len(), 1);
+    assert_eq!(
+        approvals[0].grants.0[0].resource,
+        attune_common::rbac::Resource::Keys
+    );
+    assert_eq!(
+        approvals[0].grants.0[0].actions,
+        vec![attune_common::rbac::Action::Use]
+    );
+    assert_eq!(
+        approvals[0].grants.0[0]
+            .constraints
+            .as_ref()
+            .and_then(|scope| scope.refs.as_ref()),
+        Some(&vec![key.r#ref.clone()])
+    );
+
     let identity = IdentityRepository::create(
         &ctx.pool,
         CreateIdentityInput {
@@ -174,11 +271,29 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
     )
     .await?;
     tx.commit().await?;
-    let key = system_key(&ctx, "sensor_signer", json!({
-        "private_key_pem": include_str!("../../common/tests/fixtures/jwt_signing_test_private.pem"),
-        "profiles":{"sensor":{"issuer":"approved-client","audience":"https://example.test",
-            "subjects":["approved-subject"],"pack_refs":[pack.r#ref],"sensor_refs":[sensor.r#ref],"max_ttl_seconds":120}}
-    })).await?;
+    let (_, admitted_signer, _) =
+        SensorSchemaRepository::find(&ctx.pool, workload.workload_id, workload.generation)
+            .await?
+            .expect("original admitted generation");
+    assert_eq!(
+        admitted_signer.executable.signing_permission_set_refs,
+        vec![permission.r#ref.clone()]
+    );
+    assert_eq!(admitted_signer.executable.signing_grants.len(), 1);
+    let signing_grant = &admitted_signer.executable.signing_grants[0];
+    assert_eq!(signing_grant.resource, attune_common::rbac::Resource::Keys);
+    assert_eq!(
+        signing_grant.actions,
+        vec![attune_common::rbac::Action::Use]
+    );
+    assert_eq!(
+        signing_grant
+            .constraints
+            .as_ref()
+            .and_then(|scope| scope.refs.as_ref()),
+        Some(&vec![key.r#ref.clone()])
+    );
+    assert!(admitted_signer.executable.input_grants.is_empty());
     IdentityRepository::update(
         &ctx.pool,
         installer,
@@ -813,7 +928,6 @@ async fn disclosure_uses_original_key_bindings_and_requires_every_combined_origi
     ])).await?;
     let original = system_key(&ctx, "original", json!("original-fixture-only")).await?;
     let replacement = system_key(&ctx, "replacement", json!("replacement-fixture-only")).await?;
-    let id = execution(&ctx, "sales", json!({"bound":redaction_marker(), "combined":redaction_marker(), "unknown":redaction_marker()})).await?;
     let make_secret =
         |path: &str, value: &str, origins: Vec<SecretOrigin>| -> Result<SecretValueInput> {
             Ok(SecretValueInput {
@@ -847,19 +961,36 @@ async fn disclosure_uses_original_key_bindings_and_requires_every_combined_origi
                 SecretOrigin::Key(attune_common::key_access::key_origin(&replacement)),
             ],
         )?,
-        SecretValueInput {
-            json_path: "/unknown".into(),
-            value: json!("must-remain-hidden"),
-            source_kind: "keystore".into(),
-            source_ref: Some("system.original".into()),
-        },
     ];
     let prepared = prepare_secret_values(
         inputs,
         ctx.state.config.security.encryption_key.as_ref().unwrap(),
     )?;
-    ExecutionSecretValueRepository::upsert_many(&ctx.pool, ENTITY_EXECUTION_CONFIG, id, &prepared)
-        .await?;
+    let id = execution_with_original_secret_fields(
+        &ctx,
+        "sales",
+        json!({"bound":redaction_marker(), "combined":redaction_marker()}),
+        &prepared,
+    )
+    .await?;
+    // Unsupported provenance rejects the whole disclosure frontier. Keep that
+    // negative separate so it cannot mask the known-origin disclosure checks.
+    let unknown_fields = prepare_secret_values(
+        vec![SecretValueInput {
+            json_path: "/unknown".into(),
+            value: json!("must-remain-hidden"),
+            source_kind: "keystore".into(),
+            source_ref: Some("system.original".into()),
+        }],
+        ctx.state.config.security.encryption_key.as_ref().unwrap(),
+    )?;
+    let unknown_id = execution_with_original_secret_fields(
+        &ctx,
+        "unknown_origin",
+        json!({"unknown":redaction_marker()}),
+        &unknown_fields,
+    )
+    .await?;
     let pack = PackRepository::find_by_ref(&ctx.pool, "sales")
         .await?
         .unwrap();
@@ -883,9 +1014,13 @@ async fn disclosure_uses_original_key_bindings_and_requires_every_combined_origi
     .await?;
     let url = format!("/api/v1/executions/{id}?include_secret_values=true");
     let response = ctx.get(&url, ctx.token()).await?;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "known origins before original Key decrypt grant"
+    );
     let body: Value = response.json().await?;
-    for field in ["bound", "combined", "unknown"] {
+    for field in ["bound", "combined"] {
         assert!(attune_common::secret_values::is_redaction_marker(
             &body["data"]["config"][field]
         ));
@@ -895,10 +1030,7 @@ async fn disclosure_uses_original_key_bindings_and_requires_every_combined_origi
         ENTITY_EXECUTION_CONFIG,
         id,
     )
-    .await?
-    .into_iter()
-    .filter(|secret| secret.json_path != "/unknown")
-    .collect::<Vec<_>>();
+    .await?;
     assert!(attune_common::key_access::authorize_parameter_key_origins(
         &ctx.pool,
         Some(identity),
@@ -931,13 +1063,39 @@ async fn disclosure_uses_original_key_bindings_and_requires_every_combined_origi
     )?);
     attune_common::key_access::authorize_parameter_key_origins(&ctx.pool, None, &[local]).await?;
     let response = ctx.get(&url, ctx.token()).await?;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "known origins after both Key decrypt grants"
+    );
     let body: Value = response.json().await?;
     assert_eq!(body["data"]["config"]["bound"], "original-fixture-only");
     assert_eq!(body["data"]["config"]["combined"], "original:replacement");
-    assert!(attune_common::secret_values::is_redaction_marker(
-        &body["data"]["config"]["unknown"]
-    ));
+    // Even both real Key grants cannot authorize an unsupported source kind.
+    let response = ctx
+        .get(
+            &format!("/api/v1/executions/{unknown_id}?include_secret_values=true"),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "unknown provenance disclosure"
+    );
+    let denied: Value = response.json().await?;
+    assert_eq!(denied["code"].as_str(), Some("FORBIDDEN"));
+    assert!(denied["error"].is_string());
+    assert!(denied.get("data").is_none());
+    let denied_json = serde_json::to_string(&denied)?;
+    for plaintext in [
+        "must-remain-hidden",
+        "original-fixture-only",
+        "replacement-fixture-only",
+        "original:replacement",
+    ] {
+        assert!(!denied_json.contains(plaintext));
+    }
     ctx.cleanup().await?;
     Ok(())
 }
@@ -1018,19 +1176,7 @@ async fn named_execution_token_authority_is_bounded_by_current_active_executor()
 }
 
 async fn execution(ctx: &TestContext, pack_ref: &str, parameters: Value) -> Result<i64> {
-    let pack = helpers::create_test_pack(&ctx.pool, pack_ref).await?;
-    let action =
-        helpers::create_test_action(&ctx.pool, pack.id, pack_ref, &format!("{pack_ref}.login"))
-            .await?;
-    helpers::activate_test_pack_release_with_projections(
-        &ctx.pool,
-        &pack,
-        &attune_common::repositories::component_lifecycle::PackProjectionIds {
-            actions: vec![action.id],
-            ..Default::default()
-        },
-    )
-    .await?;
+    let action = execution_action(ctx, pack_ref).await?;
     let response = ctx.post("/api/v1/executions/execute",json!({"action_ref":action.r#ref,"parameters":parameters,"permission_set_refs":["fixture.key_read"]}),ctx.token()).await?;
     let status = response.status();
     let body: Value = response.json().await?;
@@ -1043,6 +1189,132 @@ async fn execution(ctx: &TestContext, pack_ref: &str, parameters: Value) -> Resu
         .get("static_actions")
         .is_none());
     Ok(body["data"]["id"].as_i64().unwrap())
+}
+
+async fn execution_action(
+    ctx: &TestContext,
+    pack_ref: &str,
+) -> Result<attune_common::models::Action> {
+    let pack = helpers::create_test_pack(&ctx.pool, pack_ref).await?;
+    // These cases exercise active human-owned delegation, not managed admission.
+    let action = attune_common::repositories::action::ActionRepository::create(
+        &ctx.pool,
+        attune_common::repositories::action::CreateActionInput {
+            r#ref: format!("{pack_ref}.login"),
+            pack: pack.id,
+            pack_ref: pack_ref.into(),
+            label: "Ad-hoc signing caller".into(),
+            description: None,
+            entrypoint: "main.py".into(),
+            runtime: None,
+            enabled: true,
+            runtime_version_constraint: None,
+            required_worker_runtimes: json!({}),
+            worker_selector: json!({}),
+            worker_tolerations: json!([]),
+            worker_affinity: json!({}),
+            param_schema: None,
+            out_schema: None,
+            is_adhoc: true,
+            accesses_mcp: false,
+            default_execution_permission_set_refs: Vec::new(),
+            reference_visibility: Default::default(),
+            reference_allowed_pack_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            log_retention_policy: None,
+            log_retention_limit: None,
+            timeout_seconds: None,
+        },
+    )
+    .await?;
+    helpers::activate_test_pack_release(&ctx.pool, &pack).await?;
+    Ok(action)
+}
+
+async fn execution_with_original_secret_fields(
+    ctx: &TestContext,
+    pack_ref: &str,
+    redacted_config: Value,
+    fields: &[attune_common::secret_values::PreparedSecretValue],
+) -> Result<i64> {
+    use attune_common::repositories::{
+        executable_snapshot::ExecutableSnapshotRepository,
+        execution::{CreateExecutionInput, ExecutionRepository},
+        schema_contract::{BindingOwner, SchemaContractRepository},
+    };
+
+    let action = execution_action(ctx, pack_ref).await?;
+    let identity = validate_token(ctx.token().unwrap(), &jwt_config(ctx))?
+        .sub
+        .parse::<i64>()?;
+    let mut tx = ctx.pool.begin().await?;
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+    assert!(snapshot.executable.action.is_adhoc);
+    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+    // These disclosure fixtures retain original Key origins, including deliberately
+    // unknown provenance. They are human-owned ad-hoc inputs, not managed proofs.
+    let execution = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref,
+            executor: Some(identity),
+            permission_set_refs: vec!["fixture.key_read".into()],
+            status: attune_common::models::ExecutionStatus::Requested,
+            config: None,
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
+        .await?;
+    let initialized = ExecutionRepository::initialize_config_with_conn(
+        &mut tx,
+        execution.id,
+        None,
+        &snapshot,
+        Some(redacted_config.clone()),
+        fields,
+    )
+    .await?;
+    assert_eq!(initialized.config, Some(redacted_config));
+    let stored = ExecutionSecretValueRepository::find_stored_by_entity(
+        &mut *tx,
+        ENTITY_EXECUTION_CONFIG,
+        execution.id,
+    )
+    .await?;
+    assert_eq!(stored.len(), fields.len());
+    for field in fields {
+        let actual = stored
+            .iter()
+            .find(|actual| actual.json_path == field.json_path)
+            .unwrap();
+        assert_eq!(actual.encrypted_value, field.encrypted_value);
+        assert_eq!(
+            actual.encryption_key_hash.as_deref(),
+            Some(field.encryption_key_hash.as_str())
+        );
+        assert_eq!(actual.source_kind, field.source_kind);
+        assert_eq!(actual.source_ref, field.source_ref);
+    }
+    tx.commit().await?;
+    let committed = ExecutionRepository::find_by_id(&ctx.pool, execution.id)
+        .await?
+        .unwrap();
+    assert_eq!(committed.config, initialized.config);
+    assert_eq!(
+        ExecutionSecretValueRepository::find_stored_by_entity(
+            &ctx.pool,
+            ENTITY_EXECUTION_CONFIG,
+            execution.id,
+        )
+        .await?,
+        stored,
+    );
+    Ok(execution.id)
 }
 
 #[tokio::test]
@@ -1135,7 +1407,6 @@ async fn execution_decrypt_does_not_override_recorded_key_disclosure_authority()
         {"resource":"executions","actions":["read","decrypt"]}
     ])).await?;
     let key = signing_key(&ctx).await?;
-    let id = execution(&ctx, "sales", json!({"signing_key":redaction_marker()})).await?;
     let provenance = SecretProvenance {
         origins: vec![SecretOrigin::Key(attune_common::key_access::key_origin(
             &key,
@@ -1151,8 +1422,13 @@ async fn execution_decrypt_does_not_override_recorded_key_disclosure_authority()
         }],
         ctx.state.config.security.encryption_key.as_ref().unwrap(),
     )?;
-    ExecutionSecretValueRepository::upsert_many(&ctx.pool, ENTITY_EXECUTION_CONFIG, id, &prepared)
-        .await?;
+    let id = execution_with_original_secret_fields(
+        &ctx,
+        "sales",
+        json!({"signing_key":redaction_marker()}),
+        &prepared,
+    )
+    .await?;
     let response = ctx
         .get(
             &format!("/api/v1/executions/{id}?include_secret_values=true"),

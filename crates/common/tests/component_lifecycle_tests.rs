@@ -352,8 +352,17 @@ async fn loader_retires_omitted_versions_and_rejects_a_retired_runtime_dependenc
         .await
         .unwrap();
     let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("pack.yaml"),
+        format!(
+            "ref: {}\nlabel: Lifecycle fixture\nversion: '1.0.0'\n",
+            pack.r#ref
+        ),
+    )
+    .unwrap();
     std::fs::create_dir(root.path().join("runtimes")).unwrap();
     std::fs::create_dir(root.path().join("actions")).unwrap();
+    std::fs::write(root.path().join("actions/run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
     let runtime_ref = format!("{}.custom", pack.r#ref);
     let runtime_path = root.path().join("runtimes/custom.yaml");
     std::fs::write(

@@ -39,7 +39,7 @@ use attune_common::rbac::{
     Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints, Resource,
 };
 use attune_common::repositories::{
-    cache::{CacheEntryRepository, CacheNamespaceRepository, CacheTransactionMode},
+    cache::{CacheEntryRepository, CacheNamespaceRepository},
     object_maintenance::ObjectMaintenanceRepository,
     pack::{
         CreatePackInput, PackSearchFilters, PackVisibilityFilter, PackVisibilityScope,
@@ -1048,6 +1048,13 @@ pub async fn delete_pack(
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    // Explicit operation policy, not a claim of globally enforced middleware.
+    // Authorization time consumes this same total acquisition budget.
+    let acquisition_deadline = tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(
+            state.config.server.request_timeout,
+        ))
+        .ok_or_else(|| ApiError::InternalServerError("Invalid server request timeout".into()))?;
     require_pack_access_token(&user.claims.token_type)?;
     attune_common::schema::RefValidator::validate_pack_ref(&pack_ref)
         .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
@@ -1080,11 +1087,22 @@ pub async fn delete_pack(
             .await?;
     }
 
-    let mut tx = state.db.begin().await?;
-    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
-        .await?;
-    CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation).await?;
-    PackRepository::acquire_mutation_lock(&mut tx, removal_ref).await?;
+    let mut tx = match CacheEntryRepository::begin_reclamation_transaction(
+        &state.db,
+        &state.reclamation_cancellation,
+        acquisition_deadline,
+    )
+    .await?
+    {
+        attune_common::repositories::cache::CacheReclamationAdmission::Acquired(transaction) => {
+            transaction
+        }
+        attune_common::repositories::cache::CacheReclamationAdmission::DeadlineExceeded
+        | attune_common::repositories::cache::CacheReclamationAdmission::Unavailable => {
+            return Err(ApiError::RetryableDatabaseError);
+        }
+    };
+    PackRepository::acquire_mutation_lock(tx.transaction_mut(), removal_ref).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let locked_pack = PackRepository::find_by_ref(&mut *tx, removal_ref)
         .await?
@@ -1109,10 +1127,13 @@ pub async fn delete_pack(
     // transaction. Typed owner/manager FKs are then cleared while text refs
     // and cache data remain for asynchronous supervisor cleanup.
     let deleted_release_content =
-        PackRetentionRepository::content_for_pack(&mut tx, pack.id).await?;
+        PackRetentionRepository::content_for_pack(tx.transaction_mut(), pack.id).await?;
     let runtime_environment_paths =
-        PackEnvironmentManager::list_pack_environment_paths_in_transaction(&mut tx, pack.id)
-            .await?;
+        PackEnvironmentManager::list_pack_environment_paths_in_transaction(
+            tx.transaction_mut(),
+            pack.id,
+        )
+        .await?;
     let runtime_environment_relative_paths = pack_runtime_environment_relative_paths(
         FsPath::new(&state.config.runtime_envs_dir),
         &runtime_environment_paths,
@@ -1133,7 +1154,7 @@ pub async fn delete_pack(
         ))
     })?;
     let (deleted, tombstoned_caches) =
-        delete_pack_database_records_in_transaction(&mut tx, pack.id).await?;
+        delete_pack_database_records_in_transaction(tx.transaction_mut(), pack.id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound(format!("Pack '{}' not found", pack_ref)));
@@ -1146,7 +1167,11 @@ pub async fn delete_pack(
         );
     }
 
-    tx.commit().await?;
+    tx.commit().await.map_err(|error| match error {
+        attune_common::repositories::reclamation_cancellation::ReclamationEndError::CleanupUnavailable
+        | attune_common::repositories::reclamation_cancellation::ReclamationEndError::CommitUnknown => ApiError::RetryableDatabaseError,
+        attune_common::repositories::reclamation_cancellation::ReclamationEndError::Database(error) => ApiError::from(error),
+    })?;
     if let Err(error) = removal.finalize_after_commit() {
         tracing::warn!(
             error = %error,

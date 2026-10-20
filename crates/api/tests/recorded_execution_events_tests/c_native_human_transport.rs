@@ -11,7 +11,7 @@ use attune_common::{
     },
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum Change {
     Freeze,
     RevokeDecrypt,

@@ -6,13 +6,14 @@ use attune_common::{
     repositories::{
         identity::{
             CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
-            PermissionAssignmentRepository, PermissionSetRepository,
+            IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository,
         },
         recorded_input_authority::RecordedInputAuthorityRepository as Contributors,
         work_queue::{
             CreateWorkQueueInput, CreateWorkQueueItemInput, WorkQueueItemRepository,
             WorkQueueRepository,
         },
+        FindById,
     },
 };
 
@@ -111,6 +112,7 @@ pub(super) async fn queue(
     pack: &Pack,
     action: Id,
     action_ref: &str,
+    permission_set_refs: &[String],
 ) -> Result<WorkQueue> {
     Ok(WorkQueueRepository::create(
         &fixture.ctx.pool,
@@ -135,7 +137,7 @@ pub(super) async fn queue(
             item_schema: json!({}),
             action_params: json!({}),
             trace_tag_template: None,
-            permission_set_refs: None,
+            permission_set_refs: Some(permission_set_refs.to_vec()),
             config: json!({}),
             reference_visibility: Default::default(),
             reference_allowed_pack_refs: vec![],
@@ -226,4 +228,33 @@ pub(super) async fn capture(
         "contributors must retain distinct identities"
     );
     Ok(items)
+}
+
+pub(super) async fn attribution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    queue: &WorkQueue,
+    ids: &[Id],
+) -> Result<RequestAttribution> {
+    let mut items = BTreeMap::new();
+    for id in ids {
+        let item = WorkQueueItemRepository::find_by_id(&mut **tx, *id)
+            .await?
+            .unwrap();
+        assert_eq!(item.queue, queue.id);
+        let identity =
+            IdentityRepository::find_by_id(&mut **tx, item.requested_by_identity.unwrap())
+                .await?
+                .unwrap();
+        items.insert(
+            *id,
+            Some(HumanAttribution {
+                identity_id: identity.id,
+                login: identity.login,
+            }),
+        );
+    }
+    Ok(RequestAttribution::QueueBatch {
+        queue_ref: queue.r#ref.clone(),
+        items,
+    })
 }

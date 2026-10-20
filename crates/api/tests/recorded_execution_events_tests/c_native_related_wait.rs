@@ -160,6 +160,8 @@ pub(super) async fn related_wait(
         &fixture.ctx.pool,
         graph.id,
         UpdateActionInput {
+            // Revoking explicit read must not leave public-action metadata access.
+            reference_visibility: Some(attune_common::models::ActionReferenceVisibility::Private),
             param_schema: Some(json!({})),
             out_schema: Some(json!({"token":{"type":"string","secret":true}})),
             ..Default::default()
@@ -227,11 +229,15 @@ pub(super) async fn related_wait(
             default_priority: 0,
             allow_pending_update: false,
             update_strategy: attune_common::models::WorkQueueUpdateStrategy::Immutable,
-            batch_mode: attune_common::models::WorkQueueBatchMode::Single,
+            batch_mode: if contributor_case {
+                attune_common::models::WorkQueueBatchMode::Batch
+            } else {
+                attune_common::models::WorkQueueBatchMode::Single
+            },
             item_schema: json!({}),
             action_params: json!({}),
             trace_tag_template: None,
-            permission_set_refs: None,
+            permission_set_refs: Some(producer_refs.clone()),
             config: json!({}),
             reference_visibility: Default::default(),
             reference_allowed_pack_refs: vec![],
@@ -530,10 +536,17 @@ pub(super) async fn related_wait(
         task_path: "/tasks/observed".into(),
         action_ref: leaf.r#ref.clone(),
     };
-    let producer_binding = InvocationBinding::WorkflowTask {
-        workflow_ref: graph.r#ref.clone(),
-        task_path: "/tasks/producer".into(),
-        action_ref: leaf.r#ref.clone(),
+    let producer_binding = if contributor_case {
+        InvocationBinding::Queue {
+            queue_ref: queue.r#ref.clone(),
+            action_ref: leaf.r#ref.clone(),
+        }
+    } else {
+        InvocationBinding::WorkflowTask {
+            workflow_ref: graph.r#ref.clone(),
+            task_path: "/tasks/producer".into(),
+            action_ref: leaf.r#ref.clone(),
+        }
     };
     let policy = RuntimeAuthorityRepository::capture_policy(
         &mut tx,
@@ -582,15 +595,32 @@ pub(super) async fn related_wait(
         },
     };
     let mut source_admission = 0;
+    let contributor_items = if contributor_case {
+        super::c_native_contributors::capture(
+            &mut tx,
+            &queue,
+            producer.id,
+            original.id,
+            weak_contributor,
+        )
+        .await?
+    } else {
+        vec![]
+    };
+    let producer_attribution = if contributor_case {
+        super::c_native_contributors::attribution(&mut tx, &queue, &contributor_items).await?
+    } else {
+        RequestAttribution::ParentExecution {
+            execution_id: root.id,
+        }
+    };
     for (execution, binding, pin, attribution) in [
         (root.id, &root_binding, &graph_pin, human.clone()),
         (
             producer.id,
             &producer_binding,
             &leaf_pin,
-            RequestAttribution::ParentExecution {
-                execution_id: root.id,
-            },
+            producer_attribution,
         ),
     ] {
         let selected = policy.policy.select(
@@ -626,18 +656,12 @@ pub(super) async fn related_wait(
         fixture.requester,
     )
     .await?;
-    let contributor_items = if contributor_case {
-        super::c_native_contributors::capture(
-            &mut tx,
-            &queue,
-            producer.id,
-            original.id,
-            weak_contributor,
-        )
-        .await?
-    } else {
-        vec![]
-    };
+    attune_common::repositories::accepted_input::AcceptedInputRepository::seal_execution(
+        &mut tx,
+        producer.id,
+        key,
+    )
+    .await?;
     RuntimeReadRepository::close_execution(&mut tx, producer.id).await?;
     ExecutionRepository::update(
         &mut *tx,

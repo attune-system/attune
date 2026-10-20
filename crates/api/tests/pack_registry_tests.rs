@@ -124,8 +124,11 @@ async fn scoped_install_authority_admits_only_the_named_fresh_pack() -> Result<(
         )
         .await?;
     let status = response.status();
-    let body = response.text().await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
     assert!(PackRepository::find_by_ref(&ctx.pool, "scoped_fresh")
         .await?
         .is_some());
@@ -195,8 +198,11 @@ async fn managed_action_api_edit_readmits_metadata_over_the_same_immutable_relea
         )
         .await?;
     let status = response.status();
-    let body = response.text().await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
     let pack = PackRepository::find_by_ref(&ctx.pool, "metadata_edit")
         .await?
         .unwrap();
@@ -216,8 +222,11 @@ async fn managed_action_api_edit_readmits_metadata_over_the_same_immutable_relea
         )
         .await?;
     let status = response.status();
-    let body = response.text().await?;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "action metadata update should succeed"
+    );
     let mut tx = ctx.pool.begin().await?;
     let after = RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
         .await?
@@ -291,8 +300,11 @@ async fn fresh_nested_workflows_resolve_later_candidate_action_declarations() ->
         )
         .await?;
     let status = response.status();
-    let body = response.text().await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
     for reference in [
         "nested_candidates.outer",
         "nested_candidates.inner",
@@ -406,8 +418,12 @@ async fn registration_binds_named_schemas_across_component_kinds() -> Result<()>
         )
         .await?;
     let status = response.status();
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    let _: serde_json::Value = response.json().await?;
     let action = ActionRepository::find_by_ref(&ctx.pool, "named_consumers.run")
         .await?
         .unwrap();
@@ -541,8 +557,12 @@ async fn registered_pack_keeps_attribution_and_rules_use_system_owned_authority(
         )
         .await?;
     let status = response.status();
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    let _: serde_json::Value = response.json().await?;
     let identity = attune_common::auth::jwt::validate_token(
         ctx.token().unwrap(),
         &JwtConfig {
@@ -680,8 +700,12 @@ async fn restricted_uploader_can_publish_grants_it_already_holds() -> Result<()>
         )
         .await?;
     let status = response.status();
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    let _: serde_json::Value = response.json().await?;
     assert!(
         PermissionSetRepository::find_by_ref(&ctx.pool, "narrow_grant.read")
             .await?

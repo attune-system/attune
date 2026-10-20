@@ -768,16 +768,25 @@ struct CacheAuthority {
     identity_id: i64,
     grants: Vec<Grant>,
     snapshot: Option<AuthorizationSnapshot>,
+    authorization: AuthorizationService,
+    user: AuthenticatedUser,
 }
 
 impl CacheAuthority {
-    fn authorize_resolved(
-        &self,
-        action: Action,
-        mut context: AuthorizationContext,
-    ) -> CacheResult<()> {
+    fn authorize_resolved(&self, action: Action, context: AuthorizationContext) -> CacheResult<()> {
         if let Some(snapshot) = &self.snapshot {
-            context.identity_attributes = snapshot.identity_attributes.clone();
+            return self
+                .authorization
+                .authorize_with_snapshot(
+                    &self.user,
+                    Some(snapshot),
+                    crate::authz::AuthorizationCheck {
+                        resource: Resource::Caches,
+                        action,
+                        context,
+                    },
+                )
+                .map_err(Into::into);
         }
         if cache_action_allowed(&self.grants, action, &context) {
             Ok(())
@@ -808,6 +817,8 @@ async fn load_cache_authority(
                 identity_id: snapshot.identity_id,
                 grants: snapshot.grants.clone(),
                 snapshot: Some(snapshot),
+                authorization: authz,
+                user: user.clone(),
             })
         }
         // Sensor tokens are not evaluated by identity RBAC. They may only use a
@@ -866,6 +877,8 @@ async fn load_cache_authority(
                 identity_id,
                 grants,
                 snapshot: None,
+                authorization: authz,
+                user: user.clone(),
             })
         }
         // Refresh and worker tokens are rejected from cache data routes.

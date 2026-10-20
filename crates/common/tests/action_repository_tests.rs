@@ -298,6 +298,7 @@ async fn test_update_action_partial() {
 #[tokio::test]
 async fn test_delete_action() {
     let mut tx = create_test_transaction().await.unwrap();
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
         .create(&mut *tx)

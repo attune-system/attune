@@ -385,6 +385,61 @@ async fn test_update_workflow() {
         .await
         .unwrap();
 
+    use attune_common::repositories::{
+        identity::{
+            CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            PermissionAssignmentRepository, PermissionSetRepository,
+        },
+        Create,
+    };
+    let denied = ctx
+        .put(
+            &format!("/api/v1/workflows/{}.update_test", pack.r#ref),
+            json!({"label":"Updated Label","description":"Updated description","version":"1.1.0"}),
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let unchanged = WorkflowDefinitionRepository::find_by_ref(
+        &ctx.pool,
+        &format!("{}.update_test", pack.r#ref),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(unchanged.label, "Original Label");
+    assert_eq!(
+        unchanged.description.as_deref(),
+        Some("Original description")
+    );
+    assert_eq!(unchanged.version, "1.0.0");
+    let editor = ctx.user.as_ref().unwrap().id;
+    let set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: format!("fixture.workflow_update_{}", pack.id),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([{"resource":"actions","actions":["update"],
+            "constraints":{"refs":[format!("{}.update_test", pack.r#ref)]}}]),
+        },
+    )
+    .await
+    .unwrap();
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: editor,
+            permset: set.id,
+        },
+    )
+    .await
+    .unwrap();
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(editor).await;
+
     // Update workflow via API
     let response = ctx
         .put(

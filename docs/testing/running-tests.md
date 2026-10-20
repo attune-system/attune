@@ -24,6 +24,10 @@ make test-cli
 ```
 
 Database-backed Rust tests run normally and require stock PostgreSQL 16 or newer.
+The six deferred deployment cases are a documented scope exception, not
+external-service tests. See [Supported deployment scope](supported-deployment-scope.md)
+for their exact identities, supported replacements, and explicit rerun command.
+Default and all-features checks must report them as deferred, not passed.
 Compose and CI default to PostgreSQL 18. No TimescaleDB extension or preload is
 required. Use a disposable cluster and follow
 [PostgreSQL-only deployment](../deployment/postgresql-only.md) for fresh-install and reset decisions.

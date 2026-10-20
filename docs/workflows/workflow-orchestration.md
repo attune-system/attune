@@ -15,6 +15,12 @@ Workflows in Attune follow these core principles:
 5. **Observable**: Each task in a workflow creates an execution record with full traceability
 6. **Recoverable**: Failed workflows can be resumed or retried from specific tasks
 
+The supported release preserves self-recursive and mutually recursive workflow
+calls. Deployment does not add a call-cycle restriction or prove termination.
+Task-transition loops and event/rule feedback remain unchanged. The deployment
+acceptance test uploads and inspects pinned recursive call edges without running
+an unbounded workflow. See [Supported deployment scope](../testing/supported-deployment-scope.md).
+
 ## Architecture Components
 
 ### 1. Workflow Definition Format

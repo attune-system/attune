@@ -66,9 +66,12 @@ async fn operator_api_exposes_manual_quarantine_without_releasing_unknown_native
         let capabilities: Value = response.json().await?;
         assert_eq!(capabilities["data"]["management_transport"], "manual_required");
         // Explicitly owned rows, not a broad historical fixture sweep.
-        sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,metadata_gone,evidence_state) VALUES(98101,98102,98103,true,'quarantined')").execute(&ctx.pool).await?;
-        sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source) VALUES(98101,'execution',98104)").execute(&ctx.pool).await?;
-        sqlx::query("INSERT INTO file_evidence_put(attempt,owner,protocol) VALUES($1,98101,'legacy_unknown')").bind(Uuid::new_v4()).execute(&ctx.pool).await?;
+        let mut capture = ctx.pool.begin().await?;
+        attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut capture).await?;
+        sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,metadata_gone,evidence_state) VALUES(98101,98102,98103,true,'quarantined')").execute(&mut *capture).await?;
+        sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source) VALUES(98101,'execution',98104)").execute(&mut *capture).await?;
+        sqlx::query("INSERT INTO file_evidence_put(attempt,owner,protocol) VALUES($1,98101,'legacy_unknown')").bind(Uuid::new_v4()).execute(&mut *capture).await?;
+        capture.commit().await?;
         let candidates = ctx.get(&format!("{endpoint}/candidates"), ctx.token()).await?;
         assert_eq!(candidates.status(), StatusCode::OK);
         let candidates: Value = candidates.json().await?;
@@ -125,8 +128,11 @@ async fn frozen_operator_access_token_is_rejected_before_maintenance_step() -> R
     let ctx = TestContext::new().await?.with_auth().await?;
     let result: Result<()> = async {
         grant(&ctx, true).await?;
-        sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,metadata_gone,evidence_state) VALUES(98201,98202,98203,true,'quarantined')").execute(&ctx.pool).await?;
-        sqlx::query("INSERT INTO file_evidence_put(attempt,owner,protocol) VALUES($1,98201,'legacy_unknown')").bind(Uuid::new_v4()).execute(&ctx.pool).await?;
+        let mut capture = ctx.pool.begin().await?;
+        attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut capture).await?;
+        sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,metadata_gone,evidence_state) VALUES(98201,98202,98203,true,'quarantined')").execute(&mut *capture).await?;
+        sqlx::query("INSERT INTO file_evidence_put(attempt,owner,protocol) VALUES($1,98201,'legacy_unknown')").bind(Uuid::new_v4()).execute(&mut *capture).await?;
+        capture.commit().await?;
         let audit = ctx.post("/api/v1/retention-config/file-audits", json!({"versions":[98201]}), ctx.token()).await?;
         assert_eq!(audit.status(), StatusCode::CREATED);
         let audit: Value = audit.json().await?;

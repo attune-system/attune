@@ -3907,8 +3907,8 @@ fn cache_freshness_deadline(
         generation
             .activated
             .map(|activated| {
-                let seconds = freshness_target_seconds.checked_add(1).ok_or_else(denied)?;
-                let duration = chrono::Duration::try_seconds(seconds).ok_or_else(denied)?;
+                let duration =
+                    chrono::Duration::try_seconds(freshness_target_seconds).ok_or_else(denied)?;
                 activated.checked_add_signed(duration).ok_or_else(denied)
             })
             .transpose()?
@@ -4649,6 +4649,39 @@ fn denied() -> Error {
 #[cfg(test)]
 mod cache_reader_policy_tests {
     use super::*;
+
+    #[test]
+    fn finite_cache_deadline_does_not_add_a_rounding_grace_period() {
+        let activated = chrono::Utc::now() + chrono::Duration::hours(1);
+        let generation: crate::models::CacheGeneration = serde_json::from_value(json!({
+            "id": 1, "namespace": 2, "state": "active", "client_refresh_id": "deadline-fixture",
+            "expected_chunk_count": 1, "record_count": 1, "size_bytes": 1,
+            "created": activated, "activated": activated
+        }))
+        .unwrap();
+        let deadline = activated + chrono::Duration::seconds(30);
+        let saved = cache_freshness_deadline(&generation, 30, true).unwrap();
+        assert_eq!(saved, Some(deadline));
+        let policy = NativeCacheReadPolicy {
+            require_fresh: true,
+            fresh_until: saved,
+        };
+        policy
+            .check_at(deadline - chrono::Duration::nanoseconds(1))
+            .unwrap();
+        assert!(policy.check_at(deadline).is_err());
+        assert!(policy
+            .check_at(deadline + chrono::Duration::milliseconds(1))
+            .is_err());
+        assert_eq!(
+            cache_freshness_deadline(&generation, 0, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            cache_freshness_deadline(&generation, 30, false).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn original_task_flag_distinguishes_unlimited_freshness_from_default_archive_reads() {

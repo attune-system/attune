@@ -193,8 +193,8 @@ async fn normalized_local_inquiry_scope_reveals_only_actual_creator_pack() -> TR
         },
     )
     .await?;
-    let local_execution = create_execution(&ctx.pool, &action).await?;
-    let foreign_execution = create_execution(&ctx.pool, &foreign_action).await?;
+    let local_execution = create_owned_inquiry_execution(&ctx.pool, &action).await?;
+    let foreign_execution = create_owned_inquiry_execution(&ctx.pool, &foreign_action).await?;
     let local = create_inquiry(&ctx.pool, local_execution.id, None).await?;
     let foreign = create_inquiry(&ctx.pool, foreign_execution.id, None).await?;
     let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
@@ -234,6 +234,21 @@ async fn normalized_local_inquiry_scope_reveals_only_actual_creator_pack() -> TR
     assert_eq!(list["items"][0]["id"], local.id);
     ctx.cleanup().await?;
     Ok(())
+}
+
+async fn create_owned_inquiry_execution(pool: &PgPool, action: &Action) -> TResult<Execution> {
+    let snapshot = attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(pool, action.id).await?;
+    Ok(ExecutionRepository::create_pinned(
+        pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            status: ExecutionStatus::Running,
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?)
 }
 
 async fn create_child_execution(

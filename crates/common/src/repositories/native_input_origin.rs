@@ -37,6 +37,17 @@ impl NativeInputClosure {
         }
         Ok(())
     }
+    /// Non-authoritative wait bound over the whole retained closure.
+    pub fn publication_wait_deadline(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.ensure_fresh()?;
+        let mut deadline = self.effect_fence.approval_deadline();
+        for receipt in &self.receipts {
+            if let Some(candidate) = receipt.publication_wait_deadline()? {
+                deadline = Some(deadline.map_or(candidate, |old| old.min(candidate)));
+            }
+        }
+        Ok(deadline)
+    }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
         self.effect_fence.ensure_fresh_on(conn).await?;
         for receipt in &self.receipts {

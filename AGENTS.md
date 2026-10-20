@@ -259,6 +259,7 @@ make db-migrate
 ### Testing / Validation
 - Read `docs/testing/running-tests.md` before choosing a test runner or provisioning dependencies.
 - Database-only Rust tests run in normal Cargo suites and require stock PostgreSQL 16 or newer. Reserve `--ignored` for tests with explicit external-service or stress-test prerequisites.
+  Scope exception: the six named deferred deployment cases in `self_contained_deployment_tests` remain compiled and explicitly ignored. Five require disabled registrar exemptions; the historical recursion-negative case conflicts with the supported recursive-call policy. Before changing their status or reporting deployment coverage, read `docs/testing/supported-deployment-scope.md`. They are deferred coverage, never passing release evidence.
 - Prefer `scripts/run-rust-integration-tests.sh` for Docker-owned Rust tests and `scripts/run-integration-tests.sh` for full-stack E2E. These runners own setup and teardown and avoid fixed host ports.
 - For host-run database tests, provision disposable PostgreSQL and run `make db-test-setup` with `TEST_DB_ADMIN_URL` and `TEST_DB_URL`. Host setup requires `psql` and `sqlx`; direct Cargo runs use `ATTUNE__DATABASE__URL`.
 - Database fixtures use run-owned, migration-hashed templates and physical clones by default. Approved read-only and rollback-isolated tests share a runner-owned database; see `docs/testing/schema-per-test.md`.

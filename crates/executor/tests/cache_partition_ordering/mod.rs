@@ -17,6 +17,11 @@ use attune_common::{
     },
 };
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/cache_partition_ordering/admitted_fixture.rs"
+));
+
 struct CachePartitionFixture {
     database: TestDatabase,
     parent: Execution,
@@ -114,94 +119,23 @@ impl CachePartitionFixture {
         )
         .await
         .unwrap();
-        let mut tx = pool.begin().await.unwrap();
-        let release = PackReleaseRepository::create_or_get(
-            &mut tx,
-            CreatePackReleaseInput {
-                pack: pack.id,
-                pack_ref: pack.r#ref.clone(),
-                version: "1.0.0".into(),
-                digest: "b".repeat(64),
-                object_key: "cache-partition-integration".into(),
-                provider_version: "test".into(),
-                content_path: "/tmp/opencode/cache-partition-integration".into(),
-                archive_size: 1,
-                manifest: serde_json::json!({}),
-            },
-        )
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-        let release = PackReleasePin {
-            id: release.id,
-            digest: release.digest,
-            content_path: release.content_path,
-        };
-        let child_executable = ActionExecutableSnapshot {
-            action: actions[1].clone(),
-            runtime: None,
-            runtime_versions: vec![],
-            workflow_definition: None,
-        };
-        let snapshot = ExecutionExecutableSnapshot {
-            release: release.clone(),
-            executable: ActionExecutableSnapshot {
-                action: actions[0].clone(),
-                runtime: None,
-                runtime_versions: vec![],
-                workflow_definition: Some(definition.clone()),
-            },
-            pack_executables: BTreeMap::from([(
-                actions[1].r#ref.clone(),
-                ReleasedActionExecutableSnapshot {
-                    release,
-                    executable: child_executable,
-                },
-            )]),
-        };
-        let identity = IdentityRepository::create(
-            pool,
-            CreateIdentityInput {
-                login: "cache-partition-owner".into(),
-                display_name: None,
-                password_hash: None,
-                attributes: serde_json::json!({}),
-            },
-        )
-        .await
-        .unwrap();
+        ActionRepository::link_workflow_def(pool, actions[0].id, definition.id)
+            .await
+            .unwrap();
         let parameters = serde_json::json!({"generation": "active"});
-        let parent = create_bound_fixture_execution(
+        let (parent, workflow_execution_id) = create_admitted_cache_partition_parent(
             pool,
-            CreateExecutionInput {
-                action: Some(actions[0].id),
-                action_ref: actions[0].r#ref.clone(),
-                config: Some(parameters.clone()),
-                executor: Some(identity.id),
-                permission_set_refs: vec!["standard".into()],
-                status: ExecutionStatus::Running,
-                ..Default::default()
-            },
-            &snapshot,
-        )
-        .await
-        .unwrap();
-        let workflow_execution = WorkflowExecutionRepository::create(
-            pool,
-            CreateWorkflowExecutionInput {
-                execution: parent.id,
-                workflow_def: definition.id,
-                task_graph: serde_json::to_value(&graph).unwrap(),
-                variables: serde_json::json!({}),
-                status: ExecutionStatus::Running,
-            },
+            &pack,
+            &actions,
+            &graph,
+            parameters.clone(),
         )
         .await
         .unwrap();
         Self {
             database,
             parent,
-            workflow_execution_id: workflow_execution.id,
+            workflow_execution_id,
             graph,
             context: WorkflowContext::new(parameters, HashMap::new()),
         }
@@ -449,10 +383,7 @@ async fn dispatch(
     fixture: &CachePartitionFixture,
     parent: &Execution,
     task: &TaskNode,
-) -> (
-    Vec<PendingExecutionRequested>,
-    Vec<PendingExecutionCompleted>,
-) {
+) -> (WorkflowPublications, Vec<PendingExecutionCompleted>) {
     // Same pre-row protection as activate_entry_workflow_task. This does not
     // replace a broker-backed test of that outer transaction-entry function.
     CacheEntryRepository::protect_transaction(transaction, CacheTransactionMode::PinMutation)
@@ -465,7 +396,7 @@ async fn dispatch(
     .await
     .unwrap()
     .unwrap();
-    let mut messages = Vec::new();
+    let mut messages = WorkflowPublications::default();
     let mut completions = Vec::new();
     ExecutionScheduler::activate_workflow_task_with_conn(
         transaction,
@@ -474,7 +405,7 @@ async fn dispatch(
         &fixture.workflow_execution_id,
         task,
         &fixture.context,
-        None,
+        Some(CACHE_PARTITION_INPUT_KEY),
         None,
         &mut messages,
         &mut completions,
@@ -711,7 +642,7 @@ async fn finish_cache_child(
     let outcome = ExecutionScheduler::advance_workflow_serialized(
         &mut tx,
         &AtomicUsize::new(0),
-        None,
+        Some(CACHE_PARTITION_INPUT_KEY),
         &child,
         &SchedulerMetadataCaches::new(),
     )
@@ -1120,30 +1051,16 @@ async fn inverse_generation_pin_initialization_does_not_deadlock() {
         .unwrap();
     assert_ne!(first_generation, second_generation);
     let snapshot = fixture.parent.executable_snapshot.as_ref().unwrap();
-    let second_root = ExecutionRepository::create_pinned(
+    let requester = IdentityRepository::find_by_id(pool, fixture.parent.executor.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let (_second_root, second_workflow_id) = accept_cache_partition_parent(
         pool,
-        CreateExecutionInput {
-            action: fixture.parent.action,
-            action_ref: fixture.parent.action_ref.clone(),
-            config: fixture.parent.config.clone(),
-            executor: fixture.parent.executor,
-            permission_set_refs: vec!["standard".into()],
-            status: ExecutionStatus::Running,
-            ..Default::default()
-        },
         snapshot,
-    )
-    .await
-    .unwrap();
-    let second_workflow = WorkflowExecutionRepository::create(
-        pool,
-        CreateWorkflowExecutionInput {
-            execution: second_root.id,
-            workflow_def: snapshot.executable.workflow_definition.as_ref().unwrap().id,
-            task_graph: serde_json::to_value(&fixture.graph).unwrap(),
-            variables: serde_json::json!({}),
-            status: ExecutionStatus::Running,
-        },
+        &requester,
+        &fixture.graph,
+        fixture.parent.config.clone().unwrap(),
     )
     .await
     .unwrap();
@@ -1225,18 +1142,18 @@ async fn inverse_generation_pin_initialization_does_not_deadlock() {
         CacheEntryRepository::protect_transaction(&mut right, CacheTransactionMode::PinMutation)
             .await
             .unwrap();
-        WorkflowExecutionRepository::find_by_id_for_update(&mut *right, second_workflow.id)
+        WorkflowExecutionRepository::find_by_id_for_update(&mut *right, second_workflow_id)
             .await
             .unwrap()
             .unwrap();
         let mut right_first =
             iteration_input(&fixture, namespace, second_generation, "right-first");
-        right_first.workflow_execution = second_workflow.id;
+        right_first.workflow_execution = second_workflow_id;
         WorkflowCacheIterationRepository::create_or_find_for_update(&mut right, right_first)
             .await
             .unwrap();
         let mut input = iteration_input(&fixture, namespace, first_generation, "right-second");
-        input.workflow_execution = second_workflow.id;
+        input.workflow_execution = second_workflow_id;
         let result =
             WorkflowCacheIterationRepository::create_or_find_for_update(&mut right, input).await;
         if result.is_ok() {
@@ -1489,77 +1406,131 @@ async fn workflow_definition_delete_waits_for_cleanup_parent_before_cascade_rows
     assert_workflow_cascade_delete_parent_first(true).await;
 }
 
-struct CacheBrokerFixture {
+pub(super) struct CacheBrokerFixture {
     connection: attune_common::mq::Connection,
-    publisher: Publisher,
+    pub(super) publisher: Publisher,
     channel: lapin::Channel,
     queue: String,
 }
 
 impl CacheBrokerFixture {
-    async fn connect(vhost: &str) -> Self {
+    pub(super) async fn connect(vhost: &str) -> Self {
+        Self::try_connect(vhost)
+            .await
+            .expect("owned broker fixture setup failed after awaited cleanup")
+    }
+
+    async fn try_connect(vhost: &str) -> anyhow::Result<Self> {
         let base = std::env::var("ATTUNE_TEST_CACHE_BROKER_URL")
-            .expect("broker tests require the owned cache protocol runner");
-        let connection = attune_common::mq::Connection::connect(&format!("{base}/{vhost}"))
-            .await
-            .unwrap();
-        let channel = connection.create_channel().await.unwrap();
-        channel
-            .exchange_declare(
-                "attune.executions".into(),
-                lapin::ExchangeKind::Topic,
-                lapin::options::ExchangeDeclareOptions {
-                    durable: true,
-                    ..Default::default()
+            .map_err(|_| anyhow::anyhow!("broker tests require the owned cache protocol runner"))?;
+        let connection = attune_common::mq::Connection::connect(&format!("{base}/{vhost}")).await?;
+        // Keep each returned owner outside the later fallible setup future.
+        // Errors propagate only after every currently owned teardown is awaited.
+        let channel = match connection.create_channel().await {
+            Ok(channel) => channel,
+            Err(error) => {
+                let cleanup_failed = !Self::receipt_cleanup_attempt(connection.close()).await;
+                let error: anyhow::Error = error.into();
+                return Err(if cleanup_failed {
+                    error.context("Partial owned broker cleanup failed at connection")
+                } else {
+                    error
+                });
+            }
+        };
+        let mut owned_queue: Option<String> = None;
+        let setup: anyhow::Result<(Publisher, String)> = async {
+            channel
+                .exchange_declare(
+                    "attune.executions".into(),
+                    lapin::ExchangeKind::Topic,
+                    lapin::options::ExchangeDeclareOptions {
+                        durable: true,
+                        ..Default::default()
+                    },
+                    lapin::types::FieldTable::default(),
+                )
+                .await?;
+            let queue = channel
+                .queue_declare(
+                    "".into(),
+                    lapin::options::QueueDeclareOptions {
+                        exclusive: true,
+                        auto_delete: true,
+                        ..Default::default()
+                    },
+                    lapin::types::FieldTable::default(),
+                )
+                .await?
+                .name()
+                .as_str()
+                .to_string();
+            owned_queue = Some(queue.clone());
+            channel
+                .queue_bind(
+                    queue.as_str().into(),
+                    "attune.executions".into(),
+                    "#".into(),
+                    lapin::options::QueueBindOptions::default(),
+                    lapin::types::FieldTable::default(),
+                )
+                .await?;
+            let publisher = Publisher::new(
+                &connection,
+                attune_common::mq::PublisherConfig {
+                    confirm_publish: true,
+                    timeout_secs: 10,
+                    exchange: "attune.executions".into(),
                 },
-                lapin::types::FieldTable::default(),
             )
-            .await
-            .unwrap();
-        let queue = channel
-            .queue_declare(
-                "".into(),
-                lapin::options::QueueDeclareOptions {
-                    exclusive: true,
-                    auto_delete: true,
-                    ..Default::default()
-                },
-                lapin::types::FieldTable::default(),
-            )
-            .await
-            .unwrap()
-            .name()
-            .as_str()
-            .to_string();
-        channel
-            .queue_bind(
-                queue.as_str().into(),
-                "attune.executions".into(),
-                "#".into(),
-                lapin::options::QueueBindOptions::default(),
-                lapin::types::FieldTable::default(),
-            )
-            .await
-            .unwrap();
-        let publisher = Publisher::new(
-            &connection,
-            attune_common::mq::PublisherConfig {
-                confirm_publish: true,
-                timeout_secs: 10,
-                exchange: "attune.executions".into(),
-            },
-        )
-        .await
-        .unwrap();
-        Self {
-            connection,
-            publisher,
-            channel,
-            queue,
+            .await?;
+            Ok((publisher, queue))
+        }
+        .await;
+        match setup {
+            Ok((publisher, queue)) => Ok(Self {
+                connection,
+                publisher,
+                channel,
+                queue,
+            }),
+            Err(error) => {
+                let mut failed = Vec::new();
+                if let Some(queue) = owned_queue {
+                    if !Self::receipt_cleanup_attempt(channel.queue_delete(
+                        queue.as_str().into(),
+                        lapin::options::QueueDeleteOptions::default(),
+                    ))
+                    .await
+                    {
+                        failed.push("queue");
+                    }
+                }
+                if !Self::receipt_cleanup_attempt(
+                    channel.close(200, "owned broker partial setup cleanup".into()),
+                )
+                .await
+                {
+                    failed.push("channel");
+                }
+                // Closing the still-owned connection also covers any channel
+                // allocated internally by a failed Publisher::new operation.
+                if !Self::receipt_cleanup_attempt(connection.close()).await {
+                    failed.push("connection");
+                }
+                if failed.is_empty() {
+                    Err(error)
+                } else {
+                    Err(error.context(format!(
+                        "Partial owned broker cleanup failed at {}",
+                        failed.join(", ")
+                    )))
+                }
+            }
         }
     }
 
-    async fn receive(&self) -> serde_json::Value {
+    pub(super) async fn receive(&self) -> serde_json::Value {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if let Some(delivery) = self
@@ -1586,7 +1557,7 @@ impl CacheBrokerFixture {
         .expect("expected broker publication was not received")
     }
 
-    async fn assert_empty(&self) {
+    pub(super) async fn assert_empty(&self) {
         assert!(
             self.channel
                 .basic_get(
@@ -1600,20 +1571,83 @@ impl CacheBrokerFixture {
         );
     }
 
-    async fn close(self) {
-        self.channel
+    pub(super) async fn close(self) {
+        let queue_cleanup = self
+            .channel
             .queue_delete(
                 self.queue.as_str().into(),
                 lapin::options::QueueDeleteOptions::default(),
             )
-            .await
-            .unwrap();
+            .await;
         drop(self.publisher);
-        self.channel
+        let channel_cleanup = self
+            .channel
             .close(200, "owned cache fixture complete".into())
-            .await
-            .unwrap();
-        self.connection.close().await.unwrap();
+            .await;
+        let connection_cleanup = self.connection.close().await;
+        // Attempt every owned teardown before surfacing any earlier failure.
+        queue_cleanup.expect("owned broker queue cleanup failed");
+        channel_cleanup.expect("owned broker channel cleanup failed");
+        connection_cleanup.expect("owned broker connection cleanup failed");
+    }
+
+    // Receipt recovery probes need each owner retained until ALL teardown
+    // attempts complete. Never time out the entire consuming close(self).
+    async fn receipt_cleanup_attempt<F, T, E>(future: F) -> bool
+    where
+        F: std::future::Future<Output = std::result::Result<T, E>>,
+    {
+        use futures::FutureExt;
+        matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                std::panic::AssertUnwindSafe(future).catch_unwind(),
+            )
+            .await,
+            Ok(Ok(Ok(_)))
+        )
+    }
+
+    pub(super) async fn close_bounded(self) -> anyhow::Result<()> {
+        let mut failed = Vec::new();
+        if !Self::receipt_cleanup_attempt(self.channel.queue_delete(
+            self.queue.as_str().into(),
+            lapin::options::QueueDeleteOptions::default(),
+        ))
+        .await
+        {
+            failed.push("queue delete: error, panic or 5s bound");
+        }
+        let publisher_channel_cleanup = async {
+            let channel = self.publisher.channel().await;
+            if channel.status().connected() {
+                channel
+                    .close(200, "owned receipt publisher cleanup".into())
+                    .await?;
+            }
+            Ok::<(), lapin::Error>(())
+        };
+        if !Self::receipt_cleanup_attempt(publisher_channel_cleanup).await {
+            failed.push("publisher channel acquire/close: error, panic or 5s bound");
+        }
+        drop(self.publisher);
+        if !Self::receipt_cleanup_attempt(
+            self.channel
+                .close(200, "owned receipt direct fixture cleanup".into()),
+        )
+        .await
+        {
+            failed.push("fixture channel close: error, panic or 5s bound");
+        }
+        if !Self::receipt_cleanup_attempt(self.connection.close()).await {
+            failed.push("connection close: error, panic or 5s bound");
+        }
+        anyhow::ensure!(
+            failed.is_empty(),
+            "Owned receipt broker cleanup failed at {}",
+            failed.join(", ")
+        );
+        Ok(())
     }
 }
 
@@ -1630,7 +1664,7 @@ async fn activate_cache_via_broker(
         &fixture.workflow_execution_id,
         task,
         &fixture.context,
-        None,
+        Some(CACHE_PARTITION_INPUT_KEY),
         None,
     )
     .await
@@ -1666,7 +1700,7 @@ async fn advance_cache_via_broker(
         &transport,
         1024 * 1024,
         1000,
-        None,
+        Some(CACHE_PARTITION_INPUT_KEY),
         &child,
         &SchedulerMetadataCaches::new(),
     )

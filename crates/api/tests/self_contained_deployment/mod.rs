@@ -5,9 +5,9 @@ use attune_api::authz::AuthorizationService;
 use attune_common::repositories::{
     identity::{
         CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
-        PermissionAssignmentRepository, PermissionSetRepository,
+        PermissionAssignmentRepository, PermissionSetRepository, UpdatePermissionSetInput,
     },
-    Create,
+    Create, Update,
 };
 use axum::{body::Body, http::Request};
 use serde_json::{json, Value};
@@ -69,6 +69,47 @@ pub async fn installer(ctx: &TestContext, refs: &[&str]) -> Result<Actor> {
     actor(ctx, json!([{"resource":"packs","actions":["read","install","configure"],"constraints":{"refs":refs}}])).await
 }
 
+/// Supported registrar mode requires explicit initial consent to each tick.
+/// Keep the Packs-only installer unchanged for denial and deferred SOW cases.
+pub async fn consenting_installer(ctx: &TestContext, refs: &[&str]) -> Result<Actor> {
+    let ticks = refs
+        .iter()
+        .map(|reference| format!("{reference}.tick"))
+        .collect::<Vec<_>>();
+    actor(
+        ctx,
+        json!([
+            {"resource":"packs","actions":["read","install","configure"],"constraints":{"refs":refs}},
+            {"resource":"events","actions":["create"],"constraints":{"refs":ticks}}
+        ]),
+    )
+    .await
+}
+
+/// Change only this actor's fixture-owned IAM set, never deployed pack policy.
+pub async fn remove_tick_consent(
+    ctx: &TestContext,
+    installer: &Actor,
+    refs: &[&str],
+) -> Result<()> {
+    let sets = PermissionSetRepository::find_by_identity(&ctx.pool, installer.id).await?;
+    assert_eq!(sets.len(), 1);
+    assert!(sets[0].r#ref.starts_with("fixture.actor_"));
+    let grants = json!([{"resource":"packs","actions":["read","install","configure"],"constraints":{"refs":refs}}]);
+    let updated = PermissionSetRepository::update(
+        &ctx.pool,
+        sets[0].id,
+        UpdatePermissionSetInput {
+            grants: Some(grants.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(updated.grants, grants);
+    AuthorizationService::invalidate_identity_authz_cache(installer.id).await;
+    Ok(())
+}
+
 pub struct Archive {
     pub root: tempfile::TempDir,
     pub reference: String,
@@ -89,7 +130,9 @@ impl Archive {
             ("runtimes/python.yaml".into(), format!("ref: {p}.python\nname: {p}_python\nexecution_config:\n  interpreter:\n    binary: python3\n    args: []\n    file_extension: .py\n")),
             ("triggers/tick.yaml".into(), format!("ref: {p}.tick\nlabel: Tick\noutput:\n  message: {{type: string, required: true}}\n")),
             ("permission_sets/events.yaml".into(), format!("ref: {p}.events\nscope: pack\ngrants:\n  - resource: events\n    actions: [create]\n    constraints:\n      refs: [{p}.tick]\n")),
-            ("rules/feedback.yaml".into(), format!("ref: {p}.feedback\nlabel: Feedback\ntrigger_ref: {p}.tick\naction_ref: {p}.outer\nconditions:\n  - field: message\n    operator: equals\n    value: start\naction_params:\n  message: done\npermission_set_refs: [{p}.events]\n")),
+            // The object-form expression preserves the original start-only match
+            // in supported and deferred scenarios without changing their consent.
+            ("rules/feedback.yaml".into(), format!("ref: {p}.feedback\nlabel: Feedback\ntrigger_ref: {p}.tick\naction_ref: {p}.outer\nconditions:\n  expression: \"{{{{ event.payload.message == 'start' }}}}\"\naction_params:\n  message: done\npermission_set_refs: [{p}.events]\n")),
             ("queues/inbox.yaml".into(), format!("ref: {p}.inbox\nlabel: Inbox\ndispatch_action: {p}.outer\npermission_set_refs: [{p}.events]\nbatch_mode: single\nitem_schema:\n  message: {{type: string, required: true}}\naction_params:\n  message: '{{{{ item.message }}}}'\n")),
             ("actions/workflows/inner.workflow.yaml".into(), format!("version: '1.0'\ntasks:\n  - name: emit\n    action: {p}.emit\n    input:\n      message: '{{{{ parameters.message }}}}'\n")),
             ("actions/workflows/outer.workflow.yaml".into(), format!("version: '1.0'\ntasks:\n  - name: nested\n    action: {p}.inner\n    input:\n      message: '{{{{ parameters.message }}}}'\n    next:\n      - when: '{{{{ succeeded() }}}}'\n        do: [finite]\n  - name: finite\n    action: '{{{{ parameters.target }}}}'\n    allowed_action_refs: [{p}.emit, {p}.alternate]\n    input:\n      message: '{{{{ parameters.message }}}}'\n")),

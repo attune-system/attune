@@ -4433,6 +4433,16 @@ policy:
     }
 
     #[test]
+    fn matching_pack_prefix_never_substitutes_for_existing_structural_owner() {
+        let reference = "collision_subject.emit";
+        assert!(validate_pack_component_ref("collision_subject", "action", reference).is_ok());
+        let error = ensure_existing_owner("action", reference, Some(41), 42).unwrap_err();
+        assert!(error.to_string().contains("owned by another pack"));
+        assert!(ensure_existing_owner("action", reference, None, 42).is_err());
+        assert!(ensure_existing_owner("action", reference, Some(42), 42).is_ok());
+    }
+
+    #[test]
     fn workflow_path_is_confined_to_actions_workflows() {
         let temp = tempfile::tempdir().unwrap();
         let actions_dir = temp.path().join("actions");

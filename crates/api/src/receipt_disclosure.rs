@@ -12,7 +12,10 @@ use attune_common::{
         schema_type::SchemaTypeRepository,
     },
 };
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 pub(crate) type SharedHumanReceiptGuard = Arc<tokio::sync::Mutex<HumanReceiptGuard>>;
 mod iam;
@@ -23,6 +26,7 @@ pub(crate) struct HumanReceiptGuard {
     sources_closed: bool,
     sensor_versions: BTreeSet<i64>,
     iam: Option<iam::HeldIam>,
+    execution_origins: HashMap<i64, Vec<SecretProvenanceRow>>,
 }
 
 impl HumanReceiptGuard {
@@ -50,6 +54,7 @@ impl HumanReceiptGuard {
             sources_closed: false,
             sensor_versions: BTreeSet::new(),
             iam,
+            execution_origins: HashMap::new(),
         })
     }
 
@@ -86,10 +91,11 @@ impl HumanReceiptGuard {
         let mut guard = Self::begin(state, user).await?;
         let mut rows = Vec::new();
         for batch in executions.chunks(64) {
-            rows.extend(
+            let origins =
                 crate::recorded_disclosure::execution_origins_many(&mut guard.transaction, batch)
-                    .await?,
-            );
+                    .await?;
+            guard.retain_execution_origins(batch, &origins);
+            rows.extend(origins);
             if rows.len() > 256 {
                 return Err(ApiError::Forbidden(
                     "Receipt graph exceeds its bound".into(),
@@ -109,6 +115,24 @@ impl HumanReceiptGuard {
 
     pub(crate) fn frontier(&self) -> &InputReceiptFrontier {
         &self.frontier
+    }
+
+    fn retain_execution_origins(&mut self, ids: &[i64], rows: &[SecretProvenanceRow]) {
+        for id in ids {
+            self.execution_origins.insert(*id, Vec::new());
+        }
+        for row in rows {
+            self.execution_origins
+                .entry(row.entity_id)
+                .or_default()
+                .push(row.clone());
+        }
+    }
+
+    /// Exact records used during source preparation, including known-empty
+    /// roots. This is evidence reuse, not a cached authorization decision.
+    pub(crate) fn execution_origins(&self, id: i64) -> Option<&[SecretProvenanceRow]> {
+        self.execution_origins.get(&id).map(Vec::as_slice)
     }
 
     /// Reuse the IAM rows held by this disclosure transaction rather than
@@ -210,10 +234,11 @@ impl HumanReceiptGuard {
             }
         }
         for execution in executions {
-            rows.extend(
+            let origins =
                 crate::recorded_disclosure::execution_origins(&mut self.transaction, execution)
-                    .await?,
-            );
+                    .await?;
+            self.retain_execution_origins(&[execution], &origins);
+            rows.extend(origins);
             if rows.len() > 256 {
                 return Err(ApiError::Forbidden(
                     "Sensor receipt graph exceeds its bound".into(),

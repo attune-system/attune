@@ -134,6 +134,8 @@ pub(super) async fn cache_http_case(
         &fixture.ctx.pool,
         graph.id,
         UpdateActionInput {
+            // Revoking explicit read must not leave public-action metadata access.
+            reference_visibility: Some(attune_common::models::ActionReferenceVisibility::Private),
             param_schema: Some(json!({"cache_name":{"type":"string"}})),
             out_schema: Some(json!({"token":{"type":"string","secret":true}})),
             ..Default::default()
@@ -608,7 +610,8 @@ pub(super) async fn cache_http_case(
             deadline,
             at,
         )
-        .await?;
+        .await
+        .map_err(|error| format!("cache transport {at:?}: {error}"))?;
         fixture.ctx.cleanup().await?;
         return Ok(());
     }

@@ -74,7 +74,7 @@ pub(super) async fn exercise(
     execution: Id,
     token: &str,
     deadline: chrono::DateTime<chrono::Utc>,
-    source_deadline: bool,
+    source_expiry_status: Option<StatusCode>,
     human: Option<&HumanReader>,
 ) -> Result<()> {
     let mut socket = SocketHarness::connect_for(fixture, token, execution).await?;
@@ -133,7 +133,7 @@ pub(super) async fn exercise(
         );
         super::c_native_transport::expires(deadline).await?;
         held.rollback().await?;
-        if source_deadline {
+        if let Some(expected_status) = source_expiry_status {
             // Notifications do not disclose native values. Do not invent a
             // value-WebSocket exception or deny authorized metadata because a
             // separate value-source deadline expired.
@@ -145,18 +145,28 @@ pub(super) async fn exercise(
                 body["type"] == "notification"
                     && body["payload"] == json!({"auth_mode":"deferred"})
             );
+            let value_read = fixture
+                .ctx
+                .get(
+                    &format!("/api/v1/executions/{execution}?include_secret_values=true"),
+                    Some(token),
+                )
+                .await?;
             assert_eq!(
-                fixture
-                    .ctx
-                    .get(
-                        &format!("/api/v1/executions/{execution}?include_secret_values=true"),
-                        Some(token)
-                    )
-                    .await?
-                    .status(),
-                StatusCode::FORBIDDEN,
+                value_read.status(),
+                expected_status,
                 "the deferred hint cannot authorize the expired native value read"
             );
+            let denied: Value = value_read.json().await?;
+            assert_eq!(
+                denied["code"],
+                if expected_status == StatusCode::CONFLICT {
+                    "CONFLICT"
+                } else {
+                    "FORBIDDEN"
+                }
+            );
+            assert!(denied["data"].is_null());
             socket.socket.close(None).await?;
         } else {
             socket.expect_revoked_close().await?;

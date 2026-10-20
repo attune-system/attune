@@ -3272,10 +3272,7 @@ async fn authorize_artifact_action(
     };
 
     if action == Action::Read {
-        return crate::artifact_reads::ArtifactReads::new(state, user)
-            .await?
-            .authorize_detail(artifact)
-            .await;
+        return crate::artifact_reads::ArtifactReads::authorize_detail(state, user, artifact).await;
     }
 
     let ctx = artifact_authorization_context(identity_id, artifact);

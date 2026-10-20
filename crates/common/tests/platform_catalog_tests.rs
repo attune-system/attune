@@ -64,6 +64,11 @@ async fn snapshot(pool: &PgPool) -> Value {
 
 fn legacy_fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("pack.yaml"),
+        "ref: core\nlabel: Legacy core fixture\nversion: '1.0.0'\n",
+    )
+    .unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/platform_catalog");
     for directory in ["runtimes", "permission_sets", "triggers"] {
         std::fs::create_dir(root.path().join(directory)).unwrap();

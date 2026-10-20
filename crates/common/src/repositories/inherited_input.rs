@@ -666,6 +666,12 @@ impl ReceiptContext {
     pub fn ensure_fresh(&self) -> Result<()> {
         self.fence.ensure_fresh()
     }
+    /// Scheduling bound only. The opaque context must still be held and checked
+    /// at each effect attempt; a copied date is never an input authorization.
+    pub fn publication_wait_deadline(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.ensure_fresh()?;
+        Ok(self.fence.approval_deadline())
+    }
     pub fn public_source_sites(&self) -> &[InputSite] {
         &self.public_sources
     }

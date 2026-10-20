@@ -41,14 +41,25 @@ class ColdEndpointTests(unittest.TestCase):
 class HeapCreationTests(unittest.TestCase):
     def test_heap_cleanup_preserves_native_bounded_admission_and_transport_shell(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode", prefix="cache-heap-budget-") as temporary:
-            target = Path(temporary)
+            target = Path(temporary) / "baseline"
+            historical = Path(temporary) / "historical"
             files = [measure.REPO, measure.STORAGE] + [
                 Path("migrations") / name for name in [measure.CACHE, measure.ACCOUNTING, measure.PARTITIONS]]
             for name in files:
                 (target / name).parent.mkdir(parents=True, exist_ok=True)
                 (target / name).write_bytes((measure.ROOT / name).read_bytes())
+            # Unit-only predecessor grammar, not a historical benchmark source.
+            # Keep both input trees owned by this test, including in source archives.
+            fixtures = Path(__file__).resolve().parent / "test_fixtures" / "cache_heap_predecessor"
+            for fixture, name in [
+                ("cache.rs.txt", measure.REPO),
+                ("cache.sql", Path("migrations") / measure.CACHE),
+                ("accounting.sql", Path("migrations") / measure.ACCOUNTING),
+            ]:
+                (historical / name).parent.mkdir(parents=True, exist_ok=True)
+                (historical / name).write_bytes((fixtures / fixture).read_bytes())
             native = measure.function((target / measure.REPO).read_text(), "drop_if_cleanup_eligible")
-            measure.heap_baseline(target, Path("/tmp/opencode/native-workload-current-final/source"))
+            measure.heap_baseline(target, historical)
             heap_source = (target / measure.REPO).read_text()
             step = measure.function(heap_source, "cleanup_heap_step")
             # Only the operation body and its Error wrapper differ. Admission,

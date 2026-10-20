@@ -41,13 +41,7 @@ pub fn decode_complete(
             "Finite protected log exceeds its delivery bound",
         ));
     }
-    let mut verifier = crate::runtime_log_completion::FrameVerifier::new(
-        key,
-        execution,
-        version,
-        MAX_FINITE_PLAINTEXT,
-        maximum_encoded_bytes(MAX_FINITE_PLAINTEXT)?,
-    );
+    let mut verifier = crate::runtime_log_completion::FrameVerifier::for_manifest(key, &manifest);
     verifier.update(bytes)?;
     verifier.finish(&manifest)?;
     let mut plaintext = Vec::with_capacity(manifest.plaintext_bytes as usize);

@@ -69,6 +69,12 @@ pub enum NativeResultCase {
     GeneratedWarningCandidate,
     ProspectiveResultOutput,
     ProspectiveResultChild,
+    ProspectiveCompositeChild,
+    IndependentRecoveryChild,
+    // Authored independently before release/policy capture. Executor's owned MQ
+    // regression uses a finite external INPUT consent, not an SDK policy fence.
+    FiniteOriginalInputChild,
+    FiniteOriginalPublicationPair,
     AuthoredFalseStatus,
     AuthoredFalseWithControls,
 }
@@ -146,6 +152,31 @@ pub async fn original_executor_failure(
     original_failed_task_fixture(status, true, condition, None, Some(build)).await
 }
 
+/// Actual failed/timeout recovery source authored before immutable capture.
+pub async fn original_executor_independent_recovery(
+    status: ExecutionStatus,
+    build: fn(&serde_json::Value) -> serde_json::Value,
+) -> (
+    TestDatabase,
+    tempfile::TempDir,
+    Execution,
+    WorkflowExecution,
+    Execution,
+) {
+    assert!(matches!(
+        status,
+        ExecutionStatus::Failed | ExecutionStatus::Timeout
+    ));
+    original_failed_task_fixture(
+        status,
+        false,
+        false,
+        Some(NativeResultCase::IndependentRecoveryChild),
+        Some(build),
+    )
+    .await
+}
+
 pub async fn original_executor_native_result(
     case: NativeResultCase,
     build: fn(&serde_json::Value) -> serde_json::Value,
@@ -164,6 +195,35 @@ pub async fn original_executor_native_result(
         Some(build),
     )
     .await
+}
+
+/// Same genuinely admitted prospective-result fixture, with a separate callee
+/// whose supplied finite task input receives independent input consent before
+/// that callee exists. No original execution or historical seal is rewritten.
+pub async fn original_executor_finite_input_child(
+    build: fn(&serde_json::Value) -> serde_json::Value,
+) -> (
+    TestDatabase,
+    tempfile::TempDir,
+    Execution,
+    WorkflowExecution,
+    Execution,
+) {
+    original_executor_native_result(NativeResultCase::FiniteOriginalInputChild, build).await
+}
+
+/// Authored before capture: ordinary consumer first, independent finite-input
+/// consumer second. Existing commit-boundary fixture/case remains unchanged.
+pub async fn original_executor_finite_publication_pair(
+    build: fn(&serde_json::Value) -> serde_json::Value,
+) -> (
+    TestDatabase,
+    tempfile::TempDir,
+    Execution,
+    WorkflowExecution,
+    Execution,
+) {
+    original_executor_native_result(NativeResultCase::FiniteOriginalPublicationPair, build).await
 }
 
 pub async fn original_executor_success_with_approval(
@@ -228,6 +288,18 @@ async fn original_failed_task_fixture_with_file_api(
             || (native_result.is_some() && status == ExecutionStatus::Completed)
     );
     let db = create_test_pool().await.unwrap();
+    // Await cleanup even when setup assertions fail, before returning owners.
+    use futures::FutureExt;
+    let files = match tempfile::tempdir() {
+        Ok(files) => files,
+        Err(error) => {
+            db.cleanup()
+                .await
+                .expect("fixture database cleanup after tempdir failure");
+            panic!("fixture tempdir creation failed: {error}");
+        }
+    };
+    let built = std::panic::AssertUnwindSafe(async {
     let pack = PackFixture::new_unique("native_failure")
         .create(&db)
         .await
@@ -256,13 +328,30 @@ async fn original_failed_task_fixture_with_file_api(
     let mut leaf = ActionFixture::new(pack.id, &pack.r#ref, "leaf");
     if matches!(
         native_result,
-        Some(NativeResultCase::ProspectiveResultChild)
+        Some(NativeResultCase::ProspectiveResultChild | NativeResultCase::ProspectiveCompositeChild | NativeResultCase::IndependentRecoveryChild)
+            | Some(NativeResultCase::FiniteOriginalInputChild)
+            | Some(NativeResultCase::FiniteOriginalPublicationPair)
     ) {
         leaf.param_schema = Some(
             json!({"value":{"type":"string","secret":true},"whole":{"type":"object","secret":true}}),
         );
     }
     let leaf = leaf.create(&db).await.unwrap();
+    // Secret fields cannot carry schema defaults. The root graph authors an
+    // exact task-input Key selection, evaluated only for the finite successor.
+    // Its input-only consent is not a root SDK or outer-transition grant.
+    let finite_leaf = if matches!(native_result,
+        Some(NativeResultCase::FiniteOriginalInputChild | NativeResultCase::FiniteOriginalPublicationPair)) {
+        let mut consumer = ActionFixture::new(pack.id, &pack.r#ref, "finite_consumer");
+        consumer.param_schema = Some(json!({
+            "value":{"type":"string","secret":true},
+            "whole":{"type":"object","secret":true},
+            "finite":{"type":"string","secret":true}
+        }));
+        Some(consumer.create(&db).await.unwrap())
+    } else {
+        None
+    };
     let human = IdentityFixture::new_unique("native_failure_submitter")
         .create(&db)
         .await
@@ -326,8 +415,21 @@ async fn original_failed_task_fixture_with_file_api(
                     {"when":"{{ succeeded() }}","publish":["whole"]}
                 ]);
             }
+            NativeResultCase::IndependentRecoveryChild => {
+                graph["tasks"][0]["next"] = json!([{
+                    "when": if status == ExecutionStatus::Timeout { "{{ timed_out() }}" } else { "{{ failed() }}" },
+                    "publish":[{"recovered":{"literal":"recovery"}}], "do":["consumer"]
+                }]);
+                graph["tasks"].as_array_mut().unwrap().push(json!({
+                    "name":"consumer", "action":leaf.r#ref,
+                    "input":{"whole":"{{ variables.recovered }}"}, "next":[]
+                }));
+            }
             NativeResultCase::ProspectiveResultOutput
-            | NativeResultCase::ProspectiveResultChild => {
+            | NativeResultCase::ProspectiveResultChild
+            | NativeResultCase::ProspectiveCompositeChild
+            | NativeResultCase::FiniteOriginalInputChild
+            | NativeResultCase::FiniteOriginalPublicationPair => {
                 graph["tasks"][0]["next"] = json!([
                     {"when":"{{ failed() }}","publish":["not_fired"]},
                     {"when":"{{ result().literal == result().data.literal }}","publish":["whole"]},
@@ -335,9 +437,30 @@ async fn original_failed_task_fixture_with_file_api(
                     {"when":"{{ copied == vars.whole.literal }}","publish":[{"whole":{"literal":"replacement"}}]},
                     {"when":"{{ workflow.whole.literal == 'replacement' }}","publish":[{"latest":"{{ variables.whole.literal }}"}]}
                 ]);
-                if matches!(case, NativeResultCase::ProspectiveResultChild) {
+                if matches!(case, NativeResultCase::ProspectiveResultChild | NativeResultCase::ProspectiveCompositeChild | NativeResultCase::FiniteOriginalInputChild | NativeResultCase::FiniteOriginalPublicationPair) {
                     graph["tasks"][0]["next"][4]["do"] = json!(["consumer"]);
-                    graph["tasks"].as_array_mut().unwrap().push(json!({"name":"consumer","action":leaf.r#ref,"params":{"value":"{{ vars.copied }}","whole":"{{ variables.whole }}"},"next":[]}));
+                    graph["tasks"].as_array_mut().unwrap().push(json!({"name":"consumer","action":leaf.r#ref,"input":{"value":"{{ vars.copied }}","whole":"{{ variables.whole }}"},"next":[]}));
+                    if matches!(case, NativeResultCase::ProspectiveCompositeChild) {
+                        graph["tasks"][0]["next"][3]["publish"] = json!([{"whole":{
+                            "literal":"replacement", "other":"{{ copied }}"
+                        }}]);
+                    }
+                    if matches!(case, NativeResultCase::FiniteOriginalInputChild) {
+                        // The graph declaration owns consent; only actual child
+                        // input evaluation consumes it and creates the finite proof.
+                        graph["tasks"][1]["action"] = json!(finite_leaf.as_ref().unwrap().r#ref);
+                        graph["tasks"][1]["input"]["finite"] =
+                            json!("{{ keystore['system.receipt_lifetime_original'] }}");
+                    }
+                    if matches!(case, NativeResultCase::FiniteOriginalPublicationPair) {
+                        graph["tasks"][0]["next"][4]["do"] = json!(["consumer", "finite_later"]);
+                        let mut later = graph["tasks"][1].clone();
+                        later["name"] = json!("finite_later");
+                        later["action"] = json!(finite_leaf.as_ref().unwrap().r#ref);
+                        later["input"]["finite"] =
+                            json!("{{ keystore['system.receipt_lifetime_original'] }}");
+                        graph["tasks"].as_array_mut().unwrap().push(later);
+                    }
                 } else {
                     graph["output_map"] =
                         json!({"first":"{{ copied }}","latest":"{{ vars.whole.literal }}"});
@@ -406,7 +529,6 @@ async fn original_failed_task_fixture_with_file_api(
     ActionRepository::link_workflow_def(&db, action.id, definition.id)
         .await
         .unwrap();
-    let files = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(files.path().join("actions/workflows")).unwrap();
     std::fs::write(
         files.path().join("actions/run.yaml"),
@@ -422,6 +544,12 @@ async fn original_failed_task_fixture_with_file_api(
         format!("ref: {}\n", leaf.r#ref),
     )
     .unwrap();
+    if let Some(consumer) = &finite_leaf {
+        std::fs::write(files.path().join("actions/finite_consumer.yaml"), format!(
+            "ref: {}\nparam_schema: {}\n", consumer.r#ref,
+            serde_json::to_string(consumer.param_schema.as_ref().unwrap()).unwrap(),
+        )).unwrap();
+    }
     std::fs::write(
         files.path().join("actions/workflows/run.yaml"),
         serde_yaml_ng::to_string(&graph).unwrap(),
@@ -444,12 +572,14 @@ async fn original_failed_task_fixture_with_file_api(
     )
     .await
     .unwrap();
+    let mut action_ids = vec![action.id, leaf.id];
+    if let Some(consumer) = &finite_leaf { action_ids.push(consumer.id); }
     PackReleaseRepository::activate_projected(
         &mut tx,
         pack.id,
         release.id,
         &PackProjectionIds {
-            actions: vec![action.id, leaf.id],
+            actions: action_ids,
             workflows: vec![definition.id],
             ..Default::default()
         },
@@ -600,6 +730,9 @@ async fn original_failed_task_fixture_with_file_api(
             | NativeResultCase::ExplicitNextOverridesLegacy
             | NativeResultCase::ProspectiveResultOutput
             | NativeResultCase::ProspectiveResultChild
+            | NativeResultCase::ProspectiveCompositeChild
+            | NativeResultCase::FiniteOriginalInputChild
+            | NativeResultCase::FiniteOriginalPublicationPair
             | NativeResultCase::AuthoredFalseStatus
             | NativeResultCase::AuthoredFalseWithControls,
         ) => json!({"whole":"must_not_select_this_field","data":{"literal":literal}}),
@@ -614,6 +747,7 @@ async fn original_failed_task_fixture_with_file_api(
             | NativeResultCase::FalseDecisionGeneratedSuccess
             | NativeResultCase::GeneratedWarningCandidate,
         ) => json!({"data":{"literal":literal}}),
+        Some(NativeResultCase::IndependentRecoveryChild) => json!({"error":"ordinary recovery source","data":{"literal":literal}}),
         None => json!({"error":"ordinary failure","data":{"literal":literal}}),
     };
     let child = ExecutionRepository::update(
@@ -634,7 +768,18 @@ async fn original_failed_task_fixture_with_file_api(
     for receipt in parent_inputs.iter().chain(&child_inputs) {
         receipt.ensure_fresh().unwrap();
     }
-    (db, files, parent, state, child)
+        (parent, state, child)
+    }).catch_unwind().await;
+    match built {
+        Ok((parent, state, child)) => (db, files, parent, state, child),
+        Err(panic) => {
+            let database_cleanup = db.cleanup().await;
+            let files_cleanup = files.close();
+            database_cleanup.expect("fixture database cleanup after setup panic");
+            files_cleanup.expect("fixture file cleanup after setup panic");
+            std::panic::resume_unwind(panic)
+        }
+    }
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
+use sqlx::{Acquire, Executor, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
 
 use crate::{
@@ -2773,7 +2773,182 @@ impl CacheIngestRepository {
 
 pub struct CacheEntryRepository;
 
+/// Fresh owned transaction only; no caller locks can survive a failed attempt.
+#[derive(Debug)]
+pub enum CacheReclamationAdmission {
+    Unavailable,
+    Acquired(super::reclamation_cancellation::ReclamationTransaction),
+    DeadlineExceeded,
+}
+
 impl CacheEntryRepository {
+    /// Acquire graph, cache admission and parent protection without retaining
+    /// graph while waiting for cache admission. The caller supplies one absolute
+    /// deadline, including time already spent authorizing its request.
+    pub async fn begin_reclamation_transaction(
+        pool: &PgPool,
+        cancellation: &std::sync::Arc<super::reclamation_cancellation::CancellationOwner>,
+        deadline: tokio::time::Instant,
+    ) -> Result<CacheReclamationAdmission> {
+        use super::reclamation_cancellation::{BindingError, ReclamationTransaction};
+        let acquisition = async {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(CacheReclamationAdmission::DeadlineExceeded);
+            }
+            // Reserve the separately bounded control slot BEFORE primary pool
+            // acquisition, including both waits in the caller's absolute budget.
+            let reservation = match cancellation.reserve(deadline).await {
+                Ok(reservation) => reservation,
+                Err(_) => return Ok(CacheReclamationAdmission::Unavailable),
+            };
+            let mut connection = pool.acquire().await?;
+            connection.close_on_drop();
+            // Snapshot the actual connection's driver capability synchronously,
+            // before any new SQL/BEGIN or graph/cache/source wait.
+            let guard = match reservation.bind(&connection) {
+                Ok(guard) => guard,
+                Err(BindingError::Unavailable) => {
+                    return Ok(CacheReclamationAdmission::Unavailable)
+                }
+            };
+            let transaction = sqlx::Transaction::begin(connection, None).await?;
+            let mut transaction = ReclamationTransaction::new(transaction, guard);
+            let admitted =
+                Self::acquire_reclamation_gates(transaction.transaction_mut(), deadline).await;
+            match admitted {
+                Ok(true) => Ok(CacheReclamationAdmission::Acquired(transaction)),
+                Ok(false) => {
+                    if transaction.rollback().await.is_err() {
+                        return Ok(CacheReclamationAdmission::Unavailable);
+                    }
+                    Ok(CacheReclamationAdmission::DeadlineExceeded)
+                }
+                Err(error) => {
+                    if transaction.rollback().await.is_err() {
+                        return Ok(CacheReclamationAdmission::Unavailable);
+                    }
+                    Err(error)
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.closed() => Ok(CacheReclamationAdmission::Unavailable),
+            result = tokio::time::timeout_at(deadline, acquisition) => match result {
+                Ok(Err(Error::Database(error)))
+                    if tokio::time::Instant::now() >= deadline
+                        && error.as_database_error().and_then(|error| error.code())
+                            .is_some_and(|code| matches!(code.as_ref(), "55P03" | "57014")) =>
+                {
+                    Ok(CacheReclamationAdmission::DeadlineExceeded)
+                }
+                Ok(result) => result,
+                // Dropping the armed guard wakes its registered monitor. It
+                // owns the control slot through cancel transport completion.
+                // Transport EOF does not acknowledge exact backend disposal.
+                Err(_) => Ok(CacheReclamationAdmission::DeadlineExceeded),
+            },
+        }
+    }
+
+    async fn acquire_reclamation_gates(
+        transaction: &mut sqlx::Transaction<'_, Postgres>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool> {
+        let original_timeouts: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
+             (SELECT setting::BIGINT FROM pg_settings WHERE name='lock_timeout'), \
+             (SELECT setting::BIGINT FROM pg_settings WHERE name='statement_timeout')",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            // Preflight BEFORE requesting exclusive graph: a queued graph writer
+            // could otherwise block later readers through lock-queue fairness.
+            // The cache lock is only a wake-up hint and must be rolled back.
+            let mut preflight = transaction.begin().await?;
+            let ready: Result<bool> = async {
+                if !set_reclamation_acquisition_budget(
+                    &mut preflight,
+                    deadline,
+                    (original_timeouts.2, original_timeouts.3),
+                )
+                .await?
+                {
+                    return Ok(false);
+                }
+                lock_cache_admission(&mut preflight).await?;
+                Ok(true)
+            }
+            .await;
+            preflight.rollback().await?;
+            if !ready? {
+                return Ok(false);
+            }
+
+            let mut attempt = transaction.begin().await?;
+            let selected: Result<bool> = async {
+                if !set_reclamation_acquisition_budget(
+                    &mut attempt, deadline, (original_timeouts.2, original_timeouts.3),
+                ).await? {
+                    return Ok(false);
+                }
+                // Preserve the shared-to-exclusive upgrade rejection, not just
+                // the raw graph advisory lock. No source/capture locks precede it.
+                super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(
+                    &mut attempt,
+                )
+                .await?;
+                let cache_available: bool = sqlx::query_scalar(
+                    "SELECT pg_try_advisory_xact_lock($1, $2)",
+                )
+                .bind(CACHE_ADMISSION_ADVISORY_LOCK_CLASS)
+                .bind(CACHE_ADMISSION_ADVISORY_LOCK_KEY)
+                .fetch_one(&mut *attempt)
+                .await?;
+                if !cache_available {
+                    return Ok(false);
+                }
+                if !set_reclamation_acquisition_budget(
+                    &mut attempt, deadline, (original_timeouts.2, original_timeouts.3),
+                ).await? {
+                    return Ok(false);
+                }
+                // Cache acquisition here is reentrant and cannot wait. Parent
+                // protection still follows admission and precedes all source rows.
+                Self::protect_transaction(&mut attempt, CacheTransactionMode::PinMutation).await?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                // Acquisition policy must not leak into later mutation/commit.
+                sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)")
+                    .bind(&original_timeouts.0)
+                    .bind(&original_timeouts.1)
+                    .execute(&mut *attempt)
+                    .await?;
+                Ok(true)
+            }
+            .await;
+            match selected {
+                Ok(true) => {
+                    attempt.commit().await?;
+                    return Ok(tokio::time::Instant::now() < deadline);
+                }
+                Ok(false) => {
+                    // Release graph BEFORE the next blocking cache preflight.
+                    attempt.rollback().await?;
+                }
+                Err(error) => {
+                    attempt.rollback().await?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     pub async fn protect_transaction(
         connection: &mut sqlx::PgConnection,
         mode: CacheTransactionMode,
@@ -3681,6 +3856,41 @@ fn ensure_namespace_storage_quota(
         ));
     }
     Ok(())
+}
+
+async fn set_reclamation_acquisition_budget(
+    connection: &mut sqlx::PgConnection,
+    deadline: tokio::time::Instant,
+    original_limits_ms: (i64, i64),
+) -> Result<bool> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    // Round UP: zero disables PostgreSQL timeouts. The client absolute deadline
+    // remains the bound even for a final fraction of a millisecond. PostgreSQL
+    // accepts at most i32::MAX milliseconds for each of these settings.
+    let milliseconds =
+        remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+    let milliseconds = milliseconds.min(i32::MAX as u128);
+    // Respect tighter operator session limits. Zero means unlimited, not zero
+    // acquisition budget. Preserve each original per-statement/per-lock limit;
+    // the caller's monotonic deadline independently bounds the whole loop.
+    let bounded = |original: i64| {
+        if original > 0 {
+            milliseconds.min(original as u128)
+        } else {
+            milliseconds
+        }
+    };
+    sqlx::query(
+        "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+    )
+    .bind(format!("{}ms", bounded(original_limits_ms.0)))
+    .bind(format!("{}ms", bounded(original_limits_ms.1)))
+    .execute(connection)
+    .await?;
+    Ok(true)
 }
 
 async fn lock_cache_admission(connection: &mut sqlx::PgConnection) -> Result<()> {

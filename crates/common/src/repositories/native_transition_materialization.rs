@@ -37,6 +37,9 @@ use serde_json::Value;
 use sqlx::PgConnection;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod task_input;
+pub use task_input::PreparedNativeTaskInput;
+
 mod frame;
 pub use frame::{NativeTransitionRenderFrame, PreparedNativeOrdinaryTransitions};
 mod iteration;

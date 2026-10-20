@@ -3,10 +3,20 @@
 use super::*;
 use fixture::NativeResultCase;
 
+mod task_input_tests;
+
 const LITERAL: &str = "{{ keystore['foreign.never_parse'] }}";
 
 #[tokio::test]
 async fn ordinary_result_view_conditions_and_overwrites_feed_the_actual_child_input() {
+    use attune_common::{
+        repositories::{
+            accepted_input::AcceptedInputRepository,
+            declared_input_materialization::DeclaredInputMaterializationRepository as Materialize,
+            inherited_input::{InputEntityKind, InputSitePurpose},
+        },
+        secret_provenance::SecretProvenance,
+    };
     let (db, files, parent, workflow, child) = fixture::original_executor_native_result(
         NativeResultCase::ProspectiveResultChild,
         canonical_task_graph,
@@ -76,6 +86,33 @@ async fn ordinary_result_view_conditions_and_overwrites_feed_the_actual_child_in
         !fields.is_empty(),
         "the child receives real purpose-qualified lineage, not plain JSON"
     );
+    // The scheduler must have sealed this nonempty projection in its original
+    // creation transaction. Revalidation cannot create or repair that seal.
+    let accepted_inputs =
+        AcceptedInputRepository::revalidate_execution(&mut tx, consumer.id, fixture::KEY)
+            .await
+            .expect("nonempty consumer input has its genuine original acceptance seal");
+    let input_receipts =
+        Materialize::prepare_execution_input_receipts(&mut tx, consumer.id, fixture::KEY)
+            .await
+            .expect("actual consumer ciphertext is bound to its first typed deliveries");
+    assert_eq!(input_receipts.len(), fields.len());
+    for field in &fields {
+        assert_eq!(field.source_kind, "provenance");
+        let provenance: SecretProvenance =
+            serde_json::from_str(field.source_ref.as_deref().unwrap()).unwrap();
+        let receipt = input_receipts
+            .iter()
+            .find(|receipt| {
+                receipt.site().execution == consumer.id
+                    && receipt.site().kind == InputEntityKind::ExecutionConfig
+                    && receipt.site().purpose == InputSitePurpose::Value
+                    && receipt.site().path == field.json_path
+            })
+            .expect("every stored field has its own config/value first delivery");
+        assert_eq!(provenance.origins, vec![receipt.origin()]);
+        assert!(provenance.templates.is_empty());
+    }
     let config = attune_common::secret_values::restore_secret_values(
         consumer.config.clone().unwrap(),
         &fields,
@@ -127,7 +164,94 @@ async fn ordinary_result_view_conditions_and_overwrites_feed_the_actual_child_in
     );
     plan.ensure_fresh_on(&mut tx).await.unwrap();
     sources.ensure_fresh_on(&mut tx).await.unwrap();
+    // A commit owner can reopen the EXACT original child inputs after the
+    // complete advancement, including nonempty first deliveries. Duplicated
+    // plain pending messages reuse the same opaque per-child proof owner.
+    let mut duplicate_pending = outcome.execution_requests.clone();
+    duplicate_pending.push(outcome.execution_requests[0].clone());
+    let input_publications =
+        PreparedWorkflowInputPublications::prepare(&mut tx, &duplicate_pending, Some(fixture::KEY))
+            .await
+            .expect("reopen original nonempty inputs without sealing or new authority");
+    let mut forged_pending = outcome.execution_requests[0].clone();
+    forged_pending.action_ref.push_str(".wrong-target");
+    let mut forged_publications = duplicate_pending.clone();
+    forged_publications.push(forged_pending.clone());
+    assert!(
+        PreparedWorkflowInputPublications::prepare(
+            &mut tx,
+            &forged_publications,
+            Some(fixture::KEY),
+        )
+        .await
+        .is_err(),
+        "a valid first message must not hide a same-ID invalid duplicate"
+    );
+    let mut forged_first = WorkflowPublications::default();
+    forged_first.push(forged_pending);
+    forged_first.extend(duplicate_pending.clone());
+    assert!(
+        PreparedWorkflowInputPublications::prepare(&mut tx, &forged_first, Some(fixture::KEY),)
+            .await
+            .is_err(),
+        "an invalid first duplicate must not be hidden by a later valid message"
+    );
+    // A deferred child is transport bookkeeping, not a pending message. Two
+    // recursive outcome merges must preserve its original ID even with no MQ
+    // payload at either level. No fixture acceptance or receipt is synthesized.
+    let mut deferred = WorkflowPublications::default();
+    deferred.register_created(consumer.id);
+    deferred.register_created(consumer.id);
+    let mut recursive_outcome = WorkflowPublications::default();
+    recursive_outcome.extend(deferred);
+    let mut outer_outcome = WorkflowPublications::default();
+    outer_outcome.extend(recursive_outcome);
+    assert!(
+        outer_outcome.is_empty(),
+        "no message was queued for this deferred owner"
+    );
+    assert_eq!(
+        outer_outcome.owner_ids().collect::<Vec<_>>(),
+        vec![consumer.id]
+    );
+    let deferred_inputs =
+        PreparedWorkflowInputPublications::prepare(&mut tx, &outer_outcome, Some(fixture::KEY))
+            .await
+            .expect("a deferred owner survives merging and reopens original persisted input");
+    let mut missing_deferred = WorkflowPublications::default();
+    missing_deferred.register_created(i64::MAX);
+    assert!(
+        PreparedWorkflowInputPublications::prepare(&mut tx, &missing_deferred, Some(fixture::KEY),)
+            .await
+            .is_err(),
+        "an absent deferred owner must fail exact indexed lookup"
+    );
+    let empty = WorkflowPublications::default();
+    PreparedWorkflowInputPublications::prepare(&mut tx, &empty, None)
+        .await
+        .expect("zero tracked owners require neither lookup nor encryption key")
+        .ensure_fresh_on(&mut tx)
+        .await
+        .unwrap();
+    accepted_inputs.ensure_fresh_on(&mut tx).await.unwrap();
+    for receipt in &input_receipts {
+        receipt.ensure_fresh_on(&mut tx).await.unwrap();
+    }
+    input_publications.ensure_fresh_on(&mut tx).await.unwrap();
+    deferred_inputs.ensure_fresh_on(&mut tx).await.unwrap();
     tx.commit().await.unwrap();
+    input_publications.ensure_fresh().unwrap();
+    deferred_inputs.ensure_fresh().unwrap();
+    deferred_inputs.ensure_child_fresh(consumer.id).unwrap();
+    for pending in &duplicate_pending {
+        input_publications
+            .ensure_child_fresh(pending.execution_id)
+            .unwrap();
+    }
+    accepted_inputs.ensure_fresh().unwrap();
+    for receipt in &input_receipts {
+        receipt.ensure_fresh().unwrap();
+    }
     plan.ensure_fresh().unwrap();
     sources.ensure_fresh().unwrap();
     db.cleanup().await.unwrap();

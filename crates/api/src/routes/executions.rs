@@ -3849,14 +3849,26 @@ fn validate_execution_log_stream_user(
     user: &AuthenticatedUser,
     execution_id: i64,
 ) -> Result<(), ApiError> {
-    if crate::recorded_consumers::is_recorded(user)? {
+    let recorded = crate::recorded_consumers::is_recorded(user)?;
+    if user.claims.token_type == TokenType::Execution && !recorded {
+        validate_execution_token_scope(&user.claims, execution_id)?;
+    }
+    // Own-execution scope is not API opt-in. Check before leases or log backends.
+    if user.claims.token_type == TokenType::Execution
+        && crate::authz::execution_permission_set_refs(user).is_empty()
+        && !crate::authz::execution_has_standard_access(user)
+    {
+        return Err(ApiError::Forbidden(
+            "Execution log access requires explicit permission_set_refs".into(),
+        ));
+    }
+    if recorded {
         return Ok(());
     }
     let claims = &user.claims;
 
     match claims.token_type {
-        TokenType::Access => Ok(()),
-        TokenType::Execution => validate_execution_token_scope(claims, execution_id),
+        TokenType::Access | TokenType::Execution => Ok(()),
         TokenType::Sensor | TokenType::Refresh | TokenType::Worker => Err(ApiError::Unauthorized(
             "Invalid authentication token".to_string(),
         )),
@@ -3998,7 +4010,9 @@ pub fn routes() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
     use crate::auth::jwt::{validate_token, JwtConfig};
-    use attune_common::auth::jwt::generate_execution_token;
+    use attune_common::auth::jwt::{
+        generate_execution_token, generate_execution_token_with_permission_sets,
+    };
     use attune_common::rbac::{
         Action as RbacAction, ExecutionScopeConstraint, GrantConstraints, Resource as RbacResource,
     };
@@ -4090,11 +4104,54 @@ mod tests {
             refresh_token_expiration: 604800,
         };
 
-        let token = generate_execution_token(42, 123, "core.echo", &jwt_config, None).unwrap();
+        let token = generate_execution_token_with_permission_sets(
+            42,
+            123,
+            "core.echo",
+            &jwt_config,
+            None,
+            &["standard".into()],
+        )
+        .unwrap();
         let claims = validate_token(&token, &jwt_config).unwrap();
         let user = AuthenticatedUser::from_claims(claims);
+        validate_execution_log_stream_user(&user, 123).unwrap();
         let err = validate_execution_log_stream_user(&user, 456).unwrap_err();
         assert!(matches!(err, ApiError::Forbidden(_)));
+    }
+
+    #[test]
+    fn execution_log_stream_rejects_missing_or_empty_permission_refs() {
+        let jwt_config = JwtConfig {
+            secret: "test_secret_key_for_testing".to_string(),
+            access_token_expiration: 3600,
+            refresh_token_expiration: 604800,
+        };
+        let token = generate_execution_token(42, 123, "core.echo", &jwt_config, None).unwrap();
+        let claims = validate_token(&token, &jwt_config).unwrap();
+        let mut user = AuthenticatedUser::from_claims(claims);
+        user.claims
+            .metadata
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("permission_set_refs");
+        assert!(matches!(
+            validate_execution_log_stream_user(&user, 123),
+            Err(ApiError::Forbidden(_))
+        ));
+        for refs in [
+            serde_json::json!([]),
+            serde_json::json!(["", "  "]),
+            serde_json::json!([null, 42]),
+        ] {
+            user.claims.metadata.as_mut().unwrap()["permission_set_refs"] = refs;
+            assert!(matches!(
+                validate_execution_log_stream_user(&user, 123),
+                Err(ApiError::Forbidden(_))
+            ));
+        }
     }
 
     #[test]

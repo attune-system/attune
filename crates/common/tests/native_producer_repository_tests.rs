@@ -277,6 +277,9 @@ async fn corrections_deduplicate_old_and_new_hours_for_both_history_kinds() {
 async fn physical_move_coalesces_with_parent_write_and_expiry_removes_origins_atomically() {
     let db = database().await;
     let mut tx = db.pool().begin().await.unwrap();
+    // This test intentionally combines producers and physical repair in one
+    // transaction, so enter reclamation before either producer takes row locks.
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await.unwrap();
     event(&mut tx, bucket()).await;
     event(&mut tx, bucket()).await;
     let outcome: String =

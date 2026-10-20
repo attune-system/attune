@@ -190,6 +190,8 @@ pub(super) async fn execution_wait(
         &fixture.ctx.pool,
         graph.id,
         UpdateActionInput {
+            // Revoking explicit read must not leave public-action metadata access.
+            reference_visibility: Some(attune_common::models::ActionReferenceVisibility::Private),
             param_schema: Some(json!({})),
             out_schema: Some(json!({"token":{"type":"string","secret":true}})),
             ..Default::default()
@@ -220,7 +222,16 @@ pub(super) async fn execution_wait(
         vec![]
     };
     let contributor_queue = if contributor_case {
-        Some(super::c_native_contributors::queue(&fixture, &pack, leaf.id, &leaf.r#ref).await?)
+        Some(
+            super::c_native_contributors::queue(
+                &fixture,
+                &pack,
+                leaf.id,
+                &leaf.r#ref,
+                &source_refs,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -234,7 +245,8 @@ pub(super) async fn execution_wait(
             "permission_set_refs":["standard"],"params":{"token":"{{ item.value.token }}"}}));
         // Both cache references share the same authenticated parent. Native
         // snapshot identity/budgets must not reset or turn into duplicate grants.
-        definition["output_map"]["token"] = json!("{{ saved if cached == cached else saved }}");
+        // Array elements are evaluated before selecting the original saved value.
+        definition["output_map"]["token"] = json!("{{ [saved, cached, cached][0] }}");
     }
     let workflow_def = WorkflowDefinitionRepository::create(
         &fixture.ctx.pool,
@@ -309,7 +321,7 @@ pub(super) async fn execution_wait(
             action_ref: leaf.r#ref.clone(),
             parent: Some(root.id),
             permission_set_refs: source_refs.clone(),
-            status: ExecutionStatus::Completed,
+            status: ExecutionStatus::Running,
             config: Some(json!({})),
             result: Some(json!({"token":redaction_marker()})),
             workflow_task: Some(serde_json::from_value(
@@ -448,10 +460,17 @@ pub(super) async fn execution_wait(
         task_path: "/tasks/observed".into(),
         action_ref: leaf.r#ref.clone(),
     };
-    let source_binding = InvocationBinding::WorkflowTask {
-        workflow_ref: graph.r#ref.clone(),
-        task_path: "/tasks/source".into(),
-        action_ref: leaf.r#ref.clone(),
+    let source_binding = if let Some(queue) = &contributor_queue {
+        InvocationBinding::Queue {
+            queue_ref: queue.r#ref.clone(),
+            action_ref: leaf.r#ref.clone(),
+        }
+    } else {
+        InvocationBinding::WorkflowTask {
+            workflow_ref: graph.r#ref.clone(),
+            task_path: "/tasks/source".into(),
+            action_ref: leaf.r#ref.clone(),
+        }
     };
     let cached_binding = InvocationBinding::WorkflowTask {
         workflow_ref: graph.r#ref.clone(),
@@ -532,16 +551,25 @@ pub(super) async fn execution_wait(
         .filter(|grant| grant.grant().resource == attune_common::rbac::Resource::Keys)
     {
         let digest = grant_digest(grant)?;
-        let targets = policy.policy.concrete_targets[&digest]
-            .targets
-            .as_ref()
-            .unwrap();
-        assert_eq!(targets.len(), 1);
-        let target = targets.iter().next().unwrap();
-        assert_eq!(
-            (target.kind.as_str(), target.id, target.pack_id),
-            ("key", original.id, Some(pack.id))
-        );
+        match policy.policy.concrete_targets[&digest].targets.as_ref() {
+            Some(targets) => {
+                assert_eq!(targets.len(), 1);
+                let target = targets.iter().next().unwrap();
+                assert_eq!(
+                    (target.kind.as_str(), target.id, target.pack_id),
+                    ("key", original.id, Some(pack.id))
+                );
+            }
+            None => {
+                // External approval grants retain exact IDs, not component-ref
+                // selectors. They still must name this original key only.
+                assert!(grant.approval_id().is_some());
+                assert_eq!(
+                    grant.grant().constraints.as_ref().unwrap().ids.as_deref(),
+                    Some(&[original.id][..])
+                );
+            }
+        }
     }
     RuntimeAuthorityRepository::activate_policy(&mut tx, policy.id).await?;
     let attribution = RequestAttribution::Human {
@@ -551,16 +579,28 @@ pub(super) async fn execution_wait(
         },
     };
     let mut source_admission = 0;
+    let contributor_items = if let Some(queue) = &contributor_queue {
+        super::c_native_contributors::capture(
+            &mut tx,
+            queue,
+            source.id,
+            original.id,
+            weak_contributor,
+        )
+        .await?
+    } else {
+        vec![]
+    };
+    let source_attribution = if let Some(queue) = &contributor_queue {
+        super::c_native_contributors::attribution(&mut tx, queue, &contributor_items).await?
+    } else {
+        RequestAttribution::ParentExecution {
+            execution_id: root.id,
+        }
+    };
     for (execution, binding, pin, attribution) in [
         (root.id, &root_binding, &graph_pin, attribution.clone()),
-        (
-            source.id,
-            &source_binding,
-            &leaf_pin,
-            RequestAttribution::ParentExecution {
-                execution_id: root.id,
-            },
-        ),
+        (source.id, &source_binding, &leaf_pin, source_attribution),
     ] {
         let selected = policy.policy.select(
             policy.id,
@@ -599,18 +639,21 @@ pub(super) async fn execution_wait(
         fixture.requester,
     )
     .await?;
-    let contributor_items = if let Some(queue) = &contributor_queue {
-        super::c_native_contributors::capture(
-            &mut tx,
-            queue,
-            source.id,
-            original.id,
-            weak_contributor,
-        )
-        .await?
-    } else {
-        vec![]
-    };
+    // Seal once, in the original creation transaction, after every independent
+    // contributor has been recorded and before native source consumption.
+    attune_common::repositories::accepted_input::AcceptedInputRepository::seal_execution(
+        &mut tx, source.id, key,
+    )
+    .await?;
+    let source = ExecutionRepository::update(
+        &mut *tx,
+        source.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
     let original_fields = prepare_secret_values(
         vec![SecretValueInput {
             json_path: "/token".into(),
@@ -807,7 +850,39 @@ pub(super) async fn execution_wait(
     if let Some((cached, value)) = &cached {
         Inputs::bind_prepared(&mut session, "/cached", cached, value)?;
     }
-    let output_render = Inputs::evaluate(&mut tx, session).await?;
+    let output_render = Inputs::evaluate(&mut tx, session)
+        .await
+        .map_err(|error| format!("native-wait evaluate-output: {error}"))?;
+    if mixed_case {
+        assert!(
+            output_render.value() == rendered.value(),
+            "mixed output must retain the original Key-tainted wait value"
+        );
+        let paths = output_render
+            .selections()
+            .iter()
+            .map(|selection| selection.context_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            std::collections::BTreeSet::from(["/cached", "/saved"]),
+            "mixed output must retain both independently bound receipt parents"
+        );
+        assert_eq!(
+            output_render.selections().len(),
+            2,
+            "repeated cache reads must reuse their original receipt selection"
+        );
+        assert!(
+            output_render.approval_deadline().is_some(),
+            "the original contributor's finite deadline must survive composition"
+        );
+        assert_eq!(
+            output_render.approval_deadline(),
+            rendered.approval_deadline(),
+            "cache composition must not replace or extend the original wait deadline"
+        );
+    }
     let output_site = InputSite {
         execution: root.id,
         kind: InputEntityKind::ExecutionResult,

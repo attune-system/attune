@@ -18,6 +18,8 @@ members = [
 exclude = [
     "crates/core-timer-sensor",
     "vendor/utoipa-swagger-ui",
+    "vendor/sqlx-core-0.8.6",
+    "vendor/sqlx-postgres-0.8.6",
 ]
 
 [workspace.package]
@@ -135,6 +137,9 @@ serial_test = "3.4"
 dashmap = "6.1"
 
 [patch.crates-io]
+# Narrow cancellation capability patch; versions remain at 0.8.6.
+sqlx-core = { path = "vendor/sqlx-core-0.8.6" }
+sqlx-postgres = { path = "vendor/sqlx-postgres-0.8.6" }
 # Upstream Swagger still requires vulnerable zip versions. Keep its public API
 # unchanged while using the patched extractor; see vendor/utoipa-swagger-ui/ATTUNE.md.
 utoipa-swagger-ui = { path = "vendor/utoipa-swagger-ui" }

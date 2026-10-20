@@ -276,7 +276,15 @@ impl PartitionRepository {
             ));
         }
         let mut tx = bounded_transaction(pool, config).await?;
-        crate::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await?;
+        if let Err(error) = crate::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await {
+            // Admission is part of the bounded repair operation too. A busy
+            // evidence gate has the same deferral contract as a busy parent.
+            tx.rollback().await?;
+            return match error {
+                Error::Database(source) => deferred(&source).ok_or_else(|| source.into()),
+                error => Err(error),
+            };
+        }
         let row = sqlx::query_as::<_, RepairRow>(
             "SELECT outcome, rows_moved FROM native_partition_ensure_day($1, $2, $3)",
         )

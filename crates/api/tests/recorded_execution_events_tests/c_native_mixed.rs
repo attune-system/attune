@@ -46,7 +46,10 @@ async fn mixed_native_key_wait_and_retired_cache_shared_parent_expires_only_orig
                 boundary,
                 human,
             }))
-            .await?;
+            .await
+            .map_err(|error| {
+                format!("mixed-native boundary={boundary:?} human={human}: {error}")
+            })?;
         }
     }
     Ok(())

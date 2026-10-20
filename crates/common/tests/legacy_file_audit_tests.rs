@@ -256,12 +256,15 @@ async fn fixture() -> (
             .unwrap();
         }
     }
-    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,object_key,staging_done,metadata_gone,evidence_state) VALUES(9301,9302,9303,'artifacts/legacy/file',true,true,'quarantined')").execute(db.pool()).await.unwrap();
+    let mut capture = db.pool().begin().await.unwrap();
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut capture).await.unwrap();
+    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,object_key,staging_done,metadata_gone,evidence_state) VALUES(9301,9302,9303,'artifacts/legacy/file',true,true,'quarantined')").execute(&mut *capture).await.unwrap();
     sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source) VALUES(9301,'execution',9304)")
-        .execute(db.pool())
+        .execute(&mut *capture)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO file_evidence_put(attempt,owner,protocol,native_instance) VALUES($1,9301,'legacy_unknown',$2)").bind(Uuid::new_v4()).bind(Uuid::new_v4()).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO file_evidence_put(attempt,owner,protocol,native_instance) VALUES($1,9301,'legacy_unknown',$2)").bind(Uuid::new_v4()).bind(Uuid::new_v4()).execute(&mut *capture).await.unwrap();
+    capture.commit().await.unwrap();
     let scope = LegacyAuditScope {
         backend: format!("owned-fs:{}", directory.path().display()),
         staging_prefix: ".attune-upload/".into(),

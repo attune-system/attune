@@ -25,6 +25,9 @@ static NEXT_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 pub struct AppState {
     /// Database connection pool
     pub db: PgPool,
+    /// Shared max-one startup-only cancellation channel for this replica.
+    pub reclamation_cancellation:
+        Arc<attune_common::repositories::reclamation_cancellation::CancellationOwner>,
     /// JWT configuration
     pub jwt_config: Arc<JwtConfig>,
     /// CORS allowed origins
@@ -150,6 +153,8 @@ impl AppState {
                 config.artifacts.protected_file_memory_budget_bytes,
                 config.artifacts.file_transfer_concurrency,
             ),
+            reclamation_cancellation:
+                attune_common::repositories::reclamation_cancellation::CancellationOwner::new(&db),
             db,
             jwt_config: Arc::new(jwt_config),
             cors_origins,

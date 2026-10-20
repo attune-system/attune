@@ -599,7 +599,19 @@ impl AuthorizationService {
             ));
         }
         match user.claims.token_type {
-            TokenType::Access => self.load_effective_grants(identity_id).await,
+            TokenType::Access => {
+                // Grant caches cannot establish that a human is still active.
+                // Keep this fresh check out of recorded execution/sensor paths.
+                let identity = IdentityRepository::find_by_id(&self.db, identity_id)
+                    .await?
+                    .ok_or_else(|| ApiError::Unauthorized("Identity not found".into()))?;
+                if identity.frozen {
+                    return Err(ApiError::Forbidden(
+                        "Identity is frozen and cannot authorize requests".into(),
+                    ));
+                }
+                self.load_effective_grants(identity_id).await
+            }
             TokenType::Execution => {
                 let refs = execution_permission_set_refs(user);
                 let permission_sets =

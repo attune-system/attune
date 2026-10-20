@@ -3,6 +3,7 @@ use super::*;
 #[path = "../../../common/tests/native_failure_materialization_tests.rs"]
 mod fixture;
 mod prospective_result;
+mod receipt_deadline;
 mod success_recipe;
 use attune_common::repositories::{
     cache::{CacheEntryRepository, CacheTransactionMode},
@@ -493,7 +494,11 @@ async fn complete_native_result(case: fixture::NativeResultCase) {
         | NativeResultCase::FalseDecisionGeneratedSuccess
         | NativeResultCase::GeneratedWarningCandidate
         | NativeResultCase::ProspectiveResultOutput
-        | NativeResultCase::ProspectiveResultChild => {
+        | NativeResultCase::ProspectiveResultChild
+        | NativeResultCase::ProspectiveCompositeChild
+        | NativeResultCase::IndependentRecoveryChild
+        | NativeResultCase::FiniteOriginalInputChild
+        | NativeResultCase::FiniteOriginalPublicationPair => {
             unreachable!("negative case uses source-denial test")
         }
         NativeResultCase::AuthoredFalseStatus | NativeResultCase::AuthoredFalseWithControls => {

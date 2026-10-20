@@ -417,13 +417,7 @@ where
     let (sender, receiver) = mpsc::channel(1);
     let producer = tokio::spawn(async move {
         use attune_common::runtime_read_log::{decode, FRAME_BYTES};
-        let mut verifier = FrameVerifier::new(
-            &key,
-            expected.execution,
-            expected.version,
-            expected.plaintext_bytes.saturating_add(FRAME_BYTES as u64),
-            expected.ciphertext_bytes,
-        );
+        let mut verifier = FrameVerifier::for_manifest(&key, &expected);
         let mut reader = Box::pin(reader);
         let mut pending = Vec::new();
         let mut sequence = 0u64;
@@ -487,6 +481,186 @@ mod tests {
     };
     use futures::StreamExt;
     const KEY: &str = "bounded-log-decoder-key-at-least-32-bytes";
+
+    #[tokio::test]
+    async fn sealed_short_and_empty_split_frames_complete() {
+        for plaintext in [
+            [b"first".as_slice(), b"last".as_slice(), b"".as_slice()],
+            [b"".as_slice(), b"".as_slice(), b"".as_slice()],
+        ] {
+            let mut totals = FrameTotals::default();
+            let mut ciphertext = Vec::new();
+            for (sequence, bytes) in plaintext.iter().enumerate() {
+                let frame = encode(KEY, 11, 12, sequence as u64, bytes).unwrap();
+                totals.record(&frame, bytes.len()).unwrap();
+                ciphertext.extend(frame);
+            }
+            let expected = totals.manifest(11, 12).unwrap();
+            let expected =
+                FinalLogManifest::open(KEY, &expected.authenticate(KEY).unwrap()).unwrap();
+            assert_eq!(expected.frame_count, 3);
+            assert_eq!(expected.plaintext_bytes, plaintext.concat().len() as u64);
+            assert_eq!(expected.ciphertext_bytes, ciphertext.len() as u64);
+            let chunks = ciphertext
+                .chunks(7)
+                .map(|chunk| Ok::<_, io::Error>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            let stream = verified_plaintext(futures::stream::iter(chunks), KEY.into(), expected);
+            futures::pin_mut!(stream);
+            let mut decoded = Vec::new();
+            for bytes in plaintext {
+                let frame = stream
+                    .try_next()
+                    .await
+                    .unwrap()
+                    .expect("complete authenticated frame");
+                assert_eq!(frame.as_ref(), bytes);
+                decoded.extend_from_slice(&frame);
+            }
+            assert_eq!(decoded, plaintext.concat());
+            assert!(
+                stream.try_next().await.unwrap().is_none(),
+                "verified successful EOF"
+            );
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_split_frames_reject_extra_frames_and_wrong_manifest_boundaries() {
+        let mut totals = FrameTotals::default();
+        let mut ciphertext = Vec::new();
+        for (sequence, bytes) in [b"first".as_slice(), b"last".as_slice(), b"".as_slice()]
+            .iter()
+            .enumerate()
+        {
+            let frame = encode(KEY, 11, 12, sequence as u64, bytes).unwrap();
+            totals.record(&frame, bytes.len()).unwrap();
+            ciphertext.extend(frame);
+        }
+        let expected = totals.manifest(11, 12).unwrap();
+        let extra = encode(KEY, 11, 12, expected.frame_count, b"").unwrap();
+        let extended = [ciphertext.clone(), extra.clone()].concat();
+        let mut wrong_hash = expected.clone();
+        wrong_hash.ciphertext_sha256.replace_range(
+            ..1,
+            if expected.ciphertext_sha256.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        for (label, manifest, bytes) in [
+            ("extra frame", expected.clone(), extended.clone()),
+            (
+                "frame cap independent of ciphertext cap",
+                FinalLogManifest {
+                    ciphertext_bytes: extended.len() as u64,
+                    ..expected.clone()
+                },
+                extended.clone(),
+            ),
+            (
+                "hash after permitted extra empty frame",
+                FinalLogManifest {
+                    frame_count: expected.frame_count + 1,
+                    ciphertext_bytes: extended.len() as u64,
+                    ..expected.clone()
+                },
+                extended,
+            ),
+            (
+                "reduced frame count",
+                FinalLogManifest {
+                    frame_count: 2,
+                    ..expected.clone()
+                },
+                ciphertext.clone(),
+            ),
+            (
+                "reduced plaintext cap",
+                FinalLogManifest {
+                    plaintext_bytes: expected.plaintext_bytes - 1,
+                    ..expected.clone()
+                },
+                ciphertext.clone(),
+            ),
+            (
+                "missing plaintext byte",
+                FinalLogManifest {
+                    plaintext_bytes: expected.plaintext_bytes + 1,
+                    ..expected.clone()
+                },
+                ciphertext.clone(),
+            ),
+            (
+                "reduced ciphertext cap",
+                FinalLogManifest {
+                    ciphertext_bytes: expected.ciphertext_bytes - 1,
+                    ..expected.clone()
+                },
+                ciphertext.clone(),
+            ),
+            (
+                "missing ciphertext byte",
+                FinalLogManifest {
+                    ciphertext_bytes: expected.ciphertext_bytes + 1,
+                    ..expected.clone()
+                },
+                ciphertext.clone(),
+            ),
+            ("wrong ciphertext hash", wrong_hash, ciphertext.clone()),
+        ] {
+            let manifest =
+                FinalLogManifest::open(KEY, &manifest.authenticate(KEY).unwrap()).unwrap();
+            let chunks = bytes
+                .chunks(7)
+                .map(|chunk| Ok::<_, io::Error>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            let stream = verified_plaintext(futures::stream::iter(chunks), KEY.into(), manifest);
+            futures::pin_mut!(stream);
+            let mut delivered = 0;
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(_)) => delivered += 1,
+                    Ok(None) => panic!("{label} must not produce successful EOF"),
+                    Err(_) => break,
+                }
+            }
+            let expected_delivered = match label {
+                "reduced frame count" | "reduced ciphertext cap" => 2,
+                "reduced plaintext cap" => 1,
+                "hash after permitted extra empty frame" => 4,
+                _ => 3,
+            };
+            assert_eq!(
+                delivered, expected_delivered,
+                "wrong rejection boundary: {label}"
+            );
+            assert!(
+                stream.next().await.is_none(),
+                "error terminates delivery: {label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_zero_frame_manifest_rejects_nonempty_ciphertext() {
+        let empty = FrameTotals::default().manifest(11, 12).unwrap();
+        let empty = FinalLogManifest::open(KEY, &empty.authenticate(KEY).unwrap()).unwrap();
+        assert_eq!(empty.frame_count, 0);
+        assert_eq!(empty.plaintext_bytes, 0);
+        assert_eq!(empty.ciphertext_bytes, 0);
+        let ciphertext = encode(KEY, 11, 12, 0, b"").unwrap();
+        let chunks = ciphertext
+            .chunks(7)
+            .map(|chunk| Ok::<_, io::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        let stream = verified_plaintext(futures::stream::iter(chunks), KEY.into(), empty);
+        futures::pin_mut!(stream);
+        assert!(stream.try_next().await.is_err());
+        assert!(stream.next().await.is_none());
+    }
 
     #[tokio::test]
     async fn sealed_log_larger_than_the_old_finite_cap_completes_with_bounded_frames() {

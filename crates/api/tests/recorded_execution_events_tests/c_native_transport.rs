@@ -15,7 +15,7 @@ use futures::TryStreamExt;
 use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum Checkpoint {
     Head,
     Chunk,
@@ -35,7 +35,7 @@ pub(super) enum Checkpoint {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum Boundary {
     Head,
     Chunk,
@@ -121,6 +121,24 @@ async fn native_cache_original_deadline_after_http_head_chunk_and_eof_waits() ->
         super::c_native_cache::cache_http_case(true, 30, Some(at)).await?;
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn native_cache_download_eof_original_deadline() -> Result<()> {
+    super::c_native_cache::cache_http_case(true, 30, Some(Checkpoint::DownloadEof)).await
+}
+
+#[tokio::test]
+async fn native_cache_download_eof_frozen_reader() -> Result<()> {
+    super::c_native_cache::cache_http_case(
+        false,
+        3600,
+        Some(Checkpoint::Human(
+            super::c_native_human_transport::Change::Freeze,
+            Boundary::DownloadEof,
+        )),
+    )
+    .await
 }
 
 /// Issue an independent fixed reader approval against the actual native
@@ -244,6 +262,28 @@ async fn next_nonempty(body: &mut axum::body::BodyDataStream) -> Result<Option<a
     Ok(None)
 }
 
+async fn next_transport_event(body: &mut axum::body::BodyDataStream) -> Result<String> {
+    // Original source deadlines can be thirty seconds away. The ordinary
+    // ten-second event helper would cancel the held reader before expiry.
+    tokio::time::timeout(Duration::from_secs(50), async {
+        loop {
+            let bytes = next_nonempty(body)
+                .await?
+                .ok_or("native stream ended before its handoff event")?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            if text.contains("event: content")
+                || text.contains("event: append")
+                || text.contains("event: done")
+                || text.contains("event: error")
+                || text.starts_with("data:")
+            {
+                return Ok(text);
+            }
+        }
+    })
+    .await?
+}
+
 pub(super) async fn exercise(
     fixture: &mut Fixture,
     execution: Id,
@@ -252,6 +292,10 @@ pub(super) async fn exercise(
     source_deadline: Option<chrono::DateTime<chrono::Utc>>,
     at: Checkpoint,
 ) -> Result<()> {
+    let source_expiry_status = source_deadline.map(|_| match at {
+        Checkpoint::OriginalContributor { .. } | Checkpoint::Mixed { .. } => StatusCode::FORBIDDEN,
+        _ => StatusCode::CONFLICT,
+    });
     let (at, human_change) = match at {
         Checkpoint::Human(change, boundary) => (boundary.checkpoint(), Some(change)),
         Checkpoint::OriginalContributor {
@@ -288,6 +332,12 @@ pub(super) async fn exercise(
     .await?;
     log.append(fixture, b"native-transport-prefix").await?;
     log.append(fixture, b"native-unyielded-frame").await?;
+    let eof = matches!(at, Checkpoint::Eof | Checkpoint::DownloadEof);
+    if eof {
+        // A real authenticated empty append lets both data frames reach the
+        // reader before pausing the decoder's final underlying EOF.
+        log.append(fixture, b"").await?;
+    }
     log.seal(fixture).await?;
     assert_eq!(
         ExecutionRepository::find_by_id(&fixture.ctx.pool, execution)
@@ -374,7 +424,7 @@ pub(super) async fn exercise(
             execution,
             &token,
             deadline,
-            source_deadline.is_some(),
+            source_expiry_status,
             human.as_ref(),
         )
         .await?;
@@ -423,19 +473,19 @@ pub(super) async fn exercise(
         // Never poll a successful HEAD Body to obtain an authorization check.
         drop(response);
     } else {
-        let eof = matches!(at, Checkpoint::Eof | Checkpoint::DownloadEof);
         let download_body = matches!(at, Checkpoint::DownloadChunk | Checkpoint::DownloadEof);
         let stream = LogStreamRepository::find_by_artifact_version(&fixture.ctx.pool, log.version)
             .await?
             .unwrap();
         assert_eq!(
-            stream.next_sequence, 3,
-            "two data appends and the real worker terminal frame"
+            stream.next_sequence,
+            if eof { 6 } else { 4 },
+            "each authenticated frame is split across two object segments"
         );
         let segment = LogStreamRepository::find_segment_by_sequence(
             &fixture.ctx.pool,
             stream.id,
-            if eof { stream.next_sequence - 1 } else { 1 },
+            if eof { stream.next_sequence - 1 } else { 2 },
         )
         .await?
         .unwrap();
@@ -494,15 +544,20 @@ pub(super) async fn exercise(
                 // unyielded plaintext chunk, or an error completes this poll.
                 next_nonempty(&mut body).await.is_err()
             } else {
-                let event = super::live_streams::next_data(&mut body).await.unwrap();
-                event.contains("event: error")
-                    && !event.contains("native-unyielded-frame")
-                    && !event.contains("event: done")
+                match next_transport_event(&mut body).await {
+                    Ok(event) => {
+                        event.contains("event: error")
+                            && !event.contains("native-unyielded-frame")
+                            && !event.contains("event: done")
+                    }
+                    Err(_) => false,
+                }
             }
         });
         let _cancel = Cancel(pending.abort_handle());
         tokio::time::timeout(Duration::from_secs(5), arrived.acquire())
-            .await??
+            .await
+            .map_err(|_| format!("{at:?}: decoder did not reach the selected object segment; body poll finished={}", pending.is_finished()))??
             .forget();
         assert!(
             !pending.is_finished(),

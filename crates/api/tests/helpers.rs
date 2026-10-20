@@ -510,6 +510,11 @@ impl TestContext {
             .file_transfers
             .drain(std::time::Duration::from_secs(1))
             .await;
+        let cancellation_shutdown = self
+            .state
+            .reclamation_cancellation
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
         if let Some(writer) = self.audit_writer.take() {
             writer
                 .shutdown()
@@ -520,12 +525,15 @@ impl TestContext {
             database.cleanup().await?;
         }
         remove_owned_pack_tree(&self.test_packs_dir)?;
+        cancellation_shutdown?;
         Ok(())
     }
 }
 
 impl Drop for TestContext {
     fn drop(&mut self) {
+        // Recovery signal only; explicit cleanup above is the joined proof.
+        self.state.reclamation_cancellation.begin_shutdown();
         // Drop router-held emitter clones before joining the dedicated writer.
         self.app = axum::Router::new();
         if let Some(writer) = self.audit_writer.take() {

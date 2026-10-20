@@ -1596,6 +1596,7 @@ impl PackChecker {
 
     fn workflow_error(&mut self, file: &str, error: crate::workflow::parser::ParseError) {
         let metadata_path = match &error {
+            crate::workflow::parser::ParseError::InvalidTaskReference(_) => Some("/tasks".into()),
             crate::workflow::parser::ParseError::InvalidField { field, .. }
                 if field.starts_with('/') =>
             {
@@ -1747,6 +1748,31 @@ mod tests {
         let path = root.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn invalid_workflow_transition_identifies_the_authored_tasks_field() {
+        let root = TempDir::new().unwrap();
+        write(root.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
+        write(
+            root.path(),
+            "actions/run.yaml",
+            "ref: demo.run\nrunner_type: native\nentry_point: run\n",
+        );
+        let workflow_path = "actions/workflows/broken.workflow.yaml";
+        write(root.path(), workflow_path, "version: '1.0'\ntasks:\n  - name: bad\n    action: demo.run\n    next:\n      - do: [absent_task]\n");
+        let report = check_pack(root.path());
+        assert!(!report.valid);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "workflow.invalid_definition"
+                    && diagnostic.path.as_deref() == Some(workflow_path)
+                    && diagnostic.metadata_path.as_deref() == Some("/tasks")
+                    && diagnostic.message.contains("absent_task")
+            }),
+            "{:?}",
+            report.diagnostics
+        );
     }
 
     #[test]
