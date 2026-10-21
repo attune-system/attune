@@ -963,8 +963,11 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
         let _ = ctx.get(&path, ctx.token()).await?.bytes().await?;
         // Driver enum metadata is connection-local. Exercise pool churn so the
         // application-query gate cannot accidentally depend on warmed sockets.
-        let mut post_churn_pool = None;
         if retained == 100 {
+            // Finish the warm-up request's background audit work before closing
+            // sockets, so it cannot warm replacement connections outside the
+            // measured request subscriber.
+            ctx.flush_audit().await?;
             let mut parked = Vec::new();
             for _ in 0..ctx.pool.size() {
                 parked.push(ctx.pool.acquire().await?);
@@ -972,17 +975,9 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
             for connection in parked {
                 connection.close().await?;
             }
-            post_churn_pool = Some((ctx.pool.size(), ctx.pool.num_idle()));
         }
         let (sample, body) = measure(&ctx, &path).await?;
         if retained == 100 {
-            if sample.queries.driver_metadata_reads() == 0 {
-                // Temporary investigation counts only, never SQL or bind values.
-                eprintln!(
-                    "[DEBUG-seven-query] post_churn_pool={post_churn_pool:?} categories={:?}",
-                    sample.queries.statement_categories
-                );
-            }
             assert!(
                 sample.queries.driver_metadata_reads() > 0,
                 "Fresh-connection regression did not exercise SQLx type discovery"
