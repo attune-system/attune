@@ -146,11 +146,12 @@ impl PreparedNativeIteration {
                                     source.value(),
                                 )?;
                             } else {
-                                Inputs::bind_public_field(
+                                Inputs::bind_public_field_with_key(
                                     conn,
                                     &mut session,
                                     context_path,
                                     &field.site,
+                                    key,
                                 )
                                 .await?;
                             }

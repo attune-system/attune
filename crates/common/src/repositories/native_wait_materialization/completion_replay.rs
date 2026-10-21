@@ -12,6 +12,7 @@ pub struct PreparedNativeWaitCompletionReplay {
     fields: Vec<StoredSecretValue>,
     schema: super::super::schema_contract::ActionSchemaBinding,
     released: ReleasedWaitInput,
+    root_released: Option<ReleasedWaitInput>,
     receipts: Vec<ReceiptContext>,
     sources: Vec<super::super::native_input_snapshot::NativeSourceEvidence>,
     fence: ApprovalEffectFence,
@@ -19,6 +20,7 @@ pub struct PreparedNativeWaitCompletionReplay {
     original_release: (Id, String),
     completed: Vec<Execution>,
     applied: bool,
+    progress_only: bool,
 }
 impl NativeWaitCompletionReplayRepository {
     pub async fn prepare(
@@ -97,8 +99,8 @@ impl NativeWaitCompletionReplayRepository {
             if let Some(output) = source.wait_completion() {
                 if output.execution() == parent.id && output.workflow() == workflow.id {
                     if selected.is_some()
-                        || output.original_wait() != wait.id
-                        || output.original_task_name() != wait.task_name
+                        || (output.original_wait() == wait.id
+                            && output.original_task_name() != wait.task_name)
                         || output.original_output_contract() != &schema
                         || parent.result.as_ref() != Some(&crate::secret_values::redaction_marker())
                     {
@@ -128,6 +130,7 @@ impl NativeWaitCompletionReplayRepository {
                         output.original_snapshot(),
                         output.original_task_path().to_owned(),
                         output.original_release_transaction().to_owned(),
+                        output.original_wait(),
                     ));
                 }
             }
@@ -136,21 +139,50 @@ impl NativeWaitCompletionReplayRepository {
             }
             sources.push(source);
         }
-        let (snapshot, original, _path, original_tx) = selected.ok_or_else(denied)?;
-        let released = Snapshots::prepare_completed_wait_observation(conn, root, key).await?;
-        if released.outcome_binding()?.snapshot != original {
+        let (snapshot, original, _path, original_tx, final_wait) = selected.ok_or_else(denied)?;
+        let final_observation =
+            Snapshots::prepare_completed_wait_observation(conn, root, key).await?;
+        if final_observation.outcome_binding()?.snapshot != original {
             return Err(denied());
         }
         let output_release:(Id,Id,Id,Id,Id,String)=sqlx::query_as("SELECT snapshot,execution,workflow,wait,original_snapshot,release_transaction FROM runtime_native_wait_completion_release WHERE snapshot=$1")
             .bind(snapshot).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
         if output_release.1 != parent.id
             || output_release.2 != workflow.id
-            || output_release.3 != wait.id
+            || output_release.3 != final_wait
             || output_release.4 != original
         {
             return Err(denied());
         }
-        let original_release = (original, original_tx);
+        let progress_only = final_wait != wait.id;
+        let (released, root_released, original_release) = if progress_only {
+            if workflow.current_tasks.contains(&wait.task_name)
+                || workflow.completed_tasks.contains(&wait.task_name)
+                || !matches!(
+                    wait.state,
+                    WorkflowTaskWaitState::Failed | WorkflowTaskWaitState::TimedOut
+                )
+            {
+                return Err(denied());
+            }
+            let earlier =
+                Snapshots::prepare_completed_wait_observation_for(conn, root, wait.id, key).await?;
+            let earlier_release: (Id, String) = sqlx::query_as(
+                "SELECT snapshot,release_transaction FROM runtime_native_wait_release WHERE wait=$1",
+            )
+            .bind(wait.id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(denied)?;
+            if earlier_release.0 != earlier.outcome_binding()?.snapshot
+                || earlier_release.1.is_empty()
+            {
+                return Err(denied());
+            }
+            (earlier, Some(final_observation), earlier_release)
+        } else {
+            (final_observation, None, (original, original_tx))
+        };
         let replay = PreparedNativeWaitCompletionReplay {
             parent,
             workflow,
@@ -158,6 +190,7 @@ impl NativeWaitCompletionReplayRepository {
             fields,
             schema,
             released,
+            root_released,
             receipts,
             sources,
             fence,
@@ -165,6 +198,7 @@ impl NativeWaitCompletionReplayRepository {
             original_release,
             completed: vec![],
             applied: false,
+            progress_only,
         };
         replay.ensure_sources_on(conn).await?;
         Ok(Some(replay))
@@ -183,6 +217,9 @@ impl PreparedNativeWaitCompletionReplay {
     async fn ensure_sources_on(&self, conn: &mut PgConnection) -> Result<()> {
         self.fence.ensure_fresh_on(conn).await?;
         self.released.ensure_fresh_on(conn).await?;
+        if let Some(root) = &self.root_released {
+            root.ensure_fresh_on(conn).await?;
+        }
         for receipt in &self.receipts {
             receipt.ensure_fresh_on(conn).await?;
         }
@@ -204,6 +241,9 @@ impl PreparedNativeWaitCompletionReplay {
     fn source_fresh(&self) -> Result<()> {
         self.fence.ensure_fresh()?;
         self.released.ensure_fresh()?;
+        if let Some(root) = &self.root_released {
+            root.ensure_fresh()?;
+        }
         for receipt in &self.receipts {
             receipt.ensure_fresh()?;
         }
@@ -243,7 +283,9 @@ impl PreparedNativeWaitCompletionReplay {
             return Err(denied());
         }
         self.ensure_sources_on(conn).await?;
-        self.completed.push(self.parent.clone());
+        if !self.progress_only {
+            self.completed.push(self.parent.clone());
+        }
         self.applied = true;
         Ok(vec![])
     }

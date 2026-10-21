@@ -26,7 +26,7 @@ pub(crate) async fn prepare_observation(
     key: &str,
 ) -> Result<(Vec<StoredSecretValue>, Vec<ReceiptContext>)> {
     let fields = validate_accepted(conn, source, schema, key).await?;
-    let (ordinary, receipts) = super::immutable_input_origin::prepare_input_receipts(
+    let (ordinary, mut receipts) = super::immutable_input_origin::prepare_input_receipts(
         conn,
         ENTITY_EXECUTION_CONFIG,
         source.id,
@@ -37,6 +37,7 @@ pub(crate) async fn prepare_observation(
     if !ordinary.is_empty() {
         return Err(denied());
     }
+    receipts.extend(AcceptedInputRepository::prepare_input_controls(conn, source.id, key).await?);
     super::immutable_input_origin::bind_input_receipt_buffers(
         conn,
         ENTITY_EXECUTION_CONFIG,

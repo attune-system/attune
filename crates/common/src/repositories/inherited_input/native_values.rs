@@ -1,4 +1,4 @@
-//! Finite native VALUE recipes have their own proof discriminator. They cannot
+//! Finite native recipes have their own proof discriminator. They cannot
 //! be replayed as literals, accepted inputs or fabricated authored declarations.
 use super::super::native_failure_materialization::PreparedNativeFailure;
 use super::super::native_input_snapshot::{
@@ -17,6 +17,10 @@ pub(super) enum NativeValueRecipe {
     WaitCompletion {
         snapshot: Id,
     },
+    WaitInputControl {
+        snapshot: Id,
+        task_path: String,
+    },
     OrdinarySuccess {
         snapshot: Id,
     },
@@ -34,9 +38,16 @@ impl NativeValueRecipe {
         match self {
             Self::EmptyRoot { snapshot } => *snapshot,
             Self::WaitCompletion { snapshot } => *snapshot,
+            Self::WaitInputControl { snapshot, .. } => *snapshot,
             Self::OrdinarySuccess { snapshot } => *snapshot,
             Self::OrdinaryFailure { snapshot } => *snapshot,
             Self::ResultShorthand { snapshot, .. } => *snapshot,
+        }
+    }
+    pub(super) fn source_path(&self) -> &str {
+        match self {
+            Self::WaitInputControl { task_path, .. } => task_path,
+            _ => "$native/value",
         }
     }
 }
@@ -338,6 +349,23 @@ pub(super) async fn validate_recipe(
     plaintext: Option<(&Value, &str)>,
     pending: bool,
 ) -> Result<()> {
+    if let NativeValueRecipe::WaitInputControl {
+        snapshot,
+        task_path,
+    } = recipe
+    {
+        return Snapshots::validate_wait_input_control_recipe(
+            conn,
+            renderer.id,
+            *snapshot,
+            task_path,
+            site,
+            selections,
+            plaintext,
+            pending,
+        )
+        .await;
+    }
     if let NativeValueRecipe::ResultShorthand {
         snapshot,
         directive_path,
@@ -475,5 +503,23 @@ mod tests {
         )
         .is_err());
         assert!(serde_json::from_value::<NativeValueRecipe>(json!({"recipe":"result_shorthand","snapshot":1,"directive_path":"/workflow/tasks/0/publish/0","firing_control":null,"expression":"{{ arbitrary() }}"})).is_err());
+        assert!(serde_json::from_value::<NativeValueRecipe>(json!({"recipe":"wait_input_control","snapshot":1,"task_path":"/workflow/tasks/0","value":{"wait":2}})).is_err());
+    }
+    #[test]
+    fn wait_input_control_uses_the_owning_task_source_path() {
+        let recipe: NativeValueRecipe = serde_json::from_value(json!({
+            "recipe": "wait_input_control", "snapshot": 1,
+            "task_path": "/workflow/tasks/0"
+        }))
+        .unwrap();
+        assert_eq!(recipe.snapshot(), 1);
+        assert_eq!(recipe.source_path(), "/workflow/tasks/0");
+        assert_eq!(
+            serde_json::to_value(recipe).unwrap(),
+            json!({
+                "recipe": "wait_input_control", "snapshot": 1,
+                "task_path": "/workflow/tasks/0"
+            })
+        );
     }
 }

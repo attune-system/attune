@@ -13,7 +13,7 @@ use super::{
     native_input_snapshot::{
         NativeInputSnapshotRepository as Snapshots, PreparedWaitInput, ReleasedWaitInput,
     },
-    native_transition_materialization::{prepare_sources, Sources},
+    native_transition_materialization::Sources,
     native_workflow_materialization::{
         check_bounds, collect_leaves, contains_template, expression_names,
     },
@@ -51,10 +51,12 @@ pub use completion_replay::{
     NativeWaitCompletionReplayRepository, PreparedNativeWaitCompletionReplay,
 };
 mod staged;
+mod task_sources;
 pub use continuation::{NativeWaitContinuationRepository, PreparedNativeWaitContinuation};
 pub use initial::{
     InitialWaitApply, NativeInitialWaitMaterializationRepository, PreparedNativeInitialWait,
 };
+use task_sources::prepare_sources;
 
 #[expect(
     clippy::large_enum_variant,
@@ -66,6 +68,22 @@ enum Observation {
     Prospective(super::native_input_snapshot::PreparedWaitRegistration),
 }
 impl Observation {
+    async fn prepare_child_control(
+        &self,
+        conn: &mut PgConnection,
+        child: &Execution,
+        key: &str,
+    ) -> Result<super::inherited_input::PreparedWaitInputControl> {
+        let (binding, reads) = match self {
+            Self::Pending(wait) => (wait.outcome_binding()?, wait.issued_reads()?),
+            Self::Released(wait) => (wait.outcome_binding()?, Vec::new()),
+            Self::Prospective(registration) => {
+                let wait = registration.prepared_input().ok_or_else(denied)?;
+                (wait.outcome_binding()?, wait.issued_reads()?)
+            }
+        };
+        Inputs::prepare_wait_input_control(conn, binding, reads, child, key).await
+    }
     fn bind(&self, session: &mut super::inherited_input::RenderSession) -> Result<()> {
         match self {
             Self::Pending(wait) => Inputs::bind_prepared_wait_input(session, wait),
@@ -105,6 +123,8 @@ struct Child {
     value: Value,
     fields: Vec<Field>,
     defaults: Vec<SecretPathSource>,
+    control: Option<super::inherited_input::PreparedWaitInputControl>,
+    inherited: Vec<super::inherited_input::PreparedInputSource>,
 }
 pub struct PreparedNativeWait {
     context: Context,
@@ -179,7 +199,8 @@ impl Context {
                 if let Some(source) = &field.source {
                     Inputs::bind_prepared(&mut session, slot, source, source.value())?;
                 } else {
-                    Inputs::bind_public_field(conn, &mut session, slot, &field.site).await?;
+                    Inputs::bind_public_field_with_key(conn, &mut session, slot, &field.site, key)
+                        .await?;
                 }
             }
         }
@@ -337,7 +358,7 @@ impl NativeWaitMaterializationRepository {
             .ok_or_else(denied)?;
         let revision = crate::value_schema::digest(&serde_json::to_value(&snapshot.executable)?)
             .map_err(|_| denied())?;
-        let sources = prepare_sources(conn, &parent, None, &workflow, key)
+        let sources = prepare_sources(conn, &parent, &task, &workflow, key)
             .await?
             .ok_or_else(denied)?;
         let declarations = Declarations::bindings(conn, parent.id)
@@ -626,6 +647,8 @@ impl NativeWaitMaterializationRepository {
                 value,
                 fields,
                 defaults,
+                control: None,
+                inherited: Vec::new(),
             })
         };
         let original_secrets = Secrets::find_stored_by_entity(

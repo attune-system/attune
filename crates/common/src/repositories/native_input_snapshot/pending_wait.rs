@@ -115,7 +115,9 @@ impl IssuedWaitRead {
         let Source::Wait(source) = &body.source else {
             return Err(denied());
         };
-        if !in_task(&body.task_path, declaration_path) {
+        if !in_task(&body.task_path, declaration_path)
+            && !wait_control_path(&body.task_path, declaration_path, context_path)
+        {
             return Err(denied());
         }
         let outcome = ["succeeded", "failed", "timed_out", "cancelled"]
@@ -126,7 +128,8 @@ impl IssuedWaitRead {
                 return Err(denied());
             }
             native_wait_outcome_values(source)?;
-        } else if context_path != source.context_path
+        } else if !wait_control_path(&body.task_path, declaration_path, context_path)
+            && context_path != source.context_path
             && !context_path
                 .strip_prefix(&source.context_path)
                 .is_some_and(|suffix| suffix.starts_with('/'))
@@ -156,11 +159,31 @@ impl IssuedWaitRead {
         fence.ensure_fresh_on(conn).await?;
         validate_wait_value(conn, snapshot, source, &value, key).await?;
         Ok(SnapshotEvidence {
+            public_sources: Vec::new(),
             fence,
             origins: source.origins.clone(),
             parents: source.parents.clone(),
             metadata: metadata(snapshot, &body),
             bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_control_uses_only_its_exact_wait_task() {
+        let task = "/workflow/tasks/2";
+        assert!(wait_control_path(task, task, "$control"));
+        assert!(!in_task(task, task));
+        assert!(!wait_control_path(task, task, "/result"));
+        assert!(!wait_control_path(task, "/workflow/tasks/3", "$control"));
+        assert!(!wait_control_path(
+            task,
+            "/workflow/tasks/2/input",
+            "$control"
+        ));
     }
 }

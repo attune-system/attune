@@ -26,7 +26,9 @@ pub use iteration_control::PreparedIterationControl;
 mod native_result_view;
 mod native_values;
 mod wait_completion;
+mod wait_control;
 pub use wait_completion::PreparedNativeWaitCompletionDestination;
+pub(crate) use wait_control::PreparedWaitInputControl;
 mod success_metadata;
 pub use success_metadata::PreparedNativeSuccessDestination;
 mod pending_result;
@@ -106,6 +108,12 @@ pub enum SelectionSource {
     Control {
         receipt: Id,
         site: InputSite,
+    },
+    PublicControl {
+        receipt: Id,
+        site: InputSite,
+        source_site: InputSite,
+        admission: Id,
     },
     NativeOutcome {
         admission: Id,
@@ -1174,6 +1182,19 @@ impl InheritedInputRepository {
                         });
                     }
                 }
+                SelectionSource::PublicControl {
+                    receipt: source,
+                    site,
+                    source_site,
+                    admission,
+                } => {
+                    check_public_control_sites(&site, &source_site)?;
+                    if selected.context_path != "$control" || source >= receipt {
+                        return Err(denied());
+                    }
+                    receipts.insert(source);
+                    direct.insert(admission);
+                }
                 SelectionSource::PublicParameter { site, admission } => {
                     direct.insert(admission);
                     origins.push(SecretOrigin::Entity {
@@ -1426,15 +1447,93 @@ impl InheritedInputRepository {
         Ok(())
     }
 
-    /// Public fields still come from their actual typed persisted entity. Secret
-    /// values use prepare_source/bind_prepared instead. This covers task/result
-    /// namespaces and variable aliases without accepting caller-asserted values.
+    /// Keyless public reads reject any source with accepted input controls.
     pub async fn bind_public_field(
         conn: &mut PgConnection,
         session: &mut RenderSession,
         context_path: &str,
         site: &InputSite,
     ) -> Result<()> {
+        require_transaction(conn, &session.transaction).await?;
+        super::accepted_input::AcceptedInputRepository::require_no_input_controls(
+            conn,
+            site.execution,
+        )
+        .await?;
+        Self::bind_public_field_value(conn, session, context_path, site)
+            .await
+            .map(|_| ())
+    }
+
+    /// Carry the producer's controls even if this public value is not selected.
+    pub async fn bind_public_field_with_key(
+        conn: &mut PgConnection,
+        session: &mut RenderSession,
+        context_path: &str,
+        site: &InputSite,
+        key: &str,
+    ) -> Result<()> {
+        require_transaction(conn, &session.transaction).await?;
+        let admission = RuntimeAuthorityRepository::execution_admission(conn, site.execution)
+            .await?
+            .ok_or_else(denied)?
+            .id;
+        let controls =
+            super::accepted_input::AcceptedInputRepository::prepare_public_source_controls(
+                conn,
+                site.execution,
+                key,
+            )
+            .await?;
+        for control in controls {
+            if control.transaction != session.transaction {
+                return Err(denied());
+            }
+            let owner_fence = validate_public_control_source(
+                conn,
+                session.permit.source.id,
+                control.id,
+                &control.site,
+                site,
+                admission,
+            )
+            .await?;
+            control.ensure_fresh_on(conn).await?;
+            session.fence = session
+                .fence
+                .intersect(&owner_fence)
+                .intersect(&control.fence);
+            merge_wait_reads(&mut session.wait_reads, &control.wait_reads)?;
+            merge_result_reads(&mut session.result_reads, &control.result_reads)?;
+            merge_empty_reads(&mut session.empty_reads, &control.empty_reads)?;
+            let selected = ReadSelection {
+                context_path: "$control".into(),
+                source: SelectionSource::PublicControl {
+                    receipt: control.id,
+                    site: control.site.clone(),
+                    source_site: site.clone(),
+                    admission,
+                },
+            };
+            if !session.controls.contains(&selected) {
+                session.controls.push(selected);
+            }
+            if session.controls.len() > 256 {
+                return Err(denied());
+            }
+        }
+        Self::bind_public_field_value(conn, session, context_path, site)
+            .await
+            .map(|_| ())
+    }
+
+    // Only the guarded entry points above may load a public value.
+    async fn bind_public_field_value(
+        conn: &mut PgConnection,
+        session: &mut RenderSession,
+        context_path: &str,
+        site: &InputSite,
+    ) -> Result<Id> {
         require_transaction(conn, &session.transaction).await?;
         if site.purpose != InputSitePurpose::Value || protected_namespace(context_path) {
             return Err(denied());
@@ -1464,7 +1563,8 @@ impl InheritedInputRepository {
                 site: site.clone(),
                 admission: source.id,
             },
-        )
+        )?;
+        Ok(source.id)
     }
     /// Independent, explicit consent for ONE retained declaration. This issues a
     /// fixed approval using the issuer's control-plane authority, not the selected
@@ -2003,26 +2103,29 @@ impl InheritedInputRepository {
         session: &mut RenderSession,
         path: &str,
     ) -> Result<()> {
-        require_transaction(conn, &session.transaction).await?;
         let site = InputSite {
             execution: session.permit.source.owner_id,
             kind: InputEntityKind::ExecutionConfig,
             purpose: InputSitePurpose::Value,
             path: path.into(),
         };
-        let (raw, secrets) = stored_field(conn, &site).await?.ok_or_else(denied)?;
-        public_schema_site(conn, &site, &raw).await?;
-        let raw = raw.pointer(&site.path).cloned().ok_or_else(denied)?;
-        if !secrets.is_empty() || !crate::secret_values::redacted_paths(&raw).is_empty() {
-            return Err(denied());
-        }
-        let admission = session.permit.source.id;
-        insert(
-            session,
-            format!("/parameters{path}"),
-            raw,
-            SelectionSource::PublicParameter { site, admission },
-        )
+        Self::bind_public_field(conn, session, &format!("/parameters{path}"), &site).await
+    }
+
+    pub async fn bind_public_parameter_with_key(
+        conn: &mut PgConnection,
+        session: &mut RenderSession,
+        path: &str,
+        key: &str,
+    ) -> Result<()> {
+        let site = InputSite {
+            execution: session.permit.source.owner_id,
+            kind: InputEntityKind::ExecutionConfig,
+            purpose: InputSitePurpose::Value,
+            path: path.into(),
+        };
+        Self::bind_public_field_with_key(conn, session, &format!("/parameters{path}"), &site, key)
+            .await
     }
 
     /// The original exact typed field receipt is validated, not a whole-execution
@@ -2789,7 +2892,12 @@ impl InheritedInputRepository {
                         .as_ref()
                         .is_some_and(|native| native.snapshot() == *snapshot)
                     {
-                        "$native/value".into()
+                        rendered
+                            .native
+                            .as_ref()
+                            .ok_or_else(denied)?
+                            .source_path()
+                            .into()
                     } else {
                         let literal = rendered.literal.as_ref().ok_or_else(denied)?;
                         if selected.context_path != "$control"
@@ -2852,6 +2960,11 @@ impl InheritedInputRepository {
                         return Err(denied());
                     }
                     fence = fence.intersect(&evidence.fence);
+                    for site in &evidence.public_sources {
+                        if !public_sources.contains(site) {
+                            public_sources.push(site.clone());
+                        }
+                    }
                     graph_accounting.push(Some(std::sync::Arc::new(ReceiptGraphAccounting {
                         bytes: evidence.bytes,
                         nodes: BTreeSet::from([(true, *snapshot)]),
@@ -2959,7 +3072,29 @@ impl InheritedInputRepository {
                 SelectionSource::Authored { origins, .. } => origins.clone(),
                 SelectionSource::Inherited { receipt, site }
                 | SelectionSource::Control { receipt, site }
+                | SelectionSource::PublicControl { receipt, site, .. }
                 | SelectionSource::Iteration { receipt, site, .. } => {
+                    if let SelectionSource::PublicControl {
+                        source_site,
+                        admission,
+                        ..
+                    } = &selected.source
+                    {
+                        if selected.context_path != "$control" {
+                            return Err(denied());
+                        }
+                        fence = fence.intersect(
+                            &validate_public_control_source(
+                                conn,
+                                rendered.renderer.id,
+                                *receipt,
+                                site,
+                                source_site,
+                                *admission,
+                            )
+                            .await?,
+                        );
+                    }
                     let proof = SecretOrigin::Entity {
                         entity_type: site.kind.origin_kind(site.purpose),
                         entity_id: *receipt,
@@ -3243,7 +3378,8 @@ impl InheritedInputRepository {
             let admission = match &source.source {
                 SelectionSource::NativeOutcome { admission, .. }
                 | SelectionSource::System { admission, .. }
-                | SelectionSource::PublicParameter { admission, .. } => Some(*admission),
+                | SelectionSource::PublicParameter { admission, .. }
+                | SelectionSource::PublicControl { admission, .. } => Some(*admission),
                 _ => None,
             };
             if let Some(admission) = admission {
@@ -3251,6 +3387,7 @@ impl InheritedInputRepository {
             }
             if let SelectionSource::Inherited { receipt, .. }
             | SelectionSource::Control { receipt, .. }
+            | SelectionSource::PublicControl { receipt, .. }
             | SelectionSource::Iteration { receipt, .. } = &source.source
             {
                 if *receipt >= id {
@@ -3704,7 +3841,7 @@ impl InheritedInputRepository {
                                     .native
                                     .as_ref()
                                     .filter(|native| native.snapshot() == snapshot)
-                                    .map(|_| "$native/value")
+                                    .map(NativeValueRecipe::source_path)
                             })
                             .or(empty_literal)
                             .ok_or_else(denied)?;
@@ -3768,6 +3905,11 @@ impl InheritedInputRepository {
                             return Err(denied());
                         }
                         fence = Some(fence.ok_or_else(denied)?.intersect(&evidence.fence));
+                        for site in &evidence.public_sources {
+                            if !public_sources.contains(site) {
+                                public_sources.push(site.clone());
+                            }
+                        }
                         if snapshot_seen.insert(snapshot) {
                             bytes += evidence.bytes;
                             charges.insert(ReceiptGraphCharge::Snapshot(snapshot), evidence.bytes);
@@ -4000,6 +4142,29 @@ impl InheritedInputRepository {
                         }
                         expected_sources.insert(receipt);
                         pending.push((receipt, Some(source_site)));
+                    }
+                    SelectionSource::PublicControl {
+                        receipt,
+                        site: root_site,
+                        source_site,
+                        admission,
+                    } => {
+                        if selected.context_path != "$control" || receipt >= id {
+                            return Err(denied());
+                        }
+                        let deadline = validate_public_control_source(
+                            conn,
+                            renderer,
+                            receipt,
+                            &root_site,
+                            &source_site,
+                            admission,
+                        )
+                        .await?;
+                        fence = Some(fence.ok_or_else(denied)?.intersect(&deadline));
+                        expected_admissions.insert(admission);
+                        expected_sources.insert(receipt);
+                        pending.push((receipt, Some(root_site)));
                     }
                     SelectionSource::PublicParameter {
                         site: source_site,
@@ -4857,6 +5022,54 @@ fn literal_site(path: &str) -> bool {
         _ => false,
     }
 }
+fn check_public_control_sites(root: &InputSite, source: &InputSite) -> Result<()> {
+    check_site(root)?;
+    check_site(source)?;
+    if root.kind != InputEntityKind::ExecutionConfig
+        || root.purpose != InputSitePurpose::Control
+        || !root.path.is_empty()
+        || root.execution != source.execution
+        || source.purpose != InputSitePurpose::Value
+    {
+        return Err(denied());
+    }
+    Ok(())
+}
+
+// Reverse lineage applies only to the same producer's public RESULT dependency.
+// These are retained identities, not live field rows or current human grants.
+async fn validate_public_control_source(
+    conn: &mut PgConnection,
+    renderer: Id,
+    receipt: Id,
+    root: &InputSite,
+    source: &InputSite,
+    admission: Id,
+) -> Result<ApprovalEffectFence> {
+    check_public_control_sites(root, source)?;
+    let record = RuntimeAuthorityRepository::require_retained_admission(conn, admission).await?;
+    let actual: Option<(Id, String, String, String, Id)> = sqlx::query_as(
+        "SELECT execution,entity_kind,destination_purpose,destination_path,destination_admission FROM runtime_input_receipt WHERE id=$1",
+    ).bind(receipt).fetch_optional(&mut *conn).await?;
+    if record.owner_kind != "execution"
+        || record.owner_id != source.execution
+        || actual
+            != Some((
+                root.execution,
+                root.kind.as_str().into(),
+                root.purpose.as_str().into(),
+                root.path.clone(),
+                admission,
+            ))
+        || (!related(conn, admission, renderer).await?
+            && !(source.kind == InputEntityKind::ExecutionResult
+                && related(conn, renderer, admission).await?))
+    {
+        return Err(denied());
+    }
+    RuntimeAuthorityRepository::retained_admission_fence(conn, admission).await
+}
+
 async fn related(conn: &mut PgConnection, ancestor: Id, descendant: Id) -> Result<bool> {
     if ancestor == descendant {
         return Ok(true);

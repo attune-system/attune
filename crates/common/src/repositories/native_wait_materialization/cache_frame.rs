@@ -203,7 +203,7 @@ impl Frame {
                     .ok_or_else(denied)?,
                 variables: variables.clone(),
                 fields: fields.to_vec(),
-                wait: serde_json::to_value(wait)?,
+                wait: business_wait(&wait)?,
                 release_transaction,
             })
             .map_err(|_| denied())?;
@@ -358,7 +358,7 @@ impl NativeCacheRenderFrame for Frame {
         let mut expected_fields = expected.fields.clone();
         fields.sort_by(|a, b| a.json_path.cmp(&b.json_path));
         expected_fields.sort_by(|a, b| a.json_path.cmp(&b.json_path));
-        if serde_json::to_value(wait)? != expected.wait
+        if business_wait(&wait)? != expected.wait
             || workflow.variables != expected.variables
             || fields != expected_fields
         {
@@ -366,6 +366,23 @@ impl NativeCacheRenderFrame for Frame {
         }
         Ok(())
     }
+}
+
+// A delivery acknowledgement is protocol metadata, not a new observed outcome.
+// The row timestamp also changes when that marker is acknowledged. All business
+// fields, including source/target identity, state and result, stay exact.
+fn business_wait(wait: &WorkflowTaskWait) -> Result<Value> {
+    Ok(without_delivery_marker(serde_json::to_value(wait)?))
+}
+
+fn without_delivery_marker(mut value: Value) -> Value {
+    if let Some(row) = value.as_object_mut() {
+        row.remove("updated");
+    }
+    if let Some(result) = value.get_mut("result").and_then(Value::as_object_mut) {
+        result.remove("_delivery_complete");
+    }
+    value
 }
 
 fn earliest_held(
@@ -379,6 +396,15 @@ fn earliest_held(
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+    #[test]
+    fn acknowledgement_does_not_change_business_observation() {
+        let original = serde_json::json!({"id":1,"state":"failed","result":{"status":"failed","error":"original"}});
+        let mut acknowledged = original.clone();
+        acknowledged["result"]["_delivery_complete"] = serde_json::json!(true);
+        assert_eq!(without_delivery_marker(acknowledged.clone()), original);
+        acknowledged["result"]["error"] = serde_json::json!("changed");
+        assert_ne!(without_delivery_marker(acknowledged), original);
+    }
     #[test]
     fn independent_controls_and_sources_bound_no_child_frames() {
         let early = chrono::DateTime::from_timestamp(40, 0).unwrap();

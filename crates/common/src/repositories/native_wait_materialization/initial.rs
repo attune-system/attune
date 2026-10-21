@@ -130,7 +130,7 @@ impl NativeInitialWaitMaterializationRepository {
             .map_err(|_| denied())?;
         let task = task.clone();
         let key = key.ok_or_else(denied)?;
-        let sources = prepare_sources(conn, &parent, None, &workflow, key)
+        let sources = prepare_sources(conn, &parent, &task, &workflow, key)
             .await?
             .ok_or_else(denied)?;
         let declarations = Declarations::bindings(conn, parent.id)

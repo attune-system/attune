@@ -45,7 +45,7 @@ impl DeclaredInputMaterializationRepository {
                 execution,
             )
             .await?;
-        let (ordinary, receipts) = super::immutable_input_origin::prepare_input_receipts(
+        let (ordinary, mut receipts) = super::immutable_input_origin::prepare_input_receipts(
             conn,
             crate::secret_values::ENTITY_EXECUTION_CONFIG,
             execution,
@@ -53,6 +53,14 @@ impl DeclaredInputMaterializationRepository {
             encryption_key,
         )
         .await?;
+        receipts.extend(
+            super::accepted_input::AcceptedInputRepository::prepare_input_controls(
+                conn,
+                execution,
+                encryption_key,
+            )
+            .await?,
+        );
         crate::key_access::authorize_execution_parameter_key_origins_with_conn(
             conn, execution, None, &ordinary,
         )

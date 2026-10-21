@@ -820,9 +820,11 @@ async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
 
     sqlx::raw_sql(
         r#"
+        CREATE SEQUENCE pack_delete_commit_probe;
         CREATE FUNCTION reject_pack_delete_commit() RETURNS trigger AS $$
         BEGIN
             IF OLD.ref = 'delete_commit_failure' THEN
+                PERFORM nextval('pack_delete_commit_probe');
                 RAISE EXCEPTION 'injected pack delete commit failure';
             END IF;
             RETURN OLD;
@@ -841,13 +843,23 @@ async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
     let response = ctx
         .delete("/api/v1/packs/delete_commit_failure", ctx.token())
         .await?;
-    assert!(!response.status().is_success());
+    let response = response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     let error: serde_json::Value = response.json().await?;
-    assert!(
-        error
-            .to_string()
-            .contains("injected pack delete commit failure"),
-        "deletion error did not contain the expected fixed diagnostic"
+    assert_eq!(
+        error,
+        json!({"error":"Database operation temporarily unavailable; please retry", "code":"RETRYABLE_DATABASE_ERROR"})
+    );
+    // Sequence advancement survives rollback. This proves the deferred COMMIT
+    // trigger actually ran, without weakening conservative commit classification
+    // or exposing raw database diagnostics in the public response.
+    let probe: (i64, bool) =
+        sqlx::query_as("SELECT last_value,is_called FROM pack_delete_commit_probe")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(
+        probe,
+        (1, true),
+        "must exercise exactly the deferred commit failure"
     );
     assert!(PackRepository::find_by_ref(&ctx.pool, &pack.r#ref)
         .await?

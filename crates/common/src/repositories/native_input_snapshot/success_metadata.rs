@@ -513,6 +513,22 @@ impl NativeInputSnapshotRepository {
                 }
             }
         }
+        for control in
+            super::super::accepted_input::AcceptedInputRepository::prepare_input_controls(
+                conn,
+                state.execution(),
+                key,
+            )
+            .await?
+        {
+            fence = fence.intersect(control.accepted_fence());
+            let edge =
+                InheritedInputRepository::receipt_source_site(conn, &control.origin()).await?;
+            if !edges.contains(&edge) {
+                edges.push(edge);
+                held.push(control);
+            }
+        }
         let (_, root_contributors) =
             super::super::accepted_input::AcceptedInputRepository::source_contributors(
                 conn,

@@ -152,7 +152,7 @@ impl NativeWorkflowMaterializationRepository {
                         )?;
                     }
                     for path in &public_parameters {
-                        Inputs::bind_public_field(
+                        Inputs::bind_public_field_with_key(
                             conn,
                             &mut session,
                             &format!("/parameters{path}"),
@@ -162,6 +162,7 @@ impl NativeWorkflowMaterializationRepository {
                                 purpose: InputSitePurpose::Value,
                                 path: path.clone(),
                             },
+                            key,
                         )
                         .await?;
                     }

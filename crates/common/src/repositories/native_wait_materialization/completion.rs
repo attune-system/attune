@@ -7,6 +7,63 @@ use super::super::{
 use super::*;
 use std::sync::Arc;
 
+/// Liveness only. The current Wait's authenticated observation remains the
+/// sole failure VALUE source. Other task names do not grant authority.
+pub(super) async fn can_finish_root(
+    conn: &mut PgConnection,
+    context: &Context,
+    wait: Id,
+) -> Result<bool> {
+    let task = context
+        .task
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(denied)?;
+    no_other_work(conn, &context.workflow, task, wait).await
+}
+
+async fn no_other_work(
+    conn: &mut PgConnection,
+    workflow: &WorkflowExecution,
+    task: &str,
+    wait: Id,
+) -> Result<bool> {
+    if wait <= 0
+        || workflow.current_tasks.iter().any(|name| name != task)
+        || workflow.completed_tasks.iter().any(|name| name == task)
+        || workflow.failed_tasks.iter().any(|name| name == task)
+    {
+        return Ok(false);
+    }
+    let mut applied = workflow.completed_tasks.clone();
+    applied.extend(workflow.failed_tasks.iter().cloned());
+    applied.push(task.into());
+    // Match the scheduler's running-child policy. A terminal wait which is
+    // already represented in the projected task lists is applied bookkeeping,
+    // even if its post-commit delivery marker has not yet been written.
+    sqlx::query_scalar(
+        "SELECT NOT (EXISTS (
+            SELECT 1 FROM execution
+            WHERE workflow_task->>'workflow_execution' = $1::bigint::text
+              AND status::text NOT IN ('completed','failed','timeout','cancelled')
+              AND COALESCE(workflow_task->>'task_name','') <> ALL($2::text[])
+        ) OR EXISTS (
+            SELECT 1 FROM workflow_task_wait
+            WHERE workflow_execution=$1 AND id<>$3
+              AND (state::text='waiting'
+                OR (state::text IN ('failed','timed_out')
+                  AND (result->>'_delivery_complete') IS DISTINCT FROM 'true'
+                  AND task_name <> ALL($2::text[])))
+        ))",
+    )
+    .bind(workflow.id)
+    .bind(&applied)
+    .bind(wait)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(Into::into)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitCompletionOutcome {
     Failed,
@@ -52,8 +109,22 @@ impl PreparedNativeWaitCompletion {
         frame: Arc<cache_frame::Frame>,
         key: &str,
     ) -> Result<Self> {
+        let task = context
+            .task
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(denied)?;
         if !program.successors.is_empty()
-            || !context.workflow.failed_tasks.is_empty()
+            || context
+                .workflow
+                .failed_tasks
+                .iter()
+                .any(|name| name == task)
+            || context
+                .workflow
+                .completed_tasks
+                .iter()
+                .any(|name| name == task)
             || context
                 .workflow
                 .current_tasks
@@ -71,6 +142,9 @@ impl PreparedNativeWaitCompletion {
                 .outcome_binding()?,
         };
         let (wait, snapshot) = frame.source_identity();
+        if !can_finish_root(conn, context, wait).await? {
+            return Err(denied());
+        }
         let renderer = Authority::execution_admission(conn, context.parent.id)
             .await?
             .ok_or_else(denied)?
@@ -216,6 +290,11 @@ impl PreparedNativeWaitCompletion {
                 .as_ref()
                 != Some(&self.contract)
         {
+            return Err(denied());
+        }
+        // Recheck liveness under the writer's original-row guard. This does
+        // not reopen protected sources or reconstruct an approval.
+        if !no_other_work(conn, &self.workflow, &self.task, self.wait).await? {
             return Err(denied());
         }
         Ok(())

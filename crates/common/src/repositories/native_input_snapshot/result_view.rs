@@ -351,6 +351,19 @@ impl NativeInputSnapshotRepository {
                 return Err(denied());
             }
         }
+        for control in
+            super::super::accepted_input::AcceptedInputRepository::prepare_public_source_controls(
+                conn, child, key,
+            )
+            .await?
+        {
+            fence = fence.intersect(control.accepted_fence());
+            let parent =
+                InheritedInputRepository::receipt_source_site(conn, &control.origin()).await?;
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
         let contributors = if ordinary.is_empty() {
             vec![]
         } else {
@@ -686,20 +699,63 @@ fn schema_sources(
         })
         .collect()
 }
-pub(super) fn context_path(source: &ResultViewSource, path: &str) -> bool {
-    let name = source.task_name.replace('~', "~0").replace('/', "~1");
+fn selection_path<'a>(task: &str, path: &'a str) -> Option<&'a str> {
+    let name = task.replace('~', "~0").replace('/', "~1");
     [
         "/result".to_owned(),
         format!("/task/{name}"),
         format!("/tasks/{name}"),
     ]
     .iter()
-    .any(|prefix| {
-        path == prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|suffix| suffix.starts_with('/'))
+    .find_map(|prefix| {
+        path.strip_prefix(prefix)
+            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
     })
+}
+
+fn mapped_source_path(mappings: &[NativeResultPointerMapping], selected: &str) -> Option<String> {
+    let mapping = mappings
+        .iter()
+        .filter(|mapping| covers(&mapping.view, selected))
+        .max_by_key(|mapping| mapping.view.len())?;
+    Some(if mapping.decoded.is_some() {
+        // Decoded JSON still came from the original stdout field.
+        mapping.source.clone()
+    } else {
+        format!(
+            "{}{}",
+            mapping.source,
+            selected.strip_prefix(&mapping.view)?
+        )
+    })
+}
+
+/// Introspection only, derived from the already authenticated projection.
+/// Never turn a protected field or a view alias into a public source assertion.
+pub(super) fn public_selection_sites(
+    source: &ResultViewSource,
+    path: &str,
+) -> Result<Vec<InputSite>> {
+    let selected = selection_path(&source.task_name, path).ok_or_else(denied)?;
+    let actual = mapped_source_path(&source.mappings, selected).ok_or_else(denied)?;
+    if source.raw.pointer(&actual).is_none()
+        || source
+            .fields
+            .iter()
+            .any(|field| covers(&field.json_path, &actual) || covers(&actual, &field.json_path))
+    {
+        return Ok(Vec::new());
+    }
+    Ok(vec![InputSite {
+        execution: source.execution,
+        kind: super::super::inherited_input::InputEntityKind::ExecutionResult,
+        purpose: InputSitePurpose::Value,
+        path: actual,
+    }])
+}
+
+pub(super) fn context_path(source: &ResultViewSource, path: &str) -> bool {
+    selection_path(&source.task_name, path).is_some()
 }
 pub(super) async fn validate_value(
     conn: &mut PgConnection,
@@ -885,6 +941,40 @@ fn project(raw: &Value) -> Result<(Value, Vec<NativeResultPointerMapping>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn public_selection_keeps_original_pointer_when_aliases_collide() {
+        let (_, mappings) = super::project(&serde_json::json!({
+            "collision":"actual", "data":{"collision":"not selected", "nested":{"leaf":1}}
+        }))
+        .unwrap();
+        assert_eq!(
+            super::mapped_source_path(&mappings, "/collision"),
+            Some("/collision".into())
+        );
+        assert_eq!(
+            super::mapped_source_path(&mappings, "/nested/leaf"),
+            Some("/data/nested/leaf".into())
+        );
+        assert_eq!(
+            super::selection_path("source", "/task/source/collision"),
+            Some("/collision")
+        );
+        assert_eq!(
+            super::selection_path("source", "/task/source_other/collision"),
+            None
+        );
+    }
+
+    #[test]
+    fn decoded_public_selection_refers_to_stdout_not_a_fabricated_raw_field() {
+        let (_, mappings) =
+            super::project(&serde_json::json!({"stdout":"{\"nested\":{\"leaf\":1}}"})).unwrap();
+        assert_eq!(
+            super::mapped_source_path(&mappings, "/nested/leaf"),
+            Some("/stdout".into())
+        );
+    }
+
     #[test]
     fn legacy_publish_gate_matches_the_actual_parser_success_normalization() {
         let raw = serde_json::json!({"name":"source","action":"fixture.leaf","publish":["whole"],"next":[]});

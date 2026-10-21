@@ -178,7 +178,8 @@ impl Context {
                 if let Some(source) = &field.source {
                     Inputs::bind_prepared(&mut session, slot, source, source.value())?;
                 } else {
-                    Inputs::bind_public_field(conn, &mut session, slot, &field.site).await?;
+                    Inputs::bind_public_field_with_key(conn, &mut session, slot, &field.site, key)
+                        .await?;
                 }
             }
         }

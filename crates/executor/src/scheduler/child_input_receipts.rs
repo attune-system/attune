@@ -232,15 +232,17 @@ impl TransactionInputReceipts {
 /// Pending DTOs remain plain, cloneable transport data, never proof owners.
 pub(super) struct PreparedWorkflowInputPublications {
     inputs: TransactionInputReceipts,
+    waits: Vec<std::sync::Arc<NativeWaitCheckpoint>>,
 }
 
-/// Cloneable transport bookkeeping only. IDs are NOT credentials or proofs.
+/// Transport bookkeeping and opaque frame custody. Message IDs are not proofs.
 /// There is intentionally no owning IntoIterator or generic Extend impl:
 /// recursive merges must use extend(Self), which preserves deferred owner IDs.
 #[derive(Debug, Clone, Default)]
 pub(super) struct WorkflowPublications {
     messages: Vec<PendingExecutionRequested>,
     input_owners: std::collections::BTreeSet<i64>,
+    waits: Vec<std::sync::Arc<NativeWaitCheckpoint>>,
 }
 
 impl WorkflowPublications {
@@ -256,6 +258,11 @@ impl WorkflowPublications {
     pub(super) fn extend(&mut self, other: Self) {
         self.input_owners.extend(other.input_owners);
         self.messages.extend(other.messages);
+        self.waits.extend(other.waits);
+    }
+
+    pub(super) fn retain_wait(&mut self, wait: NativeWaitCheckpoint) {
+        self.waits.push(std::sync::Arc::new(wait));
     }
 
     pub(super) fn owner_ids(&self) -> impl Iterator<Item = i64> + '_ {
@@ -373,18 +380,30 @@ impl PreparedWorkflowInputPublications {
                 .retain_existing(conn, &execution, encryption_key)
                 .await?;
         }
-        Ok(Self { inputs })
+        Ok(Self {
+            inputs,
+            waits: pending.waits.clone(),
+        })
     }
 
     pub(super) async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
+        for wait in &self.waits {
+            wait.ensure_fresh_on(conn).await?;
+        }
         self.inputs.ensure_fresh_on(conn).await
     }
 
     pub(super) fn ensure_fresh(&self) -> Result<()> {
+        for wait in &self.waits {
+            wait.ensure_fresh()?;
+        }
         self.inputs.ensure_fresh()
     }
 
     pub(super) fn ensure_child_fresh(&self, execution: i64) -> Result<()> {
+        for wait in &self.waits {
+            wait.ensure_fresh()?;
+        }
         self.inputs.ensure_execution_fresh(execution)
     }
 

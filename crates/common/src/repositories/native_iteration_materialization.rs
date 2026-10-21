@@ -293,7 +293,8 @@ impl Context {
                 if let Some(source) = &field.source {
                     Inputs::bind_prepared(&mut session, path, source, source.value())?;
                 } else {
-                    Inputs::bind_public_field(conn, &mut session, path, &field.site).await?;
+                    Inputs::bind_public_field_with_key(conn, &mut session, path, &field.site, key)
+                        .await?;
                 }
             }
         }

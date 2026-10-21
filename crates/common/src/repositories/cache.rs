@@ -2320,6 +2320,13 @@ impl CacheGenerationRepository {
             .ok_or_else(|| {
                 Error::validation("cache cleanup budget exceeds monotonic clock range")
             })?;
+        // Business work keeps the full original deadline. Only protocol drain
+        // and rollback may use the explicitly bounded acknowledgement grace.
+        let acknowledgement_deadline = deadline
+            .checked_add(std::time::Duration::from_millis(500))
+            .ok_or_else(|| {
+                Error::validation("cache cleanup acknowledgement exceeds monotonic clock range")
+            })?;
         let remaining_ms = || {
             u64::try_from(
                 deadline
@@ -2368,26 +2375,32 @@ impl CacheGenerationRepository {
             sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)")
                 .bind(format!("{remaining}ms")).execute(&mut *tx).await?;
             let admission_started = std::time::Instant::now();
-            let admission = async {
-                super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await?;
-                lock_cache_admission(&mut tx).await
-            }.await;
+            // Reuse graph/cache preflight, but leave parent protection to the
+            // short DDL phase below rather than acquiring it during admission.
+            let admission = CacheEntryRepository::acquire_reclamation_gates(&mut tx, deadline, false).await;
             tracing::info!(component="cache_storage", operation="cleanup_admission",
-                status=if admission.is_ok() { "admitted" } else { "failed" },
+                status=match &admission { Ok(true) => "admitted", Ok(false) => "deferred_deadline", Err(_) => "failed" },
                 duration_ms=u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 remaining_cycle_ms=remaining_ms(), "Cache cleanup admission completed");
-            if let Err(error) = admission {
-                let code = match &error {
-                    Error::Database(database) => database.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned()),
-                    _ => None,
-                };
+            let admitted = match admission {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    let code = match &error {
+                        Error::Database(database) => database.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned()),
+                        _ => None,
+                    };
+                    tx.rollback().await?;
+                    // Either timer expiring here exhausts the cycle, not the short
+                    // DDL lock budget. SQLSTATE 55P03 can win the two-timer race.
+                    return match code.as_deref() {
+                        Some("55P03" | "57014") => Ok(CacheGenerationCleanupOutcome::DeferredDeadline),
+                        _ => Err(error),
+                    };
+                }
+            };
+            if !admitted {
                 tx.rollback().await?;
-                // Either timer expiring here exhausts the cycle, not the short
-                // DDL lock budget. SQLSTATE 55P03 can win the two-timer race.
-                return match code.as_deref() {
-                    Some("55P03" | "57014") => Ok(CacheGenerationCleanupOutcome::DeferredDeadline),
-                    _ => Err(error),
-                };
+                return Ok(CacheGenerationCleanupOutcome::DeferredDeadline);
             }
             phase = "ddl";
             let remaining = remaining_ms();
@@ -2453,9 +2466,18 @@ impl CacheGenerationRepository {
                 Err(error)
             }
             Err(_) => {
-                // Dropping the SQL future alone is not server cancellation.
-                // Server-side phase timers bound pending SQL; also discard the
-                // socket so no waiter/rollback is handed to another pool user.
+                // timeout_at has dropped the business future and its managed
+                // transactions. Retain this exact connection until their queued
+                // responses/rollbacks and an explicit root rollback are drained.
+                // No admission, DDL, commit or other business SQL runs here.
+                let acknowledgement = acknowledge_cleanup_rollback(
+                    lease.0.as_mut().expect("owned cleanup connection"),
+                    acknowledgement_deadline,
+                )
+                .await;
+                // Even acknowledged recovery never returns an uncertain driver
+                // transaction/session state to the pool. Drop also remains the
+                // socket-discard fallback if the caller cancels this recovery.
                 drop(lease);
                 if phase == "commit" {
                     tracing::error!(
@@ -2468,6 +2490,15 @@ impl CacheGenerationRepository {
                     Err(Error::invalid_state(
                         "cache cleanup commit outcome is unconfirmed after cycle deadline",
                     ))
+                } else if let Err(error) = acknowledgement {
+                    tracing::error!(
+                        component = "cache_storage",
+                        operation = "cleanup",
+                        phase,
+                        status = "rollback_unacknowledged",
+                        "Cache cleanup rollback was not acknowledged within its completion bound"
+                    );
+                    Err(error)
                 } else {
                     tracing::info!(
                         component = "cache_storage",
@@ -2480,6 +2511,42 @@ impl CacheGenerationRepository {
                 }
             }
         }
+    }
+}
+
+/// Recover only after the business future and its managed transactions dropped.
+/// The pinned SQLx flush consumes pending responses but may first return the
+/// interrupted statement's timeout error. A successful explicit ROLLBACK execute
+/// then consumes its CommandComplete and ReadyForQuery on this same connection.
+/// Driver transaction depth, a socket close, or cancellation-channel EOF cannot
+/// substitute for this acknowledgement. The caller always discards the lease.
+async fn acknowledge_cleanup_rollback(
+    connection: &mut sqlx::PgConnection,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    match tokio::time::timeout_at(deadline, async {
+        loop {
+            match sqlx::Connection::flush(&mut *connection).await {
+                Ok(()) => break,
+                Err(error)
+                    if error
+                        .as_database_error()
+                        .and_then(|error| error.code())
+                        .is_some_and(|code| matches!(code.as_ref(), "55P03" | "57014")) => {}
+                Err(error) => return Err(Error::from(error)),
+            }
+        }
+        // Do not infer server idleness from SQLx's depth after queued Drop
+        // rollbacks, including a BEGIN whose acknowledgement was interrupted.
+        sqlx::query("ROLLBACK").execute(&mut *connection).await?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::invalid_state(
+            "cache cleanup rollback acknowledgement exceeded its completion deadline",
+        )),
     }
 }
 
@@ -2814,7 +2881,8 @@ impl CacheEntryRepository {
             let transaction = sqlx::Transaction::begin(connection, None).await?;
             let mut transaction = ReclamationTransaction::new(transaction, guard);
             let admitted =
-                Self::acquire_reclamation_gates(transaction.transaction_mut(), deadline).await;
+                Self::acquire_reclamation_gates(transaction.transaction_mut(), deadline, true)
+                    .await;
             match admitted {
                 Ok(true) => Ok(CacheReclamationAdmission::Acquired(transaction)),
                 Ok(false) => {
@@ -2851,9 +2919,12 @@ impl CacheEntryRepository {
         }
     }
 
+    // Cleanup defers its exclusive parent lock to its separately timed DDL phase.
+    // Fresh pack-deletion entry also retains read protection before source locks.
     async fn acquire_reclamation_gates(
         transaction: &mut sqlx::Transaction<'_, Postgres>,
         deadline: tokio::time::Instant,
+        protect_parent: bool,
     ) -> Result<bool> {
         let original_timeouts: (String, String, i64, i64) = sqlx::query_as(
             "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
@@ -2917,9 +2988,11 @@ impl CacheEntryRepository {
                 ).await? {
                     return Ok(false);
                 }
-                // Cache acquisition here is reentrant and cannot wait. Parent
-                // protection still follows admission and precedes all source rows.
-                Self::protect_transaction(&mut attempt, CacheTransactionMode::PinMutation).await?;
+                if protect_parent {
+                    // Cache acquisition here is reentrant and cannot wait. Parent
+                    // protection still follows admission and precedes all source rows.
+                    Self::protect_transaction(&mut attempt, CacheTransactionMode::PinMutation).await?;
+                }
                 if tokio::time::Instant::now() >= deadline {
                     return Ok(false);
                 }

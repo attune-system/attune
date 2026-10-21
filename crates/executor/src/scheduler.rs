@@ -739,6 +739,15 @@ enum NativeWaitCheckpoint {
         attune_common::repositories::native_wait_materialization::PreparedNativeWaitContinuation,
     ),
 }
+impl std::fmt::Debug for NativeWaitCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeWaitCheckpoint")
+            .field("workflow", &self.workflow())
+            .field("wait", &self.terminal_wait())
+            .finish_non_exhaustive()
+    }
+}
 impl NativeWaitCheckpoint {
     async fn prepare(
         conn: &mut PgConnection,
@@ -2433,6 +2442,7 @@ impl ExecutionScheduler {
             parent_execution,
             *workflow_execution_id,
             &task_node.name,
+            None,
         )
         .await?;
         pending_messages.extend(outcome.execution_requests);
@@ -4562,13 +4572,14 @@ impl ExecutionScheduler {
 
     async fn advance_resolved_task_wait_with_conn(
         conn: &mut PgConnection,
-        round_robin_counter: &AtomicUsize,
+        _round_robin_counter: &AtomicUsize,
         encryption_key: Option<&str>,
         parent_execution: &Execution,
         workflow_execution_id: i64,
         task_name: &str,
+        prepared: Option<NativeWaitCheckpoint>,
     ) -> Result<WorkflowAdvanceOutcome> {
-        let Some(wait) = WorkflowTaskWaitRepository::find_by_workflow_task_for_update(
+        let Some(wait) = WorkflowTaskWaitRepository::find_by_workflow_task(
             &mut *conn,
             workflow_execution_id,
             task_name,
@@ -4587,7 +4598,7 @@ impl ExecutionScheduler {
         }
 
         let workflow_execution =
-            WorkflowExecutionRepository::find_by_id_for_update(&mut *conn, workflow_execution_id)
+            WorkflowExecutionRepository::find_by_id(&mut *conn, workflow_execution_id)
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!("Workflow execution {workflow_execution_id} not found")
@@ -4604,50 +4615,55 @@ impl ExecutionScheduler {
             return Ok(WorkflowAdvanceOutcome::default());
         }
 
+        anyhow::ensure!(
+            workflow_execution.execution == parent_execution.id,
+            "Wait workflow owner differs"
+        );
+        let key = encryption_key
+            .ok_or_else(|| anyhow::anyhow!("Wait input encryption is unavailable"))?;
+        let mut plan = prepared.ok_or_else(|| {
+            anyhow::anyhow!("Terminal wait requires a source-first authenticated continuation")
+        })?;
+        anyhow::ensure!(
+            plan.workflow() == workflow_execution_id && plan.terminal_wait() == Some(wait.id),
+            "Prepared wait continuation differs from its target",
+        );
+        let children = plan
+            .apply(conn, key)
+            .await
+            .map_err(|error| error.context("Terminal wait application"))?;
         WorkflowTaskWaitRepository::mark_terminal_delivery_complete(&mut *conn, wait.id).await?;
-
-        let mut logical_outcome = parent_execution.clone();
-        logical_outcome.id = -wait.id;
-        logical_outcome.action = None;
-        logical_outcome.action_ref = "system.task_wait".to_string();
-        logical_outcome.status = if wait.state == WorkflowTaskWaitState::TimedOut {
-            ExecutionStatus::Timeout
-        } else if wait
-            .result
-            .as_ref()
-            .and_then(|result| result.get("status"))
-            .and_then(JsonValue::as_str)
-            == Some("cancelled")
-        {
-            ExecutionStatus::Cancelled
-        } else {
-            ExecutionStatus::Failed
-        };
-        logical_outcome.result = wait.result.clone();
-        logical_outcome.workflow_task = Some(WorkflowTaskMetadata {
-            workflow_execution: workflow_execution_id,
-            task_name: task_name.to_string(),
-            triggered_by: None,
-            task_index: None,
-            task_batch: None,
-            retry_count: 0,
-            max_retries: 0,
-            next_retry_at: None,
-            timeout_seconds: None,
-            timed_out: wait.state == WorkflowTaskWaitState::TimedOut,
-            duration_ms: None,
-            started_at: None,
-            completed_at: Some(Utc::now()),
-        });
-
-        Self::advance_workflow_serialized(
-            conn,
-            round_robin_counter,
-            encryption_key,
-            &logical_outcome,
-            &SchedulerMetadataCaches::new(),
-        )
-        .await
+        plan.ensure_fresh_on(conn)
+            .await
+            .map_err(|error| error.context("Terminal wait custody after acknowledgement"))?;
+        let mut outcome = WorkflowAdvanceOutcome::default();
+        for child in children {
+            let action = child
+                .action
+                .ok_or_else(|| anyhow::anyhow!("Wait recovery action is unavailable"))?;
+            outcome.execution_requests.push(
+                PreparedWorkflowInputPublications::prepare_pending_data(
+                    &child,
+                    action,
+                    &child.action_ref,
+                    parent_execution,
+                )?,
+            );
+        }
+        for completed in plan.completions() {
+            outcome.completed_children.push(PendingExecutionCompleted {
+                execution_id: completed.id,
+                action_id: completed
+                    .action
+                    .ok_or_else(|| anyhow::anyhow!("Wait completion action is unavailable"))?,
+                action_ref: completed.action_ref.clone(),
+                status: completed.status,
+                result: completed.result.clone(),
+                completed_at: completed.updated,
+            });
+        }
+        outcome.execution_requests.retain_wait(plan);
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7010,6 +7026,7 @@ impl ExecutionScheduler {
                 &parent_execution,
                 workflow_execution.id,
                 &wait.task_name,
+                None,
             )
             .await?;
             pending_messages.extend(outcome.execution_requests);
@@ -9243,6 +9260,7 @@ impl ExecutionScheduler {
                     &parent_execution,
                     workflow_execution_id,
                     &terminal_task,
+                    None,
                 ))
                 .await?;
                 pending_messages.extend(outcome.execution_requests);
@@ -11441,6 +11459,21 @@ tasks:
                 .begin()
                 .await
                 .expect("begin terminal wait advancement");
+            let wait = WorkflowTaskWaitRepository::find_by_workflow_task(
+                &mut *transaction,
+                self.workflow_execution_id,
+                task_name,
+            )
+            .await
+            .expect("load terminal wait")
+            .expect("terminal wait exists");
+            let prepared = NativeWaitCheckpoint::prepare(
+                &mut transaction,
+                &wait,
+                Some(INQUIRY_SCHEDULER_INPUT_KEY),
+            )
+            .await
+            .expect("prepare terminal wait before workflow locks");
             let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
                 &mut transaction,
                 &AtomicUsize::new(0),
@@ -11448,6 +11481,7 @@ tasks:
                 &self.parent,
                 self.workflow_execution_id,
                 task_name,
+                prepared,
             )
             .await
             .expect("advance terminal task wait");
@@ -11487,48 +11521,93 @@ tasks:
     async fn empty_workflow_child_input_uses_empty_map_for_absent_parent_config() {
         let fixture = InquirySchedulerFixture::create().await;
         let pool = fixture.database.pool();
-        let mut task = fixture.guarded_task.clone();
-        task.input = serde_json::json!({});
-        let snapshot = ExecutionScheduler::workflow_task_snapshot(
-            pool,
-            &fixture.parent,
-            task.action.as_deref().unwrap(),
-            &task.name,
-        )
-        .await
-        .unwrap();
-        let mut tx = pool.begin().await.unwrap();
-        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::workflow_child_binding(
-            &mut tx, fixture.parent.id, &snapshot).await.unwrap();
-        let mut parent = fixture.parent.clone();
-        parent.config = None;
-        let absent = ExecutionScheduler::render_workflow_task_input(
-            &parent,
-            &JsonValue::Null,
-            &task,
-            &binding,
-            &fixture.context,
-        );
-        parent.config = Some(JsonValue::Null);
-        let explicit_null = ExecutionScheduler::render_workflow_task_input(
-            &parent,
-            &JsonValue::Null,
-            &task,
-            &binding,
-            &fixture.context,
-        );
-        tx.rollback().await.unwrap();
+        let task = &fixture.guarded_task;
+        let mut results = Vec::new();
+        for explicit_null in [false, true] {
+            let mut tx = pool.begin().await.unwrap();
+            let result: Result<()> = async {
+                CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+                    .await?;
+                attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+                    .await?;
+                anyhow::ensure!(task.input == serde_json::json!({}), "use the actual authored empty input");
+                let (child, binding) =
+                    create_uninitialized_inquiry_fixture_child(&mut tx, &fixture, task).await?;
+                // These are renderer arguments only. Neither the sealed root nor
+                // the accepted request child is changed in the database.
+                let mut renderer_parent = fixture.parent.clone();
+                renderer_parent.config = if explicit_null { Some(JsonValue::Null) } else { None };
+                let rendered = ExecutionScheduler::render_workflow_task_input(
+                    &renderer_parent,
+                    &JsonValue::Null,
+                    task,
+                    &binding,
+                    &fixture.context,
+                )?;
+                let expected = if explicit_null { JsonValue::Null } else { serde_json::json!({}) };
+                anyhow::ensure!(rendered.supplied == expected, "renderer must preserve absence versus explicit null");
+                anyhow::ensure!(rendered.value == expected, "managed rendering must defer schema acceptance");
+                let contract = attune_common::value_schema::CompiledContract::new(&binding.input)?;
+                contract.validate(&serde_json::json!({}))?;
+                let null_error = match contract.validate(&JsonValue::Null) {
+                    Err(error) => error,
+                    Ok(()) => anyhow::bail!("the actual attached flat contract must reject root null"),
+                };
+                anyhow::ensure!(
+                    null_error.code == attune_common::value_schema::ErrorCode::InvalidValue
+                        && null_error.path.is_empty(),
+                    "null must violate the root flat-object contract"
+                );
+                // This is the production persistence entry used by task dispatch.
+                // It calls workflow_child_defaults before config initialization
+                // and seals only the newly accepted child on the positive path.
+                let persisted = ExecutionScheduler::persist_execution_config_secrets_with_conn(
+                    &mut tx,
+                    Some(INQUIRY_SCHEDULER_INPUT_KEY),
+                    child.id,
+                    &rendered.supplied,
+                    rendered.secret_inputs,
+                )
+                .await;
+                if explicit_null {
+                    match persisted {
+                        Err(error) => anyhow::ensure!(
+                            matches!(
+                                error.downcast_ref::<attune_common::Error>(),
+                                Some(attune_common::Error::Validation(message))
+                                    if message == "Invalid admitted input value"
+                            ),
+                            "explicit null must fail final input validation, not admission or permission checks"
+                        ),
+                        Ok(_) => anyhow::bail!("explicit null must not initialize accepted child inputs"),
+                    }
+                    let unchanged = ExecutionRepository::find_by_id(&mut *tx, child.id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("admitted child disappeared"))?;
+                    anyhow::ensure!(unchanged.config.is_none(), "rejected null must leave config uninitialized");
+                } else {
+                    let accepted = persisted?;
+                    anyhow::ensure!(accepted.config == Some(serde_json::json!({})), "absent parameters must initialize an empty map");
+                    let fence = attune_common::repositories::accepted_input::AcceptedInputRepository::revalidate_execution(
+                        &mut tx,
+                        child.id,
+                        INQUIRY_SCHEDULER_INPUT_KEY,
+                    )
+                    .await?;
+                    fence.ensure_fresh_on(&mut tx).await?;
+                }
+                Ok(())
+            }
+            .await;
+            tx.rollback()
+                .await
+                .expect("roll back the entire fresh child admission and input case");
+            results.push(result);
+        }
         fixture.database.cleanup().await.unwrap();
-        assert_eq!(
-            absent
-                .expect("absent flat parameters are an empty map")
-                .value,
-            serde_json::json!({})
-        );
-        assert!(
-            explicit_null.is_err(),
-            "explicit null must still fail flat-object validation"
-        );
+        for result in results {
+            result.expect("absent-versus-null child input contract");
+        }
     }
 
     #[tokio::test]
@@ -11937,6 +12016,21 @@ tasks:
             .begin()
             .await
             .expect("begin timeout");
+        let wait = WorkflowTaskWaitRepository::find_by_workflow_task(
+            &mut *transaction,
+            fixture.workflow_execution_id,
+            "guarded",
+        )
+        .await
+        .expect("load timed-out wait")
+        .expect("timed-out wait exists");
+        let prepared = NativeWaitCheckpoint::prepare(
+            &mut transaction,
+            &wait,
+            Some(INQUIRY_SCHEDULER_INPUT_KEY),
+        )
+        .await
+        .expect("prepare timeout before workflow locks");
         let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
             &mut transaction,
             &AtomicUsize::new(0),
@@ -11944,6 +12038,7 @@ tasks:
             &fixture.parent,
             fixture.workflow_execution_id,
             "guarded",
+            prepared,
         )
         .await
         .expect("advance timed-out wait");
@@ -12272,7 +12367,300 @@ tasks:
         assert!(after_second
             .failed_tasks
             .contains(&"queue_failed_guarded".to_string()));
+        assert_eq!(after_second.status, ExecutionStatus::Failed);
+        let parent = ExecutionRepository::find_by_id(fixture.database.pool(), fixture.parent.id)
+            .await
+            .expect("load parent after both terminal waits")
+            .expect("parent exists");
+        assert_eq!(parent.status, ExecutionStatus::Failed);
 
+        fixture
+            .database
+            .cleanup()
+            .await
+            .expect("clean test database");
+    }
+
+    #[tokio::test]
+    async fn parallel_terminal_wait_progress_replays_without_effects_before_delivery_marker() {
+        let fixture = InquirySchedulerFixture::create().await;
+        let skipped = fixture
+            .create_queue_item(WorkQueueItemStatus::Skipped, fixture.parent.id)
+            .await;
+        let failed = fixture
+            .create_queue_item(WorkQueueItemStatus::Failed, fixture.parent.id)
+            .await;
+        let context = fixture
+            .context_with_request_result(serde_json::json!({
+                "queue_skipped": skipped,
+                "queue_failed": failed
+            }))
+            .await;
+        for task in ["queue_skipped_guarded", "queue_failed_guarded"] {
+            fixture
+                .activate_task(task, &context)
+                .await
+                .expect("register actual terminal wait");
+        }
+        let original_wait = fixture.wait("queue_skipped_guarded").await;
+        let mut tx = fixture
+            .database
+            .pool()
+            .begin()
+            .await
+            .expect("begin first progress");
+        CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+            .await
+            .expect("protect progress transaction");
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await
+            .expect("lock schema selection");
+        let mut first = NativeWaitCheckpoint::prepare(
+            &mut tx,
+            &original_wait,
+            Some(INQUIRY_SCHEDULER_INPUT_KEY),
+        )
+        .await
+        .expect("prepare genuine wait progress")
+        .expect("native progress plan");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(fixture.workflow_execution_id)
+            .execute(&mut *tx)
+            .await
+            .expect("lock workflow");
+        assert!(first
+            .apply(&mut tx, INQUIRY_SCHEDULER_INPUT_KEY)
+            .await
+            .expect("apply progress")
+            .is_empty());
+        assert!(first.completions().is_empty());
+        first
+            .ensure_fresh_on(&mut tx)
+            .await
+            .expect("check first progress");
+        tx.commit().await.expect("commit without delivery marker");
+        first
+            .ensure_fresh()
+            .expect("check held progress after commit");
+        drop(first);
+
+        let saved_wait = fixture.wait("queue_skipped_guarded").await;
+        assert_ne!(
+            saved_wait
+                .result
+                .as_ref()
+                .and_then(|value| value.get("_delivery_complete")),
+            Some(&serde_json::json!(true))
+        );
+        let saved_workflow = WorkflowExecutionRepository::find_by_id(
+            fixture.database.pool(),
+            fixture.workflow_execution_id,
+        )
+        .await
+        .expect("load progressed workflow")
+        .expect("workflow exists");
+        let saved_parent =
+            ExecutionRepository::find_by_id(fixture.database.pool(), fixture.parent.id)
+                .await
+                .expect("load running parent")
+                .expect("parent exists");
+        assert_eq!(saved_workflow.status, ExecutionStatus::Running);
+        assert_eq!(saved_parent.status, ExecutionStatus::Running);
+        assert!(saved_workflow
+            .failed_tasks
+            .contains(&"queue_skipped_guarded".to_string()));
+
+        let mut tx = fixture
+            .database
+            .pool()
+            .begin()
+            .await
+            .expect("begin restart replay");
+        CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+            .await
+            .expect("protect replay transaction");
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await
+            .expect("lock replay schema selection");
+        let mut replay =
+            NativeWaitCheckpoint::prepare(&mut tx, &saved_wait, Some(INQUIRY_SCHEDULER_INPUT_KEY))
+                .await
+                .expect("authenticate committed progress")
+                .expect("native replay plan");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(fixture.workflow_execution_id)
+            .execute(&mut *tx)
+            .await
+            .expect("lock replay workflow");
+        assert!(replay
+            .apply(&mut tx, INQUIRY_SCHEDULER_INPUT_KEY)
+            .await
+            .expect("apply no-effect replay")
+            .is_empty());
+        assert!(replay.completions().is_empty());
+        replay
+            .ensure_fresh_on(&mut tx)
+            .await
+            .expect("check replay custody");
+        tx.commit().await.expect("commit replay");
+        replay.ensure_fresh().expect("check replay after commit");
+        assert_eq!(
+            serde_json::to_value(fixture.wait("queue_skipped_guarded").await).unwrap(),
+            serde_json::to_value(&saved_wait).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                WorkflowExecutionRepository::find_by_id(
+                    fixture.database.pool(),
+                    fixture.workflow_execution_id
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&saved_workflow).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                ExecutionRepository::find_by_id(fixture.database.pool(), fixture.parent.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&saved_parent).unwrap()
+        );
+        assert!(fixture
+            .task_children("queue_skipped_guarded")
+            .await
+            .is_empty());
+        drop(replay);
+        // Leave the earlier marker absent while the different last Wait
+        // produces the genuine canonical Failed root output.
+        fixture.advance_terminal_wait("queue_failed_guarded").await;
+        let final_parent =
+            ExecutionRepository::find_by_id(fixture.database.pool(), fixture.parent.id)
+                .await
+                .expect("load final parent")
+                .expect("parent exists");
+        assert_eq!(final_parent.status, ExecutionStatus::Failed);
+        let final_workflow = WorkflowExecutionRepository::find_by_id(
+            fixture.database.pool(),
+            fixture.workflow_execution_id,
+        )
+        .await
+        .expect("load final workflow")
+        .expect("workflow exists");
+        let final_fields = ExecutionSecretValueRepository::find_stored_by_entity(
+            fixture.database.pool(),
+            ENTITY_EXECUTION_RESULT,
+            fixture.parent.id,
+        )
+        .await
+        .expect("capture final root ciphertext and receipt provenance");
+        let mut tx = fixture
+            .database
+            .pool()
+            .begin()
+            .await
+            .expect("begin terminal-root acknowledgement");
+        CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
+            .await
+            .expect("protect terminal-root replay");
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await
+            .expect("lock terminal-root schema selection");
+        let earlier_wait = fixture.wait("queue_skipped_guarded").await;
+        let mut terminal_replay = NativeWaitCheckpoint::prepare(
+            &mut tx,
+            &earlier_wait,
+            Some(INQUIRY_SCHEDULER_INPUT_KEY),
+        )
+        .await
+        .expect("authenticate final root and earlier own release")
+        .expect("earlier progress acknowledgement");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(fixture.workflow_execution_id)
+            .execute(&mut *tx)
+            .await
+            .expect("lock terminal-root replay");
+        assert!(terminal_replay
+            .apply(&mut tx, INQUIRY_SCHEDULER_INPUT_KEY)
+            .await
+            .expect("acknowledge without business effects")
+            .is_empty());
+        assert!(
+            terminal_replay.completions().is_empty(),
+            "earlier delivery must not republish the last root completion"
+        );
+        terminal_replay
+            .ensure_fresh_on(&mut tx)
+            .await
+            .expect("check both original release fences");
+        tx.commit()
+            .await
+            .expect("commit no-effect terminal acknowledgement");
+        terminal_replay
+            .ensure_fresh()
+            .expect("check terminal acknowledgement after commit");
+        drop(terminal_replay);
+        assert_eq!(
+            serde_json::to_value(fixture.wait("queue_skipped_guarded").await).unwrap(),
+            serde_json::to_value(&earlier_wait).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                WorkflowExecutionRepository::find_by_id(
+                    fixture.database.pool(),
+                    fixture.workflow_execution_id
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&final_workflow).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                ExecutionRepository::find_by_id(fixture.database.pool(), fixture.parent.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&final_parent).unwrap()
+        );
+        assert_eq!(
+            ExecutionSecretValueRepository::find_stored_by_entity(
+                fixture.database.pool(),
+                ENTITY_EXECUTION_RESULT,
+                fixture.parent.id
+            )
+            .await
+            .unwrap(),
+            final_fields
+        );
+        assert!(fixture
+            .task_children("queue_skipped_guarded")
+            .await
+            .is_empty());
+        WorkflowTaskWaitRepository::mark_terminal_delivery_complete(
+            fixture.database.pool(),
+            earlier_wait.id,
+        )
+        .await
+        .expect("acknowledge only the earlier delivery metadata");
+        assert_eq!(
+            fixture
+                .wait("queue_skipped_guarded")
+                .await
+                .result
+                .as_ref()
+                .and_then(|value| value.get("_delivery_complete")),
+            Some(&serde_json::json!(true))
+        );
         fixture
             .database
             .cleanup()

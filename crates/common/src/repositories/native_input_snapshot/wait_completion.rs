@@ -472,11 +472,7 @@ impl NativeInputSnapshotRepository {
         prepared.require_target(conn, projected).await?;
         let mut source = prepared.source.clone();
         source.projected = projected.clone();
-        source.registration = Some(
-            load_registration(conn, original(&source)?.wait)
-                .await?
-                .ok_or_else(denied)?,
-        );
+        source.registration = load_registration(conn, original(&source)?.wait).await?;
         validate_storage(&source)?;
         let body = Body {
             renderer: prepared.renderer.id,
@@ -597,16 +593,20 @@ pub(super) fn validate_storage(source: &WaitCompletionSource) -> Result<()> {
         crate::value_schema::CompiledContract::new(&contract).map_err(|_| denied())?;
     }
     let outcomes = native_wait_outcome_values(wait)?;
-    let registration = source.registration.as_ref().ok_or_else(denied)?;
-    if hash(&registration.recipe)? != registration.digest
-        || registration.renderer != source.original.renderer
-        || registration.task_path != source.original.task_path
-        || registration.transaction.is_empty()
-        || registration.recipe.get("workflow") != Some(&json!(source.workflow))
-        || registration.recipe.get("target_kind") != Some(&json!(wait.target_kind))
-        || registration.recipe.get("target_id") != Some(&json!(wait.target_id))
-        || registration.recipe.get("source_admission") != Some(&json!(wait.source_admission))
-    {
+    if let Some(registration) = &source.registration {
+        if hash(&registration.recipe)? != registration.digest
+            || registration.renderer != source.original.renderer
+            || registration.task_path != source.original.task_path
+            || registration.transaction.is_empty()
+            || registration.recipe.get("workflow") != Some(&json!(source.workflow))
+            || registration.recipe.get("target_kind") != Some(&json!(wait.target_kind))
+            || registration.recipe.get("target_id") != Some(&json!(wait.target_id))
+            || registration.recipe.get("source_admission") != Some(&json!(wait.source_admission))
+        {
+            return Err(denied());
+        }
+    } else if !wait.terminal_observation {
+        // Ordinary/prospective waits still require their original registration.
         return Err(denied());
     }
     if source.execution <= 0
@@ -625,7 +625,10 @@ pub(super) fn validate_storage(source: &WaitCompletionSource) -> Result<()> {
         || source.parent.status != ExecutionStatus::Running
         || source.workflow_original.status != ExecutionStatus::Running
         || source.workflow_original.paused
-        || !source.workflow_original.failed_tasks.is_empty()
+        || source
+            .workflow_original
+            .failed_tasks
+            .contains(&wait.task_name)
         || source
             .workflow_original
             .completed_tasks
@@ -788,13 +791,14 @@ pub(super) async fn require_release(
         {
             return Err(denied());
         }
-    } else if super::super::workflow_task_wait::WorkflowTaskWaitRepository::find_by_workflow_task(
-        &mut *conn,
-        wait.workflow,
-        &wait.task_name,
-    )
-    .await?
-    .is_some()
+    } else if !wait.terminal_observation
+        && super::super::workflow_task_wait::WorkflowTaskWaitRepository::find_by_workflow_task(
+            &mut *conn,
+            wait.workflow,
+            &wait.task_name,
+        )
+        .await?
+        .is_some()
     {
         return Err(denied());
     }

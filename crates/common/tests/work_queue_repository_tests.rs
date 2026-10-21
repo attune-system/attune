@@ -318,16 +318,35 @@ async fn queue_item_admission_binding_survives_schema_changes_and_rejects_replac
     .await
     .unwrap();
     transaction.commit().await.unwrap();
-    WorkQueueRepository::update(
+    let schema_change = UpdateWorkQueueInput {
+        item_schema: Some(json!({"order_id": {"type": "string"}})),
+        ..Default::default()
+    };
+    assert!(
+        WorkQueueRepository::update(&db, queue.id, schema_change.clone())
+            .await
+            .is_err(),
+        "a queued accepted item must block a schema change"
+    );
+    let cancelled = WorkQueueItemRepository::update_if_statuses(
         &db,
-        queue.id,
-        UpdateWorkQueueInput {
-            item_schema: Some(json!({"order_id": {"type": "string"}})),
+        item.id,
+        &[WorkQueueItemStatus::Queued],
+        attune_common::repositories::work_queue::UpdateWorkQueueItemInput {
+            status: Some(WorkQueueItemStatus::Cancelled),
             ..Default::default()
         },
     )
     .await
     .unwrap();
+    assert_eq!(
+        cancelled.unwrap().status,
+        WorkQueueItemStatus::Cancelled,
+        "drain only this fixture's accepted item"
+    );
+    WorkQueueRepository::update(&db, queue.id, schema_change)
+        .await
+        .unwrap();
     let item = WorkQueueItemRepository::find_by_queue_and_id(&db, queue.id, item.id)
         .await
         .unwrap()

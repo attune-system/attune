@@ -561,10 +561,19 @@ fn extract_pack_archive(
                         ));
                     }
                     #[cfg(unix)]
-                    if executable {
+                    {
                         use std::os::unix::fs::PermissionsExt;
 
-                        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+                        // Preserve only normalized executable intent, independent
+                        // of the worker's umask. Use the opened file, not a path
+                        // which could be replaced before chmod.
+                        writer
+                            .get_ref()
+                            .set_permissions(fs::Permissions::from_mode(if executable {
+                                0o755
+                            } else {
+                                0o644
+                            }))?;
                     }
                 }
                 _ => unreachable!("entry type validated above"),

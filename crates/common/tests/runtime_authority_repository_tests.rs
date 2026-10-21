@@ -6567,6 +6567,16 @@ async fn native_prospective_initial_ordered_array_publications_keep_overwritten_
     .await;
 }
 
+#[tokio::test]
+async fn empty_wait_recovery_control_reopens_after_plan_drop_and_expires_at_original_consent() {
+    native_wait_snapshot_fixture(
+        false,
+        false,
+        Some(native_wait_materialization::Case::EmptyControlExpiry(0)),
+    )
+    .await;
+}
+
 async fn native_wait_snapshot_fixture(
     expire_while_blocked: bool,
     terminal_expiry: bool,
@@ -6628,14 +6638,65 @@ async fn native_wait_snapshot_fixture(
         &db,
         leaf.id,
         UpdateActionInput {
-            param_schema: Some(json!({"token":{"type":"string"}})),
-            out_schema: Some(json!({"token":{"type":"string","secret":true}})),
+            param_schema: Some(
+                if matches!(
+                    &caller_case,
+                    Some(native_wait_materialization::Case::EmptyControlExpiry(_))
+                ) {
+                    json!({"token":{"type":"string"},"probe":{"type":"string"}})
+                } else {
+                    json!({"token":{"type":"string"}})
+                },
+            ),
+            out_schema: Some(
+                if matches!(
+                    &caller_case,
+                    Some(native_wait_materialization::Case::EmptyControlExpiry(_))
+                ) {
+                    json!({"token":{"type":"string","secret":true},"probe":{"type":"string"}})
+                } else {
+                    json!({"token":{"type":"string","secret":true}})
+                },
+            ),
             ..Default::default()
         },
     )
     .await
     .unwrap();
     let set_ref = format!("{}.wait_reads", owner.pack_ref);
+    let selector_key = if matches!(
+        &caller_case,
+        Some(native_wait_materialization::Case::EmptyControlExpiry(_))
+    ) {
+        // This key has not been read. Author its stable name and the human's
+        // exact read grant before the graph, policy, and supplying authority.
+        let key = helpers::KeyFixture::new_pack(
+            owner.pack_id,
+            &owner.pack_ref,
+            "wait_empty_selector",
+            "unread",
+        )
+        .create(&db)
+        .await
+        .unwrap();
+        let role = PermissionSetRepository::create(&db, CreatePermissionSetInput {
+            r#ref: "fixture.native_wait_empty_selector".into(), pack: None, pack_ref: None,
+            label: None, description: None,
+            grants: json!([{"resource":"keys","actions":["read"],"constraints":{"refs":[key.r#ref]}}]),
+        }).await.unwrap();
+        PermissionAssignmentRepository::create(
+            &db,
+            CreatePermissionAssignmentInput {
+                identity: fixture.human_id,
+                permset: role.id,
+            },
+        )
+        .await
+        .unwrap();
+        Some(key)
+    } else {
+        None
+    };
     let outcome_transitions = json!([
         {"when":"{{ succeeded() }}"}, {"when":"{{ failed() }}"},
         {"when":"{{ timed_out() }}"}, {"when":"{{ cancelled() }}"}
@@ -6648,6 +6709,27 @@ async fn native_wait_snapshot_fixture(
         {"name":"source","action":leaf.r#ref,"permission_set_refs":[]},
         {"name":"native_recovery","action":leaf.r#ref,"permission_set_refs":[],"params":{"token":"recovered"}}
     ]});
+    if matches!(
+        &caller_case,
+        Some(native_wait_materialization::Case::EmptyControlExpiry(_))
+    ) {
+        // Author empty inputs and real false/true outcome conditions before
+        // graph, executable, declaration, policy, or input acceptance capture.
+        definition["tasks"][0]["next"] = json!([
+            {"when":"{{ succeeded() }}","do":["native_recovery"]},
+            {"when":"{{ failed() }}","do":["native_recovery"]}
+        ]);
+        definition["tasks"][5]["params"] = json!({});
+        let selector = selector_key
+            .as_ref()
+            .expect("new case owns its authored selector key");
+        definition["tasks"][0]["wait_for"]["execution"] =
+            json!(format!("{{{{ keystore['{}'] }}}}", selector.r#ref));
+        definition["tasks"].as_array_mut().unwrap().push(json!({
+            "name":"native_after_recovery", "action":leaf.r#ref,
+            "permission_set_refs":[], "params":{"probe":"{{ task.native_recovery.probe }}"}
+        }));
+    }
     if terminal_expiry
         || matches!(
             &caller_case,
@@ -6849,7 +6931,32 @@ async fn native_wait_snapshot_fixture(
     )
     .await
     .unwrap();
+    if let Some(selector) = &selector_key {
+        // The real source ID is now known. Set the unread key before its first
+        // declared source read; no accepted input or captured proof is changed.
+        attune_common::repositories::key::KeyRepository::update(
+            &mut *tx,
+            selector.id,
+            attune_common::repositories::key::UpdateKeyInput {
+                value: Some(json!(source.id)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
     let metadata=serde_json::from_value(json!({"workflow_execution":workflow.id,"task_name":"producer","retry_count":0,"max_retries":0,"timed_out":false})).unwrap();
+    // Completion cases model the inquiry-producing action having returned.
+    // Leaving this unrelated physical child Running must block root completion,
+    // even when the selected Wait is terminal. Other lifecycle cases keep it live.
+    let producer_finished = matches!(
+        &caller_case,
+        Some(native_wait_materialization::Case::Initial(
+            _,
+            native_wait_materialization::InitialCase::TerminalOutput
+                | native_wait_materialization::InitialCase::Successor(_)
+        ))
+    );
     let producer = ExecutionRepository::create_pinned(
         &mut *tx,
         CreateExecutionInput {
@@ -6908,6 +7015,18 @@ async fn native_wait_snapshot_fixture(
     )
     .await
     .unwrap();
+    if producer_finished {
+        ExecutionRepository::update(
+            &mut *tx,
+            producer.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
     let queue = owned_queue(&mut tx, owner, leaf.id, &leaf.r#ref).await;
     let item = WorkQueueItemRepository::create(
         &mut *tx,
@@ -6936,10 +7055,12 @@ async fn native_wait_snapshot_fixture(
     .unwrap();
     // Runtime wait targets become known after the root and source tasks exist.
     // Publish actual workflow variables; root config stays immutable from creation.
-    sqlx::query("UPDATE workflow_execution SET variables=$2 WHERE id=$1")
-        .bind(workflow.id)
-        .bind(json!({"target_execution":source.id,"target_inquiry":inquiry.id,"target_queue":item.id}))
-        .execute(&mut *tx).await.unwrap();
+    if selector_key.is_none() {
+        sqlx::query("UPDATE workflow_execution SET variables=$2 WHERE id=$1")
+            .bind(workflow.id)
+            .bind(json!({"target_execution":source.id,"target_inquiry":inquiry.id,"target_queue":item.id}))
+            .execute(&mut *tx).await.unwrap();
+    }
     let grants = json!([
         {"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[source.id]}},
         {"resource":"inquiries","actions":["read","decrypt"],"constraints":{"ids":[inquiry.id]}},
@@ -6967,6 +7088,7 @@ async fn native_wait_snapshot_fixture(
     )
     .await
     .unwrap();
+    let original_consent_started = tokio::time::Instant::now();
     let approval = RuntimeAuthorityRepository::issue_approval(
         &mut tx,
         owner.pack_id,
@@ -6974,7 +7096,12 @@ async fn native_wait_snapshot_fixture(
         serde_json::from_value(grants).unwrap(),
         Some(
             Utc::now()
-                + if expire_while_blocked {
+                + if matches!(
+                    &caller_case,
+                    Some(native_wait_materialization::Case::EmptyControlExpiry(_))
+                ) {
+                    Duration::seconds(120)
+                } else if expire_while_blocked {
                     Duration::seconds(10)
                 } else {
                     Duration::hours(1)
@@ -6997,7 +7124,7 @@ async fn native_wait_snapshot_fixture(
     let leaf_binding = InvocationBinding::Action {
         action_ref: leaf.r#ref.clone(),
     };
-    let task_bindings = [
+    let mut task_bindings = [
         "observed_execution",
         "observed_inquiry",
         "observed_queue",
@@ -7012,6 +7139,13 @@ async fn native_wait_snapshot_fixture(
         action_ref: leaf.r#ref.clone(),
     })
     .collect::<Vec<_>>();
+    if selector_key.is_some() {
+        task_bindings.push(InvocationBinding::WorkflowTask {
+            workflow_ref: graph_action.r#ref.clone(),
+            task_path: "/tasks/native_after_recovery".into(),
+            action_ref: leaf.r#ref.clone(),
+        });
+    }
     let mut invocations = vec![
         InvocationPolicy::from_executable(
             root_binding.clone(),
@@ -7130,8 +7264,46 @@ async fn native_wait_snapshot_fixture(
     }
     assert!(matches!(&root_admission.authority.attribution,
         RequestAttribution::Human { actor } if actor.identity_id == fixture.human_id));
-    let original_input =
-        json!({"target_execution":source.id,"target_inquiry":inquiry.id,"target_queue":item.id});
+    if let Some(selector) = &selector_key {
+        let declarations = DeclaredInputRepository::bindings(&mut tx, root.id)
+            .await
+            .unwrap();
+        let expression = format!("{{{{ keystore['{}'] }}}}", selector.r#ref);
+        let bindings = declarations
+            .iter()
+            .filter(|binding| {
+                binding.source_path.ends_with("/wait_for/execution")
+                    && binding.expression == expression
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bindings.len(),
+            1,
+            "approve only the actual immutable selector declaration"
+        );
+        let binding = bindings[0];
+        // Separate, one-time input-only consent for this exact key declaration.
+        // It uses the already-issued selected-read deadline, never extends it.
+        Inputs::approve_external_input(
+            &mut tx,
+            root.id,
+            &binding.declaration_revision,
+            &binding.source_path,
+            &binding.expression,
+            fixture.human_id,
+            serde_json::from_value(json!([{"resource":"keys","actions":["read"],
+                "constraints":{"refs":[selector.r#ref]}}]))
+            .unwrap(),
+            approval.expires_at,
+        )
+        .await
+        .unwrap();
+    }
+    let original_input = if selector_key.is_some() {
+        json!({})
+    } else {
+        json!({"target_execution":source.id,"target_inquiry":inquiry.id,"target_queue":item.id})
+    };
     ExecutionRepository::initialize_config_with_conn(
         &mut tx,
         root.id,
@@ -7231,6 +7403,31 @@ async fn native_wait_snapshot_fixture(
     let mut outcome_references = Vec::new();
     if let Some(case) = caller_case {
         let index = case.index();
+        if let native_wait_materialization::Case::EmptyControlExpiry(_) = case {
+            // One absolute budget starts before the sole original issuance,
+            // including the positive phase, real expiry, and owned teardown.
+            let budget = original_consent_started + std::time::Duration::from_secs(130);
+            let result = tokio::time::timeout_at(
+                original_consent_started + std::time::Duration::from_secs(125),
+                native_wait_materialization::empty_control_expiry(
+                    &db,
+                    workflow.id,
+                    names[index],
+                    targets[index],
+                    key,
+                    approval.expires_at.unwrap(),
+                ),
+            )
+            .await;
+            let cleanup = tokio::time::timeout_at(budget, db.cleanup()).await;
+            cleanup
+                .expect("cleanup within original consent budget")
+                .expect("clean owned expiry database");
+            result
+                .expect("case completed within original consent budget")
+                .expect("empty CONTROL cold reopening must retain original finite consent");
+            return;
+        }
         if let native_wait_materialization::Case::Cache(_, empty) = case {
             native_wait_materialization::check_cache(
                 &db,

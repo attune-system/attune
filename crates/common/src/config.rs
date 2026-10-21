@@ -1731,7 +1731,9 @@ pub struct CacheRetentionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Total generation-reclamation budget per supervisor cycle.
+    /// Generation-reclamation business-work budget per supervisor cycle.
+    /// An interrupted repository attempt may spend at most another 500ms on
+    /// protocol drain and rollback acknowledgement, never additional business work.
     #[serde(default = "default_cache_cleanup_cycle_milliseconds")]
     pub max_cleanup_cycle_milliseconds: u64,
 

@@ -47,6 +47,7 @@ pub struct PreparedNativeWaitContinuation {
     receipts: Vec<ReceiptContext>,
     released: std::sync::Arc<OnceLock<ReleasedWaitInput>>,
     applied: bool,
+    progress_replay: bool,
     staged: Option<std::sync::Arc<super::staged::Program>>,
     cache_frame: Option<std::sync::Arc<super::cache_frame::Frame>>,
     caches: Vec<super::super::native_cache_materialization::PreparedNativeCacheCheckpoint>,
@@ -118,8 +119,9 @@ impl NativeWaitContinuationRepository {
             .into_iter()
             .map(|decl| (decl.source_path.clone(), decl))
             .collect();
-        let sources = prepare_sources(conn, &parent, None, &workflow, key)
-            .await?
+        let sources = prepare_sources(conn, &parent, &task, &workflow, key)
+            .await
+            .map_err(|error| wait_cache_stage(error, "transition-sources"))?
             .ok_or_else(denied)?;
         let context = Context {
             predecessor: None,
@@ -147,7 +149,27 @@ impl NativeWaitContinuationRepository {
             &refs,
         )
         .await?;
-        let selector = if wait.state == WorkflowTaskWaitState::Waiting {
+        let recorded_release: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM runtime_native_wait_release WHERE wait=$1)",
+        )
+        .bind(wait.id)
+        .fetch_one(&mut *conn)
+        .await?;
+        // A committed progress update may precede its delivery marker. Never
+        // manufacture a new observation for metadata claiming it was applied.
+        let progress_replay = context.workflow.failed_tasks.contains(&wait.task_name);
+        if progress_replay
+            && (!recorded_release
+                || context.workflow.current_tasks.contains(&wait.task_name)
+                || context.workflow.completed_tasks.contains(&wait.task_name)
+                || !matches!(
+                    wait.state,
+                    WorkflowTaskWaitState::Failed | WorkflowTaskWaitState::TimedOut
+                ))
+        {
+            return Err(denied());
+        }
+        let selector = if wait.state == WorkflowTaskWaitState::Waiting || !recorded_release {
             if let Some(original) = Snapshots::initial_wait_selector(
                 conn,
                 context.parent.id,
@@ -167,7 +189,8 @@ impl NativeWaitContinuationRepository {
                     let relative = format!("/wait_for/{kind}");
                     let rendered = context
                         .render(conn, &relative, InputSitePurpose::Control, None, key)
-                        .await?;
+                        .await
+                        .map_err(|error| wait_cache_stage(error, "target-selector"))?;
                     let site = InputSite {
                         execution: context.parent.id,
                         kind: InputEntityKind::WorkflowVariables,
@@ -208,7 +231,7 @@ impl NativeWaitContinuationRepository {
                 .await
                 .map_err(|error| wait_cache_stage(error, "wait-observation"))?,
             )
-        } else {
+        } else if recorded_release {
             Observation::Released(
                 Snapshots::prepare_released_wait(
                     conn,
@@ -218,6 +241,20 @@ impl NativeWaitContinuationRepository {
                     key,
                 )
                 .await?,
+            )
+        } else {
+            Observation::Pending(
+                Snapshots::prepare_terminal_wait(
+                    conn,
+                    context.parent.id,
+                    &context.path,
+                    &admission,
+                    wait.id,
+                    selector.as_ref(),
+                    key,
+                )
+                .await
+                .map_err(|error| wait_cache_stage(error, "terminal-observation"))?,
             )
         };
         let original_secrets = Secrets::find_stored_by_entity(
@@ -268,11 +305,19 @@ impl NativeWaitContinuationRepository {
             receipts: vec![],
             released: std::sync::Arc::new(OnceLock::new()),
             applied: false,
+            progress_replay,
             staged: None,
             cache_frame: None,
             caches: vec![],
             completions: vec![],
         };
+        if plan.progress_replay {
+            if !matches!(plan.observation.as_ref(), Some(Observation::Released(_))) {
+                return Err(denied());
+            }
+            plan.ensure_prepared_on(conn).await?;
+            return Ok(Some(plan));
+        }
         if plan
             .context
             .workflow
@@ -324,7 +369,15 @@ impl NativeWaitContinuationRepository {
                 .await
                 .map_err(|error| wait_cache_stage(error, "cache-frame"))?,
             );
-            if program.successors.is_empty() {
+            let unhandled = program.successors.is_empty();
+            if unhandled
+                && super::completion::can_finish_root(
+                    conn,
+                    &plan.context,
+                    frame.source_identity().0,
+                )
+                .await?
+            {
                 let source = std::sync::Arc::new(
                     PreparedNativeWaitCompletion::prepare(
                         conn,
@@ -334,10 +387,14 @@ impl NativeWaitContinuationRepository {
                         frame.clone(),
                         key,
                     )
-                    .await?,
+                    .await
+                    .map_err(|error| wait_cache_stage(error, "root-completion-source"))?,
                 );
-                plan.output =
-                    Some(Inputs::prepare_native_wait_completion(conn, source.clone(), key).await?);
+                plan.output = Some(
+                    Inputs::prepare_native_wait_completion(conn, source.clone(), key)
+                        .await
+                        .map_err(|error| wait_cache_stage(error, "root-completion-output"))?,
+                );
                 plan.completion = Some(source);
             }
             for name in &program.successors {
@@ -351,8 +408,15 @@ impl NativeWaitContinuationRepository {
                         .map_err(|error| wait_cache_stage(error, "cache-successor"))?);
                 } else {
                     plan.children.push(
-                        prepare_recovery_from_program(conn, &plan.context, name, &program, key)
-                            .await?,
+                        prepare_recovery_from_program(
+                            conn,
+                            &plan.context,
+                            name,
+                            &program,
+                            plan.observation.as_ref().ok_or_else(denied)?,
+                            key,
+                        )
+                        .await?,
                     );
                 }
             }
@@ -368,7 +432,7 @@ impl NativeWaitContinuationRepository {
                 return Err(denied());
             }
             plan.staged = Some(program);
-            if !plan.caches.is_empty() || plan.completion.is_some() {
+            if unhandled || !plan.caches.is_empty() || plan.completion.is_some() {
                 plan.cache_frame = Some(frame);
             }
             plan.ensure_prepared_on(conn).await?;
@@ -477,8 +541,16 @@ impl NativeWaitContinuationRepository {
             return Err(denied());
         }
         for name in recovery_names {
-            plan.children
-                .push(prepare_recovery(conn, &plan.context, &name, key).await?);
+            plan.children.push(
+                prepare_recovery(
+                    conn,
+                    &plan.context,
+                    &name,
+                    plan.observation.as_ref().ok_or_else(denied)?,
+                    key,
+                )
+                .await?,
+            );
             let bytes = plan
                 .publications
                 .iter()
@@ -718,6 +790,11 @@ impl PreparedNativeWaitContinuation {
             return Err(denied());
         }
         self.released.set(released).map_err(|_| denied())?;
+        if self.progress_replay {
+            self.applied = true;
+            self.ensure_fresh_on(conn).await?;
+            return Ok(vec![]);
+        }
         if let Some(source) = &self.completion {
             let (receipt, completed) = super::completion_writer::finish(
                 conn,
@@ -729,7 +806,8 @@ impl PreparedNativeWaitContinuation {
                 self.output.as_ref().ok_or_else(denied)?,
                 key,
             )
-            .await?;
+            .await
+            .map_err(|error| wait_cache_stage(error, "root-completion-write"))?;
             self.receipts.push(receipt);
             self.completions.push(completed);
             self.applied = true;
@@ -866,15 +944,22 @@ impl PreparedNativeWaitContinuation {
             }
         }
         let mut completed = actual.completed_tasks.clone();
-        if !completed.contains(&self.original.task_name) {
-            completed.push(self.original.task_name.clone());
+        let progress = self
+            .staged
+            .as_ref()
+            .is_some_and(|program| program.successors.is_empty())
+            && self.completion.is_none();
+        let mut failed = actual.failed_tasks.clone();
+        if progress {
+            if !failed.contains(&self.original.task_name) {
+                failed.push(self.original.task_name.clone());
+            }
+        } else {
+            if !completed.contains(&self.original.task_name) {
+                completed.push(self.original.task_name.clone());
+            }
+            failed.retain(|name| name != &self.original.task_name);
         }
-        let failed = actual
-            .failed_tasks
-            .iter()
-            .filter(|name| *name != &self.original.task_name)
-            .cloned()
-            .collect();
         Secrets::replace_entity_with_conn(conn, ENTITY_WORKFLOW_VARIABLES, parent.id, &secrets)
             .await?;
         Workflows::update(
@@ -1023,6 +1108,12 @@ impl PreparedNativeWaitContinuation {
             for field in &recovery.child.fields {
                 field.rendered.ensure_fresh_on(conn).await?;
             }
+            for source in &recovery.child.inherited {
+                source.ensure_fresh_on(conn).await?;
+            }
+            if let Some(control) = &recovery.child.control {
+                control.ensure_fresh_on(conn).await?;
+            }
         }
         if let Some(selector) = &self.selector {
             selector.ensure_fresh_on(conn).await?;
@@ -1103,6 +1194,7 @@ async fn prepare_recovery(
     conn: &mut PgConnection,
     context: &Context,
     name: &str,
+    observation: &Observation,
     key: &str,
 ) -> Result<Recovery> {
     let trigger = context
@@ -1110,8 +1202,14 @@ async fn prepare_recovery(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(denied)?;
-    let (child, fence) =
-        prepare_wait_child(conn, context, name, key, None, Some(trigger), false, None).await?;
+    let (mut child, fence) =
+        prepare_wait_child(conn, context, name, key, None, Some(trigger), true, None).await?;
+    child.control = Some(
+        observation
+            .prepare_child_control(conn, &child.execution, key)
+            .await
+            .map_err(|error| wait_cache_stage(error, "recovery-control"))?,
+    );
     Ok(Recovery {
         name: name.into(),
         child,
@@ -1128,6 +1226,18 @@ pub(super) async fn write_recovery_child(
 ) -> Result<Execution> {
     Executions::bind_prepared_workflow_task(conn, &child.execution).await?;
     let mut sources = child.defaults.clone();
+    for source in &child.inherited {
+        source.ensure_fresh_on(conn).await?;
+        if !source.site().path.is_empty() {
+            sources.push(SecretPathSource {
+                path: source.site().path.clone(),
+                source: SecretSource::Bound(crate::secret_provenance::SecretProvenance {
+                    origins: vec![source.origin()],
+                    templates: vec![],
+                }),
+            });
+        }
+    }
     for field in &mut child.fields {
         for control in controls {
             Inputs::attach_prepared_destination_control(
@@ -1171,7 +1281,24 @@ pub(super) async fn write_recovery_child(
         &crate::secret_values::prepare_secret_values(fields, key)?,
     )
     .await?;
-    receipts.extend(Materialize::seal_execution_inputs(conn, child.execution.id, key).await?);
+    let mut roots = Vec::new();
+    if let Some(control) = &mut child.control {
+        roots.push(
+            Inputs::record_wait_input_control(conn, control, controls, child.inherited.last(), key)
+                .await?,
+        );
+    }
+    super::super::accepted_input::AcceptedInputRepository::seal_execution_with_controls(
+        conn,
+        child.execution.id,
+        key,
+        &roots,
+    )
+    .await?;
+    receipts.extend(roots);
+    receipts.extend(
+        Materialize::prepare_execution_input_receipts(conn, child.execution.id, key).await?,
+    );
     Ok(child.execution.clone())
 }
 
@@ -1180,6 +1307,7 @@ pub(super) async fn prepare_recovery_from_program(
     context: &Context,
     name: &str,
     program: &super::staged::Program,
+    observation: &Observation,
     key: &str,
 ) -> Result<Recovery> {
     let trigger = context
@@ -1187,17 +1315,22 @@ pub(super) async fn prepare_recovery_from_program(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(denied)?;
-    let (child, fence) = prepare_wait_child(
+    let (mut child, fence) = prepare_wait_child(
         conn,
         context,
         name,
         key,
         None,
         Some(trigger),
-        false,
+        true,
         Some(program),
     )
     .await?;
+    child.control = Some(
+        observation
+            .prepare_child_control(conn, &child.execution, key)
+            .await?,
+    );
     Ok(Recovery {
         name: name.into(),
         child,
@@ -1320,10 +1453,7 @@ pub(super) async fn prepare_wait_child(
     )
     .await?;
     Schemas::attach(conn, BindingOwner::Execution, child.id, &schema).await?;
-    let input_field = if task
-        .get("input")
-        .is_some_and(|value| value.as_object().is_some_and(|v| !v.is_empty()))
-    {
+    let input_field = if task.get("input").is_some() {
         "input"
     } else {
         "params"
@@ -1334,7 +1464,11 @@ pub(super) async fn prepare_wait_child(
     collect_leaves(&authored, String::new(), &mut leaves, 0)?;
     let mut fields = Vec::new();
     for (suffix, leaf) in leaves {
-        if task.get(input_field).is_none() {
+        // An empty parameter map supplies no VALUE leaves. Its handoff is the
+        // independent CONTROL root, not an encrypted receipt for a fake field.
+        if task.get(input_field).is_none()
+            || authored.as_object().is_some_and(serde_json::Map::is_empty)
+        {
             break;
         }
         let declaration = format!("{path}/{input_field}{suffix}");
@@ -1383,6 +1517,45 @@ pub(super) async fn prepare_wait_child(
             destination,
         });
     }
+    if !value.is_object() {
+        return Err(Error::validation("Invalid admitted input value"));
+    }
+    let mut inherited = Vec::new();
+    if name
+        != context
+            .task
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(denied)?
+        && value.as_object().is_some_and(serde_json::Map::is_empty)
+    {
+        let root = super::super::accepted_input::AcceptedInputRepository::prepare_config_root(
+            conn,
+            context.parent.id,
+            context.parent.id,
+            key,
+        )
+        .await?;
+        value = root.value().clone();
+        for name in value.as_object().ok_or_else(denied)?.keys() {
+            let path = format!(
+                "/{}",
+                super::super::native_workflow_materialization::escape(name)
+            );
+            inherited.push(
+                super::super::accepted_input::AcceptedInputRepository::prepare_config_path(
+                    conn,
+                    context.parent.id,
+                    context.parent.id,
+                    &path,
+                    key,
+                )
+                .await?,
+            );
+        }
+        // Even an empty parent retains its original acceptance ceilings.
+        inherited.push(root);
+    }
     let compiled =
         crate::value_schema::CompiledContract::new(&schema.input).map_err(|_| denied())?;
     let defaulted = compiled.apply_defaults(&value).map_err(|_| denied())?;
@@ -1404,6 +1577,8 @@ pub(super) async fn prepare_wait_child(
             value,
             fields,
             defaults,
+            control: None,
+            inherited,
         },
         admission.effect_fence().clone(),
     ))
@@ -1517,16 +1692,16 @@ pub(super) fn supported_program(task: &Value, graph: &Value) -> Result<bool> {
             {
                 return Ok(false);
             }
-            let Some(input) = successor
+            let input = successor
                 .get("input")
                 .or_else(|| successor.get("params"))
-                .and_then(Value::as_object)
-                .filter(|input| !input.is_empty())
-            else {
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if !input.is_object() {
                 return Ok(false);
-            };
+            }
             let mut leaves = Vec::new();
-            collect_leaves(&Value::Object(input.clone()), String::new(), &mut leaves, 0)?;
+            collect_leaves(&input, String::new(), &mut leaves, 0)?;
             if leaves.len() > 256 {
                 return Ok(false);
             }
@@ -1633,16 +1808,11 @@ fn recovery_reads_publications(task: &Value, graph: &Value) -> Result<bool> {
     for transition in next {
         for name in super::program_shape::successors(transition)? {
             let successor = unique_task(graph, name.as_str().ok_or_else(denied)?)?;
+            let Some(input) = successor.get("input").or_else(|| successor.get("params")) else {
+                continue;
+            };
             let mut leaves = vec![];
-            collect_leaves(
-                successor
-                    .get("input")
-                    .or_else(|| successor.get("params"))
-                    .ok_or_else(denied)?,
-                String::new(),
-                &mut leaves,
-                0,
-            )?;
+            collect_leaves(input, String::new(), &mut leaves, 0)?;
             for (_, leaf) in leaves {
                 if let Some(template) = leaf.as_str().filter(|value| value.contains("{{")) {
                     if expression_names(template)?.iter().any(|name| {

@@ -663,6 +663,7 @@ impl NativeInputSnapshotRepository {
                     target_control,
                     key,
                     Some(&prepared),
+                    false,
                 )
                 .await?,
             );

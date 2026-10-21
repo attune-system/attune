@@ -258,7 +258,8 @@ impl Program {
                 if let Some(source) = &field.source {
                     Inputs::bind_prepared(session, path, source, source.value())?;
                 } else {
-                    Inputs::bind_public_field(conn, session, path, &field.site).await?;
+                    Inputs::bind_public_field_with_key(conn, session, path, &field.site, key)
+                        .await?;
                 }
             }
         }

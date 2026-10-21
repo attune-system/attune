@@ -161,6 +161,9 @@ impl ArchivedField {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WaitSource {
+    /// A present observation of an already-terminal row, not a past registration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    terminal_observation: bool,
     wait: Id,
     workflow: Id,
     task_name: String,
@@ -272,6 +275,7 @@ impl<'a> CacheSelectorControl<'a> {
     }
 }
 pub struct PreparedWaitInput {
+    saved_terminal: bool,
     read_dependencies: Vec<IssuedWaitRead>,
     transaction: String,
     renderer: Id,
@@ -731,6 +735,14 @@ pub(crate) struct NativeWaitOutcomeBinding<'a> {
     pub fence: &'a ApprovalEffectFence,
     pub values: [Value; 4],
 }
+
+pub(crate) struct WaitInputControlBinding {
+    pub renderer: super::runtime_authority::RuntimeAdmissionRecord,
+    pub task_path: String,
+    pub value: Value,
+    pub decisions: Vec<(Option<String>, bool)>,
+    pub inherits_config: bool,
+}
 impl ReleasedWaitInput {
     pub(crate) fn outcome_binding(&self) -> Result<NativeWaitOutcomeBinding<'_>> {
         self.prepared.outcome_binding()
@@ -849,6 +861,7 @@ pub(crate) struct SnapshotEvidence {
     pub(crate) origins: Vec<SecretOrigin>,
     pub(crate) parents: Vec<(Id, InputSite)>,
     pub(crate) metadata: NativeSnapshotMetadata,
+    pub(crate) public_sources: Vec<InputSite>,
     pub(crate) bytes: usize,
 }
 pub(crate) struct SnapshotRetention {
@@ -1272,8 +1285,228 @@ impl NativeInputSnapshotRepository {
             target_control,
             key,
             None,
+            false,
         )
         .await
+    }
+
+    /// Authenticate the saved outcome against the current target, without
+    /// claiming that its earlier transition had a native release witness.
+    pub(crate) async fn prepare_terminal_wait(
+        conn: &mut PgConnection,
+        renderer: Id,
+        task_path: &str,
+        admission: &ExecutionAdmission,
+        wait: Id,
+        target_control: Option<&ReceiptContext>,
+        key: &str,
+    ) -> Result<PreparedWaitInput> {
+        Self::prepare_wait_inner(
+            conn,
+            renderer,
+            task_path,
+            admission,
+            wait,
+            target_control,
+            key,
+            None,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn wait_input_control_binding(
+        conn: &mut PgConnection,
+        renderer: Id,
+        snapshot: Id,
+        task_path: &str,
+        site: &InputSite,
+    ) -> Result<WaitInputControlBinding> {
+        use super::inherited_input::{InputEntityKind, InputSitePurpose};
+        let (body, _, _, _) = load_encrypted(conn, snapshot).await?;
+        let Source::Wait(wait) = &body.source else {
+            return Err(denied());
+        };
+        if body.renderer != renderer
+            || body.task_path != task_path
+            || site.kind != InputEntityKind::ExecutionConfig
+            || site.purpose != InputSitePurpose::Control
+            || !site.path.is_empty()
+        {
+            return Err(denied());
+        }
+        let renderer =
+            RuntimeAuthorityRepository::require_retained_admission(conn, renderer).await?;
+        if renderer.owner_id != body.execution {
+            return Err(denied());
+        }
+        let child = RuntimeAuthorityRepository::execution_admission(conn, site.execution)
+            .await?
+            .ok_or_else(denied)?;
+        let InvocationBinding::WorkflowTask {
+            workflow_ref,
+            task_path: child_path,
+            action_ref,
+        } = &child.authority.binding
+        else {
+            return Err(denied());
+        };
+        if workflow_ref != renderer.authority.binding.action_ref()
+            || child.authority.attribution
+                != (RequestAttribution::ParentExecution {
+                    execution_id: body.execution,
+                })
+        {
+            return Err(denied());
+        }
+        let graph = workflow_definition(conn, &renderer).await?;
+        let child_path = canonical_task_path(&graph, child_path).ok_or_else(denied)?;
+        let child_task = graph.pointer(&child_path).ok_or_else(denied)?;
+        if child_task.get("action").and_then(Value::as_str) != Some(action_ref.as_str()) {
+            return Err(denied());
+        }
+        let child_name = child_task
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(denied)?;
+        let inherits_config = child_task
+            .get("input")
+            .or_else(|| child_task.get("params"))
+            .is_none_or(|input| input.as_object().is_some_and(serde_json::Map::is_empty));
+        let task = task_definition(conn, &renderer, task_path).await?;
+        if task.get("name").and_then(Value::as_str) != Some(wait.task_name.as_str()) {
+            return Err(denied());
+        }
+        let transitions = task
+            .get("next")
+            .and_then(Value::as_array)
+            .ok_or_else(denied)?;
+        if transitions.len() > 256 {
+            return Err(denied());
+        }
+        let mut decisions = Vec::new();
+        for (index, transition) in transitions.iter().enumerate() {
+            let condition = transition
+                .get("when")
+                .filter(|value| !value.is_null())
+                .map(|_| format!("{task_path}/next/{index}/when"));
+            let selected = transition
+                .get("do")
+                .and_then(Value::as_array)
+                .ok_or_else(denied)?
+                .iter()
+                .any(|value| value.as_str() == Some(child_name));
+            decisions.push((condition, selected));
+        }
+        if !decisions.iter().any(|(_, selected)| *selected) {
+            return Err(denied());
+        }
+        Ok(WaitInputControlBinding {
+            renderer,
+            task_path: task_path.into(),
+            value: json!({"wait": wait.wait}),
+            decisions,
+            inherits_config,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Verify independent renderer, Wait source, destination, selections, plaintext, and pending-publication custody"
+    )]
+    pub(crate) async fn validate_wait_input_control_recipe(
+        conn: &mut PgConnection,
+        renderer: Id,
+        snapshot: Id,
+        task_path: &str,
+        site: &InputSite,
+        selections: &[super::inherited_input::ReadSelection],
+        plaintext: Option<(&Value, &str)>,
+        pending: bool,
+    ) -> Result<()> {
+        use super::inherited_input::{InputEntityKind, InputSitePurpose, SelectionSource};
+        let binding =
+            Self::wait_input_control_binding(conn, renderer, snapshot, task_path, site).await?;
+        if plaintext.is_some_and(|(value, _)| value != &binding.value) || selections.len() > 256 {
+            return Err(denied());
+        }
+        let mut snapshots = 0;
+        let mut inherited = 0;
+        let mut conditions = std::collections::BTreeMap::new();
+        for selected in selections {
+            if selected.context_path != "$control" {
+                return Err(denied());
+            }
+            match &selected.source {
+                SelectionSource::NativeSnapshot { snapshot: actual } if *actual == snapshot => {
+                    snapshots += 1
+                }
+                SelectionSource::Control { receipt, site } => {
+                    if binding.inherits_config
+                        && site.execution == binding.renderer.owner_id
+                        && site.kind == InputEntityKind::ExecutionConfig
+                        && site.purpose == InputSitePurpose::Value
+                        && site.path.is_empty()
+                    {
+                        inherited += 1;
+                        continue;
+                    }
+                    if site.execution != binding.renderer.owner_id
+                        || site.kind != InputEntityKind::WorkflowVariables
+                        || site.purpose != InputSitePurpose::Condition
+                        || !binding
+                            .decisions
+                            .iter()
+                            .any(|(path, _)| path.as_deref() == Some(site.path.as_str()))
+                        || conditions.contains_key(&site.path)
+                    {
+                        return Err(denied());
+                    }
+                    let encrypted: Value = sqlx::query_scalar(
+                        "SELECT encrypted_value FROM runtime_input_receipt WHERE id=$1 AND execution=$2 AND renderer_admission=$3 AND entity_kind='workflow_variables' AND destination_purpose='condition' AND destination_path=$4",
+                    ).bind(receipt).bind(site.execution).bind(renderer).bind(&site.path)
+                        .fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+                    let fires = plaintext
+                        .map(|(_, key)| crate::crypto::decrypt_json(&encrypted, key))
+                        .transpose()?
+                        .map(|value| value.as_bool().ok_or_else(denied))
+                        .transpose()?;
+                    conditions.insert(site.path.clone(), fires);
+                }
+                _ => return Err(denied()),
+            }
+        }
+        if snapshots != 1 {
+            return Err(denied());
+        }
+        // The private prepared destination precedes decision receipt writes.
+        // Recording and reopening require the complete decision set below.
+        if pending && conditions.is_empty() && inherited == 0 {
+            return Ok(());
+        }
+        if inherited != usize::from(binding.inherits_config) {
+            return Err(denied());
+        }
+        if conditions.len()
+            != binding
+                .decisions
+                .iter()
+                .filter(|(path, _)| path.is_some())
+                .count()
+        {
+            return Err(denied());
+        }
+        if plaintext.is_some()
+            && !binding.decisions.iter().any(|(path, eligible)| {
+                *eligible
+                    && path
+                        .as_ref()
+                        .is_none_or(|path| conditions.get(path) == Some(&Some(true)))
+            })
+        {
+            return Err(denied());
+        }
+        Ok(())
     }
 
     #[expect(
@@ -1289,12 +1522,17 @@ impl NativeInputSnapshotRepository {
         target_control: Option<&ReceiptContext>,
         key: &str,
         prospective: Option<&PreparedWaitRegistration>,
+        terminal: bool,
     ) -> Result<PreparedWaitInput> {
         use super::{workflow_task_wait::WorkflowTaskWaitRepository as Waits, FindById};
         use crate::models::{WorkflowTaskWaitState, WorkflowTaskWaitTarget};
         let record = DeclaredInputRepository::require_source(conn, renderer).await?;
         require_task(conn, &record, task_path, admission.authority()).await?;
+        let mut saved_terminal = None;
         let (workflow, task_name, target) = if let Some(initial) = prospective {
+            if terminal {
+                return Err(denied());
+            }
             initial
                 .identity(conn, renderer, task_path, admission, wait)
                 .await?
@@ -1316,10 +1554,22 @@ impl NativeInputSnapshotRepository {
             .bind(renderer)
             .fetch_one(&mut *conn)
             .await?;
-            if !belongs || row.id != wait || row.state != WorkflowTaskWaitState::Waiting {
+            let valid_state = if terminal {
+                matches!(
+                    row.state,
+                    WorkflowTaskWaitState::Failed | WorkflowTaskWaitState::TimedOut
+                )
+            } else {
+                row.state == WorkflowTaskWaitState::Waiting
+            };
+            if !belongs || row.id != wait || !valid_state {
                 return Err(denied());
             }
-            (workflow, task_name, row.target()?)
+            let target = row.target()?;
+            if terminal {
+                saved_terminal = Some(row);
+            }
+            (workflow, task_name, target)
         };
         let task = task_definition(conn, &record, task_path).await?;
         if task.get("name").and_then(Value::as_str) != Some(task_name.as_str()) {
@@ -1519,6 +1769,20 @@ impl NativeInputSnapshotRepository {
                 )
             }
         };
+        if let Some(saved) = &saved_terminal {
+            if saved.state != wait_state(&state)? || saved.result.as_ref() != Some(&raw) {
+                return Err(denied());
+            }
+            let released: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM runtime_native_wait_release WHERE wait=$1)",
+            )
+            .bind(wait)
+            .fetch_one(&mut *conn)
+            .await?;
+            if released {
+                return Err(denied());
+            }
+        }
         let fields = if raw.get(source_field).is_some() {
             load_fields(conn, source_kind, id).await?
         } else {
@@ -1531,6 +1795,23 @@ impl NativeInputSnapshotRepository {
         fence = fence.intersect(
             &RuntimeAuthorityRepository::retained_admission_fence(conn, source_record.id).await?,
         );
+        // Observing a producer also retains its input-independent prerequisites.
+        // Empty CONFIG has no field provenance from which to rediscover them.
+        for control in
+            super::accepted_input::AcceptedInputRepository::prepare_public_source_controls(
+                conn,
+                source_execution,
+                key,
+            )
+            .await?
+        {
+            fence = fence.intersect(control.accepted_fence());
+            let parent =
+                InheritedInputRepository::receipt_source_site(conn, &control.origin()).await?;
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
         if !fields.is_empty() {
             require_selected_read(
                 conn,
@@ -1639,6 +1920,7 @@ impl NativeInputSnapshotRepository {
             return Err(denied());
         }
         let source = WaitSource {
+            terminal_observation: terminal,
             wait,
             workflow,
             task_name,
@@ -1683,6 +1965,7 @@ impl NativeInputSnapshotRepository {
         archive_wait(conn, snapshot, &source.fields).await?;
         fence.ensure_fresh_on(conn).await?;
         Ok(PreparedWaitInput {
+            saved_terminal: terminal,
             read_dependencies: target_control
                 .map(|control| control.issued_wait_reads().to_vec())
                 .unwrap_or_default(),
@@ -1702,6 +1985,9 @@ impl NativeInputSnapshotRepository {
         conn: &mut PgConnection,
         prepared: PreparedWaitInput,
     ) -> Result<ReleasedWaitInput> {
+        if prepared.saved_terminal {
+            return Self::confirm_terminal_wait(conn, prepared).await;
+        }
         use super::workflow_task_wait::WorkflowTaskWaitRepository as Waits;
         require_transaction(conn, &prepared.transaction).await?;
         let row = Waits::find_by_workflow_task_for_update(
@@ -1730,6 +2016,42 @@ impl NativeInputSnapshotRepository {
         .await?
         .ok_or_else(denied)?;
         sqlx::query("INSERT INTO runtime_native_wait_release(wait,snapshot,release_transaction) VALUES($1,$2,pg_current_xact_id()::TEXT)").bind(row.id).bind(prepared.snapshot).execute(&mut *conn).await?;
+        prepared.fence.ensure_fresh_on(conn).await?;
+        Ok(ReleasedWaitInput { prepared })
+    }
+
+    /// Record the present verification of an already-terminal row. The snapshot
+    /// and its release transaction describe this observation, not its old write.
+    pub(crate) async fn confirm_terminal_wait(
+        conn: &mut PgConnection,
+        prepared: PreparedWaitInput,
+    ) -> Result<ReleasedWaitInput> {
+        use super::workflow_task_wait::WorkflowTaskWaitRepository as Waits;
+        require_transaction(conn, &prepared.transaction).await?;
+        let row = Waits::find_by_workflow_task_for_update(
+            conn,
+            prepared.source.workflow,
+            &prepared.source.task_name,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        if row.id != prepared.source.wait
+            || !matches!(
+                row.state,
+                crate::models::WorkflowTaskWaitState::Failed
+                    | crate::models::WorkflowTaskWaitState::TimedOut
+            )
+            || row.state != wait_state(&prepared.source.state)?
+            || row.result.as_ref() != Some(&prepared.source.raw_projection)
+            || row.target()?.id() != prepared.source.target_id
+            || serde_json::to_value(row.target()?.kind())?.as_str()
+                != Some(prepared.source.target_kind.as_str())
+        {
+            return Err(denied());
+        }
+        prepared.fence.ensure_fresh_on(conn).await?;
+        sqlx::query("INSERT INTO runtime_native_wait_release(wait,snapshot,release_transaction) VALUES($1,$2,pg_current_xact_id()::TEXT)")
+            .bind(row.id).bind(prepared.snapshot).execute(&mut *conn).await?;
         prepared.fence.ensure_fresh_on(conn).await?;
         Ok(ReleasedWaitInput { prepared })
     }
@@ -1800,6 +2122,84 @@ impl NativeInputSnapshotRepository {
         Ok(released)
     }
 
+    /// Acknowledge an earlier applied failure only through the actual terminal
+    /// root receipt AND that Wait's own authenticated normalized release.
+    /// This cannot issue inputs, a VALUE receipt, or another root completion.
+    pub(crate) async fn prepare_completed_wait_observation_for(
+        conn: &mut PgConnection,
+        context: &ReceiptContext,
+        wait: Id,
+        key: &str,
+    ) -> Result<ReleasedWaitInput> {
+        use super::FindById;
+        let completed = Self::prepare_completed_wait_observation(conn, context, key).await?;
+        let final_source = &completed.prepared.source;
+        if wait == final_source.wait {
+            return Ok(completed);
+        }
+        if wait <= 0 {
+            return Err(denied());
+        }
+        let snapshot: Id =
+            sqlx::query_scalar("SELECT snapshot FROM runtime_native_wait_release WHERE wait=$1")
+                .bind(wait)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(denied)?;
+        let (body, _, _, _) = load(conn, snapshot, key).await?;
+        let Source::Wait(source) = &body.source else {
+            return Err(denied());
+        };
+        let execution = context.site().execution;
+        let record = RuntimeAuthorityRepository::execution_admission(conn, execution)
+            .await?
+            .ok_or_else(denied)?;
+        let workflow = super::workflow::WorkflowExecutionRepository::find_by_id(
+            &mut *conn,
+            final_source.workflow,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        let actual = super::workflow_task_wait::WorkflowTaskWaitRepository::find_by_workflow_task(
+            &mut *conn,
+            workflow.id,
+            &source.task_name,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        if body.renderer != record.id
+            || body.execution != execution
+            || source.wait != wait
+            || source.workflow != workflow.id
+            || workflow.execution != execution
+            || workflow.status != crate::models::ExecutionStatus::Failed
+            || !workflow.failed_tasks.contains(&source.task_name)
+            || workflow.current_tasks.contains(&source.task_name)
+            || workflow.completed_tasks.contains(&source.task_name)
+            || actual.id != wait
+            || !matches!(
+                actual.state,
+                crate::models::WorkflowTaskWaitState::Failed
+                    | crate::models::WorkflowTaskWaitState::TimedOut
+            )
+            || !matches!(source.state.as_str(), "failed" | "timed_out")
+        {
+            return Err(denied());
+        }
+        // Task path is from the saved authenticated source, never the caller.
+        // The existing observer verifies its declaration, ciphertext, original
+        // read ceilings, parents, and the matching live Wait projection.
+        let released =
+            Self::observe_released_wait(conn, execution, &body.task_path, wait, key, record)
+                .await?;
+        if released.outcome_binding()?.snapshot != snapshot {
+            return Err(denied());
+        }
+        completed.ensure_fresh_on(conn).await?;
+        context.ensure_fresh_on(conn).await?;
+        Ok(released)
+    }
+
     async fn observe_released_wait(
         conn: &mut PgConnection,
         renderer: Id,
@@ -1861,6 +2261,7 @@ impl NativeInputSnapshotRepository {
         fence.ensure_fresh_on(conn).await?;
         Ok(ReleasedWaitInput {
             prepared: PreparedWaitInput {
+                saved_terminal: false,
                 read_dependencies: Vec::new(),
                 transaction: transaction(conn).await?,
                 renderer: record.id,
@@ -2153,7 +2554,9 @@ impl NativeInputSnapshotRepository {
                     | Source::SuccessMetadata(_)
                     | Source::Completion(_)
                     | Source::IterationOutcome(_)
-            ) && !in_task(&body.task_path, declaration_path))
+            ) && !in_task(&body.task_path, declaration_path)
+                && !(matches!(&body.source, Source::Wait(_))
+                    && wait_control_path(&body.task_path, declaration_path, context_path)))
         {
             return Err(denied());
         }
@@ -2316,7 +2719,9 @@ impl NativeInputSnapshotRepository {
                 let outcome = ["succeeded", "failed", "timed_out", "cancelled"]
                     .iter()
                     .any(|function| context_path == format!("/$outcome/{function}"));
+                let control = wait_control_path(&body.task_path, declaration_path, context_path);
                 if !outcome
+                    && !control
                     && context_path != source.context_path
                     && !context_path
                         .strip_prefix(&source.context_path)
@@ -2352,7 +2757,14 @@ impl NativeInputSnapshotRepository {
                 (source.origins.clone(), source.parents.clone())
             }
         };
+        let public_sources = match &body.source {
+            Source::ResultView(source) => {
+                result_view::public_selection_sites(source, context_path)?
+            }
+            _ => Vec::new(),
+        };
         Ok(SnapshotEvidence {
+            public_sources,
             fence,
             origins,
             parents,
@@ -3305,6 +3717,7 @@ fn validate_wait_storage(source: &WaitSource) -> Result<()> {
         || source.source_kind != kind
         || source.source_field != field
         || source.prepared_transaction.is_empty()
+        || (source.terminal_observation && !matches!(source.state.as_str(), "failed" | "timed_out"))
         || source.contributors.len() > 256
         || source.fields.len() > 256
         || source.parents.len() > 256
@@ -3725,6 +4138,9 @@ fn cache_origin(source: &CacheSource) -> SecretOrigin {
 pub(crate) fn in_task(task: &str, path: &str) -> bool {
     path.strip_prefix(task)
         .is_some_and(|suffix| suffix.starts_with('/'))
+}
+pub(crate) fn wait_control_path(task: &str, path: &str, context: &str) -> bool {
+    context == "$control" && path == task
 }
 pub(crate) fn wait_outcome_path(task: &str, path: &str) -> bool {
     path.strip_prefix(task)

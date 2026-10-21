@@ -1671,6 +1671,48 @@ pub(super) async fn prepare_sources(
     workflow: &WorkflowExecution,
     key: &str,
 ) -> Result<Option<Sources>> {
+    prepare_sources_inner(
+        conn,
+        parent,
+        completed,
+        workflow,
+        key,
+        None,
+        completed.is_some(),
+    )
+    .await
+}
+
+/// Wait selectors may name completed task results without making any child the
+/// current result/outcome. Bind only the statically selected task namespaces.
+pub(super) async fn prepare_sources_for_tasks(
+    conn: &mut PgConnection,
+    parent: &Execution,
+    workflow: &WorkflowExecution,
+    tasks: &BTreeSet<String>,
+    key: &str,
+) -> Result<Option<Sources>> {
+    prepare_sources_inner(
+        conn,
+        parent,
+        None,
+        workflow,
+        key,
+        Some(tasks),
+        !tasks.is_empty(),
+    )
+    .await
+}
+
+async fn prepare_sources_inner(
+    conn: &mut PgConnection,
+    parent: &Execution,
+    completed: Option<&Execution>,
+    workflow: &WorkflowExecution,
+    key: &str,
+    tasks: Option<&BTreeSet<String>>,
+    include_children: bool,
+) -> Result<Option<Sources>> {
     let system = Inputs::prepare_system(conn, parent.id).await?;
     let root = RuntimeAuthorityRepository::execution_admission(conn, parent.id)
         .await?
@@ -1721,7 +1763,7 @@ pub(super) async fn prepare_sources(
     {
         return Ok(None);
     }
-    let children = if completed.is_some() {
+    let children = if include_children {
         ExecutionRepository::find_by_parent(&mut *conn, parent.id).await?
     } else {
         Vec::new()
@@ -1735,11 +1777,18 @@ pub(super) async fn prepare_sources(
         };
         if metadata.workflow_execution != workflow.id
             || metadata.task_index.is_some()
-            || !matches!(
-                child.status,
-                ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Timeout
-            )
-            || !names.insert(metadata.task_name.clone())
+            || tasks.is_some_and(|tasks| !tasks.contains(&metadata.task_name))
+        {
+            continue;
+        }
+        // A Wait must not read an older attempt while the latest is running.
+        if tasks.is_some() && !names.insert(metadata.task_name.clone()) {
+            continue;
+        }
+        if !matches!(
+            child.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Timeout
+        ) || (tasks.is_none() && !names.insert(metadata.task_name.clone()))
         {
             continue;
         }
@@ -2308,7 +2357,7 @@ async fn bind_evaluation_sources(
             if let Some(source) = &field.source {
                 Inputs::bind_prepared(session, path, source, source.value())?;
             } else {
-                Inputs::bind_public_field(conn, session, path, &field.site).await?;
+                Inputs::bind_public_field_with_key(conn, session, path, &field.site, key).await?;
             }
         }
     }

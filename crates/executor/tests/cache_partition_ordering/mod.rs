@@ -512,12 +512,71 @@ async fn workflow_first_commits_scanning_pin_before_cleanup_rechecks_eligibility
     let mut observer = pool.acquire().await.unwrap();
     let cleanup = CacheGenerationRepository::drop_if_cleanup_eligible(pool, generation, &config);
     let observed = async {
-        wait_for_mutation_admission_on_connection(&mut observer, workflow_pid).await;
-        workflow.commit().await.unwrap();
+        // Cleanup must wait for cache admission without holding or queuing graph
+        // protection. The workflow retains both locks until its pin commits.
+        let admission = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: Option<i32> = sqlx::query_scalar(
+                    "SELECT waiter.pid FROM pg_locks waiter JOIN pg_locks holder \
+                     ON holder.locktype=waiter.locktype AND holder.classid=waiter.classid \
+                     AND holder.objid=waiter.objid AND holder.objsubid=waiter.objsubid \
+                     AND holder.database IS NOT DISTINCT FROM waiter.database \
+                     WHERE waiter.locktype='advisory' AND waiter.objsubid=2 \
+                     AND waiter.classid=7821101 AND waiter.objid=0 \
+                     AND waiter.mode='ExclusiveLock' AND NOT waiter.granted \
+                     AND holder.pid=$1 AND holder.mode='ExclusiveLock' AND holder.granted \
+                     AND EXISTS(SELECT 1 FROM pg_locks g WHERE g.pid=$1 AND g.granted \
+                       AND g.locktype='advisory' AND g.objsubid=1 AND g.mode='ShareLock' \
+                       AND g.classid=((hashtextextended(current_schema() || ':named-type-graph',0)>>32)&4294967295)::OID \
+                       AND g.objid=(hashtextextended(current_schema() || ':named-type-graph',0)&4294967295)::OID \
+                       AND g.database IS NOT DISTINCT FROM waiter.database) \
+                     AND $1=ANY(pg_blocking_pids(waiter.pid))",
+                )
+                .bind(workflow_pid)
+                .fetch_optional(&mut *observer)
+                .await?;
+                if let Some(pid) = waiting {
+                    let early_locks: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND \
+                         (relation IN ('cache_entry'::regclass,'workflow_execution'::regclass, \
+                          'workflow_cache_iteration'::regclass,'cache_namespace'::regclass, \
+                          'cache_generation'::regclass,'cache_generation_entry_usage'::regclass, \
+                          'cache_deployment_physical_byte_usage'::regclass,'cache_owner_physical_byte_usage'::regclass) \
+                          OR (locktype='advisory' AND objsubid=1 \
+                            AND classid=((hashtextextended(current_schema() || ':named-type-graph',0)>>32)&4294967295)::OID \
+                            AND objid=(hashtextextended(current_schema() || ':named-type-graph',0)&4294967295)::OID))",
+                    )
+                    .bind(pid)
+                    .fetch_one(&mut *observer)
+                    .await?;
+                    anyhow::ensure!(
+                        early_locks == 0,
+                        "cleanup backend {pid} held or queued graph/source locks during cache preflight"
+                    );
+                    return Ok::<_, anyhow::Error>(pid);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // Release the blocker even if observation fails. Join cleanup below
+        // before closing the fixture or reporting the failed predicate.
+        let committed = workflow.commit().await;
+        (admission, committed)
     };
-    let (outcome, ()) = tokio::join!(cleanup, observed);
+    let (outcome, (admission, committed)) = tokio::join!(cleanup, observed);
     drop(observer);
-    assert_eq!(outcome.unwrap(), CacheGenerationCleanupOutcome::Ineligible);
+    if !matches!(&admission, Ok(Ok(_)))
+        || committed.is_err()
+        || !matches!(&outcome, Ok(CacheGenerationCleanupOutcome::Ineligible))
+    {
+        let fixture_cleanup = fixture.database.cleanup().await;
+        panic!(
+            "workflow-first cleanup ordering failed: cache_preflight={admission:?}, \
+             workflow_commit={committed:?}, cleanup_outcome={outcome:?}, \
+             fixture_cleanup={fixture_cleanup:?}"
+        );
+    }
     let iteration = WorkflowCacheIterationRepository::find_by_workflow_task(
         pool,
         fixture.workflow_execution_id,

@@ -4,7 +4,8 @@
 use super::{
     execution_secret_value::ExecutionSecretValueRepository,
     inherited_input::{
-        InheritedInputRepository, InputEntityKind, InputSite, InputSitePurpose, PreparedInputSource,
+        InheritedInputRepository, InputEntityKind, InputSite, InputSitePurpose,
+        PreparedInputSource, ReceiptContext,
     },
     runtime_authority::{ApprovalEffectFence, RuntimeAdmissionRecord, RuntimeAuthorityRepository},
     schema_contract::{BindingOwner, SchemaContractRepository},
@@ -19,6 +20,9 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgConnection;
+
+mod controls;
+use controls::AcceptedControl;
 
 pub const ENTITY_ACCEPTED_INPUT: &str = "accepted_input";
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -99,6 +103,8 @@ struct Body {
     fields: Vec<Field>,
     contributors: Vec<Contributor>,
     schema: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    controls: Vec<AcceptedControl>,
 }
 
 pub(crate) struct AcceptedFieldEvidence {
@@ -132,7 +138,12 @@ impl AcceptedInputRepository {
             return Err(denied());
         }
         Self::source_contributors(conn, execution).await?;
-        let fence = RuntimeAuthorityRepository::retained_admission_fence(conn, record.id).await?;
+        let mut fence =
+            RuntimeAuthorityRepository::retained_admission_fence(conn, record.id).await?;
+        for control in controls::reopen(conn, &original, key).await? {
+            fence = fence.intersect(control.accepted_fence());
+            control.ensure_fresh_on(conn).await?;
+        }
         fence.ensure_fresh_on(conn).await?;
         Ok(fence)
     }
@@ -229,6 +240,12 @@ impl AcceptedInputRepository {
         bytes += serde_json::to_vec(&body.fields)?.len();
         let mut origins = Vec::new();
         let mut parents = Vec::new();
+        controls::validate(&body)?;
+        controls::require_current(conn, &body).await?;
+        for control in &body.controls {
+            origins.push(control.origin());
+            parents.push(control.receipt);
+        }
         for field in body.fields {
             for origin in field.provenance()?.origins {
                 if overlaps(&field.json_path, &site.path) && typed_receipt(&origin) {
@@ -243,7 +260,7 @@ impl AcceptedInputRepository {
                 }
             }
         }
-        if origins.len() > 256 {
+        if origins.len() > 256 || parents.len() > 256 {
             return Err(denied());
         }
         Ok((admission, origins, bytes, parents))
@@ -255,6 +272,17 @@ impl AcceptedInputRepository {
         execution: Id,
         encryption_key: &str,
     ) -> Result<()> {
+        Self::seal_execution_with_controls(conn, execution, encryption_key, &[]).await
+    }
+
+    /// Root controls must have been prepared before destination locks, in this
+    /// physical transaction. An omitted root fails even on an existing seal.
+    pub async fn seal_execution_with_controls(
+        conn: &mut PgConnection,
+        execution: Id,
+        encryption_key: &str,
+        controls: &[ReceiptContext],
+    ) -> Result<()> {
         let record = RuntimeAuthorityRepository::execution_admission(conn, execution)
             .await?
             .ok_or_else(denied)?;
@@ -264,12 +292,19 @@ impl AcceptedInputRepository {
             .await?
             .ok_or_else(denied)?;
         bounded(&serde_json::to_value(&body)?)?;
+        controls::require_held(conn, &body, encryption_key, controls).await?;
+        for control in controls {
+            fence = fence.intersect(control.accepted_fence());
+        }
         if let Some((id, saved, expected, key_hash)) = saved(conn, record.id).await? {
             validate_saved(&saved, &expected, &key_hash, encryption_key)?;
             if serde_json::to_value(&body)? != saved {
                 return Err(denied());
             }
             Self::publish_first_receipts(conn, id, execution, &body.fields, encryption_key).await?;
+            for control in controls {
+                control.ensure_fresh_on(conn).await?;
+            }
             return fence.ensure_fresh_on(conn).await;
         }
         let original:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_accepted_input_epoch WHERE admission = $1 AND transaction_id = pg_current_xact_id()::TEXT)")
@@ -474,6 +509,9 @@ impl AcceptedInputRepository {
         )
         .await?;
         Self::publish_first_receipts(conn, id, execution, &body.fields, encryption_key).await?;
+        for control in controls {
+            control.ensure_fresh_on(conn).await?;
+        }
         fence.ensure_fresh_on(conn).await
     }
 
@@ -518,6 +556,49 @@ impl AcceptedInputRepository {
         Ok(())
     }
 
+    /// The complete original accepted CONFIG, before any child defaults are
+    /// applied. Public roots need no invented secret origin or live-row pin.
+    pub(crate) async fn prepare_config_root(
+        conn: &mut PgConnection,
+        renderer: Id,
+        execution: Id,
+        key: &str,
+    ) -> Result<PreparedInputSource> {
+        Self::prepare_config_source(conn, renderer, execution, "", key).await
+    }
+
+    /// One actual supplied top-level parameter, not the final defaulted child
+    /// object. Prepare these from the original root's keys before child defaults.
+    pub(crate) async fn prepare_config_path(
+        conn: &mut PgConnection,
+        renderer: Id,
+        execution: Id,
+        path: &str,
+        key: &str,
+    ) -> Result<PreparedInputSource> {
+        config_key(path).ok_or_else(denied)?;
+        Self::prepare_config_source(conn, renderer, execution, path, key).await
+    }
+
+    async fn prepare_config_source(
+        conn: &mut PgConnection,
+        renderer: Id,
+        execution: Id,
+        path: &str,
+        key: &str,
+    ) -> Result<PreparedInputSource> {
+        let site = InputSite {
+            execution,
+            kind: InputEntityKind::ExecutionConfig,
+            purpose: InputSitePurpose::Value,
+            path: path.into(),
+        };
+        let evidence = Self::field(conn, &site, key).await?;
+        let receipt = InheritedInputRepository::record_accepted(conn, &site, evidence, key).await?;
+        InheritedInputRepository::prepare_source(conn, renderer, &site, &receipt.origin(), key)
+            .await
+    }
+
     /// The source is always the original accepted CONFIG field. A result or
     /// variables pointer cannot borrow its receipt, even at the same path.
     pub async fn prepare_source(
@@ -528,7 +609,26 @@ impl AcceptedInputRepository {
         encryption_key: &str,
     ) -> Result<PreparedInputSource> {
         let evidence = Self::field(conn, site, encryption_key).await?;
-        if &evidence.provenance != original {
+        let mut expected = original.clone();
+        // Root controls are authenticated acceptance dependencies, not supplied
+        // field provenance and never a claim about the field's value.
+        for (receipt, parent) in &evidence.parents {
+            if parent.execution == site.execution
+                && parent.kind == InputEntityKind::ExecutionConfig
+                && parent.purpose == InputSitePurpose::Control
+                && parent.path.is_empty()
+            {
+                expected.merge(SecretProvenance {
+                    origins: vec![SecretOrigin::Entity {
+                        entity_type: parent.kind.origin_kind(parent.purpose),
+                        entity_id: *receipt,
+                        path: parent.path.clone(),
+                    }],
+                    templates: vec![],
+                });
+            }
+        }
+        if evidence.provenance != expected {
             return Err(denied());
         }
         let receipt =
@@ -567,7 +667,12 @@ impl AcceptedInputRepository {
         if record.owner_kind != "execution" || record.owner_id != site.execution {
             return Err(denied());
         }
-        let fence = RuntimeAuthorityRepository::retained_admission_fence(conn, admission).await?;
+        let mut fence =
+            RuntimeAuthorityRepository::retained_admission_fence(conn, admission).await?;
+        let controls = controls::reopen(conn, &body, encryption_key).await?;
+        for control in &controls {
+            fence = fence.intersect(control.accepted_fence());
+        }
         if let Some(current) = load_body(conn, site.execution, admission).await? {
             if current != body {
                 return Err(denied());
@@ -582,9 +687,7 @@ impl AcceptedInputRepository {
             .iter()
             .filter(|field| overlaps(&field.json_path, &site.path))
             .collect::<Vec<_>>();
-        if selected.is_empty() {
-            return Err(denied());
-        }
+        let has_selected_fields = !selected.is_empty();
         let mut provenance = SecretProvenance::default();
         for field in selected {
             provenance.merge(field.provenance()?);
@@ -592,11 +695,31 @@ impl AcceptedInputRepository {
         if provenance.origins.len() > 256 {
             return Err(denied());
         }
-        let value = restore(&body, encryption_key)?
-            .pointer(&site.path)
-            .cloned()
-            .ok_or_else(denied)?;
+        let restored = restore(&body, encryption_key)?;
+        require_field_selection(&site.path, has_selected_fields, &restored)?;
+        if site.path.is_empty() || !has_selected_fields {
+            if !restored.is_object() {
+                return Err(denied());
+            }
+            let schema: super::schema_contract::ActionSchemaBinding =
+                serde_json::from_value(body.schema.clone())?;
+            schema.validate()?;
+            crate::value_schema::CompiledContract::new(&schema.input)
+                .map_err(|_| denied())?
+                .validate(&restored)
+                .map_err(|_| denied())?;
+        }
+        let value = restored.pointer(&site.path).cloned().ok_or_else(denied)?;
         let mut parents = Vec::new();
+        for control in &body.controls {
+            provenance.merge(SecretProvenance {
+                origins: vec![control.origin()],
+                templates: vec![],
+            });
+        }
+        if provenance.origins.len() > 256 {
+            return Err(denied());
+        }
         for origin in &provenance.origins {
             if typed_receipt(origin) {
                 let parent = InheritedInputRepository::receipt_source_site(conn, origin).await?;
@@ -606,6 +729,9 @@ impl AcceptedInputRepository {
             }
         }
         fence.ensure_fresh_on(conn).await?;
+        for control in &controls {
+            control.ensure_fresh_on(conn).await?;
+        }
         Ok(AcceptedFieldEvidence {
             accepted: id,
             admission: record,
@@ -614,6 +740,123 @@ impl AcceptedInputRepository {
             fence,
             parents,
         })
+    }
+
+    /// Keyless public reads may prove only that the source has no controls.
+    pub(crate) async fn require_no_input_controls(
+        conn: &mut PgConnection,
+        execution: Id,
+    ) -> Result<()> {
+        let record = RuntimeAuthorityRepository::execution_admission(conn, execution)
+            .await?
+            .ok_or_else(denied)?;
+        if let Some((_, body, expected, _)) = saved(conn, record.id).await? {
+            require_uncontrolled_body(&body, &expected, execution, record.id)?;
+        }
+        if !controls::load(conn, execution, record.id).await?.is_empty() {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    /// A public source may precede acceptance only when no controls exist.
+    pub(crate) async fn prepare_public_source_controls(
+        conn: &mut PgConnection,
+        execution: Id,
+        key: &str,
+    ) -> Result<Vec<ReceiptContext>> {
+        let record = RuntimeAuthorityRepository::execution_admission(conn, execution)
+            .await?
+            .ok_or_else(denied)?;
+        if saved(conn, record.id).await?.is_some() {
+            return Self::prepare_input_controls(conn, execution, key).await;
+        }
+        if !controls::load(conn, execution, record.id).await?.is_empty() {
+            return Err(denied());
+        }
+        Ok(vec![])
+    }
+
+    /// Reopen the authenticated original root manifest, never synthesize a seal.
+    /// Keep the returned contexts through the effect and check them on its transaction.
+    pub async fn prepare_input_controls(
+        conn: &mut PgConnection,
+        execution: Id,
+        key: &str,
+    ) -> Result<Vec<ReceiptContext>> {
+        let record = RuntimeAuthorityRepository::execution_admission(conn, execution)
+            .await?
+            .ok_or_else(denied)?;
+        let (id, body, expected, key_hash) = saved(conn, record.id).await?.ok_or_else(denied)?;
+        validate_saved(&body, &expected, &key_hash, key)?;
+        let body: Body = serde_json::from_value(body)?;
+        if body.execution != execution
+            || body.admission != record.id
+            || fields(conn, ENTITY_ACCEPTED_INPUT, id).await? != body.fields
+        {
+            return Err(denied());
+        }
+        if let Some(current) = load_body(conn, execution, record.id).await? {
+            if current != body {
+                return Err(denied());
+            }
+        }
+        let controls = controls::reopen(conn, &body, key).await?;
+        RuntimeAuthorityRepository::retained_admission_fence(conn, record.id)
+            .await?
+            .ensure_fresh_on(conn)
+            .await?;
+        Ok(controls)
+    }
+}
+
+// The immutable row and its canonical digest attest absence, not read authority.
+fn require_uncontrolled_body(
+    value: &Value,
+    expected: &str,
+    execution: Id,
+    admission: Id,
+) -> Result<()> {
+    bounded(value)?;
+    if hash(value)? != expected {
+        return Err(denied());
+    }
+    let body: Body = serde_json::from_value(value.clone()).map_err(|_| denied())?;
+    if body.execution != execution
+        || body.admission != admission
+        || !body.controls.is_empty()
+        || hash(&serde_json::to_value(&body)?)? != expected
+    {
+        return Err(denied());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod public_source_control_tests {
+    use super::*;
+
+    fn original() -> Value {
+        serde_json::json!({"execution":1,"admission":2,"config":{},"fields":[],"contributors":[],"schema":{}})
+    }
+
+    #[test]
+    fn keyless_absence_requires_canonical_uncontrolled_body() {
+        let value = original();
+        assert!(require_uncontrolled_body(&value, &hash(&value).unwrap(), 1, 2).is_ok());
+        assert!(require_uncontrolled_body(&value, "wrong digest", 1, 2).is_err());
+        assert!(require_uncontrolled_body(&value, &hash(&value).unwrap(), 3, 2).is_err());
+        assert!(require_uncontrolled_body(&value, &hash(&value).unwrap(), 1, 3).is_err());
+        for controls in [
+            serde_json::json!([]),
+            serde_json::json!([{}]),
+            serde_json::json!({}),
+            Value::Null,
+        ] {
+            let mut value = original();
+            value["controls"] = controls;
+            assert!(require_uncontrolled_body(&value, &hash(&value).unwrap(), 1, 2).is_err());
+        }
     }
 }
 
@@ -655,6 +898,7 @@ async fn load_body(conn: &mut PgConnection, execution: Id, admission: Id) -> Res
         fields,
         contributors,
         schema,
+        controls: controls::load(conn, execution, admission).await?,
     }))
 }
 async fn fields(conn: &mut PgConnection, kind: &str, id: Id) -> Result<Vec<Field>> {
@@ -896,4 +1140,54 @@ fn denied() -> Error {
 }
 fn typed_receipt(origin: &SecretOrigin) -> bool {
     matches!(origin,SecretOrigin::Entity {entity_type,..} if entity_type.starts_with("declared_input:"))
+}
+
+/// Exactly one canonical JSON pointer segment, including escaped '/' and '~'.
+fn config_key(path: &str) -> Option<String> {
+    let segment = path.strip_prefix('/')?;
+    if segment.contains('/') {
+        return None;
+    }
+    let key = segment.replace("~1", "/").replace("~0", "~");
+    (key.replace('~', "~0").replace('/', "~1") == segment).then_some(key)
+}
+
+fn require_field_selection(path: &str, selected: bool, config: &Value) -> Result<()> {
+    if selected {
+        return Ok(());
+    }
+    let object = config.as_object().ok_or_else(denied)?;
+    if !path.is_empty() && !config_key(path).is_some_and(|key| object.contains_key(&key)) {
+        return Err(denied());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod config_root_tests {
+    use super::{config_key, require_field_selection};
+
+    #[test]
+    fn public_config_requires_root_or_actual_top_level_key() {
+        let config = serde_json::json!({"public": {"nested": 1}, "a/b~c": null, "": 2});
+        assert!(require_field_selection("", false, &config).is_ok());
+        assert!(require_field_selection("", true, &config).is_ok());
+        assert!(require_field_selection("/public", false, &config).is_ok());
+        assert!(require_field_selection("/a~1b~0c", false, &config).is_ok());
+        assert!(require_field_selection("/", false, &config).is_ok());
+        assert!(require_field_selection("/unknown", false, &config).is_err());
+        assert!(require_field_selection("/public/nested", false, &config).is_err());
+        assert!(require_field_selection("/secret/nested", true, &config).is_ok());
+        assert!(require_field_selection("", false, &serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn config_path_requires_one_canonical_pointer_segment() {
+        assert_eq!(config_key("/a~1b~0c").as_deref(), Some("a/b~c"));
+        assert_eq!(config_key("/a~01b").as_deref(), Some("a~1b"));
+        assert_eq!(config_key("/").as_deref(), Some(""));
+        for path in ["", "public", "/a/b", "/a~", "/a~2b", "//"] {
+            assert!(config_key(path).is_none(), "{path}");
+        }
+    }
 }

@@ -35,6 +35,7 @@ pub(super) enum Case {
     DependentExpiry(usize),
     Cache(usize, bool),
     CacheExpiry(usize),
+    EmptyControlExpiry(usize),
 }
 impl Case {
     pub(super) fn index(&self) -> usize {
@@ -47,6 +48,7 @@ impl Case {
             | Self::DependentExpiry(index)
             | Self::Cache(index, _)
             | Self::CacheExpiry(index)
+            | Self::EmptyControlExpiry(index)
             | Self::Initial(index, _) => *index,
         }
     }
@@ -286,7 +288,11 @@ pub(super) async fn lifecycle(
         Case::Terminal(_, source_status, _) => Some(*source_status),
         Case::Overwrite(_) => Some("failed"),
         Case::Dependent(_) | Case::DependentExpiry(_) | Case::DependentChild(_) => Some("failed"),
-        Case::Delivery(_) | Case::Initial(..) | Case::Cache(..) | Case::CacheExpiry(_) => None,
+        Case::Delivery(_)
+        | Case::Initial(..)
+        | Case::Cache(..)
+        | Case::CacheExpiry(_)
+        | Case::EmptyControlExpiry(_) => None,
     };
     if let Some(source_status) = source_status {
         let mut tx = pool.begin().await.unwrap();
@@ -440,7 +446,11 @@ pub(super) async fn lifecycle(
         Case::Terminal(_, _, published) => Some(*published),
         Case::Overwrite(_) => Some("native_failed"),
         Case::Dependent(_) | Case::DependentExpiry(_) | Case::DependentChild(_) => Some("b"),
-        Case::Delivery(_) | Case::Initial(..) | Case::Cache(..) | Case::CacheExpiry(_) => None,
+        Case::Delivery(_)
+        | Case::Initial(..)
+        | Case::Cache(..)
+        | Case::CacheExpiry(_)
+        | Case::EmptyControlExpiry(_) => None,
     };
     if let Some(published) = published {
         let metadata = child.workflow_task.as_ref().unwrap();
@@ -895,4 +905,304 @@ pub(super) async fn expiry(
             .state,
         attune_common::models::WorkflowTaskWaitState::Waiting
     );
+}
+
+// The caller supplies the unchanged original approval deadline. This case does
+// not issue consent, modify policy, or extend any persisted deadline.
+pub(super) async fn empty_control_expiry(
+    pool: &sqlx::PgPool,
+    workflow: Id,
+    task: &str,
+    target: Target,
+    key: &str,
+    expires_at: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    use attune_common::repositories::{
+        accepted_input::AcceptedInputRepository as Accepted,
+        declared_input::DeclaredInputRepository as Declarations,
+        declared_input_materialization::DeclaredInputMaterializationRepository as Materialize,
+        inherited_input::{
+            InheritedInputRepository as Inputs, InputEntityKind, InputSite, InputSitePurpose,
+        },
+    };
+
+    let mut tx = pool.begin().await?;
+    // Only change the real target's terminal state. Its approval is untouched.
+    let Target::Execution(target) = target else {
+        anyhow::bail!("empty CONTROL case owns an actual execution target");
+    };
+    let updated = ExecutionRepository::update(
+        &mut *tx,
+        target,
+        attune_common::repositories::execution::UpdateExecutionInput {
+            status: Some(ExecutionStatus::Failed),
+            ..Default::default()
+        },
+    )
+    .await;
+    if let Err(error) = updated {
+        tx.rollback().await?;
+        return Err(error.into());
+    }
+    tx.commit().await?;
+
+    let mut tx = pool.begin().await?;
+    let issued: anyhow::Result<Id> = async {
+        attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
+            &mut tx,
+            attune_common::repositories::cache::CacheTransactionMode::PinMutation,
+        )
+        .await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
+        let wait = Waits::find_by_workflow_task(&mut *tx, workflow, task)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("owned wait missing"))?;
+        let mut plan = Continue::prepare(&mut tx, &wait, Some(key))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("actual terminal continuation missing"))?;
+        let children = plan.apply(&mut tx, key).await?;
+        anyhow::ensure!(children.len() == 1);
+        let child = &children[0];
+        anyhow::ensure!(
+            child.config.clone().unwrap_or_else(|| json!({})) == json!({}),
+            "authored empty recovery input must stay empty"
+        );
+        anyhow::ensure!(
+            Secrets::find_stored_by_entity(&mut *tx, "execution_config", child.id)
+                .await?
+                .is_empty()
+        );
+        plan.ensure_fresh_on(&mut tx).await?;
+        Ok(child.id)
+        // Drop the plan and children before opening the first persisted proof.
+    }
+    .await;
+    let child = match issued {
+        Ok(child) => {
+            tx.commit().await?;
+            child
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(error);
+        }
+    };
+    let original: (serde_json::Value, String) =
+        sqlx::query_as("SELECT body,body_digest FROM runtime_accepted_input WHERE execution=$1")
+            .bind(child)
+            .fetch_one(pool)
+            .await?;
+    let root = Workflows::find_by_id(pool, workflow)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("owning workflow missing"))?
+        .execution;
+    let produced = ExecutionRepository::update(
+        pool,
+        child,
+        attune_common::repositories::execution::UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            result: Some(json!({"probe":"public-probe"})),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let mut tx = pool.begin().await?;
+    let positive: anyhow::Result<_> = async {
+        attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
+            &mut tx,
+            attune_common::repositories::cache::CacheTransactionMode::PinMutation,
+        )
+        .await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
+        let roots = Accepted::prepare_input_controls(&mut tx, child, key).await?;
+        anyhow::ensure!(roots.len() == 1);
+        anyhow::ensure!(
+            roots[0].approval_deadline() == Some(expires_at),
+            "empty child CONTROL must retain the actual selected-read approval deadline"
+        );
+        roots[0].ensure_fresh_on(&mut tx).await?;
+        Accepted::revalidate_execution(&mut tx, child, key)
+            .await?
+            .ensure_fresh_on(&mut tx)
+            .await?;
+        anyhow::ensure!(
+            Secrets::find_stored_by_entity(&mut *tx, "execution_result", child)
+                .await?
+                .is_empty()
+        );
+        let task_path = Materialize::workflow_task_site_path(
+            &mut tx,
+            root,
+            "native_after_recovery",
+            &produced.action_ref,
+        )
+        .await?;
+        let mut bindings = Declarations::bindings(&mut tx, root)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                binding.source_path == format!("{task_path}/params/probe")
+                    && binding.expression == "{{ task.native_recovery.probe }}"
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            bindings.len() == 1,
+            "use the actual captured downstream declaration"
+        );
+        let binding = bindings
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("downstream declaration missing"))?;
+        let source_site = InputSite {
+            execution: child,
+            kind: InputEntityKind::ExecutionResult,
+            purpose: InputSitePurpose::Value,
+            path: "/probe".into(),
+        };
+        let mut keyless = Inputs::begin_render(
+            &mut tx,
+            root,
+            &binding.declaration_revision,
+            &binding.source_path,
+            &binding.expression,
+            InputSitePurpose::Value,
+        )
+        .await?;
+        anyhow::ensure!(matches!(
+            Inputs::bind_public_field(
+                &mut tx,
+                &mut keyless,
+                "/task/native_recovery/probe",
+                &source_site
+            )
+            .await,
+            Err(attune_common::Error::PermissionDenied(_))
+        ));
+        // Ignoring the failed bind must not have inserted its public value.
+        anyhow::ensure!(Inputs::evaluate(&mut tx, keyless).await.is_err());
+        let mut session = Inputs::begin_render(
+            &mut tx,
+            root,
+            &binding.declaration_revision,
+            &binding.source_path,
+            &binding.expression,
+            InputSitePurpose::Value,
+        )
+        .await?;
+        Inputs::bind_public_field_with_key(
+            &mut tx,
+            &mut session,
+            "/task/native_recovery/probe",
+            &source_site,
+            key,
+        )
+        .await?;
+        let rendered = Inputs::evaluate(&mut tx, session).await?;
+        anyhow::ensure!(rendered.value() == &json!("public-probe"));
+        anyhow::ensure!(rendered.approval_deadline() == Some(expires_at));
+        let destination = InputSite {
+            execution: root,
+            kind: InputEntityKind::WorkflowVariables,
+            purpose: InputSitePurpose::Value,
+            path: binding.source_path.clone(),
+        };
+        let prepared = Inputs::prepare_destination(&mut tx, &rendered, &destination, key).await?;
+        let receipt = Inputs::record_prepared(
+            &mut tx,
+            &rendered,
+            &prepared,
+            rendered.value(),
+            rendered.selections(),
+            key,
+        )
+        .await?;
+        receipt.ensure_fresh_on(&mut tx).await?;
+        anyhow::ensure!(receipt.approval_deadline() == Some(expires_at));
+        Ok((
+            destination,
+            receipt.origin(),
+            roots[0].origin(),
+            source_site,
+            binding,
+        ))
+    }
+    .await;
+    let (public_site, public_origin, root_origin, source_site, binding) = match positive {
+        Ok(evidence) => {
+            tx.commit().await?;
+            evidence
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(error);
+        }
+    };
+    let mut tx = pool.begin().await?;
+    let reopened: anyhow::Result<()> = async {
+        attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
+            &mut tx,
+            attune_common::repositories::cache::CacheTransactionMode::PinMutation,
+        )
+        .await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
+        let receipt = Inputs::receipt_context(&mut tx, &public_site, &public_origin, key).await?;
+        receipt.ensure_fresh_on(&mut tx).await?;
+        anyhow::ensure!(receipt.approval_deadline() == Some(expires_at));
+        anyhow::ensure!(receipt
+            .source_receipts()
+            .iter()
+            .any(|source| source.origin() == root_origin));
+        Ok(())
+    }
+    .await;
+    tx.rollback().await?;
+    reopened?;
+
+    // Every issued proof has been dropped. Observe PostgreSQL's real clock at
+    // the original deadline, without editing consent rows or mocking time.
+    loop {
+        let now: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await?;
+        anyhow::ensure!(
+            now < expires_at + chrono::Duration::seconds(10),
+            "missed original expiry observation budget"
+        );
+        if now >= expires_at {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut tx = pool.begin().await?;
+    let negative: anyhow::Result<()> = async {
+        attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
+            &mut tx, attune_common::repositories::cache::CacheTransactionMode::PinMutation,
+        ).await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+        let admission = attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(&mut tx, child)
+            .await?.ok_or_else(|| anyhow::anyhow!("actual child admission missing"))?;
+        attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::retained_admission_fence(&mut tx, admission.id)
+            .await?.ensure_fresh_on(&mut tx).await?;
+        let unchanged: (serde_json::Value, String) = sqlx::query_as(
+            "SELECT body,body_digest FROM runtime_accepted_input WHERE execution=$1",
+        ).bind(child).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(unchanged == original, "original accepted body must not be resealed or rewritten");
+        anyhow::ensure!(matches!(Accepted::prepare_input_controls(&mut tx, child, key).await,
+            Err(attune_common::Error::PermissionDenied(_))), "persisted CONTROL must reject original consent expiry");
+        anyhow::ensure!(matches!(Accepted::revalidate_execution(&mut tx, child, key).await,
+            Err(attune_common::Error::PermissionDenied(_))), "empty accepted input must not erase the expired root fence");
+        anyhow::ensure!(matches!(Inputs::receipt_context(&mut tx, &public_site, &public_origin, key).await,
+            Err(attune_common::Error::PermissionDenied(_))), "public receipt must retain the producer's original expiry");
+        let mut session = Inputs::begin_render(&mut tx, root, &binding.declaration_revision,
+            &binding.source_path, &binding.expression, InputSitePurpose::Value).await?;
+        anyhow::ensure!(matches!(Inputs::bind_public_field_with_key(&mut tx, &mut session,
+            "/task/native_recovery/probe", &source_site, key).await, Err(attune_common::Error::PermissionDenied(_))),
+            "new public binding must not bypass original CONTROL expiry");
+        Ok(())
+    }.await;
+    tx.rollback().await?;
+    negative
 }

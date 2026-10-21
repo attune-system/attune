@@ -121,7 +121,12 @@ for drop. Readers do not acquire admission.
 Cleanup queues for admission under the actual remaining cleanup-cycle budget,
 not the short DDL lock timeout. The supervisor passes that remaining budget to
 the repository for each candidate. Pool acquisition, transaction setup, admission,
-DDL, rollback and commit acknowledgement all share its monotonic deadline.
+DDL and commit acknowledgement retain the original monotonic business deadline D.
+Normal rollback also uses D. If that deadline interrupts transaction work, only
+protocol drain and explicit root ROLLBACK may continue until absolute D + 500ms.
+This fixed completion grace is not a renewed budget from the time recovery starts,
+does not shorten admission, and permits no new admission, DDL, commit or business
+SQL. Overflow of either absolute deadline is rejected before pool acquisition.
 Admission has server-local statement and lock timeouts bounded by the remaining
 cycle; it takes no parent relation lock. After admission, cleanup applies the
 unchanged DDL limits, clamped again to the time actually left. The SQL function's
@@ -132,10 +137,14 @@ An admission timeout is `DeferredDeadline`, including `55P03` when the cycle-bou
 lock timer wins the race with `57014`. In the DDL phase, `55P03` is `DeferredBusy`
 when the short lock limit wins, or `DeferredDeadline` when that limit was clamped
 to the cycle deadline; `57014` remains `DeferredDeadline`. Structured cleanup logs
-record the phase and admission duration. A transport deadline or task cancellation
-discards the connection rather than returning pending SQL/rollback to the pool;
-dropping a Rust future alone does not cancel a PostgreSQL statement. Server timers
-still bound pending SQL. An unacknowledged commit is an error with an uncertain
+record the phase and admission duration. On a client deadline, successful deferral
+requires draining pending responses and awaiting explicit ROLLBACK acknowledgement
+on the same physical connection within the completion grace. Failure to acknowledge
+is an error, not a claimed deferral or proof that the backend is gone. The connection
+is discarded after recovery, including after successful acknowledgement. Caller
+cancellation retains the socket-discard fallback; Drop spawns no recovery task.
+Dropping a Rust future alone does not cancel a PostgreSQL statement. Server timers
+still bound pending SQL. An unacknowledged commit remains an error with an uncertain
 outcome, never a claimed drop or deferral. Only acknowledged committed reclamation
 increments supervisor drop and usage counters. This ordering does not establish
 benchmark performance acceptance.

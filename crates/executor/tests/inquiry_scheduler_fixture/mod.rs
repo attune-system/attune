@@ -1,6 +1,7 @@
 // Included only in scheduler::tests. This does not sign or enable credentials.
 const INQUIRY_SCHEDULER_INPUT_KEY: &str = "inquiry-scheduler-fixture-only-input-encryption";
 const INQUIRY_WAIT_TARGET_PERMISSION: &str = "scheduler_inquiry_it.wait_target_execute";
+const INQUIRY_WAIT_READ_PERMISSION: &str = "scheduler_inquiry_it.wait_source_read";
 
 enum InquiryFixtureSource {
     Human(i64),
@@ -17,11 +18,17 @@ async fn create_admitted_inquiry_fixture_executions(
 ) -> Result<(Execution, i64, Execution)> {
     use attune_common::{
         repositories::{
+            action::UpdateActionInput,
             component_lifecycle::PackProjectionIds,
             execution_secret_value::ExecutionSecretValueRepository,
+            identity::{
+                CreatePermissionAssignmentInput, CreatePermissionSetInput,
+                PermissionAssignmentRepository,
+            },
             managed_executable::ManagedExecutableRepository,
             native_workflow_materialization::NativeWorkflowMaterializationRepository as Variables,
-            runtime_authority::RuntimeAuthorityRepository, schema_type::SchemaTypeRepository,
+            runtime_authority::RuntimeAuthorityRepository,
+            schema_type::SchemaTypeRepository,
         },
         runtime_authority::{
             InvocationBinding, InvocationPolicy, PermissionSetDefinition, RuntimePolicy,
@@ -34,6 +41,10 @@ async fn create_admitted_inquiry_fixture_executions(
     let request_action = actions
         .get(1)
         .ok_or_else(|| anyhow::anyhow!("inquiry fixture requires its request action"))?;
+    let guarded_action = actions
+        .iter()
+        .find(|action| action.r#ref == "scheduler_inquiry_it.guarded")
+        .ok_or_else(|| anyhow::anyhow!("inquiry fixture requires its guarded wait action"))?;
     ActionRepository::link_workflow_def(pool, workflow_action.id, definition.id).await?;
     let requester = IdentityRepository::create(
         pool,
@@ -42,6 +53,53 @@ async fn create_admitted_inquiry_fixture_executions(
             display_name: None,
             password_hash: None,
             attributes: serde_json::json!({}),
+        },
+    )
+    .await?;
+    // Author both the selected native capability and the original human's
+    // source-read authority before any release, policy or input capture.
+    // These sources have no authored stable IDs yet. Their actual pinned pack
+    // ownership supplies the scope; native wait validation still checks the
+    // exact workflow, descendant tree or requesting root for each target.
+    let read_definition: PermissionSetDefinition = serde_json::from_value(serde_json::json!({
+        "ref": INQUIRY_WAIT_READ_PERMISSION,
+        "grants": [
+            {"resource": "executions", "actions": ["read", "decrypt"],
+             "constraints": {"pack_refs": [pack.r#ref.clone()]}},
+            {"resource": "inquiries", "actions": ["read", "decrypt"],
+             "constraints": {"pack_refs": [pack.r#ref.clone()]}},
+            {"resource": "queue_items", "actions": ["read", "decrypt"],
+             "constraints": {"pack_refs": [pack.r#ref.clone()]}}
+        ]
+    }))?;
+    let read_permission = PermissionSetRepository::create(
+        pool,
+        CreatePermissionSetInput {
+            r#ref: read_definition.reference.clone(),
+            pack: Some(pack.id),
+            pack_ref: Some(pack.r#ref.clone()),
+            label: None,
+            description: None,
+            grants: serde_json::to_value(&read_definition.grants)?,
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        pool,
+        CreatePermissionAssignmentInput {
+            identity: requester.id,
+            permset: read_permission.id,
+        },
+    )
+    .await?;
+    // Every use of this action in the authored graph is a guarded wait. Root,
+    // request and recovery actions retain their original empty read selections.
+    ActionRepository::update(
+        pool,
+        guarded_action.id,
+        UpdateActionInput {
+            default_execution_permission_set_refs: Some(vec![INQUIRY_WAIT_READ_PERMISSION.into()]),
+            ..Default::default()
         },
     )
     .await?;
@@ -68,6 +126,7 @@ async fn create_admitted_inquiry_fixture_executions(
         release.id,
         &PackProjectionIds {
             actions: actions.iter().map(|action| action.id).collect(),
+            permission_sets: vec![read_permission.id],
             work_queues: vec![queue_id],
             ..Default::default()
         },
@@ -86,6 +145,7 @@ async fn create_admitted_inquiry_fixture_executions(
         }]
     }))?;
     let target_set = target_definition.compile(&owner, &[])?;
+    let read_set = read_definition.compile(&owner, &[])?;
     let invocation = |binding| InvocationPolicy {
         metadata_revision: None,
         source_id: None,
@@ -119,11 +179,21 @@ async fn create_admitted_inquiry_fixture_executions(
             .get("action")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow::anyhow!("inquiry fixture requires static action targets"))?;
-        invocations.push(invocation(InvocationBinding::WorkflowTask {
+        let mut selected = invocation(InvocationBinding::WorkflowTask {
             workflow_ref: workflow_action.r#ref.clone(),
             task_path: format!("/tasks/{index}"),
             action_ref: action_ref.into(),
-        }));
+        });
+        if action_ref == guarded_action.r#ref {
+            anyhow::ensure!(
+                task.get("wait_for").is_some_and(|wait| !wait.is_null()),
+                "only authored guarded waits may select source-read authority"
+            );
+            selected
+                .permission_sets
+                .insert(read_set.reference.clone(), read_set.clone());
+        }
+        invocations.push(selected);
     }
     // No queue invocation is fabricated. This fixture observes persisted queue
     // item lifecycle metadata, never admits or dispatches the queue's workload.
@@ -484,6 +554,88 @@ async fn accept_inquiry_fixture_action(
     Ok(execution)
 }
 
+// Stop at the real child-admission boundary, before one-shot config initialization.
+// The caller owns the transaction and must roll it back after each input case.
+async fn create_uninitialized_inquiry_fixture_child(
+    conn: &mut PgConnection,
+    fixture: &InquirySchedulerFixture,
+    task: &TaskNode,
+) -> Result<(
+    Execution,
+    attune_common::repositories::schema_contract::ActionSchemaBinding,
+)> {
+    use attune_common::repositories::{
+        execution_admission::ExecutionAdmissionRepository as Admission,
+        runtime_authority::RuntimeOwner,
+        schema_contract::{BindingOwner, SchemaContractRepository},
+    };
+    let action_ref = task
+        .action
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("static fixture task required"))?;
+    let snapshot = ExecutionScheduler::workflow_task_snapshot_with_conn(
+        conn,
+        &fixture.parent,
+        action_ref,
+        &task.name,
+    )
+    .await?;
+    let binding = Admission::workflow_schema(conn, fixture.parent.id, &snapshot).await?;
+    let metadata = WorkflowTaskMetadata {
+        workflow_execution: fixture.workflow_execution_id,
+        task_name: task.name.clone(),
+        triggered_by: Some("request".into()),
+        task_index: None,
+        task_batch: None,
+        retry_count: 0,
+        max_retries: 0,
+        next_retry_at: None,
+        timeout_seconds: None,
+        timed_out: false,
+        duration_ms: None,
+        started_at: None,
+        completed_at: None,
+    };
+    let created = Admission::create_workflow_task_if_absent_pinned_with_conn(
+        conn,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: action_ref.into(),
+            parent: Some(fixture.parent.id),
+            executor: fixture.parent.executor,
+            enforcement: fixture.parent.enforcement,
+            permission_set_refs: ExecutionScheduler::workflow_task_permission_set_refs(
+                task,
+                &snapshot.executable.action,
+                &fixture.context,
+            )?,
+            config: None,
+            status: ExecutionStatus::Requested,
+            workflow_task: Some(metadata),
+            ..Default::default()
+        },
+        &snapshot,
+        fixture.workflow_execution_id,
+        &task.name,
+        None,
+    )
+    .await?;
+    anyhow::ensure!(
+        created.created,
+        "input case requires its own newly admitted child"
+    );
+    let child = created.execution;
+    anyhow::ensure!(child.config.is_none(), "child must still be uninitialized");
+    Admission::require(conn, RuntimeOwner::Execution(child.id)).await?;
+    anyhow::ensure!(
+        ExecutionRepository::is_in_execution_tree(&mut *conn, fixture.parent.id, child.id, false)
+            .await?,
+        "admitted child must be an actual strict descendant"
+    );
+    SchemaContractRepository::attach(conn, BindingOwner::Execution, child.id, &binding).await?;
+    Ok((child, binding))
+}
+
 #[tokio::test]
 async fn inquiry_scheduler_authored_request_keeps_original_input_acceptance() {
     use attune_common::repositories::accepted_input::AcceptedInputRepository;
@@ -609,4 +761,210 @@ async fn inquiry_scheduler_wait_targets_keep_action_admission_and_parent_ownersh
         "a rejected nested target must not insert a child"
     );
     fixture.database.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_wait_recovery_control_cold_reopen_rejects_value_reuse_and_missing_root() {
+    use attune_common::repositories::{
+        accepted_input::AcceptedInputRepository as Accepted,
+        file_evidence_retention::FileEvidenceRetentionRepository as Retention,
+        inherited_input::{InheritedInputRepository as Inputs, InputSitePurpose},
+        schema_type::SchemaTypeRepository,
+    };
+
+    let fixture = InquirySchedulerFixture::create().await;
+    let prepared: anyhow::Result<(i64, i64)> = async {
+        let snapshot = fixture
+            .request
+            .executable_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("fixture request snapshot missing"))?;
+        let action = fixture
+            .request
+            .action
+            .ok_or_else(|| anyhow::anyhow!("fixture request action missing"))?;
+        let target = accept_inquiry_fixture_action(
+            fixture.database.pool(),
+            snapshot.executable.action.pack,
+            action,
+            &fixture.request.action_ref,
+            InquiryFixtureSource::Execution(fixture.parent.id),
+            Vec::new(),
+            serde_json::json!({}),
+        )
+        .await?;
+        ExecutionRepository::update(
+            fixture.database.pool(),
+            target.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Failed),
+                result: Some(serde_json::json!({"target":true})),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let result = serde_json::json!({"execution_failed":target.id});
+        ExecutionRepository::update(
+            fixture.database.pool(),
+            fixture.request.id,
+            UpdateExecutionInput {
+                result: Some(result.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut context = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        context.set_task_result("request", result);
+        let task = fixture
+            .graph
+            .get_task("execution_failed_guarded")
+            .ok_or_else(|| anyhow::anyhow!("authored failed wait task missing"))?;
+        let mut activation = fixture.database.pool().begin().await?;
+        let activated: anyhow::Result<()> = async {
+            let mut pending = WorkflowPublications::default();
+            ExecutionScheduler::activate_workflow_task_with_conn(
+                &mut activation,
+                &AtomicUsize::new(0),
+                &fixture.parent,
+                &fixture.workflow_execution_id,
+                task,
+                &context,
+                Some(INQUIRY_SCHEDULER_INPUT_KEY),
+                Some("request"),
+                &mut pending,
+                &mut Vec::new(),
+            )
+            .await?;
+            anyhow::ensure!(pending.is_empty());
+            Ok(())
+        }
+        .await;
+        if let Err(error) = activated {
+            activation.rollback().await?;
+            return Err(error);
+        }
+        activation.commit().await?;
+        drop(context);
+
+        let mut advancement = fixture.database.pool().begin().await?;
+        let advanced: anyhow::Result<(i64, i64)> = async {
+            let wait = WorkflowTaskWaitRepository::find_by_workflow_task(
+                &mut *advancement,
+                fixture.workflow_execution_id,
+                "execution_failed_guarded",
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("actual failed wait missing"))?;
+            let checkpoint = NativeWaitCheckpoint::prepare(
+                &mut advancement,
+                &wait,
+                Some(INQUIRY_SCHEDULER_INPUT_KEY),
+            )
+            .await?;
+            anyhow::ensure!(
+                checkpoint.is_some(),
+                "actual terminal checkpoint must prepare"
+            );
+            let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
+                &mut advancement,
+                &AtomicUsize::new(0),
+                Some(INQUIRY_SCHEDULER_INPUT_KEY),
+                &fixture.parent,
+                fixture.workflow_execution_id,
+                "execution_failed_guarded",
+                checkpoint,
+            )
+            .await?;
+            anyhow::ensure!(outcome.execution_requests.len() == 1);
+            let request = &outcome.execution_requests[0];
+            anyhow::ensure!(request.action_ref == "scheduler_inquiry_it.failure_handler");
+            let child = request.execution_id;
+            drop(outcome);
+            Ok((child, wait.id))
+        }
+        .await;
+        match advanced {
+            Ok(ids) => {
+                advancement.commit().await?;
+                Ok(ids)
+            }
+            Err(error) => {
+                advancement.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+    .await;
+    let checked: anyhow::Result<()> = async {
+        let (child, wait) = prepared?;
+        let mut tx = fixture.database.pool().begin().await?;
+        // This test owns a scoped deletion probe. Enter the exclusive collector
+        // gate before source protection, never upgrade an existing source read.
+        let result: anyhow::Result<()> = async {
+            Retention::lock_reclamation(&mut tx).await?;
+            CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation).await?;
+            SchemaTypeRepository::lock_selection(&mut tx).await?;
+            let execution = ExecutionRepository::find_by_id(&mut *tx, child).await?
+                .ok_or_else(|| anyhow::anyhow!("actual recovery child missing"))?;
+            anyhow::ensure!(execution.config.unwrap_or_else(|| serde_json::json!({})) == serde_json::json!({}));
+            let fields = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *tx, "execution_config", child,
+            ).await?;
+            anyhow::ensure!(fields.is_empty(), "CONTROL must survive without any VALUE field");
+            let roots = Accepted::prepare_input_controls(&mut tx, child, INQUIRY_SCHEDULER_INPUT_KEY).await?;
+            anyhow::ensure!(roots.len() == 1);
+            let root = &roots[0];
+            anyhow::ensure!(root.site().execution == child && root.site().path.is_empty());
+            anyhow::ensure!(root.site().purpose == InputSitePurpose::Control);
+            root.ensure_fresh_on(&mut tx).await?;
+            Accepted::revalidate_execution(&mut tx, child, INQUIRY_SCHEDULER_INPUT_KEY)
+                .await?.ensure_fresh_on(&mut tx).await?;
+            let origin = root.origin();
+            let root_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM runtime_input_receipt WHERE execution=$1 AND entity_kind='execution_config' AND destination_purpose='control' AND destination_path=''",
+            ).bind(child).fetch_one(&mut *tx).await?;
+            let encrypted: serde_json::Value = sqlx::query_scalar(
+                "SELECT encrypted_value FROM runtime_input_receipt WHERE id=$1",
+            ).bind(root_id).fetch_one(&mut *tx).await?;
+            anyhow::ensure!(attune_common::crypto::decrypt_json(&encrypted, INQUIRY_SCHEDULER_INPUT_KEY)? == serde_json::json!({"wait":wait}));
+            let mut value_site = root.site().clone();
+            value_site.purpose = InputSitePurpose::Value;
+            anyhow::ensure!(matches!(Inputs::receipt_context(&mut tx, &value_site, &origin, INQUIRY_SCHEDULER_INPUT_KEY).await,
+                Err(attune_common::Error::PermissionDenied(_))),
+                "a real CONTROL origin cannot authenticate a VALUE site");
+            anyhow::ensure!(matches!(Accepted::seal_execution(&mut tx, child, INQUIRY_SCHEDULER_INPUT_KEY).await,
+                Err(attune_common::Error::PermissionDenied(_))),
+                "an existing saved body cannot waive the held-root requirement");
+            drop(roots);
+
+            let original: (serde_json::Value, String) = sqlx::query_as(
+                "SELECT body,body_digest FROM runtime_accepted_input WHERE execution=$1",
+            ).bind(child).fetch_one(&mut *tx).await?;
+            sqlx::query("SAVEPOINT missing_actual_control_root").execute(&mut *tx).await?;
+            let removed = sqlx::query("DELETE FROM runtime_input_receipt WHERE id=$1 AND execution=$2 AND entity_kind='execution_config' AND destination_purpose='control' AND destination_path=''")
+                .bind(root_id).bind(child).execute(&mut *tx).await?.rows_affected();
+            anyhow::ensure!(removed == 1, "probe must remove the actual root, not skip it");
+            let unchanged: (serde_json::Value, String) = sqlx::query_as(
+                "SELECT body,body_digest FROM runtime_accepted_input WHERE execution=$1",
+            ).bind(child).fetch_one(&mut *tx).await?;
+            anyhow::ensure!(unchanged == original, "probe must not rewrite or reseal the accepted body");
+            anyhow::ensure!(matches!(Accepted::prepare_input_controls(&mut tx, child, INQUIRY_SCHEDULER_INPUT_KEY).await,
+                Err(attune_common::Error::PermissionDenied(_))));
+            anyhow::ensure!(matches!(Accepted::revalidate_execution(&mut tx, child, INQUIRY_SCHEDULER_INPUT_KEY).await,
+                Err(attune_common::Error::PermissionDenied(_))),
+                "unchanged authenticated body must reject its missing live root");
+            sqlx::query("ROLLBACK TO SAVEPOINT missing_actual_control_root").execute(&mut *tx).await?;
+            sqlx::query("RELEASE SAVEPOINT missing_actual_control_root").execute(&mut *tx).await?;
+            let restored = Accepted::prepare_input_controls(&mut tx, child, INQUIRY_SCHEDULER_INPUT_KEY).await?;
+            anyhow::ensure!(restored.len() == 1 && restored[0].origin() == origin);
+            Accepted::revalidate_execution(&mut tx, child, INQUIRY_SCHEDULER_INPUT_KEY)
+                .await?.ensure_fresh_on(&mut tx).await?;
+            Ok(())
+        }.await;
+        tx.rollback().await?;
+        result
+    }.await;
+    let cleanup = fixture.database.cleanup().await;
+    cleanup.expect("clean owned database before reporting the probe result");
+    checked.expect("cold empty-input CONTROL recovery and scoped missing-root rejection");
 }

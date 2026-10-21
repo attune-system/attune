@@ -65,7 +65,9 @@ impl Recovery {
             .await
             .map_err(|error| preparation_stage(error, "frame"))?,
         );
-        let completion = if program.successors.is_empty() {
+        let completion = if program.successors.is_empty()
+            && super::completion::can_finish_root(conn, context, frame.source_identity().0).await?
+        {
             Some(Arc::new(
                 PreparedNativeWaitCompletion::prepare(
                     conn,
@@ -95,8 +97,15 @@ impl Recovery {
                 return Err(denied());
             }
             children.push(
-                continuation::prepare_recovery_from_program(conn, context, name, &program, key)
-                    .await?,
+                continuation::prepare_recovery_from_program(
+                    conn,
+                    context,
+                    name,
+                    &program,
+                    observation,
+                    key,
+                )
+                .await?,
             );
         }
         let bytes = children.iter().try_fold(program.bytes()?, |bytes, child| {
@@ -161,7 +170,7 @@ impl Recovery {
         }
         // The caller has already bound/released its exact positive reservation.
         // A's public finalization still checks all normalized transitive releases.
-        let (variables, _) = self
+        let (variables, fields) = self
             .program
             .publish(
                 conn,
@@ -196,21 +205,23 @@ impl Recovery {
             }
         }
         let mut completed = context.workflow.completed_tasks.clone();
-        if !completed.iter().any(|task| task == name) {
-            completed.push(name.into());
+        let progress = self.program.successors.is_empty() && self.completion.is_none();
+        let mut failed = context.workflow.failed_tasks.clone();
+        if progress {
+            if !failed.iter().any(|task| task == name) {
+                failed.push(name.into());
+            }
+        } else {
+            if !completed.iter().any(|task| task == name) {
+                completed.push(name.into());
+            }
+            failed.retain(|task| task != name);
         }
-        let failed = context
-            .workflow
-            .failed_tasks
-            .iter()
-            .filter(|task| task.as_str() != name)
-            .cloned()
-            .collect();
         Workflows::update(
             &mut *conn,
             context.workflow.id,
             super::super::workflow::UpdateWorkflowExecutionInput {
-                variables: Some(variables),
+                variables: Some(variables.clone()),
                 current_tasks: Some(current),
                 completed_tasks: Some(completed),
                 failed_tasks: Some(failed),
@@ -218,6 +229,9 @@ impl Recovery {
             },
         )
         .await?;
+        if progress {
+            self.frame.seal(conn, &variables, &fields).await?;
+        }
         self.ensure_fresh_on(conn).await?;
         Ok(pending)
     }
