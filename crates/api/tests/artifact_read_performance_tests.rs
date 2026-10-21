@@ -626,7 +626,32 @@ async fn distinct_execution_origins_and_workflow_children_use_frontier_batches()
         secret_origins(&ctx, destination, origins.clone()).await?;
         let path = format!("/api/v1/artifacts/{log}");
         let _ = ctx.get(&path, ctx.token()).await?.bytes().await?;
+        if count == 64 {
+            // Exercise connection-local type discovery without background audit
+            // work warming replacement connections outside the measurement.
+            ctx.flush_audit().await?;
+            let mut parked = Vec::new();
+            for _ in 0..ctx.pool.size() {
+                parked.push(ctx.pool.acquire().await?);
+            }
+            for connection in parked {
+                connection.close().await?;
+            }
+            // Complete session setup before measurement, but leave SQLx's
+            // connection-local enum metadata cold on every replacement.
+            let mut replacements = Vec::new();
+            for _ in 0..ctx.pool.options().get_max_connections() {
+                replacements.push(ctx.pool.acquire().await?);
+            }
+            drop(replacements);
+        }
         let (sample, body) = measure(&ctx, &path).await?;
+        if count == 64 {
+            assert!(
+                sample.queries.driver_metadata_reads() > 0,
+                "Fresh-connection regression did not exercise SQLx type discovery"
+            );
+        }
         assert_eq!(sample.status, 200, "{body}");
         assert_eq!(
             sample.queries.ciphertext_reads, 0,
@@ -649,11 +674,11 @@ async fn distinct_execution_origins_and_workflow_children_use_frontier_batches()
     }
     let small = measurements[0].1.queries.graph_record_reads;
     let large = measurements[1].1.queries.graph_record_reads;
-    let total = measurements[1].1.queries.statements;
+    let total = measurements[1].1.queries.application_statements();
     ctx.cleanup().await?;
     assert!(
         large == small && total <= 20,
-        "graph-record reads grew from {small} to {large}, or total {total} exceeded 20; {report}"
+        "graph-record reads grew from {small} to {large}, or application total {total} exceeded 20; {report}"
     );
     Ok(())
 }
