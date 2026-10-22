@@ -546,16 +546,14 @@ async fn pack_owner_component_scope_has_structural_list_detail_update_and_create
         &foreign.r#ref,
         "component_owned.prefix_only",
     )
-    .await?;
-    ActionRepository::update(
-        &ctx.pool,
-        prefix_only.id,
-        UpdateActionInput {
-            reference_visibility: Some(attune_common::models::ActionReferenceVisibility::Private),
-            ..Default::default()
-        },
-    )
-    .await?;
+    .await;
+    let error = prefix_only.expect_err("cross-namespace schema consumer must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("Schema consumer must belong to its declaring pack"),
+        "{error}"
+    );
     let ownerless = helpers::create_test_pack(&ctx.pool, "component_ownerless").await?;
     let missing_owner = helpers::create_test_action(
         &ctx.pool,
@@ -4105,7 +4103,7 @@ testing:
         .await?;
     assert_eq!(
         response.status(),
-        StatusCode::CREATED,
+        StatusCode::OK,
         "{}",
         response.text().await?
     );

@@ -950,8 +950,17 @@ async fn distinct_public_action_fallbacks_are_batched_but_never_grant_decrypt() 
         measurements[0].1.queries.source_scope_reads,
         measurements[1].1.queries.source_scope_reads
     );
-    assert!(measurements[1].1.queries.statements <= 25);
     save_report("public-action-fallback-frontier", &measurements)?;
+    // Type discovery is connection-local and can occur even after a warm-up
+    // request. Keep it in the report, not in the application query budget.
+    let queries = &measurements[1].1.queries;
+    assert!(
+        queries.application_statements() <= 25,
+        "public action fallback query budget exceeded: application={}, driver_metadata={}, total={}",
+        queries.application_statements(),
+        queries.driver_metadata_reads(),
+        queries.statements
+    );
     replace_grants(&ctx, "fixture.artifact_reader", json!([
         {"resource":"actions","actions":["read","execute"]},
         {"resource":"executions","actions":["read","decrypt"],"constraints":{"refs":[action_ref]}}

@@ -351,6 +351,7 @@ impl TestContext {
         AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
         AuthorizationService::invalidate_permission_set_caches().await;
         self.token = Some(token);
+        self.user = Some(identity);
         Ok(self)
     }
 
