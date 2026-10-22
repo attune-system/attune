@@ -308,6 +308,21 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         .await?
         .manages_permissions());
     let pack = create_test_pack(&ctx.pool, "core").await?;
+    let mut deployment_context = attune_common::rbac::AuthorizationContext::new(installer.id);
+    deployment_context.target_id = Some(pack.id);
+    deployment_context.managing_pack_id = Some(pack.id);
+    deployment_context.target_ref = Some(pack.r#ref.clone());
+    deployment_context.pack_ref = Some(pack.r#ref.clone());
+    assert!(
+        !DelegationAuthority::load(&ctx.pool, installer.id)
+            .await?
+            .allows(
+                attune_common::rbac::Resource::Packs,
+                attune_common::rbac::Action::Install,
+                deployment_context,
+            ),
+        "the registrar must not be able to issue deployment approvals"
+    );
     let source = actual_core_tree(&ctx.test_packs_dir.join("actual-core-source"))?;
     let ceiling = actual_core_global_ceiling(&source, "executor")?;
     assert_eq!(
@@ -545,10 +560,12 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
             ),
             "{denial}"
         );
+        // A trusted deployer could approve this missing ceiling. This registrar
+        // has no install authority and must rely on the explicit fixed approval.
         assert!(
             denial
                 .to_string()
-                .contains("External runtime scope requires separate approval"),
+                .contains("Pack deployment permission is required to approve its runtime grants"),
             "{denial}"
         );
         assert_ne!(PackRepository::find_by_id(&mut *failed, pack.id).await?.unwrap().active_release, Some(release_id), "the actual global ceiling must fail final admission after projection, not an unrelated parse");

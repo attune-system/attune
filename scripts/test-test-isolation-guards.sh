@@ -23,6 +23,7 @@ expect_exit 2 env ATTUNE_TEST_RUN_ID=a_b bash "$ROOT/scripts/cleanup-test-schema
 expect_exit 2 bash "$ROOT/scripts/check-db-test-threads.sh" 3
 bash "$ROOT/scripts/check-db-test-threads.sh" 4
 bash "$ROOT/scripts/database-test-ignore-policy.sh" --check
+python3 "$ROOT/scripts/test_database_test_ignore_policy.py"
 expect_exit 2 env ATTUNE_RUST_TEST_THREADS=3 bash "$ROOT/scripts/run-rust-integration-tests.sh"
 expect_exit 2 env ATTUNE_E2E_PROJECT_NAME= bash "$ROOT/scripts/run-integration-tests.sh" --no-startup --no-build
 expect_exit 2 env ATTUNE_E2E_PROJECT_NAME= bash "$ROOT/scripts/run-rust-integration-tests.sh" --no-startup --no-build
