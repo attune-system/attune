@@ -77,7 +77,13 @@ impl QueryMetrics {
     }
 
     fn application_statements(&self) -> usize {
-        self.statements - self.driver_metadata_reads()
+        self.statements
+            - self.driver_metadata_reads()
+            - self
+                .statement_categories
+                .get("pool_session_setup")
+                .copied()
+                .unwrap_or(0)
     }
 }
 
@@ -101,6 +107,7 @@ impl Visit for QueryMetrics {
         let category = match primary_table {
             Some("pg_catalog.pg_type") => "driver_type_discovery",
             Some("pg_catalog.pg_enum") => "driver_enum_discovery",
+            _ if sql == "select set_config('search_path', $1, false), set_config('application_name', $2, false)" => "pool_session_setup",
             Some(
                 table @ ("execution"
                 | "execution_secret_value"
@@ -337,6 +344,34 @@ fn query_budget_separates_connection_local_type_discovery_but_reports_every_stat
     assert_eq!(metrics.driver_metadata_reads(), 2);
     assert_eq!(metrics.application_statements(), 1);
     assert_eq!(metrics.graph_record_reads, 1);
+}
+
+#[test]
+fn query_budget_excludes_only_exact_pool_setup_and_preserves_application_limit() {
+    let observer = RequestQueries::default();
+    let subscriber = tracing_subscriber::registry().with(observer.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        for _ in 0..25 {
+            tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+                db.statement = "SELECT id FROM execution WHERE id = $1");
+        }
+        tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+            db.statement = "SELECT oid FROM pg_catalog.pg_type WHERE oid = $1");
+        tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+            db.statement = "SELECT enumlabel FROM pg_catalog.pg_enum WHERE enumtypid = $1");
+        tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+            db.statement = "SELECT set_config('search_path', $1, false), set_config('application_name', $2, false)");
+        let metrics = observer.0.lock().unwrap().clone();
+        assert_eq!(metrics.statements, 28);
+        assert_eq!(metrics.application_statements(), 25);
+        // Other session changes are still application work, not pool setup.
+        tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+            db.statement = "SELECT set_config('statement_timeout', $1, true)");
+        let metrics = observer.0.lock().unwrap();
+        assert_eq!(metrics.statements, 29);
+        assert_eq!(metrics.application_statements(), 26);
+        assert!(metrics.application_statements() > 25);
+    });
 }
 
 #[test]
@@ -1076,7 +1111,8 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
         writeln!(file, "{report}")?;
     }
     // Full statement counts and elapsed time above still include driver costs.
-    // Only the application scaling budget excludes catalog type discovery.
+    // Only the application scaling budget excludes catalog type discovery and
+    // the exact per-connection setup statement; RBAC cache misses still count.
     let small = samples[0].1.queries.application_statements();
     let within_batch = samples[1].1.queries.application_statements();
     let large = samples[2].1.queries.application_statements();
