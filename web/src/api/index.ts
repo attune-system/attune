@@ -268,6 +268,7 @@ export type { PackInstallProvenance } from "./models/PackInstallProvenance";
 export type { PackInstallResponse } from "./models/PackInstallResponse";
 export type { PackInstallStatusResponse } from "./models/PackInstallStatusResponse";
 export type { PackMeta } from "./models/PackMeta";
+export type { PackOwnershipMetadata } from "./models/PackOwnershipMetadata";
 export type { PackRegistryIndexSummary } from "./models/PackRegistryIndexSummary";
 export type { PackReleaseResponse } from "./models/PackReleaseResponse";
 export type { PackResponse } from "./models/PackResponse";
@@ -346,6 +347,8 @@ export { RbacExecutionScopeConstraint } from "./models/RbacExecutionScopeConstra
 export type { RbacGrant } from "./models/RbacGrant";
 export type { RbacGrantConstraints } from "./models/RbacGrantConstraints";
 export { RbacOwnerConstraint } from "./models/RbacOwnerConstraint";
+export { RbacPackOwnerConstraint } from "./models/RbacPackOwnerConstraint";
+export { RbacPackStateConstraint } from "./models/RbacPackStateConstraint";
 export { RbacResource } from "./models/RbacResource";
 export type { RefreshTokenRequest } from "./models/RefreshTokenRequest";
 export type { RegisteredPack } from "./models/RegisteredPack";

@@ -276,6 +276,32 @@ async fn keys_resolve_canonical_owners_and_never_give_system_or_human_keys_a_loc
         assert_eq!(resolved.pack_id(), None);
         assert_eq!(resolved.context().owner_type, Some(key.owner_type));
         assert_eq!(resolved.context().owner_identity_id, key.owner_identity);
+        let origin = attune_common::key_access::key_origin(&key);
+        assert_eq!(
+            resolved.context().owner_ref,
+            origin.owner_ref,
+            "concrete key resolution must preserve the canonical recorded owner ref"
+        );
+        let mut verified =
+            attune_common::repositories::iam_ownership::VerifiedKeyOrigins::default();
+        assert!(verified
+            .retain_recorded(&mut tx, 1, &origin)
+            .await
+            .unwrap()
+            .is_some());
+        if key.owner_type == OwnerType::Identity {
+            let mut substituted = origin.clone();
+            substituted.owner_ref = key.owner_identity.map(|id| id.to_string());
+            assert_ne!(substituted.owner_ref, origin.owner_ref);
+            assert!(
+                verified
+                    .retain_recorded(&mut tx, 1, &substituted)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "numeric aliases must not replace the recorded canonical owner ref"
+            );
+        }
     }
     tx.commit().await.unwrap();
     db.cleanup().await.unwrap();

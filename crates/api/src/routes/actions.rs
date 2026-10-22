@@ -75,6 +75,8 @@ pub async fn list_actions(
 
     // All filtering and pagination happen in a single SQL query.
     let filters = ActionSearchFilters {
+        read_visibility: action_read_filter(&state, &user, query.referencing_pack_ref.as_deref())
+            .await?,
         pack: None,
         packs: Vec::new(),
         query: query.q,
@@ -149,6 +151,7 @@ pub async fn list_actions_by_pack(
 
     // All filtering and pagination happen in a single SQL query.
     let filters = ActionSearchFilters {
+        read_visibility: action_read_filter(&state, &user, None).await?,
         pack: Some(pack.id),
         packs: Vec::new(),
         query: query.q,
@@ -499,6 +502,18 @@ pub async fn update_action(
             existing_action.id,
         )
         .await?;
+    attune_common::repositories::iam_ownership::IamOwnershipRepository::populate_pack_owner(
+        &mut *tx,
+        Resource::Actions,
+        &mut context,
+    )
+    .await?;
+    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::lock_pack_owner_memberships(&mut tx, editor).await?;
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::populate_pack_role_membership(
+            &mut *tx, Resource::Actions, &mut context, true,
+        ).await?;
+    }
     if !authority.allows(Resource::Actions, Action::Update, context) {
         return Err(ApiError::Forbidden(
             "Action update authority changed before readmission".into(),
@@ -729,6 +744,8 @@ pub async fn search_actions(
         .filter(|q| !q.is_empty());
 
     let filters = ActionSearchFilters {
+        read_visibility: action_read_filter(&state, &user, search.referencing_pack_ref.as_deref())
+            .await?,
         pack: None,
         packs: pack_ids,
         query,
@@ -762,6 +779,21 @@ pub async fn search_actions(
     let response = PaginatedResponse::new(hits, &pagination, total);
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+async fn action_read_filter(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    referencing_pack_ref: Option<&str>,
+) -> ApiResult<Option<attune_common::repositories::action::ActionReadFilter>> {
+    Ok(super::visibility::component_read_filter(state, user)
+        .await?
+        .map(
+            |iam| attune_common::repositories::action::ActionReadFilter {
+                iam,
+                referencing_pack_ref: referencing_pack_ref.map(str::to_owned),
+            },
+        ))
 }
 
 fn can_read_action_with_grants(

@@ -158,7 +158,7 @@ async fn rule_read_visibility(
         return Ok(None);
     }
 
-    let grants = state.authorization_service().effective_grants(user).await?;
+    let grants = state.authorization_service().resolved_grants(user).await?;
     Ok(Some(build_visibility_read_scope(
         &grants,
         Resource::Rules,

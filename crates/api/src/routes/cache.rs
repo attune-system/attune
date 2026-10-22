@@ -1093,7 +1093,9 @@ fn compile_cache_namespace_grant_filter(
         return None;
     }
 
-    if constraints.pack_refs.is_some()
+    if constraints.pack_owner.is_some()
+        || constraints.pack_state.is_some()
+        || constraints.pack_refs.is_some()
         || constraints.ids.is_some()
         || constraints.visibility.is_some()
         || constraints.encrypted.is_some()

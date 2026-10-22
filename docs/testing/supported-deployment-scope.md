@@ -1,5 +1,39 @@
 # Supported deployment test scope
 
+## Pending trusted-deployer change
+
+The current unvalidated source changes the deployment authorization contract:
+`packs:install` for a pack permits publishing broader permission definitions and
+deploying their component references. Personal grant coverage is no longer an
+additional requirement for that deployment. See
+[permission delegation](../permissions/delegation-and-secret-disclosure.md).
+The prior contract described below is historical until this change completes
+validation. Bootstrap admission and managed credential switches remain off.
+
+The former normal-suite negative `packs_only_installer_cannot_publish_tick_runtime_policy`
+is replaced by `packs_only_installer_can_publish_tick_runtime_policy_without_personal_event_grants`.
+Pack registry regressions now require trusted uploaders to publish broader grants,
+preserve scoped deployment denials, and avoid creating assignments to themselves.
+Replacement requires deployment authority rather than a separate configure grant,
+and must preserve the pack's primary owner.
+
+No deferred test has been enabled or counted as passing. All six historical
+deferred scenarios still require review against this newly authorized contract
+and fresh acceptance evidence; some old expected denials are no longer intended.
+No full deployment certification is claimed by these source changes.
+
+Trusted publication now separates stored IAM definitions from selected runtime
+capabilities. Unused human-relative or external definitions require valid metadata
+and namespace authority, but no runtime admission or runtime approval. Selected
+runtime grants still require stable non-human-relative scopes and the applicable
+recorded approvals. The historical unused-external-definition approval expectation
+below is not a deployment-publication requirement under this contract. Its deferred
+test body and ignored status remain unchanged pending separate review. New pure
+compiler and upload regressions cover the supported publication behavior; no deferred
+case is enabled or counted as passing by that coverage.
+
+## Previously validated contract
+
 The supported release keeps registrar exemptions, bootstrap admission and
 managed credential gates off. Publishing a runtime policy still requires exact
 initial registrar consent. Captured runtime authority must remain independent
@@ -55,7 +89,7 @@ another target is stated. No expected rejection was changed to an arbitrary 4xx.
 | `existing_foreign_owned_ref_is_not_adopted_by_matching_pack_prefix` | Replaced at valid boundaries | Ordinary repository creation already rejects its impossible fixture. New API identity `repository_rejects_action_ref_outside_its_structural_pack` checks that error and absence of rows. New common loader unit test `pack_registry::loader::tests::matching_pack_prefix_never_substitutes_for_existing_structural_owner` checks matching-prefix acceptance cannot override a foreign or absent actual owner. No malformed row or raw service SQL is used. This is not an end-to-end corrupted-row upload acceptance claim. |
 | `fresh_scoped_upload_pins_every_source_and_defaults_survive_installer_freeze` | Deferred, original scenario unchanged | Packs-only fresh deployment without initial Events/Create requires the disabled exemption. |
 | `reversed_fresh_upload_resolves_nested_and_finite_targets_without_preallocated_ids` | Deferred, original scenario unchanged | Same no-initial-consent contract in reversed fresh declaration/archive order. |
-| `unused_global_policy_definition_cannot_bypass_external_approval` | Deferred, original scenario unchanged | Approval-specific diagnostic is masked by the supported registrar denial on the local definition. Still requires future approval coverage even for unused definitions. |
+| `unused_global_policy_definition_cannot_bypass_external_approval` | Deferred, original scenario unchanged | Historical expectation of approval for an unused definition. This is no longer the trusted deployment-publication requirement; the original body/status await separate review. |
 | `unapproved_external_scope_fails_atomically_with_authored_location` | Deferred, original scenario unchanged | Its Packs-only publisher cannot install, and the external subject needs the future approval-aware registrar contract. |
 | `fixed_external_approval_is_reused_without_deployer_runtime_grants_after_issuer_freeze` | Deferred, original scenario unchanged | Independently approved external scope without deployer runtime grants needs the disabled registrar exemption. Granting external Events/Create to the deployer would invalidate the scenario. |
 

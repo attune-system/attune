@@ -17,6 +17,111 @@ use super::{
 /// Repository for Pack operations
 pub struct PackRepository;
 
+/// Install authority captured before candidate mutations under the namespace
+/// lock. It can only authorize this actor and pack in the capturing transaction.
+/// The original namespace context is never exposed as the current pack state.
+pub struct AuthorizedPackDeployment {
+    transaction: String,
+    pack_ref: String,
+    pack_id: Option<Id>,
+    authority: crate::delegation::DelegationAuthority,
+    context: crate::rbac::AuthorizationContext,
+}
+
+impl AuthorizedPackDeployment {
+    pub async fn capture(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        actor: Id,
+        pack_ref: &str,
+    ) -> Result<Self> {
+        PackRepository::acquire_mutation_lock(tx, pack_ref).await?;
+        let authority = crate::delegation::DelegationAuthority::load_for_share(tx, actor).await?;
+        super::iam_ownership::IamOwnershipRepository::lock_pack_owner_memberships(tx, actor)
+            .await?;
+        let context = PackRepository::deployment_context_with_roles(tx, actor, pack_ref).await?;
+        if !authority.allows(
+            crate::rbac::Resource::Packs,
+            crate::rbac::Action::Install,
+            context.clone(),
+        ) {
+            return Err(Error::PermissionDenied(
+                "Pack deployment permission is required".into(),
+            ));
+        }
+        let transaction = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
+            .fetch_one(&mut **tx)
+            .await?;
+        Ok(Self {
+            transaction,
+            pack_ref: pack_ref.into(),
+            pack_id: context.target_id,
+            authority,
+            context,
+        })
+    }
+
+    /// Bind a newly claimed namespace to its newly created row. Existing claims
+    /// cannot change IDs, and neither kind can be used in another transaction.
+    pub async fn bind(&mut self, connection: &mut sqlx::PgConnection, pack_id: Id) -> Result<()> {
+        self.validate_binding(
+            connection,
+            self.authority.identity_id,
+            pack_id,
+            &self.pack_ref,
+        )
+        .await?;
+        self.pack_id = Some(pack_id);
+        Ok(())
+    }
+
+    pub(crate) async fn validate(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        actor: Id,
+        pack_id: Id,
+        pack_ref: &str,
+    ) -> Result<()> {
+        if self.pack_id != Some(pack_id) {
+            return Err(Error::PermissionDenied(
+                "Deployment pack ID is not bound".into(),
+            ));
+        }
+        self.validate_binding(connection, actor, pack_id, pack_ref)
+            .await
+    }
+
+    async fn validate_binding(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        actor: Id,
+        pack_id: Id,
+        pack_ref: &str,
+    ) -> Result<()> {
+        let transaction: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
+            .fetch_one(&mut *connection)
+            .await?;
+        let pack = PackRepository::find_by_id(&mut *connection, pack_id)
+            .await?
+            .ok_or_else(|| Error::PermissionDenied("Deployment pack is unavailable".into()))?;
+        if transaction != self.transaction
+            || actor != self.authority.identity_id
+            || pack_ref != self.pack_ref
+            || pack.r#ref != self.pack_ref
+            || self.pack_id.is_some_and(|id| id != pack_id)
+            || !self.authority.allows(
+                crate::rbac::Resource::Packs,
+                crate::rbac::Action::Install,
+                self.context.clone(),
+            )
+        {
+            return Err(Error::PermissionDenied(
+                "Deployment authority binding changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct PackDeletionState {
     pack_exists: bool,
@@ -175,7 +280,7 @@ pub struct UpdatePackInput {
     pub installers: Option<JsonDict>,
 }
 
-pub(crate) const PACK_COLUMNS: &str = "id, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated";
+pub(crate) const PACK_COLUMNS: &str = "id, owner_roles, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated";
 
 #[async_trait::async_trait]
 impl FindById for PackRepository {
@@ -225,6 +330,77 @@ impl List for PackRepository {
 }
 
 impl PackRepository {
+    /// Caller must hold target Install authority against the previous declaration
+    /// and retain the pack mutation transaction through this write.
+    pub async fn set_owner_roles(
+        connection: &mut sqlx::PgConnection,
+        pack: Id,
+        roles: Vec<String>,
+    ) -> Result<Pack> {
+        let roles = crate::pack_ownership::validate_owner_roles(roles)?;
+        Ok(sqlx::query_as(&format!("UPDATE pack SET owner_roles = $2, updated = NOW() WHERE id = $1 RETURNING {PACK_COLUMNS}"))
+            .bind(pack).bind(roles).fetch_one(connection).await?)
+    }
+
+    /// Trusted human deployment only. Runtime target resolution deliberately
+    /// uses deployment_context/populate_pack_owner without role membership.
+    pub async fn deployment_context_with_roles(
+        connection: &mut sqlx::PgConnection,
+        identity: Id,
+        reference: &str,
+    ) -> Result<crate::rbac::AuthorizationContext> {
+        let mut context = Self::deployment_context(&mut *connection, identity, reference).await?;
+        super::iam_ownership::IamOwnershipRepository::populate_pack_role_membership(
+            connection,
+            crate::rbac::Resource::Packs,
+            &mut context,
+            true,
+        )
+        .await?;
+        Ok(context)
+    }
+
+    /// Resolve deployment constraints from persisted namespace state. Call again
+    /// under `acquire_mutation_lock` before creating or replacing the pack.
+    pub async fn deployment_context<'e, E>(
+        executor: E,
+        identity_id: Id,
+        reference: &str,
+    ) -> Result<crate::rbac::AuthorizationContext>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let pack = Self::find_by_ref(executor, reference).await?;
+        Ok(Self::deployment_context_for_pack(
+            identity_id,
+            reference,
+            pack.as_ref(),
+        ))
+    }
+
+    pub fn deployment_context_for_pack(
+        identity_id: Id,
+        reference: &str,
+        pack: Option<&Pack>,
+    ) -> crate::rbac::AuthorizationContext {
+        let mut context = crate::rbac::AuthorizationContext::new(identity_id);
+        context.target_ref = Some(reference.into());
+        context.pack_ref = Some(reference.into());
+        if let Some(pack) = pack {
+            context.target_ref = Some(pack.r#ref.clone());
+            context.pack_ref = Some(pack.r#ref.clone());
+            context.target_id = Some(pack.id);
+            context.managing_pack_id = Some(pack.id);
+            context.owner_identity_id = pack.installed_by;
+            if !pack.is_standard {
+                context.pack_owner_identity_id = pack.installed_by;
+            }
+        } else if !crate::platform_catalog::reserved_pack_namespace(reference) {
+            context.pack_state = Some(crate::rbac::PackStateConstraint::Uninstalled);
+        }
+        context
+    }
+
     /// Deployment validates against files in the candidate release, not the
     /// previously active registry. The caller retains the activation transaction.
     pub async fn create_for_deployment(
@@ -624,8 +800,9 @@ pub struct PackVisibilityScope {
 /// Mirrors the row-level semantics of the API's `pack_action_allowed`
 /// helper: standard packs are always visible; scopes in
 /// `own_or_ownerless_scopes` apply to packs the identity installed or that
-/// have no owner; scopes in `other_owner_scopes` are the subset of grants
-/// specific enough to also see packs installed by someone else.
+/// have no owner; scopes in `other_owner_scopes` apply to packs installed by
+/// someone else. Global grants belong to both lists; ownership restricts
+/// visibility only through an explicit grant constraint.
 #[derive(Debug, Clone, Default)]
 pub struct PackVisibilityFilter {
     pub identity_id: Id,
@@ -759,7 +936,9 @@ impl PackRepository {
         pack_id: Id,
         identity_id: Id,
     ) -> Result<Pack> {
-        sqlx::query_as(&format!("UPDATE pack SET installed_by = $2, updated = NOW() WHERE id = $1 RETURNING {PACK_COLUMNS}"))
+        // A deployment records its actor separately. Redeploying must not
+        // silently transfer the pack's primary ownership to that actor.
+        sqlx::query_as(&format!("UPDATE pack SET installed_by = COALESCE(installed_by, $2), updated = NOW() WHERE id = $1 RETURNING {PACK_COLUMNS}"))
             .bind(pack_id).bind(identity_id).fetch_one(conn).await.map_err(Into::into)
     }
 

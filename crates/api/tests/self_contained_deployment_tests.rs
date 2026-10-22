@@ -335,21 +335,40 @@ async fn fresh_scoped_upload(reverse: bool) -> Result<()> {
 }
 
 #[tokio::test]
-async fn packs_only_installer_cannot_publish_tick_runtime_policy() -> Result<()> {
+async fn packs_only_installer_can_publish_tick_runtime_policy_without_personal_event_grants(
+) -> Result<()> {
     let ctx = TestContext::new().await?;
     let deployer = installer(&ctx, &["no_tick_consent"]).await?;
     let fixture = Archive::new("no_tick_consent", false)?;
     let response = fixture.upload(&ctx, &deployer.token).await?;
     let status = response.status();
     let body: Value = response.json().await?;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    located(
-        &body,
-        "permission_sets/events.yaml",
-        "/grants/0",
-        "registering identity",
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pack = PackRepository::find_by_ref(&ctx.pool, "no_tick_consent")
+        .await?
+        .unwrap();
+    assert_eq!(pack.installed_by, Some(deployer.id));
+    let mut tx = ctx.pool.begin().await?;
+    let policy = RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
+        .await?
+        .unwrap();
+    assert_eq!(pack.active_release, Some(policy.policy.release_id));
+    assert!(!policy.policy.invocations.is_empty());
+    tx.rollback().await?;
+    let response = ctx
+        .post(
+            "/api/v1/events",
+            json!({
+                "trigger_ref":"no_tick_consent.tick", "payload":{"message":"start"},
+            }),
+            Some(&deployer.token),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "deployment must not grant user-token event submission"
     );
-    assert_absent(&ctx, "no_tick_consent").await?;
     ctx.cleanup().await?;
     fixture.root.close()?;
     Ok(())
@@ -794,7 +813,7 @@ async fn fixed_external_approval_is_reused_without_deployer_runtime_grants_after
     // The empty subject row is needed only by the approval control API. The
     // all-component fresh-install test above deliberately has no such seed.
     let approver = actor(&ctx, json!([
-        {"resource":"packs","actions":["create","read"],"constraints":{"refs":["approval_subject"]}},
+        {"resource":"packs","actions":["create","install","read"],"constraints":{"refs":["approval_subject"]}},
         {"resource":"permissions","actions":["manage"]}
     ])).await?;
     let response = ctx

@@ -51,6 +51,13 @@ impl PackListParams {
 /// Request DTO for creating a new pack
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct CreatePackRequest {
+    /// Ownership roles require this endpoint's matching Create and Install authority.
+    #[schema(required = false, nullable = false, max_items = 64)]
+    #[serde(
+        default,
+        deserialize_with = "attune_common::pack_ownership::deserialize_owner_roles"
+    )]
+    pub owner_roles: Option<Vec<String>>,
     /// Unique reference identifier (e.g., "core", "aws", "slack")
     #[validate(length(min = 1, max = 255))]
     #[schema(example = "slack")]
@@ -398,6 +405,14 @@ pub struct PackInstallProvenance {
 /// Request DTO for updating a pack
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct UpdatePackRequest {
+    /// Changing this declaration additionally requires target pack Install authority.
+    /// Omit to preserve; [] clears. Null is not accepted.
+    #[schema(required = false, nullable = false, max_items = 64)]
+    #[serde(
+        default,
+        deserialize_with = "attune_common::pack_ownership::deserialize_owner_roles"
+    )]
+    pub owner_roles: Option<Vec<String>>,
     /// Human-readable label
     #[validate(length(min = 1, max = 255))]
     #[schema(example = "Slack Integration v2")]
@@ -466,6 +481,7 @@ pub enum PackDescriptionPatch {
 /// Response DTO for pack information
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PackResponse {
+    pub owner_roles: Vec<String>,
     /// Pack ID
     #[schema(example = 1)]
     pub id: i64,
@@ -593,6 +609,7 @@ pub struct PlatformCatalogStateResponse {
 /// Simplified pack response (for list endpoints)
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PackSummary {
+    pub owner_roles: Vec<String>,
     /// Pack ID
     #[schema(example = 1)]
     pub id: i64,
@@ -647,6 +664,7 @@ impl From<attune_common::models::Pack> for PackResponse {
             conf_schema: pack.conf_schema,
             config,
             config_schema_binding: None,
+            owner_roles: pack.owner_roles,
             meta: pack.meta,
             tags: pack.tags,
             runtime_deps: pack.runtime_deps,
@@ -669,6 +687,7 @@ impl From<attune_common::models::Pack> for PackResponse {
 impl From<attune_common::models::Pack> for PackSummary {
     fn from(pack: attune_common::models::Pack) -> Self {
         Self {
+            owner_roles: pack.owner_roles,
             id: pack.id,
             r#ref: pack.r#ref,
             label: pack.label,
@@ -1209,6 +1228,7 @@ mod tests {
     #[test]
     fn test_create_pack_request_validation() {
         let req = CreatePackRequest {
+            owner_roles: None,
             r#ref: "".to_string(), // Invalid: empty
             label: "Test".to_string(),
             version: "1.0.0".to_string(),

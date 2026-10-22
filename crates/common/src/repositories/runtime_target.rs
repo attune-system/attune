@@ -524,15 +524,24 @@ impl RuntimeTargetRepository {
             }
             RuntimeTarget::Key(id) => {
                 positive_id(id)?;
-                let row: Option<OwnerRow> = sqlx::query_as(
+                let row: Option<KeyOwnerRow> = sqlx::query_as(
                     "SELECT ref AS reference, owner_type, owner_identity, owner_pack, owner_action, owner_sensor, \
-                     owner_pack_ref, owner_action_ref, owner_sensor_ref, encrypted \
+                     owner_pack_ref, owner_action_ref, owner_sensor_ref, encrypted, owner AS identity_owner_ref \
                      FROM key WHERE id = $1 FOR SHARE",
                 ).bind(id).fetch_optional(&mut *connection).await?;
-                let Some(row) = row else {
+                let Some(KeyOwnerRow {
+                    owner: row,
+                    identity_owner_ref,
+                }) = row
+                else {
                     return Ok(None);
                 };
                 owner_context(&mut context, &row);
+                if row.owner_type == OwnerType::Identity {
+                    // Key owner refs use the canonical identity login. Other
+                    // data-owner contexts may use numeric identity refs.
+                    context.owner_ref = identity_owner_ref;
+                }
                 owner_id = match row.owner_type {
                     OwnerType::Pack => row.owner_pack,
                     OwnerType::Action => row.owner_action,
@@ -708,6 +717,20 @@ impl RuntimeTargetRepository {
             None => None,
         };
         context.managing_pack_id = pack_id;
+        super::iam_ownership::IamOwnershipRepository::populate_pack_owner(
+            &mut *connection,
+            resource,
+            &mut context,
+        )
+        .await?;
+        if matches!(target, RuntimeTarget::Pack(_)) {
+            let owner: Option<Option<Id>> =
+                sqlx::query_scalar("SELECT installed_by FROM pack WHERE id = $1 FOR SHARE")
+                    .bind(id)
+                    .fetch_optional(&mut *connection)
+                    .await?;
+            context.owner_identity_id = owner.flatten();
+        }
         Ok(Some(ResolvedRuntimeTarget {
             kind: match target {
                 RuntimeTarget::Pack(_) => "pack",
@@ -798,6 +821,13 @@ struct OwnerRow {
     owner_action_ref: Option<String>,
     owner_sensor_ref: Option<String>,
     encrypted: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct KeyOwnerRow {
+    #[sqlx(flatten)]
+    owner: OwnerRow,
+    identity_owner_ref: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

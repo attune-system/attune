@@ -706,6 +706,8 @@ pub mod pack {
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct Pack {
         pub id: Id,
+        #[serde(default)]
+        pub owner_roles: Vec<String>,
         pub r#ref: String,
         pub label: String,
         pub description: Option<String>,

@@ -154,7 +154,9 @@ impl CacheNamespaceGrantFilter {
         } else {
             ownership
         };
-        if scope.encrypted.is_some()
+        if scope.pack_owner.is_some()
+            || scope.pack_state.is_some()
+            || scope.encrypted.is_some()
             || scope.visibility.is_some()
             || matches!(
                 scope.execution_scope,

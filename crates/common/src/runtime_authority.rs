@@ -42,6 +42,8 @@ pub struct PermissionGrantDefinition {
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredGrantConstraints {
+    pub pack_owner: Option<crate::rbac::PackOwnerConstraint>,
+    pub pack_state: Option<crate::rbac::PackStateConstraint>,
     pub pack_refs: Option<Vec<String>>,
     pub owner: Option<crate::rbac::OwnerConstraint>,
     pub owner_types: Option<Vec<OwnerType>>,
@@ -298,6 +300,71 @@ impl AdmittedPermissionSet {
 }
 
 impl PermissionSetDefinition {
+    /// Validate publication independently of runtime admission. Human-relative
+    /// IAM conditions are valid here but never become admitted runtime grants.
+    pub(crate) fn validate_publication(&self, pack_ref: &str) -> Result<()> {
+        validate_owned_ref(&self.reference, pack_ref)?;
+        for authored in &self.grants {
+            let grant = authored.grant();
+            validate_grant_shape(&grant)?;
+            if let Some(scope) = &grant.constraints {
+                if scope.managing_pack_id.is_some() {
+                    return Err(Error::validation(
+                        "Authored policy cannot set structural ownership",
+                    ));
+                }
+                if scope.ids.is_some() || scope.pack_refs.is_some() && scope.refs.is_some() {
+                    return Err(Error::validation(
+                        "Authored permissions use pack or component refs, not database IDs or both ref scopes",
+                    ));
+                }
+                if scope.pack_owner.is_some() && !crate::rbac::supports_pack_owner(grant.resource) {
+                    return Err(Error::validation(
+                        "Pack owner constraints require pack-managed component metadata or packs",
+                    ));
+                }
+            }
+            if authored.scope.unwrap_or(self.scope) == PermissionScope::Pack {
+                if !pack_owned_resource(grant.resource) {
+                    return Err(Error::validation(
+                        "System administration requires explicit external authority",
+                    ));
+                }
+                if grant.constraints.as_ref().is_some_and(|scope| {
+                    scope
+                        .pack_refs
+                        .as_ref()
+                        .is_some_and(|refs| refs.iter().any(|reference| reference != pack_ref))
+                }) {
+                    return Err(Error::validation(
+                        "A local permission cannot select another pack",
+                    ));
+                }
+                if matches!(
+                    grant.resource,
+                    Resource::Keys | Resource::Artifacts | Resource::Caches
+                ) && grant
+                    .constraints
+                    .as_ref()
+                    .and_then(|scope| scope.owner_types.as_ref())
+                    .is_some_and(|owners| {
+                        owners.iter().any(|owner| {
+                            !matches!(
+                                owner,
+                                OwnerType::Pack | OwnerType::Action | OwnerType::Sensor
+                            )
+                        })
+                    })
+                {
+                    return Err(Error::validation(
+                        "System and human-owned resources require explicit external authority",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Preserve per-grant authored scope when storing a set in the canonical
     /// permission repository. This is authoring data, not effective IAM grants.
     pub fn authored_grants(&self) -> Result<serde_json::Value> {
@@ -339,66 +406,16 @@ impl PermissionSetDefinition {
         approvals: &[ExternalApproval],
     ) -> Result<AdmittedPermissionSet> {
         owner.validate()?;
-        validate_owned_ref(&self.reference, &owner.pack_ref)?;
+        self.validate_publication(&owner.pack_ref)?;
         for approval in approvals {
             approval.validate()?;
         }
         let mut grants = Vec::with_capacity(self.grants.len());
         for authored in &self.grants {
             let grant = authored.grant();
-            if grant
-                .constraints
-                .as_ref()
-                .is_some_and(|scope| scope.managing_pack_id.is_some())
-            {
-                return Err(Error::validation(
-                    "Authored policy cannot set structural ownership",
-                ));
-            }
             validate_stable_grant(&grant)?;
-            if grant.constraints.as_ref().is_some_and(|scope| {
-                scope.ids.is_some() || scope.pack_refs.is_some() && scope.refs.is_some()
-            }) {
-                return Err(Error::validation(
-                    "Authored permissions use pack or component refs, not database IDs or both ref scopes",
-                ));
-            }
             match authored.scope.unwrap_or(self.scope) {
                 PermissionScope::Pack => {
-                    if !pack_owned_resource(grant.resource) {
-                        return Err(Error::validation(
-                            "System administration requires explicit external authority",
-                        ));
-                    }
-                    if grant.constraints.as_ref().is_some_and(|scope| {
-                        scope.pack_refs.as_ref().is_some_and(|refs| {
-                            refs.iter().any(|reference| reference != &owner.pack_ref)
-                        })
-                    }) {
-                        return Err(Error::validation(
-                            "A local permission cannot select another pack",
-                        ));
-                    }
-                    if matches!(
-                        grant.resource,
-                        Resource::Keys | Resource::Artifacts | Resource::Caches
-                    ) && grant
-                        .constraints
-                        .as_ref()
-                        .and_then(|scope| scope.owner_types.as_ref())
-                        .is_some_and(|owners| {
-                            owners.iter().any(|owner| {
-                                !matches!(
-                                    owner,
-                                    OwnerType::Pack | OwnerType::Action | OwnerType::Sensor
-                                )
-                            })
-                        })
-                    {
-                        return Err(Error::validation(
-                            "System and human-owned resources require explicit external authority",
-                        ));
-                    }
                     grants.push(AdmittedGrant::PackOwned {
                         pack_id: owner.pack_id,
                         grant,
@@ -922,12 +939,42 @@ fn validate_digest(digest: &str) -> Result<()> {
 }
 
 pub(crate) fn validate_stable_grant(grant: &Grant) -> Result<()> {
+    validate_grant_shape(grant)?;
+    if let Some(scope) = &grant.constraints {
+        if scope.pack_owner.is_some()
+            || matches!(scope.owner, Some(crate::rbac::OwnerConstraint::SelfOnly))
+            || matches!(
+                scope.execution_scope,
+                Some(
+                    crate::rbac::ExecutionScopeConstraint::SelfOnly
+                        | crate::rbac::ExecutionScopeConstraint::Descendants
+                )
+            )
+            || scope
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| !attributes.is_empty())
+        {
+            return Err(Error::validation(
+                "Admitted runtime grants require explicit resource scope, not human-relative conditions",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_grant_shape(grant: &Grant) -> Result<()> {
     if grant.actions.is_empty() {
         return Err(Error::validation(
             "Runtime permission grants require actions",
         ));
     }
     if let Some(scope) = &grant.constraints {
+        if scope.pack_state.is_some() && grant.resource != Resource::Packs {
+            return Err(Error::validation(
+                "Pack state constraints only apply to packs grants",
+            ));
+        }
         for references in [&scope.pack_refs, &scope.refs, &scope.owner_refs] {
             if references.as_ref().is_some_and(|references| {
                 references.is_empty()
@@ -949,23 +996,6 @@ pub(crate) fn validate_stable_grant(grant: &Grant) -> Result<()> {
         {
             return Err(Error::validation(
                 "Runtime permission scopes must be valid and nonempty",
-            ));
-        }
-        if matches!(scope.owner, Some(crate::rbac::OwnerConstraint::SelfOnly))
-            || matches!(
-                scope.execution_scope,
-                Some(
-                    crate::rbac::ExecutionScopeConstraint::SelfOnly
-                        | crate::rbac::ExecutionScopeConstraint::Descendants
-                )
-            )
-            || scope
-                .attributes
-                .as_ref()
-                .is_some_and(|attributes| !attributes.is_empty())
-        {
-            return Err(Error::validation(
-                "Admitted runtime grants require explicit resource scope, not human-relative conditions",
             ));
         }
         if grant.resource == Resource::Caches {

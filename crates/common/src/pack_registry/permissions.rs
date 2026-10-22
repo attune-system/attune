@@ -1,4 +1,4 @@
-//! Permission-bearing metadata admission against the pre-mutation actor authority.
+//! Permission-bearing metadata admission against pre-mutation deployment authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -8,7 +8,7 @@ use sqlx::PgConnection;
 
 use crate::{
     delegation::{named_refs, DelegationAuthority},
-    rbac::{validate_cache_grant_constraints, Grant, Resource},
+    rbac::{validate_cache_grant_constraints, Action, AuthorizationContext, Grant, Resource},
     repositories::{action::ActionRepository, identity::PermissionSetRepository},
     Error, Result,
 };
@@ -17,6 +17,7 @@ use super::loader::{read_yaml_files, resolve_workflow_path};
 
 #[derive(Default)]
 pub struct PackPermissionPlan {
+    pack_ref: String,
     definition_sources: BTreeMap<String, String>,
     definitions: BTreeMap<String, Vec<Grant>>,
     action_defaults: BTreeMap<String, Vec<String>>,
@@ -35,7 +36,10 @@ struct PermissionUse {
 
 impl PackPermissionPlan {
     pub fn read(pack_dir: &Path, pack_ref: &str) -> Result<Self> {
-        let mut plan = Self::default();
+        let mut plan = Self {
+            pack_ref: pack_ref.into(),
+            ..Self::default()
+        };
         for (name, content) in files(&pack_dir.join("permission_sets"))? {
             let file = format!("permission_sets/{name}");
             let data = parse(&content, &file)?;
@@ -52,6 +56,18 @@ impl PackPermissionPlan {
                     )
                 })?;
             let grants = definition.registrar_grants()?;
+            // Exact catalog definitions are platform-owned, not republished
+            // pack-local IAM declarations. Keep the bootstrap exception exact.
+            if !(pack_ref == "core"
+                && crate::platform_catalog::is_legacy_definition(
+                    crate::platform_catalog::ManagedComponentKind::PermissionSet,
+                    &data,
+                )?)
+            {
+                definition
+                    .validate_publication(pack_ref)
+                    .map_err(|error| super::diagnostics::located(error, &file, "/grants"))?;
+            }
             validate_grants(&grants)
                 .map_err(|error| super::diagnostics::located(error, &file, "/grants"))?;
             plan.definition_sources
@@ -285,8 +301,41 @@ impl PackPermissionPlan {
         conn: &mut PgConnection,
         authority: &DelegationAuthority,
     ) -> Result<()> {
+        let context = crate::repositories::pack::PackRepository::deployment_context_with_roles(
+            &mut *conn,
+            authority.identity_id,
+            &self.pack_ref,
+        )
+        .await?;
+        let deployment_authorized = self.deployment_authorized(authority, context);
+        self.validate_metadata(conn, authority, deployment_authorized)
+            .await
+    }
+
+    pub(crate) async fn validate_deployment(
+        &self,
+        conn: &mut PgConnection,
+        authority: &DelegationAuthority,
+        pack_id: crate::models::Id,
+        deployment: &crate::repositories::pack::AuthorizedPackDeployment,
+    ) -> Result<()> {
+        deployment
+            .validate(conn, authority.identity_id, pack_id, &self.pack_ref)
+            .await?;
+        self.validate_metadata(conn, authority, true).await
+    }
+
+    async fn validate_metadata(
+        &self,
+        conn: &mut PgConnection,
+        authority: &DelegationAuthority,
+        deployment_authorized: bool,
+    ) -> Result<()> {
         for (reference, grants) in &self.definitions {
-            if !authority.manages_permissions() && !authority.covers(grants) {
+            if !deployment_authorized
+                && !authority.manages_permissions()
+                && !authority.covers(grants)
+            {
                 let index = grants
                     .iter()
                     .position(|grant| !authority.covers(std::slice::from_ref(grant)))
@@ -404,11 +453,23 @@ impl PackPermissionPlan {
                     grant.actions = vec![crate::rbac::Action::Use];
                 }
             }
-            authority.require_grants(&grants).map_err(|error| {
-                super::diagnostics::located(error, &usage.source_file, &usage.metadata_path)
-            })?;
+            if !deployment_authorized {
+                authority.require_grants(&grants).map_err(|error| {
+                    super::diagnostics::located(error, &usage.source_file, &usage.metadata_path)
+                })?;
+            }
         }
         Ok(())
+    }
+
+    fn deployment_authorized(
+        &self,
+        authority: &DelegationAuthority,
+        context: AuthorizationContext,
+    ) -> bool {
+        context.target_ref.as_deref() == Some(self.pack_ref.as_str())
+            && context.pack_ref.as_deref() == Some(self.pack_ref.as_str())
+            && authority.allows(Resource::Packs, Action::Install, context)
     }
 }
 
@@ -475,6 +536,16 @@ fn validate_grants(grants: &[Grant]) -> Result<()> {
             return Err(Error::validation("Permission grants require actions"));
         }
         if let Some(scope) = &grant.constraints {
+            if scope.pack_owner.is_some() && !crate::rbac::supports_pack_owner(grant.resource) {
+                return Err(Error::validation(
+                    "Pack owner constraints require pack-managed component metadata or packs",
+                ));
+            }
+            if scope.pack_state.is_some() && grant.resource != Resource::Packs {
+                return Err(Error::validation(
+                    "Pack state constraints only apply to packs grants",
+                ));
+            }
             if scope.ids.is_some() {
                 return Err(Error::validation(
                     "Permission grants use metadata refs, not database IDs",
@@ -503,6 +574,71 @@ fn validate_grants(grants: &[Grant]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::PackPermissionPlan;
+
+    #[test]
+    fn deployment_authority_is_bound_to_the_target_pack_not_personal_grant_coverage() {
+        use crate::{
+            delegation::DelegationAuthority,
+            rbac::{Action, Grant, GrantConstraints, Resource},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let plan = PackPermissionPlan::read(root.path(), "team_tools").unwrap();
+        let broader = [Grant {
+            resource: Resource::Permissions,
+            actions: vec![Action::Manage],
+            constraints: None,
+        }];
+        for (resource, action, constraints, expected) in [
+            (Resource::Packs, Action::Install, None, true),
+            (
+                Resource::Packs,
+                Action::Install,
+                Some(GrantConstraints {
+                    refs: Some(vec!["team_tools".into()]),
+                    ..Default::default()
+                }),
+                true,
+            ),
+            (
+                Resource::Packs,
+                Action::Install,
+                Some(GrantConstraints {
+                    pack_refs: Some(vec!["team_tools".into()]),
+                    ..Default::default()
+                }),
+                true,
+            ),
+            (
+                Resource::Packs,
+                Action::Install,
+                Some(GrantConstraints {
+                    pack_refs: Some(vec!["another_pack".into()]),
+                    ..Default::default()
+                }),
+                false,
+            ),
+            (Resource::Packs, Action::Read, None, false),
+            (Resource::Packs, Action::Configure, None, false),
+            (Resource::Actions, Action::Create, None, false),
+        ] {
+            let authority = DelegationAuthority::new(
+                1,
+                Default::default(),
+                vec![Grant {
+                    resource,
+                    actions: vec![action],
+                    constraints,
+                }],
+            );
+            assert!(!authority.covers(&broader));
+            let context = crate::repositories::pack::PackRepository::deployment_context_for_pack(
+                authority.identity_id,
+                &plan.pack_ref,
+                None,
+            );
+            assert_eq!(plan.deployment_authorized(&authority, context), expected);
+        }
+    }
 
     #[test]
     fn sensor_signing_requires_named_permission_sets() {

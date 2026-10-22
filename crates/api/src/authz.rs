@@ -234,9 +234,36 @@ impl AuthorizationService {
     pub async fn authorize(
         &self,
         user: &AuthenticatedUser,
-        check: AuthorizationCheck,
+        mut check: AuthorizationCheck,
     ) -> Result<(), ApiError> {
         let snapshot = self.load_snapshot(user).await?;
+        // Queue metadata contexts historically omit managing ownership. Other
+        // consumers resolve their concrete target kind before calling us; do
+        // not reinterpret sensor/version/workflow IDs through a resource alias.
+        if check.resource == Resource::Queues
+            && check.action != Action::Create
+            && check.context.managing_pack_id.is_none()
+            && check.context.target_id.is_some()
+            && snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.grants.iter().any(|grant| {
+                    grant.resource == check.resource
+                        && grant.actions.contains(&check.action)
+                        && grant
+                            .constraints
+                            .as_ref()
+                            .is_some_and(|scope| scope.managing_pack_id.is_some())
+                })
+            })
+        {
+            check.context.managing_pack_id =
+                attune_common::repositories::iam_ownership::IamOwnershipRepository::target_pack(
+                    &self.db,
+                    check.resource,
+                    check.context.target_id,
+                    check.context.target_ref.as_deref(),
+                )
+                .await?;
+        }
         self.authorize_with_snapshot(user, snapshot.as_ref(), check)
     }
 
@@ -246,7 +273,37 @@ impl AuthorizationService {
         &self,
         conn: &mut PgConnection,
         identity_id: i64,
+        check: AuthorizationCheck,
+    ) -> Result<(), ApiError> {
+        self.authorize_identity_fresh_inner(conn, identity_id, check, false)
+            .await
+    }
+
+    pub async fn authorize_access_fresh(
+        &self,
+        conn: &mut PgConnection,
+        user: &AuthenticatedUser,
+        check: AuthorizationCheck,
+    ) -> Result<(), ApiError> {
+        if user.claims.token_type != TokenType::Access {
+            return Err(ApiError::Forbidden(
+                "This ownership mutation requires an access token".into(),
+            ));
+        }
+        let identity = user
+            .identity_id()
+            .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::lock_pack_owner_memberships(conn, identity).await?;
+        self.authorize_identity_fresh_inner(conn, identity, check, true)
+            .await
+    }
+
+    async fn authorize_identity_fresh_inner(
+        &self,
+        conn: &mut PgConnection,
+        identity_id: i64,
         mut check: AuthorizationCheck,
+        allow_owner_roles: bool,
     ) -> Result<(), ApiError> {
         let identity = IdentityRepository::find_by_id_for_share(conn, identity_id)
             .await?
@@ -261,6 +318,23 @@ impl AuthorizationService {
         let mut seen = std::collections::HashSet::new();
         permission_sets.retain(|permission_set| seen.insert(permission_set.id));
         let grants = Self::grants_from_permission_sets(permission_sets)?;
+        let grants = attune_common::repositories::iam_ownership::IamOwnershipRepository::resolve_pack_owner_grants(
+            &mut *conn, identity_id, grants, allow_owner_roles,
+        ).await?;
+        if check.resource == Resource::Queues
+            && check.action != Action::Create
+            && check.context.managing_pack_id.is_none()
+            && check.context.target_id.is_some()
+        {
+            check.context.managing_pack_id =
+                attune_common::repositories::iam_ownership::IamOwnershipRepository::target_pack(
+                    &mut *conn,
+                    check.resource,
+                    check.context.target_id,
+                    check.context.target_ref.as_deref(),
+                )
+                .await?;
+        }
 
         check.context.identity_id = identity.id;
         check.context.identity_attributes = match identity.attributes {
@@ -330,6 +404,13 @@ impl AuthorizationService {
         };
         let grants = self.load_grants_for_token(user, identity_id).await?;
 
+        // Resolve human-relative pack ownership per request from persisted primary
+        // owners. These narrowed copies are never used for delegation or policy
+        // serialization; effective_grants continues to return canonical grants.
+        let grants = attune_common::repositories::iam_ownership::IamOwnershipRepository::resolve_pack_owner_grants(
+            &self.db, identity_id, grants, user.claims.token_type == TokenType::Access,
+        ).await?;
+
         Ok(Some(AuthorizationSnapshot {
             identity_id,
             identity_attributes,
@@ -390,6 +471,16 @@ impl AuthorizationService {
         self.load_grants_for_token(user, identity_id).await
     }
 
+    /// Target-matching copies for SQL/list projections. Unlike effective_grants,
+    /// this resolves pack_owner against current persisted primary ownership.
+    pub async fn resolved_grants(&self, user: &AuthenticatedUser) -> Result<Vec<Grant>, ApiError> {
+        Ok(self
+            .load_snapshot(user)
+            .await?
+            .map(|snapshot| snapshot.grants)
+            .unwrap_or_default())
+    }
+
     /// Returns true when the current token's effective grants are at least
     /// sufficient to grant every resource/action pair in the named permission
     /// sets to a child execution token.
@@ -403,8 +494,8 @@ impl AuthorizationService {
     }
 
     /// Same as [`Self::can_delegate_permission_sets`] but reuses a pre-loaded
-    /// snapshot (identity attributes + effective grants) instead of
-    /// re-fetching them, when one is available for the current request.
+    /// snapshot's identity attributes. Delegation always uses canonical grants,
+    /// never the request-local structural copies used for target matching.
     pub async fn can_delegate_permission_sets_with_snapshot(
         &self,
         user: &AuthenticatedUser,
@@ -423,7 +514,7 @@ impl AuthorizationService {
         let (identity_attributes, current_grants) = match snapshot {
             Some(snapshot) => (
                 snapshot.identity_attributes.clone(),
-                snapshot.grants.clone(),
+                self.load_grants_for_token(user, identity_id).await?,
             ),
             None => {
                 let identity_attributes = self.load_identity_attributes_cached(identity_id).await?;

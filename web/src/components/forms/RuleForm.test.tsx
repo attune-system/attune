@@ -8,10 +8,16 @@ import {
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RulesService } from "@/api";
+import { RulesService, SchemaTypesService } from "@/api";
+import { CancelablePromise } from "@/api/core/CancelablePromise";
 import type { RuleResponse } from "@/api";
 import RuleForm from "./RuleForm";
 import formRequests from "../../test/fixtures/form-requests.json";
+
+const { triggerFixture } = vi.hoisted(() => {
+  const param_schema: Record<string, unknown> = {};
+  return { triggerFixture: { ref: "demo.event", param_schema } };
+});
 
 vi.mock("@/hooks/usePacks", () => ({
   usePacks: () => ({
@@ -23,7 +29,7 @@ vi.mock("@/hooks/useTriggers", () => ({
     data: { items: [{ id: 2, ref: "demo.event", label: "Event" }] },
   }),
   useTrigger: () => ({
-    data: { data: { ref: "demo.event", param_schema: {} } },
+    data: { data: triggerFixture },
   }),
 }));
 vi.mock("@/hooks/useActions", () => ({
@@ -36,6 +42,7 @@ vi.mock("@/hooks/useActions", () => ({
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  triggerFixture.param_schema = {};
 });
 
 const rule: RuleResponse = {
@@ -77,6 +84,43 @@ function showForm(initialRule?: RuleResponse) {
 }
 
 describe("rule request contracts", () => {
+  it("renders trigger parameter enums as selects and submits the chosen value", async () => {
+    triggerFixture.param_schema = {
+      mode: { type: "string", enum: ["interval", "cron"], required: true },
+    };
+    vi.spyOn(SchemaTypesService, "previewSchema").mockReturnValue(
+      new CancelablePromise<
+        Awaited<ReturnType<typeof SchemaTypesService.previewSchema>>
+      >((resolve) =>
+        resolve({
+          data: {
+            semantic_digest: "trigger-enum-preview",
+            contract: {
+              annotated_schema: {
+                type: "object",
+                required: ["mode"],
+                properties: {
+                  mode: { type: "string", enum: ["interval", "cron"] },
+                },
+              },
+            },
+          },
+        }),
+      ),
+    );
+    const update = vi.spyOn(RulesService, "updateRule").mockResolvedValue({
+      data: rule,
+    });
+    showForm({ ...rule, trigger_params: { mode: "interval" } });
+    const select = await screen.findByRole("combobox", { name: "/mode" });
+    expect(select).toHaveValue("0");
+    fireEvent.change(select, { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Update Rule" }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    expect(update.mock.calls[0][0].requestBody.trigger_params).toEqual({
+      mode: "cron",
+    });
+  });
   it("updates a rule without create-only identity fields in the API body", async () => {
     const update = vi.spyOn(RulesService, "updateRule").mockResolvedValue({
       data: rule,

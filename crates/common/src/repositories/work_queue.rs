@@ -62,6 +62,7 @@ mod tests {
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkQueueSearchFilters {
+    pub read_visibility: Option<super::iam_ownership::ComponentReadFilter>,
     pub pack: Option<Id>,
     pub pack_ref: Option<String>,
     pub dispatch_action: Option<Id>,
@@ -854,6 +855,18 @@ impl WorkQueueRepository {
         }
 
         let _ = has_where;
+
+        if let Some(visibility) = &filters.read_visibility {
+            for query in [&mut qb, &mut count_qb] {
+                query.push(" AND ");
+                super::iam_ownership::push_component_read(
+                    query,
+                    visibility,
+                    "work_queue",
+                    crate::rbac::Resource::Queues,
+                );
+            }
+        }
 
         let total: i64 = count_qb.build_query_scalar().fetch_one(db).await?;
 

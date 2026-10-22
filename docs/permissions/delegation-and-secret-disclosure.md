@@ -2,26 +2,175 @@
 
 ## Pack registration
 
-Pack installation does not grant permission to publish arbitrary authorization policies.
-Registration checks permission-bearing metadata before candidate tests and again in the activation transaction.
-The loader requires the registering identity's authority before it changes components.
+Pack ownership records the primary owner or installer; it is not an additional
+authorization gate. Applicable RBAC grants authorize access regardless of who
+owns the pack. Global `packs:read` includes packs installed by other identities.
+Explicit owner, pack, ref, and ID constraints still limit their grants. Reading a
+pack does not authorize configuration, replacement, deletion, or secret disclosure;
+each operation requires its own applicable permissions. Access does not transfer
+ownership.
 
-A caller can publish permission-set definitions whose grants it already holds.
-An unrestricted `permissions:manage` grant also permits policy definitions.
-Attaching permission refs to actions, rules, queues, workflow tasks, or sensor cache access requires separate proof that the caller covers those grants.
-An unused broad definition still requires authority to publish it.
+`packs:install` is trusted deployment authority for the matching pack. A global
+grant permits deployment to any pack; a ref-scoped grant permits deployment only
+to matching pack refs. The same permission authorizes replacing that pack with
+an explicit replacement request. Deployment does not additionally require
+`packs:configure` or personal possession of every permission declared by the pack.
 
-Delegation compares resource, action, and scope constraints.
+`core.editor` retains global pack read access. Its namespace-claim grant allows
+first installation through `constraints: {pack_state: uninstalled}`. A separate
+grant permits install and configure on packs owned by the requesting identity,
+through `constraints: {owner: self}`. Ownership includes the primary owner or
+current membership in the pack's declared owner roles. Redeploying or
+configuring other packs requires an additional matching grant. `core.admin` retains global
+install authority. Ownership remains attribution, not an extra deny on other
+applicable grants.
+
+`uninstalled` means no persisted pack or namespace entry exists. An existing pack
+with NULL `installed_by` does not qualify. The platform namespace `core` remains
+reserved even without a pack row. Missing namespace context fails closed.
+Preflight resolves the actual pack owner; activation resolves it again under the
+pack mutation lock before effects. Concurrent first uploads cannot both claim
+the same ref. The create endpoint requires both matching create and install
+authority under that lock and cannot use a namespace claim to mark a pack as
+standard. Its normal editor grant uses the same `uninstalled` constraint.
+
+Authorized deployers may publish permission sets broader than their own grants
+and select permission refs in deployed components. Permission definitions must
+remain in the deploying pack's namespace and cannot overwrite another pack's
+components or platform-managed policies. Global or cross-pack runtime authority
+still uses explicit external scope and recorded approvals when selected for runtime
+use. Deployment can issue those approvals for its target pack without granting them
+to the human uploader.
+Schema validity, reference resolution, immutable releases, concrete target pins,
+and secret-disclosure contracts remain enforced.
+
+Publication is separate from runtime admission. Unused human IAM definitions may
+contain `owner: self` or `pack_owner: self`; they are stored without runtime grants
+or runtime approvals. Every definition still requires valid authoring metadata,
+scope and namespace ownership. Selecting a human-relative definition for execution
+remains invalid. Only the permission refs needed by each pinned invocation ceiling
+are compiled and approved for runtime use. Omission uses pinned action defaults;
+`[]` selects none. Dynamic workflow tasks admit their finite targets' defaults plus
+literal task refs, not every published definition or the parent's selected API refs.
+Retained bindings keep their recorded permission bodies independently of current
+definitions. Sensor-purpose and rule-input selections retain their own admission
+checks. An unused external definition no longer requires a runtime approval merely
+to be published under trusted deployment authority.
+
+Registration checks deployment authority before candidate tests and again in
+the activation transaction. Runtime approval issuance rechecks an active
+deployer's authority for the specific subject pack. Direct component edits and
+explicit approval APIs do not acquire this deployment exception. Publishing a
+permission set does not create user or role assignments for it. Updating an
+already assigned permission set does change the grants of its existing assignees,
+so pack deployers must be trusted to administer the policies in their packs.
+
+Outside trusted pack deployment, delegation compares resource, action, and scope constraints.
 A restricted grant cannot authorize an unrestricted grant by matching a context with missing target fields.
 Scope narrowing is allowed when the evaluator can prove containment.
 Unsupported containment relationships fail closed.
 
 The registration transaction captures authority before updating the pack's permission sets.
-A set assigned to the caller cannot authorize its own replacement with broader grants.
-The current caller becomes `pack.installed_by` for deployment attribution.
+A transaction-bound `AuthorizedPackDeployment` retains the original namespace
+context and locked IAM snapshot before candidate mutations. After row creation it
+binds to the exact pack ID, ref and actor. Component metadata admission and runtime
+external approvals validate that binding and the database transaction ID, rather
+than treating the newly created row as an uninstalled namespace. The capability
+cannot authorize another deployment transaction or another pack. First-install
+authority therefore survives row creation without granting later replacement or
+personal permission-administration authority.
+A candidate permission-set change cannot supply missing deployment authority
+for its own activation. An authorized deployer may update an assigned set.
+The first registering identity initializes `pack.installed_by`; redeployment
+preserves that primary owner. Install records and deployment audits identify
+the current deploying identity separately.
 Included rules run under a separate system-owned pack identity. Deployment
 captures their input grants and explicitly assigns their execution permission
 sets to that identity. Ownerless rules cannot create executions.
+
+## Pack-owner component constraints
+
+`constraints: {pack_owner: self}` requires the requesting identity to be the
+persisted primary owner or a current declared owner-role member of the target's
+structurally managing pack. It does not
+grant permissions by itself. Another applicable grant can still authorize the
+operation. Only `self` is accepted for `pack_owner`.
+
+This constraint supports pack metadata and managed actions, rules, policies,
+queues, triggers, sensors, runtimes, and dashboards. Workflow metadata uses the
+Actions resource with its actual managing ownership. Platform components,
+standard packs, packs without a matching primary owner or declared role membership,
+missing parents, and ad hoc components do not
+qualify. A matching ref prefix, `pack_ref`, or association-only pack FK is not
+ownership. Repositories resolve the actual structural FK and
+`management_origin = 'pack'` before evaluating the pack's persisted ownership.
+
+`owner: self` remains target-own authorization. It is not reinterpreted as pack
+ownership for a rule's runtime identity, an execution's executor, a dashboard's
+author, or identity-owned data. `pack_owner` does not apply to execution lineage,
+queue items, secrets, caches, or permission administration. Unsupported resource
+declarations are rejected; unsupported projections fail closed.
+
+Request-local IAM matching and SQL visibility can narrow `pack_owner` into
+explicit managing-pack IDs after querying current primary owners and, for access
+credentials, current declared-role membership. These copies
+retain all other constraints. Assignment, policy serialization, and delegation
+use the canonical relative grants, not those narrowed copies. Captured runtime
+policies continue to reject human-relative grants, including `pack_owner`.
+
+API-created actions, rules, queues, and dashboards are ad hoc. Associating one
+with an owned pack does not make it eligible for `pack_owner` create authority.
+Policy and runtime creation can qualify when their real structural destination
+pack is owned by the caller. Managed queue ownership cannot be changed by a
+component edit. Existing component editing interfaces do not gain new ownership
+transfer powers. No bundled editor component grants are changed by this feature.
+
+## Declared pack owner roles
+
+Pack manifests may declare exact identity-role names:
+
+```yaml
+owner_roles: [platform-team, automation-maintainers]
+```
+
+The typed `pack.owner_roles` column is separate from arbitrary `meta`. Declaring
+roles does not create memberships, assign permission sets, or grant actions.
+The first human owner remains recorded in `installed_by` across deployments.
+Access-token identities with current persisted membership in a declared role
+can satisfy `pack_owner: self` and `owner: self` on pack targets. Non-pack
+`owner: self` still refers only to the target's own identity. Execution and sensor
+credentials do not borrow a human's owner-role membership. Registered pack
+runtime identities cannot use owner-role membership either.
+
+Membership is queried from active identity and role-assignment rows for each
+ownership authorization, not JWT metadata or role-name caches. Removing a role
+therefore removes its ownership eligibility on the next request. Existing
+independent global/scoped grants can still authorize the operation.
+
+Names remain case-sensitive exact strings, with no trimming or case folding.
+Lists accept at most 64 entries; names require 1–255 characters, must not be
+whitespace-only, and cannot contain control characters. Exact duplicate names
+are collapsed in first-occurrence order. Null, scalars and non-string entries
+are rejected. Missing declarations default to [] on new packs; replacement
+omission preserves the stored list, and an explicit [] clears it.
+
+Deployment requires Install against the previous owner/role declaration before
+candidate effects and again under the pack mutation lock. The activation
+transaction holds current membership rows and keeps the previous declaration
+through runtime approval rechecks, then writes the new list before commit.
+Candidates cannot add a caller's role to authorize their own replacement. An
+authorized member may deliberately remove its own role.
+
+The create API already requires Create and Install. Updating `owner_roles`
+through the pack metadata API requires an access token plus matching Configure
+and Install against the previous declaration, with a fresh transaction check.
+Changes to `is_standard` also require Install because that flag affects ownership
+eligibility. Configure alone cannot rewrite ownership. Scoped or global trusted
+installers may publish role declarations without joining those roles themselves.
+
+Migration `20261021000001_pack_owner_roles.sql` adds the column and list-integrity
+constraint. It must be applied with the compatible services during a coordinated
+rollout. Catalog revision remains 2; the editor's component grants are unchanged.
 
 ## Execution authority
 
@@ -38,7 +187,7 @@ Missing ownership never implies identity `1` or another privileged actor.
 The reserved `standard` ref retains its scoped key and artifact contract.
 It does not grant shared system-key access.
 Sensor standard cache access remains read-only within the sensor and its pack.
-Named sensor cache grants are checked against the registrar at deployment and
+Named sensor cache grants are admitted under trusted pack deployment and
 captured in the immutable executable release. An admitted workload generation
 uses those grants without a live dependency on the installer's identity or
 current access. Tokens remain fenced to a current, eligible workload assignment.

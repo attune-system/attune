@@ -64,6 +64,37 @@ pub enum OwnerConstraint {
     None,
 }
 
+/// A namespace claim requires authoritative absence, not an ownerless pack row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = RbacPackStateConstraint)]
+pub enum PackStateConstraint {
+    Uninstalled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = RbacPackOwnerConstraint)]
+pub enum PackOwnerConstraint {
+    #[serde(rename = "self")]
+    SelfOnly,
+}
+
+/// Human ownership of component metadata, not runtime lineage or secret ownership.
+pub fn supports_pack_owner(resource: Resource) -> bool {
+    matches!(
+        resource,
+        Resource::Packs
+            | Resource::Actions
+            | Resource::Policies
+            | Resource::Queues
+            | Resource::Rules
+            | Resource::Triggers
+            | Resource::Runtimes
+            | Resource::Dashboards
+    )
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[schema(as = RbacExecutionScopeConstraint)]
@@ -78,6 +109,10 @@ pub enum ExecutionScopeConstraint {
 #[serde(deny_unknown_fields)]
 #[schema(as = RbacGrantConstraints)]
 pub struct GrantConstraints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_owner: Option<PackOwnerConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_state: Option<PackStateConstraint>,
     /// Server-normalized structural ownership. Authored selectors cannot set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managing_pack_id: Option<Id>,
@@ -181,6 +216,14 @@ fn is_valid_cache_namespace_ref(value: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct AuthorizationContext {
+    /// Server-resolved, current role membership for the actual managing pack.
+    /// Never populated from JWT roles or on execution/sensor target resolution.
+    pub pack_owner_role_member: bool,
+    /// Persisted primary owner of the structurally managing pack, never the
+    /// target's runtime owner, an associated pack, or a ref-derived namespace.
+    pub pack_owner_identity_id: Option<Id>,
+    /// Set only after resolving namespace absence and platform reservations.
+    pub pack_state: Option<PackStateConstraint>,
     /// Set only from repository-owned target resolution, never a ref prefix.
     pub managing_pack_id: Option<Id>,
     pub identity_id: Id,
@@ -200,6 +243,9 @@ pub struct AuthorizationContext {
 impl AuthorizationContext {
     pub fn new(identity_id: Id) -> Self {
         Self {
+            pack_owner_role_member: false,
+            pack_owner_identity_id: None,
+            pack_state: None,
             managing_pack_id: None,
             identity_id,
             identity_attributes: HashMap::new(),
@@ -226,6 +272,28 @@ impl Grant {
         let Some(constraints) = &self.constraints else {
             return true;
         };
+        if constraints.pack_owner.is_some()
+            && (!supports_pack_owner(self.resource)
+                || ctx.managing_pack_id.is_none()
+                || !(ctx.pack_owner_identity_id == Some(ctx.identity_id)
+                    || ctx.pack_owner_role_member))
+        {
+            return false;
+        }
+        if let Some(state) = constraints.pack_state {
+            if self.resource != Resource::Packs
+                || ctx.pack_state != Some(state)
+                || ctx
+                    .target_ref
+                    .as_deref()
+                    .is_none_or(crate::platform_catalog::reserved_pack_namespace)
+                || ctx.target_id.is_some()
+                || ctx.managing_pack_id.is_some()
+                || ctx.owner_identity_id.is_some()
+            {
+                return false;
+            }
+        }
         if let Some(pack_id) = constraints.managing_pack_id {
             if ctx.managing_pack_id != Some(pack_id)
                 || !crate::runtime_authority::pack_owned_resource(self.resource)
@@ -252,7 +320,13 @@ impl Grant {
 
         if let Some(owner) = constraints.owner {
             let owner_match = match owner {
-                OwnerConstraint::SelfOnly => ctx.owner_identity_id == Some(ctx.identity_id),
+                OwnerConstraint::SelfOnly => {
+                    ctx.owner_identity_id == Some(ctx.identity_id)
+                        || self.resource == Resource::Packs
+                            && ctx.pack_owner_role_member
+                            && ctx.target_id.is_some()
+                            && ctx.target_id == ctx.managing_pack_id
+                }
                 OwnerConstraint::Any => true,
                 OwnerConstraint::None => ctx.owner_identity_id.is_none(),
             };
@@ -401,6 +475,12 @@ fn delegation_constraints_cover(
     };
     attributes_match
         && held
+            .pack_owner
+            .is_none_or(|owner| requested.pack_owner == Some(owner))
+        && held
+            .pack_state
+            .is_none_or(|state| requested.pack_state == Some(state))
+        && held
             .managing_pack_id
             .is_none_or(|pack| requested.managing_pack_id == Some(pack))
         && owner
@@ -431,6 +511,223 @@ fn selected_scope_is_subset<T: PartialEq>(held: Option<&[T]>, requested: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_role_proof_counts_only_for_pack_ownership_not_target_ownership() {
+        let mut context = AuthorizationContext::new(7);
+        context.managing_pack_id = Some(19);
+        context.target_id = Some(19);
+        context.owner_identity_id = Some(99);
+        context.pack_owner_identity_id = Some(99);
+        context.pack_owner_role_member = true;
+        let pack = Grant {
+            resource: Resource::Packs,
+            actions: vec![Action::Configure],
+            constraints: Some(GrantConstraints {
+                owner: Some(OwnerConstraint::SelfOnly),
+                ..Default::default()
+            }),
+        };
+        assert!(pack.allows(Resource::Packs, Action::Configure, &context));
+        let rule = Grant {
+            resource: Resource::Rules,
+            ..pack.clone()
+        };
+        assert!(!rule.allows(Resource::Rules, Action::Configure, &context));
+        let managed = Grant {
+            resource: Resource::Rules,
+            constraints: Some(GrantConstraints {
+                pack_owner: Some(PackOwnerConstraint::SelfOnly),
+                ..Default::default()
+            }),
+            ..pack.clone()
+        };
+        assert!(managed.allows(Resource::Rules, Action::Configure, &context));
+        context.managing_pack_id = None;
+        assert!(!managed.allows(Resource::Rules, Action::Configure, &context));
+        assert!(!pack.allows(Resource::Packs, Action::Configure, &context));
+    }
+
+    #[test]
+    fn pack_owner_is_separate_from_target_owner_and_requires_structural_context() {
+        let grant: Grant = serde_json::from_value(serde_json::json!({
+            "resource": "rules", "actions": ["read", "update"], "constraints": {"pack_owner": "self"}
+        })).unwrap();
+        let mut context = AuthorizationContext::new(7);
+        context.target_ref = Some("owned_namespace.rule".into());
+        context.owner_identity_id = Some(7);
+        assert!(!grant.allows(Resource::Rules, Action::Read, &context));
+        context.managing_pack_id = Some(19);
+        for owner in [None, Some(8)] {
+            context.pack_owner_identity_id = owner;
+            assert!(!grant.allows(Resource::Rules, Action::Read, &context));
+        }
+        context.pack_owner_identity_id = Some(7);
+        context.owner_identity_id = Some(99);
+        assert!(grant.allows(Resource::Rules, Action::Read, &context));
+        let target_owned = Grant {
+            constraints: Some(GrantConstraints {
+                owner: Some(OwnerConstraint::SelfOnly),
+                ..Default::default()
+            }),
+            ..grant.clone()
+        };
+        assert!(!target_owned.allows(Resource::Rules, Action::Read, &context));
+        context.owner_identity_id = Some(7);
+        context.pack_owner_identity_id = Some(8);
+        assert!(target_owned.allows(Resource::Rules, Action::Read, &context));
+        assert!(!grant.allows(Resource::Rules, Action::Read, &context));
+        let global = Grant {
+            constraints: None,
+            ..grant.clone()
+        };
+        context.pack_owner_identity_id = None;
+        assert!([grant.clone(), global].iter().any(|grant| grant.allows(
+            Resource::Rules,
+            Action::Read,
+            &context
+        )));
+        let secret = Grant {
+            resource: Resource::Keys,
+            ..grant.clone()
+        };
+        context.pack_owner_identity_id = Some(7);
+        assert!(!secret.allows(Resource::Keys, Action::Read, &context));
+        assert!(crate::runtime_authority::validate_stable_grant(&grant).is_err());
+        assert_eq!(
+            serde_json::to_value(&grant).unwrap()["constraints"]["pack_owner"],
+            "self"
+        );
+        for owner in ["any", "none", "primary"] {
+            assert!(serde_json::from_value::<GrantConstraints>(
+                serde_json::json!({"pack_owner": owner})
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn delegation_preserves_pack_owner_even_when_the_current_pack_is_owned() {
+        let owned = Grant {
+            resource: Resource::Actions,
+            actions: vec![Action::Update],
+            constraints: Some(GrantConstraints {
+                pack_owner: Some(PackOwnerConstraint::SelfOnly),
+                ..Default::default()
+            }),
+        };
+        let global = Grant {
+            constraints: None,
+            ..owned.clone()
+        };
+        let narrow = Grant {
+            constraints: Some(GrantConstraints {
+                refs: Some(vec!["tools.run".into()]),
+                ..owned.constraints.clone().unwrap()
+            }),
+            ..owned.clone()
+        };
+        let mut context = AuthorizationContext::new(7);
+        context.managing_pack_id = Some(19);
+        context.pack_owner_identity_id = Some(7);
+        assert!(!can_delegate_grants(
+            std::slice::from_ref(&owned),
+            std::slice::from_ref(&global),
+            &context
+        ));
+        assert!(can_delegate_grants(
+            std::slice::from_ref(&global),
+            std::slice::from_ref(&owned),
+            &context
+        ));
+        assert!(can_delegate_grants(
+            std::slice::from_ref(&owned),
+            std::slice::from_ref(&narrow),
+            &context
+        ));
+        assert!(!can_delegate_grants(
+            std::slice::from_ref(&narrow),
+            std::slice::from_ref(&owned),
+            &context
+        ));
+    }
+
+    fn claim_grant() -> Grant {
+        serde_json::from_value(serde_json::json!({
+            "resource": "packs", "actions": ["install"],
+            "constraints": {"pack_state": "uninstalled"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn uninstalled_requires_authoritative_absence_and_is_not_ownerless() {
+        let grant = claim_grant();
+        let mut context = AuthorizationContext::new(7);
+        context.target_ref = Some("tools".into());
+        assert!(!grant.allows(Resource::Packs, Action::Install, &context));
+        context.pack_state = Some(PackStateConstraint::Uninstalled);
+        assert!(grant.allows(Resource::Packs, Action::Install, &context));
+        context.target_id = Some(8);
+        assert!(!grant.allows(Resource::Packs, Action::Install, &context));
+        context.target_id = None;
+        context.owner_identity_id = Some(7);
+        assert!(!grant.allows(Resource::Packs, Action::Install, &context));
+        let mut invalid_resource = grant.clone();
+        invalid_resource.resource = Resource::Actions;
+        context.owner_identity_id = None;
+        assert!(!invalid_resource.allows(Resource::Actions, Action::Install, &context));
+        assert!(crate::runtime_authority::validate_stable_grant(&invalid_resource).is_err());
+        context.target_ref = Some("core".into());
+        assert!(!grant.allows(Resource::Packs, Action::Install, &context));
+        assert_eq!(
+            serde_json::to_value(grant).unwrap()["constraints"]["pack_state"],
+            "uninstalled"
+        );
+        assert!(serde_json::from_value::<GrantConstraints>(
+            serde_json::json!({"pack_state": "unclaimed"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn delegation_cannot_drop_pack_state_even_when_context_is_uninstalled() {
+        let claim = claim_grant();
+        let broad = Grant {
+            constraints: None,
+            ..claim.clone()
+        };
+        let narrow = Grant {
+            constraints: Some(GrantConstraints {
+                refs: Some(vec!["tools".into()]),
+                ..claim.constraints.clone().unwrap()
+            }),
+            ..claim.clone()
+        };
+        let context = crate::repositories::pack::PackRepository::deployment_context_for_pack(
+            7, "tools", None,
+        );
+        assert!(!can_delegate_grants(
+            std::slice::from_ref(&claim),
+            std::slice::from_ref(&broad),
+            &context
+        ));
+        assert!(can_delegate_grants(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&claim),
+            &context
+        ));
+        assert!(can_delegate_grants(
+            std::slice::from_ref(&claim),
+            std::slice::from_ref(&narrow),
+            &context
+        ));
+        assert!(!can_delegate_grants(
+            std::slice::from_ref(&narrow),
+            std::slice::from_ref(&claim),
+            &context
+        ));
+    }
     use serde_json::json;
 
     #[test]

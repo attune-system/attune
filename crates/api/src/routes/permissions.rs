@@ -1610,6 +1610,16 @@ fn validate_grant_constraints(
     resource: &Resource,
     constraints: &attune_common::rbac::GrantConstraints,
 ) -> ApiResult<()> {
+    if constraints.pack_state.is_some() && *resource != Resource::Packs {
+        return Err(ApiError::BadRequest(
+            "Pack state constraints only apply to packs grants".to_string(),
+        ));
+    }
+    if constraints.pack_owner.is_some() && !attune_common::rbac::supports_pack_owner(*resource) {
+        return Err(ApiError::BadRequest(
+            "Pack owner constraints require pack-managed component metadata or packs".into(),
+        ));
+    }
     if constraints.pack_refs.is_some()
         && !matches!(
             resource,

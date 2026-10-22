@@ -345,6 +345,7 @@ export class PacksService {
        * Pack metadata
        */
       meta: Record<string, any>;
+      owner_roles: Array<string>;
       /**
        * Unique reference identifier
        */
@@ -722,6 +723,7 @@ export class PacksService {
        * Pack metadata
        */
       meta: Record<string, any>;
+      owner_roles: Array<string>;
       /**
        * Unique reference identifier
        */
@@ -837,6 +839,7 @@ export class PacksService {
        * Pack metadata
        */
       meta: Record<string, any>;
+      owner_roles: Array<string>;
       /**
        * Unique reference identifier
        */

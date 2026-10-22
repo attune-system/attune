@@ -311,7 +311,7 @@ pub async fn list_packs(
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
         let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user).await?;
+        let grants = authz.resolved_grants(&user).await?;
         filters.visibility = Some(build_pack_visibility_filter(identity_id, &grants));
     }
 
@@ -355,7 +355,7 @@ pub async fn get_pack(
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
         let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user).await?;
+        let grants = authz.resolved_grants(&user).await?;
         if !pack_action_allowed(&grants, Action::Read, identity_id, &pack) {
             return Err(ApiError::NotFound(format!("Pack '{}' not found", pack_ref)));
         }
@@ -372,10 +372,7 @@ pub async fn get_pack(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
-        let grants = state
-            .authorization_service()
-            .effective_grants(&user)
-            .await?;
+        let grants = state.authorization_service().resolved_grants(&user).await?;
         if !pack_action_allowed(&grants, Action::Read, identity_id, &pack)
             || !pack_action_allowed(&grants, Action::Decrypt, identity_id, &pack)
         {
@@ -659,6 +656,16 @@ pub async fn create_pack(
         )));
     }
 
+    require_pack_access_token(&user.claims.token_type)?;
+    let mut tx = state.db.begin().await?;
+    attune_common::pack_registry::deployment_admission::DeploymentAdmission::lock(&mut tx).await?;
+    attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
+    PackRepository::acquire_mutation_lock(&mut tx, &request.r#ref).await?;
+    if PackRepository::exists_by_ref(&mut *tx, &request.r#ref).await? {
+        return Err(ApiError::Conflict(
+            "Pack namespace is already installed".into(),
+        ));
+    }
     let mut creator_identity = None;
     if user.claims.token_type == crate::auth::jwt::TokenType::Access {
         let identity_id = user
@@ -666,8 +673,21 @@ pub async fn create_pack(
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
         creator_identity = Some(identity_id);
         let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.target_ref = Some(request.r#ref.clone());
+        let mut ctx =
+            PackRepository::deployment_context(&mut *tx, identity_id, &request.r#ref).await?;
+        // A namespace claim cannot create platform/standard ownership metadata.
+        if request.is_standard {
+            ctx.pack_state = None;
+        }
+        let authority =
+            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
+                .await?;
+        require_candidate_install_authority(&authority, ctx.clone())?;
+        if !authority.allows(Resource::Packs, Action::Create, ctx.clone()) {
+            return Err(ApiError::Forbidden(
+                "Not authorized to create pack namespace".into(),
+            ));
+        }
         authz
             .authorize(
                 &user,
@@ -680,6 +700,7 @@ pub async fn create_pack(
             .await?;
     }
 
+    let owner_roles = request.owner_roles.clone();
     // Create pack input
     let pack_input = CreatePackInput {
         r#ref: request.r#ref,
@@ -696,8 +717,6 @@ pub async fn create_pack(
         installers: serde_json::json!({}),
     };
 
-    let mut tx = state.db.begin().await?;
-    attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
     let mut pack = PackRepository::create(&mut *tx, pack_input).await?;
     let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
         &mut tx, &pack, Some(&pack.config), state.config.security.encryption_key.as_deref()).await?;
@@ -714,6 +733,9 @@ pub async fn create_pack(
         if !pack.is_standard {
             pack = PackRepository::set_installed_by(&mut *tx, pack.id, identity_id).await?;
         }
+    }
+    if let Some(roles) = owner_roles {
+        pack = PackRepository::set_owner_roles(&mut tx, pack.id, roles).await?;
     }
     tx.commit().await?;
 
@@ -804,24 +826,37 @@ pub async fn update_pack(
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(&user).await?;
+    let grants = authz.resolved_grants(&user).await?;
     if !pack_action_allowed(&grants, Action::Configure, identity_id, &existing_pack) {
         return Err(ApiError::Forbidden(
             "Not authorized to configure pack".to_string(),
         ));
     }
-    if existing_pack.installed_by == Some(identity_id) || existing_pack.installed_by.is_none() {
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Packs,
-                    action: Action::Configure,
-                    context: pack_authorization_context(identity_id, &existing_pack),
-                },
-            )
-            .await?;
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Packs,
+                action: Action::Configure,
+                context: pack_authorization_context(identity_id, &existing_pack),
+            },
+        )
+        .await?;
+
+    // Authorize protected fields by presence, not a pre-lock value comparison.
+    // Even a no-op value can become an ownership change while waiting for the
+    // mutation lock behind another authorized update.
+    let ownership_metadata_requested =
+        request.owner_roles.is_some() || request.is_standard.is_some();
+    if ownership_metadata_requested {
+        require_pack_access_token(&user.claims.token_type)?;
+        if !pack_action_allowed(&grants, Action::Install, identity_id, &existing_pack) {
+            return Err(ApiError::Forbidden(
+                "Changing ownership metadata requires target pack Install authority".into(),
+            ));
+        }
     }
+    let owner_roles = request.owner_roles.clone();
 
     let authorized_pack_id = existing_pack.id;
     let mut tx = state.db.begin().await?;
@@ -830,6 +865,7 @@ pub async fn update_pack(
     )
     .await?;
     attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
+    PackRepository::acquire_mutation_lock(&mut tx, &pack_ref).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref)
         .await?
@@ -839,6 +875,23 @@ pub async fn update_pack(
             "Pack '{}' changed while the update was being authorized",
             pack_ref
         )));
+    }
+    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
+        for action in std::iter::once(Action::Configure)
+            .chain(ownership_metadata_requested.then_some(Action::Install))
+        {
+            authz
+                .authorize_access_fresh(
+                    &mut tx,
+                    &user,
+                    AuthorizationCheck {
+                        resource: Resource::Packs,
+                        action,
+                        context: pack_authorization_context(identity_id, &existing_pack),
+                    },
+                )
+                .await?;
+        }
     }
 
     validate_pack_worker_placement(
@@ -934,6 +987,11 @@ pub async fn update_pack(
             ));
         }
     }
+    let pack = if let Some(roles) = owner_roles {
+        PackRepository::set_owner_roles(&mut tx, pack.id, roles).await?
+    } else {
+        pack
+    };
     tx.commit().await?;
 
     // Auto-sync workflows after pack update
@@ -1068,24 +1126,22 @@ pub async fn delete_pack(
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(&user).await?;
+    let grants = authz.resolved_grants(&user).await?;
     if !pack_action_allowed(&grants, Action::Delete, identity_id, &pack) {
         return Err(ApiError::Forbidden(
             "Not authorized to delete pack".to_string(),
         ));
     }
-    if pack.installed_by == Some(identity_id) || pack.installed_by.is_none() {
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Packs,
-                    action: Action::Delete,
-                    context: pack_authorization_context(identity_id, &pack),
-                },
-            )
-            .await?;
-    }
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Packs,
+                action: Action::Delete,
+                context: pack_authorization_context(identity_id, &pack),
+            },
+        )
+        .await?;
 
     let mut tx = match CacheEntryRepository::begin_reclamation_transaction(
         &state.db,
@@ -2069,10 +2125,14 @@ async fn authorize_pack_delegation(
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
     let authority =
         attune_common::delegation::DelegationAuthority::load(&state.db, identity_id).await?;
-    require_candidate_install_authority(&authority, pack_ref)?;
+    let _ownership = attune_common::pack_ownership::PackOwnershipMetadata::read(path)?;
+    let mut connection = state.db.acquire().await?;
+    let context =
+        PackRepository::deployment_context_with_roles(&mut connection, identity_id, pack_ref)
+            .await?;
+    require_candidate_install_authority(&authority, context)?;
     let plan = attune_common::pack_registry::permissions::PackPermissionPlan::read(path, pack_ref)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let mut connection = state.db.acquire().await?;
     if attune_common::pack_registry::deployment_admission::BOOTSTRAP_ADMISSION_ENABLED {
         // Structural validation only here. Admission and approvals are captured
         // in the activation transaction, never from the installer's runtime IAM.
@@ -2502,6 +2562,7 @@ async fn register_pack_internal(
     let deployment_admission = attune_common::pack_registry::deployment_admission::DeploymentAdmission::read(
         &published_release.pack_path, &pack_ref,
     )?;
+    let ownership = attune_common::pack_ownership::PackOwnershipMetadata::read(&published_release.pack_path)?;
     let mut tx = state.db.begin().await?;
     attune_common::pack_registry::deployment_admission::DeploymentAdmission::lock(&mut tx).await?;
     attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
@@ -2519,7 +2580,16 @@ async fn register_pack_internal(
         registering_identity,
     )
     .await?;
-    require_candidate_install_authority(&registration_authority, &pack_ref)?;
+    attune_common::repositories::iam_ownership::IamOwnershipRepository::lock_pack_owner_memberships(
+        &mut tx, registering_identity,
+    ).await?;
+    let activation_context = PackRepository::deployment_context_with_roles(
+        &mut tx, registering_identity, &pack_ref,
+    ).await?;
+    require_candidate_install_authority(&registration_authority, activation_context)?;
+    let mut authorized_deployment = attune_common::repositories::pack::AuthorizedPackDeployment::capture(
+        &mut tx, registering_identity, &pack_ref,
+    ).await?;
     if candidate_effects_requested {
         if let Some(install_id)=active_install_id {
             let tested=PackInstallRepository::find_by_id_for_update(&mut tx,install_id).await?
@@ -2638,6 +2708,7 @@ async fn register_pack_internal(
 
     let pack =
         PackRepository::set_registered_identity(&mut tx, pack.id, registering_identity).await?;
+    authorized_deployment.bind(&mut tx, pack.id).await?;
     let release = PackReleaseRepository::create_or_get_with_policy(
         &mut tx,
         CreatePackReleaseInput {
@@ -2679,7 +2750,7 @@ async fn register_pack_internal(
         let loaded = if attune_common::pack_registry::deployment_admission::BOOTSTRAP_ADMISSION_ENABLED {
             deployment_admission.load(component_loader, &mut tx).await
         } else {
-            component_loader.load_all_in_transaction(&mut tx, &pack_path).await
+            component_loader.load_authorized_deployment(&mut tx, &pack_path, &authorized_deployment).await
         };
         match loaded {
             Ok(load_result) => {
@@ -2744,7 +2815,7 @@ async fn register_pack_internal(
         });
     }
     if let Some(mut metadata) = installation_metadata {
-        metadata.installed_by = Some(registering_identity);
+        metadata.installed_by = pack.installed_by;
         PackRepository::update_installation_metadata(
             &mut *tx,
             pack.id,
@@ -2760,9 +2831,16 @@ async fn register_pack_internal(
         .await?;
     }
     PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, &projections).await?;
-    deployment_admission.finish(
+    deployment_admission.finish_authorized_deployment(
         &mut tx, pack.id, release.id, state.config.security.encryption_key.as_deref(), &registration_authority,
+        &authorized_deployment,
     ).await.map_err(|error| ApiError::from(error).in_deployment("deployment_admission", &pack_ref, &version, active_install_id))?;
+    // Keep PREVIOUS roles through every deployment authorization and approval
+    // recheck. The candidate cannot supply its own missing authority, and an
+    // authorized member can remove its own role without invalidating this deploy.
+    if let Some(roles) = ownership.owner_roles {
+        PackRepository::set_owner_roles(&mut tx, pack.id, roles).await?;
+    }
     if let Some(install_id) = active_install_id {
         test_install = Some(
             PackInstallRepository::finish_activation_in_transaction(&mut tx, install_id, pack.id)
@@ -3028,13 +3106,13 @@ async fn authorize_pack_install_preflight(
 
 fn require_candidate_install_authority(
     authority: &attune_common::delegation::DelegationAuthority,
-    pack_ref: &str,
+    context: AuthorizationContext,
 ) -> ApiResult<()> {
+    let pack_ref = context.target_ref.as_deref().ok_or_else(|| {
+        ApiError::Forbidden("Candidate pack namespace context is unavailable".into())
+    })?;
     attune_common::schema::RefValidator::validate_pack_ref(pack_ref)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let mut context = AuthorizationContext::new(authority.identity_id);
-    context.target_ref = Some(pack_ref.into());
-    context.pack_ref = Some(pack_ref.into());
     if !authority.allows(Resource::Packs, Action::Install, context) {
         return Err(ApiError::Forbidden(
             "Not authorized to install the candidate pack".into(),
@@ -3090,30 +3168,25 @@ async fn authorize_existing_pack_replacement(
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
+    let grants = authz.resolved_grants(user).await?;
     let context = pack_authorization_context(identity_id, pack);
-    let allowed = if pack.installed_by.is_some() && pack.installed_by != Some(identity_id) {
-        constrained_pack_grant_allows(&grants, Action::Configure, &context)
-    } else {
-        AuthorizationService::is_allowed(&grants, Resource::Packs, Action::Configure, &context)
-    };
+    let allowed =
+        AuthorizationService::is_allowed(&grants, Resource::Packs, Action::Install, &context);
     if !allowed {
         return Err(ApiError::Forbidden(
             "Not authorized to replace pack".to_string(),
         ));
     }
-    if pack.installed_by == Some(identity_id) || pack.installed_by.is_none() {
-        authz
-            .authorize(
-                user,
-                AuthorizationCheck {
-                    resource: Resource::Packs,
-                    action: Action::Configure,
-                    context,
-                },
-            )
-            .await?;
-    }
+    authz
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource: Resource::Packs,
+                action: Action::Install,
+                context,
+            },
+        )
+        .await?;
     Ok(())
 }
 
@@ -3126,7 +3199,7 @@ async fn authorize_pack_read(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let grants = state.authorization_service().effective_grants(user).await?;
+    let grants = state.authorization_service().resolved_grants(user).await?;
     if !pack_action_allowed(&grants, Action::Read, identity_id, pack) {
         return Err(ApiError::NotFound(format!(
             "Pack '{}' not found",
@@ -3162,11 +3235,8 @@ async fn authorize_pack_install_read(
     context.target_ref = Some(install.pack_ref.clone());
     context.pack_ref = Some(install.pack_ref.clone());
     context.owner_identity_id = install.requested_by;
-    let allowed = if install.requested_by.is_some() && install.requested_by != Some(identity_id) {
-        constrained_pack_grant_allows(&grants, Action::Read, &context)
-    } else {
-        AuthorizationService::is_allowed(&grants, Resource::Packs, Action::Read, &context)
-    };
+    let allowed =
+        AuthorizationService::is_allowed(&grants, Resource::Packs, Action::Read, &context);
     if !allowed {
         return Err(ApiError::NotFound(format!(
             "Pack install record {} not found",
@@ -5895,6 +5965,9 @@ fn pack_authorization_context(identity_id: i64, pack: &Pack) -> AuthorizationCon
     ctx.target_ref = Some(pack.r#ref.clone());
     ctx.pack_ref = Some(pack.r#ref.clone());
     ctx.owner_identity_id = pack.installed_by;
+    if !pack.is_standard {
+        ctx.pack_owner_identity_id = pack.installed_by;
+    }
     ctx
 }
 
@@ -5904,40 +5977,12 @@ fn pack_action_allowed(grants: &[Grant], action: Action, identity_id: i64, pack:
     }
 
     let ctx = pack_authorization_context(identity_id, pack);
-    if pack.installed_by.is_some() && pack.installed_by != Some(identity_id) {
-        return constrained_pack_grant_allows(grants, action, &ctx);
-    }
-
     AuthorizationService::is_allowed(grants, Resource::Packs, action, &ctx)
 }
 
-fn constrained_pack_grant_allows(
-    grants: &[Grant],
-    action: Action,
-    ctx: &AuthorizationContext,
-) -> bool {
-    grants.iter().any(|grant| {
-        let Some(constraints) = &grant.constraints else {
-            return false;
-        };
-        let pack_scoped = constraints.managing_pack_id.is_some()
-            || constraints.owner.is_some()
-            || constraints.pack_refs.is_some()
-            || constraints.refs.is_some()
-            || constraints.ids.is_some();
-        grant.resource == Resource::Packs
-            && grant.actions.contains(&action)
-            && pack_scoped
-            && grant.allows(Resource::Packs, action, ctx)
-    })
-}
-
 /// Translates a token's effective RBAC grants into a SQL-evaluable
-/// [`PackVisibilityFilter`], mirroring `pack_action_allowed`/
-/// `constrained_pack_grant_allows` row-by-row semantics entirely in SQL:
-/// an unconstrained grant matches any pack the identity owns or that has no
-/// owner; constrained grants that are "pack scoped" (owner/pack_refs/refs/ids)
-/// additionally apply to packs installed by someone else.
+/// [`PackVisibilityFilter`], mirroring `pack_action_allowed` entirely in SQL.
+/// Ownership limits visibility only when the grant explicitly constrains it.
 fn build_pack_visibility_filter(identity_id: i64, grants: &[Grant]) -> PackVisibilityFilter {
     let mut own_or_ownerless_scopes = Vec::new();
     let mut other_owner_scopes = Vec::new();
@@ -5947,11 +5992,8 @@ fn build_pack_visibility_filter(identity_id: i64, grants: &[Grant]) -> PackVisib
             continue;
         }
         let Some(constraints) = &grant.constraints else {
-            // Unconstrained grants only ever satisfy `is_allowed` checks,
-            // which `pack_action_allowed` only consults for own/ownerless
-            // packs (see `constrained_pack_grant_allows`'s `Some(constraints)`
-            // requirement for other-owner packs).
             own_or_ownerless_scopes.push(PackVisibilityScope::default());
+            other_owner_scopes.push(PackVisibilityScope::default());
             continue;
         };
         if !pack_grant_context_feasible(constraints) {
@@ -5971,14 +6013,7 @@ fn build_pack_visibility_filter(identity_id: i64, grants: &[Grant]) -> PackVisib
                 None => constraints.ids.clone(),
             },
         };
-        let pack_scoped = constraints.managing_pack_id.is_some()
-            || constraints.owner.is_some()
-            || constraints.pack_refs.is_some()
-            || constraints.refs.is_some()
-            || constraints.ids.is_some();
-        if pack_scoped {
-            other_owner_scopes.push(scope.clone());
-        }
+        other_owner_scopes.push(scope.clone());
         own_or_ownerless_scopes.push(scope);
     }
 
@@ -5991,10 +6026,17 @@ fn build_pack_visibility_filter(identity_id: i64, grants: &[Grant]) -> PackVisib
 
 /// Returns `false` when `constraints` depend on authorization-context fields
 /// that are never populated for pack visibility checks (packs have no
-/// artifact visibility, execution scope, encryption flag, or `owner_type`),
+/// artifact visibility, execution scope, encryption flag, or owner type/ref),
 /// meaning the grant could never match any pack row.
 fn pack_grant_context_feasible(constraints: &GrantConstraints) -> bool {
-    if constraints.owner_types.is_some() {
+    if constraints.pack_owner.is_some() {
+        return false;
+    }
+    // Every list/detail target is an existing row, never an uninstalled namespace.
+    if constraints.pack_state.is_some() {
+        return false;
+    }
+    if constraints.owner_types.is_some() || constraints.owner_refs.is_some() {
         return false;
     }
     if constraints.visibility.is_some() {
@@ -6050,6 +6092,170 @@ mod tests {
     fn test_pack_routes_structure() {
         // Just verify the router can be constructed
         let _router = routes();
+    }
+
+    fn pack_owned_by_another_identity() -> Pack {
+        serde_json::from_value(serde_json::json!({
+            "id": 42, "ref": "shared_pack", "label": "Shared pack", "version": "1.0.0",
+            "conf_schema": {}, "config": {}, "meta": {}, "tags": [],
+            "runtime_deps": [], "dependencies": [], "is_standard": false,
+            "installers": {}, "worker_selector": {}, "worker_tolerations": [],
+            "worker_affinity": {}, "installed_by": 2, "install_status": "installed",
+            "created": "2026-10-21T00:00:00Z", "updated": "2026-10-21T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pack_ownership_does_not_override_applicable_grants() {
+        use attune_common::rbac::OwnerConstraint;
+
+        let pack = pack_owned_by_another_identity();
+        for action in [
+            Action::Read,
+            Action::Configure,
+            Action::Delete,
+            Action::Decrypt,
+        ] {
+            for (constraints, allowed) in [
+                (None, true),
+                (Some(GrantConstraints::default()), true),
+                (
+                    Some(GrantConstraints {
+                        owner: Some(OwnerConstraint::Any),
+                        ..Default::default()
+                    }),
+                    true,
+                ),
+                (
+                    Some(GrantConstraints {
+                        owner: Some(OwnerConstraint::SelfOnly),
+                        ..Default::default()
+                    }),
+                    false,
+                ),
+                (
+                    Some(GrantConstraints {
+                        owner: Some(OwnerConstraint::None),
+                        ..Default::default()
+                    }),
+                    false,
+                ),
+                (
+                    Some(GrantConstraints {
+                        pack_refs: Some(vec![pack.r#ref.clone()]),
+                        ..Default::default()
+                    }),
+                    true,
+                ),
+                (
+                    Some(GrantConstraints {
+                        refs: Some(vec!["different_pack".into()]),
+                        ..Default::default()
+                    }),
+                    false,
+                ),
+                (
+                    Some(GrantConstraints {
+                        ids: Some(vec![pack.id]),
+                        ..Default::default()
+                    }),
+                    true,
+                ),
+                (
+                    Some(GrantConstraints {
+                        ids: Some(vec![99]),
+                        ..Default::default()
+                    }),
+                    false,
+                ),
+            ] {
+                let grants = [Grant {
+                    resource: Resource::Packs,
+                    actions: vec![action],
+                    constraints,
+                }];
+                assert_eq!(
+                    pack_action_allowed(&grants, action, 1, &pack),
+                    allowed,
+                    "action={action:?}, grants={grants:?}"
+                );
+                assert!(!pack_action_allowed(&[], action, 1, &pack));
+            }
+        }
+        let read_only = [Grant {
+            resource: Resource::Packs,
+            actions: vec![Action::Read],
+            constraints: None,
+        }];
+        for action in [Action::Configure, Action::Delete, Action::Decrypt] {
+            assert!(!pack_action_allowed(&read_only, action, 1, &pack));
+        }
+    }
+
+    #[test]
+    fn global_pack_read_filters_include_other_owners() {
+        for constraints in [None, Some(GrantConstraints::default())] {
+            let grants = [Grant {
+                resource: Resource::Packs,
+                actions: vec![Action::Read],
+                constraints,
+            }];
+            let filter = build_pack_visibility_filter(1, &grants);
+            for scopes in [&filter.own_or_ownerless_scopes, &filter.other_owner_scopes] {
+                assert_eq!(scopes.len(), 1);
+                let scope = &scopes[0];
+                assert!(
+                    scope.owner.is_none()
+                        && scope.pack_refs.is_none()
+                        && scope.refs.is_none()
+                        && scope.ids.is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_read_filters_preserve_constraints_and_reject_unavailable_context() {
+        use attune_common::rbac::OwnerConstraint;
+
+        let constraints = GrantConstraints {
+            owner: Some(OwnerConstraint::SelfOnly),
+            pack_refs: Some(vec!["shared_pack".into()]),
+            refs: Some(vec!["shared_pack".into()]),
+            ids: Some(vec![42]),
+            ..Default::default()
+        };
+        let grants = [Grant {
+            resource: Resource::Packs,
+            actions: vec![Action::Read],
+            constraints: Some(constraints),
+        }];
+        let filter = build_pack_visibility_filter(1, &grants);
+        for scopes in [&filter.own_or_ownerless_scopes, &filter.other_owner_scopes] {
+            let scope = &scopes[0];
+            assert_eq!(scope.owner, Some(OwnerConstraint::SelfOnly));
+            assert_eq!(scope.pack_refs, Some(vec!["shared_pack".into()]));
+            assert_eq!(scope.refs, Some(vec!["shared_pack".into()]));
+            assert_eq!(scope.ids, Some(vec![42]));
+        }
+        let grants = [Grant {
+            resource: Resource::Packs,
+            actions: vec![Action::Read],
+            constraints: Some(GrantConstraints {
+                owner_refs: Some(vec!["shared_pack".into()]),
+                ..Default::default()
+            }),
+        }];
+        let filter = build_pack_visibility_filter(1, &grants);
+        assert!(filter.own_or_ownerless_scopes.is_empty());
+        assert!(filter.other_owner_scopes.is_empty());
+        assert!(!pack_action_allowed(
+            &grants,
+            Action::Read,
+            1,
+            &pack_owned_by_another_identity()
+        ));
     }
 
     #[test]

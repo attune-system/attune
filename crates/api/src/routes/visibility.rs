@@ -11,6 +11,26 @@ use attune_common::repositories::event::{VisibilityGrantFilter, VisibilityReadSc
 
 use crate::auth::{jwt::TokenType, middleware::AuthenticatedUser};
 
+pub(crate) async fn component_read_filter(
+    state: &std::sync::Arc<crate::state::AppState>,
+    user: &AuthenticatedUser,
+) -> Result<
+    Option<attune_common::repositories::iam_ownership::ComponentReadFilter>,
+    crate::middleware::ApiError,
+> {
+    Ok(state
+        .authorization_service()
+        .load_snapshot(user)
+        .await?
+        .map(
+            |snapshot| attune_common::repositories::iam_ownership::ComponentReadFilter {
+                identity: snapshot.identity_id,
+                attributes: snapshot.identity_attributes,
+                grants: snapshot.grants,
+            },
+        ))
+}
+
 #[derive(Default)]
 pub(crate) struct VisibilityOwners {
     rules: std::collections::HashMap<(i64, String), Option<i64>>,
@@ -124,7 +144,9 @@ pub(crate) fn is_scoped_identity_token(user: &AuthenticatedUser) -> bool {
 /// A constraint set that imposes no scoping at all (equivalent to an
 /// unconstrained grant).
 pub(crate) fn constraints_are_effectively_unscoped(constraints: &GrantConstraints) -> bool {
-    constraints.managing_pack_id.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.managing_pack_id.is_none()
         && constraints.pack_refs.is_none()
         && constraints.owner.is_none()
         && constraints.owner_types.is_none()
@@ -143,7 +165,9 @@ pub(crate) fn constraints_are_effectively_unscoped(constraints: &GrantConstraint
 pub(crate) fn constraints_supported_for_visibility_projection(
     constraints: &GrantConstraints,
 ) -> bool {
-    constraints.owner.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.owner.is_none()
         && constraints.owner_types.is_none()
         && constraints.owner_refs.is_none()
         && constraints.visibility.is_none()

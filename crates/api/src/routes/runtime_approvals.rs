@@ -62,9 +62,9 @@ async fn authorize_pack(
     context.pack_ref = Some(pack.r#ref.clone());
     state
         .authorization_service()
-        .authorize_identity_fresh(
+        .authorize_access_fresh(
             connection,
-            identity,
+            user,
             AuthorizationCheck {
                 resource: Resource::Packs,
                 action: Action::Read,

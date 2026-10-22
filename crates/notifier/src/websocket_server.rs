@@ -796,7 +796,9 @@ fn resource_action_grant_exists(grants: &[Grant], resource: Resource, action: Ac
 }
 
 fn constraints_are_effectively_unscoped(constraints: &GrantConstraints) -> bool {
-    constraints.managing_pack_id.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.managing_pack_id.is_none()
         && constraints.pack_refs.is_none()
         && constraints.owner.is_none()
         && constraints.owner_types.is_none()
@@ -821,7 +823,9 @@ fn has_unconstrained_resource_action(grants: &[Grant], resource: Resource, actio
 }
 
 fn constraints_supported_for_visibility_projection(constraints: &GrantConstraints) -> bool {
-    constraints.owner.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.owner.is_none()
         && constraints.owner_types.is_none()
         && constraints.owner_refs.is_none()
         && constraints.visibility.is_none()

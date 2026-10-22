@@ -122,6 +122,8 @@ type NodeProps = {
   depth?: number;
   secret?: boolean;
   budget?: number;
+  required?: boolean;
+  allowNodeTemplate?: boolean;
 };
 
 function Node({
@@ -136,6 +138,8 @@ function Node({
   depth = 0,
   secret = false,
   budget = 200,
+  required: isRequired = false,
+  allowNodeTemplate = true,
 }: NodeProps) {
   const schema = resolve(node, definitions);
   secret ||= schema?.secret === true;
@@ -155,22 +159,23 @@ function Node({
       />
     );
   }
-  const template = templates ? (
-    <button
-      type="button"
-      disabled={disabled}
-      className="text-xs text-blue-600"
-      onClick={() =>
-        onChange(
-          secret
-            ? "{{ keystore['system.key'] }}"
-            : `{{ ${templateNamespace}.value }}`,
-        )
-      }
-    >
-      Use template for {path || "value"}
-    </button>
-  ) : null;
+  const template =
+    templates && allowNodeTemplate ? (
+      <button
+        type="button"
+        disabled={disabled}
+        className="text-xs text-blue-600"
+        onClick={() =>
+          onChange(
+            secret
+              ? "{{ keystore['system.key'] }}"
+              : `{{ ${templateNamespace}.value }}`,
+          )
+        }
+      >
+        Use template for {path || "value"}
+      </button>
+    ) : null;
   if (templates && typeof value === "string" && value.includes("{{")) {
     return (
       <input
@@ -181,6 +186,61 @@ function Node({
         className="w-full border rounded p-2"
         onChange={(event) => onChange(event.target.value)}
       />
+    );
+  }
+  const choices: unknown[] | undefined = Array.isArray(schema.enum)
+    ? schema.enum
+    : undefined;
+  if (
+    !secret &&
+    choices &&
+    choices.length > 0 &&
+    choices.length <= 100 &&
+    choices.every(
+      (choice) =>
+        choice === null ||
+        typeof choice === "string" ||
+        typeof choice === "boolean" ||
+        (typeof choice === "number" && Number.isFinite(choice)),
+    )
+  ) {
+    // Option indices preserve JSON types, including false, zero, null, and "".
+    const selected = choices.findIndex((choice) => choice === value);
+    return (
+      <div>
+        {template}
+        <select
+          aria-label={path || "Value"}
+          required={isRequired}
+          disabled={disabled}
+          value={selected < 0 ? "" : String(selected)}
+          className="w-full border rounded p-2"
+          onChange={(event) => {
+            const index = Number(event.target.value);
+            if (
+              event.target.value !== "" &&
+              Number.isInteger(index) &&
+              Object.hasOwn(choices, index)
+            )
+              onChange(choices[index]);
+          }}
+        >
+          <option value="" disabled>
+            {value === undefined
+              ? "Select a value"
+              : "Current value is not an allowed choice"}
+          </option>
+          {choices.map((choice, index) => (
+            <option key={index} value={String(index)}>
+              {typeof choice === "string"
+                ? choice === ""
+                  ? "(empty string)"
+                  : choice
+                : JSON.stringify(choice)}
+            </option>
+          ))}
+        </select>
+      </div>
     );
   }
   if (schema.type === "object") {
@@ -226,6 +286,7 @@ function Node({
         return {
           key,
           child,
+          type: annotations?.type,
           order,
           title:
             typeof annotations?.title === "string" && annotations.title.trim()
@@ -253,7 +314,7 @@ function Node({
             : path || "Parameters"}
         </legend>
         {template}
-        {fields.map(({ key, child, title, description }) => (
+        {fields.map(({ key, child, type, title, description }) => (
           <div key={key} className="space-y-1">
             <span className="block text-sm font-medium">
               {title}
@@ -265,7 +326,7 @@ function Node({
             {description && (
               <p className="text-xs text-gray-500">{description}</p>
             )}
-            {!Object.hasOwn(values, key) ? (
+            {!Object.hasOwn(values, key) && !required.includes(key) ? (
               <button
                 type="button"
                 disabled={disabled}
@@ -281,10 +342,36 @@ function Node({
               </button>
             ) : (
               <>
+                {!Object.hasOwn(values, key) &&
+                  (type === "object" || type === "array") && (
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      className="text-sm text-blue-600"
+                      onClick={() =>
+                        onChange({
+                          ...values,
+                          [key]: type === "object" ? {} : [],
+                        })
+                      }
+                    >
+                      Use empty {type === "object" ? "object" : "list"} for{" "}
+                      {title}
+                    </button>
+                  )}
                 <Node
                   node={child}
                   definitions={definitions}
-                  value={values[key]}
+                  value={
+                    Object.hasOwn(values, key)
+                      ? values[key]
+                      : type === "object"
+                        ? {}
+                        : type === "array"
+                          ? []
+                          : undefined
+                  }
+                  required={required.includes(key)}
                   disabled={disabled}
                   templates={templates}
                   templateNamespace={templateNamespace}
@@ -423,6 +510,29 @@ function Node({
         label={path}
       />
     );
+  if (schema.type === "boolean" && isRequired)
+    return (
+      <div>
+        {template}
+        <select
+          aria-label={path}
+          required
+          disabled={disabled}
+          value={typeof value === "boolean" ? String(value) : ""}
+          className="w-full border rounded p-2"
+          onChange={(event) => {
+            if (event.target.value !== "")
+              onChange(event.target.value === "true");
+          }}
+        >
+          <option value="" disabled>
+            Select a value
+          </option>
+          <option value="true">True</option>
+          <option value="false">False</option>
+        </select>
+      </div>
+    );
   if (schema.type === "boolean")
     return (
       <div>
@@ -438,18 +548,20 @@ function Node({
     );
   const numeric = schema.type === "integer" || schema.type === "number";
   const constraints = Object.fromEntries(
-    Object.entries(schema).filter(([key]) =>
-      [
-        "enum",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "minLength",
-        "maxLength",
-        "pattern",
-        "format",
-      ].includes(key),
+    Object.entries(schema).filter(
+      ([key]) =>
+        !(secret && key === "enum") &&
+        [
+          "enum",
+          "minimum",
+          "maximum",
+          "exclusiveMinimum",
+          "exclusiveMaximum",
+          "minLength",
+          "maxLength",
+          "pattern",
+          "format",
+        ].includes(key),
     ),
   );
   return (
@@ -463,6 +575,11 @@ function Node({
       <input
         aria-label={path}
         type={secret ? "password" : numeric ? "number" : "text"}
+        required={
+          isRequired &&
+          (numeric ||
+            (typeof schema.minLength === "number" && schema.minLength > 0))
+        }
         min={typeof schema.minimum === "number" ? schema.minimum : undefined}
         max={typeof schema.maximum === "number" ? schema.maximum : undefined}
         step={schema.type === "integer" ? 1 : numeric ? "any" : undefined}
@@ -603,6 +720,7 @@ export default function ContractValueForm({
         disabled={disabled}
         templates={allowTemplates}
         templateNamespace={templateNamespace}
+        allowNodeTemplate={context !== SchemaPreviewContext.FLAT_DOCUMENT}
         secret={maskValue}
         path=""
       />

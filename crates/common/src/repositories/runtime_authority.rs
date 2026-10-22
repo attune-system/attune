@@ -32,6 +32,12 @@ const APPROVAL_COLUMNS: &str = "id, subject_pack, issuer_identity, issuer_login,
 const ADMISSION_COLUMNS: &str =
     "id, owner_kind, owner_id, policy_revision, authority, authority_digest, revoked_at";
 
+#[derive(Clone, Copy)]
+enum ApprovalMode<'a> {
+    Personal,
+    PackDeployment(Option<&'a super::pack::AuthorizedPackDeployment>),
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RuntimePolicyRevision {
     pub id: Id,
@@ -659,6 +665,43 @@ impl RuntimeAuthorityRepository {
         installer_identity: Id,
         grants: &[Grant],
     ) -> Result<Vec<ExternalApproval>> {
+        Self::admit_external_grants_internal(
+            connection,
+            subject_pack,
+            installer_identity,
+            grants,
+            ApprovalMode::Personal,
+        )
+        .await
+    }
+
+    /// Only immutable pack deployment may delegate beyond the installer's
+    /// personal grants. Component edits and explicit approval APIs retain their
+    /// existing authority checks.
+    pub(crate) async fn admit_deployment_external_grants(
+        connection: &mut PgConnection,
+        subject_pack: Id,
+        installer_identity: Id,
+        grants: &[Grant],
+        deployment: Option<&super::pack::AuthorizedPackDeployment>,
+    ) -> Result<Vec<ExternalApproval>> {
+        Self::admit_external_grants_internal(
+            connection,
+            subject_pack,
+            installer_identity,
+            grants,
+            ApprovalMode::PackDeployment(deployment),
+        )
+        .await
+    }
+
+    async fn admit_external_grants_internal(
+        connection: &mut PgConnection,
+        subject_pack: Id,
+        installer_identity: Id,
+        grants: &[Grant],
+        mode: ApprovalMode<'_>,
+    ) -> Result<Vec<ExternalApproval>> {
         if grants.is_empty() {
             return Ok(Vec::new());
         }
@@ -737,13 +780,22 @@ impl RuntimeAuthorityRepository {
         }
         let mut approvals = projected.into_values().collect::<Vec<_>>();
         if !missing.is_empty() {
-            installer.require_grants(&missing).map_err(|_| Error::PermissionDenied(
-                "External runtime scope requires separate approval by an authorized owner or administrator".into(),
-            ))?;
+            if matches!(mode, ApprovalMode::Personal) {
+                installer.require_grants(&missing).map_err(|_| Error::PermissionDenied(
+                    "External runtime scope requires separate approval by an authorized owner or administrator".into(),
+                ))?;
+            }
             approvals.push(
-                Self::issue_approval(connection, subject_pack, installer_identity, missing, None)
-                    .await?
-                    .approval()?,
+                Self::issue_approval_internal(
+                    connection,
+                    subject_pack,
+                    installer_identity,
+                    missing,
+                    None,
+                    mode,
+                )
+                .await?
+                .approval()?,
             );
         }
         Ok(approvals)
@@ -864,6 +916,25 @@ impl RuntimeAuthorityRepository {
         grants: Vec<Grant>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<ExternalApprovalRecord> {
+        Self::issue_approval_internal(
+            connection,
+            subject_pack,
+            issuer_identity,
+            grants,
+            expires_at,
+            ApprovalMode::Personal,
+        )
+        .await
+    }
+
+    async fn issue_approval_internal(
+        connection: &mut PgConnection,
+        subject_pack: Id,
+        issuer_identity: Id,
+        grants: Vec<Grant>,
+        expires_at: Option<DateTime<Utc>>,
+        mode: ApprovalMode<'_>,
+    ) -> Result<ExternalApprovalRecord> {
         positive_id(subject_pack)?;
         positive_id(issuer_identity)?;
         if grants.is_empty() || expires_at.is_some_and(|expiry| expiry <= Utc::now()) {
@@ -883,8 +954,46 @@ impl RuntimeAuthorityRepository {
             ));
         }
         let issuer = DelegationAuthority::load_for_share(connection, issuer_identity).await?;
-        if !issuer.manages_permissions() {
-            issuer.require_grants(&grants)?;
+        match mode {
+            ApprovalMode::PackDeployment(deployment) => {
+                use super::{pack::PackRepository, FindById};
+                let pack = PackRepository::find_by_id(&mut *connection, subject_pack)
+                    .await?
+                    .ok_or_else(|| Error::validation("Deployment approval pack is unavailable"))?;
+                if let Some(deployment) = deployment {
+                    deployment
+                        .validate(connection, issuer_identity, pack.id, &pack.r#ref)
+                        .await?;
+                } else {
+                    let mut context = AuthorizationContext::new(issuer_identity);
+                    context.target_id = Some(pack.id);
+                    context.managing_pack_id = Some(pack.id);
+                    context.target_ref = Some(pack.r#ref.clone());
+                    context.pack_ref = Some(pack.r#ref);
+                    context.owner_identity_id = pack.installed_by;
+                    if !pack.is_standard {
+                        context.pack_owner_identity_id = pack.installed_by;
+                    }
+                    super::iam_ownership::IamOwnershipRepository::populate_pack_role_membership(
+                        &mut *connection,
+                        Resource::Packs,
+                        &mut context,
+                        true,
+                    )
+                    .await?;
+                    if !issuer.allows(Resource::Packs, Action::Install, context) {
+                        return Err(Error::PermissionDenied(
+                            "Pack deployment permission is required to approve its runtime grants"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            ApprovalMode::Personal => {
+                if !issuer.manages_permissions() {
+                    issuer.require_grants(&grants)?;
+                }
+            }
         }
         let identity = IdentityRepository::find_by_id_for_share(connection, issuer_identity)
             .await?

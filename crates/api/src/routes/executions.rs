@@ -830,7 +830,9 @@ fn execution_ref_filter_like_pattern(filter: &str) -> Option<String> {
 }
 
 fn execution_grant_constraints_supported(constraints: &GrantConstraints) -> bool {
-    constraints.owner_types.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.owner_types.is_none()
         && constraints.owner_refs.is_none()
         && constraints.visibility.is_none()
         && constraints.encrypted.is_none()

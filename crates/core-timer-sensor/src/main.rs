@@ -194,31 +194,6 @@ struct SensorBootstrap {
     triggers: Vec<ManagedTriggerInstance>,
 }
 
-#[cfg(test)]
-mod bootstrap_tests {
-    use super::read_sensor_bootstrap;
-
-    #[test]
-    fn stdin_bootstrap_preserves_structured_settings_and_trigger_values() {
-        let data = br#"{"config":{"enabled":false,"count":0},"triggers":[{"id":1,"trigger_ref":"core.intervaltimer","config":{"interval":3}}]}"#;
-        let bootstrap = read_sensor_bootstrap(data.as_slice()).unwrap();
-        assert_eq!(bootstrap.config["enabled"], false);
-        assert_eq!(bootstrap.config["count"], 0);
-        assert_eq!(bootstrap.triggers[0].config["interval"], 3);
-    }
-
-    #[test]
-    fn malformed_bootstrap_diagnostics_do_not_echo_values() {
-        for data in [
-            b"private-credential-fixture".as_slice(),
-            br#"{"config":[],"triggers":[]}"#,
-        ] {
-            let failure = read_sensor_bootstrap(data).err().unwrap();
-            assert!(!failure.to_string().contains("private-credential-fixture"));
-        }
-    }
-}
-
 fn read_sensor_bootstrap(reader: impl std::io::Read) -> Result<SensorBootstrap> {
     const LIMIT: u64 = 32 * 1024 * 1024;
     let mut bytes = Vec::new();
@@ -292,5 +267,30 @@ fn infer_timer_trigger_ref(config: &serde_json::Value) -> Option<&'static str> {
         Some("core.rruletimer")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::read_sensor_bootstrap;
+
+    #[test]
+    fn stdin_bootstrap_preserves_structured_settings_and_trigger_values() {
+        let data = br#"{"config":{"enabled":false,"count":0},"triggers":[{"id":1,"trigger_ref":"core.intervaltimer","config":{"interval":3}}]}"#;
+        let bootstrap = read_sensor_bootstrap(data.as_slice()).unwrap();
+        assert_eq!(bootstrap.config["enabled"], false);
+        assert_eq!(bootstrap.config["count"], 0);
+        assert_eq!(bootstrap.triggers[0].config["interval"], 3);
+    }
+
+    #[test]
+    fn malformed_bootstrap_diagnostics_do_not_echo_values() {
+        for data in [
+            b"private-credential-fixture".as_slice(),
+            br#"{"config":[],"triggers":[]}"#,
+        ] {
+            let failure = read_sensor_bootstrap(data).err().unwrap();
+            assert!(!failure.to_string().contains("private-credential-fixture"));
+        }
     }
 }

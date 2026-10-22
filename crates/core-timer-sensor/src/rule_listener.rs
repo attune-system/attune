@@ -306,6 +306,25 @@ impl RuleLifecycleListener {
         };
 
         let (operation, rule_id) = rule_event_metadata(&event);
+        if payload.get("auth_mode").and_then(JsonValue::as_str) == Some("deferred") {
+            // Sensor notifications are invalidation hints, not configuration
+            // delivery. Refetch through the generation-fenced API before
+            // creating, updating, or removing timers.
+            let token = self.api_client.get_token().await;
+            let trigger_refs = resolve_timer_lifecycle_trigger_refs(&token)?;
+            return self
+                .reconcile_active_rules(&trigger_refs)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Failed to reconcile notifier websocket hint: frame_type=notification, \
+                     operation={}, rule_id={}, payload_bytes={}",
+                        operation,
+                        rule_id,
+                        payload_bytes
+                    )
+                });
+        }
         self.handle_event(event).await.map_err(|_| {
             anyhow::anyhow!(
                 "Failed to process notifier websocket frame: frame_type=notification, \
@@ -920,6 +939,102 @@ mod tests {
         assert!(timer_manager.job_uuid_for_rule(3).await.is_some());
 
         timer_manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_rule_creation_refetches_authorized_rules_without_restarting_existing_timers()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = server.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 1024];
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert!(count > 0 && request.len() < 8192);
+                request.extend_from_slice(&bytes[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(String::from_utf8_lossy(&request).starts_with(
+                "GET /api/v1/rules?trigger_ref=core.intervaltimer&enabled=true&page=1&page_size=100 "
+            ));
+            let body = serde_json::json!({
+                "items": [
+                    {"id":1,"ref":"core.existing","trigger_ref":"core.intervaltimer",
+                     "trigger_params":{"unit":"seconds","interval":60},"enabled":true},
+                    {"id":2,"ref":"sandbox.new","trigger_ref":"core.intervaltimer",
+                     "trigger_params":{"unit":"seconds","interval":120},"enabled":true}
+                ],
+                "pagination":{"page":1,"page_size":100,"total_items":2,"total_pages":1,"has_next":false}
+            })
+            .to_string();
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            ).as_bytes()).await.unwrap();
+        });
+        let claims = serde_json::json!({"metadata":{"trigger_types":["core.intervaltimer"]}});
+        let token = format!(
+            "header.{}.signature",
+            general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
+        let api_client = ApiClient::new(format!("http://{address}"), token);
+        let timer_manager = TimerManager::new(api_client.clone(), "core.timer_sensor".into())
+            .await
+            .unwrap();
+        timer_manager
+            .start_timer(
+                1,
+                TimerConfig::Interval {
+                    interval: 60,
+                    unit: crate::types::TimeUnit::Seconds,
+                },
+            )
+            .await
+            .unwrap();
+        let previous_job = timer_manager.job_uuid_for_rule(1).await;
+        let listener = RuleLifecycleListener::new(
+            "ws://localhost:8081/ws".into(),
+            false,
+            "core.timer_sensor".into(),
+            api_client,
+            timer_manager.clone(),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), listener.handle_ws_text(
+            r#"{"type":"notification","payload":{"auth_mode":"deferred","event_type":"rule.created","rule_id":2,"rule_ref":"sandbox.new","trigger_ref":"core.intervaltimer","enabled":true,"trigger_params":{"unit":"seconds","interval":1}}}"#
+        )).await;
+        let count = timer_manager.timer_count().await;
+        let unchanged = timer_manager.job_uuid_for_rule(1).await == previous_job;
+        let new_job = timer_manager.job_uuid_for_rule(2).await;
+        timer_manager
+            .start_timer(
+                2,
+                TimerConfig::Interval {
+                    interval: 120,
+                    unit: crate::types::TimeUnit::Seconds,
+                },
+            )
+            .await
+            .unwrap();
+        let used_authorized_config =
+            new_job.is_some() && timer_manager.job_uuid_for_rule(2).await == new_job;
+        serving.abort();
+        let _ = serving.await;
+        timer_manager.shutdown().await.unwrap();
+        result.unwrap().unwrap();
+        assert_eq!(
+            count, 2,
+            "deferred creation must load the newly authorized rule"
+        );
+        assert!(unchanged, "existing timer cadence must not restart");
+        assert!(
+            used_authorized_config,
+            "inline hint parameters must not configure timers"
+        );
     }
 
     #[tokio::test]

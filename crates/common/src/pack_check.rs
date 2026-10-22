@@ -371,6 +371,16 @@ impl PackChecker {
         self.optional_type(map, tags_field, "array", "pack.yaml");
         self.optional_type(map, "runtime_deps", "array", "pack.yaml");
         self.optional_type(map, "dependencies", "array", "pack.yaml");
+        if let Err(error) =
+            serde_yaml_ng::from_value::<crate::pack_ownership::PackOwnershipMetadata>(value.clone())
+        {
+            self.error_at(
+                "pack.yaml",
+                "owner_roles",
+                "manifest.invalid_owner_roles",
+                error.to_string(),
+            );
+        }
         if let Some(dependencies) = yaml_get(map, "dependencies") {
             match serde_yaml_ng::from_value::<Vec<String>>(dependencies.clone())
                 .map_err(|_| crate::Error::validation("Invalid pack dependency list"))

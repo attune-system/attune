@@ -22,6 +22,39 @@ pub struct IamTargetSql<'a> {
     pub ancestor_identities: Option<&'a str>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ComponentReadFilter {
+    pub identity: Id,
+    pub attributes: HashMap<String, serde_json::Value>,
+    pub grants: Vec<crate::rbac::Grant>,
+}
+
+/// `table` is a repository-owned identifier, never request input.
+pub fn push_component_read(
+    query: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
+    filter: &ComponentReadFilter,
+    table: &str,
+    resource: crate::rbac::Resource,
+) {
+    push_iam_grants(
+        query,
+        &filter.grants,
+        resource,
+        crate::rbac::Action::Read,
+        filter.identity,
+        &filter.attributes,
+        &IamTargetSql {
+            id: &format!("{table}.id"),
+            reference: &format!("{table}.ref"),
+            pack_ref: &format!("{table}.pack_ref"),
+            managing_pack: &component_pack(table),
+            owner_identity: None,
+            execution_owner: None,
+            ancestor_identities: None,
+        },
+    );
+}
+
 pub fn push_iam_grants(
     query: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
     grants: &[crate::rbac::Grant],
@@ -39,8 +72,10 @@ pub fn push_iam_grants(
         .filter(|grant| grant.resource == resource && grant.actions.contains(&action))
     {
         if let Some(scope) = &grant.constraints {
-            if scope.managing_pack_id.is_some()
-                && !crate::runtime_authority::pack_owned_resource(resource)
+            if scope.pack_state.is_some()
+                || scope.pack_owner.is_some() && !crate::rbac::supports_pack_owner(resource)
+                || scope.managing_pack_id.is_some()
+                    && !crate::runtime_authority::pack_owned_resource(resource)
                 || scope.owner_types.is_some()
                 || scope.owner_refs.is_some()
                 || scope.visibility.is_some()
@@ -60,6 +95,14 @@ pub fn push_iam_grants(
         wrote = true;
         query.push("(TRUE");
         if let Some(scope) = &grant.constraints {
+            if scope.pack_owner.is_some() {
+                query
+                    .push(" AND EXISTS (SELECT 1 FROM pack pack_owner WHERE pack_owner.id = ")
+                    .push(target.managing_pack)
+                    .push(" AND NOT pack_owner.is_standard AND pack_owner.installed_by = ")
+                    .push_bind(identity)
+                    .push(")");
+            }
             if let Some(pack) = scope.managing_pack_id {
                 query
                     .push(" AND ")
@@ -330,6 +373,161 @@ impl VerifiedKeyOrigins {
 pub struct IamOwnershipRepository;
 
 impl IamOwnershipRepository {
+    /// Request-local narrowing for IAM matching and SQL visibility only. Keep
+    /// authored grants intact for serialization, assignment and delegation.
+    pub async fn resolve_pack_owner_grants<'e, E>(
+        executor: E,
+        identity: Id,
+        grants: Vec<crate::rbac::Grant>,
+        allow_owner_roles: bool,
+    ) -> Result<Vec<crate::rbac::Grant>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        if !grants.iter().any(|grant| {
+            grant.constraints.as_ref().is_some_and(|scope| {
+                scope.pack_owner.is_some()
+                    || grant.resource == crate::rbac::Resource::Packs
+                        && scope.owner == Some(crate::rbac::OwnerConstraint::SelfOnly)
+            })
+        }) {
+            return Ok(grants);
+        }
+        let packs: Vec<(Id, bool)> = sqlx::query_as(
+            "SELECT p.id, p.is_standard FROM pack p WHERE EXISTS (SELECT 1 FROM identity i WHERE i.id = $1 AND NOT i.frozen) AND (p.installed_by = $1 OR ($2 AND NOT p.is_standard AND NOT EXISTS (SELECT 1 FROM pack_runtime_identity runtime WHERE runtime.identity = $1) AND EXISTS (SELECT 1 FROM identity_role_assignment member WHERE member.identity = $1 AND member.role = ANY(p.owner_roles) FOR SHARE))) ORDER BY p.id",
+        )
+        .bind(identity)
+        .bind(allow_owner_roles)
+        .fetch_all(executor)
+        .await?;
+        let pack_ids = packs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let component_ids = packs
+            .iter()
+            .filter(|(_, standard)| !standard)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        Ok(narrow_pack_owner_grants(
+            narrow_pack_self_grants(grants, &pack_ids),
+            &component_ids,
+        ))
+    }
+
+    /// Membership removals and principal freezing cannot cross a protected
+    /// deployment/configuration authorization boundary before its commit.
+    pub async fn lock_pack_owner_memberships(
+        connection: &mut sqlx::PgConnection,
+        identity: Id,
+    ) -> Result<()> {
+        super::identity::IdentityRepository::find_by_id_for_share(connection, identity)
+            .await?
+            .filter(|identity| !identity.frozen)
+            .ok_or_else(|| {
+                crate::Error::AuthenticationFailed("Pack owner principal is unavailable".into())
+            })?;
+        let _: Vec<Id> = sqlx::query_scalar(
+            "SELECT id FROM identity_role_assignment WHERE identity = $1 ORDER BY id FOR SHARE",
+        )
+        .bind(identity)
+        .fetch_all(connection)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn populate_pack_role_membership<'e, E>(
+        executor: E,
+        resource: crate::rbac::Resource,
+        context: &mut crate::rbac::AuthorizationContext,
+        allow_owner_roles: bool,
+    ) -> Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        context.pack_owner_role_member = false;
+        if !allow_owner_roles || !crate::rbac::supports_pack_owner(resource) {
+            return Ok(());
+        }
+        let Some(pack) = context.managing_pack_id else {
+            return Ok(());
+        };
+        context.pack_owner_role_member = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM identity_role_assignment member WHERE member.identity = i.id AND member.role = ANY(p.owner_roles) FOR SHARE) FROM pack p JOIN identity i ON i.id = $2 AND NOT i.frozen WHERE p.id = $1 AND NOT p.is_standard AND NOT EXISTS (SELECT 1 FROM pack_runtime_identity runtime WHERE runtime.identity = i.id)")
+            .bind(pack).bind(context.identity_id).fetch_optional(executor).await?.unwrap_or(false);
+        Ok(())
+    }
+
+    /// `managing_pack_id` must already be repository-resolved structural
+    /// ownership. An associated pack and a namespace prefix are not accepted.
+    pub async fn populate_pack_owner<'e, E>(
+        executor: E,
+        resource: crate::rbac::Resource,
+        context: &mut crate::rbac::AuthorizationContext,
+    ) -> Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        context.pack_owner_identity_id = None;
+        if !crate::rbac::supports_pack_owner(resource) {
+            return Ok(());
+        }
+        if let Some(pack) = context.managing_pack_id {
+            let owner: Option<Option<Id>> = sqlx::query_scalar(
+                "SELECT installed_by FROM pack WHERE id = $1 AND NOT is_standard",
+            )
+            .bind(pack)
+            .fetch_optional(executor)
+            .await?;
+            context.pack_owner_identity_id = owner.flatten();
+        }
+        Ok(())
+    }
+
+    /// Resolve source metadata by its actual identity. Never use its declared
+    /// pack_ref or association-only pack FK as managing ownership.
+    pub async fn target_pack<'e, E>(
+        executor: E,
+        resource: crate::rbac::Resource,
+        id: Option<Id>,
+        reference: Option<&str>,
+    ) -> Result<Option<Id>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        use crate::rbac::Resource;
+        if id.is_none() && reference.is_none() {
+            return Ok(None);
+        }
+        let tables: &[&str] = match resource {
+            Resource::Packs => &["pack"],
+            Resource::Actions => &["action"],
+            Resource::Rules => &["rule"],
+            Resource::Policies => &["policy"],
+            Resource::Queues => &["work_queue"],
+            // Trigger and sensor IDs/refs can overlap. These callers must pass
+            // ownership resolved using their concrete ComponentTarget instead.
+            Resource::Triggers => return Ok(None),
+            Resource::Runtimes => &["runtime"],
+            Resource::Dashboards => &["dashboard"],
+            _ => return Ok(None),
+        };
+        let query = tables.iter().map(|table| {
+            if *table == "pack" {
+                "SELECT c.id FROM pack c WHERE ($1::BIGINT IS NULL OR c.id = $1) AND ($2::TEXT IS NULL OR c.ref = $2)".to_owned()
+            } else {
+                format!("SELECT c.pack AS id FROM {table} c JOIN pack p ON p.id = c.pack WHERE c.management_origin = 'pack' AND ($1::BIGINT IS NULL OR c.id = $1) AND ($2::TEXT IS NULL OR c.ref = $2)")
+            }
+        }).collect::<Vec<_>>().join(" UNION ALL ");
+        let owners: Vec<Id> = sqlx::query_scalar(&query)
+            .bind(id)
+            .bind(reference)
+            .fetch_all(executor)
+            .await?;
+        Ok(if owners.len() == 1 {
+            owners.first().copied()
+        } else {
+            None
+        })
+    }
+
     pub async fn trigger_visibility_owners<'e, E>(
         executor: E,
         ids: &[Id],
@@ -461,6 +659,92 @@ impl IamOwnershipRepository {
     }
 }
 
+fn narrow_pack_self_grants(
+    grants: Vec<crate::rbac::Grant>,
+    owned_packs: &[Id],
+) -> Vec<crate::rbac::Grant> {
+    let mut resolved = Vec::new();
+    for grant in grants {
+        if grant.resource != crate::rbac::Resource::Packs
+            || !grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.owner == Some(crate::rbac::OwnerConstraint::SelfOnly))
+        {
+            resolved.push(grant);
+            continue;
+        }
+        let scope = grant
+            .constraints
+            .as_ref()
+            .expect("owner-self pack constraint");
+        for pack in owned_packs
+            .iter()
+            .copied()
+            .filter(|pack| scope.managing_pack_id.is_none_or(|held| held == *pack))
+        {
+            let mut narrowed = grant.clone();
+            let constraints = narrowed
+                .constraints
+                .as_mut()
+                .expect("owner-self pack constraint");
+            constraints.owner = None;
+            constraints.managing_pack_id = Some(pack);
+            resolved.push(narrowed);
+        }
+    }
+    resolved
+}
+
+fn narrow_pack_owner_grants(
+    grants: Vec<crate::rbac::Grant>,
+    owned_packs: &[Id],
+) -> Vec<crate::rbac::Grant> {
+    let mut resolved = Vec::new();
+    for grant in grants {
+        let Some(scope) = grant
+            .constraints
+            .as_ref()
+            .filter(|scope| scope.pack_owner.is_some())
+        else {
+            resolved.push(grant);
+            continue;
+        };
+        if !crate::rbac::supports_pack_owner(grant.resource) {
+            continue;
+        }
+        for pack in owned_packs
+            .iter()
+            .copied()
+            .filter(|pack| scope.managing_pack_id.is_none_or(|held| held == *pack))
+        {
+            let mut narrowed = grant.clone();
+            // Only policy/runtime creation persists structural pack ownership.
+            // Other component APIs create ad hoc metadata; an owned association
+            // cannot satisfy this constraint.
+            if !matches!(
+                grant.resource,
+                crate::rbac::Resource::Policies | crate::rbac::Resource::Runtimes
+            ) {
+                narrowed
+                    .actions
+                    .retain(|action| *action != crate::rbac::Action::Create);
+            }
+            if narrowed.actions.is_empty() {
+                continue;
+            }
+            let constraints = narrowed
+                .constraints
+                .as_mut()
+                .expect("owner-constrained grant");
+            constraints.pack_owner = None;
+            constraints.managing_pack_id = Some(pack);
+            resolved.push(narrowed);
+        }
+    }
+    resolved
+}
+
 pub fn component_pack(alias: &str) -> String {
     format!("CASE WHEN {alias}.management_origin = 'pack' THEN {alias}.pack END")
 }
@@ -495,6 +779,103 @@ pub fn data_pack(alias: &str, owner_type_column: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_owner_narrowing_keeps_selectors_and_matches_canonical_evaluation() {
+        use crate::rbac::{Action, AuthorizationContext, Grant, Resource};
+        let grant: Grant = serde_json::from_value(serde_json::json!({
+            "resource": "actions", "actions": ["read", "update", "create"],
+            "constraints": {"pack_owner": "self", "refs": ["foreign_prefix.run"]}
+        }))
+        .unwrap();
+        let narrowed = narrow_pack_owner_grants(vec![grant.clone()], &[17]);
+        assert_eq!(narrowed.len(), 1);
+        assert!(narrowed[0]
+            .constraints
+            .as_ref()
+            .unwrap()
+            .pack_owner
+            .is_none());
+        assert!(!narrowed[0].actions.contains(&Action::Create));
+        for (pack, owner) in [
+            (Some(17), Some(7)),
+            (Some(18), Some(8)),
+            (Some(19), None),
+            (None, None),
+        ] {
+            let mut context = AuthorizationContext::new(7);
+            context.target_ref = Some("foreign_prefix.run".into());
+            context.managing_pack_id = pack;
+            context.pack_owner_identity_id = owner;
+            assert_eq!(
+                grant.allows(Resource::Actions, Action::Read, &context),
+                narrowed.iter().any(|grant| grant.allows(
+                    Resource::Actions,
+                    Action::Read,
+                    &context
+                ))
+            );
+        }
+        assert!(narrow_pack_owner_grants(vec![grant.clone()], &[]).is_empty());
+        let mut intersected = grant.clone();
+        intersected.constraints.as_mut().unwrap().managing_pack_id = Some(18);
+        assert!(narrow_pack_owner_grants(vec![intersected], &[17]).is_empty());
+        let mut unsupported = grant.clone();
+        unsupported.resource = Resource::Keys;
+        assert!(narrow_pack_owner_grants(vec![unsupported], &[17]).is_empty());
+        let mut policy = grant;
+        policy.resource = Resource::Policies;
+        assert!(narrow_pack_owner_grants(vec![policy], &[17])[0]
+            .actions
+            .contains(&Action::Create));
+    }
+
+    #[test]
+    fn pack_owner_sql_uses_structural_management_and_primary_owner_not_prefix() {
+        let grants = serde_json::from_value(serde_json::json!([{
+            "resource": "rules", "actions": ["read"], "constraints": {"pack_owner": "self"}
+        }]))
+        .unwrap();
+        let filter = ComponentReadFilter {
+            identity: 7,
+            attributes: HashMap::new(),
+            grants,
+        };
+        let mut query = sqlx::QueryBuilder::new("");
+        push_component_read(&mut query, &filter, "rule", crate::rbac::Resource::Rules);
+        assert!(query.sql().contains("rule.management_origin = 'pack'"));
+        assert!(query.sql().contains("pack_owner.installed_by = "));
+        assert!(query.sql().contains("NOT pack_owner.is_standard"));
+        assert!(!query.sql().contains("split_part"));
+    }
+
+    #[test]
+    fn uninstalled_state_never_matches_an_existing_sql_target() {
+        let grants: Vec<crate::rbac::Grant> = serde_json::from_value(serde_json::json!([{
+            "resource": "packs", "actions": ["read"],
+            "constraints": {"pack_state": "uninstalled"}
+        }]))
+        .unwrap();
+        let mut query = sqlx::QueryBuilder::new("");
+        push_iam_grants(
+            &mut query,
+            &grants,
+            crate::rbac::Resource::Packs,
+            crate::rbac::Action::Read,
+            7,
+            &HashMap::new(),
+            &IamTargetSql {
+                id: "p.id",
+                reference: "p.ref",
+                pack_ref: "p.ref",
+                managing_pack: "p.id",
+                owner_identity: Some("p.installed_by"),
+                execution_owner: None,
+                ancestor_identities: None,
+            },
+        );
+        assert_eq!(query.sql(), "(FALSE)");
+    }
 
     #[test]
     fn iam_sql_keeps_local_ownership_selectors_attributes_and_self_scopes_in_one_query() {

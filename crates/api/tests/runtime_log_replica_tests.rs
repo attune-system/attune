@@ -18,7 +18,8 @@ use attune_api::{postgres_listener, AppState, Server};
 use attune_common::{
     artifact_transport::{ApiTransport, ArtifactFileTransport},
     auth::jwt::{
-        generate_access_token, generate_execution_token, generate_worker_token, JwtConfig,
+        generate_access_token, generate_execution_token_with_permission_sets,
+        generate_worker_token, JwtConfig,
     },
     blob_store::{
         BlobBody, BlobReader, BlobStore, BlobStoreError, ByteRange, DirectUploadAuthorization,
@@ -455,7 +456,7 @@ impl Harness {
                 parent: None,
                 enforcement: None,
                 executor: Some(self.execution_identity),
-                permission_set_refs: Vec::new(),
+                permission_set_refs: vec!["standard".into()],
                 artifact_retention_policy: None,
                 artifact_retention_limit: None,
                 worker_selector: None,
@@ -504,12 +505,13 @@ impl Harness {
             100,
         )
         .await?;
-        let execution_token = generate_execution_token(
+        let execution_token = generate_execution_token_with_permission_sets(
             self.execution_identity,
             execution_id,
             action_ref,
             &self.jwt,
             None,
+            &["standard".into()],
         )?;
         Ok(LogFixture {
             execution_id,
@@ -1024,6 +1026,17 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
     .await?;
     let token = generate_access_token(identity.id, &identity.login, &harness.jwt)?;
     let client = reqwest::Client::new();
+    let origin = attune_common::key_access::key_origin(&key);
+    let mut ownership = attune_common::repositories::iam_ownership::VerifiedKeyOrigins::default();
+    let mut connection = harness.database.pool().acquire().await?;
+    assert!(
+        ownership
+            .retain_recorded(&mut connection, identity.id, &origin)
+            .await?
+            .is_some(),
+        "recorded key origin must match the surviving owner-qualified key identity"
+    );
+    drop(connection);
     let mut reader =
         Box::pin(open_artifact_stream(&client, &harness.replicas[1], &fixture, &token).await?);
     assert_eq!(

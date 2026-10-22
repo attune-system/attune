@@ -294,6 +294,28 @@ impl<'a> PackComponentLoader<'a> {
         tx: &mut Transaction<'_, sqlx::Postgres>,
         pack_dir: &Path,
     ) -> Result<PackLoadResult> {
+        self.load_in_transaction(tx, pack_dir, None).await
+    }
+
+    pub async fn load_authorized_deployment(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Postgres>,
+        pack_dir: &Path,
+        deployment: &crate::repositories::pack::AuthorizedPackDeployment,
+    ) -> Result<PackLoadResult> {
+        deployment
+            .validate(tx, self.authority.identity_id, self.pack_id, &self.pack_ref)
+            .await?;
+        self.load_in_transaction(tx, pack_dir, Some(deployment))
+            .await
+    }
+
+    async fn load_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Postgres>,
+        pack_dir: &Path,
+        deployment: Option<&crate::repositories::pack::AuthorizedPackDeployment>,
+    ) -> Result<PackLoadResult> {
         crate::repositories::schema_type::SchemaTypeRepository::lock_reclamation(tx).await?;
         crate::repositories::cache::CacheEntryRepository::protect_transaction(
             tx,
@@ -303,6 +325,7 @@ impl<'a> PackComponentLoader<'a> {
         let mut loader = TransactionalPackComponentLoader {
             acknowledge_incompatible_rollout: self.acknowledge_incompatible_rollout,
             authority: self.authority.clone(),
+            deployment,
             pending_admission: self.pending_admission,
             connection: tx,
             pack_id: self.pack_id,
@@ -324,6 +347,7 @@ impl<'a> PackComponentLoader<'a> {
 }
 
 struct TransactionalPackComponentLoader<'a> {
+    deployment: Option<&'a crate::repositories::pack::AuthorizedPackDeployment>,
     acknowledge_incompatible_rollout: bool,
     pending_admission: bool,
     source_file: Option<String>,
@@ -361,9 +385,15 @@ impl TransactionalPackComponentLoader<'_> {
         self.preflight_component_ownership(pack_dir).await?;
         let permissions = super::permissions::PackPermissionPlan::read(pack_dir, &self.pack_ref)?;
         if !self.pending_admission {
-            permissions
-                .validate(&mut *self.connection, &self.authority)
-                .await?;
+            if let Some(deployment) = self.deployment {
+                permissions
+                    .validate_deployment(self.connection, &self.authority, self.pack_id, deployment)
+                    .await?;
+            } else {
+                permissions
+                    .validate(&mut *self.connection, &self.authority)
+                    .await?;
+            }
         }
 
         let mut result = PackLoadResult::default();

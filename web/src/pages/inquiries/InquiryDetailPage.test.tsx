@@ -260,6 +260,10 @@ describe("InquiryDetailPage", () => {
 
     render(<InquiryDetailPage />, { wrapper: Wrapper });
     await screen.findByRole("heading", { name: "Respond" });
+    expect(screen.getByRole("textbox")).not.toBeRequired();
+    expect(
+      screen.queryByRole("button", { name: "Add reason" }),
+    ).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Submit response" }));
 
     expect(screen.getByRole("alert")).toHaveTextContent(
@@ -267,7 +271,6 @@ describe("InquiryDetailPage", () => {
     );
     expect(respondToInquiry).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "Add reason" }));
     await user.type(screen.getByRole("textbox"), "Approved after review");
     await user.click(screen.getByRole("button", { name: "Submit response" }));
 

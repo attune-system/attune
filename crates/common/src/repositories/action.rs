@@ -37,6 +37,7 @@ pub const POLICY_COLUMNS: &str = "id, ref, pack, pack_ref, action, action_ref, e
 /// All fields are optional and combinable (AND). Pagination is always applied.
 #[derive(Debug, Clone, Default)]
 pub struct ActionSearchFilters {
+    pub read_visibility: Option<ActionReadFilter>,
     /// Filter by single pack ID
     pub pack: Option<Id>,
     /// Filter by multiple pack IDs (action.pack IN (...)). Combined with `pack` via AND.
@@ -46,6 +47,12 @@ pub struct ActionSearchFilters {
     pub query: Option<String>,
     pub limit: u32,
     pub offset: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionReadFilter {
+    pub iam: super::iam_ownership::ComponentReadFilter,
+    pub referencing_pack_ref: Option<String>,
 }
 
 /// Result of [`ActionRepository::list_search`].
@@ -829,6 +836,26 @@ impl ActionRepository {
         let _ = has_where;
 
         // Count
+        if let Some(visibility) = &filters.read_visibility {
+            for query in [&mut qb, &mut count_qb] {
+                query.push(" AND (action.reference_visibility = 'public' OR ");
+                if let Some(reference) = &visibility.referencing_pack_ref {
+                    query
+                        .push("(action.pack_ref = ")
+                        .push_bind(reference.clone())
+                        .push(" OR (action.reference_visibility = 'restricted' AND ")
+                        .push_bind(reference.clone())
+                        .push(" = ANY(action.reference_allowed_pack_refs))) OR ");
+                }
+                super::iam_ownership::push_component_read(
+                    query,
+                    &visibility.iam,
+                    "action",
+                    crate::rbac::Resource::Actions,
+                );
+                query.push(")");
+            }
+        }
         let total: i64 = count_qb.build_query_scalar().fetch_one(db).await?;
         let total = total.max(0) as u64;
 

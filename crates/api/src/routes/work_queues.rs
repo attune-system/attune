@@ -90,6 +90,7 @@ pub async fn list_queues(
     let mut rows = WorkQueueRepository::search(
         &state.db,
         &WorkQueueSearchFilters {
+            read_visibility: super::visibility::component_read_filter(&state, &user).await?,
             enabled: query.enabled,
             is_adhoc: query.is_adhoc,
             search: query.search.clone(),
@@ -100,16 +101,7 @@ pub async fn list_queues(
     )
     .await?
     .rows;
-    if let Some((identity_id, grants)) = ensure_can_read_any_queue(&state, &user).await? {
-        rows.retain(|queue| {
-            AuthorizationService::is_allowed(
-                &grants,
-                Resource::Queues,
-                RbacAction::Read,
-                &queue_authorization_context(identity_id, queue),
-            )
-        });
-    }
+    rows = filter_queue_read_access(&state, &user, rows).await?;
     rows = filter_visible_queues_for_discovery(
         &state,
         &user,
@@ -167,6 +159,7 @@ pub async fn list_queues_by_pack(
     let mut rows = WorkQueueRepository::search(
         &state.db,
         &WorkQueueSearchFilters {
+            read_visibility: super::visibility::component_read_filter(&state, &user).await?,
             pack: Some(pack.id),
             enabled: query.enabled,
             is_adhoc: query.is_adhoc,
@@ -178,16 +171,7 @@ pub async fn list_queues_by_pack(
     )
     .await?
     .rows;
-    if let Some((identity_id, grants)) = ensure_can_read_any_queue(&state, &user).await? {
-        rows.retain(|queue| {
-            AuthorizationService::is_allowed(
-                &grants,
-                Resource::Queues,
-                RbacAction::Read,
-                &queue_authorization_context(identity_id, queue),
-            )
-        });
-    }
+    rows = filter_queue_read_access(&state, &user, rows).await?;
     rows = filter_visible_queues_for_discovery(
         &state,
         &user,
@@ -2478,8 +2462,15 @@ async fn has_queue_management_access(
     queue: &attune_common::models::WorkQueue,
 ) -> Result<bool, ApiError> {
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
-    let ctx = queue_authorization_context_for_token(user, queue)?;
+    let grants = authz.resolved_grants(user).await?;
+    let mut ctx = queue_authorization_context_for_token(user, queue)?;
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Queue,
+            queue.id,
+        )
+        .await?;
 
     Ok([RbacAction::Update, RbacAction::Delete]
         .into_iter()
@@ -2544,24 +2535,45 @@ async fn authorize_queue_context_action(
         .await
 }
 
-async fn ensure_can_read_any_queue(
+async fn filter_queue_read_access(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
-) -> Result<Option<(i64, Vec<attune_common::rbac::Grant>)>, ApiError> {
+    mut rows: Vec<attune_common::models::WorkQueue>,
+) -> Result<Vec<attune_common::models::WorkQueue>, ApiError> {
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
     ) {
-        return Ok(None);
+        return Ok(rows);
     }
 
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = state.authorization_service();
-    let grants = authz.effective_grants(user).await?;
-
-    Ok(Some((identity_id, grants)))
+    let snapshot = authz.load_snapshot(user).await?;
+    let Some(snapshot) = snapshot else {
+        return Ok(rows);
+    };
+    let owners =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_packs(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Queue,
+            &rows.iter().map(|queue| queue.id).collect::<Vec<_>>(),
+        )
+        .await?;
+    rows.retain(|queue| {
+        let mut context = queue_authorization_context(identity_id, queue);
+        context.managing_pack_id = owners.get(&queue.id).copied();
+        context.identity_attributes = snapshot.identity_attributes.clone();
+        AuthorizationService::is_allowed(
+            &snapshot.grants,
+            Resource::Queues,
+            RbacAction::Read,
+            &context,
+        )
+    });
+    Ok(rows)
 }
 
 fn queue_authorization_context(

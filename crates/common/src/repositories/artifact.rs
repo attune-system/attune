@@ -929,7 +929,10 @@ fn can_apply_artifact_grant(grant: &Grant) -> bool {
     let Some(constraints) = &grant.constraints else {
         return true;
     };
-    constraints.execution_scope.is_none() && constraints.encrypted.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.execution_scope.is_none()
+        && constraints.encrypted.is_none()
 }
 
 fn push_artifact_grants_predicate<'a>(
@@ -1112,7 +1115,9 @@ fn can_apply_pack_grant(grant: &Grant) -> bool {
         return true;
     };
 
-    constraints.owner_types.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.owner_types.is_none()
         && constraints.owner_refs.is_none()
         && constraints.visibility.is_none()
         && constraints.execution_scope.is_none()
@@ -1215,7 +1220,9 @@ fn can_apply_execution_grant(grant: &Grant) -> bool {
     let Some(constraints) = &grant.constraints else {
         return true;
     };
-    constraints.owner_types.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.owner_types.is_none()
         && constraints.owner_refs.is_none()
         && constraints.visibility.is_none()
         && constraints.encrypted.is_none()

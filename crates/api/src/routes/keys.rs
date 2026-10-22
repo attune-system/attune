@@ -292,7 +292,9 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
         });
     };
 
-    let always_excluded = constraints.pack_refs.is_some()
+    let always_excluded = constraints.pack_owner.is_some()
+        || constraints.pack_state.is_some()
+        || constraints.pack_refs.is_some()
         || constraints.visibility.is_some()
         || matches!(
             constraints.execution_scope,

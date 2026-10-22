@@ -31,6 +31,7 @@ export type PaginatedResponse_PackSummary = {
      * Human-readable label
      */
     label: string;
+    owner_roles: Array<string>;
     /**
      * Unique reference identifier
      */

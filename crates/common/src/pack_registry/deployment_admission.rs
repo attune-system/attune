@@ -125,6 +125,49 @@ impl DeploymentAdmission {
         encryption_key: Option<&str>,
         installer: &DelegationAuthority,
     ) -> Result<()> {
+        self.finish_internal(
+            connection,
+            pack_id,
+            release_id,
+            encryption_key,
+            installer,
+            None,
+        )
+        .await
+    }
+
+    pub async fn finish_authorized_deployment(
+        self,
+        connection: &mut sqlx::PgConnection,
+        pack_id: Id,
+        release_id: Id,
+        encryption_key: Option<&str>,
+        installer: &DelegationAuthority,
+        deployment: &crate::repositories::pack::AuthorizedPackDeployment,
+    ) -> Result<()> {
+        deployment
+            .validate(connection, installer.identity_id, pack_id, &self.pack_ref)
+            .await?;
+        self.finish_internal(
+            connection,
+            pack_id,
+            release_id,
+            encryption_key,
+            installer,
+            Some(deployment),
+        )
+        .await
+    }
+
+    async fn finish_internal(
+        self,
+        connection: &mut sqlx::PgConnection,
+        pack_id: Id,
+        release_id: Id,
+        encryption_key: Option<&str>,
+        installer: &DelegationAuthority,
+        deployment: Option<&crate::repositories::pack::AuthorizedPackDeployment>,
+    ) -> Result<()> {
         let pack = PackRepository::find_by_id(&mut *connection, pack_id)
             .await?
             .ok_or_else(|| Error::validation("Deployment pack is unavailable"))?;
@@ -142,10 +185,15 @@ impl DeploymentAdmission {
             ));
         }
         RuntimeAuthorityRepository::ensure_owner(connection, pack_id).await?;
-        let policy = self
-            .plan
-            .admit_deployment(connection, pack_id, installer.identity_id)
-            .await?;
+        let policy = if let Some(deployment) = deployment {
+            self.plan
+                .admit_authorized_deployment(connection, pack_id, installer.identity_id, deployment)
+                .await?
+        } else {
+            self.plan
+                .admit_deployment(connection, pack_id, installer.identity_id)
+                .await?
+        };
         RuleAuthorityRepository::capture_deployment(connection, pack_id).await?;
         ComponentConfigurationRepository::bind_deployment(
             connection,

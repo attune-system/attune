@@ -62,6 +62,10 @@ async fn sensor_update_authority(
     let identity = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+    attune_common::repositories::iam_ownership::IamOwnershipRepository::lock_pack_owner_memberships(
+        connection, identity,
+    )
+    .await?;
     let authority =
         attune_common::delegation::DelegationAuthority::load_for_share(connection, identity)
             .await?;
@@ -75,7 +79,15 @@ async fn sensor_update_authority(
     )
     .await?
     .ok_or_else(|| ApiError::NotFound("Sensor owner is unavailable".into()))?;
-    if !authority.allows(Resource::Triggers, Action::Update, target.context().clone()) {
+    let mut context = target.context().clone();
+    attune_common::repositories::iam_ownership::IamOwnershipRepository::populate_pack_role_membership(
+        connection,
+        Resource::Triggers,
+        &mut context,
+        true,
+    )
+    .await?;
+    if !authority.allows(Resource::Triggers, Action::Update, context) {
         return Err(ApiError::Forbidden(
             "Sensor update is not authorized".into(),
         ));

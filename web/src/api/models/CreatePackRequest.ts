@@ -36,6 +36,10 @@ export type CreatePackRequest = {
    */
   meta?: Record<string, any>;
   /**
+   * Ownership roles require this endpoint's matching Create and Install authority.
+   */
+  owner_roles?: Array<string>;
+  /**
    * Unique reference identifier (e.g., "core", "aws", "slack")
    */
   ref: string;

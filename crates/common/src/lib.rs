@@ -43,6 +43,7 @@ mod pack_cache_definition;
 pub mod pack_check;
 pub mod pack_environment;
 pub mod pack_format;
+pub mod pack_ownership;
 pub mod pack_registry;
 pub mod pack_transport;
 pub mod platform_catalog;

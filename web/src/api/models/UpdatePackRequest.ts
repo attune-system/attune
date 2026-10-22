@@ -38,6 +38,11 @@ export type UpdatePackRequest = {
    */
   meta?: Record<string, any> | null;
   /**
+   * Changing this declaration additionally requires target pack Install authority.
+   * Omit to preserve; [] clears. Null is not accepted.
+   */
+  owner_roles?: Array<string>;
+  /**
    * Runtime dependencies (e.g., shell, python, nodejs)
    */
   runtime_deps?: Array<string> | null;
