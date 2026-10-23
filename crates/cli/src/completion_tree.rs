@@ -16,7 +16,9 @@ use crate::cli::Cli;
 
 /// Static candidates from the real CLI tree (wrapper for tests / wiring).
 pub fn real_tree_candidates(words: &[String]) -> Vec<String> {
-    tree_candidates(&Cli::command(), words)
+    let mut command = Cli::command();
+    command.build();
+    tree_candidates(&command, words)
 }
 
 /// Collect candidate subcommands and options at the node reached by walking

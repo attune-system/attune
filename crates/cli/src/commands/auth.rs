@@ -124,7 +124,7 @@ pub enum IntegrationTokenCommands {
         token_id: i64,
 
         /// Skip confirmation
-        #[arg(short, long)]
+        #[arg(long)]
         yes: bool,
     },
 }

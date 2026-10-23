@@ -40,6 +40,20 @@ ATTUNE_TEST_RUN_ID=local1 \
 
 `ATTUNE_TEST_RUN_ID` must be 1–20 lowercase ASCII letters/digits, optionally with non-leading `-`. It makes database clones and the migration template attributable to one invocation, for example `attune_db_local1_<uuid>` and `attune_tpl_local1_<migration-hash>`.
 
+## CLI startup without a server
+
+```bash
+cargo build --locked -p attune-cli --bins
+python3 scripts/test_cli_startup.py --bin-dir target/debug
+```
+
+Run this against the unoptimized debug binaries, not only binaries built by
+`cargo test`, which uses the optimized test profile. The script checks version,
+help, local build information, nested command help, and completion scripts with
+an isolated empty home and no API credentials. On Linux, child processes use a
+1 MiB main-thread stack to reproduce Windows startup limits. On Windows, the
+native stack limit is unchanged. The Windows CLI workflow runs the same script.
+
 ## Docker-owned integration runs
 
 Use the runner scripts rather than raw Compose. They generate or require explicit run identities, refuse existing project resources before startup/build, remove only stacks they started, and do not publish fixed host ports.

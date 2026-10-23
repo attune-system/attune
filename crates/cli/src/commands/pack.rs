@@ -18,6 +18,7 @@ pub enum AbsentMetadataPolicyArg {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 pub enum PackCommands {
     /// Issue declaration-scoped input consent and inspect/revoke its shared approval record
     #[command(
@@ -125,6 +126,7 @@ pub enum PackCommands {
         absent_metadata_policy: AbsentMetadataPolicyArg,
     },
     /// Update a pack
+    #[command(disable_version_flag = true)]
     Update {
         /// Pack reference (name or ID)
         pack_ref: String,
@@ -204,7 +206,7 @@ pub enum PackCommands {
         pack: String,
 
         /// Show verbose test output
-        #[arg(short, long)]
+        #[arg(from_global)]
         verbose: bool,
 
         /// Show detailed test results
@@ -233,7 +235,7 @@ pub enum PackCommands {
         path: String,
 
         /// Output format for registry index entry
-        #[arg(long)]
+        #[arg(from_global)]
         json: bool,
     },
     /// Generate registry index entry from pack.yaml

@@ -70,7 +70,7 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 validator = { version = "0.20", features = ["derive"] }
 
 # CLI
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
 # Message queue / PubSub
 # RabbitMQ

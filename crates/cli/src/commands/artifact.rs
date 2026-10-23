@@ -153,6 +153,7 @@ pub enum VersionCommands {
         artifact_id: i64,
     },
     /// Show details of a specific version
+    #[command(disable_version_flag = true)]
     Show {
         /// Artifact ID
         artifact_id: i64,

@@ -77,7 +77,7 @@ pub enum RuleCommands {
         name: String,
 
         /// Pack ID or name
-        #[arg(short, long)]
+        #[arg(long)]
         pack: String,
 
         /// Trigger reference

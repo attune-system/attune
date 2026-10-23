@@ -28,7 +28,7 @@ pub enum ActionCommands {
         query: Option<String>,
 
         /// Restrict to one or more pack refs (repeat flag for multiple packs).
-        #[arg(long = "pack", short = 'p')]
+        #[arg(long = "pack")]
         packs: Vec<String>,
 
         /// Maximum number of results to return

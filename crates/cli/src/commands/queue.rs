@@ -1088,7 +1088,8 @@ mod tests {
 
     #[test]
     fn queue_command_tree_contains_expected_verbs() {
-        let command = Cli::command();
+        let mut command = Cli::command();
+        command.build();
         let queue = command
             .get_subcommands()
             .find(|command| command.get_name() == "queue")
@@ -1100,7 +1101,7 @@ mod tests {
         queue_verbs.sort_unstable();
         assert_eq!(
             queue_verbs,
-            ["disable", "enable", "enqueue", "items", "list", "show", "update"]
+            ["disable", "enable", "enqueue", "help", "items", "list", "show", "update"]
         );
 
         let items = queue
@@ -1116,6 +1117,7 @@ mod tests {
             item_verbs,
             [
                 "delete",
+                "help",
                 "list",
                 "preview",
                 "reprioritize",

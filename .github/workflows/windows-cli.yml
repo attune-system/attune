@@ -41,7 +41,4 @@ jobs:
         run: cargo build --locked --package attune-cli --bins
       - name: Verify CLI binaries start
         run: |
-          .\target\debug\attune.exe --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\target\debug\attune-mcp.exe --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test_cli_startup.py --bin-dir target/debug

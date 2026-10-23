@@ -44,6 +44,8 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+// Build arguments only for selected subcommands to bound debug startup stack use.
+#[command(defer = true)]
 pub enum Commands {
     /// Show this CLI build and the server build for the selected profile.
     Info {
@@ -234,5 +236,100 @@ impl From<CliOutputFormat> for crate::output::OutputFormat {
             // the normal output renderer.
             CliOutputFormat::Ndjson => Self::Table,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_search_keeps_profile_and_pack_filters_distinct() {
+        let cli = Cli::try_parse_from([
+            "attune", "-p", "staging", "action", "search", "echo", "--pack", "core",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("staging"));
+        let Commands::Action {
+            command: ActionCommands::Search { packs, .. },
+        } = cli.command
+        else {
+            panic!("expected action search");
+        };
+        assert_eq!(packs, ["core"]);
+    }
+
+    #[test]
+    fn confirmation_does_not_shadow_yaml_output() {
+        let cli = Cli::try_parse_from([
+            "attune",
+            "-y",
+            "auth",
+            "token",
+            "delete",
+            "--identity-id",
+            "42",
+            "7",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(cli.yaml);
+        let Commands::Auth {
+            command:
+                AuthCommands::Token {
+                    command: crate::commands::auth::IntegrationTokenCommands::Delete { yes, .. },
+                },
+        } = cli.command
+        else {
+            panic!("expected token deletion");
+        };
+        assert!(yes);
+    }
+
+    #[test]
+    fn pack_update_accepts_a_resource_version() {
+        let cli = Cli::try_parse_from(["attune", "pack", "update", "demo", "--version", "1.2.3"])
+            .unwrap();
+        let Commands::Pack {
+            command: PackCommands::Update { version, .. },
+        } = cli.command
+        else {
+            panic!("expected pack update");
+        };
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn pack_commands_reuse_global_verbose_and_json_arguments() {
+        let cli = Cli::try_parse_from(["attune", "pack", "test", "demo", "-v"]).unwrap();
+        assert!(cli.verbose);
+        assert!(matches!(
+            cli.command,
+            Commands::Pack {
+                command: PackCommands::Test { verbose: true, .. }
+            }
+        ));
+        let cli = Cli::try_parse_from(["attune", "pack", "checksum", "demo", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Commands::Pack {
+                command: PackCommands::Checksum { json: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn artifact_version_show_accepts_a_resource_version() {
+        let cli =
+            Cli::try_parse_from(["attune", "artifact", "version", "show", "42", "2"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Artifact {
+                command: ArtifactCommands::Version(
+                    crate::commands::artifact::VersionCommands::Show { version: 2, .. }
+                )
+            }
+        ));
     }
 }
