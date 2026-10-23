@@ -62,10 +62,6 @@ def tree_digest(ref, path):
     return digest.hexdigest()
 
 
-def file_digest(ref, path):
-    return hashlib.sha256(normalized_file(ref, path)).hexdigest()
-
-
 def timer_toolchain(ref):
     workflow = file_at(ref, ".github/workflows/publish.yml").decode()
     values = []
@@ -118,16 +114,8 @@ def main():
         new_timer_digest,
     )
 
-    workflow_path = "packs/core/workflows/install_packs.yaml"
-    workflow_pattern = r'^version:\s*"?([^"\s]+)"?'
-    validate_component(
-        "core install_packs workflow",
-        version_at(args.base_ref, workflow_path, workflow_pattern),
-        file_digest(args.base_ref, workflow_path),
-        version_at(args.head_ref, workflow_path, workflow_pattern),
-        file_digest(args.head_ref, workflow_path),
-    )
-
+    # Workflow action metadata and graphs are covered by the core pack tree.
+    # They no longer carry an independent component version.
     old_pack_version = version_at(args.base_ref, pack_manifest, pack_pattern)
     new_pack_version = version_at(args.head_ref, pack_manifest, pack_pattern)
     old_pack_digest = tree_digest(args.base_ref, "packs/core")
