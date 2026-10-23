@@ -1,6 +1,6 @@
 import unittest
 
-from artifact_read_reports import compare_latency, compare_paired_reference, percentile, summarize_explain, summarize_samples
+from artifact_read_reports import compare_latency, compare_paired_reference, percentile, query_counts, summarize_explain, summarize_samples
 
 
 class ArtifactReadReportTests(unittest.TestCase):
@@ -34,6 +34,50 @@ class ArtifactReadReportTests(unittest.TestCase):
         for values in ([], [-1], [float('nan')], [float('inf')]):
             with self.assertRaises(ValueError):
                 percentile(values, .95)
+
+    def test_paired_query_gate_excludes_only_reported_infrastructure(self):
+        report = self.paired()
+        for sample in report['treatment']:
+            sample['queries'] = dict(statements=31, statement_categories={
+                'driver_type_discovery': 4, 'driver_enum_discovery': 4,
+                'driver_type_name_discovery': 1,
+                'pool_session_setup': 2, 'permission_set': 2,
+            })
+        result = compare_paired_reference(report, True)
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['treatment_statements'], 620)
+        self.assertEqual(result['treatment_application_statements'], 400)
+        self.assertAlmostEqual(result['query_reduction_fraction'], 1 - 400 / (807 * 20))
+        self.assertAlmostEqual(result['total_statement_reduction_fraction'], 1 - 620 / (807 * 20))
+        for sample in report['treatment']:
+            sample['queries']['statements'] = 32
+        self.assertFalse(compare_paired_reference(report, True)['passed'])
+
+    def test_infrastructure_cannot_make_the_reference_red(self):
+        report = self.paired()
+        for sample in report['baseline']:
+            sample['queries'] = dict(statements=1000, statement_categories={'pool_session_setup': 990})
+        self.assertFalse(compare_paired_reference(report, True)['passed'])
+
+    def test_invalid_query_accounting_fails_closed(self):
+        for queries in [dict(statements=-1), dict(statements=True),
+                        dict(statements=2, statement_categories={'driver_enum_discovery': 3}),
+                        dict(statements=2, statement_categories={'pool_session_setup': -1})]:
+            with self.subTest(queries=queries), self.assertRaises(ValueError):
+                query_counts(queries)
+        self.assertEqual(query_counts(dict(statements=21))['application'], 21)
+
+    def test_summary_reports_raw_application_and_infrastructure_costs_separately(self):
+        sample = dict(status=200, handler_seconds=1, completion_seconds=2, response_bytes=3,
+                      queries=dict(pool_acquire_seconds=.1, pool_acquisitions=2, statements=15,
+                                   returned_rows=5, statement_categories={
+                                       'driver_type_discovery': 2, 'driver_enum_discovery': 2,
+                                       'driver_type_name_discovery': 1, 'pool_session_setup': 1}))
+        summary = summarize_samples([sample, sample])
+        self.assertEqual(summary['statements'], 30)
+        self.assertEqual(summary['application_statements'], 18)
+        self.assertEqual(summary['driver_metadata_statements'], 10)
+        self.assertEqual(summary['pool_setup_statements'], 2)
 
     def test_buffers_are_not_summed_across_inclusive_nodes(self):
         plan = [{"Planning Time": 1, "Execution Time": 2, "Plan": {

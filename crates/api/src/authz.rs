@@ -54,6 +54,7 @@ pub struct AuthorizationService {
     db: PgPool,
     audit_emitter: AuditEmitter,
     cache_namespace: Arc<tokio::sync::OnceCell<String>>,
+    metadata_cache_enabled: bool,
 }
 
 const AUTHZ_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -162,6 +163,7 @@ impl AuthorizationService {
             db,
             audit_emitter,
             cache_namespace: Arc::new(tokio::sync::OnceCell::new()),
+            metadata_cache_enabled: true,
         }
     }
 
@@ -174,7 +176,15 @@ impl AuthorizationService {
             db,
             audit_emitter,
             cache_namespace: Arc::new(tokio::sync::OnceCell::from(format!("state:{namespace}"))),
+            metadata_cache_enabled: true,
         }
+    }
+
+    /// Read authorization metadata directly without changing shared cache state.
+    /// Permission evaluation and fresh identity checks are unchanged.
+    pub fn without_metadata_cache(mut self) -> Self {
+        self.metadata_cache_enabled = false;
+        self
     }
 
     async fn cache_namespace(&self) -> Result<&str, ApiError> {
@@ -544,7 +554,7 @@ impl AuthorizationService {
         &self,
         identity_id: i64,
     ) -> Result<HashMap<String, serde_json::Value>, ApiError> {
-        if identity_cache_enabled() {
+        if self.metadata_cache_enabled && identity_cache_enabled() {
             let key = identity_key(self.cache_namespace().await?, identity_id);
             if let Some(attributes) = identity_attributes_cache().get(&key).await {
                 debug!(
@@ -569,7 +579,7 @@ impl AuthorizationService {
         }
 
         let attributes = self.load_identity_attributes_uncached(identity_id).await?;
-        if identity_cache_enabled() {
+        if self.metadata_cache_enabled && identity_cache_enabled() {
             let key = identity_key(self.cache_namespace().await?, identity_id);
             identity_attributes_cache()
                 .insert(key, attributes.clone())
@@ -608,7 +618,7 @@ impl AuthorizationService {
     }
 
     async fn load_effective_grants(&self, identity_id: i64) -> Result<Vec<Grant>, ApiError> {
-        if grants_cache_enabled() {
+        if self.metadata_cache_enabled && grants_cache_enabled() {
             let key = identity_key(self.cache_namespace().await?, identity_id);
             if let Some(grants) = access_grants_cache().get(&key).await {
                 debug!(
@@ -633,7 +643,7 @@ impl AuthorizationService {
         }
 
         let grants = self.load_effective_grants_uncached(identity_id).await?;
-        if grants_cache_enabled() {
+        if self.metadata_cache_enabled && grants_cache_enabled() {
             let key = identity_key(self.cache_namespace().await?, identity_id);
             access_grants_cache().insert(key, grants.clone()).await;
             debug!(
@@ -737,7 +747,7 @@ impl AuthorizationService {
         &self,
         identity_id: i64,
     ) -> Result<Vec<String>, ApiError> {
-        if role_cache_enabled() {
+        if self.metadata_cache_enabled && role_cache_enabled() {
             let key = identity_key(self.cache_namespace().await?, identity_id);
             if let Some(roles) = role_names_cache().get(&key).await {
                 debug!(
@@ -772,7 +782,7 @@ impl AuthorizationService {
         let roles =
             IdentityRoleAssignmentRepository::find_role_names_by_identity(&self.db, identity_id)
                 .await?;
-        if role_cache_enabled() {
+        if self.metadata_cache_enabled && role_cache_enabled() {
             let key = identity_key(self.cache_namespace().await?, identity_id);
             role_names_cache().insert(key, roles.clone()).await;
             debug!(
@@ -791,6 +801,10 @@ impl AuthorizationService {
     ) -> Result<Vec<PermissionSet>, ApiError> {
         if refs.is_empty() {
             return Ok(Vec::new());
+        }
+
+        if !self.metadata_cache_enabled {
+            return Ok(PermissionSetRepository::find_by_refs(&self.db, refs).await?);
         }
 
         let key = refs_key(self.cache_namespace().await?, refs);

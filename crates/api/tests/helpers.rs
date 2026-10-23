@@ -109,6 +109,21 @@ impl TestContext {
         Self::new_with_cache_admission(CacheAdmissionConfig::default()).await
     }
 
+    /// Stable cold-cache measurements without invalidating neighboring app states.
+    #[allow(dead_code)]
+    pub async fn new_without_authorization_metadata_cache() -> Result<Self> {
+        Self::new_with_authorization_cache_options(
+            CacheAdmissionConfig::default(),
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
     #[allow(dead_code)]
     pub async fn new_with_cache_admission(cache_admission: CacheAdmissionConfig) -> Result<Self> {
         Self::new_with_options(cache_admission, false, false, false, None, None).await
@@ -196,6 +211,27 @@ impl TestContext {
         stream_limits: Option<(usize, usize)>,
         republish: Option<PackRepublishConfig>,
     ) -> Result<Self> {
+        Self::new_with_authorization_cache_options(
+            cache_admission,
+            clear_encryption_key,
+            disable_pack_registry,
+            allow_unverified_direct_remote_installs,
+            stream_limits,
+            republish,
+            true,
+        )
+        .await
+    }
+
+    async fn new_with_authorization_cache_options(
+        cache_admission: CacheAdmissionConfig,
+        clear_encryption_key: bool,
+        disable_pack_registry: bool,
+        allow_unverified_direct_remote_installs: bool,
+        stream_limits: Option<(usize, usize)>,
+        republish: Option<PackRepublishConfig>,
+        authorization_metadata_cache_enabled: bool,
+    ) -> Result<Self> {
         let database = create_test_database().await?;
         let pool = database.pool().clone();
         let schema = database.schema().to_string();
@@ -236,11 +272,16 @@ impl TestContext {
             config.database.url.clone(),
             schema.clone(),
         )?;
-        let state = Arc::new(attune_api::state::AppState::new_with_audit(
+        let state = attune_api::state::AppState::new_with_audit(
             pool.clone(),
             config.clone(),
             audit_writer.emitter.clone(),
-        ));
+        );
+        let state = Arc::new(if authorization_metadata_cache_enabled {
+            state
+        } else {
+            state.without_authorization_metadata_cache()
+        });
         let server = attune_api::server::Server::new(state.clone());
         let app = server.router();
 

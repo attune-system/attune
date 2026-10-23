@@ -1,6 +1,8 @@
 //! Real-route authorization characterization and query-growth gates.
 //! SQLx events are observed only while polling the request future; the threaded
 //! audit writer is deliberately outside that subscriber. No SQL or binds are saved.
+//! Budget fixtures bypass shared authorization metadata caches per app state:
+//! every sample counts real RBAC reads, independent of TTL or neighboring tests.
 
 #[path = "artifact_workload/cpu.rs"]
 mod cpu;
@@ -47,6 +49,17 @@ use tracing::{
 };
 use tracing_subscriber::{layer::Context, prelude::*, Layer};
 
+// Normalized statements from the pinned SQLx PostgreSQL driver's describe.rs.
+// Do not classify by table name: application catalog reads must still count.
+const DRIVER_TYPE_BY_OID: &str = "select oid::regtype::text, typtype, typcategory, typrelid, typelem, typbasetype from pg_catalog.pg_type where oid = $1";
+const DRIVER_ARRAY_TYPE: &str =
+    "select oid, typarray from pg_catalog.pg_type where oid = $1::regtype::oid";
+const DRIVER_TYPE_BY_NAME: &str = "select $1::regtype::oid";
+const DRIVER_ENUM_BY_OID: &str =
+    "select enumlabel from pg_catalog.pg_enum where enumtypid = $1 order by enumsortorder";
+const POOL_SESSION_SETUP: &str =
+    "select set_config('search_path', $1, false), set_config('application_name', $2, false)";
+
 #[derive(Clone, Default, Serialize)]
 struct QueryMetrics {
     statements: usize,
@@ -65,15 +78,19 @@ struct QueryMetrics {
 
 impl QueryMetrics {
     fn driver_metadata_reads(&self) -> usize {
-        ["driver_type_discovery", "driver_enum_discovery"]
-            .iter()
-            .map(|category| {
-                self.statement_categories
-                    .get(*category)
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .sum()
+        [
+            "driver_type_discovery",
+            "driver_enum_discovery",
+            "driver_type_name_discovery",
+        ]
+        .iter()
+        .map(|category| {
+            self.statement_categories
+                .get(*category)
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum()
     }
 
     fn application_statements(&self) -> usize {
@@ -105,9 +122,12 @@ impl Visit for QueryMetrics {
         // Keep diagnostics independent of values and SQL text. In particular,
         // distinguish cache misses from repeated graph/disclosure reads.
         let category = match primary_table {
-            Some("pg_catalog.pg_type") => "driver_type_discovery",
-            Some("pg_catalog.pg_enum") => "driver_enum_discovery",
-            _ if sql == "select set_config('search_path', $1, false), set_config('application_name', $2, false)" => "pool_session_setup",
+            _ if matches!(sql.as_str(), DRIVER_TYPE_BY_OID | DRIVER_ARRAY_TYPE) => {
+                "driver_type_discovery"
+            }
+            _ if sql == DRIVER_TYPE_BY_NAME => "driver_type_name_discovery",
+            _ if sql == DRIVER_ENUM_BY_OID => "driver_enum_discovery",
+            _ if sql == POOL_SESSION_SETUP => "pool_session_setup",
             Some(
                 table @ ("execution"
                 | "execution_secret_value"
@@ -221,6 +241,63 @@ impl Visit for QueryMetrics {
     fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
 }
 
+/// SQLx puts complete short queries in `summary` and leaves `db.statement`
+/// empty. Resolve that one known discovery shape after all event fields arrive.
+/// No query text is retained, and unknown summaries are never excluded.
+struct QueryEvent<'a> {
+    metrics: &'a mut QueryMetrics,
+    empty_statement: bool,
+    named_type_summary: bool,
+}
+
+impl QueryEvent<'_> {
+    fn finish(self) {
+        if self.empty_statement {
+            let category = if self.named_type_summary {
+                "driver_type_name_discovery"
+            } else {
+                "empty_statement"
+            };
+            *self
+                .metrics
+                .statement_categories
+                .entry(category.into())
+                .or_default() += 1;
+        }
+    }
+}
+
+impl Visit for QueryEvent<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "summary" => {
+                self.named_type_summary = value
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .eq_ignore_ascii_case(DRIVER_TYPE_BY_NAME);
+            }
+            "db.statement" => {
+                self.empty_statement = value.trim().is_empty();
+                if !self.empty_statement {
+                    self.metrics.record_str(field, value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.metrics.record_u64(field, value);
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.metrics.record_f64(field, value);
+    }
+
+    fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+}
+
 #[derive(Clone, Default)]
 struct RequestQueries(Arc<Mutex<QueryMetrics>>);
 
@@ -292,7 +369,13 @@ where
         if event.metadata().target() == "sqlx::query" {
             let mut metrics = self.0.lock().unwrap();
             metrics.statements += 1;
-            event.record(&mut *metrics);
+            let mut query = QueryEvent {
+                metrics: &mut metrics,
+                empty_statement: false,
+                named_type_summary: false,
+            };
+            event.record(&mut query);
+            query.finish();
         } else if event.metadata().target() == "sqlx::pool::acquire" {
             event.record(&mut *self.0.lock().unwrap());
         }
@@ -333,9 +416,9 @@ fn query_budget_separates_connection_local_type_discovery_but_reports_every_stat
     let subscriber = tracing_subscriber::registry().with(observer.clone());
     tracing::subscriber::with_default(subscriber, || {
         tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
-            db.statement = "SELECT oid::regtype::text, typtype FROM pg_catalog.pg_type WHERE oid = $1");
+            db.statement = DRIVER_TYPE_BY_OID);
         tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
-            db.statement = "SELECT enumlabel FROM pg_catalog.pg_enum WHERE enumtypid = $1 ORDER BY enumsortorder");
+            db.statement = DRIVER_ENUM_BY_OID);
         tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
             db.statement = "SELECT id FROM execution WHERE id = $1");
     });
@@ -356,11 +439,11 @@ fn query_budget_excludes_only_exact_pool_setup_and_preserves_application_limit()
                 db.statement = "SELECT id FROM execution WHERE id = $1");
         }
         tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
-            db.statement = "SELECT oid FROM pg_catalog.pg_type WHERE oid = $1");
+            db.statement = DRIVER_TYPE_BY_OID);
         tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
-            db.statement = "SELECT enumlabel FROM pg_catalog.pg_enum WHERE enumtypid = $1");
+            db.statement = DRIVER_ENUM_BY_OID);
         tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
-            db.statement = "SELECT set_config('search_path', $1, false), set_config('application_name', $2, false)");
+            db.statement = POOL_SESSION_SETUP);
         let metrics = observer.0.lock().unwrap().clone();
         assert_eq!(metrics.statements, 28);
         assert_eq!(metrics.application_statements(), 25);
@@ -372,6 +455,260 @@ fn query_budget_excludes_only_exact_pool_setup_and_preserves_application_limit()
         assert_eq!(metrics.application_statements(), 26);
         assert!(metrics.application_statements() > 25);
     });
+}
+
+#[test]
+fn application_catalog_queries_are_not_driver_discovery() {
+    let observer = RequestQueries::default();
+    let subscriber = tracing_subscriber::registry().with(observer.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        for sql in [
+            "SELECT oid FROM pg_catalog.pg_type WHERE oid = $1",
+            "SELECT enumlabel FROM pg_catalog.pg_enum WHERE enumtypid = $1",
+            "SELECT enumlabel FROM pg_catalog.pg_enum WHERE enumtypid = $2 ORDER BY enumsortorder",
+            "SELECT (SELECT oid FROM pg_catalog.pg_type WHERE oid = $1) FROM execution",
+            "SELECT count(*) FROM pg_catalog.pg_enum",
+        ] {
+            tracing::event!(target: "sqlx::query", tracing::Level::DEBUG, db.statement = sql);
+        }
+    });
+    let metrics = observer.0.lock().unwrap();
+    assert_eq!(metrics.statements, 5);
+    assert_eq!(metrics.driver_metadata_reads(), 0);
+    assert_eq!(metrics.application_statements(), 5);
+}
+
+#[test]
+fn pinned_driver_query_shapes_survive_whitespace_and_case_normalization() {
+    let observer = RequestQueries::default();
+    let subscriber = tracing_subscriber::registry().with(observer.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        for sql in [
+            DRIVER_TYPE_BY_OID,
+            DRIVER_ARRAY_TYPE,
+            DRIVER_ENUM_BY_OID,
+            DRIVER_TYPE_BY_NAME,
+        ] {
+            let sql = sql.to_uppercase().replace(" FROM ", "\nFROM\n");
+            tracing::event!(target: "sqlx::query", tracing::Level::DEBUG, db.statement = sql.as_str());
+        }
+    });
+    let metrics = observer.0.lock().unwrap();
+    assert_eq!(metrics.statements, 4);
+    assert_eq!(metrics.driver_metadata_reads(), 4);
+    assert_eq!(metrics.application_statements(), 0);
+}
+
+#[test]
+fn short_driver_summary_is_classified_once_in_either_field_order() {
+    let observer = RequestQueries::default();
+    let subscriber = tracing_subscriber::registry().with(observer.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        let summary = String::from("SELECT $1::regtype::oid");
+        let sql = String::new();
+        tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+            summary, db.statement = sql, rows_returned = 1u64);
+        tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+            db.statement = "", summary = "select $1::regtype::oid", rows_returned = 1u64);
+    });
+    let metrics = observer.0.lock().unwrap();
+    assert_eq!(metrics.statements, 2);
+    assert_eq!(metrics.returned_rows, 2);
+    assert_eq!(metrics.driver_metadata_reads(), 2);
+    assert_eq!(metrics.application_statements(), 0);
+    assert_eq!(metrics.statement_categories.len(), 1);
+}
+
+#[test]
+fn short_summary_fallback_does_not_hide_application_queries() {
+    let observer = RequestQueries::default();
+    let subscriber = tracing_subscriber::registry().with(observer.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        for summary in [
+            "",
+            "SELECT 1",
+            "SELECT $1::regtype::oid ...",
+            "SELECT $2::regtype::oid",
+        ] {
+            tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+                summary = summary, db.statement = "");
+        }
+        tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+            summary = DRIVER_TYPE_BY_NAME, db.statement = "SELECT id FROM execution WHERE id = $1");
+        // A summary alone is not evidence that the statement field was empty.
+        tracing::event!(target: "sqlx::query", tracing::Level::DEBUG,
+            summary = DRIVER_TYPE_BY_NAME);
+    });
+    let metrics = observer.0.lock().unwrap();
+    assert_eq!(metrics.statements, 6);
+    assert_eq!(metrics.driver_metadata_reads(), 0);
+    assert_eq!(metrics.application_statements(), 6);
+    assert_eq!(metrics.graph_record_reads, 1);
+    assert_eq!(
+        metrics.statement_categories.get("empty_statement"),
+        Some(&4)
+    );
+}
+
+#[tokio::test]
+async fn uncached_authorization_counts_reads_after_warmup_and_global_invalidation() -> Result<()> {
+    use attune_api::auth::{jwt::validate_token, middleware::AuthenticatedUser};
+    use attune_common::repositories::{FindByRef, Update};
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let _ = action(&ctx).await?;
+    let user = AuthenticatedUser {
+        claims: validate_token(
+            ctx.token().ok_or("fixture token missing")?,
+            &ctx.state.jwt_config,
+        )?,
+    };
+    let shared = ctx.state.authorization_service();
+    let expected = shared
+        .load_snapshot(&user)
+        .await?
+        .ok_or("snapshot missing")?;
+    let uncached = shared.clone().without_metadata_cache();
+    let mut counts = Vec::new();
+    for invalidate in [false, true] {
+        if invalidate {
+            AuthorizationService::invalidate_identity_authz_cache(expected.identity_id).await;
+            AuthorizationService::invalidate_permission_set_caches().await;
+        }
+        let observer = RequestQueries::default();
+        let subscriber = tracing_subscriber::registry().with(observer.clone());
+        let snapshot = uncached
+            .load_snapshot(&user)
+            .with_subscriber(subscriber)
+            .await?
+            .ok_or("snapshot missing")?;
+        assert_eq!(snapshot.grants, expected.grants);
+        assert_eq!(snapshot.identity_attributes, expected.identity_attributes);
+        let metrics = observer.0.lock().unwrap().clone();
+        assert!(
+            metrics
+                .statement_categories
+                .get("permission_set")
+                .copied()
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(
+            metrics
+                .statement_categories
+                .get("identity_role_assignment")
+                .copied()
+                .unwrap_or(0)
+                > 0
+        );
+        counts.push(metrics.application_statements());
+    }
+    assert_eq!(counts[0], counts[1]);
+    let requested = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "fixture.requested".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([{"resource":"actions","actions":["read"]}]),
+        },
+    )
+    .await?;
+    let refs = vec![requested.r#ref.clone()];
+    assert!(shared.can_delegate_permission_sets(&user, &refs).await?);
+    assert!(uncached.can_delegate_permission_sets(&user, &refs).await?);
+    PermissionSetRepository::update(
+        &ctx.pool,
+        requested.id,
+        attune_common::repositories::identity::UpdatePermissionSetInput {
+            grants: Some(json!([{"resource":"permissions","actions":["manage"]}])),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        !uncached.can_delegate_permission_sets(&user, &refs).await?,
+        "by-reference delegation must observe changed grants without invalidation"
+    );
+    // Exercise the shared-cache path without assuming a TTL or simultaneous hit.
+    let _ = shared.load_snapshot(&user).await?;
+    let set = PermissionSetRepository::find_by_ref(&ctx.pool, "fixture.artifact_reader")
+        .await?
+        .ok_or("permission fixture missing")?;
+    PermissionSetRepository::update(
+        &ctx.pool,
+        set.id,
+        attune_common::repositories::identity::UpdatePermissionSetInput {
+            grants: Some(json!([])),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(uncached
+        .load_snapshot(&user)
+        .await?
+        .ok_or("snapshot missing")?
+        .grants
+        .is_empty());
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_filtered_artifact_requests_account_for_enum_name_discovery() -> Result<()> {
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
+    let reference = action(&ctx).await?;
+    let execution = execution(&ctx, &reference).await?;
+    let log = artifact(
+        &ctx,
+        "artifact_perf.filtered.stdout.log",
+        ArtifactClassification::RuntimeLog,
+        None,
+    )
+    .await?;
+    link(&ctx, log, execution).await?;
+    ctx.flush_audit().await?;
+    let mut parked = Vec::new();
+    for _ in 0..ctx.pool.size() {
+        parked.push(ctx.pool.acquire().await?);
+    }
+    for connection in parked {
+        connection.close().await?;
+    }
+    let (sample, body) = measure(
+        &ctx,
+        &format!("/api/v1/artifacts?execution={execution}&classification=runtime_log&type=file_text&visibility=private"),
+    ).await?;
+    assert_eq!(sample.status, 200, "{body}");
+    assert_eq!(
+        body["items"]
+            .as_array()
+            .ok_or("artifact array missing")?
+            .len(),
+        1
+    );
+    assert!(
+        sample
+            .queries
+            .statement_categories
+            .get("driver_type_name_discovery")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "filtered route must exercise enum-name lookup: {}",
+        serde_json::to_string(&sample)?
+    );
+    assert!(
+        sample.queries.application_statements() <= 25,
+        "{}",
+        serde_json::to_string(&sample)?
+    );
+    ctx.cleanup().await?;
+    Ok(())
 }
 
 #[test]
@@ -604,7 +941,10 @@ fn local_origin() -> SecretOrigin {
 
 #[tokio::test]
 async fn provenance_frontiers_match_exact_kind_id_and_path_tuples() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let first = execution(&ctx, &action_ref).await?;
     let second = execution(&ctx, &action_ref).await?;
@@ -633,7 +973,10 @@ async fn provenance_frontiers_match_exact_kind_id_and_path_tuples() -> Result<()
 
 #[tokio::test]
 async fn distinct_execution_origins_and_workflow_children_use_frontier_batches() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let root = execution(&ctx, &action_ref).await?;
     let destination = execution(&ctx, &action_ref).await?;
@@ -720,7 +1063,10 @@ async fn distinct_execution_origins_and_workflow_children_use_frontier_batches()
 
 #[tokio::test]
 async fn shared_origin_depth_budget_and_cycles_are_checked_on_every_traversal() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let leaf = execution(&ctx, &action_ref).await?;
@@ -778,7 +1124,10 @@ async fn shared_origin_depth_budget_and_cycles_are_checked_on_every_traversal() 
 
 #[tokio::test]
 async fn batched_execution_sources_fail_closed_for_missing_paths_and_expiry() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let source = execution(&ctx, &action_ref).await?;
@@ -841,7 +1190,10 @@ async fn batched_execution_sources_fail_closed_for_missing_paths_and_expiry() ->
 
 #[tokio::test]
 async fn batched_lineages_preserve_dangling_parents_and_64_ancestor_owner_limit() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let identity = ctx.user.as_ref().ok_or("fixture identity missing")?.id;
     let root = ExecutionRepository::create(
         &ctx.pool,
@@ -933,7 +1285,10 @@ async fn batched_lineages_preserve_dangling_parents_and_64_ancestor_owner_limit(
 
 #[tokio::test]
 async fn workflow_source_visibility_uses_root_but_self_scope_uses_child_owner() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let root = execution(&ctx, &action_ref).await?;
     let source = execution(&ctx, &action_ref).await?;
@@ -992,7 +1347,10 @@ async fn workflow_source_visibility_uses_root_but_self_scope_uses_child_owner() 
 
 #[tokio::test]
 async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let stdout = artifact(
         &ctx,
@@ -1127,7 +1485,10 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
 #[tokio::test]
 async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result<()> {
     use attune_common::repositories::{key::KeyRepository, Delete};
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let id = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -1228,7 +1589,10 @@ async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result
 
 #[tokio::test]
 async fn summaries_exclude_large_artifact_and_version_payloads() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let execution = execution(&ctx, &action_ref).await?;
     let payload = json!({"padding": "x".repeat(10 * 1024 * 1024)});
@@ -1275,7 +1639,10 @@ async fn summaries_exclude_large_artifact_and_version_payloads() -> Result<()> {
 
 #[tokio::test]
 async fn missing_linked_executions_deny_logs_instead_of_disappearing_from_a_batch() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let execution = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -1312,7 +1679,10 @@ async fn missing_linked_executions_deny_logs_instead_of_disappearing_from_a_batc
 #[tokio::test]
 async fn disclosure_repository_failures_are_not_successful_empty_lists_or_detail_404s() -> Result<()>
 {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let execution = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -1344,7 +1714,10 @@ async fn disclosure_repository_failures_are_not_successful_empty_lists_or_detail
 #[tokio::test]
 async fn execution_pages_count_disclosure_eligible_rows_after_a_denied_candidate_batch(
 ) -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let execution = execution(&ctx, &action_ref).await?;
     let progress = artifact(
@@ -1446,7 +1819,10 @@ async fn execution_pages_count_disclosure_eligible_rows_after_a_denied_candidate
 
 #[tokio::test]
 async fn history_pages_count_visible_versions_and_exclude_hidden_newer_versions() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let visible = execution(&ctx, &action_ref).await?;
     let hidden = execution(&ctx, &action_ref).await?;
@@ -1503,7 +1879,10 @@ async fn history_pages_count_visible_versions_and_exclude_hidden_newer_versions(
 
 #[tokio::test]
 async fn artifact_page_boundaries_reject_invalid_sizes_and_overflow() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     for base in [
         "/api/v1/artifacts",
         "/api/v1/executions/1/artifacts",
@@ -1530,7 +1909,10 @@ async fn artifact_page_boundaries_reject_invalid_sizes_and_overflow() -> Result<
 
 #[tokio::test]
 async fn cancellation_keeps_bounded_owner_checks_without_a_read_anchor() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let identity = ctx.user.as_ref().ok_or("fixture identity missing")?.id;
     grant(
         &ctx,

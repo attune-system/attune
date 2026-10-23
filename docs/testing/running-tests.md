@@ -197,6 +197,21 @@ unrelated Tokio tasks. Non-Linux CPU counters are unavailable, not inferred from
 wall time. Pool acquisition includes connection creation and health checks, not
 only queue wait. Database wait samples between requests can miss short waits.
 
+Artifact query-growth fixtures bypass authorization metadata caches through an
+app-state-local setting. Every measured request includes real identity, role, and
+permission reads; another test's cache invalidation or a five-second cache expiry
+cannot change the fixture's query count. Production caching remains enabled by
+default. A separate regression compares the bypass with the shared-cache path,
+invalidates shared caches, and verifies fresh permission reads without invalidation.
+
+Application-query budgets exclude only the exact discovery statements in the
+pinned SQLx PostgreSQL driver and the exact pool session-initialization statement.
+Other catalog queries, RBAC reads, and session changes still count. Raw statements
+and infrastructure categories remain in every measurement. Paired acceptance
+reports use application counts for the query ceiling and query-reduction gate,
+while reporting raw totals and total-statement reduction separately. Elapsed time
+and CPU measurements still include infrastructure costs.
+
 `workload-summary.json` reports first-after-DDL and warm samples separately. It
 does not claim a cold server or a baseline latency improvement. The report helpers
 reject p95 comparisons with changed source, unequal workloads, errors,

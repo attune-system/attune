@@ -50,6 +50,7 @@ pub struct AppState {
     pub legacy_file_controller: Arc<attune_common::file_legacy_controller::StorageLegacyController>,
     /// Process-unique namespace for caches shared by multiple app states.
     pub(crate) cache_namespace: u64,
+    authorization_metadata_cache_enabled: bool,
     pack_projection_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -166,17 +167,30 @@ impl AppState {
             audit_emitter,
             blob_store,
             cache_namespace: NEXT_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
+            authorization_metadata_cache_enabled: true,
             pack_projection_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Count fresh authorization metadata reads in isolated benchmarks without
+    /// clearing caches or changing process-global configuration.
+    pub fn without_authorization_metadata_cache(mut self) -> Self {
+        self.authorization_metadata_cache_enabled = false;
+        self
+    }
+
     /// Create an authorization service connected to the application's audit writer.
     pub fn authorization_service(&self) -> AuthorizationService {
-        AuthorizationService::new_with_audit_and_cache_namespace(
+        let service = AuthorizationService::new_with_audit_and_cache_namespace(
             self.db.clone(),
             self.audit_emitter.clone(),
             self.cache_namespace,
-        )
+        );
+        if self.authorization_metadata_cache_enabled {
+            service
+        } else {
+            service.without_metadata_cache()
+        }
     }
 
     /// Set the message queue publisher (called once at startup or after reconnection)

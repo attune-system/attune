@@ -9,7 +9,10 @@ async fn standalone_sensor_log_disclosure_batches_foreign_delivery_owners_origin
     let mut reports = Vec::new();
     let mut scopes = Vec::new();
     for count in [1, 64, 100] {
-        let ctx = TestContext::new().await?.with_auth().await?;
+        let ctx = TestContext::new_without_authorization_metadata_cache()
+            .await?
+            .with_auth()
+            .await?;
         let _ = action(&ctx).await?;
         let deliveries = foreign_sensor_deliveries(&ctx, count, false).await?;
         let (generation, _, _, _) =
@@ -278,7 +281,10 @@ async fn foreign_sensor_deliveries(
 #[tokio::test]
 async fn ordinary_foreign_sensor_origin_cold_queries_are_chunk_bounded_and_proofs_are_required(
 ) -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let log = artifact(

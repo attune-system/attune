@@ -114,7 +114,10 @@ fn mount(ctx: &mut TestContext) {
 
 #[tokio::test]
 async fn serial_reference_matches_filtered_pages_and_missing_origin_denials() -> Result<()> {
-    let mut ctx = TestContext::new().await?.with_auth().await?;
+    let mut ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let execution = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -165,7 +168,10 @@ async fn serial_reference_matches_filtered_pages_and_missing_origin_denials() ->
 #[tokio::test]
 #[ignore = "explicit paired serial-reference/batched p95 and statement-count acceptance"]
 async fn paired_serial_reference_latency_and_query_gate() -> Result<()> {
-    let mut ctx = TestContext::new().await?.with_auth().await?;
+    let mut ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let stdout = artifact(
         &ctx,
@@ -221,7 +227,7 @@ async fn paired_serial_reference_latency_and_query_gate() -> Result<()> {
         &json!({
             "fixture":"two-non-sensitive-runtime-logs-100-retained-executions",
             "permissions":"fixture.artifact_reader", "concurrency":1,
-            "cache_state":"warm-after-separate-auth-cache-invalidation-samples", "completed_requests":20,
+            "cache_state":"authorization-metadata-uncached; database-warm", "completed_requests":20,
             "query_reduction_target":0.90,"p95_reduction_target":0.70,
             "comparison_kind":"controlled-serial-reference-not-historical-revision",
             "first_after_auth_cache_invalidation":cold,

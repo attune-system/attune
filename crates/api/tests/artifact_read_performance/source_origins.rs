@@ -44,7 +44,10 @@ fn fixture_maintenance_config() -> NativeMaintenanceConfig {
 
 #[tokio::test]
 async fn distinct_event_and_inquiry_chains_grow_by_frontier_not_source_count() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -277,7 +280,10 @@ pub(super) fn save_report(name: &str, report: &impl Serialize) -> Result<()> {
 #[tokio::test]
 async fn event_inquiry_and_component_sources_have_constant_within_batch_query_counts() -> Result<()>
 {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -331,7 +337,25 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
             }
             secret_origins(&ctx, destination, origins.clone()).await?;
             let _ = ctx.get(&path, ctx.token()).await?.bytes().await?;
+            if count == 64 {
+                // Keep the within-batch budget independent of connection-local
+                // type discovery, including the inquiry options regression.
+                ctx.flush_audit().await?;
+                let mut parked = Vec::new();
+                for _ in 0..ctx.pool.size() {
+                    parked.push(ctx.pool.acquire().await?);
+                }
+                for connection in parked {
+                    connection.close().await?;
+                }
+            }
             let (sample, body) = measure(&ctx, &path).await?;
+            if count == 64 {
+                assert!(
+                    sample.queries.driver_metadata_reads() > 0,
+                    "{kind}: fresh-connection regression must exercise SQLx type discovery"
+                );
+            }
             assert_eq!(sample.status, 200, "{kind}: {body}");
             assert_eq!(sample.queries.ciphertext_reads, 0);
             assert_eq!(sample.queries.source_payload_reads, 0);
@@ -347,8 +371,16 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
             samples[0].1.queries.graph_record_reads, samples[1].1.queries.graph_record_reads,
             "{kind}"
         );
-        assert!(samples[1].1.queries.statements <= 25, "{kind}");
-        assert!(samples[2].1.queries.statements <= 40, "{kind}");
+        assert!(
+            samples[1].1.queries.application_statements() <= 25,
+            "{kind}: within-batch application query budget exceeded: {}",
+            serde_json::to_string(&samples)?
+        );
+        assert!(
+            samples[2].1.queries.application_statements() <= 40,
+            "{kind}: cross-batch application query budget exceeded: {}",
+            serde_json::to_string(&samples)?
+        );
         let expired = match origins.last().ok_or("source origin missing")? {
             SecretOrigin::Entity { entity_id, .. } => *entity_id,
             _ => return Err("expected fixture entity origin".into()),
@@ -390,7 +422,10 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
 #[tokio::test]
 async fn exact_event_sources_survive_default_repair_and_partition_twins_but_not_expiry(
 ) -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -496,7 +531,10 @@ async fn sensor_binding(
 async fn retained_foreign_sensor_rule_proof_validates_only_original_generation_and_contract(
 ) -> Result<()> {
     use attune_common::repositories::sensor_rule_origin::SensorRuleOriginProof;
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let _ = action(&ctx).await?;
     let binding = sensor_binding(&ctx).await?;
     let trigger = binding
@@ -559,7 +597,10 @@ async fn sensor_generation_rule_and_delivery_sources_are_batched_and_keep_record
             ENTITY_SENSOR_RULE_DELIVERY_CONFIG,
         },
     };
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let action = ActionRepository::find_by_ref(&ctx.pool, &action_ref)
@@ -689,8 +730,16 @@ async fn sensor_generation_rule_and_delivery_sources_are_batched_and_keep_record
             samples[0].1.queries.graph_record_reads, samples[1].1.queries.graph_record_reads,
             "{kind}"
         );
-        assert!(samples[1].1.queries.statements <= 25, "{kind}");
-        assert!(samples[2].1.queries.statements <= 40, "{kind}");
+        assert!(
+            samples[1].1.queries.application_statements() <= 25,
+            "{kind}: within-batch application query budget exceeded: {}",
+            serde_json::to_string(&samples)?
+        );
+        assert!(
+            samples[2].1.queries.application_statements() <= 40,
+            "{kind}: cross-batch application query budget exceeded: {}",
+            serde_json::to_string(&samples)?
+        );
         if kind != ENTITY_SENSOR_GENERATION_CONFIG {
             sqlx::query("UPDATE rule SET retired_at = NOW() WHERE id = $1")
                 .bind(last_rule)
@@ -726,7 +775,10 @@ async fn replace_grants(ctx: &TestContext, reference: &str, grants: Value) -> Re
 #[tokio::test]
 async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_policies(
 ) -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -893,7 +945,10 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
 
 #[tokio::test]
 async fn distinct_public_action_fallbacks_are_batched_but_never_grant_decrypt() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let pack = PackRepository::find_by_ref(&ctx.pool, "artifact_perf")
@@ -976,7 +1031,10 @@ async fn distinct_public_action_fallbacks_are_batched_but_never_grant_decrypt() 
 #[tokio::test]
 async fn inquiry_origins_recheck_fresh_identity_attributes_after_a_parent_snapshot_is_cached(
 ) -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let id = inquiry(&ctx, i64::MAX).await?;
@@ -1037,7 +1095,10 @@ async fn inquiry_origins_recheck_fresh_identity_attributes_after_a_parent_snapsh
 #[tokio::test]
 async fn execution_input_and_output_origins_share_one_frontier_provenance_read() -> Result<()> {
     use attune_common::secret_values::ENTITY_EXECUTION_RESULT;
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let log = artifact(
@@ -1085,7 +1146,10 @@ async fn execution_input_and_output_origins_share_one_frontier_provenance_read()
 
 #[tokio::test]
 async fn distinct_workflow_ancestries_keep_source_queries_constant_within_a_batch() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
     let action_ref = action(&ctx).await?;
     let destination = execution(&ctx, &action_ref).await?;
     let log = artifact(

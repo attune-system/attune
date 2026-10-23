@@ -3,6 +3,21 @@
 import math
 
 
+def query_counts(queries):
+    """Separate observed infrastructure costs without discarding raw totals."""
+    total = queries['statements']
+    categories = queries.get('statement_categories', {})
+    excluded = ('driver_type_discovery', 'driver_enum_discovery',
+                'driver_type_name_discovery', 'pool_session_setup')
+    counts = [categories.get(category, 0) for category in excluded]
+    if any(type(count) is not int or count < 0 for count in [total, *counts]):
+        raise ValueError('query counts must be nonnegative integers')
+    if sum(counts) > total:
+        raise ValueError('infrastructure query counts exceed total statements')
+    return dict(total=total, application=total - sum(counts),
+                driver_metadata=sum(counts[:-1]), pool_setup=counts[-1])
+
+
 def percentile(values, quantile):
     """Nearest-rank percentile, retaining errors/cancellations in the caller's report."""
     if not values or not 0 < quantile <= 1:
@@ -89,11 +104,15 @@ def compare_paired_reference(report, source_unchanged):
     metadata['source_unchanged'] = source_unchanged
     latency = compare_latency({**metadata, 'seconds':[sample['handler_seconds'] for sample in baseline]},
                               {**metadata, 'seconds':[sample['handler_seconds'] for sample in treatment]})
-    before = sum(sample['queries']['statements'] for sample in baseline)
-    after = sum(sample['queries']['statements'] for sample in treatment)
+    baseline_counts = [query_counts(sample['queries']) for sample in baseline]
+    treatment_counts = [query_counts(sample['queries']) for sample in treatment]
+    before = sum(sample['application'] for sample in baseline_counts)
+    after = sum(sample['application'] for sample in treatment_counts)
+    before_total = sum(sample['total'] for sample in baseline_counts)
+    after_total = sum(sample['total'] for sample in treatment_counts)
     reduction = 1 - after / before if before else 0
-    reference_red = all(sample['queries']['statements'] > 20 for sample in baseline)
-    batched_ceiling = all(sample['queries']['statements'] <= 20 for sample in treatment)
+    reference_red = all(sample['application'] > 20 for sample in baseline_counts)
+    batched_ceiling = all(sample['application'] <= 20 for sample in treatment_counts)
     return {
         'passed': latency.get('verified', False) and latency.get('target_met', False)
                   and reduction >= .90 and reference_red and batched_ceiling,
@@ -103,7 +122,10 @@ def compare_paired_reference(report, source_unchanged):
         'query_reduction_target':.90,
         'reference_exceeds_20_statement_ceiling':reference_red,
         'batched_within_20_statement_ceiling':batched_ceiling,
-        'baseline_statements':before, 'treatment_statements':after,
+        'baseline_statements':before_total, 'treatment_statements':after_total,
+        'baseline_application_statements':before, 'treatment_application_statements':after,
+        'total_statement_reduction_fraction':1 - after_total / before_total if before_total else 0,
+        'query_budget_basis':'application statements, excluding driver discovery and pool session setup',
         'historical_or_deployed_speedup_verified':False,
     }
 
@@ -123,6 +145,9 @@ def summarize_samples(samples):
         "pool_acquire_seconds": sum(sample["queries"]["pool_acquire_seconds"] for sample in samples),
         "pool_acquisitions": sum(sample["queries"]["pool_acquisitions"] for sample in samples),
         "statements": sum(sample["queries"]["statements"] for sample in samples),
+        "application_statements": sum(query_counts(sample["queries"])["application"] for sample in samples),
+        "driver_metadata_statements": sum(query_counts(sample["queries"])["driver_metadata"] for sample in samples),
+        "pool_setup_statements": sum(query_counts(sample["queries"])["pool_setup"] for sample in samples),
         "returned_rows": sum(sample["queries"]["returned_rows"] for sample in samples),
         "cpu_counter_available": all(sample.get("handler_poll_cpu_seconds") is not None for sample in samples),
         "disclosure_cpu_counter_available": all(sample["queries"].get("execution_disclosure_poll_cpu_seconds") is not None for sample in samples),

@@ -174,7 +174,7 @@ def main():
         "snapshot_source": args.snapshot_source,
         "artifact_candidate_batch_size": 256, "execution_disclosure_batch_size": 64,
         "measurement_scope": "request-scoped SQLx statement events and real Axum responses",
-        "source_frontier_query_gates": {"batch_size": 64, "statements_at_64": 25,
+        "source_frontier_query_gates": {"batch_size": 64, "query_budget_basis": "application statements excluding exact driver discovery and pool setup", "statements_at_64": 25,
                                         "statements_at_65": 40, "within_batch_source_reads": "constant"},
         "host": {"system": platform.system(), "machine": platform.machine(), "logical_cpus": os.cpu_count()},
         "limitations": ["no network/browser TTFB", "no fixed-source baseline p95 certification",

@@ -7102,7 +7102,10 @@ async fn native_wait_snapshot_fixture(
                 ) {
                     Duration::seconds(120)
                 } else if expire_while_blocked {
-                    Duration::seconds(10)
+                    // Setup must not consume the approval before the fixture
+                    // reaches its observed target-lock barrier. The original
+                    // expiry remains fixed and must pass while that lock is held.
+                    Duration::seconds(60)
                 } else {
                     Duration::hours(1)
                 },

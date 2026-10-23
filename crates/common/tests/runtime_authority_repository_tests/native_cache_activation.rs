@@ -21,6 +21,12 @@ use attune_common::{
     test_database::TestDatabase,
 };
 
+// These are correctness/lock-order tests, not wall-clock performance gates.
+// Allow concurrent fixture work to finish before the original finite consent
+// expires; expiry itself is still observed at the actual workflow target wait.
+const PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CONSENT_LIFETIME_SECONDS: i64 = 60;
+
 #[tokio::test]
 async fn same_advance_pending_namespace_activates_two_real_cache_successors_and_refills() {
     super::run_native_cache_fixture(Some(Case::Activate)).await;
@@ -227,7 +233,7 @@ pub(super) async fn check(
         let approval = Inputs::approve_external_input(&mut tx, root.id, &binding.declaration_revision,
             &binding.source_path, &binding.expression, human,
             serde_json::from_value(json!([{"resource":"keys","actions":["read"],"constraints":{"refs":["system.cache_activation_namespace"]}}])).unwrap(),
-            Some(Utc::now()+Duration::seconds(10))).await.unwrap();
+            Some(Utc::now()+Duration::seconds(CONSENT_LIFETIME_SECONDS))).await.unwrap();
         tx.commit().await.unwrap();
         Some(approval)
     } else {
@@ -255,7 +261,7 @@ pub(super) async fn check(
     let profile = NativeCachePreparationProfile::default();
     let preparation = async {
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            PREPARATION_TIMEOUT,
             profile.record(Cache::prepare_work(
                 &mut tx,
                 root,
@@ -359,22 +365,34 @@ pub(super) async fn check(
         return;
     }
     if let (Some(approval), Some(mut blocker)) = (approval, blocker) {
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
         let waiter: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *tx)
             .await
             .unwrap();
         let release = tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(70);
             let mut observed = false;
             loop {
-                observed |=
-                    sqlx::query_scalar::<_, bool>("SELECT cardinality(pg_blocking_pids($1))>0")
+                let blocked =
+                    sqlx::query_scalar::<_, bool>("SELECT $2 = ANY(pg_blocking_pids($1))")
                         .bind(waiter)
+                        .bind(blocker_pid)
                         .fetch_one(&mut *blocker)
                         .await
                         .unwrap();
                 let expired: bool = sqlx::query_scalar("SELECT expires_at <= clock_timestamp() FROM runtime_external_approval WHERE id=$1").bind(approval).fetch_one(&mut *blocker).await.unwrap();
-                if observed && expired {
+                if blocked && !observed {
+                    assert!(
+                        !expired,
+                        "original VALUE consent must be valid when the target wait starts"
+                    );
+                    observed = true;
+                }
+                if observed && blocked && expired {
                     blocker.commit().await.unwrap();
                     return;
                 }
@@ -386,7 +404,7 @@ pub(super) async fn check(
             }
         });
         let result =
-            tokio::time::timeout(std::time::Duration::from_secs(25), plan.apply(&mut tx, key))
+            tokio::time::timeout(std::time::Duration::from_secs(80), plan.apply(&mut tx, key))
                 .await;
         release.await.unwrap();
         assert!(result.unwrap().is_err());
