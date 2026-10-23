@@ -140,6 +140,7 @@ jobs:
           python3 scripts/test_load_core_pack.py
           python3 scripts/test_bootstrap_core_pack.py
           python3 scripts/test_check_core_component_versions.py
+          python3 scripts/test_publish_image_provenance.py
 
       - name: Validate init-packs package image
         run: |
