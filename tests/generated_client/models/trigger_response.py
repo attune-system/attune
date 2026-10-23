@@ -12,6 +12,9 @@ from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.trigger_response_event_config_schema_type_0 import (
+        TriggerResponseEventConfigSchemaType0,
+    )
     from ..models.trigger_response_out_schema_type_0 import (
         TriggerResponseOutSchemaType0,
     )
@@ -30,6 +33,8 @@ class TriggerResponse:
     Attributes:
         created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
         enabled (bool): Whether the trigger is enabled Example: True.
+        event_config_schema (None | TriggerResponseEventConfigSchemaType0): Flat schema for sensor-supplied event
+            configuration.
         id (int): Trigger ID Example: 1.
         is_adhoc (bool): Whether this is an ad-hoc trigger (not from pack installation) Example: False.
         label (str): Human-readable label Example: Webhook Trigger.
@@ -54,6 +59,7 @@ class TriggerResponse:
 
     created: datetime.datetime
     enabled: bool
+    event_config_schema: None | TriggerResponseEventConfigSchemaType0
     id: int
     is_adhoc: bool
     label: str
@@ -74,6 +80,9 @@ class TriggerResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.trigger_response_event_config_schema_type_0 import (
+            TriggerResponseEventConfigSchemaType0,
+        )
         from ..models.trigger_response_out_schema_type_0 import (
             TriggerResponseOutSchemaType0,
         )
@@ -84,6 +93,12 @@ class TriggerResponse:
         created = self.created.isoformat()
 
         enabled = self.enabled
+
+        event_config_schema: dict[str, Any] | None
+        if isinstance(self.event_config_schema, TriggerResponseEventConfigSchemaType0):
+            event_config_schema = self.event_config_schema.to_dict()
+        else:
+            event_config_schema = self.event_config_schema
 
         id = self.id
 
@@ -165,6 +180,7 @@ class TriggerResponse:
             {
                 "created": created,
                 "enabled": enabled,
+                "event_config_schema": event_config_schema,
                 "id": id,
                 "is_adhoc": is_adhoc,
                 "label": label,
@@ -197,6 +213,9 @@ class TriggerResponse:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.trigger_response_event_config_schema_type_0 import (
+            TriggerResponseEventConfigSchemaType0,
+        )
         from ..models.trigger_response_out_schema_type_0 import (
             TriggerResponseOutSchemaType0,
         )
@@ -208,6 +227,25 @@ class TriggerResponse:
         created = datetime.datetime.fromisoformat(d.pop("created"))
 
         enabled = d.pop("enabled")
+
+        def _parse_event_config_schema(
+            data: object,
+        ) -> None | TriggerResponseEventConfigSchemaType0:
+            if data is None:
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                event_config_schema_type_0 = (
+                    TriggerResponseEventConfigSchemaType0.from_dict(data)
+                )
+
+                return event_config_schema_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | TriggerResponseEventConfigSchemaType0, data)
+
+        event_config_schema = _parse_event_config_schema(d.pop("event_config_schema"))
 
         id = d.pop("id")
 
@@ -331,6 +369,7 @@ class TriggerResponse:
         trigger_response = cls(
             created=created,
             enabled=enabled,
+            event_config_schema=event_config_schema,
             id=id,
             is_adhoc=is_adhoc,
             label=label,

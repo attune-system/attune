@@ -9,8 +9,8 @@ use object_store::{
     aws::{AmazonS3, AwsAuthorizer, AwsCredential, S3CopyIfNotExists},
     gcp::GoogleCloudStorage,
     path::Path,
-    Attribute, Attributes, CopyMode, CopyOptions, GetOptions, ObjectStore, ObjectStoreExt,
-    PutMultipartOptions, PutPayloadMut,
+    Attribute, Attributes, CopyMode, CopyOptions, GetOptions, ObjectStore, ObjectStoreExt, PutMode,
+    PutMultipartOptions, PutOptions, PutPayloadMut,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -161,6 +161,21 @@ pub trait BlobStore: Send + Sync {
         expected_sha256: [u8; 32],
     ) -> Result<StoredObject, BlobStoreError>;
 
+    /// Protected files are already bounded/encrypted before this call. Publish
+    /// with one atomic create-only request, with no random remote multipart
+    /// staging. An abandoned key can then be permanently fenced at the provider.
+    async fn put_file_atomic(
+        &self,
+        _key: &ObjectKey,
+        _body: BlobBody,
+        _size: u64,
+        _expected_sha256: [u8; 32],
+    ) -> Result<StoredObject, BlobStoreError> {
+        Err(BlobStoreError::Backend(
+            "Native atomic file PUT is unsupported".into(),
+        ))
+    }
+
     async fn authorize_direct_upload(
         &self,
         _key: &ObjectKey,
@@ -207,6 +222,249 @@ pub trait BlobStore: Send + Sync {
         key: &ObjectKey,
         provider_version: &ProviderVersion,
     ) -> Result<(), BlobStoreError>;
+}
+
+/// Native provider observation, not caller-supplied JSON or a runtime grant.
+pub struct FilePutSettlement {
+    key: ObjectKey,
+    token: uuid::Uuid,
+    provider: ProviderVersion,
+}
+impl FilePutSettlement {
+    pub fn key(&self) -> &ObjectKey {
+        &self.key
+    }
+    pub fn token(&self) -> uuid::Uuid {
+        self.token
+    }
+    pub fn provider(&self) -> &ProviderVersion {
+        &self.provider
+    }
+}
+
+/// Establish a permanent create-only fence on an abandoned atomic file key.
+/// A concurrent/late PUT either wins before the fence and is deleted exactly,
+/// or loses to the fence and cannot recreate payload bytes after evidence GC.
+/// The sentinel is non-content control storage and must never be collected.
+pub async fn settle_atomic_file_put(
+    store: &dyn BlobStore,
+    key: &ObjectKey,
+    token: uuid::Uuid,
+) -> Result<FilePutSettlement, BlobStoreError> {
+    let marker = Bytes::from(format!(
+        "attune-file-put-fence-v1\n{token}\n{}",
+        key.as_str()
+    ));
+    let digest = sha256(&marker);
+    for _ in 0..4 {
+        if let Some(current) = store.head(key).await? {
+            if current.size == marker.len() as u64 && current.sha256 == digest {
+                return Ok(FilePutSettlement {
+                    key: key.clone(),
+                    token,
+                    provider: current.provider_version,
+                });
+            }
+            store.delete(key, &current.provider_version).await?;
+            match store.head_version(key, &current.provider_version).await {
+                Ok(None) => {}
+                Err(BlobStoreError::VersionMismatch) => continue,
+                Ok(Some(_)) => {
+                    return Err(BlobStoreError::Backend(
+                        "Exact abandoned file version remains after native deletion".into(),
+                    ))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        match store
+            .put_file_atomic(
+                key,
+                body_from_bytes(marker.clone()),
+                marker.len() as u64,
+                digest,
+            )
+            .await
+        {
+            Ok(fence) if fence.size == marker.len() as u64 && fence.sha256 == digest => {
+                return Ok(FilePutSettlement {
+                    key: key.clone(),
+                    token,
+                    provider: fence.provider_version,
+                })
+            }
+            Ok(_) => return Err(BlobStoreError::DigestMismatch),
+            Err(BlobStoreError::Conflict) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(BlobStoreError::Conflict)
+}
+
+#[cfg(test)]
+mod file_put_settlement_tests {
+    use super::*;
+
+    struct FailOneDelete {
+        inner: FilesystemBlobStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl BlobStore for FailOneDelete {
+        async fn preflight(&self) -> Result<(), BlobStoreError> {
+            self.inner.preflight().await
+        }
+        async fn put(
+            &self,
+            key: &ObjectKey,
+            body: BlobBody,
+            digest: [u8; 32],
+        ) -> Result<StoredObject, BlobStoreError> {
+            self.inner.put(key, body, digest).await
+        }
+        async fn put_file_atomic(
+            &self,
+            key: &ObjectKey,
+            body: BlobBody,
+            size: u64,
+            digest: [u8; 32],
+        ) -> Result<StoredObject, BlobStoreError> {
+            self.inner.put_file_atomic(key, body, size, digest).await
+        }
+        async fn get(
+            &self,
+            key: &ObjectKey,
+            version: &ProviderVersion,
+            range: Option<ByteRange>,
+        ) -> Result<BlobReader, BlobStoreError> {
+            self.inner.get(key, version, range).await
+        }
+        async fn get_pinned(
+            &self,
+            key: &ObjectKey,
+            version: &ProviderVersion,
+            size: u64,
+            digest: [u8; 32],
+            range: Option<ByteRange>,
+        ) -> Result<BlobReader, BlobStoreError> {
+            self.inner
+                .get_pinned(key, version, size, digest, range)
+                .await
+        }
+        async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError> {
+            self.inner.head(key).await
+        }
+        async fn delete(
+            &self,
+            key: &ObjectKey,
+            version: &ProviderVersion,
+        ) -> Result<(), BlobStoreError> {
+            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(BlobStoreError::Conflict);
+            }
+            self.inner.delete(key, version).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_exact_provider_delete_produces_no_settlement_and_retry_removes_actual_payload()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FailOneDelete {
+            inner: FilesystemBlobStore::new(directory.path()).unwrap(),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        };
+        let key = ObjectKey::new("file-settlement/provider-failure").unwrap();
+        let payload = Bytes::from_static(b"encrypted bytes must stay owned after failed cleanup");
+        let original = store
+            .put_file_atomic(
+                &key,
+                body_from_bytes(payload.clone()),
+                payload.len() as u64,
+                sha256(&payload),
+            )
+            .await
+            .unwrap();
+        let token = uuid::Uuid::new_v4();
+        assert!(settle_atomic_file_put(&store, &key, token).await.is_err());
+        assert_eq!(store.head(&key).await.unwrap().unwrap(), original);
+        let settled = settle_atomic_file_put(&store, &key, token).await.unwrap();
+        assert_ne!(settled.provider(), &original.provider_version);
+        assert_eq!(
+            &store.head(&key).await.unwrap().unwrap().provider_version,
+            settled.provider()
+        );
+    }
+
+    #[tokio::test]
+    async fn late_atomic_put_cannot_resurrect_payload_after_provider_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(FilesystemBlobStore::new(directory.path()).unwrap());
+        let key = ObjectKey::new("file-settlement/late").unwrap();
+        let payload = Bytes::from_static(b"ciphertext belonging to the retired file");
+        let size = payload.len() as u64;
+        let digest = sha256(&payload);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let body = stream::once(async move {
+            entered_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            Ok(payload)
+        })
+        .boxed();
+        let writer_store = store.clone();
+        let writer_key = key.clone();
+        let writer = tokio::spawn(async move {
+            writer_store
+                .put_file_atomic(&writer_key, body, size, digest)
+                .await
+        });
+        entered_rx.await.unwrap();
+        let token = uuid::Uuid::new_v4();
+        let settled = settle_atomic_file_put(store.as_ref(), &key, token)
+            .await
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(matches!(
+            writer.await.unwrap(),
+            Err(BlobStoreError::Conflict)
+        ));
+        let current = store.head(&key).await.unwrap().unwrap();
+        assert_eq!(current.provider_version, *settled.provider());
+        assert_ne!(current.sha256, digest);
+    }
+
+    #[tokio::test]
+    async fn restart_after_native_fence_before_receipt_reuses_exact_fence_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FilesystemBlobStore::new(directory.path()).unwrap();
+        let key = ObjectKey::new("file-settlement/restart").unwrap();
+        let payload = Bytes::from_static(b"completed native PUT whose DB response was lost");
+        let old = store
+            .put_file_atomic(
+                &key,
+                body_from_bytes(payload.clone()),
+                payload.len() as u64,
+                sha256(&payload),
+            )
+            .await
+            .unwrap();
+        let token = uuid::Uuid::new_v4();
+        let first = settle_atomic_file_put(&store, &key, token).await.unwrap();
+        // Drop the native observation as a crash would, then reopen the backend.
+        let expected = first.provider().clone();
+        drop(first);
+        drop(store);
+        let restarted = FilesystemBlobStore::new(directory.path()).unwrap();
+        let second = settle_atomic_file_put(&restarted, &key, token)
+            .await
+            .unwrap();
+        assert_eq!(second.provider(), &expected);
+        assert!(matches!(
+            restarted.head_version(&key, &old.provider_version).await,
+            Ok(None) | Err(BlobStoreError::VersionMismatch)
+        ));
+    }
 }
 
 pub fn from_config(
@@ -539,6 +797,54 @@ impl BlobStore for ObjectStoreBlobStore {
         }
     }
 
+    async fn put_file_atomic(
+        &self,
+        key: &ObjectKey,
+        mut body: BlobBody,
+        size: u64,
+        expected_sha256: [u8; 32],
+    ) -> Result<StoredObject, BlobStoreError> {
+        let mut payload = PutPayloadMut::new();
+        let mut hasher = Sha256::new();
+        let mut count = 0_u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            count = count
+                .checked_add(chunk.len() as u64)
+                .ok_or(BlobStoreError::DigestMismatch)?;
+            if count > size {
+                return Err(BlobStoreError::DigestMismatch);
+            }
+            hasher.update(&chunk);
+            payload.push(chunk);
+        }
+        if count != size || <[u8; 32]>::from(hasher.finalize()) != expected_sha256 {
+            return Err(BlobStoreError::DigestMismatch);
+        }
+        let mut attributes = Attributes::new();
+        if self.metadata_supported {
+            attributes.insert(
+                Attribute::Metadata(Cow::Borrowed(DIGEST_METADATA_KEY)),
+                encode_digest(&expected_sha256).into(),
+            );
+        }
+        let mut options = PutOptions::from(attributes);
+        options.mode = PutMode::Create;
+        self.store
+            .put_opts(&self.path(key)?, payload.into(), options)
+            .await
+            .map_err(|error| match error {
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. } => BlobStoreError::Conflict,
+                error => map_backend_error(error),
+            })?;
+        let object = self.head(key).await?.ok_or(BlobStoreError::NotFound)?;
+        if object.size != size || object.sha256 != expected_sha256 {
+            return Err(BlobStoreError::DigestMismatch);
+        }
+        Ok(object)
+    }
+
     async fn get(
         &self,
         key: &ObjectKey,
@@ -815,6 +1121,19 @@ impl BlobStore for FilesystemBlobStore {
         self.inner.put(key, body, expected_sha256).await
     }
 
+    async fn put_file_atomic(
+        &self,
+        key: &ObjectKey,
+        body: BlobBody,
+        size: u64,
+        digest: [u8; 32],
+    ) -> Result<StoredObject, BlobStoreError> {
+        // The provider's create-only operation is the cross-process arbiter.
+        // Never hold the process mutex while waiting for producer/body EOF;
+        // recovery must be able to fence a canceled or stalled producer.
+        self.inner.put_file_atomic(key, body, size, digest).await
+    }
+
     async fn get(
         &self,
         key: &ObjectKey,
@@ -910,6 +1229,32 @@ macro_rules! delegate_cloud_blob_store {
                 expected_sha256: [u8; 32],
             ) -> Result<StoredObject, BlobStoreError> {
                 self.inner.put(key, body, expected_sha256).await
+            }
+
+            async fn put_file_atomic(
+                &self,
+                key: &ObjectKey,
+                body: BlobBody,
+                size: u64,
+                digest: [u8; 32],
+            ) -> Result<StoredObject, BlobStoreError> {
+                match &self.native {
+                    Some(native) => {
+                        native
+                            .put_file_stream(&self.inner.path(key)?, body, size, digest)
+                            .await?;
+                        let object = self
+                            .inner
+                            .head(key)
+                            .await?
+                            .ok_or(BlobStoreError::NotFound)?;
+                        if object.size != size || object.sha256 != digest {
+                            return Err(BlobStoreError::DigestMismatch);
+                        }
+                        Ok(object)
+                    }
+                    None => self.inner.put_file_atomic(key, body, size, digest).await,
+                }
             }
 
             async fn authorize_direct_upload(
@@ -1050,6 +1395,45 @@ fn preflight_error(
 }
 
 impl S3NativeDelete {
+    async fn put_file_stream(
+        &self,
+        path: &Path,
+        body: BlobBody,
+        size: u64,
+        digest: [u8; 32],
+    ) -> Result<(), BlobStoreError> {
+        let authorization = self
+            .authorize_direct_upload(
+                path,
+                &DirectUploadSpec {
+                    content_length: size,
+                    sha256: digest,
+                    content_type: "application/octet-stream".into(),
+                    expires_in: Duration::from_secs(60),
+                },
+            )
+            .await?;
+        // The signed checksum, content length and If-None-Match are all bound to
+        // this one native request. The URL never leaves the API/native adapter.
+        let mut request = self.client.put(&authorization.url);
+        for (name, value) in authorization.required_headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .body(reqwest::Body::wrap_stream(verify_reader(
+                body,
+                size,
+                Some(digest),
+            )))
+            .send()
+            .await
+            .map_err(|_| {
+                BlobStoreError::Backend(
+                    "S3 atomic file PUT request did not settle successfully".into(),
+                )
+            })?;
+        map_atomic_create_status(response.status())
+    }
     async fn authorize_direct_upload(
         &self,
         path: &Path,
@@ -1337,6 +1721,52 @@ fn s3_versioning_access_error(bucket: &str) -> BlobStoreError {
 }
 
 impl GcsNativeDelete {
+    async fn put_file_stream(
+        &self,
+        path: &Path,
+        body: BlobBody,
+        size: u64,
+        digest: [u8; 32],
+    ) -> Result<(), BlobStoreError> {
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .map_err(|_| BlobStoreError::Backend("Invalid GCS native endpoint".into()))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| BlobStoreError::Backend("GCS endpoint cannot be a base".into()))?;
+            segments.pop_if_empty().push(&self.bucket);
+            for segment in path.as_ref().split('/') {
+                segments.push(segment);
+            }
+        }
+        let credential = self
+            .store
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(map_backend_error)?;
+        let response = self
+            .client
+            .put(url)
+            .bearer_auth(&credential.bearer)
+            .header("x-goog-if-generation-match", "0")
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(reqwest::Body::wrap_stream(verify_reader(
+                body,
+                size,
+                Some(digest),
+            )))
+            .send()
+            .await
+            .map_err(|_| {
+                BlobStoreError::Backend(
+                    "GCS atomic file PUT request did not settle successfully".into(),
+                )
+            })?;
+        // GCS head verification independently hashes the actual stored bytes.
+        map_atomic_create_status(response.status())
+    }
     async fn delete(
         &self,
         path: &Path,
@@ -1380,6 +1810,18 @@ fn map_exact_delete_status(status: reqwest::StatusCode) -> Result<(), BlobStoreE
         }
         status => Err(BlobStoreError::Backend(format!(
             "exact object deletion returned HTTP {status}"
+        ))),
+    }
+}
+
+fn map_atomic_create_status(status: reqwest::StatusCode) -> Result<(), BlobStoreError> {
+    match status {
+        status if status.is_success() => Ok(()),
+        reqwest::StatusCode::CONFLICT | reqwest::StatusCode::PRECONDITION_FAILED => {
+            Err(BlobStoreError::Conflict)
+        }
+        status => Err(BlobStoreError::Backend(format!(
+            "atomic file creation returned HTTP {status}"
         ))),
     }
 }
@@ -2686,6 +3128,74 @@ mod tests {
         assert!(request.starts_with("delete /bucket/prefix/object "));
         assert!(request.contains("\r\nx-goog-if-generation-match: 123456\r\n"));
         assert!(request.contains("\r\nauthorization: bearer token\r\n"));
+    }
+
+    #[tokio::test]
+    async fn native_atomic_file_requests_stream_with_create_only_preconditions() {
+        let bytes = Bytes::from_static(b"bounded native file stream");
+        let digest = sha256(&bytes);
+        let (endpoint, captured) = capture_request(412).await;
+        let store = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("test-region")
+            .with_endpoint(&endpoint)
+            .with_allow_http(true)
+            .with_access_key_id("fixture-access")
+            .with_secret_access_key("fixture-secret")
+            .build()
+            .unwrap();
+        let native = S3NativeDelete {
+            store,
+            bucket: "bucket".into(),
+            region: "test-region".into(),
+            kms_key: None,
+            client: reqwest::Client::new(),
+        };
+        assert!(matches!(
+            native
+                .put_file_stream(
+                    &Path::from("prefix/file"),
+                    body_from_bytes(bytes.clone()),
+                    bytes.len() as u64,
+                    digest
+                )
+                .await,
+            Err(BlobStoreError::Conflict)
+        ));
+        let request = captured.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("put /bucket/prefix/file?"));
+        assert!(request.contains("\r\nif-none-match: *\r\n"));
+        assert!(request.contains("\r\nx-amz-checksum-sha256:"));
+        assert!(request.contains(&format!("\r\ncontent-length: {}\r\n", bytes.len())));
+
+        let (endpoint, captured) = capture_request(412).await;
+        let store = object_store::gcp::GoogleCloudStorageBuilder::new()
+            .with_bucket_name("bucket")
+            .with_base_url(&endpoint)
+            .with_bearer_token("fixture-token")
+            .build()
+            .unwrap();
+        let native = GcsNativeDelete {
+            store,
+            bucket: "bucket".into(),
+            base_url: endpoint,
+            client: reqwest::Client::new(),
+        };
+        assert!(matches!(
+            native
+                .put_file_stream(
+                    &Path::from("prefix/file"),
+                    body_from_bytes(bytes.clone()),
+                    bytes.len() as u64,
+                    digest
+                )
+                .await,
+            Err(BlobStoreError::Conflict)
+        ));
+        let request = captured.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("put /bucket/prefix/file "));
+        assert!(request.contains("\r\nx-goog-if-generation-match: 0\r\n"));
+        assert!(request.contains(&format!("\r\ncontent-length: {}\r\n", bytes.len())));
     }
 
     #[test]

@@ -45,6 +45,8 @@ class SensorResponse:
         artifact_retention_limit (int | None | Unset): Per-sensor retention limit override for non-log artifacts created
             by sensor-owned executions. Example: 10.
         artifact_retention_policy (None | RetentionPolicyType | Unset):
+        config (Any | None | Unset):
+        config_schema_binding (Any | None | Unset):
         description (None | str | Unset): Sensor description Example: Monitors CPU usage and generates events.
         log_retention_limit (int | None | Unset): Per-sensor retention limit override for registered stdout/stderr log
             artifacts. Example: 4.
@@ -69,6 +71,8 @@ class SensorResponse:
     worker_tolerations: list[WorkerToleration]
     artifact_retention_limit: int | None | Unset = UNSET
     artifact_retention_policy: None | RetentionPolicyType | Unset = UNSET
+    config: Any | None | Unset = UNSET
+    config_schema_binding: Any | None | Unset = UNSET
     description: None | str | Unset = UNSET
     log_retention_limit: int | None | Unset = UNSET
     log_retention_policy: None | RetentionPolicyType | Unset = UNSET
@@ -128,6 +132,18 @@ class SensorResponse:
             artifact_retention_policy = self.artifact_retention_policy.value
         else:
             artifact_retention_policy = self.artifact_retention_policy
+
+        config: Any | None | Unset
+        if isinstance(self.config, Unset):
+            config = UNSET
+        else:
+            config = self.config
+
+        config_schema_binding: Any | None | Unset
+        if isinstance(self.config_schema_binding, Unset):
+            config_schema_binding = UNSET
+        else:
+            config_schema_binding = self.config_schema_binding
 
         description: None | str | Unset
         if isinstance(self.description, Unset):
@@ -192,6 +208,10 @@ class SensorResponse:
             field_dict["artifact_retention_limit"] = artifact_retention_limit
         if artifact_retention_policy is not UNSET:
             field_dict["artifact_retention_policy"] = artifact_retention_policy
+        if config is not UNSET:
+            field_dict["config"] = config
+        if config_schema_binding is not UNSET:
+            field_dict["config_schema_binding"] = config_schema_binding
         if description is not UNSET:
             field_dict["description"] = description
         if log_retention_limit is not UNSET:
@@ -299,6 +319,26 @@ class SensorResponse:
             d.pop("artifact_retention_policy", UNSET)
         )
 
+        def _parse_config(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        config = _parse_config(d.pop("config", UNSET))
+
+        def _parse_config_schema_binding(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        config_schema_binding = _parse_config_schema_binding(
+            d.pop("config_schema_binding", UNSET)
+        )
+
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -391,6 +431,8 @@ class SensorResponse:
             worker_tolerations=worker_tolerations,
             artifact_retention_limit=artifact_retention_limit,
             artifact_retention_policy=artifact_retention_policy,
+            config=config,
+            config_schema_binding=config_schema_binding,
             description=description,
             log_retention_limit=log_retention_limit,
             log_retention_policy=log_retention_policy,

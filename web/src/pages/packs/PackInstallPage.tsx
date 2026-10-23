@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
-import { useNavigate, Link } from "react-router-dom";
-import { useInstallPack } from "@/hooks/usePackTests";
+import { Link } from "react-router-dom";
+import { useInstallPack, usePackInstallStatus } from "@/hooks/usePackTests";
+import {
+  deploymentErrorText,
+  deploymentDiagnosticsText,
+} from "@/lib/deployment-error";
 import { useIndexedPacks } from "@/hooks/usePacks";
 import {
   AlertCircle,
@@ -26,7 +30,6 @@ export default function PackInstallPage() {
   const { user } = useAuth();
   const canInstallPacks = hasPermission(user, "packs", "install");
   const canConfigurePacks = hasPermission(user, "packs", "configure");
-  const navigate = useNavigate();
   const installPack = useInstallPack();
 
   const [sourceType, setSourceType] = useState<SourceType>(() =>
@@ -44,8 +47,53 @@ export default function PackInstallPage() {
   });
   const indexedPackResults = indexedPacks.data?.data ?? [];
 
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
+  const [submissionError, setError] = useState<string | null>(null);
+  const [submissionSuccess, setSuccess] = useState<string | null>(null);
+  const [submissionProgress, setProgress] = useState<string | null>(null);
+  const [submissionWarnings, setWarnings] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState<{ ref: string; id: number } | null>(
+    null,
+  );
+  const installStatus = usePackInstallStatus(
+    attempt?.ref ?? "",
+    attempt?.id,
+    attempt !== null,
+  );
+
+  let error = submissionError;
+  let success = submissionSuccess;
+  let progress = submissionProgress;
+  let warnings = submissionWarnings;
+  if (attempt) {
+    const status = installStatus.data?.data;
+    if (status?.status === "failed" || status?.status === "rolled_back") {
+      error = deploymentErrorText(
+        {
+          body: {
+            error:
+              status.error_message ??
+              `Install ${attempt.id} failed; the candidate was not activated.`,
+            details: status.diagnostic_details,
+          },
+        },
+        "Deployment failed",
+      );
+      progress = null;
+    } else if (status?.status === "succeeded") {
+      const details = deploymentDiagnosticsText(status.diagnostic_details);
+      if (status.error_message) error = `${status.error_message}\n${details}`;
+      else {
+        success = `Pack '${attempt.ref}' deployment completed.`;
+        warnings = details || null;
+      }
+      progress = null;
+    } else if (installStatus.error) {
+      error = deploymentErrorText(
+        installStatus.error,
+        `Could not read install ${attempt.id}. Outcome is unknown; check install status before retrying.`,
+      );
+    }
+  }
   const [installErrorToast, setInstallErrorToast] = useState<string | null>(
     null,
   );
@@ -58,27 +106,14 @@ export default function PackInstallPage() {
     return () => window.clearTimeout(timeout);
   }, [installErrorToast]);
 
-  const getErrorMessage = (err: unknown, fallback: string): string => {
-    const maybeApiError = err as {
-      body?: { error?: string; message?: string };
-    };
-    const maybeAxios = err as {
-      response?: { data?: { error?: string; message?: string } };
-    };
-    return (
-      maybeApiError.body?.error ||
-      maybeApiError.body?.message ||
-      maybeAxios.response?.data?.error ||
-      maybeAxios.response?.data?.message ||
-      (err instanceof Error ? err.message : fallback)
-    );
-  };
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!canInstallPacks) return;
+    setAttempt(null);
     setError(null);
     setSuccess(null);
+    setWarnings(null);
+    setProgress(null);
 
     if (!formData.source) {
       setError("Pack source is required");
@@ -95,6 +130,27 @@ export default function PackInstallPage() {
       });
 
       const packRef = result.data.pack.ref;
+      const status = result.data.install_status;
+      if (status === "failed" || status === "rolled_back") {
+        setError(
+          "Deployment failed. Check the install status for the cause before retrying.",
+        );
+        return;
+      }
+      if (
+        status === "pending" ||
+        status === "running" ||
+        status === "activating"
+      ) {
+        setProgress(`Pack '${packRef}' deployment is still ${status}.`);
+        if (result.data.install_id)
+          setAttempt({ ref: packRef, id: result.data.install_id });
+        return;
+      }
+      setWarnings(
+        deploymentDiagnosticsText({ diagnostics: result.data.diagnostics }) ||
+          null,
+      );
       setSuccess(
         `Pack '${result.data.pack.label}' (${result.data.pack.version}) installed successfully! ${
           result.data.tests_skipped
@@ -104,13 +160,11 @@ export default function PackInstallPage() {
               : ""
         }`,
       );
-
-      // Redirect to pack details after 2 seconds
-      setTimeout(() => {
-        navigate(`/packs/${packRef}`);
-      }, 2000);
     } catch (err) {
-      const message = getErrorMessage(err, "Failed to install pack");
+      const message = deploymentErrorText(
+        err,
+        "Could not complete pack installation. Outcome may be unknown; check install status before retrying.",
+      );
       setError(message);
       setInstallErrorToast(message);
     }
@@ -225,15 +279,32 @@ export default function PackInstallPage() {
       </div>
 
       {error && (
-        <div className="mb-6 bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
+        <div
+          role="alert"
+          className="mb-6 bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3"
+        >
           <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
           <div className="flex-1">
             <h3 className="text-sm font-semibold text-red-800">Error</h3>
-            <p className="text-sm text-red-700 mt-1 whitespace-pre-line">
+            <p className="text-sm text-red-700 mt-1 whitespace-pre-wrap break-words">
               {error}
             </p>
           </div>
         </div>
+      )}
+
+      {progress && (
+        <p role="status" className="mb-6 whitespace-pre-wrap">
+          {progress}
+        </p>
+      )}
+      {warnings && (
+        <p
+          role="status"
+          className="mb-6 whitespace-pre-wrap break-words text-amber-800"
+        >
+          {warnings}
+        </p>
       )}
 
       {success && (
@@ -243,7 +314,8 @@ export default function PackInstallPage() {
             <h3 className="text-sm font-semibold text-green-800">Success</h3>
             <p className="text-sm text-green-700 mt-1">{success}</p>
             <p className="text-xs text-green-600 mt-2">
-              Redirecting to pack details...
+              Deployment details remain here so you can review the outcome and
+              warnings.
             </p>
           </div>
         </div>
@@ -648,7 +720,7 @@ export default function PackInstallPage() {
             {canInstallPacks && (
               <button
                 type="submit"
-                disabled={installPack.isPending || !!success}
+                disabled={installPack.isPending || !!success || !!progress}
                 className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium flex items-center gap-2"
               >
                 {installPack.isPending ? (

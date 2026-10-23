@@ -4,10 +4,12 @@
 //! which executes actions in various runtime environments.
 
 pub mod artifacts;
+pub mod completion;
 pub mod dynamic_runtime;
 pub mod env_setup;
 pub mod executor;
 pub mod heartbeat;
+pub mod recorded_credentials;
 pub mod registration;
 pub mod runtime;
 pub mod runtime_detect;

@@ -16,13 +16,17 @@ export type CreateTriggerRequest = {
    */
   enabled?: boolean;
   /**
+   * Flat schema for sensor-supplied event configuration, not trigger-instance parameters.
+   */
+  event_config_schema?: Record<string, any> | null;
+  /**
    * Human-readable label
    */
   label: string;
   /**
    * Output schema (flat format) defining event data structure with inline required/secret
    */
-  out_schema?: any | null;
+  out_schema?: Record<string, any> | null;
   /**
    * Optional pack reference this trigger belongs to
    */
@@ -30,7 +34,7 @@ export type CreateTriggerRequest = {
   /**
    * Parameter schema (StackStorm-style) defining trigger configuration with inline required/secret
    */
-  param_schema?: any | null;
+  param_schema?: Record<string, any> | null;
   /**
    * Unique reference identifier (e.g., "core.webhook", "system.timer")
    */

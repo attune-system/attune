@@ -1,4 +1,5 @@
-name: node_axios
+ref: test_pack.node_axios
+label: Node axios
 description: "Node.js action that imports axios"
 enabled: true
 runner_type: node

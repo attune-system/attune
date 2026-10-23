@@ -3,6 +3,9 @@ use attune_common::{
     artifact_transport::ArtifactFileTransport,
     config::SupervisorMaintenanceConfig,
     repositories::{
+        artifact::ArtifactVersionRepository,
+        file_evidence_retention::FileEvidenceRetentionRepository,
+        file_origin::FileOriginRepository,
         maintenance::{ArtifactCleanupResult, MaintenanceRepository},
         storage_maintenance::StorageMaintenanceRepository,
     },
@@ -30,12 +33,29 @@ pub async fn cleanup_expired_artifacts(
     };
 
     for version in versions {
-        if let Some(file_path) = version.file_path.as_deref() {
+        let mut tx = pool.begin().await?;
+        FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await?;
+        let Some(current) =
+            MaintenanceRepository::claim_expired_artifact_version(&mut tx, version.id).await?
+        else {
+            tx.rollback().await?;
+            continue;
+        };
+        if FileEvidenceRetentionRepository::request_cleanup(&mut tx, &[version.id]).await?
+            != [version.id]
+        {
+            tx.rollback().await?;
+            continue;
+        }
+        // The current path and retention policy were rechecked under the gate.
+        if let Some(file_path) = current.file_path.as_deref() {
             artifact_transport.delete_file(file_path).await?;
             result.deleted_files += 1;
         }
 
-        if MaintenanceRepository::delete_artifact_version(pool, version.id).await? {
+        let removed = ArtifactVersionRepository::delete(&mut *tx, version.id).await?;
+        tx.commit().await?;
+        if removed {
             result.deleted_versions += 1;
             if MaintenanceRepository::refresh_or_delete_artifact_metadata(pool, version.artifact)
                 .await?
@@ -43,6 +63,19 @@ pub async fn cleanup_expired_artifacts(
                 result.deleted_artifacts += 1;
             }
         }
+    }
+
+    // Metadata deletion must not leave a readable orphan. The guard survives
+    // failure; release it only after the native cleaner verifies removal.
+    for (path, version) in
+        FileOriginRepository::orphaned_staging(pool, maintenance.artifact_cleanup_batch_size)
+            .await?
+    {
+        artifact_transport.delete_file(&path).await?;
+        if artifact_transport.file_exists(&path).await? {
+            continue;
+        }
+        FileOriginRepository::release_staging(pool, &path, version).await?;
     }
 
     Ok(result)

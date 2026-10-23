@@ -9,19 +9,31 @@ import {
   combinePackLocalRef,
 } from "@/lib/format-utils";
 import SchemaBuilder from "@/components/common/SchemaBuilder";
+import { isFlatSchema } from "@/lib/flat-schema";
+import type { FlatSchema } from "@/components/common/SchemaBuilder";
 import SearchableSelect from "@/components/common/SearchableSelect";
 import { safeErrorSummary } from "@/lib/safe-error-summary";
+import { toJsonValue } from "@/lib/json-value";
 import {
   ActionReferenceVisibility,
-  TriggerStringPatch,
+  TriggerSetOperation,
+  TriggerClearOperation,
   WebhooksService,
 } from "@/api";
-import type { TriggerResponse, PackSummary } from "@/api";
+import type {
+  TriggerResponse,
+  PackSummary,
+  UpdateTriggerRequest,
+  TriggerJsonPatch,
+} from "@/api";
 
-/** Flat schema format: each key is a parameter name mapped to its definition */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type FlatSchema = Record<string, any>;
 type ReferenceVisibility = ActionReferenceVisibility;
+
+function schemaPatch(schema: FlatSchema | null): TriggerJsonPatch {
+  return schema === null
+    ? { op: TriggerClearOperation.CLEAR }
+    : { op: TriggerSetOperation.SET, value: toJsonValue(schema) };
+}
 
 interface TriggerFormProps {
   initialData?: TriggerResponse;
@@ -45,8 +57,12 @@ export default function TriggerForm({
   const [referenceVisibility, setReferenceVisibility] =
     useState<ReferenceVisibility>(ActionReferenceVisibility.PUBLIC);
   const [referenceAllowedPackRefs, setReferenceAllowedPackRefs] = useState("");
-  const [paramSchema, setParamSchema] = useState<FlatSchema>({});
-  const [outSchema, setOutSchema] = useState<FlatSchema>({});
+  const [paramSchema, setParamSchema] = useState<FlatSchema | null>(null);
+  const [outSchema, setOutSchema] = useState<FlatSchema | null>(null);
+  const [eventConfigSchema, setEventConfigSchema] = useState<FlatSchema | null>(
+    null,
+  );
+  const [schemaLoadError, setSchemaLoadError] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   // Fetch packs
@@ -68,14 +84,40 @@ export default function TriggerForm({
       setWebhookEnabled(initialData.webhook_enabled || false);
       setEnabled(initialData.enabled ?? true);
       setReferenceVisibility(
-        (initialData.reference_visibility as ReferenceVisibility | undefined) ??
-          ActionReferenceVisibility.PUBLIC,
+        initialData.reference_visibility ?? ActionReferenceVisibility.PUBLIC,
       );
       setReferenceAllowedPackRefs(
         (initialData.reference_allowed_pack_refs ?? []).join("\n"),
       );
-      setParamSchema(initialData.param_schema || {});
-      setOutSchema(initialData.out_schema || {});
+      const schemas = [
+        initialData.param_schema,
+        initialData.out_schema,
+        initialData.event_config_schema,
+      ];
+      if (
+        schemas.some(
+          (schema: unknown) => schema != null && !isFlatSchema(schema),
+        )
+      ) {
+        setSchemaLoadError(
+          "The stored trigger contains an invalid flat schema. Correct it through the API before editing here.",
+        );
+        return;
+      }
+      setSchemaLoadError("");
+      setParamSchema(
+        isFlatSchema(initialData.param_schema)
+          ? initialData.param_schema
+          : null,
+      );
+      setOutSchema(
+        isFlatSchema(initialData.out_schema) ? initialData.out_schema : null,
+      );
+      setEventConfigSchema(
+        isFlatSchema(initialData.event_config_schema)
+          ? initialData.event_config_schema
+          : null,
+      );
 
       if (isEditing) {
         // Find pack by pack_ref
@@ -98,6 +140,7 @@ export default function TriggerForm({
 
   const validateForm = (): boolean => {
     const newErrors: Record<string, string> = {};
+    if (schemaLoadError) newErrors.schema = schemaLoadError;
 
     if (!packId) {
       newErrors.pack = "Pack is required";
@@ -150,17 +193,23 @@ export default function TriggerForm({
         enabled,
         reference_visibility: referenceVisibility,
         reference_allowed_pack_refs: allowedRefs,
-        param_schema:
-          Object.keys(paramSchema).length > 0 ? paramSchema : undefined,
-        out_schema: Object.keys(outSchema).length > 0 ? outSchema : undefined,
+        param_schema: paramSchema ?? undefined,
+        out_schema: outSchema ?? undefined,
+        event_config_schema: eventConfigSchema ?? undefined,
       };
 
       if (isEditing && initialData?.ref) {
-        const updateData = {
-          ...formData,
+        const updateData: UpdateTriggerRequest = {
+          label: label.trim(),
+          enabled,
+          reference_visibility: referenceVisibility,
+          reference_allowed_pack_refs: allowedRefs,
+          param_schema: schemaPatch(paramSchema),
+          out_schema: schemaPatch(outSchema),
+          event_config_schema: schemaPatch(eventConfigSchema),
           description: description.trim()
-            ? { op: TriggerStringPatch.op.SET, value: description.trim() }
-            : ({ op: "clear" } as unknown as TriggerStringPatch),
+            ? { op: TriggerSetOperation.SET, value: description.trim() }
+            : { op: TriggerClearOperation.CLEAR },
         };
 
         await updateTrigger.mutateAsync({
@@ -380,21 +429,35 @@ export default function TriggerForm({
         </div>
 
         {/* Parameter Schema */}
+        {schemaLoadError && (
+          <p role="alert" className="text-sm text-red-600">
+            {schemaLoadError}
+          </p>
+        )}
         <SchemaBuilder
           label="Parameter Schema"
-          value={paramSchema}
+          value={paramSchema ?? {}}
           onChange={setParamSchema}
           error={errors.paramSchema}
         />
         <p className="text-xs text-gray-500 -mt-2">
-          Define the structure of event parameters that will be passed to this
-          trigger
+          Configuration supplied by rules to trigger instances, not emitted
+          event payloads.
         </p>
+        {paramSchema !== null && (
+          <button
+            type="button"
+            onClick={() => setParamSchema(null)}
+            className="text-sm text-red-600"
+          >
+            Remove parameter schema
+          </button>
+        )}
 
         {/* Output Schema */}
         <SchemaBuilder
           label="Output Schema"
-          value={outSchema}
+          value={outSchema ?? {}}
           onChange={setOutSchema}
           error={errors.outSchema}
         />
@@ -402,6 +465,35 @@ export default function TriggerForm({
           Define the structure of event data that will be produced by this
           trigger
         </p>
+        {outSchema !== null && (
+          <button
+            type="button"
+            onClick={() => setOutSchema(null)}
+            className="text-sm text-red-600"
+          >
+            Remove output schema
+          </button>
+        )}
+
+        <SchemaBuilder
+          label="Event Configuration Schema"
+          value={eventConfigSchema ?? {}}
+          onChange={setEventConfigSchema}
+          error={errors.eventConfigSchema}
+        />
+        <p className="text-xs text-gray-500 -mt-2">
+          Optional schema for sensor-supplied event configuration. Webhook
+          metadata uses a separate server-owned contract.
+        </p>
+        {eventConfigSchema !== null && (
+          <button
+            type="button"
+            onClick={() => setEventConfigSchema(null)}
+            className="text-sm text-red-600"
+          >
+            Remove event configuration schema
+          </button>
+        )}
       </div>
 
       {/* Settings */}

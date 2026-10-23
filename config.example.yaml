@@ -195,6 +195,11 @@ security:
 # packs:
 #   # Deployed workers and sensors must select volume or api.
 #   transport: volume
+#   # off rejects changed versions; on allows any; suffix allows matching endings.
+#   # Keep off in staging/production. Archive integrity checks still apply.
+#   republish:
+#     mode: "off"
+#     suffix: "-dev"
 
 # Artifact transport and runtime-log buffering
 # artifacts:

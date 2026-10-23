@@ -47,8 +47,7 @@ async fn platform_snapshot(pool: &sqlx::PgPool) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "integration test - requires database and Python psycopg2-binary/PyYAML"]
-async fn repeated_python_bootstrap_preserves_platform_and_rejects_changed_definitions() {
+async fn direct_python_database_bootstrap_is_rejected_without_platform_changes() {
     let db = create_test_pool().await.unwrap();
     let config = Config::load_from_file(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -73,15 +72,16 @@ async fn repeated_python_bootstrap_preserves_platform_and_rejects_changed_defini
             std::fs::copy(entry.path(), pack.join(directory).join(entry.file_name())).unwrap();
         }
     }
-    // The current volume bootstrap runs before the first API reconciliation.
+    // The former SQL entry point must reject its direct-loader flags before any write.
     let first = run_python_loader(&config.database.url, db.schema(), root.path()).await;
     assert!(
-        first.status.success(),
+        !first.status.success(),
         "{}\n{}",
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&first.stderr)
     );
-    let core = PackRepository::get_by_ref(&db, "core").await.unwrap();
+    let core = PackFixture::new("core").create(&db).await.unwrap();
+    Catalog::reconcile(&db).await.unwrap();
     let admin = PermissionSetRepository::get_by_ref(&db, "core.admin")
         .await
         .unwrap();
@@ -103,7 +103,7 @@ async fn repeated_python_bootstrap_preserves_platform_and_rejects_changed_defini
     for _ in 0..2 {
         let repeated = run_python_loader(&config.database.url, db.schema(), root.path()).await;
         assert!(
-            repeated.status.success(),
+            !repeated.status.success(),
             "{}\n{}",
             String::from_utf8_lossy(&repeated.stdout),
             String::from_utf8_lossy(&repeated.stderr)
@@ -120,10 +120,7 @@ async fn repeated_python_bootstrap_preserves_platform_and_rejects_changed_defini
             Catalog::origin(&db, ManagedComponentKind::PermissionSet, "core.key_creator")
                 .await
                 .unwrap(),
-            Some(ManagementOrigin::Pack {
-                pack_id: core.id,
-                release_id: None
-            })
+            None
         );
     }
     for (directory, filename) in [
@@ -139,15 +136,11 @@ async fn repeated_python_bootstrap_preserves_platform_and_rejects_changed_defini
             .await
             .unwrap()
             .updated;
-        let permission_updated = PermissionSetRepository::get_by_ref(&db, "core.key_creator")
-            .await
-            .unwrap()
-            .updated;
         std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
         let rejected = run_python_loader(&config.database.url, db.schema(), root.path()).await;
         assert!(!rejected.status.success(), "modified {filename} accepted");
         assert!(
-            String::from_utf8_lossy(&rejected.stderr).contains("platform-owned"),
+            String::from_utf8_lossy(&rejected.stderr).contains("unrecognized arguments"),
             "{}",
             String::from_utf8_lossy(&rejected.stderr)
         );
@@ -158,13 +151,6 @@ async fn repeated_python_bootstrap_preserves_platform_and_rejects_changed_defini
                 .unwrap()
                 .updated,
             pack_updated
-        );
-        assert_eq!(
-            PermissionSetRepository::get_by_ref(&db, "core.key_creator")
-                .await
-                .unwrap()
-                .updated,
-            permission_updated
         );
         std::fs::write(&path, original).unwrap();
     }

@@ -64,12 +64,12 @@ use crate::dto::{
     permission::{
         CreateIdentityRequest, CreateIdentityRoleAssignmentRequest, CreateIntegrationTokenRequest,
         CreateIntegrationTokenResponse, CreatePermissionAssignmentRequest,
-        CreatePermissionSetRoleAssignmentRequest, IdentityResponse, IdentityRoleAssignmentResponse,
-        IdentitySummary, IntegrationTokenResponse, PermissionAssignmentResponse,
-        PermissionBindingResponse, PermissionBindingTarget, PermissionIdentityTarget,
-        PermissionIdentityTargetType, PermissionRoleTarget, PermissionRoleTargetType,
-        PermissionSetRoleAssignmentResponse, PermissionSetSummary, RevokeIntegrationTokenRequest,
-        UpdateIdentityRequest, UpdatePermissionSetRequest,
+        CreatePermissionSetRequest, CreatePermissionSetRoleAssignmentRequest, IdentityResponse,
+        IdentityRoleAssignmentResponse, IdentitySummary, IntegrationTokenResponse,
+        PermissionAssignmentResponse, PermissionBindingResponse, PermissionBindingTarget,
+        PermissionIdentityTarget, PermissionIdentityTargetType, PermissionRoleTarget,
+        PermissionRoleTargetType, PermissionSetRoleAssignmentResponse, PermissionSetSummary,
+        RevokeIntegrationTokenRequest, UpdateIdentityRequest, UpdatePermissionSetRequest,
     },
     policy::{
         ConcurrencyPolicyRequest, ConcurrencyPolicyResponse, CreatePolicyRequest, PolicyResponse,
@@ -78,6 +78,10 @@ use crate::dto::{
     },
     rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest},
     runtime::{CreateRuntimeRequest, RuntimeResponse, RuntimeSummary, UpdateRuntimeRequest},
+    runtime_approval::{
+        IssueDeclaredInputApprovalRequest, IssueRuntimeApprovalRequest, PolicyInputApprovalRequest,
+        RendererInputApprovalRequest, RuntimeApprovalResponse,
+    },
     trace::{TraceReportResponse, TraceWorkQueueDispatchSummary},
     trigger::{
         CreateSensorRequest, CreateTriggerRequest, SensorResponse, SensorSummary, TriggerResponse,
@@ -187,10 +191,17 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::actions::list_actions_by_pack,
         crate::routes::actions::search_actions,
         crate::routes::actions::get_action,
+        crate::routes::execution_options::get_execution_options,
         crate::routes::actions::create_action,
         crate::routes::actions::update_action,
         crate::routes::actions::delete_action,
         crate::routes::actions::get_queue_stats,
+
+        crate::routes::schema_types::list_schema_types,
+        crate::routes::schema_types::list_pack_schema_types,
+        crate::routes::schema_types::get_schema_type,
+        crate::routes::schema_types::inspect_schema_type,
+        crate::routes::schema_types::preview_schema,
 
         // Policies
         crate::routes::policies::list_policies,
@@ -251,6 +262,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::triggers::get_sensor,
         crate::routes::triggers::create_sensor,
         crate::routes::triggers::update_sensor,
+        crate::routes::triggers::revoke_sensor_runtime,
         crate::routes::triggers::delete_sensor,
         crate::routes::triggers::enable_sensor,
         crate::routes::triggers::disable_sensor,
@@ -331,11 +343,19 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
         // Permissions
         crate::routes::permissions::list_identities,
+        crate::routes::runtime_approvals::list_runtime_approvals,
+        crate::routes::runtime_approvals::list_input_approval_targets,
+        crate::routes::runtime_approvals::get_runtime_approval,
+        crate::routes::runtime_approvals::issue_runtime_approval,
+        crate::routes::runtime_approvals::issue_declared_input_approval,
+        crate::routes::runtime_approvals::replace_runtime_approval,
+        crate::routes::runtime_approvals::revoke_runtime_approval,
         crate::routes::permissions::get_identity,
         crate::routes::permissions::create_identity,
         crate::routes::permissions::update_identity,
         crate::routes::permissions::delete_identity,
         crate::routes::permissions::list_permission_sets,
+        crate::routes::permissions::create_permission_set,
         crate::routes::permissions::get_permission_set,
         crate::routes::permissions::update_permission_set,
         crate::routes::permissions::list_identity_permissions,
@@ -517,6 +537,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PaginatedResponse<IdentitySummary>,
             PaginatedResponse<WorkflowSummary>,
             PaginationMeta,
+            PaginatedResponse<crate::dto::artifact::ArtifactSummary>,
+            PaginatedResponse<crate::dto::artifact::ArtifactVersionSummary>,
             SuccessResponse,
 
             // Auth DTOs
@@ -540,6 +562,13 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PackResponse,
             PackSummary,
             PackReleaseResponse,
+            crate::dto::schema_types::SchemaTypeResponse,
+            crate::dto::schema_types::SchemaPreviewContext,
+            crate::dto::schema_types::SchemaPreviewRequest,
+            crate::dto::schema_types::SchemaContractResponse,
+            ApiResponse<crate::dto::schema_types::SchemaTypeResponse>,
+            ApiResponse<crate::dto::schema_types::SchemaContractResponse>,
+            PaginatedResponse<crate::dto::schema_types::SchemaTypeResponse>,
             RetiredPackComponentResponse,
             PlatformCatalogStateResponse,
             PlatformCatalogStatus,
@@ -566,7 +595,21 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             CreateIntegrationTokenResponse,
             RevokeIntegrationTokenRequest,
             PermissionSetSummary,
+            IssueRuntimeApprovalRequest,
+            IssueDeclaredInputApprovalRequest,
+            PolicyInputApprovalRequest,
+            RendererInputApprovalRequest,
+            attune_common::repositories::public_input_approval::ApprovalPurpose,
+            attune_common::repositories::public_input_approval::DeclaredInputApprovalTarget,
+            attune_common::runtime_authority::InvocationBinding,
+            attune_common::runtime_authority::PermissionGrantDefinition,
+            attune_common::runtime_authority::AuthoredGrantConstraints,
+            attune_common::rbac::PackStateConstraint,
+            attune_common::rbac::PackOwnerConstraint,
+            attune_common::pack_ownership::PackOwnershipMetadata,
+            RuntimeApprovalResponse,
             UpdatePermissionSetRequest,
+            CreatePermissionSetRequest,
             PermissionAssignmentResponse,
             PermissionBindingResponse,
             PermissionBindingTarget,
@@ -654,6 +697,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             // Sensor DTOs
             CreateSensorRequest,
             UpdateSensorRequest,
+            crate::dto::trigger::SensorRuntimeRevocationRequest,
             SensorResponse,
             SensorSummary,
 
@@ -995,12 +1039,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 200,
+            path_count, 213,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 262,
+            operation_count, 277,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 

@@ -50,6 +50,92 @@ cargo build -p attune-cli --release
 ./target/release/attune --help
 ```
 
+## Declared-input approvals
+
+`pack input-approval` issues consent for one immutable input declaration. It does
+not select `permission_set_refs`, create an execution or authorize SDK/API effects.
+The server requires an access token and `packs:read` on the subject pack, then
+checks the issuer's current authority over the fixed grants. Execution and sensor
+tokens cannot issue this consent. Issuer inactivity does not revoke issued consent;
+fixed expiry and explicit revocation still stop its use.
+
+Use an existing authenticated profile. Put the exact public request in a protected
+file or pipe it on stdin. Do not put tokens, decrypted values or private proof in
+the file, command arguments or authored expression. This pre-execution example
+uses a server-issued policy and declaration target, not a client-invented revision:
+
+```json
+{
+  "policy_revision": 17,
+  "invocation_binding": {
+    "kind": "workflow_task",
+    "workflow_ref": "example.flow",
+    "task_path": "/tasks/send",
+    "action_ref": "example.send"
+  },
+  "declaration_revision": "COPY_EXACT_RETAINED_DECLARATION_REVISION",
+  "source_path": "/workflow/tasks/send/input/message",
+  "expression": "{{ keystore['foreign.token'] }}",
+  "grants": [{
+    "resource": "keys",
+    "actions": ["read", "decrypt"],
+    "scope": "external",
+    "constraints": {"refs": ["foreign.token"]}
+  }],
+  "expires_at": "2099-01-01T00:00:00Z"
+}
+```
+
+Replace the sample identifiers, path, expression and deadline with the exact
+admitted declaration target from `pack input-approval targets`. Discovery uses
+the pack's current policy unless `--policy-revision` selects an exact retained
+policy. PackRead plus current source-component and actual-action visibility are
+required. Hidden targets are filtered before count and pagination. Do not recover
+targets with SQL, SDK grant lookup or by starting an execution. Copy only the
+issue fields shown above, not the summary's extra action/pack/release identities.
+`renderer_execution` may replace both `policy_revision` and `invocation_binding`
+for an already admitted renderer. Never send both target forms. Input purpose is
+bound to the retained declaration; the request has no caller-selected `purpose`
+field. Invocation kinds are `action`, `workflow_task`, `rule` and `queue`, using
+their canonical component refs and exact task path where applicable.
+
+```bash
+attune --profile staging pack input-approval targets example --output json
+attune --profile staging pack input-approval targets example --policy-revision 17 --page-size 20
+attune --profile staging pack input-approval issue example --file input-approval.json --dry-run
+cat input-approval.json | attune --profile staging pack input-approval issue example --file - --output json
+attune --profile staging pack input-approval list example --output json
+attune --profile staging pack input-approval show example 42 --output json
+attune --profile staging pack input-approval revoke example 42 --dry-run
+attune --profile staging pack input-approval revoke example 42 --yes
+```
+
+Dry-run validates locally without contacting the server or checking issuer rights.
+It omits the expression and grant bodies from its preview. Consent accepts only
+fixed `keys`/`packs` `read`/`decrypt` grants. External scope is explicit or implicit;
+pack-local scope, `ids`, `managing_pack_id`, human-relative selectors and SDK
+permission refs are rejected. Omit `expires_at` for no automatic expiry.
+
+Issue uses `POST /packs/{pack_ref}/external-input-approvals`. List, show and revoke
+use the existing shared `/packs/{pack_ref}/external-approvals` ledger, including
+runtime approvals and expired/revoked entries. The public response adds `purpose`
+as either `{"kind":"runtime"}` or `{"kind":"declared_input","targets":[...]}`.
+Only currently visible retained declaration targets appear in the array. It is
+empty for hidden or collected targets, without changing input consent to runtime
+authority. Targets retain original policy, binding, action/pack/release identity,
+declaration revision/path/expression. They never contain source values or private
+proof. Inspect the known issued ID before revoking it. The client preserves the
+server response without reconstructing hidden metadata. Revoke requires permission management or current
+coverage of the approved grants. Runtime approval replacement does not reattach
+input consent; issue new declaration-scoped consent explicitly instead.
+
+MCP exposes discovery through `pack_input_approval_targets_list` and the same typed contract through `pack_input_approvals_issue`,
+`pack_input_approvals_list`, `pack_input_approvals_get` and
+`pack_input_approvals_revoke`. Issuance arguments match the JSON above plus `ref`
+for the subject pack. Revocation requires `confirm_revocation: true`. All calls
+use the normal profile/token transport and canonical API error handling; no shell
+execution or human-IAM fallback is involved.
+
 ## Configuration
 
 The CLI stores configuration in `~/.config/attune/config.yaml` (or `$XDG_CONFIG_HOME/attune/config.yaml`).

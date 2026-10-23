@@ -71,7 +71,7 @@ pub struct Subscriber {
     /// Immutable authorization snapshot captured at connect time, shared with
     /// the connection's receive loop. The central broadcast path uses this to
     /// authorize deliveries once per identity (see `auth_fingerprint`).
-    pub auth: Arc<WebSocketAuthContext>,
+    pub(crate) auth: Arc<WebSocketAuthContext>,
 
     /// Stable fingerprint of `auth`. Connections whose fingerprints match
     /// always yield the same visibility decision, so the broadcast path
@@ -93,7 +93,7 @@ pub struct Subscriber {
 pub struct DeliveryCandidate {
     pub client_id: ClientId,
     pub tx: mpsc::UnboundedSender<Notification>,
-    pub auth: Arc<WebSocketAuthContext>,
+    pub(crate) auth: Arc<WebSocketAuthContext>,
     pub auth_fingerprint: u64,
 }
 
@@ -137,7 +137,7 @@ impl SubscriberManager {
     }
 
     /// Register a new subscriber
-    pub fn register(
+    pub(crate) fn register(
         &self,
         client_id: ClientId,
         auth: Arc<WebSocketAuthContext>,

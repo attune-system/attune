@@ -90,7 +90,7 @@ services:
   pack-release-upgrade:
     image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/api:${ATTUNE_IMAGE_TAG:-latest}
     container_name: attune-pack-release-upgrade
-    command: ["/usr/local/bin/attune-service", "--upgrade-pack-releases"]
+    command: ["/bin/sh", "-c", "echo 'Core release was admitted by API bootstrap'"]
     environment:
       RUST_LOG: info
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
@@ -115,24 +115,15 @@ services:
     restart: "no"
 
   init-packs:
-    image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/init-packs:${ATTUNE_IMAGE_TAG:-latest}
+    image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/init-packs:${ATTUNE_INIT_PACKS_IMAGE_TAG:-core-1.0.4}
     container_name: attune-init-packs
-    volumes:
-      - packs_data:/opt/attune/packs
-      - runtime_envs:/opt/attune/runtime_envs
-      - artifacts_data:/opt/attune/artifacts
     environment:
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_USER: attune
-      DB_PASSWORD: attune
-      DB_NAME: attune
-      DB_SCHEMA: attune
+      ATTUNE_BOOTSTRAP_MODE: api
+      ATTUNE_BOOTSTRAP_TOKEN: ${ATTUNE_BOOTSTRAP_TOKEN:-}
+      ATTUNE_CORE_PACK_VERSION: ${ATTUNE_CORE_PACK_VERSION:-1.0.4}
+      ATTUNE_CORE_PACK_DIGEST: ${ATTUNE_CORE_PACK_DIGEST:-}
       SOURCE_PACKS_DIR: /source/packs
-      TARGET_PACKS_DIR: /opt/attune/packs
-      LOADER_SCRIPT: /scripts/load_core_pack.py
-      DEFAULT_ADMIN_LOGIN: ${ATTUNE_TEST_LOGIN:-test@attune.local}
-      DEFAULT_ADMIN_PERMISSION_SET_REF: core.admin
+      ATTUNE_API_URL: http://api:8080
     depends_on:
       init-user:
         condition: service_completed_successfully

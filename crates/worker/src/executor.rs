@@ -42,7 +42,7 @@ use attune_common::repositories::runtime_version::RuntimeVersionRepository;
 use attune_common::repositories::{Create, FindById, FindByRef, Update};
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::secret_values::{
-    prepare_secret_values, redact_action_result, ENTITY_EXECUTION_RESULT,
+    prepare_secret_values, redact_bound_action_result, ENTITY_EXECUTION_RESULT,
 };
 use attune_common::version_matching::{matches_constraint, select_best_version};
 use std::path::PathBuf as StdPathBuf;
@@ -81,6 +81,7 @@ pub struct ActionExecutor {
     runtime_envs_dir: PathBuf,
     api_url: String,
     jwt_config: JwtConfig,
+    recorded_readiness: crate::recorded_credentials::RecordedConsumerReadiness,
     /// Transport abstraction for artifact file content.
     transport: Arc<dyn ArtifactFileTransport>,
     action_cache_by_id: Arc<MetadataCache<String, Action>>,
@@ -192,7 +193,7 @@ fn record_incomplete_runtime_logs(result_data: &mut serde_json::Value, result: &
 ///   -> `action.timeout_seconds` -> app-level `default_execution_timeout_seconds`.
 ///
 /// The returned value is always a positive number of seconds.
-fn resolve_execution_timeout_seconds(execution: &Execution, action: &Action) -> u64 {
+pub(crate) fn resolve_execution_timeout_seconds(execution: &Execution, action: &Action) -> u64 {
     resolve_timeout_seconds_inner(
         execution.timeout_seconds,
         execution
@@ -254,6 +255,17 @@ struct LogRetentionSettings {
 }
 
 impl ActionExecutor {
+    /// Integration startup must prove all consumers are ready before enabling
+    /// recorded issuance. No production caller enables this yet.
+    pub fn with_recorded_readiness(
+        mut self,
+        readiness: crate::recorded_credentials::RecordedConsumerReadiness,
+    ) -> Result<Self> {
+        readiness.require_ready()?;
+        self.recorded_readiness = readiness;
+        Ok(self)
+    }
+
     /// Create a new action executor
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -300,6 +312,7 @@ impl ActionExecutor {
             runtime_envs_dir,
             api_url,
             jwt_config,
+            recorded_readiness: Default::default(),
             transport,
             action_cache_by_id: Arc::new(MetadataCache::new(
                 ACTION_CACHE_TTL,
@@ -749,16 +762,23 @@ impl ActionExecutor {
         } else {
             None
         };
+        let binding = self.schema_binding(execution.id).await?;
+        let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)
+            .map_err(|error| {
+                Error::Validation(format!("Invalid stored input contract: {error}"))
+            })?;
+        input_contract
+            .validate(restored_config.as_ref().unwrap_or(&serde_json::json!({})))
+            .map_err(|error| {
+                Error::Validation(format!("Bound input validation failed: {error}"))
+            })?;
 
         if let Some(config) = &restored_config {
             if let JsonValue::Object(map) = config {
-                let mut parameter_keys = map.keys().cloned().collect::<Vec<_>>();
-                parameter_keys.sort();
                 debug!(
-                    "Execution {} config restored (parameter_count: {}, parameter_keys: {:?})",
+                    "Execution {} config restored (parameter_count: {})",
                     execution.id,
-                    parameter_keys.len(),
-                    parameter_keys,
+                    map.len(),
                 );
                 for (key, value) in map {
                     parameters.insert(key.clone(), value.clone());
@@ -790,15 +810,7 @@ impl ActionExecutor {
             "ATTUNE_RUNTIME_ENVS_DIR".to_string(),
             self.runtime_envs_dir.to_string_lossy().to_string(),
         );
-        env.insert(
-            "ATTUNE_PACK_REF".to_string(),
-            execution
-                .action_ref
-                .split('.')
-                .next()
-                .unwrap_or(&execution.action_ref)
-                .to_string(),
-        );
+        env.insert("ATTUNE_PACK_REF".to_string(), action.pack_ref.clone());
         if let Some(digest) = execution.pack_release_digest.as_ref() {
             env.insert("ATTUNE_PACK_RELEASE_DIGEST".to_string(), digest.clone());
         }
@@ -808,47 +820,76 @@ impl ActionExecutor {
 
         // Generate execution-scoped API token.
         //
-        // SECURITY: The token's `sub` claim MUST reflect the identity that
-        // triggered the execution. Otherwise actions executed on behalf of a
-        // low-privilege user could call back into the API with system-level
-        // privileges (privilege escalation).
-        //
-        // The triggering identity is recorded in `execution.executor` at
-        // creation time by every execution-creation path (manual API,
-        // enforcement processor, scheduler, queue dispatcher, retry manager,
-        // workflow children). If `executor` is unset, that indicates a bug in
-        // one of those paths; we fall back to the system identity (1) and log
-        // a warning so the regression is visible.
+        // Recorded admissions use the system sponsor, never the attributed
+        // requester. Unconverted executions retain explicit human delegation.
+        // There is no fallback from an admitted execution to mutable human IAM.
         if execution.permission_set_refs.is_empty() {
             debug!(
                 "Execution {} has no permission sets; omitting ATTUNE_API_TOKEN",
                 execution.id
             );
         } else {
-            let identity_id = resolve_execution_identity(execution.executor, execution.id)?;
-            // Add a 60s grace period beyond the process timeout for cleanup and
-            // callback reporting.
-            let token_ttl = (execution_timeout + 60) as i64;
-            let standard_access_action_refs = self.standard_access_action_refs(execution).await;
-            match generate_runtime_api_token(
-                identity_id,
-                execution.id,
-                &execution.action_ref,
-                &self.jwt_config,
-                token_ttl,
-                &execution.permission_set_refs,
-                &standard_access_action_refs,
-            ) {
-                Ok(Some(token)) => {
-                    env.insert("ATTUNE_API_TOKEN".to_string(), token);
+            let mut admission_tx = self.pool.begin().await?;
+            let persisted = ExecutionRepository::find_by_id(&mut *admission_tx, execution.id)
+                .await?
+                .filter(|current| {
+                    current.status == ExecutionStatus::Running
+                        && current.action_ref == execution.action_ref
+                        && current.permission_set_refs == execution.permission_set_refs
+                })
+                .ok_or_else(|| {
+                    Error::PermissionDenied(
+                        "Execution credential source is missing, terminal or mismatched".into(),
+                    )
+                })?;
+            let recorded = attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(
+                &mut admission_tx, execution.id,
+            ).await?.is_some();
+            admission_tx.commit().await?;
+            if recorded {
+                let token = crate::recorded_credentials::mint_recorded_execution_token(
+                    &self.pool,
+                    execution,
+                    self.worker_id.load(Ordering::SeqCst),
+                    uuid::Uuid::new_v4(),
+                    execution_timeout as i64,
+                    &self.jwt_config,
+                    self.recorded_readiness,
+                )
+                .await?
+                .ok_or_else(|| {
+                    Error::PermissionDenied(
+                        "Required recorded API credential was not issued".into(),
+                    )
+                })?;
+                env.insert("ATTUNE_API_TOKEN".to_string(), token);
+            } else {
+                if self.recorded_readiness.require_ready().is_ok() {
+                    return Err(Error::PermissionDenied(
+                        "Recorded issuance cannot fall back from a missing admission".into(),
+                    ));
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(
-                        "Failed to generate execution token for execution {}: {}. \
-                         Actions that call back to the API will not authenticate.",
-                        execution.id, e
-                    );
+                let identity_id = resolve_execution_identity(persisted.executor, execution.id)?;
+                let token_ttl = execution_timeout as i64;
+                let standard_access_action_refs = self.standard_access_action_refs(execution).await;
+                match generate_runtime_api_token(
+                    identity_id,
+                    execution.id,
+                    &execution.action_ref,
+                    &self.jwt_config,
+                    token_ttl,
+                    &execution.permission_set_refs,
+                    &standard_access_action_refs,
+                ) {
+                    Ok(Some(token)) => {
+                        env.insert("ATTUNE_API_TOKEN".to_string(), token);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(Error::PermissionDenied(format!(
+                            "Unable to issue required execution credential: {e}"
+                        )));
+                    }
                 }
             }
         }
@@ -1057,7 +1098,7 @@ impl ActionExecutor {
             parameter_delivery: action.parameter_delivery,
             parameter_format: action.parameter_format,
             output_format: action.output_format,
-            out_schema: action.out_schema.clone(),
+            out_schema: binding.output,
             cancel_token: None,
         };
 
@@ -1361,6 +1402,23 @@ impl ActionExecutor {
         execution: &Execution,
         action: &Action,
     ) -> Result<ExecutionLogArtifacts> {
+        let binding = self.schema_binding(execution.id).await?;
+        let mut connection = self.pool.acquire().await?;
+        let recorded = attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(
+            &mut connection, execution.id,
+        ).await?.is_some();
+        drop(connection);
+        let log_encryption_key = if recorded {
+            Some(self.secret_manager.encryption_key().ok_or_else(|| {
+                Error::PermissionDenied("Recorded logs require encryption".into())
+            })?)
+        } else {
+            None
+        };
+        let sensitive_inputs = attune_common::value_schema::CompiledContract::new(&binding.input)
+            .map_err(|error| Error::Validation(format!("Invalid stored input contract: {error}")))?
+            .declares_secrets()
+            || recorded;
         let (stdout_mirror_source, stderr_mirror_source) =
             attune_common::runtime_log_mirror::select_mirror_sources(
                 attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
@@ -1373,8 +1431,8 @@ impl ActionExecutor {
                     worker_name: self.worker_name.clone(),
                     worker_instance: self.worker_instance,
                 },
-                self.mirror_runtime_stdout_to_stdio,
-                self.mirror_runtime_stderr_to_stdio,
+                self.mirror_runtime_stdout_to_stdio && !sensitive_inputs,
+                self.mirror_runtime_stderr_to_stdio && !sensitive_inputs,
             );
         let retention = self.effective_action_log_retention(action);
         let backend = if self.transport.transport_mode() == "volume" {
@@ -1382,40 +1440,114 @@ impl ActionExecutor {
         } else {
             LogStreamBackend::ObjectSegments
         };
-        let (_, stdout_path, stdout_version) = Self::allocate_execution_log_artifact_with(
+        let delivery = crate::completion::register(
             &self.pool,
-            &self.artifacts_dir,
-            self.transport.as_ref(),
             execution,
-            retention,
-            ExecutionLogArtifactStream::Stdout,
-            backend,
+            self.worker_id.load(Ordering::Acquire),
+            self.worker_instance,
         )
         .await?;
-        let (_, stderr_path, stderr_version) = Self::allocate_execution_log_artifact_with(
-            &self.pool,
-            &self.artifacts_dir,
-            self.transport.as_ref(),
-            execution,
-            retention,
-            ExecutionLogArtifactStream::Stderr,
-            backend,
-        )
-        .await?;
-        for (version_id, file_path) in [
-            (stdout_version, stdout_path.as_str()),
-            (stderr_version, stderr_path.as_str()),
-        ] {
-            attune_common::repositories::log_stream::LogStreamRepository::create_with_backend(
+        if recorded != delivery.is_some() {
+            return Err(Error::PermissionDenied(
+                "Execution admission changed during log preparation".into(),
+            ));
+        }
+        let (stdout_path, stdout_version, stderr_path, stderr_version) =
+            if let Some(context) = &delivery {
+                let (stdout_path, stdout_version) = crate::completion::allocate_log(
+                    &self.pool,
+                    execution,
+                    context,
+                    "stdout",
+                    backend,
+                    self.execution_log_retention_policy,
+                    self.execution_log_retention_limit,
+                    self.log_segment_config.max_segment_bytes as u64,
+                    self.log_segment_config.flush_interval_ms,
+                    self.max_stdout_bytes,
+                )
+                .await?;
+                let (stderr_path, stderr_version) = crate::completion::allocate_log(
+                    &self.pool,
+                    execution,
+                    context,
+                    "stderr",
+                    backend,
+                    self.execution_log_retention_policy,
+                    self.execution_log_retention_limit,
+                    self.log_segment_config.max_segment_bytes as u64,
+                    self.log_segment_config.flush_interval_ms,
+                    self.max_stderr_bytes,
+                )
+                .await?;
+                (stdout_path, stdout_version, stderr_path, stderr_version)
+            } else {
+                let (_, stdout_path, stdout_version) = Self::allocate_execution_log_artifact_with(
+                    &self.pool,
+                    &self.artifacts_dir,
+                    self.transport.as_ref(),
+                    execution,
+                    retention,
+                    ExecutionLogArtifactStream::Stdout,
+                    backend,
+                )
+                .await?;
+                let (_, stderr_path, stderr_version) = Self::allocate_execution_log_artifact_with(
+                    &self.pool,
+                    &self.artifacts_dir,
+                    self.transport.as_ref(),
+                    execution,
+                    retention,
+                    ExecutionLogArtifactStream::Stderr,
+                    backend,
+                )
+                .await?;
+                (stdout_path, stdout_version, stderr_path, stderr_version)
+            };
+        let stdout_transport = if delivery.is_some() {
+            crate::completion::CompletionTransport::for_version(
                 &self.pool,
-                version_id,
-                backend,
-                self.log_segment_config.max_segment_bytes as u64,
-                self.log_segment_config.flush_interval_ms,
+                stdout_version,
+                self.worker_id.load(Ordering::Acquire),
+                self.worker_instance,
+                self.transport.clone(),
+                &self.api_url,
+                &self.jwt_config,
             )
-            .await?;
+            .await?
+        } else {
+            self.transport.clone()
+        };
+        let stderr_transport = if delivery.is_some() {
+            crate::completion::CompletionTransport::for_version(
+                &self.pool,
+                stderr_version,
+                self.worker_id.load(Ordering::Acquire),
+                self.worker_instance,
+                self.transport.clone(),
+                &self.api_url,
+                &self.jwt_config,
+            )
+            .await?
+        } else {
+            self.transport.clone()
+        };
+        for (version_id, file_path, transport) in [
+            (stdout_version, stdout_path.as_str(), &stdout_transport),
+            (stderr_version, stderr_path.as_str(), &stderr_transport),
+        ] {
+            if delivery.is_none() {
+                attune_common::repositories::log_stream::LogStreamRepository::create_with_backend(
+                    &self.pool,
+                    version_id,
+                    backend,
+                    self.log_segment_config.max_segment_bytes as u64,
+                    self.log_segment_config.flush_interval_ms,
+                )
+                .await?;
+            }
             if backend == LogStreamBackend::SharedFile {
-                self.transport
+                transport
                     .write_file(file_path, b"", Some("text/plain"))
                     .await?;
             }
@@ -1424,7 +1556,7 @@ impl ActionExecutor {
             Ok(ExecutionLogArtifacts {
                 stdout_writer: BoundedLogFileWriter::from_shared_file_writer(
                     attune_common::log_stream::SharedFileLogWriter::new(
-                        self.transport.clone(),
+                        stdout_transport,
                         stdout_version,
                         stdout_path,
                     ),
@@ -1432,10 +1564,11 @@ impl ActionExecutor {
                     true,
                     self.log_segment_config.finalization_timeout_ms,
                 )
+                .with_encryption(log_encryption_key, execution.id, stdout_version)
                 .with_mirror_source(stdout_mirror_source),
                 stderr_writer: BoundedLogFileWriter::from_shared_file_writer(
                     attune_common::log_stream::SharedFileLogWriter::new(
-                        self.transport.clone(),
+                        stderr_transport,
                         stderr_version,
                         stderr_path,
                     ),
@@ -1443,16 +1576,17 @@ impl ActionExecutor {
                     false,
                     self.log_segment_config.finalization_timeout_ms,
                 )
+                .with_encryption(log_encryption_key, execution.id, stderr_version)
                 .with_mirror_source(stderr_mirror_source),
             })
         } else {
             let stdout_writer = attune_common::log_stream::SegmentedLogWriter::new(
-                self.transport.clone(),
+                stdout_transport,
                 stdout_version,
                 self.log_segment_config,
             )?;
             let stderr_writer = attune_common::log_stream::SegmentedLogWriter::new(
-                self.transport.clone(),
+                stderr_transport,
                 stderr_version,
                 self.log_segment_config,
             )?;
@@ -1462,12 +1596,14 @@ impl ActionExecutor {
                     self.max_stdout_bytes,
                     true,
                 )
+                .with_encryption(log_encryption_key, execution.id, stdout_version)
                 .with_mirror_source(stdout_mirror_source),
                 stderr_writer: BoundedLogFileWriter::from_segmented_writer(
                     stderr_writer,
                     self.max_stderr_bytes,
                     false,
                 )
+                .with_encryption(log_encryption_key, execution.id, stderr_version)
                 .with_mirror_source(stderr_mirror_source),
             })
         }
@@ -1596,7 +1732,22 @@ impl ActionExecutor {
         else {
             return Ok(None);
         };
-        let artifact_ref = Self::execution_log_artifact_ref(&execution.action_ref, stream);
+        let mut conn = self.pool.acquire().await?;
+        let recorded =
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+                &mut conn,
+                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                    execution_id,
+                ),
+            )
+            .await?
+            .is_some();
+        drop(conn);
+        let artifact_ref = if recorded {
+            crate::completion::log_reference(&execution, stream.as_str())?
+        } else {
+            Self::execution_log_artifact_ref(&execution.action_ref, stream)
+        };
         let Some(artifact) = ArtifactRepository::find_by_ref(&self.pool, &artifact_ref).await?
         else {
             return Ok(None);
@@ -1660,10 +1811,29 @@ impl ActionExecutor {
                 None => continue,
             };
 
-            let local_synced_size = if self.transport.transport_mode() != "volume" {
+            let mut conn = self.pool.acquire().await?;
+            let recorded = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+                &mut conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(execution_id)).await?.is_some();
+            drop(conn);
+            let transport = if recorded {
+                crate::completion::CompletionTransport::for_version(
+                    &self.pool,
+                    ver.id,
+                    self.worker_id.load(Ordering::Acquire),
+                    self.worker_instance,
+                    self.transport.clone(),
+                    &self.api_url,
+                    &self.jwt_config,
+                )
+                .await?
+            } else {
+                self.transport.clone()
+            };
+
+            let local_synced_size = if transport.transport_mode() != "volume" {
                 match sync_local_file_to_transport(
                     &self.artifacts_dir,
-                    self.transport.as_ref(),
+                    transport.as_ref(),
                     file_path,
                     ver.content_type.as_deref(),
                 )
@@ -1685,7 +1855,7 @@ impl ActionExecutor {
                 None
             };
 
-            let completed_size = match self.transport.complete_file(file_path).await {
+            let completed_size = match transport.complete_file(file_path).await {
                 Ok(size) => size.or(local_synced_size),
                 Err(e) => {
                     warn!(
@@ -1717,6 +1887,12 @@ impl ActionExecutor {
                     }
                 },
             };
+
+            // Recorded publication updates size metadata in its fenced API
+            // transaction. Never follow it with an unchecked database mutation.
+            if recorded {
+                continue;
+            }
 
             // Update the version row
             if let Err(e) =
@@ -1847,6 +2023,14 @@ impl ActionExecutor {
         action: &Action,
         result_data: JsonValue,
     ) -> Result<JsonValue> {
+        let mut origin_tx = self.pool.begin().await?;
+        let mut runtime_reads =
+            attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
+                &mut origin_tx,
+                execution_id,
+            )
+            .await?;
+        origin_tx.commit().await?;
         let parameter_secrets = ExecutionSecretValueRepository::find_stored_by_entity(
             &self.pool,
             attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
@@ -1857,12 +2041,39 @@ impl ActionExecutor {
             .into_iter()
             .map(|secret| secret.json_path)
             .collect::<Vec<_>>();
-        let (result_data, secret_inputs) = redact_action_result(
-            result_data,
-            action.out_schema.as_ref(),
+        let binding = self.schema_binding(execution_id).await?;
+        let mut runtime_origins = attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(
+            &self.pool, &[execution_id],
+        ).await?;
+        let runtime_origins = runtime_origins.remove(&execution_id).unwrap_or_default();
+        runtime_reads.extend(
+            runtime_origins
+                .iter()
+                .cloned()
+                .map(attune_common::secret_provenance::SecretOrigin::Key),
+        );
+        let original = result_data;
+        let (result_data, secret_inputs) = redact_bound_action_result(
+            original.clone(),
+            binding.output.as_ref(),
+            action.output_format,
             execution_id,
             &paths,
-        );
+            &runtime_origins,
+        )?;
+        let (result_data, secret_inputs) =
+            attune_common::secret_values::protect_runtime_read_result(
+                &original,
+                result_data,
+                secret_inputs,
+                &runtime_reads,
+            )?;
+        if result_data.get("output_validation_warning").is_some() {
+            warn!(
+                execution_id,
+                "Action output did not conform to its stored schema; successful status retained"
+            );
+        }
         if secret_inputs.is_empty() {
             return Ok(result_data);
         }
@@ -1881,6 +2092,24 @@ impl ActionExecutor {
         .await?;
 
         Ok(result_data)
+    }
+
+    async fn schema_binding(
+        &self,
+        execution_id: i64,
+    ) -> Result<attune_common::repositories::schema_contract::ActionSchemaBinding> {
+        use attune_common::repositories::schema_contract::{
+            BindingOwner, SchemaContractRepository,
+        };
+        SchemaContractRepository::find_with_executor(
+            &self.pool,
+            BindingOwner::Execution,
+            execution_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            Error::Validation("Execution is missing its immutable schema binding".into())
+        })
     }
 
     /// Handle failed execution
@@ -2148,6 +2377,27 @@ impl ActionExecutor {
             "Updating execution {} status to: {:?}",
             execution_id, status
         );
+
+        if status == ExecutionStatus::Running {
+            let mut conn = self.pool.acquire().await?;
+            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+                &mut conn,
+                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                    execution_id,
+                ),
+            )
+            .await?
+            .is_some()
+            {
+                attune_common::repositories::worker_delivery::WorkerDeliveryRepository::start(
+                    &mut conn,
+                    execution_id,
+                    self.worker_id.load(Ordering::Acquire),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
 
         let started_at = if status == ExecutionStatus::Running {
             Some(chrono::Utc::now())

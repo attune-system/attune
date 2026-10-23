@@ -11,15 +11,12 @@ email: "test@attune.example.com"
 
 # Pack configuration schema
 conf_schema:
-  type: object
-  properties:
-    test_mode:
-      type: boolean
-      default: true
-    timeout:
-      type: integer
-      default: 30
-  required: []
+  test_mode:
+    type: boolean
+    default: true
+  timeout:
+    type: integer
+    default: 30
 
 # Default pack configuration
 config:

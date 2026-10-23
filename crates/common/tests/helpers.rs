@@ -227,6 +227,21 @@ impl Deref for ReadOnlyTestPool {
 
 macro_rules! impl_pool_executor {
     ($fixture:ty) => {
+        impl<'p> sqlx::Acquire<'p> for &'p $fixture {
+            type Database = Postgres;
+            type Connection = sqlx::pool::PoolConnection<Postgres>;
+
+            fn acquire(self) -> BoxFuture<'p, std::result::Result<Self::Connection, sqlx::Error>> {
+                sqlx::Acquire::acquire(&self.pool)
+            }
+
+            fn begin(
+                self,
+            ) -> BoxFuture<'p, std::result::Result<Transaction<'p, Postgres>, sqlx::Error>> {
+                sqlx::Acquire::begin(&self.pool)
+            }
+        }
+
         impl<'p> Executor<'p> for &'p $fixture {
             type Database = Postgres;
 
@@ -324,7 +339,9 @@ impl RollbackTestPool {
 
     /// Await rollback and pool close before cleaning any fixture-owned clone.
     pub async fn cleanup(self) -> Result<()> {
-        let rollback = sqlx::query("ROLLBACK").execute(&self.pool).await;
+        let mut connection = self.pool.acquire().await?;
+        let rollback = <<Postgres as sqlx::Database>::TransactionManager as sqlx::TransactionManager>::rollback(&mut *connection).await;
+        drop(connection);
         self.pool.close().await;
         if let Some(database) = self._database {
             database.cleanup().await?;
@@ -362,7 +379,13 @@ pub async fn create_rollback_test_pool() -> Result<RollbackTestPool> {
     let runtime_database = Database::new(&config).await?;
     let pool = runtime_database.pool().clone();
     let mut connection = pool.acquire().await?;
-    sqlx::query("BEGIN").execute(&mut *connection).await?;
+    // Keep SQLx's transaction depth in sync so transactional repositories use
+    // savepoints rather than committing this fixture's outer rollback scope.
+    <<Postgres as sqlx::Database>::TransactionManager as sqlx::TransactionManager>::begin(
+        &mut *connection,
+        None,
+    )
+    .await?;
     drop(connection);
 
     Ok(RollbackTestPool {
@@ -375,6 +398,16 @@ pub async fn create_rollback_test_pool() -> Result<RollbackTestPool> {
 pub struct TestTransaction {
     transaction: Transaction<'static, Postgres>,
     _database: Option<TestDatabase>,
+}
+
+impl TestTransaction {
+    pub async fn rollback(self) -> Result<()> {
+        self.transaction.rollback().await?;
+        if let Some(database) = self._database {
+            database.cleanup().await?;
+        }
+        Ok(())
+    }
 }
 
 impl Deref for TestTransaction {
@@ -665,7 +698,7 @@ impl PackFixture {
 
     pub async fn create<'e, E>(self, executor: E) -> Result<Pack>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        E: sqlx::Acquire<'e, Database = Postgres> + Send + 'e,
     {
         let input = pack::CreatePackInput {
             r#ref: self.r#ref,
@@ -765,7 +798,7 @@ impl ActionFixture {
 
     pub async fn create<'e, E>(self, executor: E) -> Result<Action>
     where
-        E: Executor<'e, Database = Postgres> + 'e,
+        E: sqlx::Acquire<'e, Database = Postgres> + Send + 'e,
     {
         let input = action::CreateActionInput {
             pack: self.pack_id,
@@ -889,6 +922,7 @@ impl TriggerFixture {
             description: self.description,
             enabled: self.enabled,
             param_schema: self.param_schema,
+            event_config_schema: None,
             out_schema: self.out_schema,
             sensor: None,
             sensor_ref: None,

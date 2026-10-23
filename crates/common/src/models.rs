@@ -77,6 +77,37 @@ pub type JsonDict = JsonValue;
 /// JSON schema type
 pub type JsonSchema = JsonValue;
 
+pub mod schema_type {
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct SchemaType {
+        pub id: Id,
+        pub r#ref: String,
+        pub pack: Id,
+        pub pack_ref: String,
+        pub label: String,
+        pub description: Option<String>,
+        pub schema: JsonSchema,
+        pub reference_visibility: ActionReferenceVisibility,
+        pub reference_allowed_pack_refs: Vec<String>,
+        pub managed_release: Option<Id>,
+        pub retired_at: Option<DateTime<Utc>>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct SchemaTypeRevision {
+        pub id: Id,
+        pub release: Id,
+        pub type_ref: String,
+        pub definition: JsonValue,
+        pub content_digest: String,
+        pub created: DateTime<Utc>,
+    }
+}
+
 /// Enumeration types
 pub mod enums {
     use serde::{Deserialize, Serialize};
@@ -494,6 +525,16 @@ pub mod enums {
         Restricted,
     }
 
+    impl fmt::Display for ActionReferenceVisibility {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                Self::Public => "public",
+                Self::Private => "private",
+                Self::Restricted => "restricted",
+            })
+        }
+    }
+
     /// Visibility level for artifacts.
     /// - `Public`: viewable by all authenticated users on the platform.
     /// - `Private`: restricted based on the artifact's `scope` and `owner` fields.
@@ -665,6 +706,8 @@ pub mod pack {
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct Pack {
         pub id: Id,
+        #[serde(default)]
+        pub owner_roles: Vec<String>,
         pub r#ref: String,
         pub label: String,
         pub description: Option<String>,
@@ -1303,6 +1346,13 @@ pub mod trigger {
         pub runtime: Runtime,
         #[serde(default)]
         pub runtime_versions: Vec<RuntimeVersion>,
+        pub triggers: Vec<Trigger>,
+        pub cache_permission_set_refs: Vec<String>,
+        pub cache_grants: Vec<crate::rbac::Grant>,
+        pub signing_permission_set_refs: Vec<String>,
+        pub signing_grants: Vec<crate::rbac::Grant>,
+        pub input_permission_set_refs: Vec<String>,
+        pub input_grants: Vec<crate::rbac::Grant>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -1318,6 +1368,8 @@ pub mod trigger {
         pub enabled_override: Option<bool>,
         pub param_schema: Option<JsonSchema>,
         pub out_schema: Option<JsonSchema>,
+        #[serde(default)]
+        pub event_config_schema: Option<JsonSchema>,
         pub webhook_enabled: bool,
         pub webhook_key: Option<String>,
         pub webhook_config: Option<JsonDict>,
@@ -1977,7 +2029,7 @@ pub mod identity {
         pub updated: DateTime<Utc>,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct PermissionSet {
         pub id: Id,
         pub r#ref: String,
@@ -1990,6 +2042,32 @@ pub mod identity {
         pub retired_at: Option<DateTime<Utc>>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
+    }
+
+    impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PermissionSet {
+        fn from_row(row: &'r sqlx::postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+            use sqlx::Row;
+            let pack = row.try_get("pack")?;
+            let authored: JsonValue = row.try_get("grants")?;
+            let grants = crate::runtime_authority::normalize_iam_grants(authored, pack).map_err(
+                |error| sqlx::Error::ColumnDecode {
+                    index: "grants".into(),
+                    source: Box::new(error),
+                },
+            )?;
+            Ok(Self {
+                id: row.try_get("id")?,
+                r#ref: row.try_get("ref")?,
+                pack,
+                pack_ref: row.try_get("pack_ref")?,
+                label: row.try_get("label")?,
+                description: row.try_get("description")?,
+                grants,
+                retired_at: row.try_get("retired_at")?,
+                created: row.try_get("created")?,
+                updated: row.try_get("updated")?,
+            })
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -2455,6 +2533,8 @@ pub mod work_queue {
         pub priority: i32,
         pub status: WorkQueueItemStatus,
         pub payload: JsonDict,
+        #[serde(default, skip_serializing)]
+        pub schema_binding: Option<JsonDict>,
         pub metadata: JsonDict,
         pub trace_tag: Option<String>,
         pub enqueue_source: String,
@@ -2471,8 +2551,44 @@ pub mod work_queue {
         pub updated: DateTime<Utc>,
     }
 
+    impl WorkQueueItem {
+        pub fn payload_binding(&self) -> crate::Result<crate::value_schema::ValueSchemaBinding> {
+            let body = self.schema_binding.clone().ok_or_else(|| {
+                crate::Error::validation("Queue item is missing its admission schema binding")
+            })?;
+            let binding: crate::value_schema::ValueSchemaBinding = serde_json::from_value(body)
+                .map_err(|_| {
+                    crate::Error::validation("Invalid queue item admission schema binding")
+                })?;
+            binding
+                .validate(crate::value_schema::SchemaContext::FlatDocument)
+                .map_err(|error| {
+                    crate::Error::validation(format!(
+                        "Invalid queue item admission schema binding: {error}"
+                    ))
+                })?;
+            if binding.contract.source.component_ref() != self.queue_ref {
+                return Err(crate::Error::validation(
+                    "Queue item schema binding does not match its queue",
+                ));
+            }
+            Ok(binding)
+        }
+
+        pub fn payload_secret_paths(&self) -> crate::Result<Vec<String>> {
+            let binding = self.payload_binding()?;
+            crate::value_schema::CompiledContract::new(&binding.contract)
+                .and_then(|contract| contract.secret_paths(&self.payload))
+                .map_err(|error| {
+                    crate::Error::validation(format!(
+                        "Invalid bound queue secret traversal: {error}"
+                    ))
+                })
+        }
+    }
+
     pub const WORK_QUEUE_ITEM_SELECT_COLUMNS: &str = "id, queue, queue_ref, pack_release, pack_release_digest, executable_snapshot, item_key, priority, \
-         status, payload, metadata, trace_tag, enqueue_source, requested_by_identity, \
+         status, payload, schema_binding, metadata, trace_tag, enqueue_source, requested_by_identity, \
          requested_by_execution, requested_by_enforcement, leased_execution, lease_token, \
          lease_expires_at, attempt_count, last_error, ack_summary, created, updated";
 
@@ -2503,6 +2619,10 @@ pub mod work_queue {
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct WorkQueueDispatchConfig {
+        /// Opt in to grouping batches by requester identity. The default
+        /// aggregates otherwise eligible items without transferring visibility.
+        #[serde(default)]
+        pub separate_requesters: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub concurrency: Option<WorkQueueTunableValue>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2994,6 +3114,7 @@ pub mod pack_install {
         pub test_execution_id: Option<Id>,
         pub test_result: Option<JsonValue>,
         pub error_message: Option<String>,
+        pub diagnostic_details: Option<JsonValue>,
         pub started_at: DateTime<Utc>,
         pub updated_at: DateTime<Utc>,
         pub finished_at: Option<DateTime<Utc>>,

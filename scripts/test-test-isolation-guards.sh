@@ -23,6 +23,7 @@ expect_exit 2 env ATTUNE_TEST_RUN_ID=a_b bash "$ROOT/scripts/cleanup-test-schema
 expect_exit 2 bash "$ROOT/scripts/check-db-test-threads.sh" 3
 bash "$ROOT/scripts/check-db-test-threads.sh" 4
 bash "$ROOT/scripts/database-test-ignore-policy.sh" --check
+python3 "$ROOT/scripts/test_database_test_ignore_policy.py"
 expect_exit 2 env ATTUNE_RUST_TEST_THREADS=3 bash "$ROOT/scripts/run-rust-integration-tests.sh"
 expect_exit 2 env ATTUNE_E2E_PROJECT_NAME= bash "$ROOT/scripts/run-integration-tests.sh" --no-startup --no-build
 expect_exit 2 env ATTUNE_E2E_PROJECT_NAME= bash "$ROOT/scripts/run-rust-integration-tests.sh" --no-startup --no-build
@@ -70,6 +71,18 @@ expect_exit 2 env ATTUNE_RUST_TEST_THREADS=3 \
 grep -Fq 'ATTUNE_RUST_TEST_THREADS: 4' "$ROOT/.github/workflows/ci.yml"
 grep -Fq 'run: scripts/run-ci-rust-tests.sh' "$ROOT/.github/workflows/ci.yml"
 grep -Fq 'TEST_THREADS: ${ATTUNE_RUST_TEST_THREADS:-4}' "$ROOT/docker-compose.e2e.yaml"
+# Every broker consumer must use the run-owned vhost. A missing override can
+# leave the API healthy while the supervisor exits before doing maintenance.
+for service in api executor executor-2 supervisor worker-shell worker-python worker-node worker-full sensor sensor-secondary; do
+  if ! awk -v service="$service" '
+      $0 == "  " service ":" { active = 1; next }
+      active && /^  [a-zA-Z0-9_-]+:/ { exit }
+      active { print }
+    ' "$ROOT/docker-compose.e2e.yaml" | grep -Fq 'ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}'; then
+    echo "E2E broker consumer is missing its run-owned vhost: $service" >&2
+    exit 1
+  fi
+done
 grep -Fq 'cargo test --workspace --all-features --no-run' "$ROOT/docker/Dockerfile.rust-tests"
 
 # Infrastructure-only changes must exercise the Rust runner and full-stack lane.
@@ -83,6 +96,9 @@ for path in Makefile scripts/run-ci-rust-tests.sh scripts/runtime-log-s3.sh \
 done
 flags=$(printf '%s\n' crates/common/src/lib.rs | bash "$ROOT/scripts/ci-changed-paths.sh")
 grep -Fxq 'rust=true' <<< "$flags"
+grep -Fxq 'web=true' <<< "$flags"
+flags=$(printf '%s\n' crates/api/src/dto/rule.rs | bash "$ROOT/scripts/ci-changed-paths.sh")
+grep -Fxq 'web=true' <<< "$flags"
 flags=$(printf '%s\n' tests/e2e/api/test_sse_execution_stream.py | bash "$ROOT/scripts/ci-changed-paths.sh")
 grep -Fxq 'smoke=true' <<< "$flags"
 flags=$(printf '%s\n' web/src/App.tsx | bash "$ROOT/scripts/ci-changed-paths.sh")
@@ -97,10 +113,19 @@ fi
 # Exercise the Make recipe without provisioning storage or running Cargo.
 cat > "$TMP_ROOT/ci-bin/docker" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
 printf '%s\n' "$*" >> "$CAPTURE_DIR/docker-args"
+if [[ ${1:-} == container && ${2:-} == inspect ]] ||
+   [[ ${1:-} == network && ${2:-} == inspect ]]; then
+  printf '%s\n' "$RUNTIME_LOG_HARNESS_OWNER"
+  exit 0
+fi
 if [[ $* == *list-object-versions* ]]; then
   printf '%s\n' None
+  exit 0
 fi
+echo "unexpected mocked Docker command: $*" >&2
+exit 99
 EOF
 chmod +x "$TMP_ROOT/ci-bin/docker"
 : > "$TMP_ROOT/cargo-args"

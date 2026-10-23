@@ -520,15 +520,21 @@ class TestStandaloneWorkerTransport:
         assert artifact["scope"] == "action"
         assert artifact["owner"] == action_ref
 
-        versions_resp = client._request(
-            "GET", f"/api/v1/artifacts/{artifact['id']}/versions"
-        )
-        assert versions_resp.status_code == 200, (
-            f"Version list failed: {versions_resp.status_code} {versions_resp.text}"
-        )
-        versions = versions_resp.json().get("data", versions_resp.json())
-        if isinstance(versions, dict) and "items" in versions:
-            versions = versions["items"]
+        versions = []
+        page = 1
+        while True:
+            versions_resp = client._request(
+                "GET", f"/api/v1/artifacts/{artifact['id']}/versions?page={page}&per_page=100"
+            )
+            assert versions_resp.status_code == 200, (
+                f"Version list failed: {versions_resp.status_code} {versions_resp.text}"
+            )
+            version_page = versions_resp.json()
+            versions.extend(version_page["items"])
+            if not version_page["pagination"]["has_next"]:
+                break
+            assert version_page["items"], "An advancing version page must not be empty"
+            page += 1
         matching_versions = [
             version for version in versions
             if version.get("execution") == exec_id

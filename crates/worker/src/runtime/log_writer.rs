@@ -83,12 +83,22 @@ pub struct BoundedLogWriter {
 /// When constructed with a pre-opened `BoxAsyncWriter`, it uses that writer (transport mode).
 pub struct BoundedLogFileWriter {
     writer: RuntimeLogWriter,
+    encryption: Option<LogEncryption>,
     mirror_source: Option<attune_common::runtime_log_mirror::RuntimeLogSource>,
     finalization_timeout_ms: u64,
     max_bytes: usize,
     truncated: bool,
     data_bytes_written: usize,
     truncation_notice: &'static str,
+}
+
+struct LogEncryption {
+    key: String,
+    execution: i64,
+    version: i64,
+    sequence: u64,
+    pending: Vec<u8>,
+    totals: attune_common::runtime_log_completion::FrameTotals,
 }
 
 enum RuntimeLogWriter {
@@ -104,10 +114,10 @@ impl RuntimeLogWriter {
         }
     }
 
-    async fn seal(self, truncated: bool) -> attune_common::Result<()> {
+    async fn seal(self, truncated: bool, manifest: Option<String>) -> attune_common::Result<()> {
         match self {
-            Self::Segmented(writer) => writer.seal(truncated).await,
-            Self::SharedFile(writer) => writer.seal(truncated).await,
+            Self::Segmented(writer) => writer.seal_with_manifest(truncated, manifest).await,
+            Self::SharedFile(writer) => writer.seal_with_manifest(truncated, manifest).await,
         }
     }
 }
@@ -211,6 +221,7 @@ impl BoundedLogFileWriter {
         let finalization_timeout_ms = writer.finalization_timeout_ms();
         Self {
             writer: RuntimeLogWriter::Segmented(writer),
+            encryption: None,
             mirror_source: None,
             finalization_timeout_ms,
             max_bytes,
@@ -232,6 +243,7 @@ impl BoundedLogFileWriter {
     ) -> Self {
         Self {
             writer: RuntimeLogWriter::SharedFile(writer),
+            encryption: None,
             mirror_source: None,
             finalization_timeout_ms,
             max_bytes,
@@ -260,7 +272,7 @@ impl BoundedLogFileWriter {
 
         let bytes_to_write = std::cmp::min(buf.len(), remaining_space);
         if bytes_to_write > 0 {
-            self.writer.write_all(&buf[..bytes_to_write]).await?;
+            self.write_protected(&buf[..bytes_to_write]).await?;
             self.data_bytes_written += bytes_to_write;
         }
 
@@ -276,7 +288,61 @@ impl BoundedLogFileWriter {
         source: Option<attune_common::runtime_log_mirror::RuntimeLogSource>,
     ) -> Self {
         self.mirror_source = source;
+        if self.encryption.is_some() {
+            self.mirror_source = None;
+        }
         self
+    }
+
+    pub fn with_encryption(mut self, key: Option<&str>, execution: i64, version: i64) -> Self {
+        if let Some(key) = key {
+            self.encryption = Some(LogEncryption {
+                key: key.into(),
+                execution,
+                version,
+                sequence: 0,
+                pending: Vec::with_capacity(attune_common::runtime_read_log::FRAME_BYTES),
+                totals: attune_common::runtime_log_completion::FrameTotals::default(),
+            });
+            self.mirror_source = None;
+        }
+        self
+    }
+
+    async fn write_protected(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let Some(encryption) = &mut self.encryption else {
+            return self.writer.write_all(bytes).await;
+        };
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let count = remaining
+                .len()
+                .min(attune_common::runtime_read_log::FRAME_BYTES - encryption.pending.len());
+            encryption.pending.extend_from_slice(&remaining[..count]);
+            remaining = &remaining[count..];
+            if encryption.pending.len() < attune_common::runtime_read_log::FRAME_BYTES {
+                continue;
+            }
+            let frame = attune_common::runtime_read_log::encode(
+                &encryption.key,
+                encryption.execution,
+                encryption.version,
+                encryption.sequence,
+                &encryption.pending,
+            )
+            .map_err(|_| std::io::Error::other("Protected log encryption failed"))?;
+            self.writer.write_all(&frame).await?;
+            encryption
+                .totals
+                .record(&frame, encryption.pending.len())
+                .map_err(|_| std::io::Error::other("Protected log completion limit exceeded"))?;
+            encryption.sequence = encryption
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("Protected log frame limit exceeded"))?;
+            encryption.pending.clear();
+        }
+        Ok(())
     }
 
     pub fn mirror_source(&self) -> Option<&attune_common::runtime_log_mirror::RuntimeLogSource> {
@@ -294,11 +360,37 @@ impl BoundedLogFileWriter {
 
         self.truncated = true;
         let notice = self.truncation_notice;
-        self.writer.write_all(notice.as_bytes()).await
+        self.write_protected(notice.as_bytes()).await
     }
 
-    pub async fn seal(self) -> attune_common::Result<()> {
-        self.writer.seal(self.truncated).await
+    pub async fn seal(mut self) -> attune_common::Result<()> {
+        if let Some(encryption) = &mut self.encryption {
+            if !encryption.pending.is_empty() {
+                let frame = attune_common::runtime_read_log::encode(
+                    &encryption.key,
+                    encryption.execution,
+                    encryption.version,
+                    encryption.sequence,
+                    &encryption.pending,
+                )?;
+                self.writer
+                    .write_all(&frame)
+                    .await
+                    .map_err(|_| attune_common::Error::execution("Protected log write failed"))?;
+                encryption.totals.record(&frame, encryption.pending.len())?;
+                encryption.pending.clear();
+            }
+        }
+        let manifest = match self.encryption.take() {
+            Some(encryption) => Some(
+                encryption
+                    .totals
+                    .manifest(encryption.execution, encryption.version)?
+                    .authenticate(&encryption.key)?,
+            ),
+            None => None,
+        };
+        self.writer.seal(self.truncated, manifest).await
     }
 
     pub fn finalization_timeout_ms(&self) -> u64 {
@@ -336,6 +428,7 @@ mod tests {
         appends: Mutex<Vec<u8>>,
         segments: Mutex<Vec<(i64, i64, Vec<u8>)>>,
         seals: Mutex<Vec<(i64, bool)>>,
+        manifests: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -383,6 +476,15 @@ mod tests {
                 .unwrap()
                 .push((artifact_version, truncated));
             Ok(())
+        }
+        async fn seal_log_stream_with_manifest(
+            &self,
+            version: i64,
+            truncated: bool,
+            manifest: &str,
+        ) -> attune_common::Result<()> {
+            self.manifests.lock().unwrap().push(manifest.into());
+            self.seal_log_stream(version, truncated).await
         }
         async fn open_reader(
             &self,
@@ -528,6 +630,50 @@ mod tests {
             .contains("stdout exceeded size limit"));
         assert_eq!(*transport.seals.lock().unwrap(), vec![(42, true)]);
         assert!(transport.segments.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorded_shared_log_encrypts_before_transport_and_coalesces_tiny_writes() {
+        let transport = Arc::new(RecordingSharedTransport::default());
+        let inner = attune_common::log_stream::SharedFileLogWriter::new(
+            transport.clone(),
+            42,
+            "recorded/log.txt".into(),
+        );
+        let key = "recorded-log-test-key-at-least-32-characters";
+        let mut writer = BoundedLogFileWriter::from_shared_file_writer(inner, 1024, true, 100)
+            .with_encryption(Some(key), 7, 42);
+        for byte in b"sdk-secret" {
+            writer.write_all(&[*byte]).await.unwrap();
+        }
+        assert!(transport.appends.lock().unwrap().is_empty());
+        writer.seal().await.unwrap();
+        let encoded = transport.appends.lock().unwrap().clone();
+        assert!(!String::from_utf8_lossy(&encoded).contains("sdk-secret"));
+        assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert_eq!(
+            attune_common::runtime_read_log::decode(key, 7, 42, 0, &encoded).unwrap(),
+            b"sdk-secret"
+        );
+        assert!(
+            encoded.len() as u64
+                <= attune_common::runtime_read_log::maximum_encoded_bytes(1024).unwrap()
+        );
+        let proof = transport.manifests.lock().unwrap()[0].clone();
+        let manifest =
+            attune_common::runtime_log_completion::FinalLogManifest::open(key, &proof).unwrap();
+        assert_eq!(manifest.frame_count, 1);
+        assert_eq!(manifest.plaintext_bytes, 10);
+        assert_eq!(manifest.ciphertext_bytes, encoded.len() as u64);
+        let mut verifier = attune_common::runtime_log_completion::FrameVerifier::new(
+            key,
+            7,
+            42,
+            1152,
+            attune_common::runtime_read_log::maximum_encoded_bytes(1024).unwrap(),
+        );
+        verifier.update(&encoded).unwrap();
+        verifier.finish(&manifest).unwrap();
     }
 
     #[tokio::test]

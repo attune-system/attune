@@ -11,6 +11,7 @@ export type InstallPackRequest = {
    * How to handle pack-managed metadata omitted by this release.
    */
   absent_metadata_policy?: AbsentMetadataPolicy;
+  acknowledge_incompatible_rollout?: boolean;
   /**
    * Replace an existing pack with the same ref
    */

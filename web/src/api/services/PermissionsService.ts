@@ -2,16 +2,22 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ApiResponse_RuntimeApprovalResponse } from "../models/ApiResponse_RuntimeApprovalResponse";
 import type { CreateIdentityRequest } from "../models/CreateIdentityRequest";
 import type { CreateIdentityRoleAssignmentRequest } from "../models/CreateIdentityRoleAssignmentRequest";
 import type { CreateIntegrationTokenRequest } from "../models/CreateIntegrationTokenRequest";
 import type { CreatePermissionAssignmentRequest } from "../models/CreatePermissionAssignmentRequest";
+import type { CreatePermissionSetRequest } from "../models/CreatePermissionSetRequest";
 import type { CreatePermissionSetRoleAssignmentRequest } from "../models/CreatePermissionSetRoleAssignmentRequest";
 import type { IdentityRoleAssignmentResponse } from "../models/IdentityRoleAssignmentResponse";
 import type { IntegrationTokenResponse } from "../models/IntegrationTokenResponse";
+import type { IssueDeclaredInputApprovalRequest } from "../models/IssueDeclaredInputApprovalRequest";
+import type { IssueRuntimeApprovalRequest } from "../models/IssueRuntimeApprovalRequest";
 import type { ManagementOriginKind } from "../models/ManagementOriginKind";
+import type { PaginatedResponse_DeclaredInputApprovalTarget } from "../models/PaginatedResponse_DeclaredInputApprovalTarget";
 import type { PaginatedResponse_IdentitySummary } from "../models/PaginatedResponse_IdentitySummary";
 import type { PaginatedResponse_PermissionBindingResponse } from "../models/PaginatedResponse_PermissionBindingResponse";
+import type { PaginatedResponse_RuntimeApprovalResponse } from "../models/PaginatedResponse_RuntimeApprovalResponse";
 import type { PermissionAssignmentResponse } from "../models/PermissionAssignmentResponse";
 import type { PermissionSetRoleAssignmentResponse } from "../models/PermissionSetRoleAssignmentResponse";
 import type { PermissionSetSummary } from "../models/PermissionSetSummary";
@@ -581,6 +587,174 @@ export class PermissionsService {
     });
   }
   /**
+   * @returns PaginatedResponse_RuntimeApprovalResponse Fixed external approvals, including revoked and expired records
+   * @throws ApiError
+   */
+  public static listRuntimeApprovals({
+    packRef,
+    page,
+    pageSize,
+  }: {
+    packRef: string;
+    /**
+     * Page number (1-based)
+     */
+    page?: number;
+    /**
+     * Number of items per page
+     */
+    pageSize?: number;
+  }): CancelablePromise<PaginatedResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{pack_ref}/external-approvals",
+      path: {
+        pack_ref: packRef,
+      },
+      query: {
+        page: page,
+        page_size: pageSize,
+      },
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse External approval issued after current authority validation
+   * @throws ApiError
+   */
+  public static issueRuntimeApproval({
+    packRef,
+    requestBody,
+  }: {
+    packRef: string;
+    requestBody: IssueRuntimeApprovalRequest;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/{pack_ref}/external-approvals",
+      path: {
+        pack_ref: packRef,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse Immutable external approval
+   * @throws ApiError
+   */
+  public static getRuntimeApproval({
+    packRef,
+    id,
+  }: {
+    packRef: string;
+    id: number;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{pack_ref}/external-approvals/{id}",
+      path: {
+        pack_ref: packRef,
+        id: id,
+      },
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse New approval issued and predecessor explicitly revoked atomically
+   * @throws ApiError
+   */
+  public static replaceRuntimeApproval({
+    packRef,
+    id,
+    requestBody,
+  }: {
+    packRef: string;
+    id: number;
+    requestBody: IssueRuntimeApprovalRequest;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/{pack_ref}/external-approvals/{id}/replace",
+      path: {
+        pack_ref: packRef,
+        id: id,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse Approval explicitly revoked
+   * @throws ApiError
+   */
+  public static revokeRuntimeApproval({
+    packRef,
+    id,
+  }: {
+    packRef: string;
+    id: number;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/{pack_ref}/external-approvals/{id}/revoke",
+      path: {
+        pack_ref: packRef,
+        id: id,
+      },
+    });
+  }
+  /**
+   * @returns ApiResponse_RuntimeApprovalResponse Independent fixed approval for one retained input declaration, with no execution API grants
+   * @throws ApiError
+   */
+  public static issueDeclaredInputApproval({
+    packRef,
+    requestBody,
+  }: {
+    packRef: string;
+    requestBody: IssueDeclaredInputApprovalRequest;
+  }): CancelablePromise<ApiResponse_RuntimeApprovalResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/{pack_ref}/external-input-approvals",
+      path: {
+        pack_ref: packRef,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+    });
+  }
+  /**
+   * @returns PaginatedResponse_DeclaredInputApprovalTarget Authorized immutable input targets, filtered before pagination; metadata is not consent or an invocation permit
+   * @throws ApiError
+   */
+  public static listInputApprovalTargets({
+    packRef,
+    policyRevision,
+    page,
+    pageSize,
+  }: {
+    packRef: string;
+    /**
+     * Omit for this pack's current policy; explicit IDs select retained metadata.
+     */
+    policyRevision?: number | null;
+    page?: number;
+    pageSize?: number;
+  }): CancelablePromise<PaginatedResponse_DeclaredInputApprovalTarget> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{pack_ref}/input-approval-targets",
+      path: {
+        pack_ref: packRef,
+      },
+      query: {
+        policy_revision: policyRevision,
+        page: page,
+        page_size: pageSize,
+      },
+    });
+  }
+  /**
    * @returns PaginatedResponse_PermissionBindingResponse Direct identity and role permission assignments
    * @throws ApiError
    */
@@ -715,6 +889,48 @@ export class PermissionsService {
     });
   }
   /**
+   * @returns any Permission set created
+   * @throws ApiError
+   */
+  public static createPermissionSet({
+    requestBody,
+  }: {
+    requestBody: CreatePermissionSetRequest;
+  }): CancelablePromise<{
+    data: {
+      authored_definition: Value;
+      /**
+       * Canonical authored scope, distinct from normalized effective ownership.
+       */
+      authored_grants: Value;
+      description?: string | null;
+      grants: Value;
+      id: number;
+      label?: string | null;
+      management_origin: ManagementOriginKind;
+      pack_ref?: string | null;
+      ref: string;
+      retired_at?: string | null;
+      roles: Array<PermissionSetRoleAssignmentResponse>;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/permissions/sets",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid reference or grants`,
+        409: `Permission set reference already exists`,
+        422: `Validation error`,
+      },
+    });
+  }
+  /**
    * @returns any Permission set details, including retired sets
    * @throws ApiError
    */
@@ -727,6 +943,11 @@ export class PermissionsService {
     permissionSetRef: string;
   }): CancelablePromise<{
     data: {
+      authored_definition: Value;
+      /**
+       * Canonical authored scope, distinct from normalized effective ownership.
+       */
+      authored_grants: Value;
       description?: string | null;
       grants: Value;
       id: number;
@@ -811,6 +1032,11 @@ export class PermissionsService {
     dryRun?: boolean;
   }): CancelablePromise<{
     data: {
+      authored_definition: Value;
+      /**
+       * Canonical authored scope, distinct from normalized effective ownership.
+       */
+      authored_grants: Value;
       description?: string | null;
       grants: Value;
       id: number;

@@ -187,17 +187,25 @@ export class InquiriesService {
    */
   public static getInquiry({
     id,
+    includeSecretValues,
   }: {
     /**
      * Inquiry ID
      */
     id: number;
+    /**
+     * Requires inquiry visibility, explicit decrypt authority, and recorded-origin access.
+     */
+    includeSecretValues?: boolean;
   }): CancelablePromise<ApiResponse_InquiryResponse> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/inquiries/{id}",
       path: {
         id: id,
+      },
+      query: {
+        include_secret_values: includeSecretValues,
       },
       errors: {
         401: `Unauthorized`,

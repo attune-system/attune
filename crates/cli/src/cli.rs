@@ -6,8 +6,8 @@ use crate::commands::{
     cache::CacheCommands, config::ConfigCommands, execution::ExecutionCommands,
     identity::IdentityCommands, inquiry::InquiryCommands, key::KeyCommands, pack::PackCommands,
     permission::PermissionCommands, policy::PolicyCommands, queue::QueueCommands,
-    rule::RuleCommands, sensor::SensorCommands, trigger::TriggerCommands,
-    workflow::WorkflowCommands,
+    rule::RuleCommands, schema_type::SchemaTypeCommands, sensor::SensorCommands,
+    trigger::TriggerCommands, workflow::WorkflowCommands,
 };
 
 #[derive(Parser)]
@@ -107,6 +107,11 @@ pub enum Commands {
     Key {
         #[command(subcommand)]
         command: KeyCommands,
+    },
+    /// Discover and inspect non-sensitive installed type schemas
+    SchemaType {
+        #[command(subcommand)]
+        command: SchemaTypeCommands,
     },
     /// Versioned external data cache management
     Cache {

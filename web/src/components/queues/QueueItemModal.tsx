@@ -67,7 +67,25 @@ export default function QueueItemModal({
   const enqueueItem = useEnqueueQueueItem();
   const updateItem = useUpdateQueueItem();
   const isEditing = !!item;
-  const payloadSchema: ParamSchema = (itemSchema as ParamSchema) || {};
+  const storedBinding: unknown = item?.schema_binding;
+  const boundPayloadContract: unknown =
+    typeof storedBinding === "object" &&
+    storedBinding !== null &&
+    "contract" in storedBinding
+      ? storedBinding.contract
+      : undefined;
+  const storedSchema: unknown =
+    typeof storedBinding === "object" &&
+    storedBinding !== null &&
+    "authored_schema" in storedBinding
+      ? storedBinding.authored_schema
+      : undefined;
+  const payloadSchema: ParamSchema =
+    typeof storedSchema === "object" &&
+    storedSchema !== null &&
+    !Array.isArray(storedSchema)
+      ? extractProperties(Object.fromEntries(Object.entries(storedSchema)))
+      : extractProperties(isJsonObject(itemSchema) ? itemSchema : {});
   const hasPayloadSchema =
     Object.keys(extractProperties(payloadSchema)).length > 0;
   const initialPayload = isEditing ? item?.payload : {};
@@ -246,6 +264,7 @@ export default function QueueItemModal({
                 </p>
                 <ParamSchemaForm
                   schema={payloadSchema}
+                  contract={boundPayloadContract}
                   values={payloadValues}
                   onChange={handlePayloadValuesChange}
                   errors={payloadErrors}

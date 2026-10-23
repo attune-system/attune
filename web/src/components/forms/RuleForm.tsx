@@ -247,66 +247,52 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
       return;
     }
 
-    // Get the selected pack, trigger, and action
-    const selectedPackData = packs.find((p) => p.id === packId);
-
-    // Combine pack ref and local ref to create full ref
-    const fullRef = combineRefs(selectedPackData?.ref || "", localRef.trim());
-
-    const formData: Record<string, JsonValue> & Partial<CreateRuleRequest> = {
-      pack_ref: selectedPackData?.ref || "",
-      ref: fullRef,
+    const formData = {
       label: label.trim(),
+      description: description.trim() || undefined,
       trigger_ref: selectedTrigger?.ref || "",
       action_ref: selectedAction?.ref || "",
       enabled,
-    };
-
-    if (description.trim()) {
-      formData.description = description.trim();
-    }
-
-    // Only add optional fields if they have values
-    if (conditions !== undefined) {
-      formData.conditions = conditions;
-    }
-
-    if (isEditing || Object.keys(triggerParameters).length > 0) {
-      formData.trigger_params = triggerParameters;
-    }
-
-    if (isEditing || Object.keys(actionParameters).length > 0) {
-      formData.action_params = actionParameters;
-    }
-
-    if (permissionMode === "custom") {
-      formData.permission_set_refs = permissionSetRefsInput
-        .split(",")
-        .map((ref) => ref.trim())
-        .filter(Boolean);
-    } else if (permissionMode === "none") {
-      formData.permission_set_refs = [];
-    } else if (isEditing) {
-      formData.permission_set_refs = null;
-    }
-
-    formData.trace_tag_template = traceTagTemplate.trim()
-      ? traceTagTemplate.trim()
-      : null;
-    formData.sensor_worker_selector = sensorWorkerSelector;
-    formData.sensor_worker_tolerations = sensorWorkerTolerations;
-    formData.sensor_worker_affinity = sensorWorkerAffinity;
+      conditions,
+      trigger_params:
+        isEditing || Object.keys(triggerParameters).length > 0
+          ? triggerParameters
+          : undefined,
+      action_params:
+        isEditing || Object.keys(actionParameters).length > 0
+          ? actionParameters
+          : undefined,
+      permission_set_refs:
+        permissionMode === "custom"
+          ? permissionSetRefsInput
+              .split(",")
+              .map((ref) => ref.trim())
+              .filter(Boolean)
+          : permissionMode === "none"
+            ? []
+            : isEditing
+              ? null
+              : undefined,
+      trace_tag_template: traceTagTemplate.trim() || null,
+      sensor_worker_selector: sensorWorkerSelector,
+      sensor_worker_tolerations: sensorWorkerTolerations,
+      sensor_worker_affinity: sensorWorkerAffinity,
+    } satisfies UpdateRuleRequest;
 
     try {
       if (isEditing && rule) {
         await updateRule.mutateAsync({
           ref: rule.ref,
-          data: formData as unknown as UpdateRuleRequest,
+          data: formData,
         });
       } else {
-        const newRuleResponse = await createRule.mutateAsync(
-          formData as unknown as CreateRuleRequest,
-        );
+        const selectedPackData = packs.find((p) => p.id === packId);
+        const packRef = selectedPackData?.ref || "";
+        const newRuleResponse = await createRule.mutateAsync({
+          ...formData,
+          pack_ref: packRef,
+          ref: combineRefs(packRef, localRef.trim()),
+        } satisfies CreateRuleRequest);
         if (!onSuccess) {
           navigate(`/rules/${newRuleResponse.data.ref}`);
         }

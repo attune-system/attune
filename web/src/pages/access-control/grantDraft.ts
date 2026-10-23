@@ -21,21 +21,24 @@ export const ALL_ACTIONS = [
   "respond",
   "manage",
   "decrypt",
+  "use",
 ];
 
 export const RESOURCE_ACTIONS: Record<string, string[]> = {
-  packs: ["read", "create", "install", "configure", "delete"],
+  packs: ["read", "create", "install", "configure", "delete", "decrypt"],
   actions: ["read", "create", "update", "delete", "execute"],
-  queues: ["read", "create", "update", "delete"],
-  rules: ["read", "create", "update", "delete"],
-  triggers: ["read", "create", "update", "delete"],
-  executions: ["read", "update", "cancel"],
-  events: ["read"],
+  policies: ["read", "create", "update", "delete"],
+  queues: ["read", "create", "update", "delete", "decrypt"],
+  queue_items: ["read", "create", "update", "delete", "decrypt"],
+  rules: ["read", "create", "update", "delete", "decrypt"],
+  triggers: ["read", "create", "update", "delete", "decrypt"],
+  executions: ["read", "update", "cancel", "decrypt"],
+  events: ["read", "create", "decrypt"],
   enforcements: ["read"],
   inquiries: ["read", "create", "update", "delete", "respond"],
-  keys: ["read", "create", "update", "delete", "decrypt"],
+  keys: ["read", "create", "update", "delete", "decrypt", "use"],
   caches: ["read", "create", "update", "delete"],
-  artifacts: ["read", "create", "update", "delete"],
+  artifacts: ["read", "create", "update", "delete", "decrypt"],
   runtimes: ["read", "create", "update", "delete"],
   workers: ["read"],
   identities: ["read", "create", "update", "delete"],
@@ -50,6 +53,11 @@ export const PACK_SCOPED_RESOURCES = new Set([
   "rules",
   "triggers",
   "artifacts",
+  "policies",
+  "queue_items",
+  "executions",
+  "events",
+  "inquiries",
 ]);
 export const COMPONENT_SCOPED_RESOURCES = new Set([
   "packs",
@@ -61,15 +69,15 @@ export const COMPONENT_SCOPED_RESOURCES = new Set([
   "keys",
   "artifacts",
   "caches",
+  "policies",
+  "queue_items",
+  "events",
+  "inquiries",
 ]);
 export const OWNER_SCOPED_RESOURCES = new Set(["packs", "keys", "artifacts"]);
 export const OWNER_TYPE_RESOURCES = new Set(["keys", "artifacts", "caches"]);
-// Cache grants scope to a specific owner *reference* (e.g. a pack ref) in
-// addition to the owner *type*, combined with a namespace `refs` constraint —
-// see the `cache_grant_matches_owner_type_owner_ref_and_namespace_ref` test in
-// crates/common/src/rbac.rs. Owner-ref scoping isn't meaningful for the
-// self/any/none-style OWNER_SCOPED_RESOURCES above, so it's kept distinct.
-export const OWNER_REF_RESOURCES = new Set(["caches"]);
+// Owner-reference selectors narrow structural ownership; they never establish it.
+export const OWNER_REF_RESOURCES = new Set(["caches", "keys", "artifacts"]);
 
 // Cache namespaces are the "component" being scoped, so this resource gets
 // cache-specific copy instead of the generic "Component scoped" wording.
@@ -93,6 +101,7 @@ export type GrantDraft = {
   id: string;
   resource: string;
   actions: string[];
+  authorityScope?: "pack" | "external";
   scopeType: ScopeType;
   scopeRefs: string;
   owner: string;
@@ -126,6 +135,7 @@ export function grantToDraft(grant: ParsedGrant, index: number): GrantDraft {
   return {
     id: `${index}-${grant.resource}`,
     resource: grant.resource,
+    authorityScope: grant.scope,
     actions: grant.actions.filter((action) =>
       (RESOURCE_ACTIONS[grant.resource] ?? ALL_ACTIONS).includes(action),
     ),
@@ -219,6 +229,7 @@ export function draftToGrant(draft: GrantDraft): ParsedGrant {
   return {
     resource: draft.resource,
     actions: [...actions].sort(),
+    ...(draft.authorityScope ? { scope: draft.authorityScope } : {}),
     ...(Object.keys(constraints).length > 0 ? { constraints } : {}),
   };
 }

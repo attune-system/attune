@@ -263,13 +263,69 @@ pub struct ArtifactQueryParams {
 }
 
 impl ArtifactQueryParams {
+    pub fn pagination(&self) -> Result<super::common::PaginationParams, String> {
+        artifact_pagination(self.page, self.per_page)
+    }
+
     pub fn offset(&self) -> u32 {
-        (self.page.saturating_sub(1)) * self.per_page
+        self.page.saturating_sub(1).saturating_mul(self.per_page)
     }
 
     pub fn limit(&self) -> u32 {
         self.per_page.min(100)
     }
+}
+
+/// Bounded version-history pages, with the artifact list's v1 parameter names.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct ArtifactPageParams {
+    #[serde(default = "default_page")]
+    #[param(example = 1, minimum = 1)]
+    pub page: u32,
+    #[serde(default = "default_per_page")]
+    #[param(example = 20, minimum = 1, maximum = 100)]
+    pub per_page: u32,
+}
+
+impl ArtifactPageParams {
+    pub fn pagination(&self) -> Result<super::common::PaginationParams, String> {
+        artifact_pagination(self.page, self.per_page)
+    }
+}
+
+/// Execution-scoped artifact pages. The execution identity comes from the path.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct ExecutionArtifactQueryParams {
+    #[serde(default = "default_page")]
+    #[param(example = 1, minimum = 1)]
+    pub page: u32,
+    #[serde(default = "default_per_page")]
+    #[param(example = 20, minimum = 1, maximum = 100)]
+    pub per_page: u32,
+    /// Optional type filter, including bounded progress-artifact discovery.
+    pub r#type: Option<ArtifactType>,
+}
+
+impl ExecutionArtifactQueryParams {
+    pub fn pagination(&self) -> Result<super::common::PaginationParams, String> {
+        artifact_pagination(self.page, self.per_page)
+    }
+}
+
+fn artifact_pagination(
+    page: u32,
+    per_page: u32,
+) -> Result<super::common::PaginationParams, String> {
+    if page == 0 || !(1..=100).contains(&per_page) {
+        return Err("Use page >= 1 and per_page between 1 and 100".into());
+    }
+    (page - 1)
+        .checked_mul(per_page)
+        .ok_or_else(|| "Pagination offset exceeds the supported range".to_string())?;
+    Ok(super::common::PaginationParams {
+        page,
+        page_size: per_page,
+    })
 }
 
 fn default_page() -> u32 {
@@ -489,6 +545,7 @@ pub struct ArtifactVersionSummary {
 
 impl From<attune_common::models::artifact::Artifact> for ArtifactResponse {
     fn from(a: attune_common::models::artifact::Artifact) -> Self {
+        let file_body = attune_common::repositories::artifact::is_file_backed_type(a.r#type);
         Self {
             id: a.id,
             r#ref: a.r#ref,
@@ -503,7 +560,7 @@ impl From<attune_common::models::artifact::Artifact> for ArtifactResponse {
             description: a.description,
             content_type: a.content_type,
             size_bytes: a.size_bytes,
-            data: a.data,
+            data: if file_body { None } else { a.data },
             created: a.created,
             updated: a.updated,
         }
@@ -529,8 +586,28 @@ impl From<attune_common::models::artifact::Artifact> for ArtifactSummary {
     }
 }
 
+impl From<attune_common::repositories::artifact::ArtifactSummaryRow> for ArtifactSummary {
+    fn from(a: attune_common::repositories::artifact::ArtifactSummaryRow) -> Self {
+        Self {
+            id: a.id,
+            r#ref: a.r#ref,
+            r#type: a.r#type,
+            visibility: a.visibility,
+            classification: a.classification,
+            name: a.name,
+            content_type: a.content_type,
+            size_bytes: a.size_bytes,
+            scope: a.scope,
+            owner: a.owner,
+            created: a.created,
+            updated: a.updated,
+        }
+    }
+}
+
 impl From<attune_common::models::artifact_version::ArtifactVersion> for ArtifactVersionResponse {
     fn from(v: attune_common::models::artifact_version::ArtifactVersion) -> Self {
+        let file_body = v.file_path.is_some() || v.object_key.is_some();
         Self {
             id: v.id,
             artifact: v.artifact,
@@ -538,21 +615,36 @@ impl From<attune_common::models::artifact_version::ArtifactVersion> for Artifact
             execution: v.execution,
             content_type: v.content_type,
             size_bytes: v.size_bytes,
-            content_json: v.content_json,
+            content_json: if file_body { None } else { v.content_json },
             file_path: v.file_path,
             body_state: v.body_state,
             object_key: v.object_key,
             provider_version: v.provider_version,
             sha256: v.sha256,
-            meta: v.meta,
-            created_by: v.created_by,
+            meta: if file_body { None } else { v.meta },
+            created_by: if file_body { None } else { v.created_by },
             created: v.created,
         }
     }
 }
 
+impl ArtifactVersionResponse {
+    /// File content is available only through the guarded byte reader. This
+    /// also covers old inline-file rows without a physical-storage marker.
+    pub fn projection(v: attune_common::models::ArtifactVersion, file_body: bool) -> Self {
+        let mut response = Self::from(v);
+        if file_body {
+            response.content_json = None;
+            response.meta = None;
+            response.created_by = None;
+        }
+        response
+    }
+}
+
 impl From<attune_common::models::artifact_version::ArtifactVersion> for ArtifactVersionSummary {
     fn from(v: attune_common::models::artifact_version::ArtifactVersion) -> Self {
+        let file_body = v.file_path.is_some() || v.object_key.is_some();
         Self {
             id: v.id,
             version: v.version,
@@ -564,7 +656,29 @@ impl From<attune_common::models::artifact_version::ArtifactVersion> for Artifact
             object_key: v.object_key,
             provider_version: v.provider_version,
             sha256: v.sha256,
-            created_by: v.created_by,
+            created_by: if file_body { None } else { v.created_by },
+            created: v.created,
+        }
+    }
+}
+
+impl From<attune_common::repositories::artifact::ArtifactVersionSummaryRow>
+    for ArtifactVersionSummary
+{
+    fn from(v: attune_common::repositories::artifact::ArtifactVersionSummaryRow) -> Self {
+        let file_body = v.file_path.is_some() || v.object_key.is_some();
+        Self {
+            id: v.id,
+            version: v.version,
+            execution: v.execution,
+            content_type: v.content_type,
+            size_bytes: v.size_bytes,
+            file_path: v.file_path,
+            body_state: v.body_state,
+            object_key: v.object_key,
+            provider_version: v.provider_version,
+            sha256: v.sha256,
+            created_by: if file_body { None } else { v.created_by },
             created: v.created,
         }
     }

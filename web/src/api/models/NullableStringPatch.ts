@@ -7,14 +7,9 @@
  */
 export type NullableStringPatch =
   | {
-      op: NullableStringPatch.op;
+      op: "set";
       value: string;
     }
   | {
-      op: NullableStringPatch.op;
+      op: "clear";
     };
-export namespace NullableStringPatch {
-  export enum op {
-    SET = "set",
-  }
-}

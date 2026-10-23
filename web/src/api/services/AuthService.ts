@@ -103,7 +103,7 @@ export class AuthService {
       sensor_ref: string;
       token: string;
       trigger_types: Array<string>;
-      workload_fence?: any | null;
+      workload_fence?: Record<string, any> | null;
     };
     /**
      * Optional message

@@ -29,6 +29,52 @@ pub fn keystore_references(input: &str, context: &dyn EvalContext) -> EvalResult
     Ok(references)
 }
 
+/// Syntactic namespace use in an authored expression. Literal strings and field
+/// names do not count, and this never evaluates a supplied selector or value.
+pub fn uses_namespace(input: &str, namespace: &str) -> EvalResult<bool> {
+    namespace_use(input, namespace, false)
+}
+
+pub fn uses_namespace_access(input: &str, namespace: &str) -> EvalResult<bool> {
+    namespace_use(input, namespace, true)
+}
+
+fn namespace_use(input: &str, namespace: &str, access_only: bool) -> EvalResult<bool> {
+    let expression =
+        parse_expression(input).map_err(|error| EvalError::ParseError(error.to_string()))?;
+    let mut pending = vec![(&expression, 0usize)];
+    let mut nodes = 0usize;
+    while let Some((expression, depth)) = pending.pop() {
+        nodes += 1;
+        if nodes > 4096 || depth > 32 {
+            return Err(EvalError::TypeError(
+                "Authored expression exceeds its bound".into(),
+            ));
+        }
+        match expression {
+            Expr::Ident(name) if !access_only && name == namespace => return Ok(true),
+            Expr::DotAccess { object, .. } | Expr::IndexAccess { object, .. } if matches!(object.as_ref(), Expr::Ident(name) if name == namespace) => {
+                return Ok(true)
+            }
+            Expr::Array(values) | Expr::FunctionCall { args: values, .. } => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                pending.push((left, depth + 1));
+                pending.push((right, depth + 1));
+            }
+            Expr::UnaryOp { operand, .. } => pending.push((operand, depth + 1)),
+            Expr::DotAccess { object, .. } => pending.push((object, depth + 1)),
+            Expr::IndexAccess { object, index } => {
+                pending.push((object, depth + 1));
+                pending.push((index, depth + 1));
+            }
+            Expr::Literal(_) | Expr::Ident(_) => {}
+        }
+    }
+    Ok(false)
+}
+
 fn collect_keystore_references(
     expression: &Expr,
     context: &dyn EvalContext,

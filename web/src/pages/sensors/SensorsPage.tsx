@@ -8,11 +8,7 @@ import {
 import { useSensorLog, useSensorLogs } from "@/hooks/useSensorLogs";
 import { useMemo, useRef, useState } from "react";
 import type { SensorResponse, SensorSummary, UpdateSensorRequest } from "@/api";
-import {
-  LogRetentionLimitPatch,
-  LogRetentionPolicyPatch,
-  RetentionPolicyType,
-} from "@/api";
+import { RetentionPolicyType } from "@/api";
 import { ChevronDown, ChevronRight, Search, Settings, X } from "lucide-react";
 import OnOffSwitch from "@/components/common/OnOffSwitch";
 import RetentionPolicyControls from "@/components/common/RetentionPolicyControls";
@@ -21,6 +17,7 @@ import {
   type RetentionPolicy,
 } from "@/components/common/retentionPolicy";
 import PackIcon from "@/components/common/PackIcon";
+import ContractDataCard from "@/components/common/ContractDataCard";
 import PackFilter from "@/components/common/PackFilter";
 import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -292,6 +289,8 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
   const updateSensor = useUpdateSensor();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showConfigureModal, setShowConfigureModal] = useState(false);
+  const [configResetFields, setConfigResetFields] = useState<string[]>([]);
+  const [configResetError, setConfigResetError] = useState("");
   const [logStream, setLogStream] = useState<"stdout" | "stderr">("stderr");
   const [followLogs, setFollowLogs] = useState(false);
   const { data: logSummary } = useSensorLogs(sensorRef, Boolean(sensorRef));
@@ -326,6 +325,19 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
       console.error(
         "Failed to toggle sensor enabled status:",
         safeErrorSummary(err),
+      );
+    }
+  };
+
+  const handleConfigReset = async () => {
+    setConfigResetError("");
+    try {
+      const data = { config_reset_fields: configResetFields, config: {} };
+      await updateSensor.mutateAsync({ ref: sensorRef, data });
+      setConfigResetFields([]);
+    } catch {
+      setConfigResetError(
+        "Configuration reset failed. The current values were preserved.",
       );
     }
   };
@@ -545,6 +557,58 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
             </dl>
           </div>
 
+          <ContractDataCard
+            title="Sensor configuration"
+            contract={sensor.data?.config_schema_binding}
+            values={sensor.data?.config}
+            emptyMessage="No sensor configuration is currently set."
+            maskSecrets
+          />
+
+          <fieldset className="bg-white shadow rounded-lg p-6 space-y-2">
+            <legend className="text-sm font-medium">
+              Reset configuration overrides
+            </legend>
+            <p className="text-sm text-gray-600">
+              Selected fields use current release defaults. Null is a value, not
+              a reset. Capability selectors require deployment readmission.
+            </p>
+            {Object.keys(sensor.data?.config ?? {})
+              .filter(
+                (field) =>
+                  ![
+                    "input_permission_set_refs",
+                    "cache_permission_set_refs",
+                    "signing_permission_set_refs",
+                  ].includes(field),
+              )
+              .map((field) => (
+                <label key={field} className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={configResetFields.includes(field)}
+                    onChange={(event) =>
+                      setConfigResetFields((fields) =>
+                        event.target.checked
+                          ? [...fields, field]
+                          : fields.filter((candidate) => candidate !== field),
+                      )
+                    }
+                  />
+                  Reset {field} to release default
+                </label>
+              ))}
+            <button
+              type="button"
+              disabled={!configResetFields.length || updateSensor.isPending}
+              onClick={() => void handleConfigReset()}
+              className="px-3 py-2 border rounded disabled:opacity-50"
+            >
+              Reset selected fields
+            </button>
+            {configResetError && <p role="alert">{configResetError}</p>}
+          </fieldset>
+
           <div className="bg-white shadow rounded-lg p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-semibold">Sensor Logs</h2>
@@ -652,33 +716,25 @@ function ConfigureSensorRetentionModal({
       await onSave({
         log_retention_policy: logRetention.policy
           ? {
-              op: LogRetentionPolicyPatch.op.SET,
+              op: "set",
               value: logRetention.policy as RetentionPolicyType,
             }
-          : ({
-              op: "clear",
-            } as unknown as UpdateSensorRequest["log_retention_policy"]),
+          : { op: "clear" },
         log_retention_limit: logRetention.limit
-          ? { op: LogRetentionLimitPatch.op.SET, value: logRetention.limit }
-          : ({
-              op: "clear",
-            } as unknown as UpdateSensorRequest["log_retention_limit"]),
+          ? { op: "set", value: logRetention.limit }
+          : { op: "clear" },
         artifact_retention_policy: artifactRetention.policy
           ? {
-              op: LogRetentionPolicyPatch.op.SET,
+              op: "set",
               value: artifactRetention.policy as RetentionPolicyType,
             }
-          : ({
-              op: "clear",
-            } as unknown as UpdateSensorRequest["artifact_retention_policy"]),
+          : { op: "clear" },
         artifact_retention_limit: artifactRetention.limit
           ? {
-              op: LogRetentionLimitPatch.op.SET,
+              op: "set",
               value: artifactRetention.limit,
             }
-          : ({
-              op: "clear",
-            } as unknown as UpdateSensorRequest["artifact_retention_limit"]),
+          : { op: "clear" },
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save retention");

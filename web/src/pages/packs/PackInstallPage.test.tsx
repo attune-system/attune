@@ -6,10 +6,14 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { PacksService } from "@/api";
 import PackInstallPage from "./PackInstallPage";
 
+const installPackMock = vi.hoisted(() => vi.fn());
+const installStatusMock = vi.hoisted(() => vi.fn());
+
 vi.mock("@/contexts/AuthContext", () => ({ useAuth: () => ({ user: {} }) }));
 vi.mock("@/lib/permissions", () => ({ hasPermission: () => true }));
 vi.mock("@/hooks/usePackTests", () => ({
-  useInstallPack: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useInstallPack: () => ({ mutateAsync: installPackMock, isPending: false }),
+  usePackInstallStatus: installStatusMock,
 }));
 vi.mock("@/components/packs/PlatformCatalogStatus", () => ({
   default: () => null,
@@ -27,12 +31,207 @@ const index = {
 };
 
 beforeEach(() => {
+  installPackMock.mockReset();
+  installStatusMock
+    .mockReset()
+    .mockReturnValue({ data: undefined, error: null });
   vi.spyOn(PacksService, "listPackIndices").mockResolvedValue({
     data: [index],
   });
   vi.spyOn(PacksService, "browseIndexedPacks").mockResolvedValue({ data: [] });
 });
 afterEach(() => vi.restoreAllMocks());
+
+async function submitInstall() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const view = render(<PackInstallPage />, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>{children}</MemoryRouter>
+      </QueryClientProvider>
+    ),
+  });
+  await userEvent.type(
+    screen.getByLabelText(/Git Repository URL/),
+    "https://example.invalid/demo.git",
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Install Pack" }));
+  return view;
+}
+
+it("keeps failed metadata and authored field paths visible without success", async () => {
+  installPackMock.mockRejectedValueOnce({
+    body: {
+      error: "Invalid metadata",
+      details: {
+        stage: "metadata_validation",
+        outcome: "active_release_unchanged",
+        diagnostics: [
+          {
+            path: "actions/run.yaml",
+            metadata_path: "/timeout_seconds",
+            message: "Timeout must be positive",
+            hint: "Use seconds",
+          },
+        ],
+      },
+    },
+  });
+  await submitInstall();
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent("actions/run.yaml at /timeout_seconds");
+  expect(alert).toHaveTextContent("Use seconds");
+  expect(screen.queryByText(/installed successfully/)).not.toBeInTheDocument();
+});
+
+it("does not claim success or permit another submission while activation is pending", async () => {
+  installPackMock.mockResolvedValueOnce({
+    data: {
+      pack: { ref: "demo", label: "Demo", version: "1.0.0" },
+      install_id: 42,
+      install_status: "activating",
+      tests_skipped: false,
+    },
+  });
+  await submitInstall();
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "still activating",
+  );
+  expect(screen.getByRole("button", { name: "Install Pack" })).toBeDisabled();
+  expect(screen.queryByText(/installed successfully/)).not.toBeInTheDocument();
+});
+
+function pendingInstall() {
+  installPackMock.mockResolvedValueOnce({
+    data: {
+      pack: { ref: "demo", label: "Demo", version: "1.0.0" },
+      install_id: 42,
+      install_status: "activating",
+      tests_skipped: false,
+    },
+  });
+}
+
+it("shows polled deployment failures and permits a new attempt", async () => {
+  pendingInstall();
+  const view = await submitInstall();
+  const failedStatus = {
+    data: {
+      data: { status: "failed", error_message: "Candidate tests failed" },
+    },
+    error: null,
+  };
+  installStatusMock.mockImplementation(
+    (_ref: string, id: number | undefined) =>
+      id === 42 ? failedStatus : { data: undefined, error: null },
+  );
+  view.rerender(<PackInstallPage />);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Candidate tests failed",
+  );
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Install Pack" })).toBeEnabled();
+  expect(screen.queryByText(/deployment completed/)).not.toBeInTheDocument();
+  installPackMock.mockResolvedValueOnce({
+    data: {
+      pack: { ref: "demo", label: "Demo", version: "1.0.0" },
+      install_id: 43,
+      install_status: "running",
+      tests_skipped: false,
+    },
+  });
+  await userEvent.click(screen.getByRole("button", { name: "Install Pack" }));
+  expect(await screen.findByRole("status")).toHaveTextContent("still running");
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(installStatusMock).toHaveBeenLastCalledWith("demo", 43, true);
+  expect(screen.getByRole("button", { name: "Install Pack" })).toBeDisabled();
+});
+
+it("keeps success and warning details visible when polling completes", async () => {
+  pendingInstall();
+  const view = await submitInstall();
+  const completedStatus = {
+    data: {
+      data: {
+        status: "succeeded",
+        diagnostic_details: {
+          diagnostics: [{ severity: "warning", message: "Tests were skipped" }],
+        },
+      },
+    },
+    error: null,
+  };
+  installStatusMock.mockReturnValue(completedStatus);
+  view.rerender(<PackInstallPage />);
+  expect(
+    await screen.findByText("Pack 'demo' deployment completed."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("status")).toHaveTextContent("Tests were skipped");
+  expect(screen.queryByText(/still activating/)).not.toBeInTheDocument();
+  view.rerender(<PackInstallPage />);
+  expect(
+    screen.getByText("Pack 'demo' deployment completed."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("status")).toHaveTextContent("Tests were skipped");
+  installStatusMock.mockReturnValue({
+    ...completedStatus,
+    error: new Error("Status unavailable after completion"),
+  });
+  view.rerender(<PackInstallPage />);
+  expect(
+    screen.getByText("Pack 'demo' deployment completed."),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("clears transient status errors when polling recovers", async () => {
+  pendingInstall();
+  const view = await submitInstall();
+  installStatusMock.mockReturnValue({
+    data: undefined,
+    error: new Error("Status unavailable"),
+  });
+  view.rerender(<PackInstallPage />);
+  expect(await screen.findByRole("alert")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Install Pack" })).toBeDisabled();
+  installStatusMock.mockReturnValue({
+    data: { data: { status: "succeeded" } },
+    error: null,
+  });
+  view.rerender(<PackInstallPage />);
+  expect(
+    await screen.findByText("Pack 'demo' deployment completed."),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("leaves deployment warnings visible after a successful response", async () => {
+  installPackMock.mockResolvedValueOnce({
+    data: {
+      pack: { ref: "demo", label: "Demo", version: "1.0.0" },
+      install_status: "succeeded",
+      tests_skipped: true,
+      diagnostics: [
+        {
+          severity: "warning",
+          code: "testing.skipped",
+          path: "pack.yaml",
+          metadata_path: "/testing",
+          message: "Tests were skipped",
+        },
+      ],
+    },
+  });
+  await submitInstall();
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "pack.yaml at /testing",
+  );
+  expect(
+    screen.getByText(/Deployment details remain here/),
+  ).toBeInTheDocument();
+});
 
 async function openIndices() {
   const client = new QueryClient({

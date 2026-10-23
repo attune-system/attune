@@ -6,6 +6,11 @@ import type { ManagementOriginKind } from "./ManagementOriginKind";
 import type { PermissionSetRoleAssignmentResponse } from "./PermissionSetRoleAssignmentResponse";
 import type { Value } from "./Value";
 export type PermissionSetSummary = {
+  authored_definition: Value;
+  /**
+   * Canonical authored scope, distinct from normalized effective ownership.
+   */
+  authored_grants: Value;
   description?: string | null;
   grants: Value;
   id: number;

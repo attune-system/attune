@@ -41,11 +41,14 @@ export default function ExecutionProgressBar({
   const wsSummary = useArtifactProgress(executionId);
 
   // Poll-based artifact list (fallback + initial detection)
-  const { data } = useExecutionArtifacts(executionId, isRunning);
+  const { data } = useExecutionArtifacts(executionId, isRunning, {
+    type: "progress",
+    perPage: 1,
+  });
 
   // Find progress artifacts from the polled data
   const progressArtifact = useMemo<ArtifactSummary | null>(() => {
-    const artifacts = data?.data ?? [];
+    const artifacts = data?.items ?? [];
     return artifacts.find((a) => a.type === "progress") ?? null;
   }, [data]);
 

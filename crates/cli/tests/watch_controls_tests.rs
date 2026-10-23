@@ -295,7 +295,11 @@ async fn cancellation_failure_is_reported_and_restores_the_terminal() {
     interrupt(&child);
     let output = finish(child).await;
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Cancellation forbidden"));
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("Cancellation forbidden"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("cancel_requested"));
     pty.assert_restored();
     fixture.mock_server.verify().await;
@@ -312,8 +316,9 @@ async fn closed_stdin_does_not_detach_or_cancel_a_scripted_watch() {
     ready(&watching).await;
     let output = finish(child).await;
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("timed out"));
-    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(error["error"].as_str().unwrap().contains("timed out"));
+    assert!(error.get("watch_status").is_none());
     fixture.mock_server.verify().await;
 }
 

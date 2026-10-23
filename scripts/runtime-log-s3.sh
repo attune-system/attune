@@ -53,19 +53,23 @@ cleanup_prefix() {
         exit 1
     }
 
-    local endpoint=${ATTUNE_TEST_S3_ENDPOINT:-http://127.0.0.1:$RUNTIME_LOG_S3_PORT}
+    owned_resource container "$RUNTIME_LOG_S3_CONTAINER" && owned_resource network "$RUNTIME_LOG_S3_NETWORK" || {
+        printf 'refusing S3 cleanup without owned storage and network\n' >&2
+        exit 1
+    }
+    local endpoint="http://$RUNTIME_LOG_S3_CONTAINER:9000"
     local first_version
     local payload
     while true; do
-        first_version=$(run_aws host --endpoint-url "$endpoint" s3api list-object-versions \
+        first_version=$(run_aws "$RUNTIME_LOG_S3_NETWORK" --endpoint-url "$endpoint" s3api list-object-versions \
             --bucket "$RUNTIME_LOG_S3_BUCKET" --prefix "$RUNTIME_LOG_S3_PREFIX" \
             --max-items 1 --query '[Versions, DeleteMarkers][][] | [0].VersionId' --output text)
         [[ $first_version != None ]] || break
-        payload=$(run_aws host --endpoint-url "$endpoint" s3api list-object-versions \
+        payload=$(run_aws "$RUNTIME_LOG_S3_NETWORK" --endpoint-url "$endpoint" s3api list-object-versions \
             --bucket "$RUNTIME_LOG_S3_BUCKET" --prefix "$RUNTIME_LOG_S3_PREFIX" \
             --max-items 1000 \
             --query '{Objects: [Versions, DeleteMarkers][][] | [].{Key: Key, VersionId: VersionId}, Quiet: `true`}')
-        run_aws host --endpoint-url "$endpoint" s3api delete-objects \
+        run_aws "$RUNTIME_LOG_S3_NETWORK" --endpoint-url "$endpoint" s3api delete-objects \
             --bucket "$RUNTIME_LOG_S3_BUCKET" --delete "$payload" >/dev/null
     done
 }
@@ -75,7 +79,7 @@ case "$action" in
         refuse_foreign_resource container "$RUNTIME_LOG_S3_CONTAINER"
         refuse_foreign_resource network "$RUNTIME_LOG_S3_NETWORK"
         if owned_resource container "$RUNTIME_LOG_S3_CONTAINER"; then
-            docker rm -f "$RUNTIME_LOG_S3_CONTAINER" >/dev/null
+            docker rm -f -v "$RUNTIME_LOG_S3_CONTAINER" >/dev/null
         fi
         if ! owned_resource network "$RUNTIME_LOG_S3_NETWORK"; then
             docker network create \
@@ -123,7 +127,7 @@ case "$action" in
             if [[ $(docker inspect "$RUNTIME_LOG_S3_CONTAINER" --format '{{.State.Running}}') == true ]]; then
                 cleanup_prefix
             fi
-            docker rm -f "$RUNTIME_LOG_S3_CONTAINER" >/dev/null
+            docker rm -f -v "$RUNTIME_LOG_S3_CONTAINER" >/dev/null
         fi
         if owned_resource network "$RUNTIME_LOG_S3_NETWORK"; then
             docker network rm "$RUNTIME_LOG_S3_NETWORK" >/dev/null

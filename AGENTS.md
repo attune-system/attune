@@ -13,7 +13,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 - **Internal contracts still matter**: keep API ↔ web UI and service ↔ service expectations coherent.
 
 ## Critical Guardrails (Read First)
-1. **NEVER** run `git commit` from agent work. Staging is fine; commits are for the user.
+1. **ALWAYS** validate the exact repository state being committed with the standard CI validations defined in `.github/workflows/`. Agents may commit only after all applicable required checks pass; failed, skipped, blocked, or stale checks do not satisfy this requirement. Committing and pushing still require explicit user authorization. See `docs/testing/running-tests.md` for local validation procedures.
 2. **ALWAYS** use the repository layer for DB access. Do **not** bypass it with ad hoc service queries.
 3. **NEVER** hardcode schema prefixes in SQL. Rely on PostgreSQL `search_path`.
 4. **ALWAYS** apply `RequireAuth` to protected Axum routes.
@@ -21,6 +21,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 6. **NEVER** use `SELECT *` for SQLx `FromRow` models on evolving tables. Use repository `SELECT_COLUMNS` constants (for example in `execution.rs`, `pack.rs`, `runtime_version.rs`).
 7. **REMEMBER** selected runtime references to `event`, `enforcement`, and `execution` intentionally use plain `BIGINT` values without foreign keys so retention can remove rows independently. Preserve dangling-ID semantics. Native partitioning does not make `id` globally unique or justify adding reference FKs.
 8. **ALWAYS** keep schema definitions flat: `param_schema`, `out_schema`, and `conf_schema` use Attune's flat per-field format, not raw JSON Schema.
+   For value-schema validation, defaults, secret traversal, or template handling, use `crates/common/src/value_schema/` and read `docs/plans/named-type-schema-compiler.md`. Authoring previews are not runtime release bindings.
 9. **ALWAYS** keep `execution.config` flat: the object itself is the parameters map. Never wrap parameters under `{"parameters": ...}`.
 10. **ALWAYS** deliver action parameters via **stdin JSON**, not environment variables.
 11. **REMEMBER** execution API access is opt-in via `permission_set_refs`. The reserved ref `standard` grants only scoped key/artifact access for the executing action/pack (and containing workflow action/pack for workflow child executions).
@@ -192,6 +193,7 @@ Workflow details live in:
 ## Runtime / Execution Rules
 - Worker runtimes come from DB-backed runtime definitions; native runtimes are represented by empty interpreter config.
 - Candidate pack tests always download version-pinned archives from the API's configured object backend, including shared-volume workers. See `docs/deployment/pack-candidate-distribution.md`.
+- Pack publication keeps releases immutable. For the off/on/suffix republishing policy and preserved release pins, read `docs/packs/pack-release-artifacts-spec.md#republishing-policy`.
 - The worker/agent sets up isolated environments under `runtime_envs_dir/{pack_ref}/{runtime_name...}`.
 - When runtime versions exist, execution selects the highest available matching version.
 - `ATTUNE_API_TOKEN` is present only when the execution snapshot has non-empty `permission_set_refs`.
@@ -257,6 +259,7 @@ make db-migrate
 ### Testing / Validation
 - Read `docs/testing/running-tests.md` before choosing a test runner or provisioning dependencies.
 - Database-only Rust tests run in normal Cargo suites and require stock PostgreSQL 16 or newer. Reserve `--ignored` for tests with explicit external-service or stress-test prerequisites.
+  Scope exception: the six named deferred deployment cases in `self_contained_deployment_tests` remain compiled and explicitly ignored. Five require disabled registrar exemptions; the historical recursion-negative case conflicts with the supported recursive-call policy. Before changing their status or reporting deployment coverage, read `docs/testing/supported-deployment-scope.md`. They are deferred coverage, never passing release evidence.
 - Prefer `scripts/run-rust-integration-tests.sh` for Docker-owned Rust tests and `scripts/run-integration-tests.sh` for full-stack E2E. These runners own setup and teardown and avoid fixed host ports.
 - For host-run database tests, provision disposable PostgreSQL and run `make db-test-setup` with `TEST_DB_ADMIN_URL` and `TEST_DB_URL`. Host setup requires `psql` and `sqlx`; direct Cargo runs use `ATTUNE__DATABASE__URL`.
 - Database fixtures use run-owned, migration-hashed templates and physical clones by default. Approved read-only and rollback-isolated tests share a runner-owned database; see `docs/testing/schema-per-test.md`.

@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { ExecutionStatus } from "./ExecutionStatus";
 import type { RetentionPolicyType } from "./RetentionPolicyType";
+import type { Value } from "./Value";
 /**
  * Standard API response wrapper
  */
@@ -61,6 +62,7 @@ export type ApiResponse_ExecutionResponse = {
      * Execution result/output
      */
     result: Record<string, any>;
+    schema_binding?: null | Value;
     /**
      * When the execution actually started running (worker picked it up).
      * Null if the execution hasn't started running yet.
@@ -89,19 +91,19 @@ export type ApiResponse_ExecutionResponse = {
     /**
      * Worker affinity override stored on the execution, if any.
      */
-    worker_affinity?: any | null;
+    worker_affinity?: Record<string, any> | null;
     /**
      * Worker selector override stored on the execution, if any.
      */
-    worker_selector?: any | null;
+    worker_selector?: Record<string, any> | null;
     /**
      * Worker tolerations override stored on the execution, if any.
      */
-    worker_tolerations?: any[] | null;
+    worker_tolerations?: Array<Record<string, any>> | null;
     /**
      * Workflow task metadata (only populated for workflow task executions)
      */
-    workflow_task?: any | null;
+    workflow_task?: Record<string, any> | null;
   };
   /**
    * Optional message

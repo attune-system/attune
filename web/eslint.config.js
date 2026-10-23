@@ -19,5 +19,22 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector:
+            "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.name=/Request$/]",
+          message:
+            "Do not cast API request bodies. Construct an explicitly typed request or use satisfies.",
+        },
+        {
+          selector:
+            "TSAsExpression[typeAnnotation.type='TSIndexedAccessType'][typeAnnotation.objectType.typeName.name=/Request$/]",
+          message:
+            "Do not cast API request fields. Correct the generated contract or validate the value.",
+        },
+      ],
+    },
   },
 ]);

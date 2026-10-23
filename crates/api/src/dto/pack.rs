@@ -2,6 +2,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+pub struct PackDetailQuery {
+    #[serde(default)]
+    pub include_secret_values: bool,
+}
 use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
@@ -46,6 +51,13 @@ impl PackListParams {
 /// Request DTO for creating a new pack
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct CreatePackRequest {
+    /// Ownership roles require this endpoint's matching Create and Install authority.
+    #[schema(required = false, nullable = false, max_items = 64)]
+    #[serde(
+        default,
+        deserialize_with = "attune_common::pack_ownership::deserialize_owner_roles"
+    )]
+    pub owner_roles: Option<Vec<String>>,
     /// Unique reference identifier (e.g., "core", "aws", "slack")
     #[validate(length(min = 1, max = 255))]
     #[schema(example = "slack")]
@@ -116,6 +128,9 @@ pub struct CreatePackRequest {
 /// Request DTO for registering a pack from local filesystem
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct RegisterPackRequest {
+    /// Explicit consent to replacing contracts used by live admitted emitters.
+    #[serde(default)]
+    pub acknowledge_incompatible_rollout: bool,
     /// Local filesystem path to the pack directory
     #[validate(length(min = 1))]
     #[schema(example = "/path/to/packs/mypack")]
@@ -139,6 +154,8 @@ pub struct RegisterPackRequest {
 /// Request DTO for installing a pack from remote source
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct InstallPackRequest {
+    #[serde(default)]
+    pub acknowledge_incompatible_rollout: bool,
     /// Repository URL or source location
     #[validate(length(min = 1))]
     #[schema(example = "https://github.com/attune/pack-slack.git")]
@@ -288,6 +305,8 @@ pub struct PackRegistryIndexSummary {
 /// Response for pack install/register operations with test results
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PackInstallResponse {
+    #[serde(default)]
+    pub diagnostics: Vec<attune_common::pack_check::PackDiagnostic>,
     /// The installed/registered pack
     pub pack: PackResponse,
 
@@ -313,6 +332,7 @@ pub struct PackInstallResponse {
 /// Response describing a tracked pack installation attempt.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PackInstallStatusResponse {
+    pub diagnostic_details: Option<serde_json::Value>,
     /// Pack install record id
     pub install_id: i64,
     /// Pack reference this install attempt belongs to
@@ -341,6 +361,7 @@ impl From<attune_common::models::PackInstall> for PackInstallStatusResponse {
     fn from(record: attune_common::models::PackInstall) -> Self {
         Self {
             install_id: record.id,
+            diagnostic_details: record.diagnostic_details,
             pack_ref: record.pack_ref,
             pack_version: record.pack_version,
             status: record.status,
@@ -384,6 +405,14 @@ pub struct PackInstallProvenance {
 /// Request DTO for updating a pack
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct UpdatePackRequest {
+    /// Changing this declaration additionally requires target pack Install authority.
+    /// Omit to preserve; [] clears. Null is not accepted.
+    #[schema(required = false, nullable = false, max_items = 64)]
+    #[serde(
+        default,
+        deserialize_with = "attune_common::pack_ownership::deserialize_owner_roles"
+    )]
+    pub owner_roles: Option<Vec<String>>,
     /// Human-readable label
     #[validate(length(min = 1, max = 255))]
     #[schema(example = "Slack Integration v2")]
@@ -399,14 +428,25 @@ pub struct UpdatePackRequest {
     pub version: Option<String>,
 
     /// Configuration schema
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub conf_schema: Option<JsonValue>,
 
-    /// Pack configuration values
+    /// Persistent overrides, replacing each supplied top-level field completely.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::common::deserialize_present_value"
+    )]
     #[schema(value_type = Object, nullable = true)]
     pub config: Option<JsonValue>,
 
+    /// Remove these top-level overrides and use current release defaults. Null is not reset.
+    #[serde(default)]
+    pub config_reset_fields: Vec<String>,
+
     /// Pack metadata
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub meta: Option<JsonValue>,
 
@@ -441,6 +481,7 @@ pub enum PackDescriptionPatch {
 /// Response DTO for pack information
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PackResponse {
+    pub owner_roles: Vec<String>,
     /// Pack ID
     #[schema(example = 1)]
     pub id: i64,
@@ -468,6 +509,9 @@ pub struct PackResponse {
     /// Pack configuration
     #[schema(value_type = Object)]
     pub config: JsonValue,
+
+    /// Original contract for the current configuration revision.
+    pub config_schema_binding: Option<JsonValue>,
 
     /// Pack metadata
     #[schema(value_type = Object)]
@@ -565,6 +609,7 @@ pub struct PlatformCatalogStateResponse {
 /// Simplified pack response (for list endpoints)
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PackSummary {
+    pub owner_roles: Vec<String>,
     /// Pack ID
     #[schema(example = 1)]
     pub id: i64,
@@ -605,6 +650,11 @@ pub struct PackSummary {
 /// Convert from Pack model to PackResponse
 impl From<attune_common::models::Pack> for PackResponse {
     fn from(pack: attune_common::models::Pack) -> Self {
+        let config = attune_common::secret_values::configuration_metadata_projection(
+            &pack.r#ref,
+            &pack.conf_schema,
+            pack.config.clone(),
+        );
         Self {
             id: pack.id,
             r#ref: pack.r#ref,
@@ -612,7 +662,9 @@ impl From<attune_common::models::Pack> for PackResponse {
             description: pack.description,
             version: pack.version,
             conf_schema: pack.conf_schema,
-            config: pack.config,
+            config,
+            config_schema_binding: None,
+            owner_roles: pack.owner_roles,
             meta: pack.meta,
             tags: pack.tags,
             runtime_deps: pack.runtime_deps,
@@ -635,6 +687,7 @@ impl From<attune_common::models::Pack> for PackResponse {
 impl From<attune_common::models::Pack> for PackSummary {
     fn from(pack: attune_common::models::Pack) -> Self {
         Self {
+            owner_roles: pack.owner_roles,
             id: pack.id,
             r#ref: pack.r#ref,
             label: pack.label,
@@ -739,6 +792,7 @@ pub struct DownloadedPack {
 /// Information about a failed pack download
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FailedPack {
+    pub details: Option<JsonValue>,
     /// Pack source that failed
     pub source: String,
     /// Error message
@@ -884,6 +938,9 @@ pub struct BuildPackEnvsRequest {
 /// Response DTO for build pack environments operation
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BuildPackEnvsResponse {
+    /// This endpoint detects API-host interpreters only; it does not build worker environments.
+    pub detection_only: bool,
+    pub message: String,
     /// Successfully built environments
     pub built_environments: Vec<BuiltEnvironment>,
     /// Failed environment builds
@@ -973,6 +1030,8 @@ pub struct BuildSummary {
 /// Request DTO for registering multiple packs
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct RegisterPacksRequest {
+    #[serde(default)]
+    pub acknowledge_incompatible_rollout: bool,
     /// List of pack directory paths to register
     #[validate(length(min = 1))]
     #[schema(example = json!(["/tmp/attune-packs/slack"]))]
@@ -1016,6 +1075,8 @@ pub struct RegisterPacksResponse {
 /// Information about a registered pack
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RegisteredPack {
+    #[serde(default)]
+    pub diagnostics: Vec<attune_common::pack_check::PackDiagnostic>,
     /// Pack reference
     pub pack_ref: String,
     /// Pack database ID
@@ -1080,6 +1141,7 @@ pub struct ValidationResults {
 /// Failed pack registration
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FailedPackRegistration {
+    pub details: Option<JsonValue>,
     /// Pack reference
     pub pack_ref: String,
     /// Pack path
@@ -1166,6 +1228,7 @@ mod tests {
     #[test]
     fn test_create_pack_request_validation() {
         let req = CreatePackRequest {
+            owner_roles: None,
             r#ref: "".to_string(), // Invalid: empty
             label: "Test".to_string(),
             version: "1.0.0".to_string(),

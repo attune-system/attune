@@ -165,27 +165,27 @@ pub struct UpdateRuleRequest {
     pub trigger_ref: Option<String>,
 
     /// Conditions for rule evaluation
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, nullable = true, required = false)]
     pub conditions: Option<JsonValue>,
 
     /// Parameters to pass to the action when rule is triggered
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, nullable = true, required = false)]
     pub action_params: Option<JsonValue>,
 
     /// Parameters for trigger configuration and event filtering
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, nullable = true, required = false)]
     pub trigger_params: Option<JsonValue>,
 
     /// Replacement sensor-worker selector.
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, nullable = true, required = false)]
     pub sensor_worker_selector: Option<JsonValue>,
 
     /// Replacement sensor-worker tolerations.
-    #[schema(value_type = Vec<Object>, nullable = true)]
+    #[schema(value_type = Vec<Object>, nullable = true, required = false)]
     pub sensor_worker_tolerations: Option<JsonValue>,
 
     /// Replacement sensor-worker affinity.
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, nullable = true, required = false)]
     pub sensor_worker_affinity: Option<JsonValue>,
 
     /// Optional template used to resolve execution trace tags for this rule.

@@ -5,11 +5,17 @@ use serde_json::Value;
 use crate::{Error, Result};
 
 pub const COMPATIBILITY_EPOCH: i32 = 1;
-pub const CATALOG_REVISION: i32 = 1;
+pub const CATALOG_REVISION: i32 = 2;
+
+/// Platform component namespaces are reserved even without an installed pack.
+pub fn reserved_pack_namespace(reference: &str) -> bool {
+    reference == "core"
+}
 
 /// The component tables managed by pack installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManagedComponentKind {
+    SchemaType,
     Runtime,
     PermissionSet,
     Trigger,
@@ -26,6 +32,7 @@ pub enum ManagedComponentKind {
 impl ManagedComponentKind {
     pub(crate) fn table(self) -> &'static str {
         match self {
+            Self::SchemaType => "schema_type",
             Self::Runtime => "runtime",
             Self::PermissionSet => "permission_set",
             Self::Trigger => "trigger",
@@ -117,11 +124,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn editor_can_author_event_packs_without_administrative_grants() {
+        use crate::rbac::{Action, Grant, Resource};
+        let definition = definitions()
+            .unwrap()
+            .into_iter()
+            .find(|(_, definition)| definition["ref"] == "core.editor")
+            .unwrap()
+            .1;
+        let grants: Vec<Grant> = serde_json::from_value(definition["grants"].clone()).unwrap();
+        for (resource, action) in [
+            (Resource::Packs, Action::Read),
+            (Resource::Actions, Action::Create),
+            (Resource::Actions, Action::Update),
+            (Resource::Actions, Action::Execute),
+            (Resource::Rules, Action::Create),
+            (Resource::Rules, Action::Update),
+            (Resource::Triggers, Action::Read),
+            (Resource::Triggers, Action::Create),
+            (Resource::Triggers, Action::Update),
+            (Resource::Events, Action::Read),
+            (Resource::Events, Action::Create),
+        ] {
+            assert!(
+                grants.iter().any(|grant| {
+                    grant.resource == resource
+                        && grant.actions.contains(&action)
+                        && grant.constraints.is_none()
+                }),
+                "editor missing {resource:?}:{action:?}"
+            );
+        }
+        assert!(grants.iter().all(|grant| {
+            !matches!(grant.resource, Resource::Permissions | Resource::Identities)
+                && !grant.actions.contains(&Action::Manage)
+                && !(grant.resource == Resource::Events && grant.actions.contains(&Action::Decrypt))
+        }));
+        let fresh = crate::repositories::pack::PackRepository::deployment_context_for_pack(
+            7, "new_pack", None,
+        );
+        assert!(grants
+            .iter()
+            .any(|grant| grant.allows(Resource::Packs, Action::Install, &fresh)));
+        let mut existing = fresh.clone();
+        existing.pack_state = None;
+        existing.target_id = Some(8);
+        existing.managing_pack_id = Some(8);
+        for owner in [None, Some(7), Some(9)] {
+            existing.owner_identity_id = owner;
+            assert_eq!(
+                grants.iter().any(|grant| grant.allows(
+                    Resource::Packs,
+                    Action::Install,
+                    &existing
+                )),
+                owner == Some(7)
+            );
+            assert!(grants.iter().any(|grant| grant.allows(
+                Resource::Packs,
+                Action::Read,
+                &existing
+            )));
+            assert_eq!(
+                grants.iter().any(|grant| grant.allows(
+                    Resource::Packs,
+                    Action::Configure,
+                    &existing
+                )),
+                owner == Some(7)
+            );
+        }
+        let reserved =
+            crate::repositories::pack::PackRepository::deployment_context_for_pack(7, "core", None);
+        assert!(!grants.iter().any(|grant| grant.allows(
+            Resource::Packs,
+            Action::Create,
+            &reserved
+        )));
+        assert!(!grants.iter().any(|grant| grant.allows(
+            Resource::Packs,
+            Action::Install,
+            &reserved
+        )));
+    }
+
+    #[test]
     fn catalog_matches_bundled_legacy_metadata() {
         let definitions = definitions().unwrap();
         assert_eq!(definitions.len(), 16);
         for (kind, definition) in definitions {
             let component_ref = definition["ref"].as_str().unwrap();
+            assert!(reserved_pack_namespace(
+                component_ref.split('.').next().unwrap()
+            ));
             let directory = match kind {
                 ManagedComponentKind::Runtime => "runtimes",
                 ManagedComponentKind::PermissionSet => "permission_sets",

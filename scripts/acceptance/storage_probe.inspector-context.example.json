@@ -1,0 +1,11 @@
+{
+  "database_url": "postgresql://REPLACE_READ_ONLY_OBSERVER:REPLACE_PRIVATE_PASSWORD@127.0.0.1:REPLACE_OWNED_PUBLISHED_PORT/REPLACE_DATABASE",
+  "schema": "REPLACE_APPLICATION_SCHEMA",
+  "access": {
+    "run_id": "REPLACE_DRIVER_RUN_ID",
+    "project": "REPLACE_DRIVER_PROJECT",
+    "invoker_identity": 0,
+    "legacy_version_ids": [],
+    "identity_key": "REPLACE_WITH_FRESH_PRIVATE_AT_LEAST_32_BYTE_RANDOM_KEY"
+  }
+}

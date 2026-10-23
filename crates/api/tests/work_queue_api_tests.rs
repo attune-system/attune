@@ -167,7 +167,7 @@ async fn create_queue_with_visibility(
     )
     .await;
 
-    WorkQueueRepository::create(
+    let queue = WorkQueueRepository::create(
         &ctx.pool,
         CreateWorkQueueInput {
             r#ref: format!("{}.{}", pack.r#ref, queue_name),
@@ -194,7 +194,106 @@ async fn create_queue_with_visibility(
         },
     )
     .await
-    .expect("create queue")
+    .expect("create queue");
+    helpers::activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            work_queues: vec![queue.id],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("activate queue schema source");
+    admit_queue_fixture(ctx, &pack, &queue)
+        .await
+        .expect("admit managed queue");
+    queue
+}
+
+async fn admit_queue_fixture(
+    ctx: &TestContext,
+    pack: &attune_common::models::Pack,
+    queue: &attune_common::models::work_queue::WorkQueue,
+) -> Result<i64> {
+    use attune_common::{
+        repositories::{
+            executable_snapshot::ExecutableSnapshotRepository,
+            runtime_authority::RuntimeAuthorityRepository,
+        },
+        runtime_authority::{InvocationBinding, InvocationPolicy, RuntimePolicy},
+    };
+    use std::collections::BTreeMap;
+    let mut tx = ctx.pool.begin().await?;
+    let owner = RuntimeAuthorityRepository::ensure_owner(&mut tx, pack.id).await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action_ref(&mut *tx, &queue.dispatch_action_ref)
+            .await?;
+    let policy = RuntimeAuthorityRepository::capture_policy(
+        &mut tx,
+        &RuntimePolicy {
+            owner,
+            release_id: snapshot.release.id,
+            release_digest: snapshot.release.digest.clone(),
+            concrete_targets: BTreeMap::new(),
+            invocations: vec![InvocationPolicy {
+                binding: InvocationBinding::Queue {
+                    queue_ref: queue.r#ref.clone(),
+                    action_ref: queue.dispatch_action_ref.clone(),
+                },
+                target_release_id: snapshot.release.id,
+                target_release_digest: snapshot.release.digest.clone(),
+                permission_sets: BTreeMap::new(),
+                standard_access: false,
+                foreign_workflow_policy: None,
+                metadata_revision: None,
+                source_id: None,
+                dispatch_template_digest: None,
+            }],
+        },
+    )
+    .await?;
+    RuntimeAuthorityRepository::activate_policy(&mut tx, policy.id).await?;
+    tx.commit().await?;
+    Ok(policy.id)
+}
+
+#[tokio::test]
+async fn queue_requester_grouping_round_trips_through_create_inspect_and_update() -> Result<()> {
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let token = register_queue_admin(&ctx).await;
+    let (_, action) =
+        create_pack_with_action(&ctx, "batch_grouping", "batch_grouping.dispatch").await;
+    let path = "/api/v1/queues/adhoc.batch_grouping";
+    let response = ctx.post("/api/v1/queues", json!({"ref":"adhoc.batch_grouping", "label":"Batch grouping",
+        "dispatch_action_ref":action.r#ref, "batch_mode":"batch", "config":{"dispatch":{"separate_requesters":true}}
+    }), Some(&token)).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["data"]["config"]["dispatch"]["separate_requesters"],
+        true
+    );
+    for separate in [false, true] {
+        let response = ctx
+            .put(
+                path,
+                json!({"config":{"dispatch":{"separate_requesters":separate}}}),
+                Some(&token),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = ctx.get(path, Some(&token)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(
+            body["data"]["config"]["dispatch"]["separate_requesters"],
+            separate
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -579,12 +678,9 @@ async fn queue_api_supports_merge_patch_enqueue_and_pending_item_lifecycle() {
     let admin_token = register_queue_admin(&ctx).await;
     let token = Some(admin_token.as_str());
 
-    let (_pack, action) = create_pack_with_action(
-        &ctx,
-        &format!("queue_api_pack_{}", uuid::Uuid::new_v4().simple()),
-        &format!("queue_api_pack.dispatch_{}", uuid::Uuid::new_v4().simple()),
-    )
-    .await;
+    let pack_ref = format!("queue_api_pack_{}", uuid::Uuid::new_v4().simple());
+    let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
+    let (_pack, action) = create_pack_with_action(&ctx, &pack_ref, &action_ref).await;
 
     let queue_ref = format!("adhoc.queue_{}", uuid::Uuid::new_v4().simple());
     let create = ctx
@@ -968,7 +1064,7 @@ async fn queue_api_supports_jsonpath_preview_and_bulk_operations() {
 }
 
 #[tokio::test]
-async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
+async fn queue_api_allows_pack_queue_labels_and_flags_but_blocks_deletion() {
     let ctx = TestContext::new()
         .await
         .expect("test context")
@@ -978,12 +1074,9 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
     let admin_token = register_queue_admin(&ctx).await;
     let token = Some(admin_token.as_str());
 
-    let (pack, action) = create_pack_with_action(
-        &ctx,
-        &format!("queue_pack_{}", uuid::Uuid::new_v4().simple()),
-        &format!("queue_pack.dispatch_{}", uuid::Uuid::new_v4().simple()),
-    )
-    .await;
+    let pack_ref = format!("queue_pack_{}", uuid::Uuid::new_v4().simple());
+    let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
+    let (pack, action) = create_pack_with_action(&ctx, &pack_ref, &action_ref).await;
 
     let queue = WorkQueueRepository::create(
         &ctx.pool,
@@ -1017,6 +1110,20 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
     )
     .await
     .expect("create pack queue");
+    helpers::activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            work_queues: vec![queue.id],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("project the actual managed queue");
+    let policy_id = admit_queue_fixture(&ctx, &pack, &queue)
+        .await
+        .expect("admit managed queue");
 
     let list = ctx
         .get(&format!("/api/v1/packs/{}/queues", pack.r#ref), token)
@@ -1034,13 +1141,74 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
         .put(
             &format!("/api/v1/queues/{}", queue.r#ref),
             json!({
-                "label": "Should fail"
+                "label": "Updated pack queue label"
             }),
             token,
         )
         .await
         .expect("update pack queue");
-    assert_eq!(update.status(), StatusCode::FORBIDDEN);
+    assert_eq!(update.status(), StatusCode::OK);
+    let updated: serde_json::Value = update.json().await.expect("updated queue body");
+    assert_eq!(updated["data"]["label"], "Updated pack queue label");
+    assert_eq!(
+        current_queue_fixture_policy(&ctx, pack.id)
+            .await
+            .expect("current policy"),
+        policy_id
+    );
+
+    let accepted = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items", queue.r#ref),
+            json!({"payload":{"item":{"id":"retained-item"}}}),
+            token,
+        )
+        .await
+        .expect("accept pending item");
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    let item: serde_json::Value = accepted.json().await.expect("accepted item");
+    let item_id = item["data"]["id"].as_i64().expect("accepted item id");
+    let before = WorkQueueRepository::find_by_ref(&ctx.pool, &queue.r#ref)
+        .await
+        .expect("queue")
+        .unwrap();
+    let rejected = ctx
+        .put(
+            &format!("/api/v1/queues/{}", queue.r#ref),
+            json!({"action_params":{"item":"{{ item.payload }}"}}),
+            token,
+        )
+        .await
+        .expect("attempt behavior edit");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let denied: serde_json::Value = rejected.json().await.expect("behavior edit error");
+    assert!(denied["error"]
+        .as_str()
+        .unwrap()
+        .contains("Drain accepted queue items"));
+    let after = WorkQueueRepository::find_by_ref(&ctx.pool, &queue.r#ref)
+        .await
+        .expect("queue")
+        .unwrap();
+    assert_eq!(after.action_params, before.action_params);
+    assert_eq!(after.item_schema, before.item_schema);
+    assert_eq!(after.dispatch_action, before.dispatch_action);
+    assert_eq!(after.updated, before.updated);
+    assert_eq!(
+        current_queue_fixture_policy(&ctx, pack.id)
+            .await
+            .expect("current policy"),
+        policy_id
+    );
+    let retained = WorkQueueItemRepository::find_by_id(&ctx.pool, item_id)
+        .await
+        .expect("retained item")
+        .unwrap();
+    assert_eq!(retained.payload, json!({"item":{"id":"retained-item"}}));
+    assert_eq!(
+        retained.status,
+        attune_common::models::WorkQueueItemStatus::Queued
+    );
 
     let toggle_processing = ctx
         .put(
@@ -1058,12 +1226,30 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
     let toggle_body: serde_json::Value = toggle_processing.json().await.expect("toggle body");
     assert_eq!(toggle_body["data"]["enabled"], false);
     assert_eq!(toggle_body["data"]["accepting_new_items"], false);
+    assert_eq!(
+        current_queue_fixture_policy(&ctx, pack.id)
+            .await
+            .expect("current policy"),
+        policy_id
+    );
 
     let delete = ctx
         .delete(&format!("/api/v1/queues/{}", queue.r#ref), token)
         .await
         .expect("delete pack queue");
     assert_eq!(delete.status(), StatusCode::FORBIDDEN);
+}
+
+async fn current_queue_fixture_policy(ctx: &TestContext, pack: i64) -> Result<i64> {
+    let mut tx = ctx.pool.begin().await?;
+    let policy =
+        attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::current_policy(
+            &mut tx, pack,
+        )
+        .await?
+        .expect("admitted fixture policy");
+    tx.commit().await?;
+    Ok(policy.id)
 }
 
 async fn create_trace_queue_item(

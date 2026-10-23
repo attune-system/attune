@@ -77,7 +77,6 @@ grep -Fq 'chmod 600 /build/config.test.yaml' docker/rust-tests-entrypoint.sh
 
 database_url_scripts=(
     scripts/cleanup-test-schemas.sh
-    scripts/load-core-pack.sh
     scripts/verify-schema-cleanup.sh
     docker/rust-tests-entrypoint.sh
 )
@@ -90,6 +89,11 @@ for script in "${database_url_scripts[@]}"; do
         exit 1
     fi
 done
+
+# The core loader is API-only now. Guard against restoring the retired database
+# path rather than requiring an unused URL sanitizer in its five-line wrapper.
+assert_absent 'psql|DATABASE_URL|TEST_DB_URL|POSTGRES_PASSWORD' scripts/load-core-pack.sh
+grep -Fq 'exec python3 "$script_dir/load_core_pack.py" "$@"' scripts/load-core-pack.sh
 
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/attune-credential-output.XXXXXX")
 trap 'rm -rf -- "$test_dir"' EXIT

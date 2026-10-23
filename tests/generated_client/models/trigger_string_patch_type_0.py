@@ -7,7 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
 
-from ..models.trigger_string_patch_type_0_op import TriggerStringPatchType0Op
+from ..models.trigger_set_operation import TriggerSetOperation
 
 T = TypeVar("T", bound="TriggerStringPatchType0")
 
@@ -16,11 +16,11 @@ T = TypeVar("T", bound="TriggerStringPatchType0")
 class TriggerStringPatchType0:
     """
     Attributes:
-        op (TriggerStringPatchType0Op):
+        op (TriggerSetOperation):
         value (str):
     """
 
-    op: TriggerStringPatchType0Op
+    op: TriggerSetOperation
     value: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -43,7 +43,7 @@ class TriggerStringPatchType0:
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
-        op = TriggerStringPatchType0Op(d.pop("op"))
+        op = TriggerSetOperation(d.pop("op"))
 
         value = d.pop("value")
 

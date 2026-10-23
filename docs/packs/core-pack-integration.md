@@ -363,68 +363,28 @@ impl SensorManager {
 }
 ```
 
-#### 3.2 Sensor Environment Setup
+#### 3.2 Sensor startup values
 
-```rust
-pub fn prepare_sensor_env(
-    sensor: &Sensor,
-    trigger_instances: &[TriggerInstance],
-) -> HashMap<String, String> {
-    let mut env = HashMap::new();
+The manager writes one bounded stdin JSON object and closes the pipe:
 
-    // Add sensor config
-    for (key, value) in &sensor.config {
-        let env_key = format!("ATTUNE_SENSOR_{}", key.to_uppercase());
-        env.insert(env_key, value.to_string());
-    }
-
-    // Add trigger instances as JSON array
-    let triggers_json = serde_json::to_string(trigger_instances).unwrap();
-    env.insert("ATTUNE_SENSOR_TRIGGERS".to_string(), triggers_json);
-
-    env
-}
+```json
+{"config": {"check_interval_seconds": 1}, "triggers": []}
 ```
+
+`config` is the flat sensor settings map. `triggers` contains initial active rule
+bindings with `id`, `ref`, `trigger_ref`, and `config` fields. Both sections may
+contain secrets. Configuration environment variables are not supported.
+Connection metadata, sensor identity, and trigger-ref lists remain in the
+cleared child environment.
 
 #### 3.3 Sensor Execution
 
-```rust
-pub async fn run_sensor(
-    &self,
-    sensor: &Sensor,
-    trigger_instances: Vec<TriggerInstance>,
-) -> Result<()> {
-    // Resolve sensor script path
-    let script_path = self.resolve_sensor_path(
-        &sensor.pack_ref,
-        &sensor.entrypoint,
-    )?;
-
-    // Prepare environment
-    let env = prepare_sensor_env(sensor, &trigger_instances);
-
-    // Start sensor process
-    let mut child = Command::new(&script_path)
-        .envs(env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    // Read stdout line by line (JSON events)
-    let stdout = child.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
-
-    for line in reader.lines() {
-        let event_json = line?;
-        let event: SensorEvent = serde_json::from_str(&event_json)?;
-
-        // Create event in database
-        self.create_event_from_sensor(sensor, event).await?;
-    }
-
-    Ok(())
-}
-```
+`crates/sensor/src/sensor_manager.rs` selects the admitted executable release,
+clears inherited environment variables, provisions a workload-fenced token, and
+starts the process with piped stdin/stdout/stderr. It starts log readers before
+writing the bootstrap to avoid pipe deadlocks. Failed or timed-out delivery
+terminates and waits for the child. Stdout is a log stream, not an event protocol.
+Sensors emit events through the authenticated API.
 
 ---
 

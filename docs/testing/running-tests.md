@@ -24,6 +24,10 @@ make test-cli
 ```
 
 Database-backed Rust tests run normally and require stock PostgreSQL 16 or newer.
+The six deferred deployment cases are a documented scope exception, not
+external-service tests. See [Supported deployment scope](supported-deployment-scope.md)
+for their exact identities, supported replacements, and explicit rerun command.
+Default and all-features checks must report them as deferred, not passed.
 Compose and CI default to PostgreSQL 18. No TimescaleDB extension or preload is
 required. Use a disposable cluster and follow
 [PostgreSQL-only deployment](../deployment/postgresql-only.md) for fresh-install and reset decisions.
@@ -77,6 +81,28 @@ bash scripts/benchmark-rust-integration-tests.sh \
 
 The Rust image uses a small runtime stage and stores stripped test executables, not the Rust toolchain or Cargo's incremental directory. Its `inventory.tsv` is the exact runnable-test fingerprint. A normal runtime invocation executes those binaries directly and does not compile. Changes limited to the entrypoint or other runtime Docker fixtures do not invalidate the workspace compile layer.
 
+The full-stack runner starts the API and test identity before core-pack
+publication. If no `ATTUNE_BOOTSTRAP_TOKEN` is supplied, it creates an owned
+integration token through the authenticated API. The token stays in a mode-0600
+file inside a private, Docker-shared `.scratch/e2e-bootstrap-*` directory. It is
+never printed. The runner revokes it after worker admission, or during cleanup
+if startup fails, and checks that `/auth/token-login` rejects the raw revoked
+credential with HTTP 401.
+It removes the private files on exit, including with
+`--no-teardown`. If revocation fails, the runner exits nonzero, deletes the secret
+file, and retains the private non-secret `credential.json` descriptor for a
+retry. It reports that descriptor's path. A caller-supplied bootstrap token is
+not revoked by the runner.
+This setup does not enable managed execution credentials or change normal
+deployment authentication. Attach mode does not provision credentials or mutate
+the existing stack.
+
+Offline bootstrap credential checks:
+
+```bash
+python3 -m unittest discover -s tests/unit -p 'test_e2e_bootstrap.py' -v
+```
+
 The Docker lane intentionally uses libtest rather than cargo-nextest. An earlier 0.9.145 prototype matched the then-ignored database-test identities but was 7.2% slower by median test time across three equal 591-test common-crate samples. The stock nextest archive was also larger than the complete runtime image. See [Test concurrency reliability](../plans/test-concurrency-reliability.md#cargo-nextest-scheduler-investigation) for the coverage map and measurements.
 
 The database/broker lane excludes tests that declare additional API, S3, installed-CLI, or high-load prerequisites. Those identities remain in the image and in their owning CI/E2E lanes; they are not silently discovered or conditionally skipped. To run them after provisioning every prerequisite:
@@ -124,6 +150,120 @@ image and executable-stripping measurements reduced image size from 5.07 GB
 to 2.44 GB; ignored-test artifacts fell from 2.1 GB to 1.6 GB.
 
 ## Native partition and summary validation
+
+### Artifact read query-growth checks
+
+The artifact benchmark reuses the owned native PostgreSQL fixture and API test
+context. It requires cached PostgreSQL images and the Rust toolchain, never accepts
+an existing database, and refuses to overwrite an evidence directory.
+
+```bash
+python3 scripts/benchmark-artifact-reads.py --dry-run \
+  --output /tmp/opencode/artifact-read-plan
+python3 scripts/benchmark-artifact-reads.py --stage treatment --versions 16 18 \
+  --with-key-usage-tests --output /tmp/opencode/artifact-read-treatment
+# Explicit stress profile, kept out of routine query-growth tests
+python3 scripts/benchmark-artifact-reads.py --stage treatment --versions 16 18 \
+  --snapshot-source --with-key-usage-tests --with-notifier-tests --workload-profile \
+  --output /tmp/opencode/artifact-read-workload
+```
+
+Choose unused output paths. A red baseline exits nonzero and retains evidence;
+startup or compilation failures do not count as a reproduced performance bug.
+The runner records source changes and cannot certify a run whose source changed.
+Its statement-count/projection gates and actual repository-generated EXPLAIN plan
+are not a browser/network TTFB measurement or p95 latency certification. See
+[the implementation checkpoint](../plans/artifacts-postgresql-implementation.md#implementation-checkpoint)
+for completed work and remaining measurements.
+
+The workload profile holds 64 event origins and graph depth constant while adding
+1, 7, 30, and 90 populated daily event leaves, plus a retained source in DEFAULT.
+These are added populated leaves. Fresh migrations may already have other daily
+leaves, and the actual EXPLAIN relation list includes them.
+It explains the real SQLx-prepared event statement after repeated execution and
+probes 1/16/64/256-ID parameter sets without changing the runtime batch bound.
+It also records routed reads and the repository lineage SELECT for 64 sources at
+depth eight with shared and distinct ancestry. Lineage EXPLAIN statements are
+separate from timing; event prepared-plan probes explain the cached SQLx statement.
+It then runs reads alongside bounded execution deletion, DEFAULT repair/partition
+expiry, audit writes, and hourly summary refresh. It drains the complete owned
+expired execution cohort and records per-relation table/index/TOAST bytes, catalog
+estimates and analyze/vacuum timestamps, WAL positions, sampled waits, and memory.
+
+Request metrics separately record SQLx statements, pool acquisition time, handler
+poll CPU, and execution-disclosure poll CPU. The CPU counters use Linux's thread
+CPU clock only while each future is polled, excluding pending database time and
+unrelated Tokio tasks. Non-Linux CPU counters are unavailable, not inferred from
+wall time. Pool acquisition includes connection creation and health checks, not
+only queue wait. Database wait samples between requests can miss short waits.
+
+Artifact query-growth fixtures bypass authorization metadata caches through an
+app-state-local setting. Every measured request includes real identity, role, and
+permission reads; another test's cache invalidation or a five-second cache expiry
+cannot change the fixture's query count. Production caching remains enabled by
+default. A separate regression compares the bypass with the shared-cache path,
+invalidates shared caches, and verifies fresh permission reads without invalidation.
+
+Application-query budgets exclude only the exact discovery statements in the
+pinned SQLx PostgreSQL driver and the exact pool session-initialization statement.
+Other catalog queries, RBAC reads, and session changes still count. Raw statements
+and infrastructure categories remain in every measurement. Paired acceptance
+reports use application counts for the query ceiling and query-reduction gate,
+while reporting raw totals and total-statement reduction separately. Elapsed time
+and CPU measurements still include infrastructure costs.
+
+`workload-summary.json` reports first-after-DDL and warm samples separately. It
+does not claim a cold server or a baseline latency improvement. The report helpers
+reject p95 comparisons with changed source, unequal workloads, errors,
+cancellations, or fewer than 20 complete samples. Fixture capacity is not a
+deployment retention forecast. Follow
+[Artifact-read acceptance](../deployment/artifact-read-acceptance.md) for rollout
+evidence and operator gates.
+
+`--with-notifier-tests` runs the notifier executable on the same run-owned server.
+Its database-only listener test is not ignored. It awaits channel registration,
+creates a deterministic UNLISTEN/reconnect gap, keeps the downstream receiver
+open, and proves that a missed durable artifact change is not replayed. A separate
+test overflows the production broadcast/dispatch path. Browser tests verify the
+reconciliation response to that missing-delivery contract without disconnecting
+the socket context.
+
+Use `--snapshot-source` when other work is changing the checkout. The runner copies
+required build/test inputs into the unused evidence directory, verifies their
+hashes, sets the recorded build revision explicitly, and pins copies of its test
+executables with SHA-256 hashes. It does not create a Git worktree or copy local
+credential files, build caches, or virtual environments. Required binary fixtures
+remain included. A failed capture starts no database tests.
+
+Frozen builds use a run-specific directory below `target/artifact-benchmarks/`,
+also when `CARGO_TARGET_DIR` supplies the parent. This prevents concurrent builds
+from another source copy replacing the executable before it is pinned. Workload
+test names are checked before database setup, and missing reports fail the run.
+Native partition correctness fixtures declare a 30-second operation deadline and
+one-second lock deadline, rather than asserting that DDL completes within the
+production default's one-second budget on an overloaded test host. Request query
+and projection gates are unchanged. Docker removal commands have a separate
+180-second bounded teardown budget.
+
+In this mode, `source_unchanged` describes the tested source copy.
+`live_source_changes_since_capture` separately reports later checkout changes. A
+passing frozen run does not certify those newer changes or a deployed build. Keep
+the source copy and executable manifest with the numeric evidence.
+
+The separate cardinality profile measures two action-level logs across 1, 100,
+and 1,000 retained executions. Retention is explicitly set to keep the fixture's
+versions. It records first-after-authorization-cache-invalidation, 20 warm serial
+requests, and 20 completed requests across four concurrent clients separately.
+It also measures 2/20/100 attached artifacts with bounded pages and a 10 MiB
+progress body excluded from summaries. Cache invalidation is not a cold database.
+
+Add `--paired-reference` to enforce the 90% query and 70% warm-p95 reduction gates
+against a controlled serial reader on the same fixture. It is not a historical
+revision comparison. Add `--notifier-profile` for database-backed per-identity
+delivery/SQL measurements. See
+[the executable acceptance gates](../deployment/artifact-read-acceptance.md#executable-local-gates)
+for scope, sample ordering, and failure rules. The serial route exists only in the
+integration-test executable and is protected by `RequireAuth`.
 
 Use stock PostgreSQL 16 and 18 for native-maintenance correctness checks. The
 schema has daily RANGE parents for `event`, `execution_history`, and `audit_event`,

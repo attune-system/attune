@@ -3,14 +3,16 @@
 
 ref: core.build_pack_envs
 label: "Build Pack Environments"
-description: "Build runtime environments for packs and install declared dependencies (Python requirements.txt, Node.js package.json)"
+description: "Detect API-host interpreters for packs. Actual runtime setup belongs to workers during candidate testing and execution."
 enabled: true
 runner_type: shell
 entry_point: build_pack_envs.sh
 
 # Parameter delivery: stdin for secure parameter passing (no env vars)
 parameter_delivery: stdin
-parameter_format: dotenv
+parameter_format: json
+required_worker_runtimes:
+  python: ">=3.11,<4.0"
 
 # Output format: json (structured data parsing enabled)
 output_format: json
@@ -54,10 +56,23 @@ parameters:
     default: 600
     minimum: 60
     maximum: 3600
+  api_url:
+    type: string
+    description: Optional explicit bearer endpoint. Omit to use the execution's ATTUNE_API_URL.
+  api_token:
+    type: string
+    secret: true
+    description: Existing bearer access token. Omit to use an explicitly authorized execution token.
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
-output_schema:
+output:
+  detection_only:
+    type: boolean
+  message:
+    type: string
+  duration_seconds:
+    type: integer
   built_environments:
     type: array
     description: "List of successfully built environments"
@@ -75,7 +90,7 @@ output_schema:
           description: "Built environments for this pack"
           properties:
             python:
-              type: object
+              type: [object, "null"]
               description: "Python environment details"
               properties:
                 virtualenv_path:
@@ -91,7 +106,7 @@ output_schema:
                   type: string
                   description: "Python version used"
             nodejs:
-              type: object
+              type: [object, "null"]
               description: "Node.js environment details"
               properties:
                 node_modules_path:

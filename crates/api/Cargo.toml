@@ -15,12 +15,13 @@ name = "attune-api"
 path = "src/main.rs"
 
 [dependencies]
+semver = { workspace = true }
 # Internal dependencies
 attune-common = { path = "../common" }
 
 # Async runtime
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -65,7 +66,6 @@ clap = { workspace = true }
 
 # JSON Schema
 schemars = { workspace = true }
-jsonschema = { workspace = true }
 
 # HTTP client
 reqwest = { workspace = true, features = ["stream"] }
@@ -98,6 +98,10 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
 
 [dev-dependencies]
+serde_jcs = "=0.2.0"
+attune-worker = { path = "../worker" }
+attune-notifier = { path = "../notifier" }
+tokio-tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 mockall = { workspace = true }
 tower = { workspace = true }

@@ -9,6 +9,7 @@ use crate::{Error, Result};
 
 #[derive(Debug, Default, Clone)]
 pub struct PackProjectionIds {
+    pub schema_types: Vec<i64>,
     pub runtimes: Vec<i64>,
     pub runtime_versions: Vec<i64>,
     pub permission_sets: Vec<i64>,
@@ -41,6 +42,7 @@ impl ComponentLifecycleRepository {
     ) -> Result<PackProjectionIds> {
         #[derive(sqlx::FromRow)]
         struct ProjectionRow {
+            schema_types: Vec<i64>,
             runtimes: Vec<i64>,
             runtime_versions: Vec<i64>,
             permission_sets: Vec<i64>,
@@ -58,6 +60,7 @@ impl ComponentLifecycleRepository {
         let row: ProjectionRow = sqlx::query_as(
             r#"
             SELECT
+                ARRAY(SELECT id FROM schema_type WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS schema_types,
                 ARRAY(SELECT id FROM runtime WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS runtimes,
                 ARRAY(SELECT rv.id FROM runtime_version rv JOIN runtime r ON r.id = rv.runtime WHERE r.pack = $1 AND r.management_origin = 'pack' AND r.retired_at IS NULL AND rv.retired_at IS NULL ORDER BY rv.id) AS runtime_versions,
                 ARRAY(SELECT id FROM permission_set WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NULL ORDER BY id) AS permission_sets,
@@ -77,6 +80,7 @@ impl ComponentLifecycleRepository {
         .await?;
 
         Ok(PackProjectionIds {
+            schema_types: row.schema_types,
             runtimes: row.runtimes,
             runtime_versions: row.runtime_versions,
             permission_sets: row.permission_sets,
@@ -102,6 +106,9 @@ impl ComponentLifecycleRepository {
         Ok(sqlx::query_as(
             "SELECT 'runtime' AS kind, id, ref AS component_ref, managed_release, retired_at
              FROM runtime WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NOT NULL
+             UNION ALL
+             SELECT 'schema_type', id, ref, managed_release, retired_at
+             FROM schema_type WHERE pack = $1 AND retired_at IS NOT NULL
              UNION ALL
              SELECT 'permission_set', id, ref, managed_release, retired_at
              FROM permission_set WHERE pack = $1 AND management_origin = 'pack' AND retired_at IS NOT NULL
@@ -234,8 +241,17 @@ impl ComponentLifecycleRepository {
         ids: &PackProjectionIds,
         policy: AbsentMetadataPolicy,
     ) -> Result<u64> {
+        if policy == AbsentMetadataPolicy::Remove {
+            super::schema_type::SchemaTypeRepository::protect_omissions(
+                &mut *connection,
+                pack_id,
+                &ids.schema_types,
+            )
+            .await?;
+        }
         let mut retired = 0;
         for (table, owner, keep, toggleable) in [
+            ("schema_type", "pack", ids.schema_types.as_slice(), false),
             ("runtime", "pack", ids.runtimes.as_slice(), false),
             (
                 "permission_set",
@@ -350,6 +366,7 @@ impl ComponentLifecycleRepository {
         ids: &PackProjectionIds,
     ) -> Result<()> {
         for (table, owner, keep) in [
+            ("schema_type", "pack", ids.schema_types.as_slice()),
             ("runtime", "pack", ids.runtimes.as_slice()),
             ("permission_set", "pack", ids.permission_sets.as_slice()),
             ("trigger", "pack", ids.triggers.as_slice()),
@@ -392,6 +409,7 @@ impl ComponentLifecycleRepository {
         ids: &PackProjectionIds,
     ) -> Result<()> {
         for (table, owner, keep) in [
+            ("schema_type", "pack", ids.schema_types.as_slice()),
             ("runtime", "pack", ids.runtimes.as_slice()),
             ("permission_set", "pack", ids.permission_sets.as_slice()),
             ("trigger", "pack", ids.triggers.as_slice()),

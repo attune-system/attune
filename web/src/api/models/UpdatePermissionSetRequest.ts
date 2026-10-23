@@ -2,9 +2,11 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { PermissionScope } from "./PermissionScope";
 import type { Value } from "./Value";
 export type UpdatePermissionSetRequest = {
   description?: string | null;
   grants: Value;
   label?: string | null;
+  scope?: null | PermissionScope;
 };

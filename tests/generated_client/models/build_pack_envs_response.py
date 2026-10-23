@@ -22,12 +22,16 @@ class BuildPackEnvsResponse:
 
     Attributes:
         built_environments (list[BuiltEnvironment]): Successfully built environments
+        detection_only (bool): This endpoint detects API-host interpreters only; it does not build worker environments.
         failed_environments (list[FailedEnvironment]): Failed environment builds
+        message (str):
         summary (BuildSummary): Build summary statistics
     """
 
     built_environments: list[BuiltEnvironment]
+    detection_only: bool
     failed_environments: list[FailedEnvironment]
+    message: str
     summary: BuildSummary
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -37,10 +41,14 @@ class BuildPackEnvsResponse:
             built_environments_item = built_environments_item_data.to_dict()
             built_environments.append(built_environments_item)
 
+        detection_only = self.detection_only
+
         failed_environments = []
         for failed_environments_item_data in self.failed_environments:
             failed_environments_item = failed_environments_item_data.to_dict()
             failed_environments.append(failed_environments_item)
+
+        message = self.message
 
         summary = self.summary.to_dict()
 
@@ -49,7 +57,9 @@ class BuildPackEnvsResponse:
         field_dict.update(
             {
                 "built_environments": built_environments,
+                "detection_only": detection_only,
                 "failed_environments": failed_environments,
+                "message": message,
                 "summary": summary,
             }
         )
@@ -72,6 +82,8 @@ class BuildPackEnvsResponse:
 
             built_environments.append(built_environments_item)
 
+        detection_only = d.pop("detection_only")
+
         failed_environments = []
         _failed_environments = d.pop("failed_environments")
         for failed_environments_item_data in _failed_environments:
@@ -81,11 +93,15 @@ class BuildPackEnvsResponse:
 
             failed_environments.append(failed_environments_item)
 
+        message = d.pop("message")
+
         summary = BuildSummary.from_dict(d.pop("summary"))
 
         build_pack_envs_response = cls(
             built_environments=built_environments,
+            detection_only=detection_only,
             failed_environments=failed_environments,
+            message=message,
             summary=summary,
         )
 

@@ -1,5 +1,11 @@
 //! Cleanup admission and whole-cycle deadline regressions on owned databases.
 
+#[path = "cache_generation_partition_tests/cleanup_acknowledgement.rs"]
+mod cleanup_acknowledgement;
+
+#[path = "cache_generation_partition_tests/direct_cleanup_graph_ordering.rs"]
+mod direct_cleanup_graph_ordering;
+
 use attune_common::{
     config::{CacheAdmissionConfig, CacheRetentionConfig, Config},
     repositories::cache::{
@@ -168,9 +174,10 @@ async fn cleanup_admission_exhausts_cycle_without_parent_locks_or_waiters() {
         CacheGenerationRepository::drop_if_cleanup_eligible(&pool, generation, &limits(300)).await
     });
     let mut parent_locks = None;
+    let mut cleanup_pid = None;
     while !task.is_finished() && started.elapsed() < Duration::from_secs(2) {
-        parent_locks = sqlx::query_scalar::<_, i64>(
-            "SELECT (SELECT count(*) FROM pg_locks l WHERE l.pid=a.pid \
+        let observed = sqlx::query_as::<_, (i32, i64)>(
+            "SELECT a.pid, (SELECT count(*) FROM pg_locks l WHERE l.pid=a.pid \
              AND l.relation='cache_entry'::regclass) FROM pg_stat_activity a \
              WHERE $1=ANY(pg_blocking_pids(a.pid)) AND a.wait_event='advisory' LIMIT 1",
         )
@@ -178,18 +185,31 @@ async fn cleanup_admission_exhausts_cycle_without_parent_locks_or_waiters() {
         .fetch_optional(db.pool())
         .await
         .unwrap();
-        if parent_locks.is_some() {
+        if let Some((pid, locks)) = observed {
+            cleanup_pid = Some(pid);
+            parent_locks = Some(locks);
             break;
         }
         tokio::task::yield_now().await;
     }
     let outcome = task.await.unwrap().unwrap();
     let elapsed = started.elapsed();
-    let waiters: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=7821101 \
-         AND objid=0 AND objsubid=2 AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) \
-         AND NOT granted",
-    ).fetch_one(db.pool()).await.unwrap();
+    let (waiters, waiter_diagnostic): (i64, sqlx::types::Json<serde_json::Value>) = sqlx::query_as(
+        "SELECT count(*), COALESCE(jsonb_agg(jsonb_build_object(\
+          'pid', l.pid, 'controlled_cleanup', l.pid=$1, \
+          'state', a.state, 'wait_type', a.wait_event_type, 'wait', a.wait_event, \
+          'query_start', a.query_start, 'backend_start', a.backend_start, \
+          'query_kind', CASE \
+            WHEN a.query='SELECT pg_advisory_xact_lock($1, $2)' THEN a.query \
+            WHEN a.query LIKE 'ROLLBACK TO SAVEPOINT _sqlx_savepoint_%' THEN 'sqlx savepoint rollback' \
+            WHEN a.query='ROLLBACK' THEN 'outer rollback' \
+            ELSE 'other query, redacted' END)), '[]'::jsonb) \
+         FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid=l.pid \
+         WHERE l.locktype='advisory' AND l.classid=7821101 \
+         AND l.objid=0 AND l.objsubid=2 \
+         AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) \
+         AND NOT l.granted",
+    ).bind(cleanup_pid).fetch_one(db.pool()).await.unwrap();
     let after = usage(db.pool(), generation).await;
     holder.rollback().await.unwrap();
     db.cleanup().await.unwrap();
@@ -199,7 +219,11 @@ async fn cleanup_admission_exhausts_cycle_without_parent_locks_or_waiters() {
         elapsed < Duration::from_secs(1),
         "admission exceeded its short test cycle: {elapsed:?}"
     );
-    assert_eq!(waiters, 0);
+    assert_eq!(
+        waiters, 0,
+        "cleanup_pid={cleanup_pid:?}; holder_pid={holder_pid}; pending={:?}",
+        waiter_diagnostic.0
+    );
     assert_eq!(after, before);
 }
 

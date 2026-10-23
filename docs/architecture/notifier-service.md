@@ -46,7 +46,11 @@ Source: [service orchestration](../../crates/notifier/src/service.rs#L48-L165).
 
 ## Authorization model
 
-The notifier captures roles, permission grants, identity attributes, token type, and token expiry at connection time. It checks token expiry every 30 seconds, but permission changes do not alter an existing connection's snapshot. Reconnect after changing an identity's roles or permission sets.
+For human access tokens the notifier captures roles, permission grants, identity attributes, token type, and token expiry at connection time. It checks token expiry every 30 seconds, but permission changes do not alter that snapshot. Reconnect after changing a human identity's roles or permission sets.
+
+Recorded execution credentials do not load human IAM. Upgrade validates the persisted execution, admission, attempt, sponsor, selected refs and external approvals. Fanout checks the resolved structural target, and the socket writer checks again after dequeueing each notification. Execution, admission, attempt, selection and expiry participate in the authorization fingerprint, so two executions with the same sponsor cannot share a permit. Terminal, revoked or unavailable authority closes the connection at delivery or the next 30-second liveness check. Database failures deny delivery. Reconnect cannot restore a revoked credential.
+
+Recorded deliveries contain only the notification envelope and `payload.auth_mode: deferred`. Fetch content through the API, which applies secret-origin disclosure. Unknown entity kinds and event notifications without an exact retained partition identity are denied for recorded connections. This is not a claim that all recorded HTTP consumers or production worker issuance are enabled.
 
 Filter authorization limits what a connection may request. Delivery authorization checks each matching notification against the connected identity. Sensor tokens are narrower: they may subscribe only to `trigger_ref:<ref>` filters listed in the token and receive only matching `rule_lifecycle_changed` messages.
 

@@ -1,4 +1,4 @@
-import { defineConfig, mergeConfig } from "vitest/config";
+import { configDefaults, defineConfig, mergeConfig } from "vitest/config";
 import viteConfig from "./vite.config";
 
 // Reuses the app's Vite config (React plugin, "@" path alias) so component
@@ -10,6 +10,7 @@ export default mergeConfig(
       environment: "jsdom",
       setupFiles: ["./src/test/setup.ts"],
       css: false,
+      exclude: [...configDefaults.exclude, "scripts/**"],
     },
   }),
 );

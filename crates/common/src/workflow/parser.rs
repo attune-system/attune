@@ -67,7 +67,7 @@ pub enum ParseError {
 
 impl From<validator::ValidationErrors> for ParseError {
     fn from(errors: validator::ValidationErrors) -> Self {
-        ParseError::ValidationError(format!("{}", errors))
+        ParseError::ValidationError(crate::error::validation_message(&errors))
     }
 }
 
@@ -107,10 +107,10 @@ pub struct WorkflowDefinition {
     #[validate(length(min = 1, max = 50))]
     pub version: String,
 
-    /// Input parameter schema (JSON Schema)
+    /// Flat input parameter schema. If action metadata also declares it, the bodies must match.
     pub parameters: Option<JsonValue>,
 
-    /// Output schema (JSON Schema)
+    /// Flat output schema. If action metadata also declares it, the bodies must match.
     pub output: Option<JsonValue>,
 
     /// Workflow-scoped variables with initial values
@@ -119,6 +119,7 @@ pub struct WorkflowDefinition {
 
     /// Task definitions
     #[validate(length(min = 1))]
+    #[serde(deserialize_with = "deserialize_task_collection")]
     pub tasks: Vec<Task>,
 
     /// Output mapping (how to construct final workflow output)
@@ -281,6 +282,11 @@ pub struct Task {
     /// Action reference (for action type tasks)
     pub action: Option<String>,
 
+    /// Finite literal target ceiling for a rendered action selector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[validate(length(max = 256))]
+    pub allowed_action_refs: Vec<String>,
+
     /// Input parameters (template strings)
     #[serde(default)]
     pub input: HashMap<String, JsonValue>,
@@ -389,6 +395,7 @@ pub struct Task {
     pub join: Option<usize>,
 
     /// Parallel tasks (for parallel type)
+    #[serde(default, deserialize_with = "deserialize_optional_task_collection")]
     pub tasks: Option<Vec<Task>>,
 
     /// Frontend-only visual metadata (e.g. canvas position).
@@ -699,6 +706,64 @@ pub struct DecisionBranch {
 // Parsing & validation
 // ---------------------------------------------------------------------------
 
+fn deserialize_task_collection<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Task>, D::Error> {
+    struct Tasks;
+    impl<'input> serde::de::Visitor<'input> for Tasks {
+        type Value = Vec<Task>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array or named task object")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'input>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut tasks = Vec::new();
+            // Keep normal sequence deserialization, including located field errors.
+            while let Some(task) = sequence.next_element::<Task>()? {
+                tasks.push(task);
+            }
+            Ok(tasks)
+        }
+        fn visit_map<A: serde::de::MapAccess<'input>>(
+            self,
+            mut mapping: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut tasks = Vec::new();
+            while let Some((name, mut value)) = mapping.next_entry::<String, JsonValue>()? {
+                let task = value.as_object_mut().ok_or_else(|| {
+                    <A::Error as serde::de::Error>::custom("Named task must be an object")
+                })?;
+                if task
+                    .get("name")
+                    .is_some_and(|declared| declared.as_str() != Some(name.as_str()))
+                {
+                    return Err(<A::Error as serde::de::Error>::custom(
+                        "Named task name must match its authored map key",
+                    ));
+                }
+                task.insert("name".into(), JsonValue::String(name));
+                tasks.push(
+                    serde_json::from_value(value)
+                        .map_err(<A::Error as serde::de::Error>::custom)?,
+                );
+            }
+            Ok(tasks)
+        }
+    }
+    deserializer.deserialize_any(Tasks)
+}
+
+fn deserialize_optional_task_collection<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<Task>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    struct Tasks(#[serde(deserialize_with = "deserialize_task_collection")] Vec<Task>);
+    Option::<Tasks>::deserialize(deserializer).map(|tasks| tasks.map(|tasks| tasks.0))
+}
+
 /// Parse workflow YAML string into WorkflowDefinition
 pub fn parse_workflow_yaml(yaml: &str) -> ParseResult<WorkflowDefinition> {
     let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
@@ -709,7 +774,18 @@ pub fn parse_workflow_yaml(yaml: &str) -> ParseResult<WorkflowDefinition> {
         return Err(ParseError::ValidationError(errors.join("; ")));
     }
     // Parse YAML
-    let mut workflow: WorkflowDefinition = serde_yaml_ng::from_value(raw)?;
+    let mut workflow: WorkflowDefinition =
+        crate::pack_registry::diagnostics::decode_yaml_value("workflow metadata", "", raw)
+            .map_err(|error| match error {
+                crate::Error::Deployment { details, .. } => {
+                    let diagnostic = details.diagnostics.into_iter().next().unwrap_or_default();
+                    ParseError::InvalidField {
+                        field: diagnostic.metadata_path.unwrap_or_default(),
+                        reason: diagnostic.message,
+                    }
+                }
+                _ => ParseError::ValidationError("Invalid workflow metadata field types".into()),
+            })?;
 
     // Normalize legacy transitions into `next` arrays
     normalize_all_transitions(&mut workflow);
@@ -2121,4 +2197,29 @@ tasks:
         let error = parse_workflow_yaml(yaml).unwrap_err().to_string();
         assert!(error.contains("cyclic graph regions"));
     }
+}
+#[test]
+fn named_nested_dynamic_tasks_keep_escaped_identity_and_finite_targets() {
+    let definition: serde_json::Value = serde_json::json!({"version":"1.0", "tasks":{
+        "group/name~": {"type":"parallel", "tasks":{
+            "choose/target": {"action":"{{ parameters.target }}", "allowed_action_refs":["example.one","foreign.two"], "permission_set_refs":[]}
+        }}
+    }});
+    let parsed: WorkflowDefinition = serde_json::from_value(definition).unwrap();
+    assert_eq!(parsed.tasks[0].name, "group/name~");
+    let normalized = serde_json::to_value(parsed).unwrap();
+    let task = crate::repositories::workflow_policy::task_at_authored_path(
+        &normalized,
+        "/tasks/group~1name~0/tasks/choose~1target",
+    )
+    .unwrap();
+    assert_eq!(
+        task["allowed_action_refs"],
+        serde_json::json!(["example.one", "foreign.two"])
+    );
+    assert_eq!(task["permission_set_refs"], serde_json::json!([]));
+    assert!(serde_json::from_value::<WorkflowDefinition>(
+        serde_json::json!({"tasks":{"authored":{"name":"different", "action":"example.one"}}})
+    )
+    .is_err());
 }

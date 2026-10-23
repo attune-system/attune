@@ -21,6 +21,8 @@ pub mod permission;
 pub mod policy;
 pub mod rule;
 pub mod runtime;
+pub mod runtime_approval;
+pub mod schema_types;
 pub mod trace;
 pub mod trigger;
 pub mod webhook;
@@ -78,7 +80,7 @@ pub use pack::{
 };
 pub use permission::{
     CreateIdentityRequest, CreateIdentityRoleAssignmentRequest, CreateIntegrationTokenRequest,
-    CreateIntegrationTokenResponse, CreatePermissionAssignmentRequest,
+    CreateIntegrationTokenResponse, CreatePermissionAssignmentRequest, CreatePermissionSetRequest,
     CreatePermissionSetRoleAssignmentRequest, IdentityQueryParams, IdentityResponse,
     IdentityRoleAssignmentResponse, IdentitySummary, IntegrationTokenResponse,
     PermissionAssignmentResponse, PermissionBindingQueryParams, PermissionBindingResponse,

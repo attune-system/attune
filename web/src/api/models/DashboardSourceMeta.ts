@@ -12,7 +12,7 @@ export type DashboardSourceMeta = {
    */
   aggregate_watermark?: string | null;
   authorization_mode: DashboardAuthorizationMode;
-  authorized_refs: any | null;
+  authorized_refs: Record<string, any> | null;
   bucket_size?: string | null;
   cache_hit: boolean;
   freshness_mode: DashboardFreshnessMode;

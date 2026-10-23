@@ -41,15 +41,22 @@ pub struct ExecutionManager {
     pool: PgPool,
     publisher: Arc<Publisher>,
     consumer: Arc<Consumer>,
+    encryption_key: Option<String>,
 }
 
 impl ExecutionManager {
     /// Create a new execution manager
-    pub fn new(pool: PgPool, publisher: Arc<Publisher>, consumer: Arc<Consumer>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        publisher: Arc<Publisher>,
+        consumer: Arc<Consumer>,
+        encryption_key: Option<String>,
+    ) -> Self {
         Self {
             pool,
             publisher,
             consumer,
+            encryption_key,
         }
     }
 
@@ -59,6 +66,7 @@ impl ExecutionManager {
 
         let pool = self.pool.clone();
         let publisher = self.publisher.clone();
+        let encryption_key = self.encryption_key.clone();
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -66,10 +74,16 @@ impl ExecutionManager {
                 move |envelope: MessageEnvelope<ExecutionStatusChangedPayload>| {
                     let pool = pool.clone();
                     let publisher = publisher.clone();
+                    let encryption_key = encryption_key.clone();
 
                     async move {
-                        if let Err(e) =
-                            Self::process_status_change(&pool, &publisher, &envelope).await
+                        if let Err(e) = Self::process_status_change(
+                            &pool,
+                            &publisher,
+                            &envelope,
+                            encryption_key.as_deref(),
+                        )
+                        .await
                         {
                             error!("Error processing status change: {}", e);
                             // Return error to trigger nack with requeue
@@ -93,6 +107,7 @@ impl ExecutionManager {
         pool: &PgPool,
         publisher: &Publisher,
         envelope: &MessageEnvelope<ExecutionStatusChangedPayload>,
+        encryption_key: Option<&str>,
     ) -> Result<()> {
         debug!("Processing execution status change: {:?}", envelope);
 
@@ -121,7 +136,7 @@ impl ExecutionManager {
                 if status == ExecutionStatus::Cancelled {
                     Self::handle_workflow_cancellation(pool, publisher, &execution).await?;
                 }
-                Self::handle_completion(pool, publisher, &execution).await?;
+                Self::handle_completion(pool, publisher, &execution, encryption_key).await?;
             }
             ExecutionStatus::Canceling => {
                 debug!(
@@ -368,6 +383,7 @@ impl ExecutionManager {
         pool: &PgPool,
         publisher: &Publisher,
         execution: &Execution,
+        encryption_key: Option<&str>,
     ) -> Result<()> {
         info!("Handling completion for execution: {}", execution.id);
 
@@ -375,7 +391,14 @@ impl ExecutionManager {
         if let Some(child_actions) = Self::get_child_actions(execution).await? {
             // Only trigger children on completion
             if execution.status == ExecutionStatus::Completed {
-                Self::trigger_child_executions(pool, publisher, execution, &child_actions).await?;
+                Self::trigger_child_executions(
+                    pool,
+                    publisher,
+                    execution,
+                    &child_actions,
+                    encryption_key,
+                )
+                .await?;
             } else {
                 warn!(
                     "Execution {} failed/canceled, skipping child executions",
@@ -408,7 +431,13 @@ impl ExecutionManager {
         publisher: &Publisher,
         parent: &Execution,
         child_actions: &[String],
+        encryption_key: Option<&str>,
     ) -> Result<()> {
+        if !child_actions.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Completion callbacks are not admitted invocations; use workflow task bindings"
+            ));
+        }
         info!(
             "Triggering {} child executions for parent: {}",
             child_actions.len(),
@@ -416,6 +445,17 @@ impl ExecutionManager {
         );
 
         for action_ref in child_actions {
+            use attune_common::{
+                repositories::{
+                    execution_secret_value::ExecutionSecretValueRepository,
+                    schema_contract::{BindingOwner, SchemaContractRepository},
+                    schema_type::SchemaTypeRepository,
+                },
+                secret_values::{SecretPathSource, SecretSource, ENTITY_EXECUTION_CONFIG},
+                value_schema::CompiledContract,
+            };
+            let mut transaction = pool.begin().await?;
+            SchemaTypeRepository::lock_selection(&mut transaction).await?;
             let snapshot = match parent.executable_snapshot.as_ref().and_then(|root| {
                 root.pack_executables.get(action_ref).map(|released| {
                     attune_common::models::ExecutionExecutableSnapshot {
@@ -427,22 +467,85 @@ impl ExecutionManager {
             }) {
                 Some(snapshot) => snapshot,
                 None => attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action_ref(
-                    pool,
+                    &mut *transaction,
                     action_ref,
                 )
                 .await?,
             };
+            let binding = SchemaContractRepository::workflow_child_binding(
+                &mut transaction,
+                parent.id,
+                &snapshot,
+            )
+            .await?;
+            let stored = ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *transaction,
+                ENTITY_EXECUTION_CONFIG,
+                parent.id,
+            )
+            .await?;
+            attune_common::key_access::authorize_execution_parameter_key_origins(
+                pool,
+                parent.id,
+                parent.executor,
+                &stored,
+            )
+            .await?;
+            let plaintext = if stored.is_empty() {
+                parent.config.clone().unwrap_or(serde_json::json!({}))
+            } else {
+                attune_common::secret_values::restore_secret_values(
+                    parent.config.clone().unwrap_or(serde_json::json!({})),
+                    &stored,
+                    encryption_key.ok_or_else(|| {
+                        anyhow::anyhow!("Callback input secrets require an encryption key")
+                    })?,
+                )?
+            };
+            let contract = CompiledContract::new(&binding.input)?;
+            let plaintext = contract.apply_defaults(&plaintext)?;
+            contract.validate(&plaintext)?;
+            let paths = stored
+                .iter()
+                .map(|secret| secret.json_path.clone())
+                .collect::<Vec<_>>();
+            attune_common::secret_values::validate_contract_secret_destination_paths(
+                &plaintext, &contract, &paths,
+            )?;
+            let sources = paths
+                .into_iter()
+                .map(|path| SecretPathSource {
+                    path: path.clone(),
+                    source: SecretSource::WorkflowParameter {
+                        execution_id: parent.id,
+                        path,
+                    },
+                })
+                .collect::<Vec<_>>();
+            let (config, inputs) = attune_common::secret_values::merge_contract_secret_redactions(
+                plaintext, &sources, &contract,
+            )?;
+            let secrets = if inputs.is_empty() {
+                vec![]
+            } else {
+                attune_common::secret_values::prepare_secret_values(
+                    inputs,
+                    encryption_key.ok_or_else(|| {
+                        anyhow::anyhow!("Callback input secrets require an encryption key")
+                    })?,
+                )?
+            };
             let child_input = CreateExecutionInput {
                 action: Some(snapshot.executable.action.id),
                 action_ref: action_ref.clone(),
-                config: parent.config.clone(), // Pass parent config to child
+                config: Some(config),
                 env_vars: parent.env_vars.clone(), // Pass parent env vars to child
-                parent: Some(parent.id),       // Link to parent execution
+                parent: Some(parent.id),           // Link to parent execution
                 enforcement: parent.enforcement,
                 // Inherit triggering identity from parent so the callback
                 // token has the same security context.
                 executor: parent.executor,
-                permission_set_refs: parent.permission_set_refs.clone(),
+                permission_set_refs: Vec::new(),
                 artifact_retention_policy: parent.artifact_retention_policy,
                 artifact_retention_limit: parent.artifact_retention_limit,
                 worker_selector: parent.worker_selector.clone(),
@@ -457,7 +560,23 @@ impl ExecutionManager {
             };
 
             let child_execution =
-                ExecutionRepository::create_pinned(pool, child_input, &snapshot).await?;
+                ExecutionRepository::create_pinned(&mut *transaction, child_input, &snapshot)
+                    .await?;
+            SchemaContractRepository::attach(
+                &mut transaction,
+                BindingOwner::Execution,
+                child_execution.id,
+                &binding,
+            )
+            .await?;
+            ExecutionSecretValueRepository::upsert_many_with_conn(
+                &mut transaction,
+                ENTITY_EXECUTION_CONFIG,
+                child_execution.id,
+                &secrets,
+            )
+            .await?;
+            transaction.commit().await?;
 
             info!(
                 "Created child execution {} for parent {}",

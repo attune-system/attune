@@ -11,6 +11,7 @@ export type RegisterPacksRequest = {
    * How to handle pack-managed metadata omitted by each release.
    */
   absent_metadata_policy?: AbsentMetadataPolicy;
+  acknowledge_incompatible_rollout?: boolean;
   /**
    * Force registration (replace if exists)
    */

@@ -172,7 +172,7 @@ pub struct ExecutionContext {
     pub output_format: OutputFormat,
 
     /// Action output schema used to protect mirrored container output.
-    pub out_schema: Option<serde_json::Value>,
+    pub out_schema: Option<attune_common::value_schema::Contract>,
 
     /// Optional cancellation token for process termination.
     /// When triggered, the executor sends SIGTERM → SIGKILL

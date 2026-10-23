@@ -48,8 +48,13 @@ impl ErrorResponse {
 /// API error type that can be converted to HTTP responses
 #[derive(Debug)]
 pub enum ApiError {
+    Deployment {
+        source: Box<ApiError>,
+        details: Box<attune_common::pack_registry::diagnostics::DeploymentDetails>,
+    },
     /// Bad request (400)
     BadRequest(String),
+    PayloadTooLarge(String),
     /// Unauthorized (401)
     Unauthorized(String),
     /// Forbidden (403)
@@ -80,7 +85,9 @@ impl ApiError {
     /// Get the HTTP status code for this error
     pub fn status_code(&self) -> StatusCode {
         match self {
+            ApiError::Deployment { source, .. } => source.status_code(),
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -100,7 +107,9 @@ impl ApiError {
     /// Get the error message
     pub fn message(&self) -> &str {
         match self {
+            ApiError::Deployment { source, .. } => source.message(),
             ApiError::BadRequest(msg)
+            | ApiError::PayloadTooLarge(msg)
             | ApiError::Unauthorized(msg)
             | ApiError::Forbidden(msg)
             | ApiError::NotFound(msg)
@@ -121,7 +130,9 @@ impl ApiError {
     /// Get the error code
     pub fn code(&self) -> &str {
         match self {
+            ApiError::Deployment { source, .. } => source.code(),
             ApiError::BadRequest(_) => "BAD_REQUEST",
+            ApiError::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
             ApiError::Unauthorized(_) => "UNAUTHORIZED",
             ApiError::Forbidden(_) => "FORBIDDEN",
             ApiError::NotFound(_) => "NOT_FOUND",
@@ -134,6 +145,58 @@ impl ApiError {
             ApiError::RetryableDatabaseError => "RETRYABLE_DATABASE_ERROR",
             ApiError::DatabaseError(_) => "DATABASE_ERROR",
             ApiError::InternalServerError(_) => "INTERNAL_SERVER_ERROR",
+        }
+    }
+
+    pub fn deployment_details(
+        &self,
+    ) -> Option<&attune_common::pack_registry::diagnostics::DeploymentDetails> {
+        match self {
+            Self::Deployment { details, .. } => Some(details),
+            _ => None,
+        }
+    }
+
+    pub fn response_body(&self) -> ErrorResponse {
+        let mut body = ErrorResponse::new(self.message()).with_code(self.code());
+        if let Some(details) = self.deployment_details() {
+            body.details = serde_json::to_value(details).ok();
+        }
+        body
+    }
+
+    pub fn in_deployment(
+        self,
+        stage: &str,
+        pack_ref: &str,
+        version: &str,
+        install_id: Option<i64>,
+    ) -> Self {
+        let mut details = self.deployment_details().cloned().unwrap_or_else(|| {
+            attune_common::pack_registry::diagnostics::DeploymentDetails::new(stage, Vec::new())
+        });
+        if !pack_ref.is_empty() {
+            details.pack_ref = Some(pack_ref.into());
+        }
+        if !version.is_empty() {
+            details.version = Some(version.into());
+        }
+        details.install_id = install_id;
+        let mut source = match self {
+            Self::Deployment { source, .. } => source,
+            other => Box::new(other),
+        };
+        match &mut *source {
+            Self::InternalServerError(message)
+            | Self::DatabaseError(message)
+            | Self::BadGateway(message) => {
+                *message = format!("The API could not complete {}. Ask the operator to check the responsible service configuration. Check install status before retrying.", details.stage.replace('_', " "));
+            }
+            _ => {}
+        }
+        Self::Deployment {
+            source,
+            details: Box::new(details),
         }
     }
 }
@@ -149,7 +212,7 @@ impl std::error::Error for ApiError {}
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let error_response = ErrorResponse::new(self.message()).with_code(self.code());
+        let error_response = self.response_body();
 
         let mut response = (status, Json(error_response)).into_response();
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -209,10 +272,10 @@ impl From<sqlx::Error> for ApiError {
                 } else if let Some(constraint) = db_err.constraint() {
                     ApiError::Conflict(format!("Constraint violation: {}", constraint))
                 } else {
-                    ApiError::DatabaseError(format!("Database error: {}", db_err))
+                    ApiError::DatabaseError("The database operation failed. Check API database availability and install status before retrying.".into())
                 }
             }
-            _ => ApiError::DatabaseError(format!("Database error: {}", err)),
+            _ => ApiError::DatabaseError("The database operation failed. Check API database availability and install status before retrying.".into()),
         }
     }
 }
@@ -220,6 +283,21 @@ impl From<sqlx::Error> for ApiError {
 impl From<attune_common::error::Error> for ApiError {
     fn from(err: attune_common::error::Error) -> Self {
         match err {
+            attune_common::error::Error::Deployment { details, source } => {
+                let source = match *source {
+                    attune_common::Error::Validation(message) | attune_common::Error::SchemaValidation(message) => {
+                        if details.diagnostics.iter().any(|diagnostic| diagnostic.code == "metadata.invalid_yaml") { ApiError::BadRequest(message) }
+                        else { ApiError::UnprocessableEntity(message) }
+                    },
+                    attune_common::Error::Io(_) | attune_common::Error::Internal(_) | attune_common::Error::Configuration(_) | attune_common::Error::Other(_) =>
+                        ApiError::InternalServerError(format!("The API could not complete {}. Ask the operator to check service configuration and storage. Check install status before retrying.", details.stage.replace('_', " "))),
+                    other => ApiError::from(other),
+                };
+                ApiError::Deployment {
+                    source: Box::new(source),
+                    details,
+                }
+            }
             attune_common::error::Error::NotFound {
                 entity,
                 field,
@@ -278,7 +356,7 @@ impl From<attune_common::error::Error> for ApiError {
 
 impl From<validator::ValidationErrors> for ApiError {
     fn from(err: validator::ValidationErrors) -> Self {
-        ApiError::ValidationError(format!("Validation failed: {}", err))
+        ApiError::ValidationError(attune_common::error::validation_message(&err))
     }
 }
 
@@ -331,6 +409,57 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::{borrow::Cow, error::Error, fmt};
+
+    #[tokio::test]
+    async fn deployment_errors_preserve_category_and_source_locations() {
+        let error = ApiError::from(attune_common::pack_registry::diagnostics::located(
+            attune_common::Error::PermissionDenied("Cannot delegate the requested grant".into()),
+            "permission_sets/deploy.yaml",
+            "/grants/0/actions",
+        ));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        let details = body.details.unwrap();
+        assert_eq!(
+            details["diagnostics"][0]["path"],
+            "permission_sets/deploy.yaml"
+        );
+        assert_eq!(
+            details["diagnostics"][0]["metadata_path"],
+            "/grants/0/actions"
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_infrastructure_failures_do_not_expose_internal_values() {
+        let error = ApiError::from(attune_common::pack_registry::diagnostics::located(
+            attune_common::Error::Io("SECRET_CANARY: /private/staging/path".into()),
+            "actions/run.yaml",
+            "",
+        ));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("SECRET_CANARY"));
+        assert!(!body.contains("/private/staging"));
+        assert!(body.contains("component loading"));
+    }
+
+    #[test]
+    fn deployment_does_not_demote_retryable_database_failures_to_bad_requests() {
+        let error = ApiError::from(attune_common::pack_registry::diagnostics::located(
+            attune_common::Error::Database(sqlx::Error::Database(Box::new(TestDatabaseError {
+                code: "40001",
+            }))),
+            "actions/run.yaml",
+            "",
+        ));
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code(), "RETRYABLE_DATABASE_ERROR");
+    }
 
     #[derive(Debug)]
     struct TestDatabaseError {

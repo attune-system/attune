@@ -63,6 +63,7 @@ pub struct UpdateRuntimeInput {
 /// Filters for [`RuntimeRepository::list_search`].
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeSearchFilters {
+    pub visibility: Option<super::event::VisibilityReadScope>,
     pub pack: Option<Id>,
     /// Text search across ref, name, description, and pack_ref.
     pub query: Option<String>,
@@ -360,6 +361,20 @@ impl RuntimeRepository {
             }
         }
 
+        if let Some(scope) = &filters.visibility {
+            for query in [&mut query, &mut count_query] {
+                query.push(" AND ");
+                super::event::push_visibility_scope_predicate(
+                    query,
+                    scope,
+                    "runtime.id",
+                    "runtime.ref",
+                    "runtime.pack_ref",
+                    &super::iam_ownership::component_pack("runtime"),
+                    None,
+                );
+            }
+        }
         let total: i64 = count_query.build_query_scalar().fetch_one(db).await?;
         query.push(" ORDER BY ref ASC LIMIT ");
         query.push_bind(filters.limit as i64);

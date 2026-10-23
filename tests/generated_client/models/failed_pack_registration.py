@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 from typing_extensions import Self
+
+from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="FailedPackRegistration")
 
@@ -19,12 +21,14 @@ class FailedPackRegistration:
         error_stage (str): Error stage
         pack_path (str): Pack path
         pack_ref (str): Pack reference
+        details (Any | None | Unset):
     """
 
     error: str
     error_stage: str
     pack_path: str
     pack_ref: str
+    details: Any | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -36,6 +40,12 @@ class FailedPackRegistration:
 
         pack_ref = self.pack_ref
 
+        details: Any | None | Unset
+        if isinstance(self.details, Unset):
+            details = UNSET
+        else:
+            details = self.details
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -46,6 +56,8 @@ class FailedPackRegistration:
                 "pack_ref": pack_ref,
             }
         )
+        if details is not UNSET:
+            field_dict["details"] = details
 
         return field_dict
 
@@ -60,11 +72,21 @@ class FailedPackRegistration:
 
         pack_ref = d.pop("pack_ref")
 
+        def _parse_details(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        details = _parse_details(d.pop("details", UNSET))
+
         failed_pack_registration = cls(
             error=error,
             error_stage=error_stage,
             pack_path=pack_path,
             pack_ref=pack_ref,
+            details=details,
         )
 
         failed_pack_registration.additional_properties = d

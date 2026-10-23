@@ -510,16 +510,10 @@ async fn test_queue_admin_like_crud_and_pending_item_guards() {
         .await
         .expect("Failed to create test context");
 
-    let (_pack, action) = create_pack_with_action(
-        &ctx,
-        &format!("queue_admin_pack_{}", uuid::Uuid::new_v4().simple()),
-        &format!(
-            "queue_admin_pack.dispatch_{}",
-            uuid::Uuid::new_v4().simple()
-        ),
-    )
-    .await
-    .expect("Failed to create queue fixture");
+    let pack_ref = format!("queue_admin_pack_{}", uuid::Uuid::new_v4().simple());
+    let (_pack, action) = create_pack_with_action(&ctx, &pack_ref, &format!("{pack_ref}.dispatch"))
+        .await
+        .expect("Failed to create queue fixture");
 
     let token = register_scoped_user(
         &ctx,

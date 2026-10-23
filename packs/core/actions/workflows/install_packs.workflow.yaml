@@ -1,0 +1,223 @@
+version: "1.0.0"
+vars:
+  pack_paths: []
+  registered_packs: []
+  failed_packs: []
+  installed_dependencies: []
+  duration_seconds: 0
+  summary:
+    total_requested: 0
+    success_count: 0
+    failure_count: 0
+    dependencies_installed: 0
+    duration_seconds: 0
+tasks:
+  - name: initialize
+    action: core.noop
+    input:
+      message: Starting explicit-source pack installation
+    next:
+      - when: "{{ succeeded() and not ('api_token' in parameters) }}"
+        publish: &initial_summary
+          - summary:
+              total_requested: "{{ length(parameters.packs) }}"
+              success_count: 0
+              failure_count: "{{ length(parameters.packs) }}"
+              dependencies_installed: 0
+              duration_seconds: 0
+        do: [download_packs]
+      - when: "{{ succeeded() and 'api_token' in parameters }}"
+        publish: *initial_summary
+        do: [download_packs_with_token]
+
+  - name: download_packs
+    action: core.download_packs
+    timeout: "{{ int(parameters.timeout / 4) }}"
+    input:
+      packs: "{{ parameters.packs }}"
+      destination_dir: /tmp/attune-pack-downloads
+      ref_spec: "{{ parameters.ref_spec }}"
+      timeout: "{{ min(300, int(parameters.timeout / 4)) }}"
+      verify_ssl: true
+    next: &after_download
+      - when: "{{ succeeded() and result().success_count > 0 }}"
+        publish:
+          - pack_paths: "{{ result().pack_paths }}"
+          - failed_packs: "{{ result().failed_packs }}"
+          - duration_seconds: "{{ result().duration_seconds }}"
+        do: [check_dependencies]
+      - when: "{{ succeeded() and result().success_count == 0 }}"
+        publish:
+          - failed_packs: "{{ result().failed_packs }}"
+        do: [fail_installation]
+      - when: "{{ failed() or timed_out() }}"
+        do: [fail_installation]
+
+  - name: check_dependencies
+    action: core.noop
+    next:
+      - when: "{{ succeeded() and not parameters.skip_dependencies and not ('api_token' in parameters) }}"
+        do: [get_dependencies]
+      - when: "{{ succeeded() and not parameters.skip_dependencies and 'api_token' in parameters }}"
+        do: [get_dependencies_with_token]
+      - when: "{{ succeeded() and parameters.skip_dependencies }}"
+        do: [check_environment]
+
+  - name: get_dependencies
+    action: core.get_pack_dependencies
+    timeout: "{{ int(parameters.timeout / 4) }}"
+    input:
+      pack_paths: "{{ workflow.pack_paths }}"
+      skip_validation: false
+    next: &after_dependencies
+      - when: "{{ succeeded() and length(result().missing_dependencies) == 0 and length(result().errors) == 0 }}"
+        publish:
+          - duration_seconds: "{{ workflow.duration_seconds + result().duration_seconds }}"
+        do: [check_environment]
+      - when: "{{ succeeded() and (length(result().missing_dependencies) > 0 or length(result().errors) > 0) }}"
+        publish:
+          - failed_packs: "{{ workflow.failed_packs + result().errors + result().missing_dependencies }}"
+        do: [fail_installation]
+      - when: "{{ failed() or timed_out() }}"
+        do: [fail_installation]
+
+  - name: check_environment
+    action: core.noop
+    next:
+      - when: "{{ succeeded() and not parameters.skip_env_build and not ('api_token' in parameters) }}"
+        do: [build_environments]
+      - when: "{{ succeeded() and not parameters.skip_env_build and 'api_token' in parameters }}"
+        do: [build_environments_with_token]
+      - when: "{{ succeeded() and parameters.skip_env_build and not ('api_token' in parameters) }}"
+        do: [register_packs]
+      - when: "{{ succeeded() and parameters.skip_env_build and 'api_token' in parameters }}"
+        do: [register_packs_with_token]
+
+  - name: build_environments
+    action: core.build_pack_envs
+    timeout: "{{ int(parameters.timeout / 4) }}"
+    input:
+      pack_paths: "{{ workflow.pack_paths }}"
+      packs_base_dir: "{{ parameters.packs_base_dir }}"
+      python_version: "3.11"
+      nodejs_version: "20"
+      skip_python: false
+      skip_nodejs: false
+      force_rebuild: "{{ parameters.force }}"
+      timeout: "{{ min(600, int(parameters.timeout / 4)) }}"
+    next: &after_environment
+      - when: "{{ succeeded() and (result().summary.failure_count == 0 or parameters.force) and not ('api_token' in parameters) }}"
+        publish: &environment_result
+          - duration_seconds: "{{ workflow.duration_seconds + result().duration_seconds }}"
+          - failed_packs: "{{ workflow.failed_packs + result().failed_environments }}"
+        do: [register_packs]
+      - when: "{{ succeeded() and (result().summary.failure_count == 0 or parameters.force) and 'api_token' in parameters }}"
+        publish: *environment_result
+        do: [register_packs_with_token]
+      - when: "{{ succeeded() and result().summary.failure_count > 0 and not parameters.force }}"
+        publish:
+          - failed_packs: "{{ workflow.failed_packs + result().failed_environments }}"
+        do: [fail_installation]
+      - when: "{{ (failed() or timed_out()) and parameters.force and not ('api_token' in parameters) }}"
+        do: [register_packs]
+      - when: "{{ (failed() or timed_out()) and parameters.force and 'api_token' in parameters }}"
+        do: [register_packs_with_token]
+      - when: "{{ (failed() or timed_out()) and not parameters.force }}"
+        do: [fail_installation]
+
+  # Candidate tests belong to this ordinary registration request. There is no
+  # invented run_pack_tests action and force does not imply skip_tests.
+  - name: register_packs
+    action: core.register_packs
+    timeout: "{{ int(parameters.timeout / 4) }}"
+    input:
+      pack_paths: "{{ workflow.pack_paths }}"
+      packs_base_dir: "{{ parameters.packs_base_dir }}"
+      skip_validation: false
+      skip_tests: "{{ parameters.skip_tests }}"
+      force: "{{ parameters.force }}"
+    next: &after_registration
+      - when: "{{ succeeded() and result().summary.success_count > 0 }}"
+        publish:
+          - registered_packs: "{{ result().registered_packs }}"
+          - failed_packs: "{{ workflow.failed_packs + result().failed_packs }}"
+          - summary:
+              total_requested: "{{ length(parameters.packs) }}"
+              success_count: "{{ result().summary.success_count }}"
+              failure_count: "{{ length(parameters.packs) - result().summary.success_count }}"
+              dependencies_installed: 0
+              duration_seconds: "{{ workflow.duration_seconds + result().duration_seconds }}"
+      - when: "{{ succeeded() and result().summary.success_count == 0 }}"
+        publish:
+          - failed_packs: "{{ workflow.failed_packs + result().failed_packs }}"
+        do: [fail_installation]
+      - when: "{{ failed() or timed_out() }}"
+        do: [fail_installation]
+
+  - name: fail_installation
+    action: core.noop
+    input:
+      message: Pack installation failed. Inspect child execution and API admission diagnostics.
+      exit_code: 1
+
+  # Optional secrets have no literal schema defaults. Native guarded branches
+  # omit the child field entirely when absent, rather than looking up a missing
+  # parameter or manufacturing an empty secret. Provided values retain their
+  # direct parameter expression and the renderer's recorded source evidence.
+  - name: download_packs_with_token
+    action: core.download_packs
+    timeout: "{{ int(parameters.timeout / 4) }}"
+    input:
+      packs: "{{ parameters.packs }}"
+      destination_dir: /tmp/attune-pack-downloads
+      ref_spec: "{{ parameters.ref_spec }}"
+      api_url: "{{ parameters.api_url }}"
+      api_token: "{{ parameters.api_token }}"
+      timeout: "{{ min(300, int(parameters.timeout / 4)) }}"
+      verify_ssl: true
+    next: *after_download
+
+  - name: get_dependencies_with_token
+    action: core.get_pack_dependencies
+    timeout: "{{ int(parameters.timeout / 4) }}"
+    input:
+      pack_paths: "{{ workflow.pack_paths }}"
+      api_url: "{{ parameters.api_url }}"
+      api_token: "{{ parameters.api_token }}"
+      skip_validation: false
+    next: *after_dependencies
+
+  - name: build_environments_with_token
+    action: core.build_pack_envs
+    timeout: "{{ int(parameters.timeout / 4) }}"
+    input:
+      pack_paths: "{{ workflow.pack_paths }}"
+      packs_base_dir: "{{ parameters.packs_base_dir }}"
+      python_version: "3.11"
+      nodejs_version: "20"
+      skip_python: false
+      skip_nodejs: false
+      force_rebuild: "{{ parameters.force }}"
+      timeout: "{{ min(600, int(parameters.timeout / 4)) }}"
+      api_url: "{{ parameters.api_url }}"
+      api_token: "{{ parameters.api_token }}"
+    next: *after_environment
+
+  - name: register_packs_with_token
+    action: core.register_packs
+    timeout: "{{ int(parameters.timeout / 4) }}"
+    input:
+      pack_paths: "{{ workflow.pack_paths }}"
+      packs_base_dir: "{{ parameters.packs_base_dir }}"
+      skip_validation: false
+      skip_tests: "{{ parameters.skip_tests }}"
+      force: "{{ parameters.force }}"
+      api_url: "{{ parameters.api_url }}"
+      api_token: "{{ parameters.api_token }}"
+    next: *after_registration
+
+output_map:
+  registered_packs: "{{ workflow.registered_packs }}"
+  failed_packs: "{{ workflow.failed_packs }}"
+  installed_dependencies: "{{ workflow.installed_dependencies }}"
+  summary: "{{ workflow.summary }}"

@@ -40,7 +40,7 @@ pub enum EvalError {
 
 /// Trait for resolving variables and workflow-specific functions from
 /// the execution context.
-pub trait EvalContext {
+pub trait EvalContext: Sync {
     /// Resolve a top-level variable name to its JSON value.
     fn resolve_variable(&self, name: &str) -> EvalResult<JsonValue>;
 
@@ -51,78 +51,450 @@ pub trait EvalContext {
         name: &str,
         args: &[JsonValue],
     ) -> EvalResult<Option<JsonValue>>;
+    fn workflow_function_source(&self, name: &str, args: &[JsonValue]) -> Option<SelectedField> {
+        function_source(name, args)
+    }
+}
+
+fn function_source(name: &str, args: &[JsonValue]) -> Option<SelectedField> {
+    (name == "result" && args.is_empty()).then(|| SelectedField {
+        namespace: "result".into(),
+        path: String::new(),
+    })
+}
+
+/// Asynchronous source loading at the exact selected member, not a selector
+/// prepass. Both sync and async entry points use the evaluator below.
+pub trait AsyncEvalContext: Sync {
+    fn workflow_function_source(&self, name: &str, args: &[JsonValue]) -> Option<SelectedField> {
+        function_source(name, args)
+    }
+    fn resolve_variable<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, EvalResult<JsonValue>>;
+    fn call_workflow_function<'a>(
+        &'a self,
+        name: &'a str,
+        args: &'a [JsonValue],
+    ) -> futures::future::BoxFuture<'a, EvalResult<Option<JsonValue>>>;
+    fn resolve_member<'a>(
+        &'a self,
+        _source: &'a SelectedField,
+        _member: &'a str,
+    ) -> futures::future::BoxFuture<'a, EvalResult<Option<JsonValue>>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+struct SynchronousContext<'a>(&'a dyn EvalContext);
+impl AsyncEvalContext for SynchronousContext<'_> {
+    fn workflow_function_source(&self, name: &str, args: &[JsonValue]) -> Option<SelectedField> {
+        self.0.workflow_function_source(name, args)
+    }
+    fn resolve_variable<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, EvalResult<JsonValue>> {
+        Box::pin(async move { self.0.resolve_variable(name) })
+    }
+    fn call_workflow_function<'a>(
+        &'a self,
+        name: &'a str,
+        args: &'a [JsonValue],
+    ) -> futures::future::BoxFuture<'a, EvalResult<Option<JsonValue>>> {
+        Box::pin(async move { self.0.call_workflow_function(name, args) })
+    }
+}
+
+/// An actual selected field. JSON pointers keep dotted/slashed property names
+/// distinct, unlike the display paths used by legacy template sensitivity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SelectedField {
+    pub namespace: String,
+    pub path: String,
+}
+
+pub struct SelectedEvaluation {
+    pub value: JsonValue,
+    pub direct: Option<SelectedField>,
+    pub fields: std::collections::BTreeSet<SelectedField>,
+}
+
+struct EvaluatedValue {
+    value: JsonValue,
+    field: Option<SelectedField>,
+}
+
+impl EvaluatedValue {
+    fn plain(value: JsonValue) -> Self {
+        Self { value, field: None }
+    }
+    fn consume(self, fields: &mut std::collections::BTreeSet<SelectedField>) -> JsonValue {
+        if let Some(field) = self.field {
+            fields.insert(field);
+        }
+        self.value
+    }
+    fn selected(value: JsonValue, namespace: &str) -> Self {
+        Self {
+            value,
+            field: Some(SelectedField {
+                namespace: namespace.into(),
+                path: String::new(),
+            }),
+        }
+    }
+    fn member(self, value: JsonValue, member: &str) -> Self {
+        let field = self.field.map(|mut field| {
+            field.path.push('/');
+            field
+                .path
+                .push_str(&member.replace('~', "~0").replace('/', "~1"));
+            field
+        });
+        Self { value, field }
+    }
+}
+
+/// Selection evidence comes from the same evaluator pass as the value. Dynamic
+/// selectors run once and short-circuited branches supply no invented reads.
+pub fn eval_selected(expr: &Expr, ctx: &dyn EvalContext) -> EvalResult<SelectedEvaluation> {
+    use futures::FutureExt;
+    // The synchronous adapter never suspends. This polls once and does not
+    // block a runtime thread or create an executor for asynchronous I/O.
+    eval_selected_async(expr, &SynchronousContext(ctx))
+        .now_or_never()
+        .expect("synchronous expression context suspended")
+}
+
+pub async fn eval_selected_async(
+    expr: &Expr,
+    ctx: &dyn AsyncEvalContext,
+) -> EvalResult<SelectedEvaluation> {
+    let mut fields = std::collections::BTreeSet::new();
+    let result = eval_inner(expr, ctx, &mut fields, 0).await?;
+    let direct = result.field.clone();
+    let value = result.consume(&mut fields);
+    if fields.len() > 4096 {
+        return Err(EvalError::TypeError(
+            "Expression selection exceeds its bound".into(),
+        ));
+    }
+    Ok(SelectedEvaluation {
+        value,
+        direct,
+        fields,
+    })
 }
 
 /// Evaluate an AST expression against the given context.
 pub fn eval(expr: &Expr, ctx: &dyn EvalContext) -> EvalResult<JsonValue> {
-    match expr {
-        Expr::Literal(v) => Ok(v.clone()),
+    Ok(eval_selected(expr, ctx)?.value)
+}
 
-        Expr::Array(elements) => {
-            let mut arr = Vec::with_capacity(elements.len());
-            for elem in elements {
-                arr.push(eval(elem, ctx)?);
-            }
-            Ok(JsonValue::Array(arr))
+fn eval_inner<'a>(
+    expr: &'a Expr,
+    ctx: &'a dyn AsyncEvalContext,
+    fields: &'a mut std::collections::BTreeSet<SelectedField>,
+    depth: usize,
+) -> futures::future::BoxFuture<'a, EvalResult<EvaluatedValue>> {
+    Box::pin(async move {
+        if depth > 32 || fields.len() > 4096 {
+            return Err(EvalError::TypeError(
+                "Expression selection exceeds its bound".into(),
+            ));
         }
+        let depth = depth + 1;
+        match expr {
+            Expr::Literal(v) => Ok(EvaluatedValue::plain(v.clone())),
 
-        Expr::Ident(name) => ctx.resolve_variable(name),
-
-        Expr::BinaryOp { op, left, right } => {
-            // Short-circuit for `and` / `or`
-            if *op == BinaryOp::And {
-                let lv = eval(left, ctx)?;
-                if !is_truthy(&lv) {
-                    return Ok(json!(false));
+            Expr::Array(elements) => {
+                let mut arr = Vec::with_capacity(elements.len());
+                for elem in elements {
+                    arr.push(eval_inner(elem, ctx, fields, depth).await?.consume(fields));
                 }
-                let rv = eval(right, ctx)?;
-                return Ok(json!(is_truthy(&rv)));
+                Ok(EvaluatedValue::plain(JsonValue::Array(arr)))
             }
-            if *op == BinaryOp::Or {
-                let lv = eval(left, ctx)?;
-                if is_truthy(&lv) {
-                    return Ok(json!(true));
+
+            Expr::Ident(name) => Ok(EvaluatedValue::selected(
+                ctx.resolve_variable(name).await?,
+                name,
+            )),
+
+            Expr::BinaryOp { op, left, right } => {
+                // Short-circuit for `and` / `or`
+                if *op == BinaryOp::And {
+                    let lv = eval_inner(left, ctx, fields, depth).await?.consume(fields);
+                    if !is_truthy(&lv) {
+                        return Ok(EvaluatedValue::plain(json!(false)));
+                    }
+                    let rv = eval_inner(right, ctx, fields, depth).await?.consume(fields);
+                    return Ok(EvaluatedValue::plain(json!(is_truthy(&rv))));
                 }
-                let rv = eval(right, ctx)?;
-                return Ok(json!(is_truthy(&rv)));
+                if *op == BinaryOp::Or {
+                    let lv = eval_inner(left, ctx, fields, depth).await?.consume(fields);
+                    if is_truthy(&lv) {
+                        return Ok(EvaluatedValue::plain(json!(true)));
+                    }
+                    let rv = eval_inner(right, ctx, fields, depth).await?.consume(fields);
+                    return Ok(EvaluatedValue::plain(json!(is_truthy(&rv))));
+                }
+
+                let lv = eval_inner(left, ctx, fields, depth).await?.consume(fields);
+                let rv = eval_inner(right, ctx, fields, depth).await?.consume(fields);
+                Ok(EvaluatedValue::plain(eval_binary_op(*op, &lv, &rv)?))
             }
 
-            let lv = eval(left, ctx)?;
-            let rv = eval(right, ctx)?;
-            eval_binary_op(*op, &lv, &rv)
-        }
-
-        Expr::UnaryOp { op, operand } => {
-            let v = eval(operand, ctx)?;
-            eval_unary_op(*op, &v)
-        }
-
-        Expr::DotAccess { object, field } => {
-            let obj = eval(object, ctx)?;
-            dot_access(&obj, field)
-        }
-
-        Expr::IndexAccess { object, index } => {
-            let obj = eval(object, ctx)?;
-            let idx = eval(index, ctx)?;
-            index_access(&obj, &idx)
-        }
-
-        Expr::FunctionCall { name, args } => {
-            // First, try workflow-specific functions (result(), succeeded(), etc.)
-            // We evaluate args lazily for workflow fns that take 0 args.
-            let evaluated_args: Vec<JsonValue> = args
-                .iter()
-                .map(|a| eval(a, ctx))
-                .collect::<EvalResult<Vec<_>>>()?;
-
-            if let Some(val) = ctx.call_workflow_function(name, &evaluated_args)? {
-                return Ok(val);
+            Expr::UnaryOp { op, operand } => {
+                let v = eval_inner(operand, ctx, fields, depth)
+                    .await?
+                    .consume(fields);
+                Ok(EvaluatedValue::plain(eval_unary_op(*op, &v)?))
             }
 
-            // Built-in functions
-            eval_builtin_function(name, &evaluated_args)
+            Expr::DotAccess { object, field } => {
+                let obj = eval_inner(object, ctx, fields, depth).await?;
+                let loaded = if let Some(source) = &obj.field {
+                    ctx.resolve_member(source, field).await?
+                } else {
+                    None
+                };
+                let value = match loaded {
+                    Some(value) => value,
+                    None => dot_access(&obj.value, field)?,
+                };
+                Ok(obj.member(value, field))
+            }
+
+            Expr::IndexAccess { object, index } => {
+                let obj = eval_inner(object, ctx, fields, depth).await?;
+                let idx = eval_inner(index, ctx, fields, depth).await?.consume(fields);
+                let loaded = if let (Some(source), Some(member)) = (&obj.field, idx.as_str()) {
+                    ctx.resolve_member(source, member).await?
+                } else {
+                    None
+                };
+                let value = match loaded {
+                    Some(value) => value,
+                    None => index_access(&obj.value, &idx)?,
+                };
+                if obj.value.is_string() {
+                    obj.consume(fields);
+                    return Ok(EvaluatedValue::plain(value));
+                }
+                let member = match idx {
+                    JsonValue::String(index) => index,
+                    JsonValue::Number(index) => {
+                        let index = index.as_i64().ok_or_else(|| {
+                            EvalError::TypeError("Invalid selected field index".into())
+                        })?;
+                        if index < 0 {
+                            (obj.value
+                                .as_array()
+                                .ok_or_else(|| {
+                                    EvalError::TypeError("Invalid selected field container".into())
+                                })?
+                                .len() as i64
+                                + index)
+                                .to_string()
+                        } else {
+                            index.to_string()
+                        }
+                    }
+                    _ => return Err(EvalError::TypeError("Invalid selected field index".into())),
+                };
+                Ok(obj.member(value, &member))
+            }
+
+            Expr::FunctionCall { name, args } => {
+                // First, try workflow-specific functions (result(), succeeded(), etc.)
+                // We evaluate args lazily for workflow fns that take 0 args.
+                let mut evaluated_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    evaluated_args.push(eval_inner(arg, ctx, fields, depth).await?.consume(fields));
+                }
+
+                if let Some(val) = ctx.call_workflow_function(name, &evaluated_args).await? {
+                    return Ok(EvaluatedValue {
+                        value: val,
+                        field: ctx.workflow_function_source(name, &evaluated_args),
+                    });
+                }
+
+                // Built-in functions
+                Ok(EvaluatedValue::plain(eval_builtin_function(
+                    name,
+                    &evaluated_args,
+                )?))
+            }
         }
+    })
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use std::{
+        collections::BTreeSet,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Default)]
+    struct LoadingContext {
+        selectors: AtomicUsize,
+        reads: AtomicUsize,
+    }
+    impl AsyncEvalContext for LoadingContext {
+        fn resolve_variable<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> futures::future::BoxFuture<'a, EvalResult<JsonValue>> {
+            Box::pin(async move {
+                match name {
+                    "keystore" => Ok(json!({})),
+                    "parameters" => {
+                        self.selectors.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"selector":"first"}))
+                    }
+                    _ => Err(EvalError::VariableNotFound(name.into())),
+                }
+            })
+        }
+        fn call_workflow_function<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: &'a [JsonValue],
+        ) -> futures::future::BoxFuture<'a, EvalResult<Option<JsonValue>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn resolve_member<'a>(
+            &'a self,
+            source: &'a SelectedField,
+            member: &'a str,
+        ) -> futures::future::BoxFuture<'a, EvalResult<Option<JsonValue>>> {
+            Box::pin(async move {
+                if source.namespace != "keystore" || !source.path.is_empty() {
+                    return Ok(None);
+                }
+                tokio::task::yield_now().await;
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(match member {
+                    "first" => json!({"next":"second"}),
+                    "second" => json!("selected"),
+                    _ => return Err(EvalError::VariableNotFound(member.into())),
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn async_member_loading_keeps_nested_dynamic_selectors_in_one_canonical_pass() {
+        let context = LoadingContext::default();
+        let ast =
+            super::super::parse_expression("keystore[keystore[parameters.selector].next]").unwrap();
+        let result = eval_selected_async(&ast, &context).await.unwrap();
+        assert_eq!(result.value, json!("selected"));
+        assert_eq!(context.selectors.load(Ordering::SeqCst), 1);
+        assert_eq!(context.reads.load(Ordering::SeqCst), 2);
+        assert!(result.fields.contains(&SelectedField {
+            namespace: "parameters".into(),
+            path: "/selector".into()
+        }));
+        assert!(result.fields.contains(&SelectedField {
+            namespace: "keystore".into(),
+            path: "/first/next".into()
+        }));
+        assert!(result.fields.contains(&SelectedField {
+            namespace: "keystore".into(),
+            path: "/second".into()
+        }));
+        let short =
+            super::super::parse_expression("true or keystore[parameters.selector]").unwrap();
+        let result = eval_selected_async(&short, &context).await.unwrap();
+        assert!(result.fields.is_empty());
+        assert_eq!(context.selectors.load(Ordering::SeqCst), 1);
+        assert_eq!(context.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Default)]
+    struct Context {
+        selectors: AtomicUsize,
+    }
+    impl EvalContext for Context {
+        fn resolve_variable(&self, name: &str) -> EvalResult<JsonValue> {
+            match name {
+                "parameters" => Ok(json!({"a.b/~":"secret", "tokens":["one","two"]})),
+                "workflow" => {
+                    self.selectors.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"field":"a.b/~"}))
+                }
+                "config" => Ok(json!({"suffix":"!"})),
+                _ => Err(EvalError::VariableNotFound(name.into())),
+            }
+        }
+        fn call_workflow_function(
+            &self,
+            _: &str,
+            _: &[JsonValue],
+        ) -> EvalResult<Option<JsonValue>> {
+            Ok(None)
+        }
+    }
+    fn selected(input: &str, context: &Context) -> SelectedEvaluation {
+        eval_selected(&super::super::parse_expression(input).unwrap(), context).unwrap()
+    }
+
+    #[test]
+    fn actual_dynamic_selection_runs_once_and_preserves_pointer_segments() {
+        let context = Context::default();
+        let result = selected("parameters[workflow.field]", &context);
+        assert_eq!(result.value, json!("secret"));
+        assert_eq!(context.selectors.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            result.direct,
+            Some(SelectedField {
+                namespace: "parameters".into(),
+                path: "/a.b~1~0".into()
+            })
+        );
+        assert_eq!(
+            result.fields,
+            BTreeSet::from([
+                SelectedField {
+                    namespace: "parameters".into(),
+                    path: "/a.b~1~0".into()
+                },
+                SelectedField {
+                    namespace: "workflow".into(),
+                    path: "/field".into()
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn mixed_and_negative_index_sources_are_exact_and_unused_branches_are_absent() {
+        let context = Context::default();
+        let result = selected("parameters.tokens[-1] + config.suffix", &context);
+        assert_eq!(result.value, json!("two!"));
+        assert!(result.direct.is_none());
+        assert_eq!(
+            result.fields,
+            BTreeSet::from([
+                SelectedField {
+                    namespace: "parameters".into(),
+                    path: "/tokens/1".into()
+                },
+                SelectedField {
+                    namespace: "config".into(),
+                    path: "/suffix".into()
+                },
+            ])
+        );
+        let short = selected("false and missing.token", &context);
+        assert_eq!(short.value, json!(false));
+        assert!(short.fields.is_empty());
     }
 }
 

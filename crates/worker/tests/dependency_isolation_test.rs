@@ -305,6 +305,7 @@ async fn test_unittest_uses_prepared_runtime_dependencies() {
         .expect("Failed to prepare Python test environment");
 
     let test_config = TestConfig {
+        candidate_api_effects: false,
         enabled: true,
         discovery: DiscoveryConfig {
             method: "directory".to_string(),

@@ -9,7 +9,6 @@ use crate::scheduling::{parse_worker_affinity, parse_worker_selector, parse_work
 use crate::trace_tag::default_execution_trace_tag;
 use crate::{Error, Result};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder, Row};
-use tokio::time::{sleep, Duration};
 
 use super::{ref_filter_like_pattern, Create, Delete, FindById, List, Repository, Update};
 
@@ -158,6 +157,201 @@ pub const SELECT_COLUMNS: &str = "\
     original_execution, started_at, timeout_seconds, workflow_task, created, updated";
 
 pub struct ExecutionRepository;
+
+/// The fields required by execution visibility and runtime-log authorization.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExecutionAuthorizationRow {
+    pub id: Id,
+    pub action_ref: String,
+    pub parent: Option<Id>,
+    pub executor: Option<Id>,
+}
+
+/// Rooted visibility and the first 64 ancestor owners for one requested row.
+/// A dangling parent stops the lineage at the last surviving execution.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExecutionLineageRow {
+    pub execution_id: Id,
+    pub anchor_id: Id,
+    pub anchor_action_ref: String,
+    pub ancestor_identity_ids: Vec<Id>,
+    pub cyclic: bool,
+}
+
+const AUTHORIZATION_LINEAGE_SELECT: &str = "WITH RECURSIVE lineage AS ( \
+    SELECT id AS execution_id, id, parent, action_ref, executor, 0 AS depth \
+    FROM execution WHERE id = ANY($1) \
+    UNION ALL \
+    SELECT l.execution_id, p.id, p.parent, p.action_ref, p.executor, l.depth + 1 \
+    FROM execution p JOIN lineage l ON l.parent = p.id \
+    ) CYCLE id SET cyclic USING visited, owners AS ( \
+    SELECT execution_id, BOOL_OR(cyclic) AS cyclic, \
+    COALESCE(ARRAY_AGG(DISTINCT executor ORDER BY executor) \
+    FILTER (WHERE depth BETWEEN 1 AND 64 AND executor IS NOT NULL), ARRAY[]::BIGINT[]) AS ancestor_identity_ids \
+    FROM lineage GROUP BY execution_id) \
+    SELECT DISTINCT ON (l.execution_id) l.execution_id, l.id AS anchor_id, \
+    l.action_ref AS anchor_action_ref, o.ancestor_identity_ids, o.cyclic \
+    FROM lineage l JOIN owners o USING (execution_id) ORDER BY l.execution_id, l.depth DESC";
+
+impl From<&Execution> for ExecutionAuthorizationRow {
+    fn from(execution: &Execution) -> Self {
+        Self {
+            id: execution.id,
+            action_ref: execution.action_ref.clone(),
+            parent: execution.parent,
+            executor: execution.executor,
+        }
+    }
+}
+
+impl ExecutionRepository {
+    /// One-shot initialization of a value-free execution inserted by this
+    /// transaction. This is deliberately NOT a general config update operation.
+    /// The caller renders/validates against its retained contract first; config
+    /// and the complete encrypted projection become visible at the same commit.
+    pub async fn initialize_config_with_conn(
+        connection: &mut PgConnection,
+        id: Id,
+        expected_admission: Option<Id>,
+        snapshot: &crate::models::ExecutionExecutableSnapshot,
+        config: Option<JsonDict>,
+        secrets: &[crate::secret_values::PreparedSecretValue],
+    ) -> Result<Execution> {
+        use super::runtime_authority::{RuntimeAuthorityRepository, RuntimeOwner};
+        let actual = super::execution_runtime_admission::ExecutionAdmissionRepository::find(
+            connection,
+            RuntimeOwner::Execution(id),
+        )
+        .await?;
+        let fence = match (expected_admission, actual) {
+            (Some(expected), Some(actual)) if expected == actual.id => Some(
+                RuntimeAuthorityRepository::retained_admission_fence(connection, actual.id).await?,
+            ),
+            (None, None) if snapshot.executable.action.is_adhoc => None,
+            _ => {
+                return Err(Error::PermissionDenied(
+                    "Initial input admission does not match the new execution".into(),
+                ))
+            }
+        };
+        let binding = super::schema_contract::SchemaContractRepository::find(
+            connection,
+            super::schema_contract::BindingOwner::Execution,
+            id,
+        )
+        .await?
+        .ok_or_else(|| Error::validation("Initial execution schema binding unavailable"))?;
+        binding.validate()?;
+        // Even an empty input consumes the one-shot NULL -> object transition.
+        // Leaving it NULL would permit a second initialization in this tx.
+        let config = config.unwrap_or_else(|| serde_json::json!({}));
+        if !config.is_object() {
+            return Err(Error::validation(
+                "Initial execution config must be a flat object",
+            ));
+        }
+        let markers = crate::secret_values::redacted_paths(&config)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let paths = secrets
+            .iter()
+            .map(|secret| secret.json_path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if markers != paths || paths.len() != secrets.len() {
+            return Err(Error::validation(
+                "Initial execution secret projection does not match its config",
+            ));
+        }
+        let initialized = sqlx::query_as::<_, Execution>(&format!(
+            "UPDATE execution SET config = $2, updated = clock_timestamp() WHERE id = $1 \
+             AND initial_input_transaction = pg_current_xact_id() \
+             AND status = 'requested' AND config IS NULL AND result IS NULL AND worker IS NULL \
+             AND original_execution IS NULL AND started_at IS NULL AND executable_snapshot = $3 \
+             AND NOT EXISTS (SELECT 1 FROM execution_secret_value WHERE entity_type = 'execution_config' AND entity_id = $1) \
+             RETURNING {SELECT_COLUMNS}"
+        )).bind(id).bind(&config).bind(sqlx::types::Json(snapshot)).fetch_optional(&mut *connection).await?
+            .ok_or_else(|| Error::PermissionDenied("Execution inputs may only be initialized once, in their creation transaction, before dispatch".into()))?;
+        if !secrets.is_empty() {
+            // No prior ciphertext exists, the new row is ours, and its mutation
+            // lock stays held. This cannot replace an accepted secret snapshot.
+            super::execution_secret_value::ExecutionSecretValueRepository::upsert_many_with_conn(
+                connection,
+                crate::secret_values::ENTITY_EXECUTION_CONFIG,
+                id,
+                secrets,
+            )
+            .await?;
+        }
+        if let Some(fence) = fence {
+            fence.ensure_fresh_on(connection).await?;
+        }
+        Ok(initialized)
+    }
+    /// Mutation scopes use at most 64 parents and do not resolve a read anchor.
+    /// Deduplicate cyclic owners as the original bounded parent walk did.
+    pub async fn find_ancestor_identity_ids<'e, E>(executor: E, parent: Id) -> Result<Vec<Id>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar(
+            "WITH RECURSIVE ancestors AS ( \
+                SELECT id, parent, executor, 1 AS depth FROM execution WHERE id = $1 \
+                UNION ALL \
+                SELECT p.id, p.parent, p.executor, a.depth + 1 \
+                FROM execution p JOIN ancestors a ON a.parent = p.id WHERE a.depth < 64 \
+             ) SELECT DISTINCT executor FROM ancestors WHERE executor IS NOT NULL ORDER BY executor",
+        )
+        .bind(parent).fetch_all(executor).await.map_err(Into::into)
+    }
+
+    pub async fn find_authorization_lineages<'e, E>(
+        executor: E,
+        ids: &[Id],
+    ) -> Result<Vec<ExecutionLineageRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        // The visibility anchor has no depth cutoff in the existing contract.
+        // Only owner/descendant scoping stops after 64 parents. CYCLE terminates
+        // malformed ancestry instead of letting the recursive anchor query hang.
+        sqlx::query_as(AUTHORIZATION_LINEAGE_SELECT)
+            .bind(ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Diagnostic over the same SELECT and binds as the authorization reader.
+    pub async fn explain_authorization_lineages<'e, E>(
+        executor: E,
+        ids: &[Id],
+    ) -> Result<serde_json::Value>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar(&format!(
+            "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) {AUTHORIZATION_LINEAGE_SELECT}"
+        ))
+        .bind(ids)
+        .fetch_one(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_authorization_rows<'e, E>(
+        executor: E,
+        ids: &[Id],
+    ) -> Result<Vec<ExecutionAuthorizationRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as("SELECT id, action_ref, parent, executor FROM execution WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+}
 
 impl Repository for ExecutionRepository {
     type Entity = Execution;
@@ -631,6 +825,72 @@ impl ExecutionRepository {
         Ok(row.map(|(execution_id,)| execution_id))
     }
 
+    /// Reserve the immutable task identity before interpreting proposed inputs.
+    /// The admission boundary and persistence boundary share this lock so a
+    /// concurrent winner is returned without selecting the loser's permissions.
+    pub(super) async fn reserve_workflow_task_with_conn(
+        conn: &mut PgConnection,
+        workflow: Id,
+        task: &str,
+        index: Option<i32>,
+    ) -> Result<Option<Execution>> {
+        Self::claim_workflow_task_dispatch(&mut *conn, workflow, task, index).await?;
+        match Self::lock_workflow_task_dispatch(&mut *conn, workflow, task, index).await? {
+            Some(Some(id)) => Ok(Some(Self::find_by_id(&mut *conn, id).await?.ok_or_else(
+                || Error::validation("Workflow task dispatch references a missing execution"),
+            )?)),
+            Some(None) => Ok(None),
+            None => Err(Error::validation("Workflow task reservation unavailable")),
+        }
+    }
+
+    /// Bind a child inserted/admitted earlier in this transaction, after its
+    /// source proofs are prepared. The dispatch FK must not lock workflow state
+    /// during source preparation.
+    pub(super) async fn bind_prepared_workflow_task(
+        conn: &mut PgConnection,
+        child: &Execution,
+    ) -> Result<()> {
+        let metadata = child
+            .workflow_task
+            .as_ref()
+            .ok_or_else(|| Error::validation("Prepared task metadata missing"))?;
+        let actual = Self::find_by_id(&mut *conn, child.id)
+            .await?
+            .ok_or_else(|| Error::validation("Prepared task disappeared"))?;
+        let parent: Option<Id> =
+            sqlx::query_scalar("SELECT execution FROM workflow_execution WHERE id=$1")
+                .bind(metadata.workflow_execution)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if actual.status != ExecutionStatus::Requested
+            || actual.config.is_some()
+            || serde_json::to_value(&actual)? != serde_json::to_value(child)?
+            || parent.is_none()
+            || parent != child.parent
+            || !Self::claim_workflow_task_dispatch(
+                &mut *conn,
+                metadata.workflow_execution,
+                &metadata.task_name,
+                metadata.task_index,
+            )
+            .await?
+        {
+            return Err(Error::PermissionDenied(
+                "Prepared task dispatch changed".into(),
+            ));
+        }
+        Self::assign_workflow_task_dispatch_execution(
+            &mut *conn,
+            metadata.workflow_execution,
+            &metadata.task_name,
+            metadata.task_index,
+            child.id,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn create_workflow_task_if_absent_in_conn(
         conn: &mut PgConnection,
         input: CreateExecutionInput,
@@ -694,72 +954,11 @@ impl ExecutionRepository {
             }
 
             Some(None) => {
-                // Row exists but execution_id is still NULL: another transaction is
-                // mid-creation (between claim and assign). Retry until it's filled in.
-                // If the original creator's transaction rolled back, the row also
-                // disappears — handled by the `None` branch inside the loop.
-                'wait: {
-                    for _ in 0..20_u32 {
-                        sleep(Duration::from_millis(50)).await;
-                        match Self::lock_workflow_task_dispatch(
-                            &mut *conn,
-                            workflow_execution_id,
-                            task_name,
-                            task_index,
-                        )
-                        .await?
-                        {
-                            Some(Some(execution_id)) => {
-                                let execution =
-                                    Self::find_by_id(&mut *conn, execution_id).await?.ok_or_else(
-                                        || {
-                                            anyhow::anyhow!(
-                                                "workflow child execution {} missing for workflow_execution {} task '{}' index {:?}",
-                                                execution_id,
-                                                workflow_execution_id,
-                                                task_name,
-                                                task_index
-                                            )
-                                        },
-                                    )?;
-                                return Ok(WorkflowTaskExecutionCreateOrGetResult {
-                                    execution,
-                                    created: false,
-                                });
-                            }
-                            Some(None) => {}     // still NULL, keep waiting
-                            None => break 'wait, // row rolled back; fall through to re-claim
-                        }
-                    }
-                    // Exhausted all retries without the execution_id being set.
-                    return Err(anyhow::anyhow!(
-                        "Timed out waiting for workflow task dispatch execution_id to be set \
-                         for workflow_execution {} task '{}' index {:?}",
-                        workflow_execution_id,
-                        task_name,
-                        task_index
-                    )
-                    .into());
-                }
-
-                // Row disappeared (original creator rolled back) — re-claim and create.
-                let re_claimed = Self::claim_workflow_task_dispatch(
-                    &mut *conn,
-                    workflow_execution_id,
-                    task_name,
-                    task_index,
-                )
-                .await?;
-                if !re_claimed {
-                    return Err(anyhow::anyhow!(
-                        "Workflow task dispatch for workflow_execution {} task '{}' index {:?} \
-                         was reclaimed by another executor after rollback",
-                        workflow_execution_id,
-                        task_name,
-                        task_index
-                    )
-                    .into());
-                }
+                // Admission may have reserved this row on this same connection.
+                // FOR UPDATE owns the reservation now. A concurrent creator
+                // cannot still be assigning it: the unique INSERT and row lock
+                // wait for that transaction before returning. Finish the owned
+                // reservation instead of waiting for our own transaction.
                 let execution = Self::create_with_snapshot(&mut *conn, input, snapshot).await?;
                 Self::assign_workflow_task_dispatch_execution(
                     &mut *conn,
@@ -1240,7 +1439,7 @@ impl Delete for ExecutionRepository {
             ),
             deleted_execution AS (
                 DELETE FROM execution
-                WHERE id = $1 AND NOT (SELECT blocked FROM target)
+                WHERE id = $1 AND NOT (SELECT blocked FROM target) AND NOT file_evidence_pinned('execution',id)
                 RETURNING id
             ),
             deleted_config_secrets AS (
@@ -1381,6 +1580,29 @@ impl ExecutionRepository {
             .map_err(Into::into)
     }
 
+    /// Bounded recovery read for cache checkpoints. Never scan/materialize the
+    /// stream's terminal history just to retry a broker delivery.
+    pub async fn find_requested_workflow_task<'e, E>(
+        executor: E,
+        workflow: Id,
+        task: &str,
+        limit: i64,
+    ) -> Result<Vec<Execution>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if !(1..=65).contains(&limit) {
+            return Err(Error::validation("Invalid native task recovery limit"));
+        }
+        let query = format!("SELECT {SELECT_COLUMNS} FROM execution WHERE workflow_task->>'workflow_execution'=$1::TEXT AND workflow_task->>'task_name'=$2 AND status='requested' ORDER BY id LIMIT $3");
+        Ok(sqlx::query_as::<_, Execution>(&query)
+            .bind(workflow.to_string())
+            .bind(task)
+            .bind(limit)
+            .fetch_all(executor)
+            .await?)
+    }
+
     /// Find all child executions for a given parent execution ID.
     ///
     /// Returns child executions ordered by creation time (ascending),
@@ -1425,6 +1647,22 @@ impl ExecutionRepository {
             .fetch_all(executor)
             .await
             .map_err(Into::into)
+    }
+
+    /// Complete bounded inventory for a native cache completion observation.
+    /// The extra row detects overflow; callers must reject, never truncate it.
+    /// Ordering exactly matches summarize_workflow_task_latest_attempts.
+    pub async fn native_cache_attempt_inventory(
+        conn: &mut PgConnection,
+        workflow: Id,
+        task: &str,
+    ) -> Result<Vec<Execution>> {
+        let query = format!("SELECT {SELECT_COLUMNS} FROM execution WHERE workflow_task->>'workflow_execution'=$1::TEXT AND workflow_task->>'task_name'=$2 ORDER BY (workflow_task->>'task_index')::INT ASC NULLS FIRST, retry_count DESC, created DESC, id DESC LIMIT 257");
+        Ok(sqlx::query_as::<_, Execution>(&query)
+            .bind(workflow.to_string())
+            .bind(task)
+            .fetch_all(&mut *conn)
+            .await?)
     }
 
     /// Aggregates only the newest retry attempt for every materialized index.

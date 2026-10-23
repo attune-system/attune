@@ -21,7 +21,7 @@ use validator::Validate;
 use attune_common::{
     dashboard_spec::validate_dashboard_spec,
     models::{
-        key::Key, Dashboard, DashboardScopeType, DashboardVisibility, ExecutionStatus, OwnerType,
+        Dashboard, DashboardScopeType, DashboardVisibility, ExecutionStatus, OwnerType,
         SensorProcessStatus, WorkerRole, WorkerStatus,
     },
     rbac::{Action as RbacAction, AuthorizationContext, Grant, Resource},
@@ -171,6 +171,8 @@ impl SourcePrimaryRefKind {
 
 #[derive(Debug, Clone)]
 struct SourceQueryScope {
+    structural: Option<(Resource, RbacAction)>,
+    identity_attributes: HashMap<String, JsonValue>,
     authorization_mode: DashboardAuthorizationMode,
     pack_refs: Option<BTreeSet<String>>,
     primary_ref_kind: Option<SourcePrimaryRefKind>,
@@ -569,9 +571,20 @@ pub async fn list_dashboards(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<impl IntoResponse> {
     let dashboards = DashboardRepository::list(&state.db).await?;
-    let grants = state
-        .authorization_service()
-        .effective_grants(&user)
+    let snapshot = state.authorization_service().load_snapshot(&user).await?;
+    let grants = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.grants.as_slice())
+        .unwrap_or_default();
+    let owners =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_packs(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Dashboard,
+            &dashboards
+                .iter()
+                .map(|dashboard| dashboard.id)
+                .collect::<Vec<_>>(),
+        )
         .await?;
     let identity_id = user.identity_id().ok();
 
@@ -589,6 +602,10 @@ pub async fn list_dashboards(
                 return false;
             };
             let mut ctx = AuthorizationContext::new(id);
+            ctx.managing_pack_id = owners.get(&dashboard.id).copied();
+            if let Some(snapshot) = &snapshot {
+                ctx.identity_attributes = snapshot.identity_attributes.clone();
+            }
             ctx.target_id = Some(dashboard.id);
             ctx.target_ref = Some(dashboard.r#ref.clone());
             ctx.pack_ref = dashboard
@@ -596,7 +613,7 @@ pub async fn list_dashboards(
                 .split_once('.')
                 .map(|(pack_ref, _)| pack_ref.to_string());
             ctx.owner_identity_id = dashboard.owner_identity;
-            AuthorizationService::is_allowed(&grants, Resource::Dashboards, RbacAction::Read, &ctx)
+            AuthorizationService::is_allowed(grants, Resource::Dashboards, RbacAction::Read, &ctx)
         })
         .map(DashboardListItemResponse::from)
         .collect::<Vec<_>>();
@@ -1102,7 +1119,15 @@ async fn execute_dashboard_data_request(
 
     validate_request_filters(&request.filters, &spec_index.filters)?;
     let request_ref_scope = normalize_request_ref_scope(&request.filters)?;
-    let effective_grants = state.authorization_service().effective_grants(user).await?;
+    let snapshot = state.authorization_service().load_snapshot(user).await?;
+    let effective_grants = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.grants.clone())
+        .unwrap_or_default();
+    let identity_attributes = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.identity_attributes.clone())
+        .unwrap_or_default();
 
     let resolved_source_ids = resolve_requested_source_ids(&request, &spec_index)?;
     let effective_time_range = resolve_effective_time_range(&request, &spec_index)?;
@@ -1136,7 +1161,7 @@ async fn execute_dashboard_data_request(
             continue;
         };
 
-        let source_scope = match resolve_source_query_scope(
+        let mut source_scope = match resolve_source_query_scope(
             source_def,
             &request_ref_scope,
             &resolve_source_param_scope(source_def, &request.filters)?,
@@ -1162,6 +1187,7 @@ async fn execute_dashboard_data_request(
             }
             Err(err) => return Err(err),
         };
+        source_scope.identity_attributes = identity_attributes.clone();
 
         if let Err(violation) =
             validate_source_window_bounds(&source_def.source_type, &effective_time_range)
@@ -1357,6 +1383,9 @@ async fn execute_source_data(
     request_deadline: tokio::time::Instant,
 ) -> DashboardSourceResult {
     let started = Instant::now();
+    // Local scopes depend on current structural target rows. A ref-only data
+    // cache cannot preserve those bindings across deletion or ownership change.
+    let cacheable = source_scope.structural.is_none() && source.source_type != "key_value";
     let cache_key = build_source_cache_key(
         state.cache_namespace,
         dashboard,
@@ -1367,6 +1396,9 @@ async fn execute_source_data(
     );
 
     loop {
+        if !cacheable {
+            break;
+        }
         if let Some(mut cached) = source_cache().get_fresh(&cache_key).await {
             cached.meta.cache_hit = include_meta;
             emit_source_telemetry(dashboard, &cached, started, false);
@@ -1405,14 +1437,16 @@ async fn execute_source_data(
                         if !include_meta {
                             executed.meta.cache_hit = false;
                         }
-                        source_cache()
-                            .insert(cache_key.clone(), executed.clone())
-                            .await;
+                        if cacheable {
+                            source_cache()
+                                .insert(cache_key.clone(), executed.clone())
+                                .await;
+                        }
                         executed
                     }
                     Ok(Err(error)) => {
                         let retryable = stale_cache_error_retryable(&error);
-                        let stale = if retryable {
+                        let stale = if retryable && cacheable {
                             source_cache().get_stale(&cache_key).await
                         } else {
                             None
@@ -1443,7 +1477,12 @@ async fn execute_source_data(
                         }
                     }
                     Err(_) => {
-                        if let Some(mut stale) = source_cache().get_stale(&cache_key).await {
+                        let stale = if cacheable {
+                            source_cache().get_stale(&cache_key).await
+                        } else {
+                            None
+                        };
+                        if let Some(mut stale) = stale {
                             mark_cached_fallback(&mut stale, include_meta);
                             stale.error = Some(DashboardSourceError {
                                 code: "timeout_fallback".to_string(),
@@ -1488,13 +1527,15 @@ async fn execute_source_data(
         Err(_) => unsupported_source_result(source, "semaphore"),
     };
 
-    if should_coalesce_failure(&result) {
+    if cacheable && should_coalesce_failure(&result) {
         source_cache()
             .insert_retryable_failure(cache_key.clone(), result.clone())
             .await;
     }
 
-    source_cache().complete_inflight(&cache_key).await;
+    if cacheable {
+        source_cache().complete_inflight(&cache_key).await;
+    }
     emit_source_telemetry(dashboard, &result, started, true);
     if !include_meta {
         result.meta.cache_hit = false;
@@ -2570,11 +2611,46 @@ fn resolve_source_query_scope(
     let mut mode = DashboardAuthorizationMode::OperatorGlobal;
     if source.source_type == "key_value" {
         return Ok(SourceQueryScope {
+            structural: None,
+            identity_attributes: HashMap::new(),
             authorization_mode: mode,
             pack_refs: requested_pack_refs,
             primary_ref_kind,
             primary_refs: requested_primary,
         });
+    }
+    if let Some(required) = required_auth {
+        let matching = effective_grants
+            .iter()
+            .filter(|grant| {
+                grant.resource == required.resource && grant.actions.contains(&required.action)
+            })
+            .collect::<Vec<_>>();
+        if matching.iter().any(|grant| {
+            grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+        }) && !matching.iter().any(|grant| {
+            grant
+                .constraints
+                .as_ref()
+                .is_none_or(super::visibility::constraints_are_effectively_unscoped)
+        }) {
+            if !attune_common::runtime_authority::pack_owned_resource(required.resource) {
+                return Err(ApiError::Forbidden(
+                    "Global administration has no local ownership scope".into(),
+                ));
+            }
+            return Ok(SourceQueryScope {
+                structural: Some((required.resource, required.action)),
+                identity_attributes: HashMap::new(),
+                authorization_mode: DashboardAuthorizationMode::IdentityFiltered,
+                pack_refs: requested_pack_refs,
+                primary_ref_kind,
+                primary_refs: requested_primary,
+            });
+        }
     }
     let (auth_pack_refs, auth_primary_refs) = if let Some(required_auth) = required_auth {
         let constraints = collect_authz_ref_constraints(
@@ -2607,6 +2683,8 @@ fn resolve_source_query_scope(
     let primary_refs = intersect_ref_sets(requested_primary, auth_primary_refs);
 
     Ok(SourceQueryScope {
+        structural: None,
+        identity_attributes: HashMap::new(),
         authorization_mode: mode,
         pack_refs,
         primary_ref_kind,
@@ -2634,7 +2712,8 @@ fn collect_authz_ref_constraints(
                 return Ok(constraints);
             }
             Some(c) => {
-                if c.owner.is_some()
+                if c.managing_pack_id.is_some()
+                    || c.owner.is_some()
                     || c.owner_types.is_some()
                     || c.owner_refs.is_some()
                     || c.visibility.is_some()
@@ -2782,65 +2861,27 @@ fn key_owner_ref(
     }
 }
 
-fn key_authorization_context(identity_id: i64, key: &Key) -> AuthorizationContext {
-    let mut ctx = AuthorizationContext::new(identity_id);
-    ctx.target_id = Some(key.id);
-    ctx.target_ref = Some(key.r#ref.clone());
-    ctx.owner_identity_id = key.owner_identity;
-    ctx.owner_type = Some(key.owner_type);
-    ctx.owner_ref = key_owner_ref(
-        key.owner_type,
-        key.owner.as_deref(),
-        key.owner_pack_ref.as_deref(),
-        key.owner_action_ref.as_deref(),
-        key.owner_sensor_ref.as_deref(),
-    );
-    ctx.encrypted = Some(key.encrypted);
-    ctx
-}
-
-fn constrained_key_grant_allows(
-    grants: &[Grant],
-    action: RbacAction,
-    ctx: &AuthorizationContext,
-) -> bool {
-    grants.iter().any(|grant| {
-        let Some(constraints) = &grant.constraints else {
-            return false;
-        };
-        let owner_scoped = constraints.owner.is_some()
-            || constraints.owner_types.is_some()
-            || constraints.owner_refs.is_some()
-            || constraints.refs.is_some()
-            || constraints.ids.is_some();
-        grant.resource == Resource::Keys
-            && grant.actions.contains(&action)
-            && owner_scoped
-            && grant.allows(Resource::Keys, action, ctx)
-    })
-}
-
-fn key_action_allowed(grants: &[Grant], action: RbacAction, identity_id: i64, key: &Key) -> bool {
-    let ctx = key_authorization_context(identity_id, key);
-    if key.owner_type == OwnerType::Identity && key.owner_identity != Some(identity_id) {
-        return constrained_key_grant_allows(grants, action, &ctx);
-    }
-
-    AuthorizationService::is_allowed(grants, Resource::Keys, action, &ctx)
-}
-
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep source selection, filters, current grants, and decrypt consent separate"
+)]
 async fn build_key_value_source_data(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     effective_grants: &[Grant],
+    identity_attributes: &HashMap<String, JsonValue>,
     key_ref: &str,
     expected_owner_type: Option<OwnerType>,
     expected_owner_ref: Option<&str>,
     decrypt_requested: bool,
 ) -> Result<Option<KeyValueSourceData>, ApiError> {
-    let Some(mut key) =
-        attune_common::repositories::key::KeyRepository::find_by_ref(&state.db, key_ref).await?
-    else {
+    let (mut keys, ownership) =
+        attune_common::repositories::iam_ownership::VerifiedKeyOrigins::keys_by_refs(
+            &state.db,
+            &[key_ref.to_string()],
+        )
+        .await?;
+    let Some(mut key) = keys.pop() else {
         return Ok(None);
     };
 
@@ -2860,7 +2901,16 @@ async fn build_key_value_source_data(
     }
 
     let identity_id = actor_identity_id(user)?.unwrap_or_default();
-    if !key_action_allowed(effective_grants, RbacAction::Read, identity_id, &key) {
+    let mut caller = AuthorizationContext::new(identity_id);
+    caller.identity_attributes = identity_attributes.clone();
+    let origin = attune_common::key_access::key_origin(&key);
+    if !attune_common::key_access::origin_action_allowed_verified(
+        effective_grants,
+        &caller,
+        &origin,
+        RbacAction::Read,
+        &ownership,
+    ) {
         return Err(ApiError::Forbidden(
             "Not authorized to read this source".to_string(),
         ));
@@ -2868,7 +2918,13 @@ async fn build_key_value_source_data(
 
     let can_decrypt = !key.encrypted
         || (decrypt_requested
-            && key_action_allowed(effective_grants, RbacAction::Decrypt, identity_id, &key));
+            && attune_common::key_access::origin_action_allowed_verified(
+                effective_grants,
+                &caller,
+                &origin,
+                RbacAction::Decrypt,
+                &ownership,
+            ));
 
     if key.encrypted {
         if can_decrypt {
@@ -2995,6 +3051,156 @@ fn extract_json_path<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonVal
     Some(current)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn execute_structural_source(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    grants: &[Grant],
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    scope: &SourceQueryScope,
+    range: &DashboardEffectiveTimeRange,
+    resource: Resource,
+    action: RbacAction,
+) -> Result<JsonValue, ApiError> {
+    use attune_common::repositories::dashboard_iam::{
+        DashboardIamFilters, DashboardIamRepository, DashboardIamScope,
+    };
+    let include_in_flight = source.source_type == "last_execution"
+        && resolve_optional_source_bool_param(source, request_filters, "include_in_flight")?
+            .unwrap_or(false);
+    let statuses = if source.source_type == "latest_action_result" {
+        resolve_optional_source_string_param(source, request_filters, "status")?
+            .map(|status| vec![status])
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        if include_in_flight {
+            [
+                "requested",
+                "scheduling",
+                "scheduled",
+                "running",
+                "completed",
+                "failed",
+                "canceling",
+                "cancelled",
+                "timeout",
+                "abandoned",
+            ]
+            .iter()
+            .map(|value| (*value).into())
+            .collect()
+        } else {
+            TERMINAL_EXECUTION_STATUSES
+                .iter()
+                .map(|value| (*value).into())
+                .collect()
+        }
+    });
+    let sla_target_seconds = if source.source_type == "inquiry_sla" {
+        resolve_source_param_i64(source, request_filters, "sla_target_seconds")?
+            .unwrap_or(DEFAULT_INQUIRY_SLA_TARGET_SECONDS)
+    } else {
+        DEFAULT_INQUIRY_SLA_TARGET_SECONDS
+    };
+    if sla_target_seconds <= 0 {
+        return Err(ApiError::BadRequest(
+            "SLA target must be greater than zero".into(),
+        ));
+    }
+    let assigned_to = if source.source_type.starts_with("inquiry_") {
+        resolve_source_param_i64(source, request_filters, "assigned_to")?
+    } else {
+        None
+    };
+    let mut data = DashboardIamRepository::query(
+        &state.db,
+        &DashboardIamScope {
+            identity: user
+                .identity_id()
+                .map_err(|_| ApiError::Unauthorized("Invalid dashboard identity".into()))?,
+            attributes: scope.identity_attributes.clone(),
+            grants: grants.to_vec(),
+            resource,
+            action,
+        },
+        &DashboardIamFilters {
+            source: &source.source_type,
+            since: range.start,
+            until: range.end,
+            pack_refs: scope.pack_refs.as_ref(),
+            primary_refs: scope.primary_refs.as_ref(),
+            statuses,
+            assigned_to,
+            sla_target_seconds,
+            limit: SOURCE_ROW_CAP + 1,
+            small_cohort_min: small_cohort_suppression_enabled(&source.source_type)
+                .then_some(SMALL_COHORT_MIN_COUNT),
+        },
+    )
+    .await?;
+    if data.as_array().is_some_and(Vec::is_empty) {
+        return Ok(data);
+    }
+    if source.source_type == "action_result_path" {
+        let path = resolve_required_result_path(source, request_filters)?;
+        let mut allowed_paths = BTreeSet::new();
+        seed_default_action_result_paths(&mut allowed_paths);
+        include_requested_derived_action_result_paths(&path, &mut allowed_paths);
+        if let Some(rows) = data.as_array() {
+            for row in rows {
+                if let Some(result) = row.get("result").filter(|result| !result.is_null()) {
+                    collect_json_paths(result, None, &mut allowed_paths);
+                }
+            }
+        }
+        ActionResultPathAllowList::new(allowed_paths.iter().cloned())
+            .require_allowed(&path)
+            .map_err(|_| {
+                ApiError::BadRequest(build_action_result_path_not_allowed_message(
+                    &source.source_id,
+                    &path,
+                    &allowed_paths,
+                ))
+            })?;
+        if let Some(rows) = data.as_array_mut() {
+            for row in rows {
+                let value = row
+                    .get("result")
+                    .and_then(|result| extract_json_path(result, &path))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null);
+                if let Some(object) = row.as_object_mut() {
+                    object.retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "action_ref" | "execution_id" | "status" | "updated_at"
+                        )
+                    });
+                    object.insert("path".into(), JsonValue::String(path.clone()));
+                    object.insert("value".into(), value);
+                }
+            }
+        }
+    } else if source.source_type == "latest_action_result" {
+        if let Some(rows) = data.as_array_mut() {
+            for row in rows {
+                if let Some(object) = row.as_object_mut() {
+                    object.retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "action_ref" | "execution_id" | "status" | "updated_at" | "result"
+                        )
+                    });
+                }
+            }
+        }
+    }
+    Ok(data)
+}
+
 async fn execute_source_handler(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
@@ -3012,6 +3218,22 @@ async fn execute_source_handler(
         until: effective_time_range.end,
     };
 
+    if let Some((resource, action)) = source_scope.structural {
+        meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+        let data = execute_structural_source(
+            state,
+            user,
+            effective_grants,
+            source,
+            request_filters,
+            source_scope,
+            effective_time_range,
+            resource,
+            action,
+        )
+        .await?;
+        return Ok(finish_source_data(source, meta, data));
+    }
     let data = match source.source_type.as_str() {
         "key_value" => {
             meta.freshness_mode = DashboardFreshnessMode::RawOnly;
@@ -3044,6 +3266,7 @@ async fn execute_source_handler(
                 state,
                 user,
                 effective_grants,
+                &source_scope.identity_attributes,
                 &key_ref,
                 expected_owner_type,
                 expected_owner_ref.as_deref(),
@@ -3604,11 +3827,16 @@ async fn execute_source_handler(
         _ => return Ok(unsupported_source_result(source, "unsupported")),
     };
 
-    let data = suppress_small_cohort_rows(
-        data,
-        source.source_type.as_str(),
-        source_scope.authorization_mode,
-    );
+    Ok(finish_source_data(source, meta, data))
+}
+
+fn finish_source_data(
+    source: &DashboardSourceDef,
+    mut meta: DashboardSourceMeta,
+    data: JsonValue,
+) -> DashboardSourceResult {
+    let data =
+        suppress_small_cohort_rows(data, source.source_type.as_str(), meta.authorization_mode);
     let (data, truncated) = truncate_source_data(data);
     meta.truncated = truncated;
     let status = if data.as_array().is_some_and(|rows| rows.is_empty())
@@ -3621,14 +3849,14 @@ async fn execute_source_handler(
         DashboardSourceStatus::Ok
     };
 
-    Ok(DashboardSourceResult {
+    DashboardSourceResult {
         source_id: source.source_id.clone(),
         source_type: source.source_type.clone(),
         status,
         data: Some(data),
         meta,
         error: None,
-    })
+    }
 }
 
 fn truncate_source_data(data: JsonValue) -> (JsonValue, bool) {
@@ -3866,8 +4094,15 @@ async fn authorize_dashboard_action(
     action: RbacAction,
     dashboard: &Dashboard,
 ) -> Result<(), ApiError> {
-    let context =
+    let mut context =
         dashboard_authorization_context_for_dashboard(actor_identity_or_zero(user), dashboard);
+    context.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Dashboard,
+            dashboard.id,
+        )
+        .await?;
     authorize_dashboard_context_action(state, user, action, context).await
 }
 
@@ -5607,6 +5842,8 @@ mod tests {
     #[test]
     fn source_scope_authorized_refs_json_is_deterministic() {
         let scope = SourceQueryScope {
+            structural: None,
+            identity_attributes: HashMap::new(),
             authorization_mode: DashboardAuthorizationMode::IdentityFiltered,
             pack_refs: Some(BTreeSet::from(["zeta".to_string(), "alpha".to_string()])),
             primary_ref_kind: Some(SourcePrimaryRefKind::Rule),
@@ -5623,6 +5860,45 @@ mod tests {
                 "rule_refs": ["core.rule_a", "core.rule_b"]
             }))
         );
+    }
+
+    #[test]
+    fn normalized_local_sources_use_structural_sql_without_turning_pack_ids_into_refs() {
+        let source = DashboardSourceDef {
+            source_id: "events".into(),
+            source_type: "event_count".into(),
+            source_params: BTreeMap::new(),
+        };
+        let grants: Vec<Grant> = serde_json::from_value(
+            attune_common::runtime_authority::normalize_iam_grants(
+                json!([{"resource":"events","actions":["read"],"constraints":{"ids":[8]}}]),
+                Some(17),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = RefFilterScope {
+            trigger_refs: Some(BTreeSet::from(["local.signal".into()])),
+            ..Default::default()
+        };
+        let scope = resolve_source_query_scope(
+            &source,
+            &request,
+            &RefFilterScope::default(),
+            &grants,
+            Some(SourceAuthRequirement {
+                resource: Resource::Events,
+                action: RbacAction::Read,
+            }),
+        )
+        .unwrap();
+        assert_eq!(scope.structural, Some((Resource::Events, RbacAction::Read)));
+        assert_eq!(scope.primary_refs, request.trigger_refs);
+        assert_eq!(scope.pack_refs, None);
+        assert!(matches!(
+            scope.authorization_mode,
+            DashboardAuthorizationMode::IdentityFiltered
+        ));
     }
 
     #[test]

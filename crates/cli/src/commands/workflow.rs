@@ -113,6 +113,52 @@ struct SaveWorkflowFileRequest {
     tags: Option<Vec<String>>,
 }
 
+fn build_upload_request(
+    action: &ActionYaml,
+    workflow_definition: serde_json::Value,
+    file: &str,
+) -> Result<SaveWorkflowFileRequest> {
+    let (pack_ref, workflow_name) = split_action_ref(&action.action_ref)?;
+    attune_common::pack_registry::runtime_policy::CandidateRuntimePolicyPlan::validate_workflow_targets(
+        &workflow_definition, &pack_ref, &action.action_ref, file,
+    )?;
+    let version = workflow_definition
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("1.0.0")
+        .to_string();
+    let mut definition_map = workflow_definition
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Workflow definition must be an object"))?;
+    if let Some(parameters) = &action.parameters {
+        definition_map
+            .entry("parameters")
+            .or_insert_with(|| parameters.clone());
+    }
+    if let Some(output) = &action.output {
+        definition_map
+            .entry("output")
+            .or_insert_with(|| output.clone());
+    }
+    Ok(SaveWorkflowFileRequest {
+        name: workflow_name.clone(),
+        label: if action.label.is_empty() {
+            workflow_name
+        } else {
+            action.label.clone()
+        },
+        description: action.description.clone(),
+        version,
+        pack_ref,
+        enabled: action.enabled,
+        definition: serde_json::Value::Object(definition_map),
+        param_schema: action.parameters.clone(),
+        out_schema: action.output.clone(),
+        tags: action.tags.clone(),
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct WorkflowResponse {
     id: i64,
@@ -234,56 +280,13 @@ async fn handle_upload(
             workflow_path.display()
         ))?;
 
-    // Extract version from the workflow definition, defaulting to "1.0.0"
-    let version = workflow_definition
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("1.0.0")
-        .to_string();
-
-    // ── 5. Build the API request ────────────────────────────────────────
-    //
-    // Merge the action-level fields from the workflow definition back into the
-    // definition payload (the API's SaveWorkflowFileRequest.definition carries
-    // the full blob; write_workflow_yaml on the server side strips the action-
-    // level fields before writing the graph-only file).
-    let mut definition_map: serde_json::Map<String, serde_json::Value> =
-        if let Some(obj) = workflow_definition.as_object() {
-            obj.clone()
-        } else {
-            serde_json::Map::new()
-        };
-
-    // Ensure action-level fields are present in the definition (the API and
-    // web UI store the combined form in the database; the server splits them
-    // into two files on disk).
-    if let Some(params) = &action.parameters {
-        definition_map
-            .entry("parameters".to_string())
-            .or_insert_with(|| params.clone());
-    }
-    if let Some(out) = &action.output {
-        definition_map
-            .entry("output".to_string())
-            .or_insert_with(|| out.clone());
-    }
-
-    let request = SaveWorkflowFileRequest {
-        name: workflow_name.clone(),
-        label: if action.label.is_empty() {
-            workflow_name.clone()
-        } else {
-            action.label.clone()
-        },
-        description: action.description.clone(),
-        version,
-        pack_ref: pack_ref.clone(),
-        enabled: action.enabled,
-        definition: serde_json::Value::Object(definition_map),
-        param_schema: action.parameters.clone(),
-        out_schema: action.output.clone(),
-        tags: action.tags.clone(),
-    };
+    // Keep task metadata opaque while applying the canonical finite-target
+    // grammar. Referenceability and capability admission remain server-owned.
+    let request = build_upload_request(
+        &action,
+        workflow_definition,
+        &workflow_path.display().to_string(),
+    )?;
 
     // ── 6. Print progress ───────────────────────────────────────────────
     if output_format == OutputFormat::Table {
@@ -681,6 +684,74 @@ fn resolve_workflow_path(action_yaml_path: &Path, workflow_file: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_dynamic_targets_survive_real_upload_and_show_export_conversion() {
+        let action: ActionYaml =
+            serde_yaml_ng::from_str("ref: example.flow\nworkflow_file: workflows/flow.yaml\n")
+                .unwrap();
+        let definition: serde_json::Value = serde_yaml_ng::from_str(
+            r#"
+version: '1.0'
+tasks:
+  group/name~:
+    type: parallel
+    tasks:
+      choose/target:
+        action: '{{ parameters.target }}'
+        allowed_action_refs: [example.one, foreign.two]
+        permission_set_refs: ['{{ parameters.permissions }}', example.extra]
+        with_items: '{{ parameters.items }}'
+        concurrency: 2
+        retry: {count: 2, delay: 0}
+        worker_selector: {zone: retained}
+"#,
+        )
+        .unwrap();
+        let request =
+            build_upload_request(&action, definition.clone(), "actions/workflows/flow.yaml")
+                .unwrap();
+        assert_eq!(request.definition, definition);
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            encoded["definition"]["tasks"]["group/name~"]["tasks"]["choose/target"]
+                ["allowed_action_refs"],
+            serde_json::json!(["example.one", "foreign.two"])
+        );
+        let response: WorkflowResponse = serde_json::from_value(serde_json::json!({
+            "id": 1, "ref": "example.flow", "pack": 2, "pack_ref": "example", "label": "Flow", "description": null,
+            "version": "1.0", "param_schema": null, "out_schema": null, "definition": request.definition,
+            "tags": [], "created": "2026-10-15T00:00:00Z", "updated": "2026-10-15T00:00:00Z"
+        })).unwrap();
+        // `workflow show --output yaml` serializes this same response model.
+        let exported: WorkflowResponse =
+            serde_yaml_ng::from_str(&serde_yaml_ng::to_string(&response).unwrap()).unwrap();
+        assert_eq!(exported.definition, definition);
+    }
+
+    #[test]
+    fn workflow_upload_uses_canonical_located_finite_target_validation() {
+        let action: ActionYaml =
+            serde_yaml_ng::from_str("ref: example.flow\nworkflow_file: workflows/flow.yaml\n")
+                .unwrap();
+        for allowed in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(["example.*"]),
+            serde_json::json!(["{{ parameters.escape }}"]),
+        ] {
+            let graph = serde_json::json!({"tasks":{"group/name":{"action":"{{ parameters.target }}", "allowed_action_refs":allowed}}});
+            let error = build_upload_request(&action, graph, "actions/workflows/flow.yaml")
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                error.contains("/tasks/group~1name/allowed_action_refs"),
+                "{error}"
+            );
+        }
+        assert!(build_upload_request(&action, serde_json::json!({"tasks":[{"action":"example.other","allowed_action_refs":["example.one"]}]}), "flow.yaml").is_err());
+    }
 
     #[test]
     fn test_split_action_ref_simple() {

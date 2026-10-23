@@ -2,13 +2,17 @@ ref: core.editor
 label: Editor
 description: Create and update operational resources without full administrative control.
 grants:
-  - {resource: packs, actions: [read, create, install, configure]}
+  - {resource: packs, actions: [read]}
+  - {resource: packs, actions: [create, install], constraints: {pack_state: uninstalled}}
+  # For pack targets, self includes the primary owner and declared owner-role members.
+  - {resource: packs, actions: [install, configure], constraints: {owner: self}}
   - {resource: actions, actions: [read, create, update, execute]}
   - {resource: policies, actions: [read, create, update]}
   - {resource: queues, actions: [read, create, update, delete]}
   - {resource: queue_items, actions: [read, create, update, delete]}
   - {resource: rules, actions: [read, create, update]}
-  - {resource: triggers, actions: [read]}
+  - {resource: triggers, actions: [read, create, update]}
+  - {resource: events, actions: [read, create]}
   - {resource: executions, actions: [read, cancel]}
   - {resource: keys, actions: [read, update, decrypt]}
   - {resource: artifacts, actions: [read]}

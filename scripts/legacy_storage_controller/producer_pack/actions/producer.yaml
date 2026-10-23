@@ -1,0 +1,18 @@
+ref: f_native_settlement.producer
+label: Owned native producer
+description: Declares the original secret input sealed before native worker delivery.
+runner_type: python
+entry_point: producer.py
+parameter_delivery: stdin
+parameter_format: json
+output_format: json
+default_execution_permission_set_refs:
+  - standard
+parameters:
+  native_source:
+    type: string
+    secret: true
+    required: true
+output:
+  accepted:
+    type: boolean

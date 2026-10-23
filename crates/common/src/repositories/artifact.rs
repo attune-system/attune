@@ -10,6 +10,7 @@ use crate::models::{
 };
 use crate::rbac::{Action, ExecutionScopeConstraint, Grant, OwnerConstraint, Resource};
 use crate::Result;
+use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashMap;
 
@@ -78,10 +79,31 @@ pub struct ArtifactSearchFilters {
 }
 
 /// Search result with total count
-pub struct ArtifactSearchResult {
-    pub rows: Vec<Artifact>,
+pub struct ArtifactSearchResult<T = Artifact> {
+    pub rows: Vec<T>,
     pub total: i64,
 }
+
+pub const ARTIFACT_READ_BATCH_SIZE: usize = 256;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ArtifactSummaryRow {
+    pub id: i64,
+    pub r#ref: String,
+    pub scope: OwnerType,
+    pub owner: String,
+    pub r#type: ArtifactType,
+    pub visibility: ArtifactVisibility,
+    pub classification: ArtifactClassification,
+    pub name: Option<String>,
+    pub content_type: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+}
+
+pub const SUMMARY_SELECT_COLUMNS: &str =
+    "id, ref, scope, owner, type, visibility, classification, name, content_type, size_bytes, created, updated";
 
 #[derive(Debug, Clone)]
 pub struct ArtifactReadContext {
@@ -283,6 +305,25 @@ impl Delete for ArtifactRepository {
 }
 
 impl ArtifactRepository {
+    pub async fn find_by_id_for_update(
+        connection: &mut PgConnection,
+        id: i64,
+    ) -> Result<Option<Artifact>> {
+        // Version writers take this advisory lock before updating their parent
+        // through triggers. Match that order before taking the artifact row.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(id.to_string())
+        .execute(&mut *connection)
+        .await?;
+        let query = format!("SELECT {SELECT_COLUMNS} FROM artifact WHERE id = $1 FOR UPDATE");
+        sqlx::query_as(&query)
+            .bind(id)
+            .fetch_optional(connection)
+            .await
+            .map_err(Into::into)
+    }
     /// Create an artifact or return the row that already owns the reference.
     pub async fn create_or_get(
         connection: &mut PgConnection,
@@ -309,7 +350,7 @@ impl ArtifactRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        Self::search_internal(executor, filters, None).await
+        Self::search_internal(executor, filters, None, SELECT_COLUMNS).await
     }
 
     /// Search artifacts with read visibility applied in-database.
@@ -321,7 +362,114 @@ impl ArtifactRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        Self::search_internal(executor, filters, Some(read_ctx)).await
+        Self::search_internal(executor, filters, Some(read_ctx), SELECT_COLUMNS).await
+    }
+
+    pub async fn search_summaries<'e, E>(
+        executor: E,
+        filters: &ArtifactSearchFilters,
+        read_ctx: Option<&ArtifactReadContext>,
+    ) -> Result<ArtifactSearchResult<ArtifactSummaryRow>>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        Self::search_internal(executor, filters, read_ctx, SUMMARY_SELECT_COLUMNS).await
+    }
+
+    pub async fn find_summary_by_id<'e, E>(
+        executor: E,
+        id: i64,
+    ) -> Result<Option<ArtifactSummaryRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(&format!(
+            "SELECT {SUMMARY_SELECT_COLUMNS} FROM artifact WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// A count-free keyset scan. The caller applies disclosure before public
+    /// pagination and shares those decisions with its exact eligible total.
+    pub async fn scan_summaries<'e, E>(
+        executor: E,
+        filters: &ArtifactSearchFilters,
+        read_ctx: Option<&ArtifactReadContext>,
+        after: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<ArtifactSummaryRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        Self::summary_scan_query(filters, read_ctx, after, false)
+            .build_query_as()
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Diagnostic SELECT over owned benchmark data, using the handler's exact
+    /// query builder and binds rather than an approximate handwritten query.
+    pub async fn explain_summary_scan<'e, E>(
+        executor: E,
+        filters: &ArtifactSearchFilters,
+        read_ctx: Option<&ArtifactReadContext>,
+    ) -> Result<serde_json::Value>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        Self::summary_scan_query(filters, read_ctx, None, true)
+            .build_query_scalar()
+            .fetch_one(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Explicit fixture preparation, never called by artifact request handlers.
+    pub async fn analyze_read_fixtures<'e, E>(executor: E) -> Result<()>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query("ANALYZE artifact, artifact_version, execution, execution_secret_value, runtime_schema_binding")
+            .execute(executor).await?;
+        Ok(())
+    }
+
+    fn summary_scan_query(
+        filters: &ArtifactSearchFilters,
+        read_ctx: Option<&ArtifactReadContext>,
+        after: Option<(DateTime<Utc>, i64)>,
+        explain: bool,
+    ) -> QueryBuilder<'static, Postgres> {
+        let prefix = if explain {
+            "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) "
+        } else {
+            ""
+        };
+        let mut query = QueryBuilder::<Postgres>::new(format!(
+            "{prefix}SELECT {SUMMARY_SELECT_COLUMNS} FROM artifact a"
+        ));
+        let mut has_where = false;
+        push_artifact_filters(&mut query, filters, "a", &mut has_where);
+        if let Some(ctx) = read_ctx {
+            push_where_prefix(&mut query, &mut has_where);
+            push_artifact_read_predicate(&mut query, ctx, "a");
+        }
+        if let Some((created, id)) = after {
+            push_where_prefix(&mut query, &mut has_where);
+            query
+                .push("(a.created, a.id) < (")
+                .push_bind(created)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        query
+            .push(" ORDER BY a.created DESC, a.id DESC LIMIT ")
+            .push_bind(ARTIFACT_READ_BATCH_SIZE as i64);
+        query
     }
 
     pub async fn is_readable<'e, E>(
@@ -346,13 +494,15 @@ impl ArtifactRepository {
             .map_err(Into::into)
     }
 
-    async fn search_internal<'e, E>(
+    async fn search_internal<'e, E, T>(
         executor: E,
         filters: &ArtifactSearchFilters,
         read_ctx: Option<&ArtifactReadContext>,
-    ) -> Result<ArtifactSearchResult>
+        columns: &str,
+    ) -> Result<ArtifactSearchResult<T>>
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
     {
         let mut count_query = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM artifact a");
         let mut has_where = false;
@@ -367,7 +517,7 @@ impl ArtifactRepository {
             .await?;
 
         let mut data_query =
-            QueryBuilder::<Postgres>::new(format!("SELECT {} FROM artifact a", SELECT_COLUMNS));
+            QueryBuilder::<Postgres>::new(format!("SELECT {columns} FROM artifact a"));
         let mut has_where = false;
         push_artifact_filters(&mut data_query, filters, "a", &mut has_where);
         if let Some(ctx) = read_ctx {
@@ -381,10 +531,7 @@ impl ArtifactRepository {
         data_query.push(" OFFSET ");
         data_query.push_bind(filters.offset as i64);
 
-        let rows = data_query
-            .build_query_as::<Artifact>()
-            .fetch_all(executor)
-            .await?;
+        let rows = data_query.build_query_as::<T>().fetch_all(executor).await?;
 
         Ok(ArtifactSearchResult { rows, total })
     }
@@ -472,6 +619,41 @@ impl ArtifactRepository {
         ).bind(artifact_id).fetch_all(executor).await.map_err(Into::into)
     }
 
+    pub async fn linked_execution_ids_many<'e, E>(
+        executor: E,
+        artifact_ids: &[i64],
+    ) -> Result<Vec<(i64, i64)>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(
+            "SELECT DISTINCT artifact, execution FROM artifact_version \
+             WHERE artifact = ANY($1) AND execution IS NOT NULL ORDER BY artifact, execution",
+        )
+        .bind(artifact_ids)
+        .fetch_all(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Fetch one overflow row without allocating all retained history.
+    pub async fn linked_execution_ids_bounded<'e, E>(
+        executor: E,
+        artifact: i64,
+        limit: i64,
+    ) -> Result<Vec<i64>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if !(1..=257).contains(&limit) {
+            return Err(crate::Error::validation(
+                "Invalid artifact disclosure bound",
+            ));
+        }
+        sqlx::query_scalar("SELECT DISTINCT execution FROM artifact_version WHERE artifact = $1 AND execution IS NOT NULL ORDER BY execution LIMIT $2")
+            .bind(artifact).bind(limit).fetch_all(executor).await.map_err(Into::into)
+    }
+
     pub async fn find_by_execution<'e, E>(executor: E, execution_id: i64) -> Result<Vec<Artifact>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
@@ -482,9 +664,8 @@ impl ArtifactRepository {
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "SELECT DISTINCT {} FROM artifact a \
-             JOIN artifact_version av ON av.artifact = a.id \
-             WHERE av.execution = $1 \
+            "SELECT {} FROM artifact a \
+             WHERE EXISTS (SELECT 1 FROM artifact_version av WHERE av.artifact = a.id AND av.execution = $1) \
              ORDER BY a.created DESC, a.id DESC",
             select_with_alias
         );
@@ -732,7 +913,12 @@ fn push_owner_path_read_predicate<'a>(
         .push(artifact_alias)
         .push(".scope IN ('pack', 'action', 'sensor') AND ");
     let pack_expr = artifact_pack_ref_expr(artifact_alias);
-    push_pack_grants_predicate(query, read_ctx, &pack_expr);
+    push_pack_grants_predicate(
+        query,
+        read_ctx,
+        &pack_expr,
+        &super::iam_ownership::artifact_pack(artifact_alias),
+    );
     query.push(")");
     query.push(")");
     query.push(")");
@@ -743,7 +929,10 @@ fn can_apply_artifact_grant(grant: &Grant) -> bool {
     let Some(constraints) = &grant.constraints else {
         return true;
     };
-    constraints.execution_scope.is_none() && constraints.encrypted.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.execution_scope.is_none()
+        && constraints.encrypted.is_none()
 }
 
 fn push_artifact_grants_predicate<'a>(
@@ -802,6 +991,14 @@ fn push_single_artifact_grant_predicate<'a>(
             *has_term = true;
         }
     };
+
+    if let Some(pack) = constraints.managing_pack_id {
+        push_and(query, &mut has_term);
+        query
+            .push(super::iam_ownership::artifact_pack(artifact_alias))
+            .push(" = ")
+            .push_bind(pack);
+    }
 
     if let Some(pack_refs) = &constraints.pack_refs {
         if pack_refs.is_empty() {
@@ -918,7 +1115,9 @@ fn can_apply_pack_grant(grant: &Grant) -> bool {
         return true;
     };
 
-    constraints.owner_types.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.owner_types.is_none()
         && constraints.owner_refs.is_none()
         && constraints.visibility.is_none()
         && constraints.execution_scope.is_none()
@@ -931,6 +1130,7 @@ fn push_pack_grants_predicate<'a>(
     query: &mut QueryBuilder<'a, Postgres>,
     read_ctx: &ArtifactReadContext,
     pack_expr: &str,
+    managing_pack_expr: &str,
 ) {
     let grants: Vec<&Grant> = read_ctx
         .grants
@@ -951,7 +1151,7 @@ fn push_pack_grants_predicate<'a>(
         if wrote_any {
             query.push(" OR ");
         }
-        push_single_pack_grant_predicate(query, grant, pack_expr);
+        push_single_pack_grant_predicate(query, grant, pack_expr, managing_pack_expr);
         wrote_any = true;
     }
     if !wrote_any {
@@ -964,6 +1164,7 @@ fn push_single_pack_grant_predicate<'a>(
     query: &mut QueryBuilder<'a, Postgres>,
     grant: &Grant,
     pack_expr: &str,
+    managing_pack_expr: &str,
 ) {
     let Some(constraints) = &grant.constraints else {
         query.push("TRUE");
@@ -979,6 +1180,11 @@ fn push_single_pack_grant_predicate<'a>(
             *has_term = true;
         }
     };
+
+    if let Some(pack) = constraints.managing_pack_id {
+        push_and(query, &mut has_term);
+        query.push(managing_pack_expr).push(" = ").push_bind(pack);
+    }
 
     if let Some(pack_refs) = &constraints.pack_refs {
         if pack_refs.is_empty() {
@@ -1014,7 +1220,9 @@ fn can_apply_execution_grant(grant: &Grant) -> bool {
     let Some(constraints) = &grant.constraints else {
         return true;
     };
-    constraints.owner_types.is_none()
+    constraints.pack_owner.is_none()
+        && constraints.pack_state.is_none()
+        && constraints.owner_types.is_none()
         && constraints.owner_refs.is_none()
         && constraints.visibility.is_none()
         && constraints.encrypted.is_none()
@@ -1073,6 +1281,14 @@ fn push_single_execution_grant_predicate<'a>(
             *has_term = true;
         }
     };
+
+    if let Some(pack) = constraints.managing_pack_id {
+        push_and(query, &mut has_term);
+        query
+            .push(super::iam_ownership::execution_pack(execution_alias))
+            .push(" = ")
+            .push_bind(pack);
+    }
 
     if let Some(pack_refs) = &constraints.pack_refs {
         if pack_refs.is_empty() {
@@ -1214,6 +1430,85 @@ fn push_artifact_version_read_predicate<'a>(
 use crate::models::artifact_version;
 
 pub struct ArtifactVersionRepository;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ArtifactVersionSummaryRow {
+    pub id: i64,
+    pub version: i32,
+    pub execution: Option<i64>,
+    pub content_type: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub file_path: Option<String>,
+    pub body_state: Option<crate::models::enums::ArtifactBodyState>,
+    pub object_key: Option<String>,
+    pub provider_version: Option<String>,
+    pub sha256: Option<String>,
+    pub created_by: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
+pub const VERSION_SUMMARY_SELECT_COLUMNS: &str =
+    "id, version, execution, content_type, size_bytes, file_path, body_state, object_key, provider_version, sha256, created_by, created";
+
+impl ArtifactVersionRepository {
+    pub async fn bounded_summaries<'e, E: Executor<'e, Database = Postgres>>(
+        executor: E,
+        artifact: i64,
+    ) -> Result<Vec<ArtifactVersionSummaryRow>> {
+        sqlx::query_as(&format!("SELECT {VERSION_SUMMARY_SELECT_COLUMNS} FROM artifact_version WHERE artifact = $1 ORDER BY version DESC LIMIT 257"))
+            .bind(artifact).fetch_all(executor).await.map_err(Into::into)
+    }
+
+    pub async fn page_summaries<'e, E>(
+        executor: E,
+        artifact_id: i64,
+        read_ctx: Option<&ArtifactReadContext>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<ArtifactSearchResult<ArtifactVersionSummaryRow>>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        if !(1..=100).contains(&limit) {
+            return Err(crate::Error::validation(
+                "Version page size must be between 1 and 100",
+            ));
+        }
+        let total = Self::summary_query(artifact_id, read_ctx, "COUNT(*)")
+            .build_query_scalar::<i64>()
+            .fetch_one(executor)
+            .await?;
+        let columns = VERSION_SUMMARY_SELECT_COLUMNS
+            .split(',')
+            .map(|column| format!("av.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut query = Self::summary_query(artifact_id, read_ctx, &columns);
+        query
+            .push(" ORDER BY av.version DESC, av.id DESC LIMIT ")
+            .push_bind(i64::from(limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(offset));
+        let rows = query.build_query_as().fetch_all(executor).await?;
+        Ok(ArtifactSearchResult { rows, total })
+    }
+
+    fn summary_query(
+        artifact_id: i64,
+        read_ctx: Option<&ArtifactReadContext>,
+        columns: &str,
+    ) -> QueryBuilder<'static, Postgres> {
+        let mut query = QueryBuilder::<Postgres>::new(format!(
+            "SELECT {columns} FROM artifact_version av JOIN artifact a ON a.id = av.artifact WHERE av.artifact = "
+        ));
+        query.push_bind(artifact_id);
+        if let Some(ctx) = read_ctx {
+            query.push(" AND ");
+            push_artifact_version_read_predicate(&mut query, ctx, "a", "av");
+        }
+        query
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFailureStage {
@@ -1471,6 +1766,74 @@ impl ArtifactVersionRepository {
     }
 
     /// Get the latest version for an artifact (without binary content)
+    pub async fn find_selected_for_share(
+        connection: &mut PgConnection,
+        artifact: i64,
+        version: Option<i32>,
+    ) -> Result<Option<ArtifactVersion>> {
+        sqlx::query_as::<_, ArtifactVersion>(&format!(
+            "SELECT {} FROM artifact_version WHERE artifact = $1 AND ($2::INTEGER IS NULL OR version = $2) ORDER BY version DESC LIMIT 1 FOR SHARE",
+            artifact_version::SELECT_COLUMNS_WITH_CONTENT,
+        )).bind(artifact).bind(version).fetch_optional(connection).await.map_err(Into::into)
+    }
+
+    pub async fn mark_encrypted_log<'e, E: Executor<'e, Database = Postgres>>(
+        executor: E,
+        version: i64,
+    ) -> Result<()> {
+        sqlx::query("UPDATE artifact_version SET meta = COALESCE(meta,'{}'::JSONB) || jsonb_build_object('log_encoding',$2::TEXT) WHERE id = $1 AND execution IS NOT NULL")
+            .bind(version).bind(crate::runtime_read_log::ENCODING).execute(executor).await?;
+        Ok(())
+    }
+
+    /// Called only in the fenced seal/Ready transaction. A Ready version may
+    /// replay its exact existing proof, never acquire or replace one afterward.
+    pub async fn set_encrypted_log_manifest(
+        connection: &mut sqlx::PgConnection,
+        version: i64,
+        authenticated: &str,
+    ) -> Result<()> {
+        let changed = sqlx::query("UPDATE artifact_version SET meta=COALESCE(meta,'{}'::jsonb) || jsonb_build_object('encrypted_log_manifest',$2::text) \
+            WHERE id=$1 AND meta->>'log_encoding'=$3 AND (meta->>'encrypted_log_manifest' IS NULL OR meta->>'encrypted_log_manifest'=$2) \
+            AND (body_state='pending' OR (body_state='ready' AND meta->>'encrypted_log_manifest'=$2))")
+            .bind(version).bind(authenticated).bind(crate::runtime_read_log::ENCODING).execute(connection).await?.rows_affected();
+        if changed != 1 {
+            return Err(crate::Error::PermissionDenied(
+                "Encrypted log completion metadata is immutable or unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn has_runtime_log_binding(
+        connection: &mut PgConnection,
+        version: i64,
+    ) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM log_stream WHERE artifact_version = $1) OR EXISTS(SELECT 1 FROM sensor_log_generation_binding WHERE artifact_version = $1) OR EXISTS(SELECT 1 FROM artifact_version WHERE id = $1 AND meta ? 'log_encoding')")
+            .bind(version).fetch_one(connection).await.map_err(Into::into)
+    }
+
+    pub async fn log_is_sealed(connection: &mut PgConnection, version: i64) -> Result<bool> {
+        let sealed: Option<bool> = sqlx::query_scalar("SELECT sealed AND sealed_at IS NOT NULL FROM log_stream WHERE artifact_version = $1 FOR SHARE")
+            .bind(version).fetch_optional(connection).await?;
+        Ok(sealed == Some(true))
+    }
+
+    pub async fn find_pinned_for_share(
+        connection: &mut PgConnection,
+        id: i64,
+    ) -> Result<Option<ArtifactVersion>> {
+        sqlx::query_as::<_, ArtifactVersion>(&format!(
+            "SELECT {} FROM artifact_version WHERE id = $1 FOR SHARE",
+            artifact_version::SELECT_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(connection)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Get the latest version for an artifact (without binary content)
     pub async fn find_latest<'e, E>(
         executor: E,
         artifact_id: i64,
@@ -1604,7 +1967,8 @@ impl ArtifactVersionRepository {
     }
 
     /// Create a new artifact version. The version number is auto-assigned
-    /// (MAX(version) + 1) and the retention trigger fires after insert.
+    /// (MAX(version) + 1). The trigger projects parent metadata only; bounded
+    /// retention runs separately under graph-first supervisor reclamation.
     pub async fn create<'e, E>(
         executor: E,
         input: CreateArtifactVersionInput,
@@ -1771,9 +2135,82 @@ impl ArtifactVersionRepository {
                 Err(err) => return Err(err),
             }
         };
-        let file_path = compute_file_path(artifact_ref, version.version, &content_type)?;
+        let file_path = format!(
+            "files/versions/{}/{}",
+            version.id,
+            compute_file_path(artifact_ref, version.version, &content_type)?
+        );
         Self::update_file_path(executor, version.id, &file_path).await?;
         version.file_path = Some(file_path);
+        Ok(version)
+    }
+
+    /// Allocate a staged file in an outer transaction, allowing immutable source
+    /// bindings to be attached before any content becomes visible.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_file_backed_with_conn(
+        connection: &mut sqlx::PgConnection,
+        artifact_id: i64,
+        artifact_ref: &str,
+        content_type: String,
+        execution: Option<i64>,
+        meta: Option<serde_json::Value>,
+        created_by: Option<String>,
+    ) -> Result<ArtifactVersion> {
+        validate_artifact_ref(artifact_ref)?;
+        // Separate admission from MAX(version), so waiting writers compute the
+        // version from a fresh READ COMMITTED snapshot after obtaining the lock.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(artifact_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+        let mut version = sqlx::query_as::<_, ArtifactVersion>(&format!(
+            "INSERT INTO artifact_version (artifact, version, execution, content_type, file_path, body_state, object_key, meta, created_by) \
+             SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, NULL, 'pending', \
+                    format('artifacts/%s/uploads/%s', $1, gen_random_uuid()), $4, $5 \
+             FROM artifact_version WHERE artifact = $1 RETURNING {}", artifact_version::SELECT_COLUMNS))
+            .bind(artifact_id).bind(execution).bind(&content_type).bind(meta).bind(created_by)
+            .fetch_one(&mut *connection).await?;
+        // Display version numbers and refs can be reused; physical staging cannot.
+        let file_path = format!(
+            "files/versions/{}/{}",
+            version.id,
+            compute_file_path(artifact_ref, version.version, &content_type)?
+        );
+        Self::update_file_path(&mut *connection, version.id, &file_path).await?;
+        version.file_path = Some(file_path);
+        Ok(version)
+    }
+
+    /// Allocate a runtime-log version without claiming that the body is an object.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_log_pending_with_conn(
+        connection: &mut sqlx::PgConnection,
+        artifact: i64,
+        reference: &str,
+        backend: crate::models::LogStreamBackend,
+        execution: i64,
+        meta: serde_json::Value,
+    ) -> Result<ArtifactVersion> {
+        validate_artifact_ref(reference)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(artifact.to_string())
+        .execute(&mut *connection)
+        .await?;
+        let mut version: ArtifactVersion = sqlx::query_as(&format!(
+            "INSERT INTO artifact_version (artifact,version,execution,content_type,body_state,object_key,meta,created_by) \
+             SELECT $1,COALESCE(MAX(version),0)+1,$2,'text/plain','pending', \
+             CASE WHEN $3 THEN format('artifacts/%s/uploads/%s',$1,gen_random_uuid()) END,$4,'worker' \
+             FROM artifact_version WHERE artifact=$1 RETURNING {}", artifact_version::SELECT_COLUMNS))
+            .bind(artifact).bind(execution).bind(backend == crate::models::LogStreamBackend::ObjectSegments)
+            .bind(meta).fetch_one(&mut *connection).await?;
+        let path = compute_file_path(reference, version.version, "text/plain")?;
+        Self::update_file_path(connection, version.id, &path).await?;
+        version.file_path = Some(path);
         Ok(version)
     }
 
@@ -1833,6 +2270,30 @@ impl ArtifactVersionRepository {
         Self::update_file_path(executor, version.id, &file_path).await?;
         version.file_path = Some(file_path);
         Ok(version)
+    }
+
+    /// Reserve an object-backed version before receiving its body.
+    pub async fn create_object_pending_with_conn(
+        connection: &mut sqlx::PgConnection,
+        artifact: i64,
+        execution: Option<i64>,
+        content_type: String,
+        meta: Option<serde_json::Value>,
+        created_by: Option<String>,
+    ) -> Result<ArtifactVersion> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(artifact.to_string())
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query_as(&format!(
+            "INSERT INTO artifact_version (artifact,version,execution,content_type,body_state,object_key,meta,created_by) \
+             SELECT $1,COALESCE(MAX(version),0)+1,$2,$3,'pending', \
+             format('artifacts/%s/uploads/%s',$1,gen_random_uuid()),$4,$5 \
+             FROM artifact_version WHERE artifact=$1 RETURNING {}", artifact_version::SELECT_COLUMNS))
+            .bind(artifact).bind(execution).bind(content_type).bind(meta).bind(created_by)
+            .fetch_one(connection).await.map_err(Into::into)
     }
 
     /// Reserve an object-backed version before receiving its body.
@@ -1939,7 +2400,10 @@ impl ArtifactVersionRepository {
         sqlx::query(
             "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
         )
-        .bind(artifact_id)
+        // All callers of this exact cached query use canonical decimal TEXT.
+        // Mixing i64 binary arguments with its TEXT-prepared statement sends
+        // zero bytes as UTF-8, rather than changing the advisory lock identity.
+        .bind(artifact_id.to_string())
         .execute(&mut **tx)
         .await?;
 
@@ -1977,7 +2441,7 @@ impl ArtifactVersionRepository {
         sqlx::query(
             "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
         )
-        .bind(artifact_id)
+        .bind(artifact_id.to_string())
         .execute(&mut **tx)
         .await?;
         let query = format!(

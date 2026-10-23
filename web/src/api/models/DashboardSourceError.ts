@@ -4,7 +4,7 @@
 /* eslint-disable */
 export type DashboardSourceError = {
   code: string;
-  details: any | null;
+  details: Record<string, any> | null;
   message: string;
   retryable: boolean;
 };

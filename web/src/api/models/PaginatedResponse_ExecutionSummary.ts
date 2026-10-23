@@ -68,7 +68,7 @@ export type PaginatedResponse_ExecutionSummary = {
     /**
      * Workflow task metadata (only populated for workflow task executions)
      */
-    workflow_task?: any | null;
+    workflow_task?: Record<string, any> | null;
   }>;
   /**
    * Pagination metadata

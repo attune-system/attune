@@ -176,7 +176,7 @@ impl TemplateContext {
 
     pub fn with_event_payload_secret_paths(
         mut self,
-        trigger_ref: Option<String>,
+        event_id: i64,
         secret_paths: Vec<JsonPointer>,
     ) -> Self {
         for path in secret_paths {
@@ -189,11 +189,53 @@ impl TemplateContext {
             self.secret_sources.push(ContextSecretSource {
                 path: source_path,
                 pointer: pointer_join("/payload", &path),
-                source: SecretSource::TriggerSchema {
-                    trigger_ref: trigger_ref.clone(),
-                    section: "payload",
-                    path,
+                source: SecretSource::EventPayload { event_id, path },
+            });
+        }
+        self
+    }
+
+    /// The source ID is an immutable snapshot keyed by exact event (id,created),
+    /// selected by the server. A display event ID is not a source capability.
+    pub fn with_event_source_secret_paths(mut self, source: i64, paths: Vec<JsonPointer>) -> Self {
+        for path in paths {
+            let suffix = pointer_to_dot_path(&path);
+            self.secret_sources.push(ContextSecretSource {
+                path: if suffix.is_empty() {
+                    "event.payload".into()
+                } else {
+                    format!("event.payload.{suffix}")
                 },
+                pointer: pointer_join("/payload", &path),
+                source: SecretSource::Bound(crate::secret_provenance::SecretProvenance {
+                    origins: vec![crate::secret_provenance::SecretOrigin::Entity {
+                        entity_type: crate::repositories::event_origin::EVENT_SOURCE_PAYLOAD.into(),
+                        entity_id: source,
+                        path,
+                    }],
+                    templates: Vec::new(),
+                }),
+            });
+        }
+        self
+    }
+
+    pub fn with_bound_pack_config_secret_paths(
+        mut self,
+        revision: i64,
+        secret_paths: Vec<JsonPointer>,
+    ) -> Self {
+        for path in secret_paths {
+            let suffix = pointer_to_dot_path(&path);
+            self.secret_sources.push(ContextSecretSource {
+                path: if suffix.is_empty() {"pack.config".into()} else {format!("pack.config.{suffix}")},
+                pointer: path.clone(),
+                source: SecretSource::Bound(crate::secret_provenance::SecretProvenance {
+                    origins: vec![crate::secret_provenance::SecretOrigin::Entity {
+                        entity_type: crate::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION.into(),
+                        entity_id: revision, path,
+                    }], templates: Vec::new(),
+                }),
             });
         }
         self
@@ -254,6 +296,19 @@ impl TemplateContext {
     ) -> Vec<SecretPathSource> {
         let expr = normalize_expression_path(expr);
         let mut sources = Vec::new();
+        if let Some(selector) = expr
+            .strip_prefix("keystore[")
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            let selector = selector.trim();
+            if !selector.starts_with("keystore") {
+                sources.extend(self.secret_path_sources_for_expression(
+                    selector,
+                    dest_pointer,
+                    false,
+                ));
+            }
+        }
 
         for source in &self.secret_sources {
             if source.path == expr || expr.starts_with(&format!("{}.", source.path)) {
@@ -302,6 +357,43 @@ impl TemplateContext {
 static TEMPLATE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\{\{\s*([^}]+?)\s*\}\}").expect("Failed to compile template regex")
 });
+
+/// Rule secret inputs must be a whole Key expression, never interpolated text.
+pub fn is_key_template(value: &str) -> bool {
+    let value = value.trim();
+    let Some(captures) = TEMPLATE_REGEX.captures(value) else {
+        return false;
+    };
+    if captures
+        .get(0)
+        .is_none_or(|matched| matched.as_str() != value)
+    {
+        return false;
+    }
+    let expression = normalize_expression_path(captures[1].trim());
+    let valid_path = |path: &str| {
+        !path.is_empty()
+            && path.split('.').all(|part| {
+                !part.is_empty()
+                    && part.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                    })
+            })
+    };
+    if let Some(reference) = expression.strip_prefix("keystore.") {
+        // Identity-owned refs may contain an email address in the owner segment.
+        return reference.contains('.')
+            && !reference.split('.').any(|part| part.is_empty())
+            && reference.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | '_' | '-' | '@' | '+')
+            });
+    }
+    expression
+        .strip_prefix("keystore[")
+        .and_then(|value| value.strip_suffix(']'))
+        .is_some_and(|selector| !selector.starts_with("keystore") && valid_path(selector.trim()))
+}
 
 impl std::fmt::Debug for TemplateContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -374,6 +466,38 @@ pub fn referenced_keystore_expressions(
         _ => {}
     }
     Ok(references)
+}
+
+pub fn references_pack_configuration(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::String(value) => TEMPLATE_REGEX.captures_iter(value).any(|capture| {
+            let expression = normalize_expression_path(capture[1].trim());
+            expression == "pack.config"
+                || expression.starts_with("pack.config.")
+                || expression
+                    .strip_prefix("keystore[")
+                    .and_then(|value| value.strip_suffix(']'))
+                    .is_some_and(|selector| selector.trim().starts_with("pack.config."))
+        }),
+        JsonValue::Array(values) => values.iter().any(references_pack_configuration),
+        JsonValue::Object(values) => values.values().any(references_pack_configuration),
+        _ => false,
+    }
+}
+
+/// Only for repository-pinned workflow declarations. Workflow `config` is the
+/// author's pack configuration, unlike rule/event `config` namespaces.
+pub fn workflow_template_uses_namespace(expression: &str, namespace: &str) -> bool {
+    TEMPLATE_REGEX.captures_iter(expression).any(|capture| {
+        crate::workflow::expression::uses_namespace(capture[1].trim(), namespace).unwrap_or(false)
+    })
+}
+
+pub fn workflow_template_uses_lookup(expression: &str, namespace: &str) -> bool {
+    TEMPLATE_REGEX.captures_iter(expression).any(|capture| {
+        crate::workflow::expression::uses_namespace_access(capture[1].trim(), namespace)
+            .unwrap_or(false)
+    })
 }
 
 /// Resolve all template variables in a JSON value.
@@ -505,6 +629,14 @@ fn resolve_string_template_with_sensitivity(
     context: &TemplateContext,
     pointer: &str,
 ) -> Result<RenderedJson> {
+    for capture in TEMPLATE_REGEX.captures_iter(s) {
+        if context
+            .get_value(capture[1].trim())
+            .is_some_and(|value| !crate::secret_values::redacted_paths(&value).is_empty())
+        {
+            anyhow::bail!("Template source is redacted or lacks disclosure authority");
+        }
+    }
     if let Some(captures) = TEMPLATE_REGEX.captures(s) {
         let full_match = captures.get(0).unwrap();
         if full_match.start() == 0 && full_match.end() == s.len() {
@@ -643,6 +775,51 @@ fn unescape_pointer_segment(segment: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secret_key_selectors_retain_selector_and_selected_key_origins() {
+        use super::*;
+        use crate::{
+            key_access::ResolvedKey,
+            models::OwnerType,
+            secret_provenance::{KeyOrigin, SecretOrigin, SecretProvenance},
+        };
+        let input = serde_json::json!({"token":"{{ keystore[event.payload.reference] }}"});
+        let context = TemplateContext::new(
+            serde_json::json!({"reference":"system.selected"}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .with_event_payload_secret_paths(42, vec!["/reference".into()]);
+        let expressions = referenced_keystore_expressions(&input, &context).unwrap();
+        let context = context.with_resolved_keys(
+            &expressions,
+            std::collections::BTreeMap::from([(
+                "system.selected".into(),
+                ResolvedKey {
+                    value: serde_json::json!("selected-fixture"),
+                    origin: KeyOrigin {
+                        key_id: 7,
+                        key_ref: "system.selected".into(),
+                        owner_type: OwnerType::System,
+                        owner_identity: None,
+                        owner_ref: None,
+                        encrypted: true,
+                    },
+                },
+            )]),
+        );
+        let rendered = resolve_templates_with_sensitivity(&input, &context).unwrap();
+        let mut origins = SecretProvenance::default();
+        for source in rendered.secret_path_sources {
+            origins.merge(source.source.provenance());
+        }
+        assert!(origins
+            .origins
+            .iter()
+            .any(|origin| matches!(origin, SecretOrigin::Key(key) if key.key_id == 7)));
+        assert!(origins.origins.iter().any(|origin| matches!(origin, SecretOrigin::Entity {entity_type,entity_id,path}
+            if entity_type == crate::secret_values::ENTITY_EVENT_PAYLOAD && *entity_id == 42 && path == "/reference")));
+    }
     use super::*;
 
     #[test]
@@ -807,10 +984,7 @@ mod tests {
             json!({}),
             json!({}),
         )
-        .with_event_payload_secret_paths(
-            Some("demo.secret_trigger".to_string()),
-            vec!["/api_key".to_string()],
-        );
+        .with_event_payload_secret_paths(42, vec!["/api_key".to_string()]);
         let template = json!({"api_key": "{{ event.payload.api_key }}"});
 
         let rendered = resolve_templates_with_sensitivity(&template, &context).unwrap();
@@ -820,10 +994,7 @@ mod tests {
         assert_eq!(rendered.secret_path_sources[0].path, "/api_key");
         assert!(matches!(
             rendered.secret_path_sources[0].source,
-            SecretSource::TriggerSchema {
-                section: "payload",
-                ..
-            }
+            SecretSource::EventPayload { event_id: 42, .. }
         ));
     }
 

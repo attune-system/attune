@@ -60,7 +60,7 @@ def sync_detailed(
     client: AuthenticatedClient,
     x_attune_pack_candidate_token: str,
 ) -> Response[Any]:
-    """Stream the staged candidate for a pending pack-install test.
+    """Stream the version-pinned candidate object for an assigned pack-install test.
 
     Args:
         pack_install_id (int):
@@ -92,7 +92,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     x_attune_pack_candidate_token: str,
 ) -> Response[Any]:
-    """Stream the staged candidate for a pending pack-install test.
+    """Stream the version-pinned candidate object for an assigned pack-install test.
 
     Args:
         pack_install_id (int):

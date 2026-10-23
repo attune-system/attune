@@ -10,7 +10,9 @@ entry_point: get_pack_dependencies.sh
 
 # Parameter delivery: stdin for secure parameter passing (no env vars)
 parameter_delivery: stdin
-parameter_format: dotenv
+parameter_format: json
+required_worker_runtimes:
+  python: ">=3.11,<4.0"
 
 # Output format: json (structured data parsing enabled)
 output_format: json
@@ -31,11 +33,16 @@ parameters:
   api_url:
     type: string
     description: "Attune API URL for checking installed packs"
-    default: "http://localhost:8080"
+  api_token:
+    type: string
+    secret: true
+    description: Existing bearer access token. Omit to use an explicitly authorized execution token.
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
-output_schema:
+output:
+  duration_seconds:
+    type: integer
   dependencies:
     type: array
     description: "List of pack dependencies that need to be installed"
@@ -64,24 +71,24 @@ output_schema:
           type: string
           description: "Pack reference"
         python:
-          type: object
+          type: [object, "null"]
           description: "Python runtime requirements"
           properties:
             version:
-              type: string
+              type: [string, "null"]
               description: "Python version requirement"
             requirements_file:
-              type: string
+              type: [string, "null"]
               description: "Path to requirements.txt"
         nodejs:
-          type: object
+          type: [object, "null"]
           description: "Node.js runtime requirements"
           properties:
             version:
-              type: string
+              type: [string, "null"]
               description: "Node.js version requirement"
             package_file:
-              type: string
+              type: [string, "null"]
               description: "Path to package.json"
   missing_dependencies:
     type: array

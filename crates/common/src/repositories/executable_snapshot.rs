@@ -2,6 +2,7 @@ use crate::models::{ExecutionExecutableSnapshot, Id};
 use crate::{Error, Result};
 use serde_json::Value;
 use sqlx::{Executor, FromRow, PgConnection, Postgres};
+use std::collections::BTreeMap;
 
 #[derive(FromRow)]
 struct SnapshotRow {
@@ -15,12 +16,89 @@ struct SnapshotRow {
 pub struct ExecutableSnapshotRepository;
 
 impl ExecutableSnapshotRepository {
+    /// Load the complete immutable release declaration set for candidate policy
+    /// compilation. Disabled declarations remain present: lifecycle checks for
+    /// new invocation are separate from the contents of the immutable release.
+    /// This method does not prove foreign reference visibility to its caller.
+    pub async fn resolve_release_actions(
+        connection: &mut PgConnection,
+        release_id: Id,
+    ) -> Result<BTreeMap<String, ExecutionExecutableSnapshot>> {
+        super::schema_type::SchemaTypeRepository::lock_selection(&mut *connection).await?;
+        let release: Option<(Id, String, String)> = sqlx::query_as(
+            "SELECT pack, digest, content_path FROM pack_release WHERE id = $1 FOR SHARE",
+        )
+        .bind(release_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let (pack, digest, content_path) =
+            release.ok_or_else(|| crate::Error::validation("Immutable release is unavailable"))?;
+        let release = crate::models::PackReleasePin {
+            id: release_id,
+            digest,
+            content_path,
+        };
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT component_ref, snapshot FROM pack_release_executable \
+             WHERE release = $1 AND component_kind = 'action' ORDER BY component_ref FOR SHARE",
+        )
+        .bind(release_id)
+        .fetch_all(connection)
+        .await?;
+        let mut actions = BTreeMap::new();
+        for (reference, body) in rows {
+            let executable: crate::models::ActionExecutableSnapshot = serde_json::from_value(body)?;
+            if executable.action.r#ref != reference || executable.action.pack != pack {
+                return Err(crate::Error::validation(
+                    "Immutable executable ownership mismatch",
+                ));
+            }
+            if actions
+                .insert(
+                    reference,
+                    crate::models::ReleasedActionExecutableSnapshot {
+                        release: release.clone(),
+                        executable,
+                    },
+                )
+                .is_some()
+            {
+                return Err(crate::Error::validation(
+                    "Duplicate immutable executable reference",
+                ));
+            }
+        }
+        Ok(actions
+            .iter()
+            .map(|(reference, action)| {
+                (
+                    reference.clone(),
+                    ExecutionExecutableSnapshot {
+                        release: action.release.clone(),
+                        executable: action.executable.clone(),
+                        pack_executables: if action.executable.workflow_definition.is_some() {
+                            actions.clone()
+                        } else {
+                            BTreeMap::new()
+                        },
+                    },
+                )
+            })
+            .collect())
+    }
+
     pub async fn capture_present(
         connection: &mut PgConnection,
         release_id: Id,
         action_ids: &[Id],
         sensor_ids: &[Id],
     ) -> Result<()> {
+        // Desired-state deployment replaces future metadata overrides, including
+        // redeployment of identical code bytes. Old policy revisions retain pins.
+        sqlx::query("DELETE FROM managed_executable_metadata_current WHERE action = ANY($1)")
+            .bind(action_ids)
+            .execute(&mut *connection)
+            .await?;
         sqlx::query(
             r#"
             INSERT INTO pack_release_executable
@@ -52,12 +130,42 @@ impl ExecutableSnapshotRepository {
             INSERT INTO pack_release_executable
                 (release, component_kind, component_id, component_ref, snapshot)
             SELECT $1, 'sensor', s.id, s.ref, jsonb_build_object(
-                'sensor', to_jsonb(s),
+                'sensor', to_jsonb(s) - 'config',
                 'runtime', to_jsonb(r),
                 'runtime_versions', COALESCE((
                     SELECT jsonb_agg(to_jsonb(rv) ORDER BY rv.version, rv.id)
                     FROM runtime_version rv
                     WHERE rv.runtime = r.id AND rv.retired_at IS NULL
+                ), '[]'::jsonb),
+                'triggers', COALESCE((
+                    SELECT jsonb_agg(to_jsonb(t) - 'webhook_key' - 'webhook_config' ORDER BY t.ref, t.id)
+                    FROM trigger t WHERE t.sensor = s.id AND t.retired_at IS NULL
+                ), '[]'::jsonb),
+                'cache_permission_set_refs', COALESCE(s.config->'cache_permission_set_refs', '[]'::jsonb),
+                'cache_grants', COALESCE((
+                    SELECT jsonb_agg(grant_value ORDER BY p.ref, ordinal)
+                    FROM permission_set p
+                    CROSS JOIN LATERAL jsonb_array_elements(effective_permission_set_grants(p.grants, COALESCE(p.pack, 0))) WITH ORDINALITY AS g(grant_value, ordinal)
+                    WHERE p.ref IN (SELECT btrim(value) FROM jsonb_array_elements_text(COALESCE(s.config->'cache_permission_set_refs', '[]'::jsonb)) AS refs(value))
+                        AND p.retired_at IS NULL AND grant_value->>'resource' = 'caches'
+                ), '[]'::jsonb),
+                'signing_permission_set_refs', COALESCE(s.config->'signing_permission_set_refs', '[]'::jsonb),
+                'signing_grants', COALESCE((
+                    SELECT jsonb_agg(jsonb_set(grant_value, '{actions}', '["use"]'::jsonb) ORDER BY p.ref, ordinal)
+                    FROM permission_set p
+                    CROSS JOIN LATERAL jsonb_array_elements(effective_permission_set_grants(p.grants, COALESCE(p.pack, 0))) WITH ORDINALITY AS g(grant_value, ordinal)
+                    WHERE p.ref IN (SELECT btrim(value) FROM jsonb_array_elements_text(COALESCE(s.config->'signing_permission_set_refs', '[]'::jsonb)) AS refs(value))
+                        AND p.retired_at IS NULL AND grant_value->>'resource' = 'keys' AND grant_value->'actions' ? 'use'
+                ), '[]'::jsonb),
+                'input_permission_set_refs', COALESCE(s.config->'input_permission_set_refs', '[]'::jsonb),
+                'input_grants', COALESCE((
+                    SELECT jsonb_agg(jsonb_set(grant_value, '{actions}', selected.actions) ORDER BY p.ref, ordinal)
+                    FROM permission_set p
+                    CROSS JOIN LATERAL jsonb_array_elements(effective_permission_set_grants(p.grants, COALESCE(p.pack, 0))) WITH ORDINALITY AS g(grant_value, ordinal)
+                    CROSS JOIN LATERAL (SELECT jsonb_agg(action) AS actions FROM jsonb_array_elements(grant_value->'actions') action
+                        WHERE action IN ('"read"'::jsonb, '"decrypt"'::jsonb)) selected
+                    WHERE p.ref IN (SELECT btrim(value) FROM jsonb_array_elements_text(COALESCE(s.config->'input_permission_set_refs', '[]'::jsonb)) AS refs(value))
+                        AND p.retired_at IS NULL AND grant_value->>'resource' IN ('keys', 'packs') AND selected.actions IS NOT NULL
                 ), '[]'::jsonb)
             )
             FROM sensor s
@@ -121,7 +229,7 @@ impl ExecutableSnapshotRepository {
                 SELECT
                     a.id,
                     a.ref,
-                    executable.snapshot,
+                    COALESCE(metadata.snapshot, executable.snapshot) AS snapshot,
                     pr.id AS release_id,
                     pr.digest AS release_digest,
                     pr.content_path
@@ -134,6 +242,10 @@ impl ExecutableSnapshotRepository {
                  AND executable.component_kind = 'action'
                  AND executable.component_id = a.id
                 JOIN pack_release pr ON pr.id = executable.release
+                LEFT JOIN managed_executable_metadata_current metadata_current ON metadata_current.action = a.id
+                LEFT JOIN managed_executable_metadata_revision metadata
+                  ON metadata.id = metadata_current.revision AND metadata.release = executable.release
+                 AND metadata.action = a.id AND metadata.pack = a.pack AND metadata.action_ref = a.ref
                 WHERE a.retired_at IS NULL
                   AND a.effective_enabled
                   AND (a.runtime IS NULL OR r.id IS NOT NULL)

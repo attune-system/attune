@@ -19,6 +19,7 @@ export type PackResponse = {
    * Pack configuration
    */
   config: Record<string, any>;
+  config_schema_binding?: null | Value;
   /**
    * Creation timestamp
    */
@@ -47,6 +48,7 @@ export type PackResponse = {
    * Pack metadata
    */
   meta: Record<string, any>;
+  owner_roles: Array<string>;
   /**
    * Unique reference identifier
    */

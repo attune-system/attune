@@ -956,8 +956,7 @@ async fn handle_version_list(
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 
-    let path = format!("/artifacts/{}/versions", artifact_id);
-    let versions: Vec<VersionSummary> = client.get(&path).await?;
+    let versions = fetch_all_version_summaries(&mut client, artifact_id).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -1004,6 +1003,38 @@ async fn handle_version_list(
     }
 
     Ok(())
+}
+
+async fn fetch_all_version_summaries(
+    client: &mut ApiClient,
+    artifact_id: i64,
+) -> Result<Vec<VersionSummary>> {
+    let mut page = 1u32;
+    let mut versions = Vec::new();
+    loop {
+        let path = format!("/artifacts/{artifact_id}/versions?page={page}&per_page=100");
+        let response = client
+            .get_paginated_response::<VersionSummary>(&path)
+            .await?;
+        let has_next = response
+            .pagination
+            .get("has_next")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Version-list response is missing pagination.has_next")
+            })?;
+        if has_next && response.items.is_empty() {
+            anyhow::bail!("Version-list response returned an empty page with has_next=true");
+        }
+        versions.extend(response.items);
+        if !has_next {
+            break;
+        }
+        page = page
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Version-list page number overflow"))?;
+    }
+    Ok(versions)
 }
 
 async fn handle_version_show(
@@ -1255,6 +1286,62 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Commands};
     use clap::Parser;
+
+    #[tokio::test]
+    async fn version_list_traverses_all_pages_without_truncating_structured_output() {
+        use wiremock::{
+            matchers::{method, path, query_param},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        for (page, version, has_next) in [(1, 2, true), (2, 1, false)] {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/artifacts/42/versions"))
+                .and(query_param("page", page.to_string()))
+                .and(query_param("per_page", "100"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "items":[{"id":version,"version":version,"created":"2026-10-14T00:00:00Z"}],
+                    "pagination":{"has_next":has_next}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut client = ApiClient::new(server.uri(), None);
+        let versions = fetch_all_version_summaries(&mut client, 42).await.unwrap();
+        assert_eq!(
+            versions.iter().map(|row| row.version).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            serde_json::to_value(&versions)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn version_list_rejects_missing_metadata_and_empty_advancing_pages() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        for pagination in [serde_json::json!({}), serde_json::json!({"has_next":true})] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"items":[],"pagination":pagination})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut client = ApiClient::new(server.uri(), None);
+            assert!(fetch_all_version_summaries(&mut client, 42).await.is_err());
+            server.verify().await;
+        }
+    }
 
     #[test]
     fn retry_workflow_log_help_and_positional_id_match_documented_syntax() {

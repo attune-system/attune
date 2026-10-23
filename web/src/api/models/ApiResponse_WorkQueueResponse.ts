@@ -29,7 +29,7 @@ export type ApiResponse_WorkQueueResponse = {
     label: string;
     pack?: null | i64;
     pack_ref?: string | null;
-    permission_set_refs?: any[] | null;
+    permission_set_refs?: Array<string> | null;
     ref: string;
     reference_allowed_pack_refs: Array<string>;
     reference_visibility: ActionReferenceVisibility;

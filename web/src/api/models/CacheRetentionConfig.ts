@@ -52,7 +52,9 @@ export type CacheRetentionConfig = {
    */
   freshness_alerts_enabled?: boolean;
   /**
-   * Total generation-reclamation budget per supervisor cycle.
+   * Generation-reclamation business-work budget per supervisor cycle.
+   * An interrupted repository attempt may spend at most another 500ms on
+   * protocol drain and rollback acknowledgement, never additional business work.
    */
   max_cleanup_cycle_milliseconds?: number;
   /**

@@ -37,7 +37,7 @@ export type CreateWorkflowRequest = {
   /**
    * Tags for categorization and search
    */
-  tags?: any[] | null;
+  tags?: Array<string> | null;
   /**
    * Workflow version (semantic versioning recommended)
    */

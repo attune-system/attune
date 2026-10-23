@@ -4,6 +4,7 @@
 /* eslint-disable */
 export type PackUploadForm = {
   absent_metadata_policy?: string | null;
+  acknowledge_incompatible_rollout?: string | null;
   force?: string | null;
   pack: Blob;
   skip_tests?: string | null;

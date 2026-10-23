@@ -61,8 +61,14 @@ mod parser;
 mod tokenizer;
 
 pub use ast::{BinaryOp, Expr, UnaryOp};
-pub use dependencies::{expression_dependencies, keystore_references, ExpressionDependencies};
-pub use evaluator::{is_truthy, EvalContext, EvalError, EvalResult};
+pub use dependencies::{
+    expression_dependencies, keystore_references, uses_namespace, uses_namespace_access,
+    ExpressionDependencies,
+};
+pub use evaluator::{
+    eval_selected, eval_selected_async, is_truthy, AsyncEvalContext, EvalContext, EvalError,
+    EvalResult, SelectedEvaluation, SelectedField,
+};
 pub use parser::{ParseError, Parser};
 pub use tokenizer::{Token, TokenKind, Tokenizer};
 

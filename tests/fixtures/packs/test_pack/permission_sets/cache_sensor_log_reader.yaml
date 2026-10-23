@@ -1,0 +1,8 @@
+ref: test_pack.cache_sensor_log_reader
+label: Cache Sensor Log Reader Fixture
+description: Explicit disclosure authority for the SDK-capable cache sensor.
+grants:
+  - resource: triggers
+    actions: [decrypt]
+    constraints:
+      refs: [test_pack.cache_reader]

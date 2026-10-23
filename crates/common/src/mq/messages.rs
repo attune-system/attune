@@ -331,6 +331,8 @@ fn default_version() -> String {
 /// Payload for EventCreated message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventCreatedPayload {
+    #[serde(default)]
+    pub event_created: Option<chrono::DateTime<chrono::Utc>>,
     /// Event ID
     pub event_id: Id,
     /// Trigger ID (may be None if trigger was deleted)

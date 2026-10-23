@@ -1,5 +1,6 @@
 //! Integration tests for health check and authentication endpoints
 
+use attune_common::platform_catalog::{CATALOG_REVISION, COMPATIBILITY_EPOCH};
 use axum::http::{header, StatusCode};
 use helpers::*;
 use serde_json::json;
@@ -94,8 +95,8 @@ async fn test_health_ready() {
 
     let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
     assert_eq!(body["status"], "ready");
-    assert_eq!(body["catalog"]["compatibility_epoch"], 1);
-    assert_eq!(body["catalog"]["revision"], 1);
+    assert_eq!(body["catalog"]["compatibility_epoch"], COMPATIBILITY_EPOCH);
+    assert_eq!(body["catalog"]["revision"], CATALOG_REVISION);
 }
 
 #[tokio::test]
@@ -177,7 +178,7 @@ async fn test_health_ready_rejects_non_current_catalog_revision() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
     assert_eq!(body["catalog"]["revision"], 0);
-    assert_eq!(body["catalog"]["expected_revision"], 1);
+    assert_eq!(body["catalog"]["expected_revision"], CATALOG_REVISION);
 }
 
 #[tokio::test]

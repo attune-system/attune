@@ -6,7 +6,7 @@
 use attune_api::authz::AuthorizationService;
 use attune_common::{
     audit::ThreadedAuditWriterHandle,
-    config::{CacheAdmissionConfig, Config},
+    config::{CacheAdmissionConfig, Config, PackRepublishConfig, PackRepublishMode},
     models::*,
     repositories::{
         action::{ActionRepository, CreateActionInput},
@@ -109,24 +109,85 @@ impl TestContext {
         Self::new_with_cache_admission(CacheAdmissionConfig::default()).await
     }
 
+    /// Stable cold-cache measurements without invalidating neighboring app states.
+    #[allow(dead_code)]
+    pub async fn new_without_authorization_metadata_cache() -> Result<Self> {
+        Self::new_with_authorization_cache_options(
+            CacheAdmissionConfig::default(),
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
     #[allow(dead_code)]
     pub async fn new_with_cache_admission(cache_admission: CacheAdmissionConfig) -> Result<Self> {
-        Self::new_with_options(cache_admission, false, false, false, None).await
+        Self::new_with_options(cache_admission, false, false, false, None, None).await
     }
 
     #[allow(dead_code)]
     pub async fn new_without_registry_encryption_key() -> Result<Self> {
-        Self::new_with_options(CacheAdmissionConfig::default(), true, false, false, None).await
+        Self::new_with_options(
+            CacheAdmissionConfig::default(),
+            true,
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
     }
 
     #[allow(dead_code)]
     pub async fn new_with_disabled_pack_registry() -> Result<Self> {
-        Self::new_with_options(CacheAdmissionConfig::default(), false, true, true, None).await
+        Self::new_with_options(
+            CacheAdmissionConfig::default(),
+            false,
+            true,
+            true,
+            None,
+            None,
+        )
+        .await
     }
 
     #[allow(dead_code)]
     pub async fn new_with_unverified_direct_remote_installs() -> Result<Self> {
-        Self::new_with_options(CacheAdmissionConfig::default(), false, false, true, None).await
+        Self::new_with_options(
+            CacheAdmissionConfig::default(),
+            false,
+            false,
+            true,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_dev_version_republish() -> Result<Self> {
+        Self::new_with_pack_republish(PackRepublishConfig {
+            mode: PackRepublishMode::Suffix,
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_pack_republish(republish: PackRepublishConfig) -> Result<Self> {
+        Self::new_with_options(
+            CacheAdmissionConfig::default(),
+            false,
+            false,
+            false,
+            None,
+            Some(republish),
+        )
+        .await
     }
 
     #[allow(dead_code)]
@@ -137,6 +198,7 @@ impl TestContext {
             false,
             false,
             Some((global, per_identity)),
+            None,
         )
         .await
     }
@@ -147,6 +209,28 @@ impl TestContext {
         disable_pack_registry: bool,
         allow_unverified_direct_remote_installs: bool,
         stream_limits: Option<(usize, usize)>,
+        republish: Option<PackRepublishConfig>,
+    ) -> Result<Self> {
+        Self::new_with_authorization_cache_options(
+            cache_admission,
+            clear_encryption_key,
+            disable_pack_registry,
+            allow_unverified_direct_remote_installs,
+            stream_limits,
+            republish,
+            true,
+        )
+        .await
+    }
+
+    async fn new_with_authorization_cache_options(
+        cache_admission: CacheAdmissionConfig,
+        clear_encryption_key: bool,
+        disable_pack_registry: bool,
+        allow_unverified_direct_remote_installs: bool,
+        stream_limits: Option<(usize, usize)>,
+        republish: Option<PackRepublishConfig>,
+        authorization_metadata_cache_enabled: bool,
     ) -> Result<Self> {
         let database = create_test_database().await?;
         let pool = database.pool().clone();
@@ -163,10 +247,14 @@ impl TestContext {
         config.database.url = database_url;
         config.database.schema = Some(schema.clone());
         config.packs_base_dir = test_packs_dir.to_string_lossy().into_owned();
+        let artifacts_dir = test_packs_dir.join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir)?;
+        config.artifacts_dir = artifacts_dir.to_string_lossy().into_owned();
         config.storage = attune_common::config::BlobStorageConfig::Filesystem {
             root: test_packs_dir.join("blobs"),
         };
         config.cache_admission = cache_admission;
+        config.packs.republish = republish.unwrap_or_default();
         if let Some((global, per_identity)) = stream_limits {
             config.server.execution_log_stream_global_limit = global;
             config.server.execution_log_stream_per_identity_limit = per_identity;
@@ -184,11 +272,16 @@ impl TestContext {
             config.database.url.clone(),
             schema.clone(),
         )?;
-        let state = Arc::new(attune_api::state::AppState::new_with_audit(
+        let state = attune_api::state::AppState::new_with_audit(
             pool.clone(),
             config.clone(),
             audit_writer.emitter.clone(),
-        ));
+        );
+        let state = Arc::new(if authorization_metadata_cache_enabled {
+            state
+        } else {
+            state.without_authorization_metadata_cache()
+        });
         let server = attune_api::server::Server::new(state.clone());
         let app = server.router();
 
@@ -299,6 +392,7 @@ impl TestContext {
         AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
         AuthorizationService::invalidate_permission_set_caches().await;
         self.token = Some(token);
+        self.user = Some(identity);
         Ok(self)
     }
 
@@ -454,6 +548,15 @@ impl TestContext {
     #[allow(dead_code)] // This shared helper is compiled by tests that use Drop recovery only.
     pub async fn cleanup(mut self) -> Result<()> {
         self.app = axum::Router::new();
+        self.state
+            .file_transfers
+            .drain(std::time::Duration::from_secs(1))
+            .await;
+        let cancellation_shutdown = self
+            .state
+            .reclamation_cancellation
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
         if let Some(writer) = self.audit_writer.take() {
             writer
                 .shutdown()
@@ -464,12 +567,15 @@ impl TestContext {
             database.cleanup().await?;
         }
         remove_owned_pack_tree(&self.test_packs_dir)?;
+        cancellation_shutdown?;
         Ok(())
     }
 }
 
 impl Drop for TestContext {
     fn drop(&mut self) {
+        // Recovery signal only; explicit cleanup above is the joined proof.
+        self.state.reclamation_cancellation.begin_shutdown();
         // Drop router-held emitter clones before joining the dedicated writer.
         self.app = axum::Router::new();
         if let Some(writer) = self.audit_writer.take() {
@@ -679,6 +785,7 @@ pub async fn create_test_trigger(pool: &PgPool, pack_id: i64, ref_name: &str) ->
         description: Some(format!("Test trigger for {}", ref_name)),
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,

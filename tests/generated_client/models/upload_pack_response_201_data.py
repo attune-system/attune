@@ -10,6 +10,7 @@ from typing_extensions import Self
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.pack_diagnostic import PackDiagnostic
     from ..models.pack_install_provenance import PackInstallProvenance
     from ..models.pack_response import PackResponse
     from ..models.pack_test_result import PackTestResult
@@ -25,6 +26,7 @@ class UploadPackResponse201Data:
     Attributes:
         pack (PackResponse): Response DTO for pack information
         tests_skipped (bool): Whether tests were skipped
+        diagnostics (list[PackDiagnostic] | Unset):
         install_id (int | None | Unset): ID of the pack install tracking record, present when tests were dispatched.
         install_status (None | str | Unset): Current install status: pending, running, activating, succeeded, failed, or
             rolled_back.
@@ -34,6 +36,7 @@ class UploadPackResponse201Data:
 
     pack: PackResponse
     tests_skipped: bool
+    diagnostics: list[PackDiagnostic] | Unset = UNSET
     install_id: int | None | Unset = UNSET
     install_status: None | str | Unset = UNSET
     provenance: None | PackInstallProvenance | Unset = UNSET
@@ -41,14 +44,19 @@ class UploadPackResponse201Data:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.pack_install_provenance import (
-            PackInstallProvenance,
-        )
+        from ..models.pack_install_provenance import PackInstallProvenance
         from ..models.pack_test_result import PackTestResult
 
         pack = self.pack.to_dict()
 
         tests_skipped = self.tests_skipped
+
+        diagnostics: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.diagnostics, Unset):
+            diagnostics = []
+            for diagnostics_item_data in self.diagnostics:
+                diagnostics_item = diagnostics_item_data.to_dict()
+                diagnostics.append(diagnostics_item)
 
         install_id: int | None | Unset
         if isinstance(self.install_id, Unset):
@@ -86,6 +94,8 @@ class UploadPackResponse201Data:
                 "tests_skipped": tests_skipped,
             }
         )
+        if diagnostics is not UNSET:
+            field_dict["diagnostics"] = diagnostics
         if install_id is not UNSET:
             field_dict["install_id"] = install_id
         if install_status is not UNSET:
@@ -99,6 +109,7 @@ class UploadPackResponse201Data:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.pack_diagnostic import PackDiagnostic
         from ..models.pack_install_provenance import (
             PackInstallProvenance,
         )
@@ -109,6 +120,15 @@ class UploadPackResponse201Data:
         pack = PackResponse.from_dict(d.pop("pack"))
 
         tests_skipped = d.pop("tests_skipped")
+
+        _diagnostics = d.pop("diagnostics", UNSET)
+        diagnostics: list[PackDiagnostic] | Unset = UNSET
+        if _diagnostics is not UNSET:
+            diagnostics = []
+            for diagnostics_item_data in _diagnostics:
+                diagnostics_item = PackDiagnostic.from_dict(diagnostics_item_data)
+
+                diagnostics.append(diagnostics_item)
 
         def _parse_install_id(data: object) -> int | None | Unset:
             if data is None:
@@ -165,6 +185,7 @@ class UploadPackResponse201Data:
         upload_pack_response_201_data = cls(
             pack=pack,
             tests_skipped=tests_skipped,
+            diagnostics=diagnostics,
             install_id=install_id,
             install_status=install_status,
             provenance=provenance,

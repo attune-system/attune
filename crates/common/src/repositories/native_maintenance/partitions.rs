@@ -276,6 +276,15 @@ impl PartitionRepository {
             ));
         }
         let mut tx = bounded_transaction(pool, config).await?;
+        if let Err(error) = crate::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await {
+            // Admission is part of the bounded repair operation too. A busy
+            // evidence gate has the same deferral contract as a busy parent.
+            tx.rollback().await?;
+            return match error {
+                Error::Database(source) => deferred(&source).ok_or_else(|| source.into()),
+                error => Err(error),
+            };
+        }
         let row = sqlx::query_as::<_, RepairRow>(
             "SELECT outcome, rows_moved FROM native_partition_ensure_day($1, $2, $3)",
         )
@@ -341,7 +350,9 @@ impl PartitionRepository {
             .await
             .map_err(|e| failure(e, None, 0))?;
         let ids = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM native_partition_registry WHERE parent = $1 AND upper_bound <= $2
+            "SELECT r.id FROM native_partition_registry r WHERE parent = $1 AND upper_bound <= $2
+             AND (parent <> 'event' OR NOT EXISTS (SELECT 1 FROM file_evidence_pin p
+                 WHERE p.kind='event' AND p.source_created>=r.lower_bound AND p.source_created<r.upper_bound))
              ORDER BY upper_bound, id LIMIT $3",
         )
         .bind(table)
@@ -400,6 +411,33 @@ impl PartitionRepository {
                 failure(e.into(), Some(result.candidates), result.partitions_dropped)
             })?;
             result.partitions_dropped += i64::from(dropped);
+        }
+        if table == ManagedTable::Event && !result.cancelled && Instant::now() < deadline {
+            let mut tx = bounded_transaction(pool, &remaining_config(config, deadline))
+                .await
+                .map_err(|e| failure(e, Some(result.candidates), result.partitions_dropped))?;
+            crate::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await
+                .map_err(|e|failure(e,Some(result.candidates),result.partitions_dropped))?;
+            if let Err(source) =
+                crate::repositories::event_schema::EventSchemaRepository::cleanup_orphans(
+                    &mut tx,
+                    config.default_repair_row_limit,
+                    cutoff,
+                )
+                .await
+            {
+                tx.rollback().await.map_err(|e| {
+                    failure(e.into(), Some(result.candidates), result.partitions_dropped)
+                })?;
+                return Err(failure(
+                    source,
+                    Some(result.candidates),
+                    result.partitions_dropped,
+                ));
+            }
+            tx.commit().await.map_err(|e| {
+                failure(e.into(), Some(result.candidates), result.partitions_dropped)
+            })?;
         }
         Ok(result)
     }

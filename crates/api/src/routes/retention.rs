@@ -160,6 +160,7 @@ pub async fn update_retention_config(
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(super::file_audits::routes())
         .route(
             "/retention-config",
             get(get_retention_config).put(update_retention_config),

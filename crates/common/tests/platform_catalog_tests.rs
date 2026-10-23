@@ -5,7 +5,7 @@ use attune_common::{
     config::CacheAdmissionConfig,
     models::ManagementOrigin,
     pack_registry::loader::PackComponentLoader,
-    platform_catalog::{ManagedComponentKind as Kind, CATALOG_REVISION},
+    platform_catalog::{ManagedComponentKind as Kind, CATALOG_REVISION, COMPATIBILITY_EPOCH},
     repositories::{
         action::ActionRepository,
         identity::{
@@ -64,6 +64,11 @@ async fn snapshot(pool: &PgPool) -> Value {
 
 fn legacy_fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("pack.yaml"),
+        "ref: core\nlabel: Legacy core fixture\nversion: '1.0.0'\n",
+    )
+    .unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/platform_catalog");
     for directory in ["runtimes", "permission_sets", "triggers"] {
         std::fs::create_dir(root.path().join(directory)).unwrap();
@@ -634,11 +639,15 @@ async fn legacy_core_cannot_replace_platform_definitions_or_claim_ad_hoc_refs() 
 
 #[tokio::test]
 async fn newer_catalog_revision_and_incompatible_epoch_fail_closed() {
-    for column in ["revision", "compatibility_epoch"] {
+    for (column, unsupported) in [
+        ("revision", CATALOG_REVISION + 1),
+        ("compatibility_epoch", COMPATIBILITY_EPOCH + 1),
+    ] {
         let db = create_test_pool().await.unwrap();
         Catalog::reconcile(&db).await.unwrap();
         let before = snapshot(&db).await;
-        sqlx::query(&format!("UPDATE platform_catalog_state SET {column} = 2"))
+        sqlx::query(&format!("UPDATE platform_catalog_state SET {column} = $1"))
+            .bind(unsupported)
             .execute(&db)
             .await
             .unwrap();

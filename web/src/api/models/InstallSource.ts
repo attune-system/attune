@@ -15,7 +15,7 @@ export type InstallSource =
        * Git ref (tag, branch, commit)
        */
       ref: string;
-      type: InstallSource.type;
+      type: "git";
       /**
        * Git repository URL
        */
@@ -26,14 +26,9 @@ export type InstallSource =
        * Checksum in format "algorithm:hash"
        */
       checksum: string;
-      type: InstallSource.type;
+      type: "archive";
       /**
        * Archive URL
        */
       url: string;
     };
-export namespace InstallSource {
-  export enum type {
-    GIT = "git",
-  }
-}

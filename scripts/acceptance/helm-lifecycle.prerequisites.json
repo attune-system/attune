@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "status": "EXTERNAL_PREREQUISITE_NOT_EXECUTED",
+  "cluster_provisioning": "Integrator supplies a disposable local cluster and explicit kube-context. The runner does not provision, select or mutate a cluster.",
+  "namespace": "New run-owned namespace with io.attune.acceptance.owner=<run-id>; reject existing namespaces or foreign resources.",
+  "artifacts": ["same compatible immutable platform/init images as Compose", "real native-binary-inclusive core archive digest", "operator-provisioned integration credential Secret", "versioned owned object provider for object mode"],
+  "required_matrix": ["sharedVolume fresh", "sharedVolume failed required upgrade", "sharedVolume rollback", "object fresh", "object failed required upgrade", "object rollback"],
+  "startup_contract": "helm --wait waits ordinary Pods before post-install publication. Ordinary API/host/web startup must use platform readiness, not content readiness. Publisher and later content hooks must complete and prove exact pins.",
+  "writers_drained": "Before F pre-06005 preflight, stop and join every application writer and old workload. Never restart between parking and ordinary migration through 06006. No checksum edits or reset.",
+  "cleanup": "Join fixture processes, stop workloads, await Pod deletion, inspect exact namespace ownership, uninstall only this release, then remove only this owned namespace/PVCs after native physical cleanup evidence. Never delete cluster-global or external volumes.",
+  "result": "Offline helm template output is not live cluster or UI lifecycle acceptance. Missing any matrix entry remains INCOMPLETE, not PASS."
+}

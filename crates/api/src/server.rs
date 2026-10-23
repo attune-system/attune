@@ -49,7 +49,10 @@ impl Server {
         // API v1 routes (versioned endpoints)
         let api_v1 = Router::new()
             .merge(routes::pack_routes())
+            .merge(routes::candidate_effects::routes())
             .merge(routes::action_routes())
+            .merge(routes::execution_options::routes())
+            .merge(routes::schema_type_routes())
             .merge(routes::policy_routes())
             .merge(routes::runtime_routes())
             .merge(routes::rule_routes())
@@ -61,6 +64,7 @@ impl Server {
             .merge(routes::key_routes())
             .merge(routes::cache_routes())
             .merge(routes::permission_routes())
+            .merge(routes::runtime_approvals::routes())
             .merge(routes::external_identity_mapping_routes())
             .merge(routes::worker_routes())
             .merge(routes::retention_routes())
@@ -170,6 +174,7 @@ impl Server {
             Instant::now() + Duration::from_secs(self.state.config.server.shutdown_grace_period)
         };
 
+        self.state.reclamation_cancellation.begin_shutdown();
         drop(server);
         if tokio::time::timeout_at(
             release_deadline,
@@ -180,9 +185,20 @@ impl Server {
         {
             tracing::warn!("Execution log stream lease release drain timed out");
         }
+        // Request drain can consume its entire grace. Cancellation owns a
+        // separate bounded teardown window, not an already-expired deadline.
+        let cancellation_shutdown = self
+            .state
+            .reclamation_cancellation
+            .shutdown(Instant::now() + Duration::from_secs(10))
+            .await;
+        if cancellation_shutdown.is_err() {
+            tracing::error!("Reclamation cancellation shutdown did not acknowledge cleanup");
+        }
         if let Some(result) = server_result {
             result?;
         }
+        cancellation_shutdown?;
 
         Ok(())
     }

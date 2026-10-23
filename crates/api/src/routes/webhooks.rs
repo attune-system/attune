@@ -15,11 +15,10 @@ use attune_common::{
     mq::{EventCreatedPayload, MessageEnvelope, MessageType},
     repositories::{
         event::{CreateEventInput, EventRepository},
-        execution_secret_value::ExecutionSecretValueRepository,
         trigger::{TriggerRepository, WebhookEventLogInput},
         Create, FindById, FindByRef,
     },
-    secret_values::{prepare_secret_values, ENTITY_EVENT_CONFIG, ENTITY_EVENT_PAYLOAD},
+    secret_values::prepare_secret_values,
 };
 
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
@@ -33,7 +32,6 @@ use crate::{
         ApiResponse,
     },
     middleware::{ApiError, ApiResult},
-    routes::events::redact_event_parts_for_trigger,
     routes::triggers::can_access_trigger_api,
     state::AppState,
     webhook_security,
@@ -732,12 +730,21 @@ pub async fn receive_webhook(
         config["hmac_verified"] = serde_json::Value::Bool(hmac_verified.unwrap_or(false));
     }
 
-    let redacted = redact_event_parts_for_trigger(
-        &trigger.r#ref,
-        trigger.param_schema.as_ref(),
-        Some(payload.payload),
-        Some(config),
-    );
+    let mut tx = state.db.begin().await?;
+    let (current_trigger, binding) =
+        attune_common::repositories::event_schema::EventSchemaRepository::materialize_current(
+            &mut tx, trigger.id, true,
+        )
+        .await?;
+    if !current_trigger.webhook_enabled
+        || current_trigger.webhook_key.as_deref() != Some(webhook_key.as_str())
+        || current_trigger.webhook_config != trigger.webhook_config
+    {
+        return Err(ApiError::Unauthorized(
+            "Webhook is no longer active".to_string(),
+        ));
+    }
+    let redacted = binding.prepare(Some(payload.payload), Some(config))?;
     let prepared_payload_secrets =
         prepare_webhook_secret_values(&state, redacted.payload_secrets).await?;
     let prepared_config_secrets =
@@ -756,7 +763,6 @@ pub async fn receive_webhook(
         rule_ref: None,
     };
 
-    let mut tx = state.db.begin().await?;
     let event = EventRepository::create(&mut *tx, event_input)
         .await
         .map_err(|e| {
@@ -777,24 +783,14 @@ pub async fn receive_webhook(
             ));
             ApiError::InternalServerError(e.to_string())
         })?;
-    if !prepared_payload_secrets.is_empty() {
-        ExecutionSecretValueRepository::upsert_many_with_conn(
-            &mut tx,
-            ENTITY_EVENT_PAYLOAD,
-            event.id,
-            &prepared_payload_secrets,
-        )
-        .await?;
-    }
-    if !prepared_config_secrets.is_empty() {
-        ExecutionSecretValueRepository::upsert_many_with_conn(
-            &mut tx,
-            ENTITY_EVENT_CONFIG,
-            event.id,
-            &prepared_config_secrets,
-        )
-        .await?;
-    }
+    attune_common::repositories::event_origin::EventOriginRepository::capture(
+        &mut tx,
+        &event,
+        &binding,
+        &prepared_payload_secrets,
+        &prepared_config_secrets,
+    )
+    .await?;
     tx.commit().await?;
 
     // Publish EventCreated message to message queue if publisher is available
@@ -804,6 +800,7 @@ pub async fn receive_webhook(
     );
     if let Some(publisher) = state.get_publisher().await {
         let message_payload = EventCreatedPayload {
+            event_created: Some(event.created),
             event_id: event.id,
             trigger_id: event.trigger,
             trigger_ref: event.trigger_ref.clone(),

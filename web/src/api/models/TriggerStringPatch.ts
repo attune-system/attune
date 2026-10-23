@@ -2,16 +2,13 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { TriggerClearOperation } from "./TriggerClearOperation";
+import type { TriggerSetOperation } from "./TriggerSetOperation";
 export type TriggerStringPatch =
   | {
-      op: TriggerStringPatch.op;
+      op: TriggerSetOperation;
       value: string;
     }
   | {
-      op: TriggerStringPatch.op;
+      op: TriggerClearOperation;
     };
-export namespace TriggerStringPatch {
-  export enum op {
-    SET = "set",
-  }
-}

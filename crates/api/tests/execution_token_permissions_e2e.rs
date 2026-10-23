@@ -22,7 +22,7 @@ use attune_common::{
         key::{CreateKeyInput, KeyRepository},
         pack::{CreatePackInput, PackRepository},
         workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
-        Create, FindById, FindByRef,
+        Create, FindById, FindByRef, Update,
     },
 };
 use axum::http::StatusCode;
@@ -381,6 +381,39 @@ async fn create_parent_execution(
     .await?)
 }
 
+async fn create_pinned_ad_hoc_parent(
+    pool: &PgPool,
+    action: &Action,
+    identity: &Identity,
+    refs: &[String],
+) -> TResult<Execution> {
+    use attune_common::repositories::{
+        executable_snapshot::ExecutableSnapshotRepository,
+        schema_contract::{BindingOwner, SchemaContractRepository},
+    };
+    assert!(action.is_adhoc, "human-owned token fixture must be ad hoc");
+    let mut tx = pool.begin().await?;
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+    let execution = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            executor: Some(identity.id),
+            permission_set_refs: refs.to_vec(),
+            status: ExecutionStatus::Running,
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
+        .await?;
+    tx.commit().await?;
+    Ok(execution)
+}
+
 fn execution_token(
     identity: &Identity,
     parent_execution: &Execution,
@@ -505,8 +538,16 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     let suffix = uuid::Uuid::new_v4().to_string().replace('-', "");
     let suffix = &suffix[..8];
     let identity = create_execution_identity(&ctx.pool, suffix).await?;
-    let (_pack, action) = setup_executable_action(&ctx.pool, suffix).await?;
-    let parent_execution = create_parent_execution(&ctx.pool, &action, &identity).await?;
+    let pack = create_pack(
+        &ctx.pool,
+        &format!("exec_token_pack_{suffix}"),
+        "Execution Token Pack",
+    )
+    .await?;
+    let action =
+        create_action_with_default_access(&ctx.pool, &pack, "call_api", Vec::new()).await?;
+    helpers::activate_test_pack_release(&ctx.pool, &pack).await?;
+    let parent_execution = create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &[]).await?;
 
     let runtime_read_ref = format!("test.exec_token_runtime_read_{}", suffix);
     let worker_read_ref = format!("test.exec_token_worker_read_{}", suffix);
@@ -578,7 +619,9 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         worker_read_ref.clone(),
         action_read_ref.clone(),
     ];
-    let read_only_token = execution_token(&identity, &parent_execution, &action, &read_only_refs)?;
+    let read_only_parent =
+        create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &read_only_refs).await?;
+    let read_only_token = execution_token(&identity, &read_only_parent, &action, &read_only_refs)?;
 
     let runtime_read = ctx.get("/api/v1/runtimes", Some(&read_only_token)).await?;
     assert_eq!(runtime_read.status(), StatusCode::OK);
@@ -610,8 +653,25 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     assert_eq!(read_only_execute.status(), StatusCode::FORBIDDEN);
 
     let execute_only_refs = vec![action_execute_ref.clone()];
+    let execute_only_parent =
+        create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &execute_only_refs).await?;
     let execute_only_token =
+        execution_token(&identity, &execute_only_parent, &action, &execute_only_refs)?;
+
+    let unbound_selection =
         execution_token(&identity, &parent_execution, &action, &execute_only_refs)?;
+    let mismatched = ctx
+        .post(
+            "/api/v1/executions/execute",
+            execute_body(&action, Some(Vec::new())),
+            Some(&unbound_selection),
+        )
+        .await?;
+    assert_eq!(
+        mismatched.status(),
+        StatusCode::UNAUTHORIZED,
+        "a token cannot supply a permission selection absent from its real parent"
+    );
 
     let execute_only_runtime_read = ctx
         .get("/api/v1/runtimes", Some(&execute_only_token))
@@ -677,7 +737,7 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     );
     assert_eq!(
         no_permission_body["data"]["parent"].as_i64(),
-        Some(parent_execution.id)
+        Some(execute_only_parent.id)
     );
     assert!(
         no_permission_body["data"]["permission_set_refs"].is_null(),
@@ -685,7 +745,9 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     );
 
     let combined_refs = vec![action_execute_ref.clone(), runtime_read_ref.clone()];
-    let combined_token = execution_token(&identity, &parent_execution, &action, &combined_refs)?;
+    let combined_parent =
+        create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &combined_refs).await?;
+    let combined_token = execution_token(&identity, &combined_parent, &action, &combined_refs)?;
 
     let combined_runtime_read = ctx.get("/api/v1/runtimes", Some(&combined_token)).await?;
     assert_eq!(combined_runtime_read.status(), StatusCode::OK);
@@ -701,7 +763,7 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     let delegated_body: Value = delegated_execution.json().await?;
     assert_eq!(
         delegated_body["data"]["parent"].as_i64(),
-        Some(parent_execution.id)
+        Some(combined_parent.id)
     );
     assert_eq!(
         delegated_body["data"]["executor"].as_i64(),
@@ -710,6 +772,32 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     assert_eq!(
         delegated_body["data"]["permission_set_refs"],
         json!([runtime_read_ref])
+    );
+    assert!(stored.permission_set_refs.is_empty());
+    let delegated =
+        ExecutionRepository::find_by_id(&ctx.pool, delegated_body["data"]["id"].as_i64().unwrap())
+            .await?
+            .unwrap();
+    assert_eq!(
+        delegated.permission_set_refs,
+        vec![runtime_read_ref.clone()]
+    );
+    IdentityRepository::update(
+        &ctx.pool,
+        identity.id,
+        attune_common::repositories::identity::UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    assert_eq!(
+        ctx.get("/api/v1/runtimes", Some(&combined_token))
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "ad-hoc authority stays bounded by the active owner"
     );
 
     Ok(())

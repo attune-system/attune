@@ -12,11 +12,11 @@ export type UpdateRuntimeRequest = {
   /**
    * Distribution metadata used for verification and platform support
    */
-  distributions: any | null;
+  distributions?: Record<string, any> | null;
   /**
    * Runtime execution configuration
    */
-  execution_config: any | null;
+  execution_config?: Record<string, any> | null;
   installation?: null | NullableJsonPatch;
   /**
    * Display name

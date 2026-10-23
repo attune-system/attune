@@ -5,12 +5,8 @@ use attune_common::{config::Config, observability};
 use clap::Parser;
 use tracing::info;
 
-mod postgres_listener;
-mod service;
-mod subscriber_manager;
-mod websocket_server;
-
-use service::NotifierService;
+use attune_notifier::mask_connection_url;
+use attune_notifier::service::NotifierService;
 
 #[derive(Parser, Debug)]
 #[command(name = "attune-notifier")]
@@ -84,39 +80,6 @@ async fn main() -> Result<()> {
     info!("Attune Notifier Service stopped");
 
     Ok(())
-}
-
-/// Return connection metadata that is safe to include in logs.
-fn mask_connection_url(url: &str) -> String {
-    let Some((scheme, remainder)) = url.split_once("://") else {
-        return "<redacted connection URL>".to_string();
-    };
-    if scheme.is_empty()
-        || !scheme.chars().enumerate().all(|(index, ch)| {
-            ch.is_ascii_alphabetic() || index > 0 && "+-.0123456789".contains(ch)
-        })
-    {
-        return "<redacted connection URL>".to_string();
-    }
-
-    let suffix_start = remainder.find(['?', '#']).unwrap_or(remainder.len());
-    let without_suffix = &remainder[..suffix_start];
-    let authority_end = without_suffix.find('/').unwrap_or(without_suffix.len());
-    let authority = &without_suffix[..authority_end];
-    let path = &without_suffix[authority_end..];
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-
-    if host.is_empty()
-        || host.contains('@')
-        || host.chars().any(char::is_whitespace)
-        || path.chars().any(char::is_whitespace)
-    {
-        return "<redacted connection URL>".to_string();
-    }
-
-    format!("{scheme}://{host}{path}")
 }
 
 #[cfg(test)]

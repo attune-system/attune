@@ -916,6 +916,10 @@ pub struct AgentConfig {
 /// workers/sensors and the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactsConfig {
+    /// Operator-owned native storage management API for explicit legacy audits.
+    /// Absent configuration leaves an invokable, diagnosed manual quarantine.
+    #[serde(default)]
+    pub legacy_audit_controller: Option<LegacyAuditControllerConfig>,
     /// Transport mode: "auto" (default), "volume", or "api".
     ///
     /// - `auto`: detect shared volume via sentinel file, fall back to API
@@ -927,6 +931,13 @@ pub struct ArtifactsConfig {
     /// Maximum file upload size in bytes for API transport (default: 100 MB).
     #[serde(default = "default_max_upload_size")]
     pub max_upload_size: u64,
+
+    /// Per-API-instance budget for protected file codec/response buffers.
+    #[serde(default = "default_protected_file_memory_budget_bytes")]
+    pub protected_file_memory_budget_bytes: u64,
+    /// Maximum active file publications/whole-file plaintext responses.
+    #[serde(default = "default_file_transfer_concurrency")]
+    pub file_transfer_concurrency: usize,
 
     /// Buffer flush interval in milliseconds for streaming writes (default: 500).
     #[serde(default = "default_flush_interval_ms")]
@@ -969,18 +980,93 @@ pub struct ArtifactsConfig {
     pub sensor_log_max_files: u32,
 }
 
-/// Configuration for pack file transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyAuditControllerConfig {
+    /// HTTPS management endpoint, not the S3 data endpoint or a caller URL.
+    pub endpoint: String,
+    pub issuer: String,
+    pub audience: String,
+    /// Pinned RS256 public key. This must not be an execution JWT signing key.
+    pub verification_key_file: PathBuf,
+    /// PEM client certificate and private key for management API mutual TLS.
+    pub client_identity_file: PathBuf,
+    pub ca_certificate_file: PathBuf,
+}
+
+/// Configuration for pack file transport and publication policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PacksConfig {
     /// Transport mode: "auto" for local compatibility, "volume", or "api".
     #[serde(default)]
     pub transport: crate::artifact_transport::TransportMode,
+
+    /// Policy for accepting a new digest under an existing pack version.
+    #[serde(default)]
+    pub republish: PackRepublishConfig,
 }
 
 impl Default for PacksConfig {
     fn default() -> Self {
         Self {
             transport: crate::artifact_transport::TransportMode::Auto,
+            republish: PackRepublishConfig::default(),
+        }
+    }
+}
+
+impl PacksConfig {
+    pub fn allows_version_republish(&self, version: &str) -> bool {
+        self.republish.allows_version_republish(version)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackRepublishMode {
+    #[default]
+    Off,
+    On,
+    Suffix,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackRepublishConfig {
+    /// Off rejects new digests; on allows them for any valid semantic version.
+    pub mode: PackRepublishMode,
+    /// Suffix mode matches this literal, case-sensitive version ending.
+    pub suffix: String,
+}
+
+impl Default for PackRepublishConfig {
+    fn default() -> Self {
+        Self {
+            mode: PackRepublishMode::Off,
+            suffix: "-dev".to_string(),
+        }
+    }
+}
+
+impl PackRepublishConfig {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.suffix.is_empty() || self.suffix.chars().any(char::is_whitespace) {
+            return Err(crate::Error::configuration(
+                "packs.republish.suffix must be non-empty and contain no whitespace",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn allows_version_republish(&self, version: &str) -> bool {
+        if semver::Version::parse(version).is_err() {
+            return false;
+        }
+        match self.mode {
+            PackRepublishMode::Off => false,
+            PackRepublishMode::On => true,
+            PackRepublishMode::Suffix => self.validate().is_ok() && version.ends_with(&self.suffix),
         }
     }
 }
@@ -988,8 +1074,11 @@ impl Default for PacksConfig {
 impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
+            legacy_audit_controller: None,
             transport: crate::artifact_transport::TransportMode::Auto,
             max_upload_size: default_max_upload_size(),
+            protected_file_memory_budget_bytes: default_protected_file_memory_budget_bytes(),
+            file_transfer_concurrency: default_file_transfer_concurrency(),
             flush_interval_ms: default_flush_interval_ms(),
             log_segment_max_bytes: default_log_segment_max_bytes(),
             log_segment_initial_bytes: default_log_segment_initial_bytes(),
@@ -1005,6 +1094,25 @@ impl Default for ArtifactsConfig {
 }
 
 impl ArtifactsConfig {
+    pub fn validate_file_memory(&self) -> crate::Result<()> {
+        let minimum = crate::runtime_file_body::allocation_budget(self.max_upload_size)
+            .ok_or_else(|| {
+                crate::Error::configuration(
+                    "artifacts.max_upload_size exceeds codec allocation accounting",
+                )
+            })?;
+        if self.protected_file_memory_budget_bytes < minimum
+            || !self
+                .protected_file_memory_budget_bytes
+                .is_multiple_of(1024 * 1024)
+            || self.protected_file_memory_budget_bytes / (1024 * 1024) > u32::MAX as u64
+            || self.file_transfer_concurrency == 0
+            || self.file_transfer_concurrency > 1024
+        {
+            return Err(crate::Error::configuration(format!("artifacts.protected_file_memory_budget_bytes must cover {minimum} bytes for max_upload_size in whole MiB units and fit u32 permits; file_transfer_concurrency must be 1..=1024. Provision memory explicitly rather than lowering file authority or allocating unbounded buffers")));
+        }
+        Ok(())
+    }
     pub fn log_segment_writer_config(&self) -> crate::log_stream::SegmentedLogConfig {
         crate::log_stream::SegmentedLogConfig {
             initial_segment_bytes: self.log_segment_initial_bytes,
@@ -1021,6 +1129,12 @@ impl ArtifactsConfig {
 
 fn default_max_upload_size() -> u64 {
     100 * 1024 * 1024 // 100 MB
+}
+fn default_protected_file_memory_budget_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+fn default_file_transfer_concurrency() -> usize {
+    4
 }
 
 fn default_flush_interval_ms() -> u64 {
@@ -1617,7 +1731,9 @@ pub struct CacheRetentionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Total generation-reclamation budget per supervisor cycle.
+    /// Generation-reclamation business-work budget per supervisor cycle.
+    /// An interrupted repository attempt may spend at most another 500ms on
+    /// protocol drain and rollback acknowledgement, never additional business work.
     #[serde(default = "default_cache_cleanup_cycle_milliseconds")]
     pub max_cleanup_cycle_milliseconds: u64,
 
@@ -2299,6 +2415,8 @@ impl Config {
 
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
+        self.packs.republish.validate()?;
+        self.artifacts.validate_file_memory()?;
         if let Some(worker) = &self.worker {
             crate::child_process_environment::validate_passthrough_env(&worker.passthrough_env)?;
         }
@@ -3031,6 +3149,149 @@ mod tests {
         let sensor: SensorConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(sensor.notifier_ws_url.is_none());
         assert!(!sensor.allow_insecure_notifier_ws);
+    }
+
+    #[test]
+    fn pack_republish_defaults_to_off_with_dev_suffix() {
+        let partial: PacksConfig = serde_json::from_value(serde_json::json!({
+            "transport": "volume"
+        }))
+        .unwrap();
+        let nested: PacksConfig = serde_json::from_value(serde_json::json!({
+            "republish": {}
+        }))
+        .unwrap();
+        for config in [PacksConfig::default(), partial, nested] {
+            assert_eq!(config.republish.mode, PackRepublishMode::Off);
+            assert_eq!(config.republish.suffix, "-dev");
+            assert!(!config.allows_version_republish("1.2.3-dev"));
+            assert!(!config.allows_version_republish("1.2.3"));
+        }
+    }
+
+    #[test]
+    fn pack_republish_suffix_matches_literal_version_endings() {
+        let config: PacksConfig = serde_json::from_value(serde_json::json!({
+            "republish": {"mode": "suffix"}
+        }))
+        .unwrap();
+        for version in [
+            "0.0.0-dev",
+            "1.2.3-dev",
+            "10.20.30-dev",
+            "1.2.3-alpha-dev",
+            "1.2.3+build-dev",
+        ] {
+            assert!(config.allows_version_republish(version), "{version}");
+        }
+        for version in [
+            "1.2.3",
+            "1.2.3-rc",
+            "1.2.3-dev.1",
+            "1.2.3-DEV",
+            "1.2.3-dev+build",
+            "01.2.3-dev",
+            "1.2-dev",
+            "v1.2.3-dev",
+            "1.2.3-dev ",
+            "not-a-version-dev",
+        ] {
+            assert!(!config.allows_version_republish(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn pack_republish_supports_custom_suffixes() {
+        let config: PacksConfig = serde_json::from_value(serde_json::json!({
+            "republish": {"mode": "suffix", "suffix": "-snapshot"}
+        }))
+        .unwrap();
+        assert!(config.allows_version_republish("1.2.3-snapshot"));
+        assert!(config.allows_version_republish("1.2.3-alpha-snapshot"));
+        for version in ["1.2.3-dev", "1.2.3", "1.2.3-SNAPSHOT", "1.2.3-snapshot.1"] {
+            assert!(!config.allows_version_republish(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn pack_republish_on_allows_any_valid_semantic_version() {
+        let config: PacksConfig = serde_json::from_value(serde_json::json!({
+            "republish": {"mode": "on"}
+        }))
+        .unwrap();
+        for version in ["1.2.3", "1.2.3-rc", "1.2.3-dev", "1.2.3+build"] {
+            assert!(config.allows_version_republish(version), "{version}");
+        }
+        for version in ["", "1.2", "01.2.3-dev", "v1.2.3", "not-a-version"] {
+            assert!(!config.allows_version_republish(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn pack_republish_environment_overrides_mode_and_suffix() {
+        #[derive(Deserialize)]
+        struct Probe {
+            packs: PacksConfig,
+        }
+        for (mode, allowed) in [("off", false), ("on", true), ("suffix", true)] {
+            let source = attune_environment_source().source(Some(
+                [
+                    (
+                        "ATTUNE__PACKS__REPUBLISH__MODE".to_string(),
+                        mode.to_string(),
+                    ),
+                    (
+                        "ATTUNE__PACKS__REPUBLISH__SUFFIX".to_string(),
+                        "-snapshot".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            let probe: Probe = config_crate::Config::builder()
+                .add_source(source)
+                .build()
+                .unwrap()
+                .try_deserialize()
+                .unwrap();
+            assert_eq!(probe.packs.republish.suffix, "-snapshot");
+            assert_eq!(
+                probe.packs.allows_version_republish("1.2.3-snapshot"),
+                allowed
+            );
+            assert_eq!(
+                probe.packs.allows_version_republish("1.2.3-dev"),
+                mode == "on"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_republish_rejects_invalid_configuration() {
+        for republish in [
+            serde_json::json!({"mode": "invalid"}),
+            serde_json::json!({"mode": true}),
+            serde_json::json!({"mode": "suffix", "sufix": "-dev"}),
+        ] {
+            assert!(serde_json::from_value::<PacksConfig>(serde_json::json!({
+                "republish": republish
+            }))
+            .is_err());
+        }
+        assert!(serde_json::from_value::<PacksConfig>(serde_json::json!({
+            "allow_dev_version_republish": true
+        }))
+        .is_err());
+        for suffix in ["", " ", "-dev ", "-dev\n"] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "security": {"enable_auth": false},
+                "packs": {"republish": {"mode": "suffix", "suffix": suffix}}
+            }))
+            .unwrap();
+            assert!(!config.packs.allows_version_republish("1.2.3-dev"));
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("packs.republish.suffix"));
+        }
     }
 
     #[test]

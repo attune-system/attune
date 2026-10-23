@@ -8,6 +8,7 @@ import type { LogRetentionPolicyPatch } from "./LogRetentionPolicyPatch";
 import type { RuntimeVersionConstraintPatch } from "./RuntimeVersionConstraintPatch";
 import type { TimeoutSecondsPatch } from "./TimeoutSecondsPatch";
 import type { WorkerAffinity } from "./WorkerAffinity";
+import type { WorkerToleration } from "./WorkerToleration";
 /**
  * Request DTO for updating an action
  */
@@ -21,7 +22,7 @@ export type UpdateActionRequest = {
   /**
    * Default permission set refs for execution-scoped API tokens.
    */
-  default_execution_permission_set_refs?: any[] | null;
+  default_execution_permission_set_refs?: Array<string> | null;
   /**
    * Action description
    */
@@ -43,20 +44,20 @@ export type UpdateActionRequest = {
   /**
    * Output schema
    */
-  out_schema?: any | null;
+  out_schema?: Record<string, any> | null;
   /**
    * Parameter schema (StackStorm-style with inline required/secret)
    */
-  param_schema?: any | null;
+  param_schema?: Record<string, any> | null;
   /**
    * Replace the restricted visibility allow-list.
    */
-  reference_allowed_pack_refs?: any[] | null;
+  reference_allowed_pack_refs?: Array<string> | null;
   reference_visibility?: null | ActionReferenceVisibility;
   /**
    * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
    */
-  required_worker_runtimes?: any | null;
+  required_worker_runtimes?: Record<string, any> | null;
   /**
    * Runtime ID
    */
@@ -71,9 +72,9 @@ export type UpdateActionRequest = {
   /**
    * Exact worker label requirements. All labels must match the selected worker.
    */
-  worker_selector?: any | null;
+  worker_selector?: Record<string, any> | null;
   /**
    * Tolerations that allow scheduling onto workers with matching taints.
    */
-  worker_tolerations?: any[] | null;
+  worker_tolerations?: Array<WorkerToleration> | null;
 };

@@ -1,0 +1,7 @@
+ref: test_pack.sdk_key_decrypt
+label: SDK Key Decrypt Fixture
+grants:
+  - resource: keys
+    actions: [decrypt]
+    constraints:
+      owner_types: [pack]

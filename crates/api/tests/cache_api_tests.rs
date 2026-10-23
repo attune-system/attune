@@ -29,7 +29,7 @@ use attune_common::{
             CreateCacheNamespaceInput, ManagedCacheNamespaceDefinition,
         },
         component_lifecycle::PackProjectionIds,
-        execution::{CreateExecutionInput, ExecutionRepository},
+        execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository, UpdateIdentityInput,
@@ -41,7 +41,9 @@ use attune_common::{
             AcquireSensorWorkloadInput, AcquireSensorWorkloadOutcome, SensorWorkloadRepository,
         },
         trigger::{CreateSensorInput, CreateTriggerInput, SensorRepository, TriggerRepository},
-        workflow::{CreateWorkflowExecutionInput, WorkflowExecutionRepository},
+        workflow::{
+            CreateWorkflowExecutionInput, UpdateWorkflowExecutionInput, WorkflowExecutionRepository,
+        },
         workflow_cache_iteration::{
             CreateWorkflowCacheIterationInput, WorkflowCacheIterationRepository,
         },
@@ -50,6 +52,249 @@ use attune_common::{
 };
 
 mod helpers;
+
+// Only this context's state/config/router changes. Keep the shared helper,
+// process environment, authority caches and owned audit-writer lifecycle intact.
+fn with_pack_delete_timeout(mut context: TestContext, seconds: u64) -> TestContext {
+    let mut state = context.state.as_ref().clone();
+    let mut config = state.config.as_ref().clone();
+    config.server.request_timeout = seconds;
+    config.runtime_envs_dir = context
+        .test_packs_dir
+        .join("deadline-runtime-envs")
+        .to_string_lossy()
+        .into_owned();
+    state.config = std::sync::Arc::new(config);
+    context.state = std::sync::Arc::new(state);
+    context.app = attune_api::server::Server::new(context.state.clone()).router();
+    context
+}
+
+#[tokio::test]
+async fn pack_delete_acquisition_deadline_is_sanitized_503_without_row_or_storage_changes(
+) -> Result<()> {
+    use attune_common::repositories::pack::PackRepository;
+    // Match this suite's boxed-error Result while allowing awaited teardown.
+    macro_rules! ensure {
+        ($condition:expr, $($message:tt)*) => {
+            if !$condition {
+                return Err(std::io::Error::other(format!($($message)*)).into());
+            }
+        };
+    }
+    let original = TestContext::new().await?;
+    let original_config = original.state.config.clone();
+    let original_timeout = original_config.server.request_timeout;
+    let ctx = with_pack_delete_timeout(original, 5);
+    ensure!(
+        original_config.server.request_timeout == original_timeout,
+        "shared config was mutated"
+    );
+    ensure!(
+        !std::sync::Arc::ptr_eq(&original_config, &ctx.state.config),
+        "fixture must own a new config"
+    );
+    let result: Result<()> = async {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let pack = create_test_pack(&ctx.pool, &format!("cache_deadline_{}", &suffix[..8])).await?;
+        let mut grants = pack_writer_grants(&pack.r#ref);
+        grants.as_array_mut().unwrap().push(json!({"resource":"packs","actions":["read","delete"],"constraints":{"refs":[pack.r#ref]}}));
+        let (token, _) = register_user(&ctx, "cache_delete_deadline", grants).await?;
+        let projection = ctx.test_packs_dir.join(&pack.r#ref);
+        let runtime = std::path::Path::new(&ctx.state.config.runtime_envs_dir).join(&pack.r#ref).join("python");
+        let digest = "e".repeat(64);
+        let release_tree = ctx.test_packs_dir.join(".releases/sha256").join(&digest);
+        let release_content = release_tree.join("pack");
+        std::fs::create_dir_all(&projection)?;
+        std::fs::create_dir_all(&runtime)?;
+        std::fs::create_dir_all(&release_content)?;
+        let pack_bytes = format!("ref: {}\n", pack.r#ref);
+        std::fs::write(projection.join("pack.yaml"), &pack_bytes)?;
+        std::fs::write(runtime.join("installed"), "original-runtime-marker")?;
+        std::fs::write(release_content.join("pack.yaml"), &pack_bytes)?;
+        let mut setup = ctx.pool.begin().await?;
+        let release = PackReleaseRepository::create_or_get(&mut setup, CreatePackReleaseInput {
+            pack: pack.id, pack_ref: pack.r#ref.clone(), version: "1.0.0".into(), digest,
+            object_key: "owned-cache-delete-deadline".into(), provider_version: "test".into(),
+            content_path: release_content.to_string_lossy().into_owned(), archive_size: 1,
+            manifest: json!({}),
+        }).await?;
+        setup.commit().await?;
+        create_namespace(&ctx, &token, &pack.r#ref, "users", json!({})).await?
+            .assert_status(StatusCode::CREATED);
+        let generation = begin_generation(&ctx, &token, &pack.r#ref, "users", "delete-deadline", 0).await?;
+        for operation in ["seal", "promote"] {
+            ctx.post(&format!("/api/v1/cache/namespaces/users/generations/{generation}/{operation}"),
+                json!({"owner_type":"pack","owner_ref":pack.r#ref,"expected_chunk_count":0,"expected_active_generation_id":null}),
+                Some(&token)).await?.assert_status(StatusCode::OK);
+        }
+        let stored_generation = CacheGenerationRepository::find_by_id(&ctx.pool, generation).await?.context("baseline generation missing")?;
+        let namespace = CacheNamespaceRepository::find_by_id(&ctx.pool, stored_generation.namespace).await?.context("baseline namespace missing")?;
+        ensure!(namespace.tombstoned_at.is_none() && namespace.active_generation == Some(generation), "baseline namespace is not active");
+        ensure!(stored_generation.state == attune_common::models::CacheGenerationState::Active, "baseline generation is not active");
+        let before_usage: Value = sqlx::query_scalar("SELECT to_jsonb(u) FROM cache_generation_entry_usage u WHERE generation=$1")
+            .bind(generation).fetch_one(&ctx.pool).await?;
+        let before = json!({
+            "pack": PackRepository::find_by_id(&ctx.pool, pack.id).await?.context("baseline pack missing")?,
+            "namespace": namespace,
+            "generation": stored_generation,
+            "release": PackReleaseRepository::find_by_id(&ctx.pool, release.id).await?.context("baseline release missing")?,
+        });
+        let before_files = (
+            std::fs::read(projection.join("pack.yaml"))?,
+            std::fs::read(runtime.join("installed"))?,
+            std::fs::read(release_content.join("pack.yaml"))?,
+        );
+        let mut gate = ctx.pool.begin().await?;
+        CacheEntryRepository::protect_transaction(&mut gate, CacheTransactionMode::PinMutation).await?;
+        let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *gate).await?;
+        let path = format!("/api/v1/packs/{}", pack.r#ref);
+        let started = tokio::time::Instant::now();
+        let request = ctx.delete(&path, Some(&token));
+        let observe = async {
+            let observation: Result<()> = async {
+                let observation_deadline = started + std::time::Duration::from_secs(4);
+                let (actor, backend_start): (i32, chrono::DateTime<chrono::Utc>) = loop {
+                    let waiting = sqlx::query_as(
+                        "SELECT a.pid,a.backend_start FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid \
+                         WHERE a.datname=current_database() AND $1=ANY(pg_blocking_pids(a.pid)) \
+                         AND l.locktype='advisory' AND l.classid=7821101 AND l.objid=0 AND l.objsubid=2 AND NOT l.granted",
+                    ).bind(blocker).fetch_optional(&ctx.pool).await?;
+                    if let Some(actor) = waiting { break actor; }
+                    ensure!(tokio::time::Instant::now() < observation_deadline, "HTTP delete did not reach cache preflight before deadline");
+                    tokio::task::yield_now().await;
+                };
+                let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND granted AND (locktype='advisory' OR relation IN ('cache_entry'::regclass,'pack'::regclass,'pack_release'::regclass,'sensor'::regclass))")
+                    .bind(actor).fetch_one(&ctx.pool).await?;
+                ensure!(held == 0, "HTTP preflight retained graph/source locks");
+                let disposal_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    let present: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid=$1 AND backend_start=$2)")
+                        .bind(actor).bind(backend_start).fetch_one(&ctx.pool).await?;
+                    if !present { break; }
+                    ensure!(tokio::time::Instant::now() < disposal_deadline, "HTTP deadline backend was not disposed");
+                    tokio::task::yield_now().await;
+                }
+                // Gate is still held. Every baseline row must still exist with
+                // its original fields, not merely produce an empty lookup.
+                let after = json!({
+                    "pack": PackRepository::find_by_id(&ctx.pool, pack.id).await?.context("pack disappeared on deadline")?,
+                    "namespace": CacheNamespaceRepository::find_by_id(&ctx.pool, namespace.id).await?.context("namespace disappeared on deadline")?,
+                    "generation": CacheGenerationRepository::find_by_id(&ctx.pool, generation).await?.context("generation disappeared on deadline")?,
+                    "release": PackReleaseRepository::find_by_id(&ctx.pool, release.id).await?.context("release disappeared on deadline")?,
+                });
+                ensure!(after == before, "deadline changed original persisted fields");
+                let after_usage: Value = sqlx::query_scalar("SELECT to_jsonb(u) FROM cache_generation_entry_usage u WHERE generation=$1")
+                    .bind(generation).fetch_one(&ctx.pool).await?;
+                ensure!(after_usage == before_usage, "deadline changed retained iteration/byte/record accounting");
+                ensure!(std::fs::read(projection.join("pack.yaml"))? == before_files.0, "projection changed");
+                ensure!(std::fs::read(runtime.join("installed"))? == before_files.1, "runtime changed");
+                ensure!(std::fs::read(release_content.join("pack.yaml"))? == before_files.2, "release tree changed");
+                let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory' AND classid=7821101 AND objid=0 AND objsubid=2 AND granted)")
+                    .fetch_one(&mut *gate).await?;
+                ensure!(held, "blocker released before negative-state observation");
+                Ok(())
+            }.await;
+            gate.rollback().await?;
+            observation
+        };
+        let (response, observation) = tokio::join!(request, observe);
+        let response = response?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        observation?;
+        ensure!(status == StatusCode::SERVICE_UNAVAILABLE, "wrong acquisition deadline status: {status}");
+        ensure!(body == json!({"error":"Database operation temporarily unavailable; please retry","code":"RETRYABLE_DATABASE_ERROR"}), "deadline response is not the existing sanitized retryable error");
+        let rendered = body.to_string();
+        for forbidden in ["pg_advisory", "cache_entry", "named-type-graph", "lock_timeout", "statement_timeout", "SELECT"] {
+            ensure!(!rendered.contains(forbidden), "deadline response leaked source/SQL details");
+        }
+        Ok(())
+    }.await;
+    let cleanup = ctx.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn normalized_local_cache_iam_covers_actual_point_effect_and_owner_list_targets() -> Result<()>
+{
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let local = create_test_pack(&ctx.pool, "local_cache_iam").await?;
+    let foreign = create_test_pack(&ctx.pool, "foreign_cache_iam").await?;
+    let (token, identity) = register_user(&ctx, "local-cache-operator", json!([])).await?;
+    let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: format!("{}.cache_local", local.r#ref), pack: Some(local.id), pack_ref: Some(local.r#ref.clone()),
+        label: None, description: None, grants: json!([{"resource":"caches", "actions":["read","create","update","delete"], "constraints":{"refs":["allowed"]}}]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    assert_eq!(
+        create_namespace(&ctx, &token, &local.r#ref, "allowed", json!({}))
+            .await?
+            .status(),
+        StatusCode::CREATED
+    );
+    for (owner, namespace) in [(&foreign.r#ref, "allowed"), (&local.r#ref, "other")] {
+        assert_eq!(
+            create_namespace(&ctx, &token, owner, namespace, json!({}))
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let url = format!(
+        "/api/v1/cache/namespaces/allowed?owner_type=pack&owner_ref={}",
+        local.r#ref
+    );
+    assert_eq!(ctx.get(&url, Some(&token)).await?.status(), StatusCode::OK);
+    let list: Value = ctx
+        .get(
+            &format!(
+                "/api/v1/cache/namespaces?owner_type=pack&owner_ref={}&limit=1",
+                local.r#ref
+            ),
+            Some(&token),
+        )
+        .await?
+        .json()
+        .await?;
+    assert_eq!(list["data"]["namespaces"].as_array().unwrap().len(), 1);
+    let list: Value = ctx
+        .get(
+            &format!(
+                "/api/v1/cache/namespaces?owner_type=pack&owner_ref={}&limit=1",
+                foreign.r#ref
+            ),
+            Some(&token),
+        )
+        .await?
+        .json()
+        .await?;
+    assert!(list["data"]["namespaces"].as_array().unwrap().is_empty());
+    // Refresh effects use the same locked actual namespace and do not borrow
+    // authority merely from the requested owner ref.
+    begin_generation(&ctx, &token, &local.r#ref, "allowed", "local-refresh", 0).await?;
+    let denied = ctx
+        .put(
+            "/api/v1/cache/namespaces/allowed",
+            json!({"owner_type":"pack","owner_ref":foreign.r#ref,"freshness_target_seconds":1}),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    ctx.cleanup().await?;
+    Ok(())
+}
 
 fn test_jwt_config() -> JwtConfig {
     JwtConfig {
@@ -746,7 +991,7 @@ async fn pack_delete_handler_waits_for_pin_admission_before_pack_sensor_and_casc
         CreateExecutionInput {
             action: Some(action.id),
             action_ref: action.r#ref,
-            status: ExecutionStatus::Completed,
+            status: ExecutionStatus::Running,
             ..Default::default()
         },
     )
@@ -758,7 +1003,7 @@ async fn pack_delete_handler_waits_for_pin_admission_before_pack_sensor_and_casc
             workflow_def: definition.id,
             task_graph: json!({}),
             variables: json!({}),
-            status: ExecutionStatus::Completed,
+            status: ExecutionStatus::Running,
         },
     )
     .await?;
@@ -785,6 +1030,24 @@ async fn pack_delete_handler_waits_for_pin_admission_before_pack_sensor_and_casc
     )
     .await?;
     pin.commit().await?;
+    WorkflowExecutionRepository::update(
+        &ctx.pool,
+        workflow.id,
+        UpdateWorkflowExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
+    ExecutionRepository::update(
+        &ctx.pool,
+        root.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
     let mut gate = ctx.pool.begin().await?;
     CacheEntryRepository::protect_transaction(&mut gate, CacheTransactionMode::PinMutation).await?;
     let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -802,13 +1065,16 @@ async fn pack_delete_handler_waits_for_pin_admission_before_pack_sensor_and_casc
             let waiting = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
                     let pid: Option<i32> = sqlx::query_scalar(
-                        "SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=7821101 AND objid=0 \
-                         AND objsubid=2 AND NOT granted AND $1=ANY(pg_blocking_pids(pid))",
+                        "SELECT pid FROM pg_locks WHERE locktype='advisory' AND NOT granted \
+                         AND ((classid=7821101 AND objid=0 AND objsubid=2) \
+                         OR (classid=((hashtextextended(current_schema() || ':named-type-graph',0) >> 32) & 4294967295)::OID \
+                         AND objid=(hashtextextended(current_schema() || ':named-type-graph',0) & 4294967295)::OID AND objsubid=1)) \
+                         AND $1=ANY(pg_blocking_pids(pid))",
                     ).bind(gate_pid).fetch_optional(&mut *observer).await?;
                     if let Some(pid) = pid { return Ok::<_, sqlx::Error>(pid); }
                     tokio::task::yield_now().await;
                 }
-            }).await??;
+            }).await.map_err(|_| std::io::Error::other("pack deletion never reached the held admission gate"))??;
             let locks: (i64, i64) = sqlx::query_as(
                 "SELECT (SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted), \
                  (SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND relation IN \
@@ -821,7 +1087,11 @@ async fn pack_delete_handler_waits_for_pin_admission_before_pack_sensor_and_casc
                  (SELECT retained_iterations FROM cache_generation_entry_usage WHERE generation=$2), \
                  (SELECT COUNT(*) FROM workflow_cache_iteration WHERE generation=$2)",
             ).bind(namespace).bind(generation).fetch_one(&mut *observer).await?;
-            let read = tokio::time::timeout(std::time::Duration::from_secs(10), ctx.get(&read_path, Some(token))).await??;
+            let read = tokio::time::timeout(std::time::Duration::from_secs(10), ctx.get(&read_path, Some(token)))
+                .await.map_err(|_| std::io::Error::other(format!(
+                    "ordinary cache read blocked behind pack deletion; deletion held {} advisory and {} source relation locks while awaiting admission",
+                    locks.0, locks.1
+                )))??;
             let read_status = read.status();
             let read_body: Value = read.json().await?;
             Ok((locks, before, read_status, read_body,
@@ -2196,6 +2466,7 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Resu
             description: None,
             enabled: true,
             param_schema: None,
+            event_config_schema: None,
             out_schema: None,
             sensor: Some(sensor.id),
             sensor_ref: Some(sensor_ref.clone()),
@@ -2252,6 +2523,18 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Resu
         AcquireSensorWorkloadOutcome::Acquired(workload) => workload,
         AcquireSensorWorkloadOutcome::HeldByOther(_) => panic!("test workload is already held"),
     };
+    let workload = SensorWorkloadRepository::begin_process(&ctx.pool, workload)
+        .await?
+        .context("start sensor workload generation")?;
+    let mut tx = ctx.pool.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+    attune_common::repositories::sensor_schema::SensorSchemaRepository::admit(
+        &mut tx,
+        &workload,
+        ctx.state.config.security.encryption_key.as_deref(),
+    )
+    .await?;
+    tx.commit().await?;
     let worker_token = generate_worker_token_with_instance(
         1,
         &worker.id.to_string(),

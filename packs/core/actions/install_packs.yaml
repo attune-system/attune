@@ -1,0 +1,81 @@
+ref: core.install_packs
+label: Install Packs
+description: Install explicit Git or HTTP archive sources through ordinary API admission and candidate testing.
+enabled: true
+workflow_file: workflows/install_packs.workflow.yaml
+parameters:
+  packs:
+    type: array
+    description: Explicit remote URLs, not registry references.
+    items:
+      type: string
+    minItems: 1
+    required: true
+  ref_spec:
+    type: string
+    description: Git branch, tag or commit.
+    default: ""
+  skip_dependencies:
+    type: boolean
+    description: Skip checking whether declared dependencies are already installed.
+    default: false
+  skip_tests:
+    type: boolean
+    description: Request the ordinary API's explicit candidate-test skip.
+    default: false
+  skip_env_build:
+    type: boolean
+    description: Skip optional API-host runtime detection. Workers own actual environment setup.
+    default: false
+  force:
+    type: boolean
+    description: Authorize replacement and continue after optional runtime-detection failure. Does not bypass admission.
+    default: false
+  packs_base_dir:
+    type: string
+    description: Storage hint passed to the API. Server configuration remains authoritative.
+    default: /opt/attune/packs
+  api_url:
+    type: string
+    description: Attune API URL for an explicit bearer. Without api_token, the execution's context API URL is authoritative.
+    default: http://localhost:8080
+  api_token:
+    type: string
+    description: Optional existing bearer access token for ordinary pack API authorization. Never returned in outputs.
+    secret: true
+  timeout:
+    type: integer
+    description: Total task-time budget in seconds, divided across the four API stages. Queueing and scheduler overhead are additional.
+    default: 1800
+    minimum: 300
+    maximum: 7200
+output:
+  registered_packs:
+    type: array
+    description: API registration results, including candidate install IDs/status when testing is pending.
+    items:
+      type: object
+  failed_packs:
+    type: array
+    description: Download, dependency, runtime-detection or registration failures.
+    items:
+      type: object
+  installed_dependencies:
+    type: array
+    description: Empty. Missing dependencies must be admitted separately, never recursively installed from unbound names.
+    items:
+      type: string
+  summary:
+    type: object
+    properties:
+      total_requested:
+        type: integer
+      success_count:
+        type: integer
+      failure_count:
+        type: integer
+      dependencies_installed:
+        type: integer
+      duration_seconds:
+        type: integer
+tags: [pack, installation, workflow, dependencies, git]

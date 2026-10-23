@@ -59,5 +59,6 @@ urlencoding = "2.1"
 base64 = "0.22"
 
 [dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }
 mockall = "0.14"
 tempfile = "3.27"

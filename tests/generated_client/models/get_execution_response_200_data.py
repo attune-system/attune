@@ -58,6 +58,7 @@ class GetExecutionResponse200Data:
         parent (int | None | Unset): Parent execution ID (for nested/child executions) Example: 1.
         permission_set_refs (list[str] | Unset): Permission set refs embedded in the execution-scoped API token.
             Example: ['core.agent_reader'].
+        schema_binding (Any | None | Unset):
         started_at (datetime.datetime | None | Unset): When the execution actually started running (worker picked it
             up).
             Null if the execution hasn't started running yet. Example: 2024-01-13T10:31:00Z.
@@ -91,6 +92,7 @@ class GetExecutionResponse200Data:
     original_execution: int | None | Unset = UNSET
     parent: int | None | Unset = UNSET
     permission_set_refs: list[str] | Unset = UNSET
+    schema_binding: Any | None | Unset = UNSET
     started_at: datetime.datetime | None | Unset = UNSET
     timeout_seconds: int | None | Unset = UNSET
     trace_tag: None | str | Unset = UNSET
@@ -179,6 +181,12 @@ class GetExecutionResponse200Data:
         permission_set_refs: list[str] | Unset = UNSET
         if not isinstance(self.permission_set_refs, Unset):
             permission_set_refs = self.permission_set_refs
+
+        schema_binding: Any | None | Unset
+        if isinstance(self.schema_binding, Unset):
+            schema_binding = UNSET
+        else:
+            schema_binding = self.schema_binding
 
         started_at: None | str | Unset
         if isinstance(self.started_at, Unset):
@@ -279,6 +287,8 @@ class GetExecutionResponse200Data:
             field_dict["parent"] = parent
         if permission_set_refs is not UNSET:
             field_dict["permission_set_refs"] = permission_set_refs
+        if schema_binding is not UNSET:
+            field_dict["schema_binding"] = schema_binding
         if started_at is not UNSET:
             field_dict["started_at"] = started_at
         if timeout_seconds is not UNSET:
@@ -414,6 +424,15 @@ class GetExecutionResponse200Data:
         parent = _parse_parent(d.pop("parent", UNSET))
 
         permission_set_refs = cast(list[str], d.pop("permission_set_refs", UNSET))
+
+        def _parse_schema_binding(data: object) -> Any | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | None | Unset, data)
+
+        schema_binding = _parse_schema_binding(d.pop("schema_binding", UNSET))
 
         def _parse_started_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -579,6 +598,7 @@ class GetExecutionResponse200Data:
             original_execution=original_execution,
             parent=parent,
             permission_set_refs=permission_set_refs,
+            schema_binding=schema_binding,
             started_at=started_at,
             timeout_seconds=timeout_seconds,
             trace_tag=trace_tag,

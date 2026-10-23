@@ -20,7 +20,7 @@ export type EnforcementResponse = {
   /**
    * Enforcement configuration
    */
-  config: any | null;
+  config: Record<string, any> | null;
   /**
    * Creation timestamp
    */
@@ -31,9 +31,17 @@ export type EnforcementResponse = {
    */
   id: i64;
   /**
+   * Stored action input contract, without static executable metadata.
+   */
+  input_contract?: Record<string, any> | null;
+  /**
    * Enforcement payload
    */
   payload: Record<string, any>;
+  /**
+   * Original event payload contract, when its admission record is retained.
+   */
+  payload_contract?: Record<string, any> | null;
   /**
    * Timestamp when the enforcement was resolved (status changed from created to processed/disabled)
    */

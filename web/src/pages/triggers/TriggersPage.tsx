@@ -570,7 +570,7 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
                               <span className="font-mono font-semibold text-sm">
                                 {key}
                               </span>
-                              {param?.required && (
+                              {param?.required === true && (
                                 <span className="text-xs px-2 py-0.5 bg-red-100 text-red-700 rounded">
                                   Required
                                 </span>
@@ -627,7 +627,7 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
                             <span className="font-mono font-semibold text-sm">
                               {key}
                             </span>
-                            {param?.required && (
+                            {param?.required === true && (
                               <span className="text-xs px-2 py-0.5 bg-red-100 text-red-700 rounded">
                                 Required
                               </span>

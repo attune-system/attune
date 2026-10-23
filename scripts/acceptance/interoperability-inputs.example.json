@@ -1,0 +1,29 @@
+{
+  "timeout_seconds": 7200,
+  "archive_tool": {"binary": "/owned/build/native/tools/interoperability_acceptance_archive", "sha256": "REQUIRED_ACTUAL_BINARY_SHA256"},
+  "repository_inspector": {"binary": "/owned/build/native/tools/interoperability_inspector", "sha256": "REQUIRED_ACTUAL_INSPECTOR_BINARY_SHA256"},
+  "observer_credential_file": "/owned/credentials/project-select-only-g-observer.private.json",
+  "transports": {
+    "cli": {"command": ["/owned/build/native/agents/attune"]},
+    "mcp": {"command": ["/owned/build/native/agents/attune-mcp"]},
+    "python": {"command": ["/owned/sdk-venv/bin/python", "/SOURCE/scripts/acceptance/interoperability_python_sdk.py"]},
+    "javascript": {"command": ["/owned/bin/node", "/SOURCE/scripts/acceptance/interoperability_js_sdk.mjs", "/owned/js-sdk/dist/index.js"]},
+    "java": {"command": ["/owned/bin/java", "-cp", "/owned/probe-classes:/owned/attune-sdk.jar:/owned/jackson-databind.jar:/owned/jackson-core.jar:/owned/jackson-annotations.jar", "InteroperabilityJavaSdk"]}
+  },
+  "browser": {"command": ["/owned/bin/node", "/SOURCE/scripts/acceptance/interoperability_browser.mjs", "/owned/playwright/index.mjs"], "executable": "/owned/chromium/chrome"},
+  "artifacts": {
+    "/SOURCE/scripts/acceptance/provision_interoperability.py": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_probe.py": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_transports.py": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_python_sdk.py": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_js_sdk.mjs": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_browser.mjs": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_worker.py": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/InteroperabilityJavaSdk.java": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_observer.py": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_scenarios.py": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_batch_worker.py": "REQUIRED_MEASURED_SHA256",
+    "/SOURCE/scripts/acceptance/interoperability_emitter.py": "REQUIRED_MEASURED_SHA256",
+    "/owned/build/native/tools/interoperability_inspector": "REQUIRED_ACTUAL_INSPECTOR_BINARY_SHA256"
+  }
+}

@@ -1,0 +1,15 @@
+ref: test_pack.sdk_log_reader
+label: SDK Log Reader Fixture
+grants:
+  - resource: triggers
+    actions: [update, decrypt]
+    constraints:
+      refs: [test_pack.sdk_log_reader, test_pack.sdk_log_probe, test_pack.secret_lifecycle, test_pack.secret_lifecycle_probe]
+  - resource: rules
+    actions: [read, decrypt]
+    constraints:
+      refs: [test_pack.secret_lifecycle_fixture]
+  - resource: artifacts
+    actions: [read]
+    constraints:
+      refs: [sensor.test_pack.secret_lifecycle.stdout, sensor.test_pack.secret_lifecycle.stderr]

@@ -8,7 +8,7 @@ mod helpers;
 use attune_common::{
     repositories::{
         trigger::{CreateTriggerInput, TriggerRepository, UpdateTriggerInput},
-        Create, Delete, FindById, FindByRef, List, Patch, Update,
+        Delete, FindById, FindByRef, List, Patch,
     },
     Error,
 };
@@ -32,6 +32,7 @@ async fn test_create_trigger() {
         description: Some("Test webhook trigger".to_string()),
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -64,6 +65,7 @@ async fn test_create_trigger_without_pack() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -89,21 +91,15 @@ async fn test_create_trigger_with_schemas() {
         .unwrap();
 
     let param_schema = json!({
-        "type": "object",
-        "properties": {
-            "url": {"type": "string"},
-            "method": {"type": "string", "enum": ["GET", "POST"]}
-        },
-        "required": ["url"]
+        "url": {"type": "string", "required": true},
+        "method": {"type": "string", "enum": ["GET", "POST"]}
     });
 
     let out_schema = json!({
-        "type": "object",
-        "properties": {
-            "status": {"type": "integer"},
-            "body": {"type": "string"}
-        }
+        "status": {"type": "integer"},
+        "body": {"type": "string"}
     });
+    let config_schema = json!({"token": {"type": "string", "secret": true}});
 
     let input = CreateTriggerInput {
         r#ref: format!("{}.http_trigger", pack.r#ref),
@@ -113,6 +109,7 @@ async fn test_create_trigger_with_schemas() {
         description: Some("HTTP request trigger".to_string()),
         enabled: true,
         param_schema: Some(param_schema.clone()),
+        event_config_schema: Some(config_schema.clone()),
         out_schema: Some(out_schema.clone()),
         sensor: None,
         sensor_ref: None,
@@ -125,6 +122,7 @@ async fn test_create_trigger_with_schemas() {
 
     assert_eq!(trigger.param_schema, Some(param_schema));
     assert_eq!(trigger.out_schema, Some(out_schema));
+    assert_eq!(trigger.event_config_schema, Some(config_schema));
 }
 
 #[tokio::test]
@@ -140,6 +138,7 @@ async fn test_create_trigger_disabled() {
         description: None,
         enabled: false,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -168,6 +167,7 @@ async fn test_create_trigger_duplicate_ref() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -186,6 +186,7 @@ async fn test_create_trigger_duplicate_ref() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -222,6 +223,7 @@ async fn test_find_trigger_by_id() {
         description: Some("Test find".to_string()),
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -269,6 +271,7 @@ async fn test_find_trigger_by_ref() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -317,6 +320,7 @@ async fn test_list_triggers() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -334,6 +338,7 @@ async fn test_list_triggers() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -375,6 +380,7 @@ async fn test_find_triggers_by_pack() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -392,6 +398,7 @@ async fn test_find_triggers_by_pack() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -410,6 +417,7 @@ async fn test_find_triggers_by_pack() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -453,6 +461,7 @@ async fn test_find_enabled_triggers() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -473,6 +482,7 @@ async fn test_find_enabled_triggers() {
         description: None,
         enabled: false,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -512,6 +522,7 @@ async fn test_update_trigger() {
         description: Some("Original description".to_string()),
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -529,6 +540,7 @@ async fn test_update_trigger() {
         description: Some(Patch::Set("Updated description".to_string())),
         enabled: Some(false),
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -560,6 +572,7 @@ async fn test_update_trigger_partial() {
         description: Some("Original".to_string()),
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -576,6 +589,7 @@ async fn test_update_trigger_partial() {
         description: None,
         enabled: None,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -604,6 +618,7 @@ async fn test_update_trigger_schemas() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -615,24 +630,20 @@ async fn test_update_trigger_schemas() {
     let trigger = TriggerRepository::create(&pool, input).await.unwrap();
 
     let new_param_schema = json!({
-        "type": "object",
-        "properties": {
-            "name": {"type": "string"}
-        }
+        "name": {"type": "string"}
     });
 
     let new_out_schema = json!({
-        "type": "object",
-        "properties": {
-            "result": {"type": "boolean"}
-        }
+        "result": {"type": "boolean"}
     });
+    let config_schema = json!({"token": {"type": "string", "secret": true}});
 
     let update_input = UpdateTriggerInput {
         label: None,
         description: None,
         enabled: None,
         param_schema: Some(Patch::Set(new_param_schema.clone())),
+        event_config_schema: Some(Patch::Set(config_schema.clone())),
         out_schema: Some(Patch::Set(new_out_schema.clone())),
         sensor: None,
         sensor_ref: None,
@@ -645,6 +656,18 @@ async fn test_update_trigger_schemas() {
 
     assert_eq!(updated.param_schema, Some(new_param_schema));
     assert_eq!(updated.out_schema, Some(new_out_schema));
+    assert_eq!(updated.event_config_schema, Some(config_schema));
+    let cleared = TriggerRepository::update(
+        &pool,
+        trigger.id,
+        UpdateTriggerInput {
+            event_config_schema: Some(Patch::Clear),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(cleared.event_config_schema.is_none());
 }
 
 #[tokio::test]
@@ -656,6 +679,7 @@ async fn test_update_trigger_not_found() {
         description: None,
         enabled: None,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -687,6 +711,7 @@ async fn test_delete_trigger() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -736,6 +761,7 @@ async fn test_trigger_timestamps_auto_populated() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -768,6 +794,7 @@ async fn test_trigger_updated_changes_on_update() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -786,6 +813,7 @@ async fn test_trigger_updated_changes_on_update() {
         description: None,
         enabled: None,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -821,6 +849,7 @@ async fn test_multiple_triggers_same_pack() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -838,6 +867,7 @@ async fn test_multiple_triggers_same_pack() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -873,6 +903,7 @@ async fn test_trigger_cascade_delete_with_pack() {
         description: None,
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,

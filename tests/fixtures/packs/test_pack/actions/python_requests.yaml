@@ -1,4 +1,5 @@
-name: python_requests
+ref: test_pack.python_requests
+label: Python requests
 description: "Python action that imports requests"
 enabled: true
 runner_type: python

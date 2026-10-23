@@ -10,7 +10,9 @@ entry_point: register_packs.sh
 
 # Parameter delivery: stdin for secure parameter passing (no env vars)
 parameter_delivery: stdin
-parameter_format: dotenv
+parameter_format: json
+required_worker_runtimes:
+  python: ">=3.11,<4.0"
 
 # Output format: json (structured data parsing enabled)
 output_format: json
@@ -43,7 +45,6 @@ parameters:
   api_url:
     type: string
     description: "Attune API URL for registration calls"
-    default: "http://localhost:8080"
   api_token:
     type: string
     description: "API authentication token"
@@ -51,7 +52,9 @@ parameters:
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
-output_schema:
+output:
+  duration_seconds:
+    type: integer
   registered_packs:
     type: array
     description: "List of successfully registered packs"
@@ -93,16 +96,12 @@ output_schema:
               type: integer
               description: "Number of policies registered"
         test_result:
-          type: object
+          type: [object, "null"]
           description: "Pack test results (if tests were run)"
           properties:
             status:
               type: string
               description: "Test status"
-              enum:
-                - passed
-                - failed
-                - skipped
             total_tests:
               type: integer
               description: "Total number of tests"

@@ -106,8 +106,14 @@ STOPPED <──(token revoked)──< STOPPING <──(rule disabled/deleted)─
    - Scope: Sensor-specific trigger types
    - TTL: 90 days (with auto-refresh)
 3. Start sensor process:
-   - **Native sensors**: Spawn binary with environment config
-   - **Python/Script sensors**: Execute via runtime
+   - **Native sensors**: Spawn the binary directly
+   - **Python/Script sensors**: Execute via the selected runtime
+   - Deliver flat configuration and initial rule settings in one bounded stdin
+     JSON object. The environment carries connection metadata and trigger refs,
+     not credentials or rule configuration values.
+   - Restore settings under the admitted generation's immutable schema contracts
+     and captured input grants. Retain Key origins for later event and log
+     disclosure checks.
 4. Register process handle in memory
 5. Monitor process health
 

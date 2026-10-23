@@ -561,10 +561,19 @@ fn extract_pack_archive(
                         ));
                     }
                     #[cfg(unix)]
-                    if executable {
+                    {
                         use std::os::unix::fs::PermissionsExt;
 
-                        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+                        // Preserve only normalized executable intent, independent
+                        // of the worker's umask. Use the opened file, not a path
+                        // which could be replaced before chmod.
+                        writer
+                            .get_ref()
+                            .set_permissions(fs::Permissions::from_mode(if executable {
+                                0o755
+                            } else {
+                                0o644
+                            }))?;
                     }
                 }
                 _ => unreachable!("entry type validated above"),
@@ -1102,5 +1111,117 @@ mod tests {
         );
         assert!(first.ends_with(format!(".releases/sha256/{digest}/pack")));
         assert!(second.ends_with(format!(".releases/sha256/{digest}/pack")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uploaded_executables_survive_publication_and_api_download() {
+        use crate::pack_registry::{extract_archive, SafeExtractionLimits};
+        use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("sensors/bin")).unwrap();
+        let files = [
+            ("pack.yaml", b"ref: demo\nversion: 1.0.0\n".to_vec(), false),
+            (
+                "sensors/launcher",
+                b"#!/bin/sh\nexec \"${0%/*}/bin/native\" -c 'printf sensor-started'\n".to_vec(),
+                true,
+            ),
+            // The host's POSIX shell supplies an architecture-matched native binary.
+            (
+                "sensors/bin/native",
+                std::fs::read("/bin/sh").unwrap(),
+                true,
+            ),
+        ];
+        for (path, contents, executable) in &files {
+            let target = source.join(path);
+            std::fs::write(&target, contents).unwrap();
+            std::fs::set_permissions(
+                target,
+                std::fs::Permissions::from_mode(if *executable { 0o755 } else { 0o644 }),
+            )
+            .unwrap();
+        }
+
+        // Match CLI upload archive creation, then use the shared API ingestion path.
+        let upload = temp.path().join("upload.tar.gz");
+        let encoder = GzEncoder::new(
+            std::fs::File::create(&upload).unwrap(),
+            Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        for (path, _, _) in &files {
+            archive
+                .append_path_with_name(source.join(path), path)
+                .unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap();
+        let extracted = temp.path().join("extracted");
+        extract_archive(&upload, &extracted, SafeExtractionLimits::default()).unwrap();
+
+        let storage = PackStorage::new(temp.path().join("api-store"));
+        let staged = storage.stage_pack(&extracted, "demo", None).unwrap();
+        let release = storage
+            .publish_release(staged.staged_path(), "demo", "1.0.0")
+            .unwrap();
+        for file in &release.manifest.files {
+            let (_, contents, executable) = files
+                .iter()
+                .find(|(path, _, _)| *path == file.path)
+                .unwrap();
+            assert_eq!(file.executable, *executable, "{}", file.path);
+            assert_eq!(file.size, contents.len() as u64);
+        }
+        assert_eq!(release.manifest.files.len(), files.len());
+
+        let bytes = std::fs::read(&release.archive_path).unwrap();
+        let mut archive = tar::Archive::new(GzDecoder::new(bytes.as_slice()));
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap();
+            let relative = path.strip_prefix("demo").unwrap();
+            let (_, _, executable) = files
+                .iter()
+                .find(|(path, _, _)| Path::new(path) == relative)
+                .unwrap();
+            assert_eq!(
+                entry.header().mode().unwrap(),
+                if *executable { 0o755 } else { 0o644 }
+            );
+            assert_eq!(entry.header().uid().unwrap(), 0);
+            assert_eq!(entry.header().gid().unwrap(), 0);
+        }
+
+        let cache = temp.path().join("worker-cache");
+        let (url, server) = spawn_archive_server(bytes).await;
+        let transport = ApiPackTransport::new(&url, "token", cache.to_str().unwrap()).unwrap();
+        let downloaded = transport.sync_release("demo", 42, &release.digest).await;
+        server.await.unwrap();
+        storage
+            .remove_release_tree(&release.digest, &release.pack_path.to_string_lossy())
+            .unwrap();
+        let downloaded = downloaded.unwrap();
+        for (path, contents, executable) in &files {
+            let target = downloaded.join(path);
+            assert_eq!(std::fs::read(&target).unwrap(), *contents);
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                if *executable { 0o755 } else { 0o644 },
+                "{path}"
+            );
+        }
+        let mut command = std::process::Command::new(downloaded.join("sensors/launcher"));
+        crate::child_process_environment::ChildProcessEnvironment::from_parent([], &[])
+            .unwrap()
+            .apply(&mut command);
+        let output = command
+            .output()
+            .expect("downloaded launcher and native binary must start without chmod");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"sensor-started");
     }
 }

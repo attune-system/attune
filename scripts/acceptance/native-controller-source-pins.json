@@ -1,0 +1,15 @@
+{
+  "description": "F supplied frozen source checksums, not binary/image/archive digests",
+  "modules": {
+    "main.py": "f6b488890c7af7ac054789ede8a294f532b3d611082f7ff369b84bff56164def",
+    "controller.py": "eaea835b5901304a03e10f64fbe209442a48804c8fe13e0811004d5011f0408a",
+    "journal.py": "7bbed0c483b51d4c8d295b6307a571748e2b6172ba8ab93870426012023af417",
+    "native.py": "77de474995f2ed72997be1f1fefca7991d747b6eb396d19f0ad932a465582ff8",
+    "protocol.py": "60aca6993c7760d59297ed8e6cf6cbe7567a1f44fd6d43a71418caa3c163e1ca",
+    "http_input.py": "9f711203b6d700d30c104e5e4b0aa9ce12033b6caec22d4014e39ee28f2dafe5"
+  },
+  "migration": {
+    "path": "migrations/20261016006015_controlled_native_file_operations.sql",
+    "sha256": "fbcf4fb7294fee500c8f6a73e97918da8b4546b00386008f526fff753fb3e8b9"
+  }
+}

@@ -146,6 +146,18 @@ pub trait ArtifactFileTransport: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    async fn seal_log_stream_with_manifest(
+        &self,
+        artifact_version: i64,
+        truncated: bool,
+        manifest: &str,
+    ) -> Result<()> {
+        let _ = (artifact_version, truncated, manifest);
+        Err(Error::invalid_state(
+            "transport does not support authenticated encrypted log completion",
+        ))
+    }
+
     /// Open a streaming reader, optionally starting at `offset` bytes.
     async fn open_reader(&self, file_path: &str, offset: u64) -> Result<BoxAsyncReader>;
 

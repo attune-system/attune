@@ -216,6 +216,7 @@ impl SensorService {
 
         let default_sensor_log_config = crate::sensor_log::SensorLogConfig::default();
         let sensor_log_config = crate::sensor_log::SensorLogConfig {
+            generation_binding_id: None,
             max_bytes: config.artifacts.sensor_log_max_bytes,
             max_files: config.artifacts.sensor_log_max_files,
             segment_writer: config.artifacts.log_segment_writer_config(),
@@ -235,6 +236,7 @@ impl SensorService {
         let sensor_manager = Arc::new(SensorManager::new(
             db.clone(),
             SensorManagerConfig {
+                encryption_key: config.security.encryption_key.clone(),
                 child_environment,
                 api_url,
                 worker_token_provider: Some(worker_token_provider),

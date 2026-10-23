@@ -211,8 +211,8 @@ async fn test_create_permission_set_with_pack() {
         label: Some("Pack Permission Set".to_string()),
         description: Some("Permission set from pack".to_string()),
         grants: json!([
-            {"resource": "actions", "permission": "read"},
-            {"resource": "actions", "permission": "execute"}
+            {"resource": "actions", "actions": ["read"]},
+            {"resource": "actions", "actions": ["execute"]}
         ]),
     };
 
@@ -234,19 +234,34 @@ async fn test_create_permission_set_with_complex_grants() {
     let grants = json!([
         {
             "resource": "executions",
-            "permissions": ["read", "write", "delete"],
-            "filters": {"pack": "core"}
+            "actions": ["read", "cancel", "delete"],
+            "constraints": {"pack_refs": ["core"]}
         },
         {
             "resource": "actions",
-            "permissions": ["execute"],
-            "filters": {"tags": ["safe"]}
+            "actions": ["execute"],
+            "constraints": {"refs": ["core.safe"]}
         }
     ]);
 
     let permset = fixture.create_with_grants(grants.clone()).await;
 
     assert_eq!(permset.grants, grants);
+}
+
+#[test]
+fn retired_grant_field_names_are_not_silently_accepted() {
+    for grant in [
+        json!({"resource":"actions","permission":"execute"}),
+        json!({"resource":"actions","permissions":["execute"]}),
+        json!({"resource":"actions","actions":["execute"],"filters":{"tags":["safe"]}}),
+    ] {
+        assert!(serde_json::from_value::<attune_common::rbac::Grant>(grant).is_err());
+    }
+    assert!(serde_json::from_value::<attune_common::rbac::Grant>(json!({
+        "resource":"actions", "actions":["execute"], "constraints":{"refs":["core.safe"]}
+    }))
+    .is_ok());
 }
 
 #[tokio::test]
@@ -400,8 +415,8 @@ async fn test_update_permission_set_grants() {
     let created = fixture.create_with_grants(json!([])).await;
 
     let new_grants = json!([
-        {"resource": "packs", "permission": "read"},
-        {"resource": "actions", "permission": "execute"}
+        {"resource": "packs", "actions": ["read"]},
+        {"resource": "actions", "actions": ["execute"]}
     ]);
 
     let update_input = UpdatePermissionSetInput {
@@ -424,7 +439,7 @@ async fn test_update_permission_set_all_fields() {
 
     let created = fixture.create_default().await;
 
-    let new_grants = json!([{"resource": "all", "permission": "admin"}]);
+    let new_grants = json!([{"resource": "permissions", "actions": ["manage"]}]);
     let update_input = UpdatePermissionSetInput {
         label: Some("New Label".to_string()),
         description: Some("New Description".to_string()),

@@ -17,7 +17,10 @@ use attune_common::repositories::{
         CreateKeyInput, KeyGrantFilter, KeyRepository, KeySearchFilters, KeyVisibility,
         UpdateKeyInput,
     },
+    key_schema::{KeySchemaAssignment, KeySchemaRepository},
     pack::PackRepository,
+    schema_contract::SchemaContractRepository,
+    schema_type::SchemaTypeRepository,
     trigger::SensorRepository,
     Create, Delete, FindById, FindByRef, Update,
 };
@@ -44,6 +47,49 @@ use crate::{
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
+
+async fn assign_key_schema(
+    connection: &mut sqlx::PgConnection,
+    key_ref: &str,
+    schema: &serde_json::Value,
+) -> ApiResult<KeySchemaAssignment> {
+    let contract = SchemaContractRepository::materialize_assignment(
+        connection,
+        attune_common::value_schema::SourceIdentity::Assigned {
+            component_ref: key_ref.to_owned(),
+            assignment_id: uuid::Uuid::new_v4(),
+        },
+        attune_common::value_schema::SchemaContext::SingleValue,
+        schema,
+    )
+    .await?;
+    Ok(KeySchemaAssignment {
+        authored_schema: schema.clone(),
+        contract,
+    })
+}
+
+fn compare_key_schema_preview(
+    expected: Option<&str>,
+    assignment: Option<&KeySchemaAssignment>,
+) -> ApiResult<()> {
+    if let Some(expected) = expected {
+        let assignment = assignment.ok_or_else(|| {
+            ApiError::BadRequest("A schema preview digest requires an assigned value schema".into())
+        })?;
+        let actual = assignment
+            .contract
+            .semantic_digest()
+            .map_err(|_| ApiError::BadRequest("Invalid Key schema digest".into()))?;
+        if actual != expected {
+            return Err(ApiError::Conflict(
+                "The accepted Key schema differs from the preview; refresh the assigned schema"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 async fn key_grants(state: &AppState, user: &RequireAuth) -> ApiResult<(i64, Vec<Grant>)> {
     let identity_id = user
@@ -102,6 +148,30 @@ async fn key_grants(state: &AppState, user: &RequireAuth) -> ApiResult<(i64, Vec
     }
 }
 
+/// Load human/sensor grants before reserving an effect connection. Recorded
+/// credentials never enter mutable IAM; their permits are validated in the
+/// effect transaction instead. This also supports single-connection pools.
+async fn delegated_key_grants(
+    state: &AppState,
+    user: &RequireAuth,
+) -> ApiResult<Option<(i64, Vec<Grant>)>> {
+    if user
+        .0
+        .claims
+        .admitted_execution_credential()
+        .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
+        .is_some()
+    {
+        Ok(None)
+    } else {
+        key_grants(state, user).await.map(Some)
+    }
+}
+
+fn missing_key_authority() -> ApiError {
+    ApiError::Unauthorized("Key authority is unavailable".into())
+}
+
 fn require_key_mutation_token(user: &RequireAuth) -> ApiResult<()> {
     match user.0.claims.token_type {
         TokenType::Access | TokenType::Execution => Ok(()),
@@ -127,18 +197,34 @@ pub async fn list_keys(
     State(state): State<Arc<AppState>>,
     Query(query): Query<KeyQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let (identity_id, grants) = key_grants(&state, &user).await?;
-    if !grants
-        .iter()
-        .any(|grant| grant.resource == Resource::Keys && grant.actions.contains(&Action::Read))
-    {
+    let delegated = delegated_key_grants(&state, &user).await?;
+    let mut transaction = state.db.begin().await?;
+    let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let (identity_id, filters) = if let Some(authority) = &recorded {
+        (
+            authority.authority().owner.sponsor_identity_id,
+            authority.key_read_filters(),
+        )
+    } else {
+        let (identity_id, grants) = delegated.ok_or_else(missing_key_authority)?;
+        if !grants
+            .iter()
+            .any(|grant| grant.resource == Resource::Keys && grant.actions.contains(&Action::Read))
+        {
+            return Err(ApiError::Forbidden(
+                "Insufficient permissions: keys:read".into(),
+            ));
+        }
+        (identity_id, compile_key_read_grant_filters(&grants))
+    };
+    if recorded.is_some() && filters.is_empty() {
         return Err(ApiError::Forbidden(
-            "Insufficient permissions: keys:read".to_string(),
+            "Insufficient recorded authority: keys:read".into(),
         ));
     }
     let visibility = Some(KeyVisibility {
         identity_id,
-        grants: compile_key_read_grant_filters(&grants),
+        grants: filters,
     });
 
     // Owner filters, RBAC visibility, and pagination are all pushed into a
@@ -152,7 +238,11 @@ pub async fn list_keys(
         visibility,
     };
 
-    let result = KeyRepository::search(&state.db, &filters).await?;
+    let result = KeyRepository::search_with_connection(&mut transaction, &filters).await?;
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
+    }
+    transaction.commit().await?;
 
     let paginated_keys: Vec<KeySummary> = result.rows.into_iter().map(KeySummary::from).collect();
 
@@ -202,7 +292,9 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
         });
     };
 
-    let always_excluded = constraints.pack_refs.is_some()
+    let always_excluded = constraints.pack_owner.is_some()
+        || constraints.pack_state.is_some()
+        || constraints.pack_refs.is_some()
         || constraints.visibility.is_some()
         || matches!(
             constraints.execution_scope,
@@ -224,6 +316,10 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
         || constraints.ids.is_some();
 
     Some(KeyGrantFilter {
+        ownership: constraints
+            .managing_pack_id
+            .map(attune_common::repositories::key::KeyOwnershipScope::ManagedPack)
+            .unwrap_or_default(),
         owner_types: constraints.owner_types.clone(),
         owner: constraints.owner,
         owner_refs: constraints.owner_refs.clone(),
@@ -231,6 +327,7 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
         ids: constraints.ids.clone(),
         encrypted: constraints.encrypted,
         owner_scoped,
+        ..Default::default()
     })
 }
 
@@ -258,6 +355,17 @@ pub async fn sign_key_jwt(
         ));
     }
     request.validate()?;
+    let mut recorded_transaction = state.db.begin().await?;
+    let recorded = user
+        .0
+        .recorded_runtime_authority(&mut recorded_transaction)
+        .await?;
+    let recorded_transaction = if recorded.is_some() {
+        Some(recorded_transaction)
+    } else {
+        recorded_transaction.rollback().await?;
+        None
+    };
     let (identity_id, grants, pack_ref, execution_id, sensor_ref, fence_transaction) = if user
         .0
         .claims
@@ -292,41 +400,51 @@ pub async fn sign_key_jwt(
         if !attune_common::repositories::sensor_workload::SensorWorkloadRepository::lock_current_fence(&mut tx, sensor.id, fence).await? {
             return Err(ApiError::Unauthorized("Sensor workload is no longer current".into()));
         }
-        let pack_id = sensor
-            .pack
-            .ok_or_else(|| ApiError::Forbidden("Signing requires a pack-owned sensor".into()))?;
-        let pack = PackRepository::find_by_id(&mut *tx, pack_id)
+        let identity_id = user
+            .0
+            .identity_id()
+            .map_err(|_| ApiError::Unauthorized("Sensor identity is invalid".into()))?;
+        let (_, binding, _) =
+            attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+                &mut *tx,
+                fence.workload_id,
+                fence.generation,
+            )
             .await?
-            .ok_or_else(|| ApiError::Unauthorized("Sensor pack is unavailable".into()))?;
-        let identity_id = pack.installed_by.ok_or_else(|| {
-            ApiError::Forbidden("Signing requires an attributed sensor pack".into())
-        })?;
-        let authority =
-            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
-                .await?;
+            .ok_or_else(|| {
+                ApiError::Forbidden("Sensor generation binding is unavailable".into())
+            })?;
+        if binding.executable.sensor.id != sensor.id
+            || binding.executable.sensor.r#ref != sensor_ref
+            || binding.executable.sensor.pack_ref.as_deref() != Some(pack_ref.as_str())
+        {
+            return Err(ApiError::Forbidden(
+                "Sensor generation signing scope mismatch".into(),
+            ));
+        }
+        let grants = binding.executable.signing_grants;
         let key = KeyRepository::find_by_ref(&mut *tx, &key_ref)
             .await?
             .ok_or_else(|| ApiError::NotFound("Signing key is not available".into()))?;
-        let origin = attune_common::key_access::key_origin(&key);
-        if !authority.key_allows(&origin, Action::Read)
-            && !authority.key_allows(&origin, Action::Use)
-        {
+        if !key_action_allowed(&grants, Action::Use, identity_id, &key) {
             return Err(ApiError::NotFound("Signing key is not available".into()));
         }
         (
             identity_id,
-            vec![Grant {
-                resource: Resource::Keys,
-                actions: vec![Action::Use],
-                constraints: Some(GrantConstraints {
-                    refs: Some(vec![key_ref.clone()]),
-                    ..Default::default()
-                }),
-            }],
+            grants,
             pack_ref,
             None,
             Some(sensor_ref),
             Some(tx),
+        )
+    } else if let Some(authority) = &recorded {
+        (
+            authority.authority().owner.sponsor_identity_id,
+            Vec::new(),
+            authority.authority().owner.pack_ref.clone(),
+            Some(authority.credential_binding().execution_id),
+            None,
+            recorded_transaction,
         )
     } else {
         let (identity_id, grants) = key_grants(&state, &user).await?;
@@ -363,15 +481,31 @@ pub async fn sign_key_jwt(
             None,
         )
     };
-    let key = KeyRepository::find_by_ref(&state.db, &key_ref)
+    let mut fence_transaction = match fence_transaction {
+        Some(transaction) => transaction,
+        None => state.db.begin().await?,
+    };
+    let key = KeyRepository::find_by_ref_for_share(&mut fence_transaction, &key_ref)
         .await?
-        .filter(|key| {
-            key.owner_type == OwnerType::System
-                && key.encrypted
-                && (key_action_allowed(&grants, Action::Use, identity_id, key)
-                    || key_action_allowed(&grants, Action::Read, identity_id, key))
-        })
+        .filter(|key| key.owner_type == OwnerType::System && key.encrypted)
         .ok_or_else(|| ApiError::NotFound("Signing key is not available".into()))?;
+    let permitted = if let Some(authority) = &recorded {
+        let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+            &mut fence_transaction,
+            attune_common::repositories::runtime_target::RuntimeTarget::Key(key.id),
+            identity_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Signing key is not available".into()))?;
+        authority.allows_new_effect(&target, Action::Use)
+            || authority.allows_new_effect(&target, Action::Read)
+    } else {
+        key_action_allowed(&grants, Action::Use, identity_id, &key)
+            || key_action_allowed(&grants, Action::Read, identity_id, &key)
+    };
+    if !permitted {
+        return Err(ApiError::NotFound("Signing key is not available".into()));
+    }
     let encryption_key = state
         .config
         .security
@@ -401,9 +535,10 @@ pub async fn sign_key_jwt(
     })
     .await
     .map_err(|_| ApiError::InternalServerError("Signing operation failed".into()))??;
-    if let Some(transaction) = fence_transaction {
-        transaction.commit().await?;
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut fence_transaction).await?;
     }
+    fence_transaction.commit().await?;
     emit_key_audit(
         &state,
         &user,
@@ -437,19 +572,101 @@ pub async fn get_key(
     State(state): State<Arc<AppState>>,
     Path(key_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let (identity_id, grants) = key_grants(&state, &user).await?;
-    let mut key = KeyRepository::find_by_ref(&state.db, &key_ref)
+    let delegated = delegated_key_grants(&state, &user).await?;
+    let mut transaction = state.db.begin().await?;
+    SchemaTypeRepository::lock_selection(&mut transaction).await?;
+    let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let (identity_id, grants) = match &recorded {
+        Some(authority) => (authority.authority().owner.sponsor_identity_id, Vec::new()),
+        None => delegated.ok_or_else(missing_key_authority)?,
+    };
+    let mut key = KeyRepository::find_by_ref_for_share(&mut transaction, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
 
-    if !key_action_allowed(&grants, Action::Read, identity_id, &key) {
+    let resolved = {
+        Some(
+            attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+                &mut transaction,
+                attune_common::repositories::runtime_target::RuntimeTarget::Key(key.id),
+                identity_id,
+            )
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Key is not available".into()))?,
+        )
+    };
+    let allows = |action| match (&recorded, &resolved) {
+        (Some(authority), Some(target)) => authority.allows_target(target, action),
+        _ => key_action_allowed_in_pack(
+            &grants,
+            action,
+            identity_id,
+            &key,
+            resolved.as_ref().and_then(|target| target.pack_id()),
+        ),
+    };
+    if !allows(Action::Read) {
         return Err(ApiError::NotFound(format!("Key '{}' not found", key_ref)));
     }
 
     // For encrypted keys, separately check keys:decrypt. Failing this returns
     // a null value rather than ciphertext.
-    let can_decrypt =
-        !key.encrypted || key_action_allowed(&grants, Action::Decrypt, identity_id, &key);
+    let can_decrypt = !key.encrypted || allows(Action::Decrypt);
+    if can_decrypt {
+        if let Some(authority) = &recorded {
+            attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::record(
+                &mut transaction,
+                authority,
+                &attune_common::key_access::key_origin(&key),
+            )
+            .await?;
+        }
+    }
+
+    if can_decrypt && user.0.claims.token_type == TokenType::Sensor {
+        use attune_common::repositories::{
+            sensor_schema::SensorSchemaRepository, sensor_workload::SensorWorkloadRepository,
+        };
+        let fence = user
+            .0
+            .claims
+            .sensor_workload_fence()
+            .map_err(|_| ApiError::Unauthorized("Sensor workload scope is missing".into()))?;
+        let sensor_ref = user
+            .0
+            .claims
+            .sensor_ref()
+            .map_err(|_| ApiError::Unauthorized("Sensor scope is missing".into()))?;
+        let sensor = SensorRepository::find_by_ref(&mut *transaction, sensor_ref)
+            .await?
+            .ok_or_else(|| ApiError::Unauthorized("Sensor is unavailable".into()))?;
+        if !SensorWorkloadRepository::lock_current_fence(&mut transaction, sensor.id, fence).await?
+        {
+            return Err(ApiError::Unauthorized(
+                "Sensor workload is no longer current".into(),
+            ));
+        }
+        let (generation, binding, _) =
+            SensorSchemaRepository::find(&mut *transaction, fence.workload_id, fence.generation)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Forbidden("Sensor generation binding is unavailable".into())
+                })?;
+        if binding.executable.sensor.id != sensor.id
+            || binding.executable.sensor.r#ref != sensor_ref
+            || binding.executable.sensor.pack_ref.as_deref() != user.0.claims.sensor_pack_ref().ok()
+        {
+            return Err(ApiError::Forbidden(
+                "Sensor generation Key scope mismatch".into(),
+            ));
+        }
+        SensorSchemaRepository::record_key_read_origin(
+            &mut transaction,
+            generation,
+            &attune_common::key_access::key_origin(&key),
+        )
+        .await?;
+    }
 
     // Decrypt value if encrypted and caller has permission.
     // If they lack Keys::Decrypt, return null rather than the ciphertext.
@@ -503,7 +720,12 @@ pub async fn get_key(
         }),
     );
 
-    let response = ApiResponse::new(KeyResponse::from(key));
+    let assignment = KeySchemaRepository::find(&mut *transaction, key.id).await?;
+    let response = ApiResponse::new(KeyResponse::from(key).with_schema(assignment.as_ref())?);
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
+    }
+    transaction.commit().await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -529,11 +751,16 @@ pub async fn create_key(
     require_key_mutation_token(&user)?;
     // Validate request
     request.validate()?;
-    let authorization = if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let (identity_id, grants) = key_grants(&state, &user).await?;
+    let delegated = delegated_key_grants(&state, &user).await?;
+    let mut transaction = state.db.begin().await?;
+    SchemaTypeRepository::lock_selection(&mut transaction).await?;
+    let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let authorization = if recorded.is_none()
+        && matches!(
+            user.0.claims.token_type,
+            TokenType::Access | TokenType::Execution
+        ) {
+        let (identity_id, grants) = delegated.ok_or_else(missing_key_authority)?;
         if !grants.iter().any(|grant| {
             grant.resource == Resource::Keys && grant.actions.contains(&Action::Create)
         }) {
@@ -554,37 +781,92 @@ pub async fn create_key(
     )
     .map_err(ApiError::BadRequest)?;
 
-    if let Some((identity_id, grants)) = authorization {
-        let mut ctx = AuthorizationContext::new(identity_id);
-
-        ctx.owner_identity_id = (request.owner_type == OwnerType::Identity
-            && request.owner_identity_login.as_deref() == Some(user.0.login()))
-        .then_some(identity_id);
-        ctx.owner_type = Some(request.owner_type);
-        ctx.owner_ref = requested_owner_ref;
-        ctx.encrypted = Some(request.encrypted);
-        ctx.target_ref = Some(key_ref.clone());
-
-        let create_allowed = if request.owner_type == OwnerType::Identity
-            && request.owner_identity_login.as_deref() != Some(user.0.login())
-        {
-            constrained_key_grant_allows(&grants, Action::Create, &ctx)
-        } else {
-            AuthorizationService::is_allowed(&grants, Resource::Keys, Action::Create, &ctx)
+    // Resolve the real owner before local-scope matching. Hide missing-owner
+    // diagnostics until authorization, just as for foreign owner denial.
+    let resolved_owner = resolve_key_owner(&mut transaction, &request)
+        .await
+        .map_err(|error| {
+            if matches!(error, ApiError::BadRequest(_) | ApiError::NotFound(_)) {
+                ApiError::Forbidden(
+                    "Key owner is not available to the recorded creation authority".into(),
+                )
+            } else {
+                error
+            }
+        })?;
+    if recorded.is_some() || authorization.is_some() {
+        use attune_common::repositories::runtime_target::{
+            ProspectiveDataOwner, ProspectiveRuntimeTarget, RuntimeTargetRepository,
         };
-        if !create_allowed {
+        let missing = || {
+            ApiError::Forbidden(
+                "Key owner is not available to the recorded creation authority".into(),
+            )
+        };
+        let owner = match request.owner_type {
+            OwnerType::System => ProspectiveDataOwner::System,
+            OwnerType::Identity => {
+                ProspectiveDataOwner::Identity(resolved_owner.owner_identity.ok_or_else(missing)?)
+            }
+            OwnerType::Pack => {
+                ProspectiveDataOwner::Pack(resolved_owner.owner_pack.ok_or_else(missing)?)
+            }
+            OwnerType::Action => {
+                ProspectiveDataOwner::Action(resolved_owner.owner_action.ok_or_else(missing)?)
+            }
+            OwnerType::Sensor => {
+                ProspectiveDataOwner::Sensor(resolved_owner.owner_sensor.ok_or_else(missing)?)
+            }
+        };
+        let target = RuntimeTargetRepository::resolve_creation_target(
+            &mut transaction,
+            owner,
+            ProspectiveRuntimeTarget::Key {
+                local_ref: &request.local_ref,
+                encrypted: request.encrypted,
+            },
+            recorded
+                .as_ref()
+                .map(|authority| authority.authority().owner.sponsor_identity_id)
+                .or_else(|| authorization.as_ref().map(|(identity, _)| *identity))
+                .ok_or_else(missing)?,
+        )
+        .await?
+        .ok_or_else(missing)?;
+        let allowed = if let Some(authority) = &recorded {
+            authority.allows_new_effect(&target, Action::Create)
+        } else if let Some((identity_id, grants)) = &authorization {
+            let mut ctx = target.context().clone();
+            ctx.owner_identity_id = (request.owner_type == OwnerType::Identity
+                && request.owner_identity_login.as_deref() == Some(user.0.login()))
+            .then_some(*identity_id);
+            ctx.owner_ref = requested_owner_ref;
+            if request.owner_type == OwnerType::Identity
+                && request.owner_identity_login.as_deref() != Some(user.0.login())
+            {
+                constrained_key_grant_allows(grants, Action::Create, &ctx)
+            } else {
+                AuthorizationService::is_allowed(grants, Resource::Keys, Action::Create, &ctx)
+            }
+        } else {
+            false
+        };
+        if target.context().target_ref.as_deref() != Some(key_ref.as_str()) || !allowed {
             return Err(ApiError::Forbidden(
-                "Insufficient permissions: keys:create".to_string(),
+                "Insufficient recorded authority: keys:create".into(),
             ));
         }
     }
 
-    // Resolve database IDs only after constrained authorization so callers
-    // cannot use owner lookup errors to enumerate resources they cannot access.
-    let resolved_owner = resolve_key_owner(&state, &request).await?;
-
     // Keep the database uniqueness constraint as the final concurrency guard.
-    if KeyRepository::find_by_ref(&state.db, &key_ref)
+    if let Some(authority) = &recorded {
+        attune_common::repositories::runtime_read::RuntimeReadRepository::require_untainted(
+            &mut transaction,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+    }
+    if KeyRepository::find_by_ref(&mut *transaction, &key_ref)
         .await?
         .is_some()
     {
@@ -594,7 +876,19 @@ pub async fn create_key(
         )));
     }
 
-    // Encrypt value if requested
+    let assignment = if let Some(schema) = &request.value_schema {
+        Some(assign_key_schema(&mut transaction, &key_ref, schema).await?)
+    } else {
+        None
+    };
+    compare_key_schema_preview(request.schema_digest.as_deref(), assignment.as_ref())?;
+    let plaintext = if let Some(assignment) = &assignment {
+        KeySchemaRepository::prepare_value(assignment, &request.value, request.encrypted)?
+    } else {
+        request.value.clone()
+    };
+
+    // Validate plaintext before encryption, under the selected assignment.
     let (value, encryption_key_hash) = if request.encrypted {
         let encryption_key = state
             .config
@@ -607,18 +901,18 @@ pub async fn create_key(
                 )
             })?;
 
-        let encrypted_value = attune_common::crypto::encrypt_json(&request.value, encryption_key)
+        let encrypted_value = attune_common::crypto::encrypt_json(&plaintext, encryption_key)
             .map_err(|e| {
-            tracing::error!("Failed to encrypt key value: {}", e);
-            ApiError::InternalServerError(format!("Failed to encrypt value: {}", e))
-        })?;
+                tracing::error!("Failed to encrypt key value: {}", e);
+                ApiError::InternalServerError(format!("Failed to encrypt value: {}", e))
+            })?;
 
         let key_hash = attune_common::crypto::hash_encryption_key(encryption_key);
 
         (encrypted_value, Some(key_hash))
     } else {
         // Store in plaintext (not recommended for sensitive data)
-        (request.value.clone(), None)
+        (plaintext.clone(), None)
     };
 
     // Create key input
@@ -638,7 +932,12 @@ pub async fn create_key(
         value,
     };
 
-    let mut key = KeyRepository::create(&state.db, key_input).await?;
+    let mut key = KeyRepository::create(&mut *transaction, key_input).await?;
+    KeySchemaRepository::set(&mut transaction, key.id, assignment.as_ref()).await?;
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
+    }
+    transaction.commit().await?;
 
     // Return decrypted value in response
     if key.encrypted {
@@ -670,7 +969,10 @@ pub async fn create_key(
         }),
     );
 
-    let response = ApiResponse::with_message(KeyResponse::from(key), "Key created successfully");
+    let response = ApiResponse::with_message(
+        KeyResponse::from(key).with_schema(assignment.as_ref())?,
+        "Key created successfully",
+    );
 
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -695,21 +997,132 @@ pub async fn update_key(
     user: RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(key_ref): Path<String>,
-    Json(request): Json<UpdateKeyRequest>,
+    Json(mut request): Json<UpdateKeyRequest>,
 ) -> ApiResult<impl IntoResponse> {
     require_key_mutation_token(&user)?;
     // Validate request
     request.validate()?;
+    let delegated = delegated_key_grants(&state, &user).await?;
 
     // Verify key exists
-    let existing = KeyRepository::find_by_ref(&state.db, &key_ref)
+    let mut transaction = state.db.begin().await?;
+    SchemaTypeRepository::lock_selection(&mut transaction).await?;
+    let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let existing = KeyRepository::find_by_ref_for_update(&mut transaction, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
-    let (identity_id, grants) = key_grants(&state, &user).await?;
-    if !key_action_allowed(&grants, Action::Update, identity_id, &existing) {
+    let (identity_id, grants) = match &recorded {
+        Some(authority) => (authority.authority().owner.sponsor_identity_id, Vec::new()),
+        None => delegated.ok_or_else(missing_key_authority)?,
+    };
+    let target = {
+        Some(
+            attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+                &mut transaction,
+                attune_common::repositories::runtime_target::RuntimeTarget::Key(existing.id),
+                identity_id,
+            )
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Key is not available".into()))?,
+        )
+    };
+    let allows = |action| match (&recorded, &target) {
+        (Some(authority), Some(target)) => authority.allows_new_effect(target, action),
+        _ => key_action_allowed_in_pack(
+            &grants,
+            action,
+            identity_id,
+            &existing,
+            target.as_ref().and_then(|target| target.pack_id()),
+        ),
+    };
+    if !allows(Action::Update) {
         return Err(ApiError::Forbidden(
             "Insufficient permissions: keys:update".to_string(),
         ));
+    }
+
+    let stored_assignment = KeySchemaRepository::find(&mut *transaction, existing.id).await?;
+    if let Some(authority) = &recorded {
+        attune_common::repositories::runtime_read::RuntimeReadRepository::require_untainted(
+            &mut transaction,
+            authority.credential_binding().admission_id,
+        )
+        .await?;
+    }
+    let schema_changed = request.value_schema.as_ref().is_some_and(|schema| {
+        if schema.is_null() {
+            stored_assignment.is_some()
+        } else {
+            stored_assignment
+                .as_ref()
+                .is_none_or(|stored| stored.authored_schema != *schema)
+        }
+    });
+    let assignment = if request
+        .value_schema
+        .as_ref()
+        .is_some_and(serde_json::Value::is_null)
+    {
+        if request.rebind_schema {
+            return Err(ApiError::BadRequest(
+                "Cannot rebind a removed schema".into(),
+            ));
+        }
+        None
+    } else if schema_changed || request.rebind_schema {
+        let schema = request
+            .value_schema
+            .as_ref()
+            .or_else(|| {
+                stored_assignment
+                    .as_ref()
+                    .map(|assignment| &assignment.authored_schema)
+            })
+            .ok_or_else(|| ApiError::BadRequest("Rebinding requires a value schema".into()))?;
+        Some(assign_key_schema(&mut transaction, &existing.r#ref, schema).await?)
+    } else {
+        stored_assignment.clone()
+    };
+    compare_key_schema_preview(request.schema_digest.as_deref(), assignment.as_ref())?;
+    let encryption_changed = request
+        .encrypted
+        .is_some_and(|encrypted| encrypted != existing.encrypted);
+    let needs_value = request.value.is_some()
+        || encryption_changed
+        || (schema_changed || request.rebind_schema) && assignment.is_some();
+    if needs_value {
+        let plaintext = if let Some(value) = request.value.take() {
+            value
+        } else {
+            if !allows(Action::Read) || existing.encrypted && !allows(Action::Decrypt) {
+                return Err(ApiError::Forbidden("Inspecting preserved Key material for schema/encryption changes requires read and applicable decrypt authority".into()));
+            }
+            if existing.encrypted {
+                let encryption_key =
+                    state
+                        .config
+                        .security
+                        .encryption_key
+                        .as_deref()
+                        .ok_or_else(|| {
+                            ApiError::InternalServerError("Encryption key is not configured".into())
+                        })?;
+                attune_common::crypto::decrypt_json(&existing.value, encryption_key)?
+            } else {
+                existing.value.clone()
+            }
+        };
+        let plaintext = if let Some(assignment) = &assignment {
+            KeySchemaRepository::prepare_value(
+                assignment,
+                &plaintext,
+                request.encrypted.unwrap_or(existing.encrypted),
+            )?
+        } else {
+            plaintext
+        };
+        request.value = Some(plaintext);
     }
 
     // Handle value update with encryption
@@ -741,44 +1154,6 @@ pub async fn update_key(
         } else {
             (Some(new_value), Some(false), None)
         }
-    } else if let Some(encrypted) = request
-        .encrypted
-        .filter(|encrypted| *encrypted != existing.encrypted)
-    {
-        if existing.encrypted
-            && !(key_action_allowed(&grants, Action::Read, identity_id, &existing)
-                && key_action_allowed(&grants, Action::Decrypt, identity_id, &existing))
-        {
-            return Err(ApiError::Forbidden(
-                "Changing encryption of existing key material requires read and decrypt authority"
-                    .into(),
-            ));
-        }
-        let encryption_key = state
-            .config
-            .security
-            .encryption_key
-            .as_ref()
-            .ok_or_else(|| {
-                ApiError::InternalServerError("Encryption key is not configured".into())
-            })?;
-        let plaintext = if existing.encrypted {
-            attune_common::crypto::decrypt_json(&existing.value, encryption_key)?
-        } else {
-            existing.value.clone()
-        };
-        if encrypted {
-            (
-                Some(attune_common::crypto::encrypt_json(
-                    &plaintext,
-                    encryption_key,
-                )?),
-                Some(true),
-                Some(attune_common::crypto::hash_encryption_key(encryption_key)),
-            )
-        } else {
-            (Some(plaintext), Some(false), None)
-        }
     } else {
         (None, None, None)
     };
@@ -791,11 +1166,53 @@ pub async fn update_key(
         encryption_key_hash,
     };
 
-    let mut updated_key = KeyRepository::update(&state.db, existing.id, update_input).await?;
+    let mut updated_key =
+        KeyRepository::update(&mut *transaction, existing.id, update_input).await?;
+    if schema_changed || request.rebind_schema {
+        KeySchemaRepository::set(&mut transaction, existing.id, assignment.as_ref()).await?;
+    }
     let value_updated = updated_key.value != existing.value;
 
-    let can_read = key_action_allowed(&grants, Action::Read, identity_id, &updated_key);
-    let can_decrypt = key_action_allowed(&grants, Action::Decrypt, identity_id, &updated_key);
+    let (can_read, can_decrypt) = if let Some(authority) = &recorded {
+        let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+            &mut transaction,
+            attune_common::repositories::runtime_target::RuntimeTarget::Key(updated_key.id),
+            identity_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Key is not available".into()))?;
+        (
+            authority.allows_target(&target, Action::Read),
+            authority.allows_target(&target, Action::Decrypt),
+        )
+    } else {
+        (
+            key_action_allowed_in_pack(
+                &grants,
+                Action::Read,
+                identity_id,
+                &updated_key,
+                target.as_ref().and_then(|target| target.pack_id()),
+            ),
+            key_action_allowed_in_pack(
+                &grants,
+                Action::Decrypt,
+                identity_id,
+                &updated_key,
+                target.as_ref().and_then(|target| target.pack_id()),
+            ),
+        )
+    };
+    if can_read && (!updated_key.encrypted || can_decrypt) {
+        if let Some(authority) = &recorded {
+            attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::record(
+                &mut transaction,
+                authority,
+                &attune_common::key_access::key_origin(&updated_key),
+            )
+            .await?;
+        }
+    }
     if !can_read || updated_key.encrypted && !can_decrypt {
         updated_key.value = serde_json::Value::Null;
     } else if updated_key.encrypted {
@@ -814,6 +1231,10 @@ pub async fn update_key(
                 ApiError::InternalServerError(format!("Failed to decrypt value: {}", e))
             })?;
     }
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
+    }
+    transaction.commit().await?;
 
     emit_key_audit(
         &state,
@@ -832,12 +1253,17 @@ pub async fn update_key(
                 updated_key.owner_sensor_ref.as_deref(),
             ),
             "value_updated": value_updated,
+            "schema_changed": schema_changed || request.rebind_schema,
+            "previous_schema_binding_digest": stored_assignment.as_ref().map(|assignment| &assignment.contract.binding_digest),
+            "schema_binding_digest": assignment.as_ref().map(|assignment| &assignment.contract.binding_digest),
             "value": "***",
         }),
     );
 
-    let response =
-        ApiResponse::with_message(KeyResponse::from(updated_key), "Key updated successfully");
+    let response = ApiResponse::with_message(
+        KeyResponse::from(updated_key).with_schema(assignment.as_ref())?,
+        "Key updated successfully",
+    );
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -862,17 +1288,42 @@ pub async fn delete_key(
     Path(key_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     require_key_mutation_token(&user)?;
+    let delegated = delegated_key_grants(&state, &user).await?;
+    let mut transaction = state.db.begin().await?;
+    SchemaTypeRepository::lock_selection(&mut transaction).await?;
+    let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
     // Verify key exists
-    let key = KeyRepository::find_by_ref(&state.db, &key_ref)
+    let key = KeyRepository::find_by_ref_for_update(&mut transaction, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
 
-    if matches!(
+    if let Some(authority) = &recorded {
+        let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+            &mut transaction,
+            attune_common::repositories::runtime_target::RuntimeTarget::Key(key.id),
+            authority.authority().owner.sponsor_identity_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Key is not available".into()))?;
+        if !authority.allows_new_effect(&target, Action::Delete) {
+            return Err(ApiError::Forbidden(
+                "Insufficient recorded authority: keys:delete".into(),
+            ));
+        }
+    } else if matches!(
         user.0.claims.token_type,
         TokenType::Access | TokenType::Execution
     ) {
-        let (identity_id, grants) = key_grants(&state, &user).await?;
-        if !key_action_allowed(&grants, Action::Delete, identity_id, &key) {
+        let (identity_id, grants) = delegated.ok_or_else(missing_key_authority)?;
+        let target = attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+            &mut transaction,
+            attune_common::repositories::runtime_target::RuntimeTarget::Key(key.id),
+            identity_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Key is not available".into()))?;
+        if !key_action_allowed_in_pack(&grants, Action::Delete, identity_id, &key, target.pack_id())
+        {
             return Err(ApiError::Forbidden(
                 "Insufficient permissions: keys:delete".to_string(),
             ));
@@ -880,11 +1331,15 @@ pub async fn delete_key(
     }
 
     // Delete the key
-    let deleted = KeyRepository::delete(&state.db, key.id).await?;
+    let deleted = KeyRepository::delete(&mut *transaction, key.id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound(format!("Key '{}' not found", key_ref)));
     }
+    if let Some(authority) = &recorded {
+        authority.ensure_fresh_on(&mut transaction).await?;
+    }
+    transaction.commit().await?;
 
     let response = SuccessResponse::new("Key deleted successfully");
 
@@ -912,12 +1367,34 @@ pub async fn delete_key(
 
 /// Register key/secret routes
 pub fn routes() -> Router<Arc<AppState>> {
+    use axum::handler::Handler;
     Router::new()
-        .route("/keys/{ref}/sign-jwt", post(sign_key_jwt))
-        .route("/keys", get(list_keys).post(create_key))
+        .route(
+            "/keys/{ref}/sign-jwt",
+            post(sign_key_jwt.layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::KeySigning,
+            ))),
+        )
+        .route(
+            "/keys",
+            get(list_keys.layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::KeyList,
+            )))
+            .post(create_key.layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::KeyCreate,
+            ))),
+        )
         .route(
             "/keys/{ref}",
-            get(get_key).put(update_key).delete(delete_key),
+            get(get_key.layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::KeyRead,
+            )))
+            .put(update_key.layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::KeyUpdate,
+            )))
+            .delete(delete_key.layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::KeyDelete,
+            ))),
         )
 }
 
@@ -939,7 +1416,18 @@ fn key_authorization_context(identity_id: i64, key: &Key) -> AuthorizationContex
 }
 
 fn key_action_allowed(grants: &[Grant], action: Action, identity_id: i64, key: &Key) -> bool {
-    let ctx = key_authorization_context(identity_id, key);
+    key_action_allowed_in_pack(grants, action, identity_id, key, None)
+}
+
+fn key_action_allowed_in_pack(
+    grants: &[Grant],
+    action: Action,
+    identity_id: i64,
+    key: &Key,
+    managing_pack_id: Option<i64>,
+) -> bool {
+    let mut ctx = key_authorization_context(identity_id, key);
+    ctx.managing_pack_id = managing_pack_id;
     if key.owner_type == OwnerType::Identity && key.owner_identity != Some(identity_id) {
         return constrained_key_grant_allows(grants, action, &ctx);
     }
@@ -1032,7 +1520,7 @@ fn requested_key_owner_ref(request: &CreateKeyRequest) -> ApiResult<Option<Strin
 }
 
 async fn resolve_key_owner(
-    state: &Arc<AppState>,
+    connection: &mut sqlx::PgConnection,
     request: &CreateKeyRequest,
 ) -> ApiResult<ResolvedKeyOwner> {
     let no_component_refs = request.owner_pack_ref.is_none()
@@ -1049,7 +1537,7 @@ async fn resolve_key_owner(
                     "owner_identity_login is required for identity keys".to_string(),
                 )
             })?;
-            let identity = IdentityRepository::find_by_login(&state.db, identity_login)
+            let identity = IdentityRepository::find_by_login(&mut *connection, identity_login)
                 .await?
                 .ok_or_else(|| {
                     ApiError::BadRequest(format!(
@@ -1071,7 +1559,7 @@ async fn resolve_key_owner(
                     "pack keys cannot include action or sensor owners".to_string(),
                 ));
             }
-            let owner = PackRepository::find_by_ref(&state.db, owner_ref)
+            let owner = PackRepository::find_by_ref(&mut *connection, owner_ref)
                 .await?
                 .ok_or_else(|| {
                     ApiError::BadRequest(format!("Pack with ref '{}' not found", owner_ref))
@@ -1091,7 +1579,7 @@ async fn resolve_key_owner(
                     "action keys cannot include pack or sensor owners".to_string(),
                 ));
             }
-            let owner = ActionRepository::find_by_ref(&state.db, owner_ref)
+            let owner = ActionRepository::find_by_ref(&mut *connection, owner_ref)
                 .await?
                 .ok_or_else(|| {
                     ApiError::BadRequest(format!("Action with ref '{}' not found", owner_ref))
@@ -1111,7 +1599,7 @@ async fn resolve_key_owner(
                     "sensor keys cannot include pack or action owners".to_string(),
                 ));
             }
-            let owner = SensorRepository::find_by_ref(&state.db, owner_ref)
+            let owner = SensorRepository::find_by_ref(&mut *connection, owner_ref)
                 .await?
                 .ok_or_else(|| {
                     ApiError::BadRequest(format!("Sensor with ref '{}' not found", owner_ref))
@@ -1178,7 +1666,7 @@ fn build_key_audit_event(
         .resource("key")
         .resource_id(key.id)
         .resource_ref(key.r#ref.clone())
-        .with_details(details);
+        .with_details(user.0.with_recorded_audit_context(details));
 
     if let Ok(identity_id) = user.0.identity_id() {
         builder = builder.actor_identity(identity_id);
@@ -1248,6 +1736,8 @@ mod tests {
             name: "API token".to_string(),
             value: serde_json::json!("secret"),
             encrypted: true,
+            value_schema: None,
+            schema_digest: None,
         }
     }
 
@@ -1422,6 +1912,59 @@ mod tests {
             actual, expected,
             "case `{case}` mismatch: compiled filters gave {actual}, key_action_allowed gave {expected}"
         );
+    }
+
+    #[test]
+    fn local_key_iam_needs_structural_context_and_keeps_narrower_selectors() {
+        let key = key_fixture(
+            8,
+            "pack.local.secret",
+            OwnerType::Pack,
+            Some("local"),
+            None,
+            Some("local"),
+            false,
+        );
+        let grants = vec![read_grant(Some(GrantConstraints {
+            managing_pack_id: Some(17),
+            ids: Some(vec![8]),
+            refs: Some(vec![key.r#ref.clone()]),
+            ..Default::default()
+        }))];
+        assert!(key_action_allowed_in_pack(
+            &grants,
+            Action::Read,
+            42,
+            &key,
+            Some(17)
+        ));
+        for owner in [None, Some(18)] {
+            assert!(!key_action_allowed_in_pack(
+                &grants,
+                Action::Read,
+                42,
+                &key,
+                owner
+            ));
+        }
+        let mut other = key.clone();
+        other.id = 9;
+        assert!(!key_action_allowed_in_pack(
+            &grants,
+            Action::Read,
+            42,
+            &other,
+            Some(17)
+        ));
+        other = key.clone();
+        other.owner_type = OwnerType::System;
+        assert!(!key_action_allowed_in_pack(
+            &grants,
+            Action::Read,
+            42,
+            &other,
+            Some(17)
+        ));
     }
 
     #[test]

@@ -9,9 +9,58 @@ use crate::{models::Id, mq::MqError};
 /// Result type alias using Attune's Error type
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Render validation constraints, never the submitted values or Rust error structs.
+pub fn validation_message(errors: &validator::ValidationErrors) -> String {
+    let mut messages = Vec::new();
+    for (field, failures) in errors.field_errors() {
+        for failure in failures {
+            let reason = failure
+                .message
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| match failure.code.as_ref() {
+                    "length" => "Length does not satisfy the field's declared bounds".into(),
+                    "range" => "Value is outside the field's allowed range".into(),
+                    "required" => "Required field is missing".into(),
+                    _ => "Field does not satisfy its declared validation rules".into(),
+                });
+            let bounds = ["min", "max", "equal"]
+                .iter()
+                .filter_map(|name| {
+                    failure
+                        .params
+                        .get(*name)
+                        .filter(|value| value.is_number())
+                        .map(|value| format!("{name}={value}"))
+                })
+                .collect::<Vec<_>>();
+            messages.push(format!(
+                "{field}: {reason}{}",
+                if bounds.is_empty() {
+                    String::new()
+                } else {
+                    format!(". Allowed bounds: {}", bounds.join(", "))
+                }
+            ));
+        }
+    }
+    messages.sort();
+    if messages.is_empty() {
+        "Nested fields do not satisfy the metadata validation rules".into()
+    } else {
+        messages.join("\n")
+    }
+}
+
 /// Main error type for Attune services
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("{details}")]
+    Deployment {
+        details: Box<crate::pack_registry::diagnostics::DeploymentDetails>,
+        #[source]
+        source: Box<Error>,
+    },
     /// Database errors
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
@@ -141,6 +190,12 @@ pub enum Error {
 }
 
 impl Error {
+    pub fn root_cause(&self) -> &Self {
+        match self {
+            Self::Deployment { source, .. } => source.root_cause(),
+            other => other,
+        }
+    }
     /// Create a NotFound error
     pub fn not_found(
         entity: impl Into<String>,
@@ -252,23 +307,23 @@ impl Error {
     }
 
     pub fn is_retryable_transport(&self) -> bool {
-        matches!(self, Self::RetryableTransport(_))
+        matches!(self.root_cause(), Self::RetryableTransport(_))
     }
 
     /// Check if this is a database error
     pub fn is_database(&self) -> bool {
-        matches!(self, Self::Database(_))
+        matches!(self.root_cause(), Self::Database(_))
     }
 
     /// Check if this is a not found error
     pub fn is_not_found(&self) -> bool {
-        matches!(self, Self::NotFound { .. })
+        matches!(self.root_cause(), Self::NotFound { .. })
     }
 
     /// Check if this is an authentication error
     pub fn is_auth_error(&self) -> bool {
         matches!(
-            self,
+            self.root_cause(),
             Self::AuthenticationFailed(_) | Self::PermissionDenied(_)
         )
     }

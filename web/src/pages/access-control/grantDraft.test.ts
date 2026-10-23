@@ -8,7 +8,80 @@ import {
   OWNER_TYPE_RESOURCES,
   RESOURCE_ACTIONS,
 } from "@/pages/access-control/grantDraft";
-import type { ParsedGrant } from "@/components/access-control/grants";
+import {
+  permissionSetAuthoring,
+  type ParsedGrant,
+} from "@/components/access-control/grants";
+
+describe("canonical authority scope authoring", () => {
+  it.each([
+    { resource: "events", actions: ["create"] },
+    { resource: "keys", actions: ["use"] },
+    { resource: "queue_items", actions: ["create", "decrypt", "read"] },
+    {
+      resource: "artifacts",
+      actions: ["decrypt", "read"],
+      constraints: { owner_refs: ["pack.action"] },
+    },
+  ])("preserves runtime consumer permission specs and selectors", (grant) => {
+    expect(draftToGrant(grantToDraft(grant, 0))).toEqual(grant);
+  });
+  it.each(["pack", "external"] satisfies Array<"pack" | "external">)(
+    "preserves explicit %s grant scope",
+    (scope) => {
+      const grant: ParsedGrant = { resource: "keys", actions: ["read"], scope };
+      expect(draftToGrant(grantToDraft(grant, 0))).toEqual(grant);
+    },
+  );
+
+  it("keeps inherited grant scope omitted", () => {
+    const grant: ParsedGrant = { resource: "keys", actions: ["read"] };
+    expect(draftToGrant(grantToDraft(grant, 0))).toEqual(grant);
+  });
+
+  it("edits authored scope instead of normalized structural IAM bindings", () => {
+    const authored = {
+      scope: "pack",
+      grants: [{ resource: "keys", actions: ["read"], scope: "external" }],
+    };
+    expect(
+      permissionSetAuthoring({
+        authored_definition: authored,
+        grants: [
+          {
+            resource: "keys",
+            actions: ["read"],
+            constraints: { managing_pack_id: 42 },
+          },
+        ],
+      }),
+    ).toEqual(authored);
+  });
+
+  it.each([
+    null,
+    {},
+    { grants: [] },
+    { authored_definition: { scope: "unknown", grants: [] } },
+    {
+      authored_definition: {
+        scope: "pack",
+        grants: [{ resource: "keys", actions: [1] }],
+      },
+    },
+    {
+      authored_definition: {
+        scope: "external",
+        grants: [{ resource: "keys", actions: ["read"], scope: "unknown" }],
+      },
+    },
+  ])(
+    "does not reconstruct or silently drop malformed authored grants",
+    (input) => {
+      expect(permissionSetAuthoring(input)).toBeUndefined();
+    },
+  );
+});
 
 describe("caches resource action set", () => {
   it("exposes exactly read/create/update/delete for caches", () => {
@@ -73,7 +146,7 @@ describe("grantToDraft / draftToGrant round trip for caches", () => {
 
   it("does not leak owner_refs onto resources outside OWNER_REF_RESOURCES", () => {
     const draft = newGrantDraft();
-    draft.resource = "keys";
+    draft.resource = "actions";
     draft.ownerRefs = "salesforce";
     draft.actions = ["read"];
 

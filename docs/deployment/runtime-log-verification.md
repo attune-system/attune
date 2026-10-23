@@ -114,12 +114,18 @@ limiter. The suite checks these behaviors against RustFS:
 
 - Cross-replica upload, live tailing, and `Last-Event-ID` reconnects.
 - Artifact preview `content`, `append`, and `done` events across API replicas without a local artifact file, using a real identity with scoped artifact-read permission.
+- Recorded key-decrypt revocation between object-backed artifact SSE frames. The
+  reader retains execution/artifact permissions but receives no data frame after
+  its source-key decrypt grant is removed.
 - Concurrent duplicate uploads through separate S3 clients.
 - A delayed successful S3 PUT whose caller receives an injected failure, then
   duplicate retries that recover the object and commit one segment row.
 - S3 version IDs and exact pinned reads.
 - The 15-second reconciliation path after one replica misses log and terminal
   notifications.
+- Slow publication longer than terminal grace, with completion only after sealing
+  is acknowledged. A separate early-completion case expects `log_stream_incomplete`
+  and EOF rather than silently treating the stream as successfully completed.
 - Append-before-seal and seal-before-append orderings through production HTTP
   routes.
 - Initial PostgreSQL listener failure followed by a readiness signal after the
@@ -132,6 +138,9 @@ child appends with `VolumeTransport`, acquires the production file's `flock`, an
 is killed without cleanup. The parent proves lock contention, API visibility,
 seal behavior, truncation, cleanup retry after process loss, and retention
 selection and deletion.
+
+Fixtures that expose runtime logs create a released action snapshot and attach its
+admission schema binding. Tests must not rely on unbound executions being readable.
 
 This shared-volume test proves local cross-process Linux `flock` behavior on the
 test filesystem. It does not prove NFS lock recovery, mount propagation,
@@ -204,6 +213,13 @@ Start PostgreSQL with `pg_stat_statements` in `shared_preload_libraries`, then
 create that extension in the test database. This extension is required for the
 load report only; Attune does not require TimescaleDB.
 
+Physical fixtures clone a migration-hashed template built from `template0`, not
+the database named in `TEST_DB_URL`. In an exclusively owned disposable cluster,
+install the extension in `template0` before creating any fixture templates, then
+restore its connection restriction. Otherwise the load test's clone has no
+extension even if `TEST_DB_URL` does. Never modify a shared or live template
+database for this test.
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;
 ```
@@ -219,6 +235,10 @@ make test-runtime-log-load \
 The test prints one JSON object. Save it with the commit, build profile, host,
 PostgreSQL settings, S3 implementation and version, and stream count. Compare runs only when
 those inputs match.
+
+Set `ATTUNE_LOG_LOAD_REPORT` to an unused file path to save that JSON after awaited
+teardown. The file is never overwritten. The test waits for active readers to
+reach zero and fails on its bounded leak-check deadline.
 
 | Field | Meaning |
 | --- | --- |

@@ -323,7 +323,7 @@ fn jar_deflate_streams_are_checked_for_size_crc_and_complete_records() {
         .unwrap();
     zip.start_file("Main.class", options).unwrap();
     zip.write_all(&vec![b'x'; 3 * 64 * 1024 + 17]).unwrap();
-    zip.set_comment("ordinary ZIP comment");
+    zip.set_comment("ordinary ZIP comment").unwrap();
     let valid = zip.finish().unwrap().into_inner();
     let file = tempfile::NamedTempFile::new().unwrap();
     fs::write(file.path(), &valid).unwrap();
@@ -332,7 +332,8 @@ fn jar_deflate_streams_are_checked_for_size_crc_and_complete_records() {
         .unwrap()
         .by_index(1)
         .unwrap()
-        .data_start() as usize;
+        .data_start()
+        .expect("valid ZIP entry has a known data offset") as usize;
     let mut corrupt = valid.clone();
     corrupt[data] ^= 0xff;
     fs::write(file.path(), corrupt).unwrap();
@@ -892,6 +893,25 @@ fn rejects_invalid_launches_and_flat_schemas() {
         let (dir, options) = fixture();
         put(&options.source, "actions/native.yaml", content);
         assert!(build(&options, &dir.path().join("bad.gz"), Limits::default()).is_err(), "{content}");
+    }
+}
+
+#[test]
+fn archive_checks_authored_and_metadata_schema_names_with_the_same_compiler() {
+    for field in [
+        "parameters",
+        "param_schema",
+        "output",
+        "output_schema",
+        "out_schema",
+    ] {
+        let (dir, options) = fixture();
+        put(&options.source, "actions/native.yaml", format!("ref: demo.native\nrunner_type: native\nlaunch: {{type: native, artifact: tool}}\n{field}:\n  value:\n    type: integer\n    default: invalid\n"));
+        let error = build(&options, &dir.path().join("bad.gz"), Limits::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("schema.invalid_default"),
+            "{field}: {error}"
+        );
     }
 }
 

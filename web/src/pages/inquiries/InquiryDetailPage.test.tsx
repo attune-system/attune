@@ -99,7 +99,7 @@ describe("InquiryDetailPage", () => {
 
     expect(respondToInquiry).toHaveBeenCalledWith({
       id: 91,
-      requestBody: { response: { approved: true } },
+      requestBody: { option_ref: "approve" },
     });
     await waitFor(() => expect(getInquiry).toHaveBeenCalledTimes(2));
   });
@@ -232,6 +232,20 @@ describe("InquiryDetailPage", () => {
   it("validates and submits a custom flat response schema", async () => {
     getInquiry.mockResolvedValue({
       data: inquiry({
+        schema_binding: {
+          contract: {
+            annotated_schema: {
+              type: "object",
+              required: ["reason"],
+              properties: {
+                reason: {
+                  type: "string",
+                  description: "Reason for the decision",
+                },
+              },
+            },
+          },
+        },
         response_schema: {
           reason: {
             type: "string",
@@ -246,9 +260,15 @@ describe("InquiryDetailPage", () => {
 
     render(<InquiryDetailPage />, { wrapper: Wrapper });
     await screen.findByRole("heading", { name: "Respond" });
+    expect(screen.getByRole("textbox")).not.toBeRequired();
+    expect(
+      screen.queryByRole("button", { name: "Add reason" }),
+    ).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Submit response" }));
 
-    expect(screen.getByText("This field is required")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "reason: This field is required",
+    );
     expect(respondToInquiry).not.toHaveBeenCalled();
 
     await user.type(screen.getByRole("textbox"), "Approved after review");

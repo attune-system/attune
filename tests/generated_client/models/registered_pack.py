@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.component_counts import ComponentCounts
+    from ..models.pack_diagnostic import PackDiagnostic
     from ..models.test_result import TestResult
     from ..models.validation_results import ValidationResults
 
@@ -29,6 +30,7 @@ class RegisteredPack:
         pack_version (str): Pack version
         storage_path (str): Permanent storage path
         validation_results (ValidationResults): Validation results
+        diagnostics (list[PackDiagnostic] | Unset):
         install_id (int | None | Unset): Pack install tracking ID when tests were dispatched or failed to dispatch
         install_status (None | str | Unset): Current pack install status
         test_result (None | TestResult | Unset):
@@ -40,6 +42,7 @@ class RegisteredPack:
     pack_version: str
     storage_path: str
     validation_results: ValidationResults
+    diagnostics: list[PackDiagnostic] | Unset = UNSET
     install_id: int | None | Unset = UNSET
     install_status: None | str | Unset = UNSET
     test_result: None | TestResult | Unset = UNSET
@@ -59,6 +62,13 @@ class RegisteredPack:
         storage_path = self.storage_path
 
         validation_results = self.validation_results.to_dict()
+
+        diagnostics: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.diagnostics, Unset):
+            diagnostics = []
+            for diagnostics_item_data in self.diagnostics:
+                diagnostics_item = diagnostics_item_data.to_dict()
+                diagnostics.append(diagnostics_item)
 
         install_id: int | None | Unset
         if isinstance(self.install_id, Unset):
@@ -92,6 +102,8 @@ class RegisteredPack:
                 "validation_results": validation_results,
             }
         )
+        if diagnostics is not UNSET:
+            field_dict["diagnostics"] = diagnostics
         if install_id is not UNSET:
             field_dict["install_id"] = install_id
         if install_status is not UNSET:
@@ -104,6 +116,7 @@ class RegisteredPack:
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         from ..models.component_counts import ComponentCounts
+        from ..models.pack_diagnostic import PackDiagnostic
         from ..models.test_result import TestResult
         from ..models.validation_results import ValidationResults
 
@@ -121,6 +134,15 @@ class RegisteredPack:
         storage_path = d.pop("storage_path")
 
         validation_results = ValidationResults.from_dict(d.pop("validation_results"))
+
+        _diagnostics = d.pop("diagnostics", UNSET)
+        diagnostics: list[PackDiagnostic] | Unset = UNSET
+        if _diagnostics is not UNSET:
+            diagnostics = []
+            for diagnostics_item_data in _diagnostics:
+                diagnostics_item = PackDiagnostic.from_dict(diagnostics_item_data)
+
+                diagnostics.append(diagnostics_item)
 
         def _parse_install_id(data: object) -> int | None | Unset:
             if data is None:
@@ -164,6 +186,7 @@ class RegisteredPack:
             pack_version=pack_version,
             storage_path=storage_path,
             validation_results=validation_results,
+            diagnostics=diagnostics,
             install_id=install_id,
             install_status=install_status,
             test_result=test_result,

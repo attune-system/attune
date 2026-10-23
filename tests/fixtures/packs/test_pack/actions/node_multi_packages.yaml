@@ -1,4 +1,5 @@
-name: node_multi_packages
+ref: test_pack.node_multi_packages
+label: Node multiple packages
 description: "Node.js action that imports multiple packages"
 enabled: true
 runner_type: node

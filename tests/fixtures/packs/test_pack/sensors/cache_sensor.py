@@ -3,6 +3,7 @@
 
 import json
 import os
+import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -35,7 +36,8 @@ def request_json(path: str, *, method: str, payload: dict) -> tuple[int, dict]:
 
 
 def probe() -> None:
-    instances = json.loads(os.environ.get("ATTUNE_SENSOR_TRIGGERS", "[]"))
+    bootstrap = json.load(sys.stdin)
+    instances = bootstrap["triggers"]
     config = next(
         (
             item.get("config", {})

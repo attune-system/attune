@@ -466,6 +466,8 @@ pub struct WorkQueueItemResponse {
     pub status: WorkQueueItemStatus,
     #[schema(value_type = Object)]
     pub payload: JsonValue,
+    /// The item's original admission contract, never the queue's current schema.
+    pub schema_binding: Option<JsonValue>,
     #[schema(value_type = Object)]
     pub metadata: JsonValue,
     #[schema(example = "core.timer.1234", nullable = true)]
@@ -516,6 +518,14 @@ pub struct WorkQueueItemQueryParams {
     #[serde(default = "default_per_page")]
     #[param(example = 50, minimum = 1, maximum = 100)]
     pub per_page: u32,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct WorkQueueItemDetailQuery {
+    /// Restore encrypted payload fields. Requires queue read and decrypt rights.
+    #[serde(default)]
+    pub decrypt: bool,
 }
 
 impl WorkQueueItemQueryParams {
@@ -604,6 +614,7 @@ impl From<WorkQueueItem> for WorkQueueItemResponse {
             priority: item.priority,
             status: item.status,
             payload: item.payload,
+            schema_binding: item.schema_binding,
             metadata: item.metadata,
             trace_tag: item.trace_tag,
             enqueue_source: item.enqueue_source,
@@ -781,6 +792,17 @@ fn validate_queue_config_field(value: &JsonValue) -> Result<(), ValidationError>
 }
 
 fn validate_item_schema_field(value: &JsonValue) -> Result<(), ValidationError> {
+    let references = attune_common::value_schema::inspect_definition(
+        attune_common::value_schema::SchemaContext::FlatDocument,
+        value,
+        attune_common::value_schema::Limits::default(),
+    )
+    .map_err(|error| validation_error("item_schema", error.to_string()))?;
+    if !references.is_empty() {
+        // The owning queue repository compiles against its fixed registry in
+        // the write transaction. An extractor cannot select those bodies.
+        return Ok(());
+    }
     attune_common::queue_definition::validate_work_queue_item_schema(value)
         .map(|_| ())
         .map_err(|e| validation_error("item_schema", e.to_string()))
@@ -805,6 +827,17 @@ fn validate_json_object_field(value: &JsonValue) -> Result<(), ValidationError> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_item_schemas_defer_body_selection_to_the_transactional_repository() {
+        assert!(super::validate_item_schema_field(&serde_json::json!({
+            "value": {"type": "demo.value", "required": true}
+        }))
+        .is_ok());
+        assert!(super::validate_item_schema_field(&serde_json::json!({
+            "value": {"type": "string", "default": 42}
+        }))
+        .is_err());
+    }
     use super::{parse_status_filters, WorkQueueItemStatus};
 
     #[test]

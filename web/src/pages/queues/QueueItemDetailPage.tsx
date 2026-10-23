@@ -7,6 +7,8 @@ import {
   getStatusBadge,
 } from "@/components/queues/queueUtils";
 import { useQueueItem } from "@/hooks/useQueues";
+import ContractDataCard from "@/components/common/ContractDataCard";
+import { isJsonObject } from "@/components/common/curatedDataUtils";
 
 export default function QueueItemDetailPage() {
   const { ref = "", itemId = "" } = useParams<{
@@ -16,6 +18,8 @@ export default function QueueItemDetailPage() {
   const parsedItemId = /^\d+$/.test(itemId) ? Number(itemId) : null;
   const { data, isLoading, error } = useQueueItem(ref, parsedItemId);
   const item = data?.data;
+  const binding: unknown = item?.schema_binding;
+  const payloadContract = isJsonObject(binding) ? binding.contract : undefined;
 
   return (
     <div className="mx-auto max-w-5xl p-6">
@@ -62,7 +66,13 @@ export default function QueueItemDetailPage() {
             title="Result"
             value={item.ack_summary ?? item.last_error ?? null}
           />
-          <JsonCard title="Payload" value={item.payload} />
+          <ContractDataCard
+            title="Payload"
+            contract={payloadContract}
+            values={item.payload}
+            emptyMessage="No payload data"
+            maskSecrets
+          />
           <JsonCard title="Metadata" value={item.metadata} />
         </div>
       )}

@@ -204,6 +204,99 @@ impl PostgresListener {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn listener_recreation_keeps_receivers_open_but_cannot_replay_artifact_changes(
+    ) -> Result<()> {
+        use attune_common::{
+            config::Config,
+            models::{
+                ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+                RetentionPolicyType,
+            },
+            repositories::{
+                artifact::{ArtifactRepository, CreateArtifactInput},
+                artifact_read_diagnostics::ArtifactReadDiagnostics,
+                Create, FindById,
+            },
+            test_database::TestDatabase,
+        };
+        let config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))?;
+        let db = TestDatabase::create(&config.database)
+            .await?
+            .with_cleanup_on_drop();
+        let (tx, mut receiver) = broadcast::channel(4);
+        let listener = PostgresListener::new(db.database_url().to_string(), tx).await?;
+        let mut pg = listener.create_listener().await?;
+        let create = |reference: &str| CreateArtifactInput {
+            r#ref: reference.into(),
+            scope: OwnerType::Action,
+            owner: "listener.fixture".into(),
+            r#type: ArtifactType::Progress,
+            visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Versions,
+            retention_limit: 4,
+            name: None,
+            description: None,
+            content_type: None,
+            data: Some(serde_json::json!({})),
+        };
+        let first = ArtifactRepository::create(db.pool(), create("listener.first")).await?;
+        let notification = tokio::time::timeout(Duration::from_secs(10), pg.recv()).await??;
+        listener.process_notification(notification.channel(), notification.payload())?;
+        assert_eq!(receiver.recv().await?.entity_id, first.id);
+
+        // Await UNLISTEN before the gap, rather than racing a connection Drop.
+        // Recreating the listener never closes the existing broadcast receiver.
+        pg.unlisten_all().await?;
+        drop(pg);
+        let missed = ArtifactRepository::create(db.pool(), create("listener.missed")).await?;
+        assert!(!receiver.is_closed());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let mut pg = listener.create_listener().await?;
+        let latest = ArtifactRepository::create(db.pool(), create("listener.latest")).await?;
+        let notification = tokio::time::timeout(Duration::from_secs(10), pg.recv()).await??;
+        listener.process_notification(notification.channel(), notification.payload())?;
+        assert_eq!(receiver.recv().await?.entity_id, latest.id);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(
+            ArtifactRepository::find_by_id(db.pool(), missed.id)
+                .await?
+                .is_some(),
+            "reconciliation can still find the missed durable change"
+        );
+        pg.unlisten_all().await?;
+        drop(pg);
+        drop(listener);
+        drop(receiver);
+        // PgListener returns its connection asynchronously. Observe completed
+        // closure before asking the fixture to remove its database.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut retry = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                retry.tick().await;
+                let (_, sessions) = ArtifactReadDiagnostics::wait_sample(db.pool()).await?;
+                if sessions <= i64::from(db.pool().size()) {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        db.cleanup().await?;
+        Ok(())
+    }
+
     #[test]
     fn test_notification_channels_defined() {
         assert!(!NOTIFICATION_CHANNELS.is_empty());

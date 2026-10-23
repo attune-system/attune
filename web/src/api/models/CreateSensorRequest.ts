@@ -17,7 +17,7 @@ export type CreateSensorRequest = {
   /**
    * Configuration values for this sensor instance (conforms to param_schema)
    */
-  config?: any | null;
+  config?: Record<string, any> | null;
   /**
    * Sensor description
    */
@@ -46,7 +46,7 @@ export type CreateSensorRequest = {
   /**
    * Parameter schema (flat format) for sensor configuration
    */
-  param_schema?: any | null;
+  param_schema?: Record<string, any> | null;
   /**
    * Unique reference identifier (e.g., "mypack.cpu_monitor")
    */

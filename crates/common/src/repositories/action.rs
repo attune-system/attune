@@ -37,6 +37,7 @@ pub const POLICY_COLUMNS: &str = "id, ref, pack, pack_ref, action, action_ref, e
 /// All fields are optional and combinable (AND). Pagination is always applied.
 #[derive(Debug, Clone, Default)]
 pub struct ActionSearchFilters {
+    pub read_visibility: Option<ActionReadFilter>,
     /// Filter by single pack ID
     pub pack: Option<Id>,
     /// Filter by multiple pack IDs (action.pack IN (...)). Combined with `pack` via AND.
@@ -48,6 +49,12 @@ pub struct ActionSearchFilters {
     pub offset: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActionReadFilter {
+    pub iam: super::iam_ownership::ComponentReadFilter,
+    pub referencing_pack_ref: Option<String>,
+}
+
 /// Result of [`ActionRepository::list_search`].
 #[derive(Debug)]
 pub struct ActionSearchResult {
@@ -57,6 +64,19 @@ pub struct ActionSearchResult {
 
 /// Repository for Action operations
 pub struct ActionRepository;
+
+impl ActionRepository {
+    pub async fn find_disclosure_visibility<'e, E>(
+        executor: E,
+        refs: &[String],
+    ) -> Result<Vec<(String, crate::models::enums::ActionReferenceVisibility)>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as("SELECT ref, reference_visibility FROM action WHERE ref = ANY($1) AND retired_at IS NULL")
+            .bind(refs).fetch_all(executor).await.map_err(Into::into)
+    }
+}
 
 fn validate_version_constraint(field_name: &str, constraint: &str) -> Result<()> {
     parse_constraint(constraint).map_err(|e| {
@@ -253,11 +273,17 @@ impl List for ActionRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Create for ActionRepository {
-    type CreateInput = CreateActionInput;
+super::schema_consumer::schema_consumer_repository!(
+    ActionRepository,
+    CreateActionInput,
+    UpdateActionInput,
+    "action",
+    value_patch,
+    [param_schema, out_schema]
+);
 
-    async fn create<'e, E>(executor: E, input: Self::CreateInput) -> Result<Self::Entity>
+impl ActionRepository {
+    async fn create_row<'e, E>(executor: E, input: CreateActionInput) -> Result<Action>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -350,11 +376,8 @@ impl Create for ActionRepository {
     }
 }
 
-#[async_trait::async_trait]
-impl Update for ActionRepository {
-    type UpdateInput = UpdateActionInput;
-
-    async fn update<'e, E>(executor: E, id: i64, input: Self::UpdateInput) -> Result<Self::Entity>
+impl ActionRepository {
+    async fn update_row<'e, E>(executor: E, id: i64, input: UpdateActionInput) -> Result<Action>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -670,12 +693,7 @@ impl Delete for ActionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query("DELETE FROM action WHERE id = $1")
-            .bind(id)
-            .execute(executor)
-            .await?;
-
-        Ok(result.rows_affected() > 0)
+        super::schema_type::SchemaTypeRepository::delete_consumer_row(executor, "action", id).await
     }
 }
 
@@ -818,6 +836,26 @@ impl ActionRepository {
         let _ = has_where;
 
         // Count
+        if let Some(visibility) = &filters.read_visibility {
+            for query in [&mut qb, &mut count_qb] {
+                query.push(" AND (action.reference_visibility = 'public' OR ");
+                if let Some(reference) = &visibility.referencing_pack_ref {
+                    query
+                        .push("(action.pack_ref = ")
+                        .push_bind(reference.clone())
+                        .push(" OR (action.reference_visibility = 'restricted' AND ")
+                        .push_bind(reference.clone())
+                        .push(" = ANY(action.reference_allowed_pack_refs))) OR ");
+                }
+                super::iam_ownership::push_component_read(
+                    query,
+                    &visibility.iam,
+                    "action",
+                    crate::rbac::Resource::Actions,
+                );
+                query.push(")");
+            }
+        }
         let total: i64 = count_qb.build_query_scalar().fetch_one(db).await?;
         let total = total.max(0) as u64;
 
@@ -1099,6 +1137,7 @@ pub enum PolicyScopeFilter {
 /// matches every row (i.e. an unconstrained grant).
 #[derive(Debug, Clone, Default)]
 pub struct PolicyVisibilityScope {
+    pub managing_pack_id: Option<Id>,
     /// Allowed pack refs. A policy matches if its own `pack_ref` is in this
     /// list, or (when `pack_ref` is null) the pack portion of its
     /// `action_ref` is in this list -- mirroring how `AuthorizationContext`
@@ -1195,7 +1234,17 @@ fn push_policy_visibility_filter<'args>(
         query.push("(");
         let mut wrote = false;
 
+        if let Some(pack) = scope.managing_pack_id {
+            query
+                .push(super::iam_ownership::component_pack("policy"))
+                .push(" = ")
+                .push_bind(pack);
+            wrote = true;
+        }
         if let Some(pack_refs) = &scope.pack_refs {
+            if wrote {
+                query.push(" AND ");
+            }
             query.push("(pack_ref = ANY(");
             query.push_bind(pack_refs);
             query.push(") OR (pack_ref IS NULL AND split_part(action_ref, '.', 1) = ANY(");

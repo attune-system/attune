@@ -3,7 +3,14 @@ label: Editor
 description: Create and update operational resources without full administrative control.
 grants:
   - resource: packs
-    actions: [read, create, install, configure]
+    actions: [read]
+  - resource: packs
+    actions: [create, install]
+    constraints: {pack_state: uninstalled}
+  - resource: packs
+    # For pack targets, self includes the primary owner and declared owner-role members.
+    actions: [install, configure]
+    constraints: {owner: self}
   - resource: actions
     actions: [read, create, update, execute]
   - resource: policies
@@ -15,7 +22,9 @@ grants:
   - resource: rules
     actions: [read, create, update]
   - resource: triggers
-    actions: [read]
+    actions: [read, create, update]
+  - resource: events
+    actions: [read, create]
   - resource: executions
     actions: [read, cancel]
   - resource: keys

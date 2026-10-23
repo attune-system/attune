@@ -1,0 +1,7 @@
+ref: test_pack.sdk_key_reader
+label: SDK Key Reader Fixture
+grants:
+  - resource: keys
+    actions: [read]
+    constraints:
+      owner_types: [pack]

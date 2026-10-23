@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "run_id": "owned-run",
+  "project": "eaccept-owned-run-native",
+  "owned_root": "/tmp/opencode/owned-run-native",
+  "lanes": {
+    "paused_combined": {
+      "config": "/tmp/opencode/owned-run-native/paused-combined/config.json",
+      "service_gid": 61124,
+      "api": "http://127.0.0.1:REPLACE_WITH_OWNED_API_PORT",
+      "maintenance_credential_file": "/tmp/opencode/owned-run-native/private/maintenance-password.json",
+      "server_ca": "/tmp/opencode/owned-run-native/private/controller-ca.pem",
+      "verification_key": "/tmp/opencode/owned-run-native/private/controller-rsa-public.pem",
+      "manager_tls": {
+        "certificate": "/tmp/opencode/owned-run-native/private/api-manager-cert.pem",
+        "key": "/tmp/opencode/owned-run-native/private/api-manager-key.pem"
+      },
+      "writer_tls": {
+        "certificate": "/tmp/opencode/owned-run-native/private/actual-writer-cert.pem",
+        "key": "/tmp/opencode/owned-run-native/private/actual-writer-key.pem"
+      },
+      "unknown_tls": {
+        "certificate": "/tmp/opencode/owned-run-native/private/unregistered-same-ca-cert.pem",
+        "key": "/tmp/opencode/owned-run-native/private/unregistered-same-ca-key.pem"
+      },
+      "producer_adapter": {
+        "binary": "/opt/attune/native/native_settlement_adapter",
+        "sha256": "REPLACE_WITH_MATCHING_CENTRAL_ADAPTER_BINARY_SHA256",
+        "context_file": "/tmp/opencode/owned-run-native/private/producer-context.json"
+      }
+    }
+  }
+}

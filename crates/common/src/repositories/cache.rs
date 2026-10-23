@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
+use sqlx::{Acquire, Executor, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
 
 use crate::{
@@ -85,15 +85,104 @@ pub struct CacheNamespacePage {
 pub struct CacheNamespaceReadVisibility {
     pub identity_id: Id,
     pub grants: Vec<CacheNamespaceGrantFilter>,
+    pub owner_filter: Option<CacheNamespaceOwnerFilter>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CacheNamespaceOwnerFilter {
+    System,
+    Identity(Id),
+    Pack(String),
+    Action(String),
+    Sensor(String),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum CacheOwnershipScope {
+    #[default]
+    Any,
+    ManagedPack(Id),
+    Pack(Id),
+    Action(Id),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum CacheGrantContext {
+    #[default]
+    Delegation,
+    Recorded,
 }
 
 /// The cache-row fields constrained by one readable RBAC grant.
 #[derive(Debug, Clone, Default)]
 pub struct CacheNamespaceGrantFilter {
+    pub pinned_targets: Option<Vec<crate::runtime_authority::BoundRuntimeTarget>>,
+    pub pinned_owners: Option<Vec<(String, Id, Option<Id>)>>,
+    pub pinned_packs: Option<Vec<Id>>,
+    pub ownership: CacheOwnershipScope,
+    pub context: CacheGrantContext,
+    pub ids: Option<Vec<Id>>,
+    pub pack_refs: Option<Vec<String>>,
     pub owner: Option<OwnerConstraint>,
     pub owner_types: Option<Vec<OwnerType>>,
     pub owner_refs: Option<Vec<String>>,
     pub namespace_refs: Option<Vec<String>>,
+}
+
+impl CacheNamespaceGrantFilter {
+    pub fn from_recorded_grant(
+        grant: &crate::rbac::Grant,
+        ownership: CacheOwnershipScope,
+    ) -> Option<Self> {
+        use crate::rbac::{Action, ExecutionScopeConstraint, Resource};
+        if grant.resource != Resource::Caches || !grant.actions.contains(&Action::Read) {
+            return None;
+        }
+        let Some(scope) = &grant.constraints else {
+            return Some(Self {
+                ownership,
+                context: CacheGrantContext::Recorded,
+                ..Default::default()
+            });
+        };
+        let ownership = if let Some(pack) = scope.managing_pack_id {
+            match ownership {
+                CacheOwnershipScope::Any => CacheOwnershipScope::ManagedPack(pack),
+                CacheOwnershipScope::ManagedPack(existing) if existing == pack => ownership,
+                _ => return None,
+            }
+        } else {
+            ownership
+        };
+        if scope.pack_owner.is_some()
+            || scope.pack_state.is_some()
+            || scope.encrypted.is_some()
+            || scope.visibility.is_some()
+            || matches!(
+                scope.execution_scope,
+                Some(ExecutionScopeConstraint::SelfOnly | ExecutionScopeConstraint::Descendants)
+            )
+            || scope
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| !attributes.is_empty())
+        {
+            return None;
+        }
+        Some(Self {
+            pinned_targets: None,
+            pinned_owners: None,
+            pinned_packs: None,
+            ownership,
+            context: CacheGrantContext::Recorded,
+            ids: scope.ids.clone(),
+            pack_refs: scope.pack_refs.clone(),
+            owner: scope.owner,
+            owner_types: scope.owner_types.clone(),
+            owner_refs: scope.owner_refs.clone(),
+            namespace_refs: scope.refs.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1319,14 +1408,19 @@ impl CacheNamespaceRepository {
 
     /// Deletes only an already tombstoned namespace with no generations left.
     pub async fn delete_tombstoned_if_empty(pool: &PgPool, namespace_id: Id) -> Result<bool> {
+        let mut tx = pool.begin().await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
+            .await?;
         let result = sqlx::query(
             "DELETE FROM cache_namespace n \
              WHERE n.id = $1 AND n.tombstoned_at IS NOT NULL \
+             AND NOT file_evidence_pinned('cache_namespace',n.id) \
              AND NOT EXISTS (SELECT 1 FROM cache_generation g WHERE g.namespace = n.id)",
         )
         .bind(namespace_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1334,10 +1428,14 @@ impl CacheNamespaceRepository {
     /// already have no generations, including namespaces that were never populated.
     pub async fn delete_empty_tombstoned_batch(pool: &PgPool, limit: i64) -> Result<u64> {
         let limit = bounded_limit(limit, MAX_CLEANUP_SELECTION, "tombstoned namespace cleanup")?;
+        let mut tx = pool.begin().await?;
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
+            .await?;
         let result = sqlx::query(
             "WITH candidates AS ( \
                  SELECT n.id FROM cache_namespace n \
                   WHERE n.tombstoned_at IS NOT NULL \
+                    AND NOT file_evidence_pinned('cache_namespace',n.id) \
                     AND NOT EXISTS (SELECT 1 FROM cache_generation g WHERE g.namespace = n.id) \
                   ORDER BY n.tombstoned_at, n.id LIMIT $1 \
                   FOR UPDATE OF n SKIP LOCKED \
@@ -1345,8 +1443,9 @@ impl CacheNamespaceRepository {
              DELETE FROM cache_namespace n USING candidates c WHERE n.id = c.id",
         )
         .bind(limit)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 }
@@ -2183,6 +2282,7 @@ impl CacheGenerationRepository {
             "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation g \
              WHERE (state = 'failed' \
                 OR (state = 'retired' AND readable_until IS NOT NULL AND readable_until <= NOW())) \
+                AND NOT file_evidence_cache_generation_pinned(g.id) \
                AND NOT EXISTS (SELECT 1 FROM workflow_cache_iteration i \
                                JOIN workflow_execution w ON w.id = i.workflow_execution \
                                WHERE i.generation = g.id AND i.state = 'scanning' \
@@ -2221,6 +2321,13 @@ impl CacheGenerationRepository {
             ))
             .ok_or_else(|| {
                 Error::validation("cache cleanup budget exceeds monotonic clock range")
+            })?;
+        // Business work keeps the full original deadline. Only protocol drain
+        // and rollback may use the explicitly bounded acknowledgement grace.
+        let acknowledgement_deadline = deadline
+            .checked_add(std::time::Duration::from_millis(500))
+            .ok_or_else(|| {
+                Error::validation("cache cleanup acknowledgement exceeds monotonic clock range")
             })?;
         let remaining_ms = || {
             u64::try_from(
@@ -2270,23 +2377,32 @@ impl CacheGenerationRepository {
             sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)")
                 .bind(format!("{remaining}ms")).execute(&mut *tx).await?;
             let admission_started = std::time::Instant::now();
-            let admission = lock_cache_admission(&mut tx).await;
+            // Reuse graph/cache preflight, but leave parent protection to the
+            // short DDL phase below rather than acquiring it during admission.
+            let admission = CacheEntryRepository::acquire_reclamation_gates(&mut tx, deadline, false).await;
             tracing::info!(component="cache_storage", operation="cleanup_admission",
-                status=if admission.is_ok() { "admitted" } else { "failed" },
+                status=match &admission { Ok(true) => "admitted", Ok(false) => "deferred_deadline", Err(_) => "failed" },
                 duration_ms=u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 remaining_cycle_ms=remaining_ms(), "Cache cleanup admission completed");
-            if let Err(error) = admission {
-                let code = match &error {
-                    Error::Database(database) => database.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned()),
-                    _ => None,
-                };
+            let admitted = match admission {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    let code = match &error {
+                        Error::Database(database) => database.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned()),
+                        _ => None,
+                    };
+                    tx.rollback().await?;
+                    // Either timer expiring here exhausts the cycle, not the short
+                    // DDL lock budget. SQLSTATE 55P03 can win the two-timer race.
+                    return match code.as_deref() {
+                        Some("55P03" | "57014") => Ok(CacheGenerationCleanupOutcome::DeferredDeadline),
+                        _ => Err(error),
+                    };
+                }
+            };
+            if !admitted {
                 tx.rollback().await?;
-                // Either timer expiring here exhausts the cycle, not the short
-                // DDL lock budget. SQLSTATE 55P03 can win the two-timer race.
-                return match code.as_deref() {
-                    Some("55P03" | "57014") => Ok(CacheGenerationCleanupOutcome::DeferredDeadline),
-                    _ => Err(error),
-                };
+                return Ok(CacheGenerationCleanupOutcome::DeferredDeadline);
             }
             phase = "ddl";
             let remaining = remaining_ms();
@@ -2352,9 +2468,18 @@ impl CacheGenerationRepository {
                 Err(error)
             }
             Err(_) => {
-                // Dropping the SQL future alone is not server cancellation.
-                // Server-side phase timers bound pending SQL; also discard the
-                // socket so no waiter/rollback is handed to another pool user.
+                // timeout_at has dropped the business future and its managed
+                // transactions. Retain this exact connection until their queued
+                // responses/rollbacks and an explicit root rollback are drained.
+                // No admission, DDL, commit or other business SQL runs here.
+                let acknowledgement = acknowledge_cleanup_rollback(
+                    lease.0.as_mut().expect("owned cleanup connection"),
+                    acknowledgement_deadline,
+                )
+                .await;
+                // Even acknowledged recovery never returns an uncertain driver
+                // transaction/session state to the pool. Drop also remains the
+                // socket-discard fallback if the caller cancels this recovery.
                 drop(lease);
                 if phase == "commit" {
                     tracing::error!(
@@ -2367,6 +2492,15 @@ impl CacheGenerationRepository {
                     Err(Error::invalid_state(
                         "cache cleanup commit outcome is unconfirmed after cycle deadline",
                     ))
+                } else if let Err(error) = acknowledgement {
+                    tracing::error!(
+                        component = "cache_storage",
+                        operation = "cleanup",
+                        phase,
+                        status = "rollback_unacknowledged",
+                        "Cache cleanup rollback was not acknowledged within its completion bound"
+                    );
+                    Err(error)
                 } else {
                     tracing::info!(
                         component = "cache_storage",
@@ -2379,6 +2513,42 @@ impl CacheGenerationRepository {
                 }
             }
         }
+    }
+}
+
+/// Recover only after the business future and its managed transactions dropped.
+/// The pinned SQLx flush consumes pending responses but may first return the
+/// interrupted statement's timeout error. A successful explicit ROLLBACK execute
+/// then consumes its CommandComplete and ReadyForQuery on this same connection.
+/// Driver transaction depth, a socket close, or cancellation-channel EOF cannot
+/// substitute for this acknowledgement. The caller always discards the lease.
+async fn acknowledge_cleanup_rollback(
+    connection: &mut sqlx::PgConnection,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    match tokio::time::timeout_at(deadline, async {
+        loop {
+            match sqlx::Connection::flush(&mut *connection).await {
+                Ok(()) => break,
+                Err(error)
+                    if error
+                        .as_database_error()
+                        .and_then(|error| error.code())
+                        .is_some_and(|code| matches!(code.as_ref(), "55P03" | "57014")) => {}
+                Err(error) => return Err(Error::from(error)),
+            }
+        }
+        // Do not infer server idleness from SQLx's depth after queued Drop
+        // rollbacks, including a BEGIN whose acknowledgement was interrupted.
+        sqlx::query("ROLLBACK").execute(&mut *connection).await?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::invalid_state(
+            "cache cleanup rollback acknowledgement exceeded its completion deadline",
+        )),
     }
 }
 
@@ -2672,7 +2842,188 @@ impl CacheIngestRepository {
 
 pub struct CacheEntryRepository;
 
+/// Fresh owned transaction only; no caller locks can survive a failed attempt.
+#[derive(Debug)]
+pub enum CacheReclamationAdmission {
+    Unavailable,
+    Acquired(super::reclamation_cancellation::ReclamationTransaction),
+    DeadlineExceeded,
+}
+
 impl CacheEntryRepository {
+    /// Acquire graph, cache admission and parent protection without retaining
+    /// graph while waiting for cache admission. The caller supplies one absolute
+    /// deadline, including time already spent authorizing its request.
+    pub async fn begin_reclamation_transaction(
+        pool: &PgPool,
+        cancellation: &std::sync::Arc<super::reclamation_cancellation::CancellationOwner>,
+        deadline: tokio::time::Instant,
+    ) -> Result<CacheReclamationAdmission> {
+        use super::reclamation_cancellation::{BindingError, ReclamationTransaction};
+        let acquisition = async {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(CacheReclamationAdmission::DeadlineExceeded);
+            }
+            // Reserve the separately bounded control slot BEFORE primary pool
+            // acquisition, including both waits in the caller's absolute budget.
+            let reservation = match cancellation.reserve(deadline).await {
+                Ok(reservation) => reservation,
+                Err(_) => return Ok(CacheReclamationAdmission::Unavailable),
+            };
+            let mut connection = pool.acquire().await?;
+            connection.close_on_drop();
+            // Snapshot the actual connection's driver capability synchronously,
+            // before any new SQL/BEGIN or graph/cache/source wait.
+            let guard = match reservation.bind(&connection) {
+                Ok(guard) => guard,
+                Err(BindingError::Unavailable) => {
+                    return Ok(CacheReclamationAdmission::Unavailable)
+                }
+            };
+            let transaction = sqlx::Transaction::begin(connection, None).await?;
+            let mut transaction = ReclamationTransaction::new(transaction, guard);
+            let admitted =
+                Self::acquire_reclamation_gates(transaction.transaction_mut(), deadline, true)
+                    .await;
+            match admitted {
+                Ok(true) => Ok(CacheReclamationAdmission::Acquired(transaction)),
+                Ok(false) => {
+                    if transaction.rollback().await.is_err() {
+                        return Ok(CacheReclamationAdmission::Unavailable);
+                    }
+                    Ok(CacheReclamationAdmission::DeadlineExceeded)
+                }
+                Err(error) => {
+                    if transaction.rollback().await.is_err() {
+                        return Ok(CacheReclamationAdmission::Unavailable);
+                    }
+                    Err(error)
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.closed() => Ok(CacheReclamationAdmission::Unavailable),
+            result = tokio::time::timeout_at(deadline, acquisition) => match result {
+                Ok(Err(Error::Database(error)))
+                    if tokio::time::Instant::now() >= deadline
+                        && error.as_database_error().and_then(|error| error.code())
+                            .is_some_and(|code| matches!(code.as_ref(), "55P03" | "57014")) =>
+                {
+                    Ok(CacheReclamationAdmission::DeadlineExceeded)
+                }
+                Ok(result) => result,
+                // Dropping the armed guard wakes its registered monitor. It
+                // owns the control slot through cancel transport completion.
+                // Transport EOF does not acknowledge exact backend disposal.
+                Err(_) => Ok(CacheReclamationAdmission::DeadlineExceeded),
+            },
+        }
+    }
+
+    // Cleanup defers its exclusive parent lock to its separately timed DDL phase.
+    // Fresh pack-deletion entry also retains read protection before source locks.
+    async fn acquire_reclamation_gates(
+        transaction: &mut sqlx::Transaction<'_, Postgres>,
+        deadline: tokio::time::Instant,
+        protect_parent: bool,
+    ) -> Result<bool> {
+        let original_timeouts: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
+             (SELECT setting::BIGINT FROM pg_settings WHERE name='lock_timeout'), \
+             (SELECT setting::BIGINT FROM pg_settings WHERE name='statement_timeout')",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            // Preflight BEFORE requesting exclusive graph: a queued graph writer
+            // could otherwise block later readers through lock-queue fairness.
+            // The cache lock is only a wake-up hint and must be rolled back.
+            let mut preflight = transaction.begin().await?;
+            let ready: Result<bool> = async {
+                if !set_reclamation_acquisition_budget(
+                    &mut preflight,
+                    deadline,
+                    (original_timeouts.2, original_timeouts.3),
+                )
+                .await?
+                {
+                    return Ok(false);
+                }
+                lock_cache_admission(&mut preflight).await?;
+                Ok(true)
+            }
+            .await;
+            preflight.rollback().await?;
+            if !ready? {
+                return Ok(false);
+            }
+
+            let mut attempt = transaction.begin().await?;
+            let selected: Result<bool> = async {
+                if !set_reclamation_acquisition_budget(
+                    &mut attempt, deadline, (original_timeouts.2, original_timeouts.3),
+                ).await? {
+                    return Ok(false);
+                }
+                // Preserve the shared-to-exclusive upgrade rejection, not just
+                // the raw graph advisory lock. No source/capture locks precede it.
+                super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(
+                    &mut attempt,
+                )
+                .await?;
+                let cache_available: bool = sqlx::query_scalar(
+                    "SELECT pg_try_advisory_xact_lock($1, $2)",
+                )
+                .bind(CACHE_ADMISSION_ADVISORY_LOCK_CLASS)
+                .bind(CACHE_ADMISSION_ADVISORY_LOCK_KEY)
+                .fetch_one(&mut *attempt)
+                .await?;
+                if !cache_available {
+                    return Ok(false);
+                }
+                if !set_reclamation_acquisition_budget(
+                    &mut attempt, deadline, (original_timeouts.2, original_timeouts.3),
+                ).await? {
+                    return Ok(false);
+                }
+                if protect_parent {
+                    // Cache acquisition here is reentrant and cannot wait. Parent
+                    // protection still follows admission and precedes all source rows.
+                    Self::protect_transaction(&mut attempt, CacheTransactionMode::PinMutation).await?;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                // Acquisition policy must not leak into later mutation/commit.
+                sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)")
+                    .bind(&original_timeouts.0)
+                    .bind(&original_timeouts.1)
+                    .execute(&mut *attempt)
+                    .await?;
+                Ok(true)
+            }
+            .await;
+            match selected {
+                Ok(true) => {
+                    attempt.commit().await?;
+                    return Ok(tokio::time::Instant::now() < deadline);
+                }
+                Ok(false) => {
+                    // Release graph BEFORE the next blocking cache preflight.
+                    attempt.rollback().await?;
+                }
+                Err(error) => {
+                    attempt.rollback().await?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     pub async fn protect_transaction(
         connection: &mut sqlx::PgConnection,
         mode: CacheTransactionMode,
@@ -3582,6 +3933,41 @@ fn ensure_namespace_storage_quota(
     Ok(())
 }
 
+async fn set_reclamation_acquisition_budget(
+    connection: &mut sqlx::PgConnection,
+    deadline: tokio::time::Instant,
+    original_limits_ms: (i64, i64),
+) -> Result<bool> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    // Round UP: zero disables PostgreSQL timeouts. The client absolute deadline
+    // remains the bound even for a final fraction of a millisecond. PostgreSQL
+    // accepts at most i32::MAX milliseconds for each of these settings.
+    let milliseconds =
+        remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+    let milliseconds = milliseconds.min(i32::MAX as u128);
+    // Respect tighter operator session limits. Zero means unlimited, not zero
+    // acquisition budget. Preserve each original per-statement/per-lock limit;
+    // the caller's monotonic deadline independently bounds the whole loop.
+    let bounded = |original: i64| {
+        if original > 0 {
+            milliseconds.min(original as u128)
+        } else {
+            milliseconds
+        }
+    };
+    sqlx::query(
+        "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+    )
+    .bind(format!("{}ms", bounded(original_limits_ms.0)))
+    .bind(format!("{}ms", bounded(original_limits_ms.1)))
+    .execute(connection)
+    .await?;
+    Ok(true)
+}
+
 async fn lock_cache_admission(connection: &mut sqlx::PgConnection) -> Result<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
         .bind(CACHE_ADMISSION_ADVISORY_LOCK_CLASS)
@@ -3746,6 +4132,32 @@ fn push_cache_namespace_visibility_clause(
         push_cache_namespace_grant_clause(query, visibility.identity_id, grant);
     }
     query.push(")");
+    match &visibility.owner_filter {
+        None => {}
+        Some(CacheNamespaceOwnerFilter::System) => {
+            query.push(" AND n.owner_type = 'system'");
+        }
+        Some(CacheNamespaceOwnerFilter::Identity(identity)) => {
+            query
+                .push(" AND n.owner_type = 'identity' AND n.owner_identity = ")
+                .push_bind(*identity);
+        }
+        Some(CacheNamespaceOwnerFilter::Pack(reference)) => {
+            query
+                .push(" AND n.owner_type = 'pack' AND n.owner_pack_ref = ")
+                .push_bind(reference.clone());
+        }
+        Some(CacheNamespaceOwnerFilter::Action(reference)) => {
+            query
+                .push(" AND n.owner_type = 'action' AND n.owner_action_ref = ")
+                .push_bind(reference.clone());
+        }
+        Some(CacheNamespaceOwnerFilter::Sensor(reference)) => {
+            query
+                .push(" AND n.owner_type = 'sensor' AND n.owner_sensor_ref = ")
+                .push_bind(reference.clone());
+        }
+    }
 }
 
 fn push_cache_namespace_grant_clause(
@@ -3753,6 +4165,7 @@ fn push_cache_namespace_grant_clause(
     identity_id: Id,
     grant: &CacheNamespaceGrantFilter,
 ) {
+    let runtime_pack = format!("(CASE WHEN n.management_origin <> 'pack' OR n.managing_pack IS NOT DISTINCT FROM {CACHE_DATA_PACK_ID_SQL} THEN {CACHE_DATA_PACK_ID_SQL} ELSE NULL END)");
     query.push("(");
     let mut first = true;
 
@@ -3764,6 +4177,60 @@ fn push_cache_namespace_grant_clause(
                 query.push(" AND ");
             }
         };
+    }
+
+    match grant.ownership {
+        CacheOwnershipScope::Any => {}
+        CacheOwnershipScope::ManagedPack(pack) => {
+            and_sep!();
+            query
+                .push(CACHE_DATA_PACK_ID_SQL)
+                .push(" = ")
+                .push_bind(pack)
+                .push(" AND (n.management_origin <> 'pack' OR n.managing_pack = ")
+                .push_bind(pack)
+                .push(")");
+        }
+        CacheOwnershipScope::Pack(pack) => {
+            and_sep!();
+            query
+                .push("(n.owner_type = 'pack' AND n.owner_pack = ")
+                .push_bind(pack)
+                .push(")");
+        }
+        CacheOwnershipScope::Action(action) => {
+            and_sep!();
+            query
+                .push("(n.owner_type = 'action' AND n.owner_action = ")
+                .push_bind(action)
+                .push(")");
+        }
+    }
+    if let Some(ids) = &grant.ids {
+        and_sep!();
+        query.push("n.id = ANY(").push_bind(ids.clone()).push(")");
+    }
+    if let Some(owners) = &grant.pinned_owners {
+        and_sep!();
+        super::runtime_target_binding::push_owner_clause(query, "n", &runtime_pack, owners);
+    }
+    if let Some(targets) = &grant.pinned_targets {
+        and_sep!();
+        super::runtime_target_binding::push_target_clause(query, "n", &runtime_pack, targets);
+    }
+    if let Some(packs) = &grant.pinned_packs {
+        and_sep!();
+        query
+            .push(&runtime_pack)
+            .push(" = ANY(")
+            .push_bind(packs.clone())
+            .push(")");
+    }
+    if let Some(refs) = &grant.pack_refs {
+        and_sep!();
+        query.push("EXISTS (SELECT 1 FROM pack scoped_pack WHERE scoped_pack.id = ").push(CACHE_DATA_PACK_ID_SQL)
+            .push(" AND (n.management_origin <> 'pack' OR n.managing_pack = scoped_pack.id) AND scoped_pack.ref = ANY(")
+            .push_bind(refs.clone()).push("))");
     }
 
     if let Some(owner) = grant.owner {
@@ -3809,7 +4276,11 @@ fn push_cache_namespace_grant_clause(
             query.push_bind(OwnerType::Action);
             query.push(" THEN n.owner_action_ref WHEN ");
             query.push_bind(OwnerType::Sensor);
-            query.push(" THEN n.owner_sensor_ref ELSE NULL END) IN (");
+            query.push(" THEN n.owner_sensor_ref ");
+            if matches!(grant.context, CacheGrantContext::Recorded) {
+                query.push("WHEN 'identity' THEN n.owner_identity::TEXT ");
+            }
+            query.push("ELSE NULL END) IN (");
             {
                 let mut separated = query.separated(", ");
                 for owner_ref in owner_refs {
@@ -3825,7 +4296,10 @@ fn push_cache_namespace_grant_clause(
         if namespace_refs.is_empty() {
             query.push("FALSE");
         } else {
-            query.push("n.namespace IN (");
+            query.push(match grant.context {
+                CacheGrantContext::Delegation => "n.namespace IN (",
+                CacheGrantContext::Recorded => "COALESCE(n.definition_ref, n.namespace) IN (",
+            });
             {
                 let mut separated = query.separated(", ");
                 for namespace_ref in namespace_refs {
@@ -3841,6 +4315,12 @@ fn push_cache_namespace_grant_clause(
     }
     query.push(")");
 }
+
+const CACHE_DATA_PACK_ID_SQL: &str = "(CASE n.owner_type \
+    WHEN 'pack' THEN (SELECT p.id FROM pack p WHERE p.id = n.owner_pack) \
+    WHEN 'action' THEN (SELECT a.pack FROM action a WHERE a.id = n.owner_action AND a.management_origin = 'pack') \
+    WHEN 'sensor' THEN (SELECT s.pack FROM sensor s WHERE s.id = n.owner_sensor AND s.management_origin = 'pack') \
+    ELSE NULL END)";
 
 fn push_cache_namespace_freshness_clause(
     query: &mut QueryBuilder<'_, Postgres>,
@@ -3953,6 +4433,63 @@ async fn lock_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_namespace_filters_preserve_structural_ownership_and_target_constraints() {
+        let grant = serde_json::from_value(serde_json::json!({"resource":"caches", "actions":["read"],
+            "constraints":{"pack_refs":["local"], "owner_refs":["local"], "refs":["local.data"], "ids":[7]}})).unwrap();
+        let filter = CacheNamespaceGrantFilter::from_recorded_grant(
+            &grant,
+            CacheOwnershipScope::ManagedPack(42),
+        )
+        .unwrap();
+        assert!(matches!(
+            filter.ownership,
+            CacheOwnershipScope::ManagedPack(42)
+        ));
+        let visibility = CacheNamespaceReadVisibility {
+            identity_id: 17,
+            grants: vec![filter],
+            owner_filter: Some(CacheNamespaceOwnerFilter::Pack("local".into())),
+        };
+        let mut query = QueryBuilder::<Postgres>::new("SELECT n.id FROM cache_namespace n WHERE ");
+        push_cache_namespace_visibility_clause(&mut query, &visibility);
+        let sql = query.sql();
+        assert!(sql.contains("a.management_origin = 'pack'"));
+        assert!(sql.contains("s.management_origin = 'pack'"));
+        assert!(sql.contains("n.management_origin <> 'pack' OR n.managing_pack ="));
+        assert!(sql.contains("COALESCE(n.definition_ref, n.namespace) IN ("));
+        assert!(sql.contains("n.id = ANY("));
+        assert!(sql.contains("n.owner_pack_ref ="));
+        assert!(!sql.contains("LIKE"));
+    }
+
+    #[test]
+    fn recorded_namespace_filters_fail_closed_for_inapplicable_grants() {
+        for constraints in [
+            serde_json::json!({"encrypted":false}),
+            serde_json::json!({"visibility":["public"]}),
+            serde_json::json!({"execution_scope":"self"}),
+            serde_json::json!({"attributes":{"team":"ops"}}),
+        ] {
+            let grant = serde_json::from_value(serde_json::json!({"resource":"caches", "actions":["read"], "constraints":constraints})).unwrap();
+            assert!(CacheNamespaceGrantFilter::from_recorded_grant(
+                &grant,
+                CacheOwnershipScope::Any
+            )
+            .is_none());
+        }
+        for grant in [
+            serde_json::json!({"resource":"caches", "actions":["update"]}),
+            serde_json::json!({"resource":"keys", "actions":["read"]}),
+        ] {
+            assert!(CacheNamespaceGrantFilter::from_recorded_grant(
+                &serde_json::from_value(grant).unwrap(),
+                CacheOwnershipScope::Any
+            )
+            .is_none());
+        }
+    }
 
     #[test]
     fn owner_scope_requires_matching_canonical_owner() {

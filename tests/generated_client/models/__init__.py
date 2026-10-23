@@ -105,8 +105,14 @@ from .api_response_enforcement_response_data_conditions import (
 from .api_response_enforcement_response_data_config_type_0 import (
     ApiResponseEnforcementResponseDataConfigType0,
 )
+from .api_response_enforcement_response_data_input_contract_type_0 import (
+    ApiResponseEnforcementResponseDataInputContractType0,
+)
 from .api_response_enforcement_response_data_payload import (
     ApiResponseEnforcementResponseDataPayload,
+)
+from .api_response_enforcement_response_data_payload_contract_type_0 import (
+    ApiResponseEnforcementResponseDataPayloadContractType0,
 )
 from .api_response_event_response import ApiResponseEventResponse
 from .api_response_event_response_data import ApiResponseEventResponseData
@@ -115,6 +121,9 @@ from .api_response_event_response_data_config_type_0 import (
 )
 from .api_response_event_response_data_payload import (
     ApiResponseEventResponseDataPayload,
+)
+from .api_response_event_response_data_schema_binding_type_0 import (
+    ApiResponseEventResponseDataSchemaBindingType0,
 )
 from .api_response_execution_response import ApiResponseExecutionResponse
 from .api_response_execution_response_data import ApiResponseExecutionResponseData
@@ -230,6 +239,13 @@ from .api_response_rule_response_data_sensor_worker_tolerations_item import (
 from .api_response_rule_response_data_trigger_params import (
     ApiResponseRuleResponseDataTriggerParams,
 )
+from .api_response_runtime_approval_response import ApiResponseRuntimeApprovalResponse
+from .api_response_runtime_approval_response_data import (
+    ApiResponseRuntimeApprovalResponseData,
+)
+from .api_response_runtime_approval_response_data_grants_item import (
+    ApiResponseRuntimeApprovalResponseDataGrantsItem,
+)
 from .api_response_runtime_response import ApiResponseRuntimeResponse
 from .api_response_runtime_response_data import ApiResponseRuntimeResponseData
 from .api_response_runtime_response_data_distributions import (
@@ -238,9 +254,12 @@ from .api_response_runtime_response_data_distributions import (
 from .api_response_runtime_response_data_execution_config import (
     ApiResponseRuntimeResponseDataExecutionConfig,
 )
-from .api_response_runtime_response_data_installation_type_0 import (
-    ApiResponseRuntimeResponseDataInstallationType0,
+from .api_response_schema_contract_response import ApiResponseSchemaContractResponse
+from .api_response_schema_contract_response_data import (
+    ApiResponseSchemaContractResponseData,
 )
+from .api_response_schema_type_response import ApiResponseSchemaTypeResponse
+from .api_response_schema_type_response_data import ApiResponseSchemaTypeResponseData
 from .api_response_sensor_response import ApiResponseSensorResponse
 from .api_response_sensor_response_data import ApiResponseSensorResponseData
 from .api_response_sensor_response_data_param_schema_type_0 import (
@@ -249,7 +268,6 @@ from .api_response_sensor_response_data_param_schema_type_0 import (
 from .api_response_sensor_response_data_worker_selector import (
     ApiResponseSensorResponseDataWorkerSelector,
 )
-from .api_response_string import ApiResponseString
 from .api_response_success_response import ApiResponseSuccessResponse
 from .api_response_success_response_data import ApiResponseSuccessResponseData
 from .api_response_token_response import ApiResponseTokenResponse
@@ -258,6 +276,9 @@ from .api_response_trace_report_response import ApiResponseTraceReportResponse
 from .api_response_trace_report_response_data import ApiResponseTraceReportResponseData
 from .api_response_trigger_response import ApiResponseTriggerResponse
 from .api_response_trigger_response_data import ApiResponseTriggerResponseData
+from .api_response_trigger_response_data_event_config_schema_type_0 import (
+    ApiResponseTriggerResponseDataEventConfigSchemaType0,
+)
 from .api_response_trigger_response_data_out_schema_type_0 import (
     ApiResponseTriggerResponseDataOutSchemaType0,
 )
@@ -369,6 +390,7 @@ from .artifact_string_patch_type_1_op import ArtifactStringPatchType1Op
 from .artifact_summary import ArtifactSummary
 from .artifact_type import ArtifactType
 from .artifact_version_by_ref_upload_form import ArtifactVersionByRefUploadForm
+from .artifact_version_summary import ArtifactVersionSummary
 from .artifact_version_upload_form import ArtifactVersionUploadForm
 from .artifact_visibility import ArtifactVisibility
 from .audit_category import AuditCategory
@@ -584,9 +606,6 @@ from .create_rule_request_trigger_params import CreateRuleRequestTriggerParams
 from .create_runtime_request import CreateRuntimeRequest
 from .create_runtime_request_distributions import CreateRuntimeRequestDistributions
 from .create_runtime_request_execution_config import CreateRuntimeRequestExecutionConfig
-from .create_runtime_request_installation_type_0 import (
-    CreateRuntimeRequestInstallationType0,
-)
 from .create_sensor_request import CreateSensorRequest
 from .create_sensor_request_config_type_0 import CreateSensorRequestConfigType0
 from .create_sensor_request_param_schema_type_0 import (
@@ -603,6 +622,9 @@ from .create_sensor_token_internal_response_200_data_workload_fence_type_0 impor
     CreateSensorTokenInternalResponse200DataWorkloadFenceType0,
 )
 from .create_trigger_request import CreateTriggerRequest
+from .create_trigger_request_event_config_schema_type_0 import (
+    CreateTriggerRequestEventConfigSchemaType0,
+)
 from .create_trigger_request_out_schema_type_0 import CreateTriggerRequestOutSchemaType0
 from .create_trigger_request_param_schema_type_0 import (
     CreateTriggerRequestParamSchemaType0,
@@ -698,7 +720,13 @@ from .enforcement_condition import EnforcementCondition
 from .enforcement_response import EnforcementResponse
 from .enforcement_response_conditions import EnforcementResponseConditions
 from .enforcement_response_config_type_0 import EnforcementResponseConfigType0
+from .enforcement_response_input_contract_type_0 import (
+    EnforcementResponseInputContractType0,
+)
 from .enforcement_response_payload import EnforcementResponsePayload
+from .enforcement_response_payload_contract_type_0 import (
+    EnforcementResponsePayloadContractType0,
+)
 from .enforcement_status import EnforcementStatus
 from .enforcement_summary import EnforcementSummary
 from .enqueue_work_queue_item_request import EnqueueWorkQueueItemRequest
@@ -711,6 +739,7 @@ from .error_response import ErrorResponse
 from .event_response import EventResponse
 from .event_response_config_type_0 import EventResponseConfigType0
 from .event_response_payload import EventResponsePayload
+from .event_response_schema_binding_type_0 import EventResponseSchemaBindingType0
 from .event_summary import EventSummary
 from .execution_reschedule_response import ExecutionRescheduleResponse
 from .execution_response import ExecutionResponse
@@ -873,8 +902,11 @@ from .history_record_response_old_values import HistoryRecordResponseOldValues
 from .identity_response import IdentityResponse
 from .identity_role_assignment_response import IdentityRoleAssignmentResponse
 from .identity_summary import IdentitySummary
-from .inquiry_respond_request import InquiryRespondRequest
-from .inquiry_respond_request_response import InquiryRespondRequestResponse
+from .inquiry_literal_response_request import InquiryLiteralResponseRequest
+from .inquiry_literal_response_request_response import (
+    InquiryLiteralResponseRequestResponse,
+)
+from .inquiry_option_response_request import InquiryOptionResponseRequest
 from .inquiry_response import InquiryResponse
 from .inquiry_response_option import InquiryResponseOption
 from .inquiry_response_option_handle import InquiryResponseOptionHandle
@@ -891,18 +923,16 @@ from .install_source_type_1 import InstallSourceType1
 from .install_source_type_1_type import InstallSourceType1Type
 from .integration_token_response import IntegrationTokenResponse
 from .internal_create_sensor_token_request import InternalCreateSensorTokenRequest
+from .issue_runtime_approval_request import IssueRuntimeApprovalRequest
+from .issue_runtime_approval_request_grants_item import (
+    IssueRuntimeApprovalRequestGrantsItem,
+)
 from .key_response import KeyResponse
 from .key_summary import KeySummary
 from .label_expression_operator import LabelExpressionOperator
 from .ldap_login_request import LdapLoginRequest
 from .ldap_login_response_200 import LdapLoginResponse200
 from .ldap_login_response_200_data import LdapLoginResponse200Data
-from .list_artifacts_by_execution_response_200 import (
-    ListArtifactsByExecutionResponse200,
-)
-from .list_artifacts_by_execution_response_200_data_item import (
-    ListArtifactsByExecutionResponse200DataItem,
-)
 from .list_integration_tokens_response_200 import ListIntegrationTokensResponse200
 from .list_integration_tokens_response_200_data_item import (
     ListIntegrationTokensResponse200DataItem,
@@ -912,8 +942,6 @@ from .list_pack_indices_response_200_data_item import ListPackIndicesResponse200
 from .list_pack_indices_response_200_data_item_headers import (
     ListPackIndicesResponse200DataItemHeaders,
 )
-from .list_versions_response_200 import ListVersionsResponse200
-from .list_versions_response_200_data_item import ListVersionsResponse200DataItem
 from .list_workflow_cache_iterations_response_200 import (
     ListWorkflowCacheIterationsResponse200,
 )
@@ -982,6 +1010,8 @@ from .pack_description_patch_type_0 import PackDescriptionPatchType0
 from .pack_description_patch_type_0_op import PackDescriptionPatchType0Op
 from .pack_description_patch_type_1 import PackDescriptionPatchType1
 from .pack_description_patch_type_1_op import PackDescriptionPatchType1Op
+from .pack_diagnostic import PackDiagnostic
+from .pack_diagnostic_severity import PackDiagnosticSeverity
 from .pack_index_entry import PackIndexEntry
 from .pack_install_provenance import PackInstallProvenance
 from .pack_install_response import PackInstallResponse
@@ -1020,6 +1050,12 @@ from .paginated_response_action_summary_items_item_worker_selector import (
 from .paginated_response_artifact_summary import PaginatedResponseArtifactSummary
 from .paginated_response_artifact_summary_items_item import (
     PaginatedResponseArtifactSummaryItemsItem,
+)
+from .paginated_response_artifact_version_summary import (
+    PaginatedResponseArtifactVersionSummary,
+)
+from .paginated_response_artifact_version_summary_items_item import (
+    PaginatedResponseArtifactVersionSummaryItemsItem,
 )
 from .paginated_response_audit_event_summary import PaginatedResponseAuditEventSummary
 from .paginated_response_audit_event_summary_items_item import (
@@ -1107,9 +1143,22 @@ from .paginated_response_rule_summary_items_item_sensor_worker_tolerations_item 
 from .paginated_response_rule_summary_items_item_trigger_params import (
     PaginatedResponseRuleSummaryItemsItemTriggerParams,
 )
+from .paginated_response_runtime_approval_response import (
+    PaginatedResponseRuntimeApprovalResponse,
+)
+from .paginated_response_runtime_approval_response_items_item import (
+    PaginatedResponseRuntimeApprovalResponseItemsItem,
+)
+from .paginated_response_runtime_approval_response_items_item_grants_item import (
+    PaginatedResponseRuntimeApprovalResponseItemsItemGrantsItem,
+)
 from .paginated_response_runtime_summary import PaginatedResponseRuntimeSummary
 from .paginated_response_runtime_summary_items_item import (
     PaginatedResponseRuntimeSummaryItemsItem,
+)
+from .paginated_response_schema_type_response import PaginatedResponseSchemaTypeResponse
+from .paginated_response_schema_type_response_items_item import (
+    PaginatedResponseSchemaTypeResponseItemsItem,
 )
 from .paginated_response_sensor_summary import PaginatedResponseSensorSummary
 from .paginated_response_sensor_summary_items_item import (
@@ -1223,11 +1272,12 @@ from .rule_summary_sensor_worker_tolerations_item import (
     RuleSummarySensorWorkerTolerationsItem,
 )
 from .rule_summary_trigger_params import RuleSummaryTriggerParams
+from .runtime_approval_response import RuntimeApprovalResponse
+from .runtime_approval_response_grants_item import RuntimeApprovalResponseGrantsItem
 from .runtime_requirements import RuntimeRequirements
 from .runtime_response import RuntimeResponse
 from .runtime_response_distributions import RuntimeResponseDistributions
 from .runtime_response_execution_config import RuntimeResponseExecutionConfig
-from .runtime_response_installation_type_0 import RuntimeResponseInstallationType0
 from .runtime_summary import RuntimeSummary
 from .runtime_version_constraint_patch_type_0 import RuntimeVersionConstraintPatchType0
 from .runtime_version_constraint_patch_type_0_op import (
@@ -1256,6 +1306,10 @@ from .save_workflow_file_response_201_data_out_schema_type_0 import (
 from .save_workflow_file_response_201_data_param_schema_type_0 import (
     SaveWorkflowFileResponse201DataParamSchemaType0,
 )
+from .schema_contract_response import SchemaContractResponse
+from .schema_preview_context import SchemaPreviewContext
+from .schema_preview_request import SchemaPreviewRequest
+from .schema_type_response import SchemaTypeResponse
 from .seal_cache_generation_request import SealCacheGenerationRequest
 from .sensor_response import SensorResponse
 from .sensor_response_param_schema_type_0 import SensorResponseParamSchemaType0
@@ -1300,13 +1354,18 @@ from .toleration_operator import TolerationOperator
 from .trace_enforcement_summary import TraceEnforcementSummary
 from .trace_report_response import TraceReportResponse
 from .trace_work_queue_dispatch_summary import TraceWorkQueueDispatchSummary
+from .trigger_clear_operation import TriggerClearOperation
+from .trigger_json_patch_type_0 import TriggerJsonPatchType0
+from .trigger_json_patch_type_1 import TriggerJsonPatchType1
 from .trigger_response import TriggerResponse
+from .trigger_response_event_config_schema_type_0 import (
+    TriggerResponseEventConfigSchemaType0,
+)
 from .trigger_response_out_schema_type_0 import TriggerResponseOutSchemaType0
 from .trigger_response_param_schema_type_0 import TriggerResponseParamSchemaType0
+from .trigger_set_operation import TriggerSetOperation
 from .trigger_string_patch_type_0 import TriggerStringPatchType0
-from .trigger_string_patch_type_0_op import TriggerStringPatchType0Op
 from .trigger_string_patch_type_1 import TriggerStringPatchType1
-from .trigger_string_patch_type_1_op import TriggerStringPatchType1Op
 from .trigger_summary import TriggerSummary
 from .unfreeze_identity_response_200 import UnfreezeIdentityResponse200
 from .unfreeze_identity_response_200_data import UnfreezeIdentityResponse200Data
@@ -1400,6 +1459,7 @@ from .update_runtime_request_execution_config_type_0 import (
     UpdateRuntimeRequestExecutionConfigType0,
 )
 from .update_sensor_request import UpdateSensorRequest
+from .update_sensor_request_config_type_0 import UpdateSensorRequestConfigType0
 from .update_sensor_request_param_schema_type_0 import (
     UpdateSensorRequestParamSchemaType0,
 )
@@ -1407,10 +1467,6 @@ from .update_sensor_request_worker_selector_type_0 import (
     UpdateSensorRequestWorkerSelectorType0,
 )
 from .update_trigger_request import UpdateTriggerRequest
-from .update_trigger_request_out_schema_type_0 import UpdateTriggerRequestOutSchemaType0
-from .update_trigger_request_param_schema_type_0 import (
-    UpdateTriggerRequestParamSchemaType0,
-)
 from .update_work_queue_item_request import UpdateWorkQueueItemRequest
 from .update_work_queue_item_request_metadata_type_0 import (
     UpdateWorkQueueItemRequestMetadataType0,
@@ -1575,11 +1631,14 @@ __all__ = (
     "ApiResponseEnforcementResponseData",
     "ApiResponseEnforcementResponseDataConditions",
     "ApiResponseEnforcementResponseDataConfigType0",
+    "ApiResponseEnforcementResponseDataInputContractType0",
     "ApiResponseEnforcementResponseDataPayload",
+    "ApiResponseEnforcementResponseDataPayloadContractType0",
     "ApiResponseEventResponse",
     "ApiResponseEventResponseData",
     "ApiResponseEventResponseDataConfigType0",
     "ApiResponseEventResponseDataPayload",
+    "ApiResponseEventResponseDataSchemaBindingType0",
     "ApiResponseExecutionResponse",
     "ApiResponseExecutionResponseData",
     "ApiResponseExecutionResponseDataConfig",
@@ -1634,16 +1693,21 @@ __all__ = (
     "ApiResponseRuleResponseDataSensorWorkerSelector",
     "ApiResponseRuleResponseDataSensorWorkerTolerationsItem",
     "ApiResponseRuleResponseDataTriggerParams",
+    "ApiResponseRuntimeApprovalResponse",
+    "ApiResponseRuntimeApprovalResponseData",
+    "ApiResponseRuntimeApprovalResponseDataGrantsItem",
     "ApiResponseRuntimeResponse",
     "ApiResponseRuntimeResponseData",
     "ApiResponseRuntimeResponseDataDistributions",
     "ApiResponseRuntimeResponseDataExecutionConfig",
-    "ApiResponseRuntimeResponseDataInstallationType0",
+    "ApiResponseSchemaContractResponse",
+    "ApiResponseSchemaContractResponseData",
+    "ApiResponseSchemaTypeResponse",
+    "ApiResponseSchemaTypeResponseData",
     "ApiResponseSensorResponse",
     "ApiResponseSensorResponseData",
     "ApiResponseSensorResponseDataParamSchemaType0",
     "ApiResponseSensorResponseDataWorkerSelector",
-    "ApiResponseString",
     "ApiResponseSuccessResponse",
     "ApiResponseSuccessResponseData",
     "ApiResponseTokenResponse",
@@ -1652,6 +1716,7 @@ __all__ = (
     "ApiResponseTraceReportResponseData",
     "ApiResponseTriggerResponse",
     "ApiResponseTriggerResponseData",
+    "ApiResponseTriggerResponseDataEventConfigSchemaType0",
     "ApiResponseTriggerResponseDataOutSchemaType0",
     "ApiResponseTriggerResponseDataParamSchemaType0",
     "ApiResponseVecAuditEventResponse",
@@ -1709,6 +1774,7 @@ __all__ = (
     "ArtifactSummary",
     "ArtifactType",
     "ArtifactVersionByRefUploadForm",
+    "ArtifactVersionSummary",
     "ArtifactVersionUploadForm",
     "ArtifactVisibility",
     "AuditCategory",
@@ -1856,7 +1922,6 @@ __all__ = (
     "CreateRuntimeRequest",
     "CreateRuntimeRequestDistributions",
     "CreateRuntimeRequestExecutionConfig",
-    "CreateRuntimeRequestInstallationType0",
     "CreateSensorRequest",
     "CreateSensorRequestConfigType0",
     "CreateSensorRequestParamSchemaType0",
@@ -1865,6 +1930,7 @@ __all__ = (
     "CreateSensorTokenInternalResponse200Data",
     "CreateSensorTokenInternalResponse200DataWorkloadFenceType0",
     "CreateTriggerRequest",
+    "CreateTriggerRequestEventConfigSchemaType0",
     "CreateTriggerRequestOutSchemaType0",
     "CreateTriggerRequestParamSchemaType0",
     "CreateVersionFileResponse201",
@@ -1934,7 +2000,9 @@ __all__ = (
     "EnforcementResponse",
     "EnforcementResponseConditions",
     "EnforcementResponseConfigType0",
+    "EnforcementResponseInputContractType0",
     "EnforcementResponsePayload",
+    "EnforcementResponsePayloadContractType0",
     "EnforcementStatus",
     "EnforcementSummary",
     "EnqueueWorkQueueItemRequest",
@@ -1945,6 +2013,7 @@ __all__ = (
     "EventResponse",
     "EventResponseConfigType0",
     "EventResponsePayload",
+    "EventResponseSchemaBindingType0",
     "EventSummary",
     "ExecutionRescheduleResponse",
     "ExecutionResponse",
@@ -2049,8 +2118,9 @@ __all__ = (
     "IdentityResponse",
     "IdentityRoleAssignmentResponse",
     "IdentitySummary",
-    "InquiryRespondRequest",
-    "InquiryRespondRequestResponse",
+    "InquiryLiteralResponseRequest",
+    "InquiryLiteralResponseRequestResponse",
+    "InquiryOptionResponseRequest",
     "InquiryResponse",
     "InquiryResponseOption",
     "InquiryResponseOptionHandle",
@@ -2067,21 +2137,19 @@ __all__ = (
     "InstallSourceType1Type",
     "IntegrationTokenResponse",
     "InternalCreateSensorTokenRequest",
+    "IssueRuntimeApprovalRequest",
+    "IssueRuntimeApprovalRequestGrantsItem",
     "KeyResponse",
     "KeySummary",
     "LabelExpressionOperator",
     "LdapLoginRequest",
     "LdapLoginResponse200",
     "LdapLoginResponse200Data",
-    "ListArtifactsByExecutionResponse200",
-    "ListArtifactsByExecutionResponse200DataItem",
     "ListIntegrationTokensResponse200",
     "ListIntegrationTokensResponse200DataItem",
     "ListPackIndicesResponse200",
     "ListPackIndicesResponse200DataItem",
     "ListPackIndicesResponse200DataItemHeaders",
-    "ListVersionsResponse200",
-    "ListVersionsResponse200DataItem",
     "ListWorkflowCacheIterationsResponse200",
     "ListWorkflowCacheIterationsResponse200DataItem",
     "ListWorkflowTaskWaitsResponse200",
@@ -2128,6 +2196,8 @@ __all__ = (
     "PackDescriptionPatchType0Op",
     "PackDescriptionPatchType1",
     "PackDescriptionPatchType1Op",
+    "PackDiagnostic",
+    "PackDiagnosticSeverity",
     "PackIndexEntry",
     "PackInstallProvenance",
     "PackInstallResponse",
@@ -2155,6 +2225,8 @@ __all__ = (
     "PaginatedResponseActionSummaryItemsItemWorkerSelector",
     "PaginatedResponseArtifactSummary",
     "PaginatedResponseArtifactSummaryItemsItem",
+    "PaginatedResponseArtifactVersionSummary",
+    "PaginatedResponseArtifactVersionSummaryItemsItem",
     "PaginatedResponseAuditEventSummary",
     "PaginatedResponseAuditEventSummaryItemsItem",
     "PaginatedResponseEnforcementSummary",
@@ -2191,8 +2263,13 @@ __all__ = (
     "PaginatedResponseRuleSummaryItemsItemSensorWorkerSelector",
     "PaginatedResponseRuleSummaryItemsItemSensorWorkerTolerationsItem",
     "PaginatedResponseRuleSummaryItemsItemTriggerParams",
+    "PaginatedResponseRuntimeApprovalResponse",
+    "PaginatedResponseRuntimeApprovalResponseItemsItem",
+    "PaginatedResponseRuntimeApprovalResponseItemsItemGrantsItem",
     "PaginatedResponseRuntimeSummary",
     "PaginatedResponseRuntimeSummaryItemsItem",
+    "PaginatedResponseSchemaTypeResponse",
+    "PaginatedResponseSchemaTypeResponseItemsItem",
     "PaginatedResponseSensorSummary",
     "PaginatedResponseSensorSummaryItemsItem",
     "PaginatedResponseTriggerSummary",
@@ -2275,11 +2352,12 @@ __all__ = (
     "RuleSummarySensorWorkerSelector",
     "RuleSummarySensorWorkerTolerationsItem",
     "RuleSummaryTriggerParams",
+    "RuntimeApprovalResponse",
+    "RuntimeApprovalResponseGrantsItem",
     "RuntimeRequirements",
     "RuntimeResponse",
     "RuntimeResponseDistributions",
     "RuntimeResponseExecutionConfig",
-    "RuntimeResponseInstallationType0",
     "RuntimeSummary",
     "RuntimeVersionConstraintPatchType0",
     "RuntimeVersionConstraintPatchType0Op",
@@ -2294,6 +2372,10 @@ __all__ = (
     "SaveWorkflowFileResponse201DataDefinition",
     "SaveWorkflowFileResponse201DataOutSchemaType0",
     "SaveWorkflowFileResponse201DataParamSchemaType0",
+    "SchemaContractResponse",
+    "SchemaPreviewContext",
+    "SchemaPreviewRequest",
+    "SchemaTypeResponse",
     "SealCacheGenerationRequest",
     "SensorResponse",
     "SensorResponseParamSchemaType0",
@@ -2338,13 +2420,16 @@ __all__ = (
     "TraceEnforcementSummary",
     "TraceReportResponse",
     "TraceWorkQueueDispatchSummary",
+    "TriggerClearOperation",
+    "TriggerJsonPatchType0",
+    "TriggerJsonPatchType1",
     "TriggerResponse",
+    "TriggerResponseEventConfigSchemaType0",
     "TriggerResponseOutSchemaType0",
     "TriggerResponseParamSchemaType0",
+    "TriggerSetOperation",
     "TriggerStringPatchType0",
-    "TriggerStringPatchType0Op",
     "TriggerStringPatchType1",
-    "TriggerStringPatchType1Op",
     "TriggerSummary",
     "UnfreezeIdentityResponse200",
     "UnfreezeIdentityResponse200Data",
@@ -2404,11 +2489,10 @@ __all__ = (
     "UpdateRuntimeRequestDistributionsType0",
     "UpdateRuntimeRequestExecutionConfigType0",
     "UpdateSensorRequest",
+    "UpdateSensorRequestConfigType0",
     "UpdateSensorRequestParamSchemaType0",
     "UpdateSensorRequestWorkerSelectorType0",
     "UpdateTriggerRequest",
-    "UpdateTriggerRequestOutSchemaType0",
-    "UpdateTriggerRequestParamSchemaType0",
     "UpdateWorkQueueItemRequest",
     "UpdateWorkQueueItemRequestMetadataType0",
     "UpdateWorkQueueItemRequestPayloadType0",

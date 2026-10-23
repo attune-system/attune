@@ -2,10 +2,12 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { Value } from "./Value";
 /**
  * Information about a failed pack download
  */
 export type FailedPack = {
+  details?: null | Value;
   /**
    * Error message
    */

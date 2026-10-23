@@ -107,6 +107,7 @@ impl Database {
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.connect_timeout))
+            .acquire_time_level(log::LevelFilter::Debug)
             .idle_timeout(Duration::from_secs(config.idle_timeout))
             .after_connect(move |conn, _meta| {
                 let schema = schema_for_hook.clone();

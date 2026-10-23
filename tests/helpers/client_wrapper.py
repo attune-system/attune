@@ -155,7 +155,6 @@ from generated_client.models.create_pack_request import CreatePackRequest
 from generated_client.models.create_rule_request import CreateRuleRequest
 from generated_client.models.create_sensor_request import CreateSensorRequest
 from generated_client.models.create_trigger_request import CreateTriggerRequest
-from generated_client.models.inquiry_respond_request import InquiryRespondRequest
 from generated_client.models.login_request import LoginRequest
 from generated_client.models.register_pack_request import RegisterPackRequest
 from generated_client.models.register_request import RegisterRequest

@@ -8,7 +8,6 @@ use axum::{
     Json, Router,
 };
 
-use sqlx::PgConnection;
 use validator::Validate;
 
 use attune_common::auth::{
@@ -23,7 +22,7 @@ use attune_common::repositories::{
     },
     sensor_admission::SensorAdmissionRepository,
     sensor_workload::SensorWorkloadRepository,
-    trigger::{SensorRepository, TriggerRepository},
+    trigger::SensorRepository,
     Create, FindById, FindByRef, IntegrationTokenRepository, Update,
 };
 
@@ -1317,6 +1316,7 @@ pub async fn create_sensor_token_internal(
                 &user.claims,
                 &identity,
                 payload.ttl_seconds,
+                workload_fence,
             )
             .await?;
             create_sensor_token_impl(state, request, true, workload_fence).await
@@ -1352,44 +1352,8 @@ fn canonical_string_refs(refs: &[String]) -> Vec<String> {
     refs
 }
 
-fn registered_sensor_permission_set_refs(sensor: &Sensor) -> Result<Vec<String>, ApiError> {
-    let Some(config) = sensor
-        .config
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(Vec::new());
-    };
-    let Some(value) = config.get("cache_permission_set_refs") else {
-        return Ok(Vec::new());
-    };
-    let values = value.as_array().ok_or_else(|| {
-        ApiError::ValidationError(format!(
-            "Sensor '{}' cache_permission_set_refs must be an array of strings",
-            sensor.r#ref
-        ))
-    })?;
-    let refs = values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| {
-                    ApiError::ValidationError(format!(
-                        "Sensor '{}' cache_permission_set_refs entries must be non-empty strings",
-                        sensor.r#ref
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(canonical_string_refs(&refs))
-}
-
 async fn sensor_cache_grant_snapshot(
-    connection: &mut PgConnection,
+    snapshot: &attune_common::models::SensorExecutableSnapshot,
     sensor_ref: &str,
     pack_ref: &str,
     permission_set_refs: &[String],
@@ -1404,60 +1368,26 @@ async fn sensor_cache_grant_snapshot(
         ));
     }
 
-    let named_refs = permission_set_refs
+    if snapshot
+        .cache_grants
         .iter()
-        .filter(|permission_ref| permission_ref.as_str() != "standard")
-        .cloned()
-        .collect::<Vec<_>>();
-    let permission_sets =
-        PermissionSetRepository::find_by_refs(&mut *connection, &named_refs).await?;
-    if permission_sets.len() != named_refs.len() {
-        return Err(ApiError::ValidationError(
-            "One or more sensor cache permission sets do not exist".to_string(),
+        .any(|grant| grant.resource != Resource::Caches)
+    {
+        return Err(ApiError::Forbidden(
+            "Invalid admitted sensor cache authority".into(),
         ));
     }
-    let standard_grant_count = grants.len();
-    for permission_set in permission_sets {
-        let permission_grants: Vec<Grant> =
-            serde_json::from_value(permission_set.grants).map_err(|err| {
-                ApiError::ValidationError(format!(
-                    "Sensor cache permission set '{}' has invalid grants: {err}",
-                    permission_set.r#ref
-                ))
-            })?;
-        grants.extend(
-            permission_grants
-                .into_iter()
-                .filter(|grant| grant.resource == Resource::Caches),
-        );
-    }
-    if grants.len() > standard_grant_count {
-        let pack = attune_common::repositories::pack::PackRepository::find_by_ref(
-            &mut *connection,
-            pack_ref,
-        )
-        .await?
-        .ok_or_else(|| ApiError::Forbidden("Sensor pack is not available".into()))?;
-        let identity = pack.installed_by.ok_or_else(|| {
-            ApiError::Forbidden(
-                "Named sensor cache access requires an attributed pack installer".into(),
-            )
-        })?;
-        let authority = attune_common::delegation::DelegationAuthority::load_for_share(
-            &mut *connection,
-            identity,
-        )
-        .await?;
-        authority.require_grants(&grants[standard_grant_count..])?;
-    }
+    grants.extend(snapshot.cache_grants.clone());
     Ok(grants)
 }
 
 async fn resolve_registered_sensor_authority(
-    connection: &mut PgConnection,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     payload: &CreateSensorTokenRequest,
     require_exact_request_scope: bool,
+    workload_fence: SensorWorkloadFence,
 ) -> Result<RegisteredSensorAuthority, ApiError> {
+    let connection = &mut **transaction;
     let sensor = SensorRepository::find_by_ref(&mut *connection, &payload.sensor_ref)
         .await?
         .ok_or_else(|| {
@@ -1490,12 +1420,31 @@ async fn resolve_registered_sensor_authority(
         ));
     }
 
-    let registered_triggers =
-        TriggerRepository::find_by_sensor(&mut *connection, sensor.id).await?;
+    if !SensorWorkloadRepository::lock_current_fence(transaction, sensor.id, workload_fence).await?
+    {
+        return Err(ApiError::Forbidden(
+            "Sensor workload assignment is stale or expired".into(),
+        ));
+    }
+    let connection = &mut **transaction;
+    let (_, binding, _) = attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+        &mut *connection,
+        workload_fence.workload_id,
+        workload_fence.generation,
+    )
+    .await?
+    .ok_or_else(|| ApiError::Forbidden("Sensor generation binding is unavailable".into()))?;
+    if binding.executable.sensor.id != sensor.id || binding.executable.sensor.r#ref != sensor.r#ref
+    {
+        return Err(ApiError::Forbidden(
+            "Sensor generation owner mismatch".into(),
+        ));
+    }
+    let registered_triggers = &binding.executable.triggers;
     let registered_trigger_refs = canonical_string_refs(
         &registered_triggers
-            .into_iter()
-            .map(|trigger| trigger.r#ref)
+            .iter()
+            .map(|trigger| trigger.r#ref.clone())
             .collect::<Vec<_>>(),
     );
     if canonical_string_refs(&payload.trigger_types) != registered_trigger_refs {
@@ -1504,7 +1453,7 @@ async fn resolve_registered_sensor_authority(
         ));
     }
 
-    let permission_set_refs = registered_sensor_permission_set_refs(&sensor)?;
+    let permission_set_refs = canonical_string_refs(&binding.executable.cache_permission_set_refs);
     let requested_permission_set_refs = canonical_string_refs(&payload.permission_set_refs);
     if require_exact_request_scope && requested_permission_set_refs != permission_set_refs {
         return Err(ApiError::Forbidden(
@@ -1522,9 +1471,13 @@ async fn resolve_registered_sensor_authority(
         ));
     }
 
-    let cache_grants =
-        sensor_cache_grant_snapshot(connection, &sensor.r#ref, &pack_ref, &permission_set_refs)
-            .await?;
+    let cache_grants = sensor_cache_grant_snapshot(
+        &binding.executable,
+        &sensor.r#ref,
+        &pack_ref,
+        &permission_set_refs,
+    )
+    .await?;
     Ok(RegisteredSensorAuthority {
         sensor,
         pack_ref,
@@ -1548,8 +1501,13 @@ async fn create_sensor_token_impl(
 
     let mut tx = state.db.begin().await?;
     SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
-    let authority =
-        resolve_registered_sensor_authority(&mut tx, &payload, require_exact_request_scope).await?;
+    let authority = resolve_registered_sensor_authority(
+        &mut tx,
+        &payload,
+        require_exact_request_scope,
+        workload_fence,
+    )
+    .await?;
     if !SensorWorkloadRepository::lock_current_fence(&mut tx, authority.sensor.id, workload_fence)
         .await?
     {
@@ -1759,6 +1717,7 @@ async fn refresh_request_from_sensor_identity(
     claims: &crate::auth::jwt::Claims,
     identity: &Identity,
     ttl_seconds: Option<i64>,
+    workload_fence: SensorWorkloadFence,
 ) -> Result<CreateSensorTokenRequest, ApiError> {
     let sensor_ref = sensor_ref_from_refresh_identity(claims, identity)?;
     let sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
@@ -1770,19 +1729,25 @@ async fn refresh_request_from_sensor_identity(
         .pack_ref
         .clone()
         .ok_or_else(|| ApiError::Unauthorized("Registered sensor has no pack scope".to_string()))?;
-    let triggers = TriggerRepository::find_by_sensor(&state.db, sensor.id).await?;
-    let trigger_types = canonical_string_refs(
-        &triggers
-            .into_iter()
-            .map(|trigger| trigger.r#ref)
-            .collect::<Vec<_>>(),
-    );
+    let (_, binding, _) = attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+        &state.db,
+        workload_fence.workload_id,
+        workload_fence.generation,
+    )
+    .await?
+    .ok_or_else(|| ApiError::Unauthorized("Sensor generation binding is unavailable".into()))?;
+    if binding.executable.sensor.id != sensor.id {
+        return Err(ApiError::Unauthorized(
+            "Sensor generation owner mismatch".into(),
+        ));
+    }
+    let trigger_types = binding.triggers.keys().cloned().collect::<Vec<_>>();
     if trigger_types.is_empty() {
         return Err(ApiError::Unauthorized(
             "Registered sensor has no trigger scope".to_string(),
         ));
     }
-    let permission_set_refs = registered_sensor_permission_set_refs(&sensor)?;
+    let permission_set_refs = canonical_string_refs(&binding.executable.cache_permission_set_refs);
 
     Ok(CreateSensorTokenRequest {
         sensor_ref,

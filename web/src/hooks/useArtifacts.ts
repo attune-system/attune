@@ -1,6 +1,8 @@
-import { useQuery, keepPreviousData } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { OpenAPI } from "@/api/core/OpenAPI";
 import { request as __request } from "@/api/core/request";
+import { artifactRequest } from "@/lib/artifact-request";
+import { useArtifactReconciliation } from "./useArtifactReconciliation";
 
 // Artifact types matching the backend ArtifactType enum
 export type ArtifactType =
@@ -17,8 +19,6 @@ export type ArtifactVisibility = "public" | "private";
 export type OwnerType = "system" | "pack" | "action" | "sensor" | "rule";
 
 export type RetentionPolicyType = "versions" | "days" | "hours" | "minutes";
-
-const MAX_ARTIFACT_VERSIONS_RETAINED = 100;
 
 export interface ArtifactSummary {
   id: number;
@@ -90,7 +90,19 @@ export interface PaginatedArtifacts {
     page_size: number;
     total_items: number;
     total_pages: number;
+    has_previous: boolean;
+    has_next: boolean;
   };
+}
+
+export interface ArtifactPageParams {
+  page?: number;
+  perPage?: number;
+}
+
+export interface PaginatedArtifactVersions {
+  items: ArtifactVersionSummary[];
+  pagination: PaginatedArtifacts["pagination"];
 }
 
 // ============================================================================
@@ -102,10 +114,14 @@ export interface PaginatedArtifacts {
  *
  * Uses GET /api/v1/artifacts with query params for server-side filtering.
  */
-export function useArtifactsList(params: ArtifactsListParams = {}) {
+export function useArtifactsList(
+  params: ArtifactsListParams = {},
+  paused = false,
+) {
+  useArtifactReconciliation({ scope: "list", paused });
   return useQuery({
     queryKey: ["artifacts", "list", params],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const query: Record<string, string> = {};
       if (params.page) query.page = String(params.page);
       if (params.perPage) query.per_page = String(params.perPage);
@@ -116,42 +132,67 @@ export function useArtifactsList(params: ArtifactsListParams = {}) {
       if (params.execution) query.execution = String(params.execution);
       if (params.name) query.name = params.name;
 
-      const response = await __request<PaginatedArtifacts>(OpenAPI, {
-        method: "GET",
-        url: "/api/v1/artifacts",
-        query,
-      });
+      const response = await artifactRequest(
+        __request<PaginatedArtifacts>(OpenAPI, {
+          method: "GET",
+          url: "/api/v1/artifacts",
+          query,
+        }),
+        signal,
+      );
       return response;
     },
     staleTime: 10000,
-    placeholderData: keepPreviousData,
+    // A paused browse still loads a newly selected page, but does not let a
+    // different active subscriber's prefix invalidation refresh loaded pages.
+    enabled: (query) => !paused || query.state.data === undefined,
+    refetchOnWindowFocus: !paused,
+    refetchOnReconnect: !paused,
   });
 }
 
 /**
- * Fetch all artifacts for a given execution ID.
+ * Fetch an eligible artifact page, optionally filtered for progress discovery.
  *
  * Uses the GET /api/v1/executions/{execution_id}/artifacts endpoint.
  */
 export function useExecutionArtifacts(
   executionId: number | undefined,
   isRunning = false,
+  params: ArtifactPageParams & { type?: ArtifactType } = {},
+  paused = false,
 ) {
+  useArtifactReconciliation({
+    scope: "execution",
+    id: executionId,
+    isRunning,
+    paused,
+  });
   return useQuery({
-    queryKey: ["artifacts", "execution", executionId],
-    queryFn: async () => {
-      const response = await __request<{ data: ArtifactSummary[] }>(OpenAPI, {
-        method: "GET",
-        url: "/api/v1/executions/{execution_id}/artifacts",
-        path: {
-          execution_id: executionId!,
-        },
-      });
+    queryKey: ["artifacts", "execution", executionId, params],
+    queryFn: async ({ signal }) => {
+      const response = await artifactRequest(
+        __request<PaginatedArtifacts>(OpenAPI, {
+          method: "GET",
+          url: "/api/v1/executions/{execution_id}/artifacts",
+          path: {
+            execution_id: executionId!,
+          },
+          query: {
+            page: params.page ?? 1,
+            per_page: params.perPage ?? 20,
+            type: params.type,
+          },
+        }),
+        signal,
+      );
       return response;
     },
-    enabled: !!executionId,
+    enabled: (query) =>
+      !!executionId && (!paused || query.state.data === undefined),
+    refetchOnWindowFocus: !paused,
+    refetchOnReconnect: !paused,
     staleTime: isRunning ? 3000 : 30000,
-    refetchInterval: isRunning ? 3000 : false,
   });
 }
 
@@ -161,49 +202,64 @@ export function useExecutionArtifacts(
  * @param isRunning - When true, polls every 3s for live updates. When false,
  *   uses a longer stale time and disables automatic polling.
  */
-export function useArtifact(id: number | undefined, isRunning = false) {
+export function useArtifact(
+  id: number | undefined,
+  isRunning = false,
+  paused = false,
+) {
+  useArtifactReconciliation({ scope: "detail", id, isRunning, paused });
   return useQuery({
     queryKey: ["artifacts", id],
-    queryFn: async () => {
-      const response = await __request<{ data: ArtifactResponse }>(OpenAPI, {
-        method: "GET",
-        url: "/api/v1/artifacts/{id}",
-        path: {
-          id: id!,
-        },
-      });
+    queryFn: async ({ signal }) => {
+      const response = await artifactRequest(
+        __request<{ data: ArtifactResponse }>(OpenAPI, {
+          method: "GET",
+          url: "/api/v1/artifacts/{id}",
+          path: {
+            id: id!,
+          },
+        }),
+        signal,
+      );
       return response;
     },
-    enabled: !!id,
+    enabled: (query) => !!id && (!paused || query.state.data === undefined),
+    refetchOnWindowFocus: !paused,
+    refetchOnReconnect: !paused,
     staleTime: isRunning ? 3000 : 30000,
-    refetchInterval: isRunning ? 3000 : false,
   });
 }
 
 /**
  * Fetch versions for a given artifact ID.
  */
-export function useArtifactVersions(artifactId: number | undefined) {
+export function useArtifactVersions(
+  artifactId: number | undefined,
+  paused = false,
+  params: ArtifactPageParams = {},
+) {
+  useArtifactReconciliation({ scope: "versions", id: artifactId, paused });
   return useQuery({
-    queryKey: ["artifacts", artifactId, "versions"],
-    queryFn: async () => {
-      const response = await __request<{ data: ArtifactVersionSummary[] }>(
-        OpenAPI,
-        {
+    queryKey: ["artifacts", artifactId, "versions", params],
+    queryFn: async ({ signal }) => {
+      const response = await artifactRequest(
+        __request<PaginatedArtifactVersions>(OpenAPI, {
           method: "GET",
           url: "/api/v1/artifacts/{id}/versions",
           path: {
             id: artifactId!,
           },
-        },
+          query: { page: params.page ?? 1, per_page: params.perPage ?? 20 },
+        }),
+        signal,
       );
 
-      return {
-        ...response,
-        data: response.data.slice(0, MAX_ARTIFACT_VERSIONS_RETAINED),
-      };
+      return response;
     },
-    enabled: !!artifactId,
+    enabled: (query) =>
+      !!artifactId && (!paused || query.state.data === undefined),
+    refetchOnWindowFocus: !paused,
+    refetchOnReconnect: !paused,
     staleTime: 10000,
   });
 }

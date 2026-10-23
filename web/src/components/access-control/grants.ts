@@ -10,6 +10,7 @@ import {
 import { navIcons } from "@/components/layout/navIcons";
 
 export interface GrantConstraints {
+  managing_pack_id?: number;
   pack_refs?: string[];
   owner?: string;
   owner_types?: string[];
@@ -24,6 +25,7 @@ export interface GrantConstraints {
 export interface ParsedGrant {
   resource: string;
   actions: string[];
+  scope?: "pack" | "external";
   constraints?: GrantConstraints;
 }
 
@@ -129,7 +131,41 @@ export function parseGrants(raw: unknown): ParsedGrant[] {
     (grant): grant is ParsedGrant =>
       typeof grant === "object" &&
       grant !== null &&
-      typeof (grant as ParsedGrant).resource === "string" &&
-      Array.isArray((grant as ParsedGrant).actions),
+      "resource" in grant &&
+      typeof grant.resource === "string" &&
+      "actions" in grant &&
+      Array.isArray(grant.actions) &&
+      grant.actions.every((action: unknown) => typeof action === "string") &&
+      (!("scope" in grant) ||
+        grant.scope === "pack" ||
+        grant.scope === "external"),
   );
+}
+
+// Normalized IAM grants contain server-owned IDs, not editable authored scope.
+export function permissionSetAuthoring(raw: unknown):
+  | {
+      scope: "pack" | "external";
+      grants: ParsedGrant[];
+    }
+  | undefined {
+  if (
+    typeof raw !== "object" ||
+    raw === null ||
+    !("authored_definition" in raw)
+  )
+    return;
+  const definition = raw.authored_definition;
+  if (
+    typeof definition !== "object" ||
+    definition === null ||
+    !("scope" in definition) ||
+    (definition.scope !== "pack" && definition.scope !== "external") ||
+    !("grants" in definition) ||
+    !Array.isArray(definition.grants)
+  )
+    return;
+  const grants = parseGrants(definition.grants);
+  if (grants.length !== definition.grants.length) return;
+  return { scope: definition.scope, grants };
 }

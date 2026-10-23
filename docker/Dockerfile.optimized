@@ -34,6 +34,7 @@ ENV RUST_MIN_STACK=67108864
 # Copy dependency metadata first so `cargo fetch` layer is cached
 # when only source code changes (Cargo.toml/Cargo.lock stay the same)
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ ./vendor/
 COPY crates/common/Cargo.toml ./crates/common/Cargo.toml
 COPY crates/api/Cargo.toml ./crates/api/Cargo.toml
 COPY crates/executor/Cargo.toml ./crates/executor/Cargo.toml
@@ -86,15 +87,25 @@ COPY migrations/ ./migrations/
 # a cache hit here and skip straight to the cp below.
 ARG CARGO_BUILD_JOBS=4
 ARG ATTUNE_BUILD_GIT_SHA
+# Copied source mtimes can predate artifacts from another build context.
+# Recheck local crates while retaining cached dependency compilation.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
+    for service in api executor notifier supervisor; do \
+        binary="/build/target/release/attune-${service}"; \
+        if [ -f "$binary" ] && [ ! -s "$binary" ]; then rm "$binary"; fi; \
+    done && \
+    find crates -type f -name '*.rs' -exec touch {} + && \
     cargo build --release \
     --bin attune-api \
     --bin attune-executor \
     --bin attune-notifier \
     --bin attune-supervisor \
     -j "${CARGO_BUILD_JOBS}" && \
+    for service in api executor notifier supervisor; do \
+        test -s "/build/target/release/attune-${service}" || exit 1; \
+    done && \
     mkdir -p /build/service-binaries && \
     cp /build/target/release/attune-api /build/service-binaries/api && \
     cp /build/target/release/attune-executor /build/service-binaries/executor && \

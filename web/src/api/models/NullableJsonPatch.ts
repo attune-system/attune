@@ -8,14 +8,9 @@ import type { Value } from "./Value";
  */
 export type NullableJsonPatch =
   | {
-      op: NullableJsonPatch.op;
+      op: "set";
       value: Value;
     }
   | {
-      op: NullableJsonPatch.op;
+      op: "clear";
     };
-export namespace NullableJsonPatch {
-  export enum op {
-    SET = "set",
-  }
-}

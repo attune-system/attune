@@ -15,13 +15,40 @@ pub struct PlatformHealth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentHealth {
     pub core_active: bool,
+    pub core_admitted: bool,
     pub action_host_available: bool,
     pub sensor_host_available: bool,
 }
 
 pub struct HealthRepository;
 
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct AdmittedCoreRelease {
+    pub release_id: i64,
+    pub version: String,
+    pub digest: String,
+    pub policy_revision: i64,
+}
+
 impl HealthRepository {
+    /// A release file/frozen snapshot alone is not runtime admission evidence.
+    pub async fn admitted_core(pool: &sqlx::PgPool) -> Result<Option<AdmittedCoreRelease>> {
+        let mut tx = pool.begin().await?;
+        super::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+        let core: Option<AdmittedCoreRelease> = sqlx::query_as("SELECT pr.id AS release_id, pr.version, pr.digest, r.id AS policy_revision FROM pack p JOIN pack_release pr ON pr.id = p.active_release AND pr.pack = p.id JOIN pack_runtime_policy_current c ON c.pack = p.id JOIN pack_runtime_policy_revision r ON r.id = c.revision AND r.pack = p.id AND r.release = pr.id JOIN pack_runtime_identity runtime_owner ON runtime_owner.pack = p.id JOIN identity sponsor ON sponsor.id = runtime_owner.identity AND NOT sponsor.frozen WHERE p.ref = 'core' AND r.revoked_at IS NULL AND r.policy->'owner'->>'sponsor_identity_id' = runtime_owner.identity::text")
+            .fetch_optional(&mut *tx).await?;
+        if let Some(core) = &core {
+            // Presence of a revision alone does not prove fixed approvals or
+            // retained publisher dependencies remain live.
+            super::runtime_authority::RuntimeAuthorityRepository::require_deployment_policy(
+                &mut tx,
+                core.policy_revision,
+            )
+            .await?;
+        }
+        tx.rollback().await?;
+        Ok(core)
+    }
     pub async fn platform<'e, E>(executor: E) -> Result<PlatformHealth>
     where
         E: Executor<'e, Database = Postgres>,
@@ -42,12 +69,24 @@ impl HealthRepository {
     where
         E: Executor<'e, Database = Postgres>,
     {
-        let (core_active, action_host_available, sensor_host_available) = sqlx::query_as(
-            "SELECT
+        let (core_active, core_admitted, action_host_available, sensor_host_available) =
+            sqlx::query_as(
+                "SELECT
                 EXISTS(
                     SELECT 1 FROM pack p
                     JOIN pack_release pr ON pr.id = p.active_release AND pr.pack = p.id
                     WHERE p.ref = 'core'
+                ),
+                EXISTS(
+                    SELECT 1 FROM pack p
+                    JOIN pack_release pr ON pr.id = p.active_release AND pr.pack = p.id
+                    JOIN pack_runtime_policy_current c ON c.pack = p.id
+                    JOIN pack_runtime_policy_revision r ON r.id = c.revision
+                        AND r.pack = p.id AND r.release = pr.id
+                    JOIN pack_runtime_identity runtime_owner ON runtime_owner.pack = p.id
+                    JOIN identity sponsor ON sponsor.id = runtime_owner.identity AND NOT sponsor.frozen
+                    WHERE p.ref = 'core' AND r.revoked_at IS NULL
+                        AND r.policy->'owner'->>'sponsor_identity_id' = runtime_owner.identity::text
                 ),
                 EXISTS(
                     SELECT 1 FROM worker
@@ -67,13 +106,14 @@ impl HealthRepository {
                       AND jsonb_typeof(capabilities->'runtimes') = 'array'
                       AND capabilities->'runtimes' ? 'native'
                 )",
-        )
-        .bind(HOST_HEARTBEAT_MAX_AGE_SECONDS)
-        .fetch_one(executor)
-        .await?;
+            )
+            .bind(HOST_HEARTBEAT_MAX_AGE_SECONDS)
+            .fetch_one(executor)
+            .await?;
 
         Ok(ContentHealth {
             core_active,
+            core_admitted,
             action_host_available,
             sensor_host_available,
         })

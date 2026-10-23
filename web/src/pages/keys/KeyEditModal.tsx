@@ -3,6 +3,10 @@ import { useKey, useUpdateKey } from "@/hooks/useKeys";
 import { formatJsonValue } from "@/lib/format-utils";
 import { X, Eye, EyeOff } from "lucide-react";
 import KeyOwnerDisplay from "./KeyOwnerDisplay";
+import ValueSchemaEditor from "@/components/common/ValueSchemaEditor";
+import ContractValueForm from "@/components/common/ContractValueForm";
+import { SchemaPreviewContext } from "@/api/models/SchemaPreviewContext";
+import { toJsonValue } from "@/lib/json-value";
 
 interface KeyEditModalProps {
   keyRef: string;
@@ -22,6 +26,15 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
   const [encrypted, setEncrypted] = useState(true);
   const [showValue, setShowValue] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [schemaChange, setSchemaChange] = useState<
+    { value: unknown } | undefined
+  >();
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [schemaDigest, setSchemaDigest] = useState<string | undefined>();
+  const [rebindSchema, setRebindSchema] = useState(false);
+  const [structuredEdit, setStructuredEdit] = useState<
+    { value: unknown } | undefined
+  >();
 
   const updateKeyMutation = useUpdateKey();
 
@@ -38,6 +51,10 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    if (schemaError) {
+      setError(schemaError);
+      return;
+    }
 
     try {
       const valueChanged = value !== formatJsonValue(key?.value, 2);
@@ -47,11 +64,17 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
         ref: keyRef,
         data: {
           name: name !== key?.name ? name : undefined,
-          value:
-            valueChanged || encryptionChanged
-              ? parseKeyValue(value, key?.value)
+          value: structuredEdit
+            ? toJsonValue(structuredEdit.value)
+            : valueChanged
+              ? toJsonValue(parseKeyValue(value, key?.value))
               : undefined,
           encrypted: encryptionChanged ? encrypted : undefined,
+          ...(schemaChange
+            ? { value_schema: toJsonValue(schemaChange.value) }
+            : {}),
+          ...(rebindSchema ? { rebind_schema: true } : {}),
+          ...(schemaDigest ? { schema_digest: schemaDigest } : {}),
         },
       });
       onClose();
@@ -103,6 +126,29 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
         </div>
 
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
+          <ValueSchemaEditor
+            key={key.ref}
+            value={key.value_schema}
+            onChange={(value) => setSchemaChange({ value })}
+            onError={setSchemaError}
+            onDigest={setSchemaDigest}
+          />
+          {key.value_schema != null && (
+            <label className="flex gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={rebindSchema}
+                onChange={(event) => setRebindSchema(event.target.checked)}
+              />
+              Rebind to current installed type revisions and revalidate the
+              complete value
+            </label>
+          )}
+          {key.schema_digest && (
+            <p className="text-xs text-gray-600 break-all">
+              Assigned contract: {key.schema_digest}
+            </p>
+          )}
           {error && (
             <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
               {error}
@@ -157,12 +203,48 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
             >
               Value <span className="text-red-500">*</span>
             </label>
-            <div className="relative">
+            {(schemaChange
+              ? schemaChange.value != null
+              : key.value_schema != null) && (
+              <button
+                type="button"
+                onClick={() =>
+                  setStructuredEdit({ value: key.encrypted ? "" : key.value })
+                }
+                className="text-sm text-blue-600"
+              >
+                Replace complete value with schema controls
+              </button>
+            )}
+            {structuredEdit && (
+              <ContractValueForm
+                schema={schemaChange ? schemaChange.value : key.value_schema}
+                contract={
+                  !schemaChange && !rebindSchema
+                    ? key.schema_binding
+                    : undefined
+                }
+                context={SchemaPreviewContext.SINGLE_VALUE}
+                value={structuredEdit.value}
+                onChange={(value) => setStructuredEdit({ value })}
+                maskValue={encrypted}
+                disabled={updateKeyMutation.isPending}
+              />
+            )}
+            {structuredEdit && (
+              <button
+                type="button"
+                onClick={() => setStructuredEdit(undefined)}
+              >
+                Keep existing value
+              </button>
+            )}
+            <div className="relative" hidden={structuredEdit !== undefined}>
               <textarea
                 id="value"
                 value={value}
                 onChange={(e) => setValue(e.target.value)}
-                required
+                required={structuredEdit === undefined}
                 rows={6}
                 className={`w-full px-3 py-2 pr-10 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm ${
                   !showValue ? "text-security-disc" : ""

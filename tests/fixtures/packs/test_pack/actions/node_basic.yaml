@@ -1,4 +1,5 @@
-name: node_basic
+ref: test_pack.node_basic
+label: Node basic
 description: "Basic Node.js action"
 enabled: true
 runner_type: node

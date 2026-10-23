@@ -21,6 +21,8 @@ use attune_common::runtime_log_mirror::{RuntimeLogMirror, RuntimeLogSource, Runt
 /// Configuration for sensor log rotation.
 #[derive(Debug, Clone)]
 pub struct SensorLogConfig {
+    /// Immutable admitted source for each version allocated by this process.
+    pub generation_binding_id: Option<i64>,
     /// Maximum bytes per log file before rotation.
     pub max_bytes: u64,
     /// Number of legacy raw rotated files to keep when artifact versioning is unavailable.
@@ -35,6 +37,7 @@ pub struct SensorLogConfig {
 impl Default for SensorLogConfig {
     fn default() -> Self {
         Self {
+            generation_binding_id: None,
             max_bytes: 10 * 1024 * 1024, // 10 MB
             max_files: 4,
             retention_policy: RetentionPolicyType::Versions,
@@ -72,6 +75,7 @@ pub struct RotatingLogWriter {
     config: SensorLogConfig,
     versioning: SensorLogVersioning,
     writer: Option<attune_common::log_stream::SegmentedLogWriter>,
+    active_version: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +114,7 @@ impl RotatingLogWriter {
             config,
             versioning: SensorLogVersioning { pool, target },
             writer: None,
+            active_version: None,
         }
     }
 
@@ -145,6 +150,13 @@ impl RotatingLogWriter {
             } else {
                 bytes.len()
             };
+            if let (Some(generation), Some(version)) =
+                (self.config.generation_binding_id, self.active_version)
+            {
+                let mut connection = self.versioning.pool.acquire().await?;
+                attune_common::repositories::sensor_schema::SensorSchemaRepository::attach_current_log_deliveries(
+                    &mut connection, version, generation).await?;
+            }
             self.writer
                 .as_ref()
                 .expect("writer allocated")
@@ -169,9 +181,9 @@ impl RotatingLogWriter {
 
     async fn allocate_new_version_file(&mut self) -> anyhow::Result<()> {
         let versioning = &self.versioning;
-
-        let version = ArtifactVersionRepository::create_file_backed(
-            &versioning.pool,
+        let mut tx = versioning.pool.begin().await?;
+        let version = ArtifactVersionRepository::create_file_backed_with_conn(
+            &mut tx,
             versioning.target.artifact_id,
             &versioning.target.artifact_ref,
             "text/plain".to_string(),
@@ -183,6 +195,13 @@ impl RotatingLogWriter {
             Some("sensor".to_string()),
         )
         .await?;
+        if let Some(binding_id) = self.config.generation_binding_id {
+            attune_common::repositories::sensor_schema::SensorSchemaRepository::attach_log_version(
+                &mut tx, version.id, binding_id,
+            )
+            .await?;
+        }
+        tx.commit().await?;
         info!(
             artifact_id = versioning.target.artifact_id,
             artifact_ref = %versioning.target.artifact_ref,
@@ -209,6 +228,7 @@ impl RotatingLogWriter {
             self.config.segment_writer,
         )?);
         self.relative_path = file_path;
+        self.active_version = Some(version.id);
         self.current_size = 0;
         Ok(())
     }
@@ -218,6 +238,7 @@ impl RotatingLogWriter {
             return Ok(());
         };
         writer.seal(false).await?;
+        self.active_version = None;
         Ok(())
     }
 }

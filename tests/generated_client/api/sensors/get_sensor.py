@@ -7,18 +7,27 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.api_response_sensor_response import ApiResponseSensorResponse
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     ref: str,
+    *,
+    include_secret_values: bool | Unset = UNSET,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    params["include_secret_values"] = include_secret_values
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/api/v1/sensors/{ref}".format(
             ref=quote(str(ref), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -61,11 +70,13 @@ def sync_detailed(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
+    include_secret_values: bool | Unset = UNSET,
 ) -> Response[Any | ApiResponseSensorResponse]:
     """Get a single sensor by reference
 
     Args:
         ref (str):
+        include_secret_values (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -77,6 +88,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         ref=ref,
+        include_secret_values=include_secret_values,
     )
 
     response = client.get_httpx_client().request(
@@ -90,11 +102,13 @@ def sync(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
+    include_secret_values: bool | Unset = UNSET,
 ) -> Any | ApiResponseSensorResponse | None:
     """Get a single sensor by reference
 
     Args:
         ref (str):
+        include_secret_values (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -107,6 +121,7 @@ def sync(
     return sync_detailed(
         ref=ref,
         client=client,
+        include_secret_values=include_secret_values,
     ).parsed
 
 
@@ -114,11 +129,13 @@ async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
+    include_secret_values: bool | Unset = UNSET,
 ) -> Response[Any | ApiResponseSensorResponse]:
     """Get a single sensor by reference
 
     Args:
         ref (str):
+        include_secret_values (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -130,6 +147,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         ref=ref,
+        include_secret_values=include_secret_values,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -141,11 +159,13 @@ async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
+    include_secret_values: bool | Unset = UNSET,
 ) -> Any | ApiResponseSensorResponse | None:
     """Get a single sensor by reference
 
     Args:
         ref (str):
+        include_secret_values (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -159,5 +179,6 @@ async def asyncio(
         await asyncio_detailed(
             ref=ref,
             client=client,
+            include_secret_values=include_secret_values,
         )
     ).parsed

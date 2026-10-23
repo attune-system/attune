@@ -194,7 +194,7 @@ tags: [alerts, external]
 - `node`: launched with Node.js for JavaScript/TypeScript-style sensors.
 - `shell`: launched through shell runtime for simple wrappers only; avoid complex long-running logic in shell.
 
-All sensor processes receive stdin as null and stdout/stderr as captured pipes. They should run until SIGTERM/SIGINT, then stop monitors, flush/drop pending events intentionally, close API/MQ clients, and exit cleanly.
+Sensor processes receive one stdin JSON object with flat `config` and initial `triggers` sections, followed by EOF. Both sections may contain secrets. Stdout/stderr remain captured pipes. Run until SIGTERM/SIGINT, then stop monitors, close clients, and exit cleanly.
 
 ## Environment Provided to Sensor Processes
 
@@ -206,7 +206,6 @@ The sensor manager currently sets these variables when it starts a process:
 | `ATTUNE_API_TOKEN` | JWT sensor token minted for this sensor process, default TTL 24 hours. Do not log it. |
 | `ATTUNE_SENSOR_ID` | Sensor database id. |
 | `ATTUNE_SENSOR_REF` | Sensor ref, for example `core.timer_sensor`. |
-| `ATTUNE_SENSOR_TRIGGERS` | JSON array of active rule instances for the linked triggers at process start: `[{"id": 123, "ref": "rule.ref", "config": {...}}]`. |
 | `ATTUNE_MQ_URL` | RabbitMQ URL if the sensor wants lifecycle messages. |
 | `ATTUNE_MQ_EXCHANGE` | Currently set to `attune.events`. |
 | `ATTUNE_ARTIFACTS_DIR` | Artifact directory for sensor-owned files and local staging. |
@@ -231,7 +230,7 @@ When writing Python, Node.js, or Java sensors, prefer the official Attune SDKs f
 | Node.js | <https://github.com/attune-system/js-attune-sdk> | `npm install attune amqplib` |
 | Java | <https://github.com/attune-system/java-attune-sdk> | Maven `org.attunedev:attune-sdk:0.1.0`; add `com.rabbitmq:amqp-client:5.21.0` for MQ lifecycle support |
 
-Keep the sensor YAML conventions unchanged: set `runner_type`, `runtime_version` when needed, `entry_point`, and `trigger_types`. The SDKs read `ATTUNE_API_URL`, `ATTUNE_API_TOKEN`, `ATTUNE_SENSOR_REF`, `ATTUNE_SENSOR_TRIGGERS`, and MQ variables from the environment.
+Keep the sensor YAML conventions unchanged: set `runner_type`, optional `runtime_version`, `entry_point`, and `trigger_types`. SDKs read connection metadata from the environment and consume settings and initial rule configurations from stdin JSON. They do not read configuration environment variables.
 
 ### Python SDK polling sensor
 
@@ -367,7 +366,7 @@ At sensor manager startup, enabled sensors are started only when at least one en
 
 - not running + now has active rules: start it, if placement matches this sensor worker;
 - running + no active rules: stop it;
-- running + still active: restart it to refresh `ATTUNE_SENSOR_TRIGGERS` and process code/config;
+- running + still active: apply notifier lifecycle updates in process;
 - running + placement no longer matches: stop it.
 
 Pack registration can restart running sensors for that pack; pack deletion stops affected sensors. A sensor process may also connect to RabbitMQ and consume rule lifecycle messages for lower-latency updates, but the manager-level reconciliation/restart path is the current platform baseline.

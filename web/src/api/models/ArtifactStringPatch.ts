@@ -4,14 +4,9 @@
 /* eslint-disable */
 export type ArtifactStringPatch =
   | {
-      op: ArtifactStringPatch.op;
+      op: "set";
       value: string;
     }
   | {
-      op: ArtifactStringPatch.op;
+      op: "clear";
     };
-export namespace ArtifactStringPatch {
-  export enum op {
-    SET = "set",
-  }
-}

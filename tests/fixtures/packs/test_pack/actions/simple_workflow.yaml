@@ -1,0 +1,24 @@
+ref: test_pack.simple_workflow
+label: Simple workflow
+description: Three sequential echo tasks for workflow integration tests
+workflow_file: workflows/simple_workflow.workflow.yaml
+parameters:
+  workflow_message:
+    type: string
+    default: Starting workflow...
+  workflow_delay:
+    type: integer
+    default: 2
+    minimum: 0
+    maximum: 30
+output:
+  workflow_result:
+    type: string
+  total_tasks:
+    type: integer
+  start_time:
+    type: string
+  end_time:
+    type: string
+  all_tasks_succeeded:
+    type: boolean

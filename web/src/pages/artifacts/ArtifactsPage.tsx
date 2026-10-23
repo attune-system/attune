@@ -13,6 +13,7 @@ import {
   type OwnerType,
 } from "@/hooks/useArtifacts";
 import { useArtifactStream } from "@/hooks/useArtifactStream";
+import { useArtifactLivePage } from "@/hooks/useArtifactLivePage";
 import {
   TYPE_OPTIONS,
   VISIBILITY_OPTIONS,
@@ -313,8 +314,12 @@ export default function ArtifactsPage() {
   ]);
 
   const [livePaused, setLivePaused] = useState(false);
+  useArtifactLivePage({ scope: "list", page, setPage, paused: livePaused });
 
-  const { data, isLoading, isFetching, error } = useArtifactsList(queryParams);
+  const { data, isLoading, isFetching, error } = useArtifactsList(
+    queryParams,
+    livePaused,
+  );
 
   // Subscribe to real-time artifact updates
   const { isConnected } = useArtifactStream({
@@ -366,6 +371,10 @@ export default function ArtifactsPage() {
       </div>
 
       {/* Filters */}
+      <p className="mb-3 text-sm text-gray-500">
+        Live refreshes return to page one. Pause updates to browse older pages;
+        resuming starts from page one.
+      </p>
       <div className="bg-white shadow rounded-lg p-4 mb-6">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">

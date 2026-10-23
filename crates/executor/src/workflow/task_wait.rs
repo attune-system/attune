@@ -168,6 +168,7 @@ mod tests {
             priority: 0,
             status,
             payload: json!({"secret": "payload"}),
+            schema_binding: None,
             metadata: json!({"secret": "metadata"}),
             trace_tag: None,
             enqueue_source: "test".to_string(),

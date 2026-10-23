@@ -15,7 +15,7 @@ use attune_common::{
             CreateCacheGenerationInput, CreateCacheGenerationResult, CreateCacheNamespaceInput,
         },
         event::{CreateEnforcementInput, EnforcementRepository},
-        execution::{CreateExecutionInput, ExecutionRepository},
+        execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
         retention::RetentionRepository,
         workflow::{
             CreateWorkflowDefinitionInput, CreateWorkflowExecutionInput,
@@ -24,7 +24,7 @@ use attune_common::{
         workflow_cache_iteration::{
             CreateWorkflowCacheIterationInput, WorkflowCacheIterationRepository,
         },
-        Create, FindById, PackRepository,
+        Create, FindById, PackRepository, Update,
     },
     test_database::TestDatabase,
 };
@@ -52,6 +52,10 @@ struct Fixture {
 
 impl Fixture {
     async fn create() -> Self {
+        Self::create_with_parent_state(true).await
+    }
+
+    async fn create_with_parent_state(completed: bool) -> Self {
         let db = helpers::create_test_pool().await.unwrap();
         let pool = db.pool();
         // This suite measures delete ordering, not partition creation latency.
@@ -71,7 +75,7 @@ impl Fixture {
             pool,
             CreateExecutionInput {
                 action_ref: format!("{}.workflow", pack.r#ref),
-                status: ExecutionStatus::Completed,
+                status: ExecutionStatus::Running,
                 ..Default::default()
             },
         )
@@ -141,6 +145,20 @@ impl Fixture {
             iterations.push(iteration.id);
         }
         pins.commit().await.unwrap();
+        // Establish orchestration and its pins while the parent is admissible,
+        // then retain the original completed-parent deletion scenario.
+        if completed {
+            ExecutionRepository::update(
+                pool,
+                execution.id,
+                UpdateExecutionInput {
+                    status: Some(ExecutionStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
         publish(pool, namespace.id, "replacement", Some(generation)).await;
         sqlx::query("UPDATE cache_generation SET retired=NOW()-INTERVAL '1 day', readable_until=NOW()-INTERVAL '1 hour' WHERE id=$1")
             .bind(generation).execute(pool).await.unwrap();
@@ -264,7 +282,9 @@ async fn parent_wait(pool: &PgPool, waiter: i32, blocker: i32, mode: &str) {
 async fn mutation_wait(pool: &PgPool, waiter: i32, blocker: i32) {
     tokio::time::timeout(StdDuration::from_secs(15), async {
         loop {
-            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND classid=7821101 AND objid=0 AND objsubid=2 AND NOT granted) AND $2=ANY(pg_blocking_pids($1))")
+            // Evidence reclamation now precedes cache mutation admission for
+            // destructive paths. Either exact gate must block before row locks.
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted AND ((classid=7821101 AND objid=0 AND objsubid=2) OR (classid=((hashtextextended(current_schema() || ':named-type-graph',0) >> 32) & 4294967295)::OID AND objid=(hashtextextended(current_schema() || ':named-type-graph',0) & 4294967295)::OID AND objsubid=1))) AND $2=ANY(pg_blocking_pids($1))")
                 .bind(waiter).bind(blocker).fetch_one(pool).await.unwrap();
             if waiting { break; }
             tokio::task::yield_now().await;
@@ -712,7 +732,7 @@ async fn multi_generation_cascades_wait_before_rows_for_reverse_order_pin_mutati
         DeleteTarget::Definition,
         DeleteTarget::Workflow,
     ] {
-        let fixture = Fixture::create().await;
+        let fixture = Fixture::create_with_parent_state(false).await;
         let pool = fixture.db.pool();
         let namespace = CacheGenerationRepository::find_by_id(pool, fixture.generation)
             .await
@@ -729,7 +749,7 @@ async fn multi_generation_cascades_wait_before_rows_for_reverse_order_pin_mutati
             pool,
             CreateExecutionInput {
                 action_ref: "cascade.pinner".into(),
-                status: ExecutionStatus::Completed,
+                status: ExecutionStatus::Running,
                 ..Default::default()
             },
         )
@@ -768,6 +788,16 @@ async fn multi_generation_cascades_wait_before_rows_for_reverse_order_pin_mutati
         .await
         .unwrap();
         initial.commit().await.unwrap();
+        ExecutionRepository::update(
+            pool,
+            fixture.execution,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let before_a = counters(pool, fixture.generation).await;
         let before_b = counters(pool, generation_b).await;
         assert_eq!((before_a.0, before_b.0), (2, 1));
@@ -813,6 +843,16 @@ async fn multi_generation_cascades_wait_before_rows_for_reverse_order_pin_mutati
         let (deleted, ()) = tokio::join!(fixture.delete(&mut deletion, target), observation);
         assert!(deleted);
         deletion.commit().await.unwrap();
+        ExecutionRepository::update(
+            pool,
+            second_execution.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let retained = if matches!(target, DeleteTarget::Workflow) {
             1
         } else {

@@ -43,6 +43,11 @@ pub struct KeyVisibility {
 /// by the caller before reaching SQL; they are not represented here.
 #[derive(Debug, Clone, Default)]
 pub struct KeyGrantFilter {
+    pub pinned_targets: Option<Vec<crate::runtime_authority::BoundRuntimeTarget>>,
+    pub pinned_owners: Option<Vec<(String, Id, Option<Id>)>>,
+    pub pinned_packs: Option<Vec<Id>>,
+    pub ownership: KeyOwnershipScope,
+    pub pack_refs: Option<Vec<String>>,
     pub owner_types: Option<Vec<OwnerType>>,
     pub owner: Option<OwnerConstraint>,
     pub owner_refs: Option<Vec<String>>,
@@ -54,6 +59,77 @@ pub struct KeyGrantFilter {
     /// that are not owner-scoped never grant visibility into another
     /// identity's `owner_type = 'identity'` keys.
     pub owner_scoped: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum KeyOwnershipScope {
+    #[default]
+    Any,
+    ManagedPack(Id),
+    Pack(Id),
+    Action(Id),
+}
+
+impl KeyGrantFilter {
+    /// Compile recorded constraints without erasing their managing-pack envelope.
+    /// Human Key authorization does not populate pack context and keeps its
+    /// separate compiler until the canonical IAM conversion is complete.
+    pub fn from_recorded_grant(
+        grant: &crate::rbac::Grant,
+        ownership: KeyOwnershipScope,
+    ) -> Option<Self> {
+        use crate::rbac::{Action, ExecutionScopeConstraint, Resource};
+        if grant.resource != Resource::Keys || !grant.actions.contains(&Action::Read) {
+            return None;
+        }
+        let Some(scope) = &grant.constraints else {
+            return Some(Self {
+                ownership,
+                ..Default::default()
+            });
+        };
+        let ownership = if let Some(pack) = scope.managing_pack_id {
+            match ownership {
+                KeyOwnershipScope::Any => KeyOwnershipScope::ManagedPack(pack),
+                KeyOwnershipScope::ManagedPack(existing) if existing == pack => ownership,
+                _ => return None,
+            }
+        } else {
+            ownership
+        };
+        if scope.pack_owner.is_some()
+            || scope.pack_state.is_some()
+            || scope.visibility.is_some()
+            || matches!(
+                scope.execution_scope,
+                Some(ExecutionScopeConstraint::SelfOnly | ExecutionScopeConstraint::Descendants)
+            )
+            || scope
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| !attributes.is_empty())
+        {
+            return None;
+        }
+        Some(Self {
+            pinned_targets: None,
+            pinned_owners: None,
+            pinned_packs: None,
+            ownership,
+            pack_refs: scope.pack_refs.clone(),
+            owner_types: scope.owner_types.clone(),
+            owner: scope.owner,
+            owner_refs: scope.owner_refs.clone(),
+            refs: scope.refs.clone(),
+            ids: scope.ids.clone(),
+            encrypted: scope.encrypted,
+            owner_scoped: scope.owner.is_some()
+                || scope.owner_types.is_some()
+                || scope.owner_refs.is_some()
+                || scope.refs.is_some()
+                || scope.ids.is_some(),
+        })
+    }
 }
 
 /// Result of [`KeyRepository::search`].
@@ -68,6 +144,28 @@ pub struct KeyRepository;
 pub const SELECT_COLUMNS: &str = "id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted, encryption_key_hash, value, created, updated";
 
 impl KeyRepository {
+    pub async fn find_by_ref_for_share(
+        connection: &mut sqlx::PgConnection,
+        key_ref: &str,
+    ) -> Result<Option<Key>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {SELECT_COLUMNS} FROM key WHERE ref = $1 FOR SHARE"
+        ))
+        .bind(key_ref)
+        .fetch_optional(connection)
+        .await?)
+    }
+    pub async fn find_by_ref_for_update(
+        connection: &mut sqlx::PgConnection,
+        key_ref: &str,
+    ) -> Result<Option<Key>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {SELECT_COLUMNS} FROM key WHERE ref = $1 FOR UPDATE"
+        ))
+        .bind(key_ref)
+        .fetch_optional(connection)
+        .await?)
+    }
     pub async fn find_by_refs<'e, E>(executor: E, refs: &[String]) -> Result<Vec<Key>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
@@ -253,8 +351,16 @@ impl KeyRepository {
     /// All filter fields are combinable (AND). Pagination is server-side.
     pub async fn search<'e, E>(db: E, filters: &KeySearchFilters) -> Result<KeySearchResult>
     where
-        E: Executor<'e, Database = Postgres> + Copy + 'e,
+        E: sqlx::Acquire<'e, Database = Postgres> + Send + 'e,
     {
+        let mut connection = db.acquire().await?;
+        Self::search_with_connection(&mut connection, filters).await
+    }
+
+    pub async fn search_with_connection(
+        connection: &mut sqlx::PgConnection,
+        filters: &KeySearchFilters,
+    ) -> Result<KeySearchResult> {
         let select_cols = "id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted, encryption_key_hash, value, created, updated";
 
         let mut qb: QueryBuilder<'_, Postgres> =
@@ -305,7 +411,10 @@ impl KeyRepository {
         let _ = has_where;
 
         // Count
-        let total: i64 = count_qb.build_query_scalar().fetch_one(db).await?;
+        let total: i64 = count_qb
+            .build_query_scalar()
+            .fetch_one(&mut *connection)
+            .await?;
         let total = total.max(0) as u64;
 
         // Data query
@@ -315,7 +424,7 @@ impl KeyRepository {
         qb.push(" OFFSET ");
         qb.push_bind(filters.offset as i64);
 
-        let rows: Vec<Key> = qb.build_query_as().fetch_all(db).await?;
+        let rows: Vec<Key> = qb.build_query_as().fetch_all(&mut *connection).await?;
 
         Ok(KeySearchResult { rows, total })
     }
@@ -354,6 +463,61 @@ fn push_grant_clause(qb: &mut QueryBuilder<'_, Postgres>, identity_id: Id, grant
                 qb.push(" AND ");
             }
         };
+    }
+
+    match grant.ownership {
+        KeyOwnershipScope::Any => {}
+        KeyOwnershipScope::ManagedPack(pack) => {
+            and_sep!();
+            qb.push(KEY_MANAGING_PACK_ID_SQL)
+                .push(" = ")
+                .push_bind(pack);
+        }
+        KeyOwnershipScope::Pack(pack) => {
+            and_sep!();
+            qb.push("(key.owner_type = 'pack' AND key.owner_pack = ")
+                .push_bind(pack)
+                .push(")");
+        }
+        KeyOwnershipScope::Action(action) => {
+            and_sep!();
+            qb.push("(key.owner_type = 'action' AND key.owner_action = ")
+                .push_bind(action)
+                .push(")");
+        }
+    }
+    if let Some(owners) = &grant.pinned_owners {
+        and_sep!();
+        super::runtime_target_binding::push_owner_clause(
+            qb,
+            "key",
+            KEY_MANAGING_PACK_ID_SQL,
+            owners,
+        );
+    }
+    if let Some(targets) = &grant.pinned_targets {
+        and_sep!();
+        super::runtime_target_binding::push_target_clause(
+            qb,
+            "key",
+            KEY_MANAGING_PACK_ID_SQL,
+            targets,
+        );
+    }
+    if let Some(packs) = &grant.pinned_packs {
+        and_sep!();
+        qb.push(KEY_MANAGING_PACK_ID_SQL)
+            .push(" = ANY(")
+            .push_bind(packs.clone())
+            .push(")");
+    }
+    if let Some(pack_refs) = &grant.pack_refs {
+        and_sep!();
+        qb.push("EXISTS (SELECT 1 FROM pack scoped_pack WHERE scoped_pack.id = ")
+            .push(KEY_MANAGING_PACK_ID_SQL)
+            .push(" AND scoped_pack.ref = ANY(")
+            .push_bind(pack_refs.clone())
+            .push("))");
     }
 
     if let Some(owner_types) = &grant.owner_types {
@@ -467,4 +631,61 @@ fn push_grant_clause(qb: &mut QueryBuilder<'_, Postgres>, identity_id: Id, grant
     }
 
     qb.push(")");
+}
+
+const KEY_MANAGING_PACK_ID_SQL: &str = "(CASE key.owner_type \
+    WHEN 'pack' THEN (SELECT p.id FROM pack p WHERE p.id = key.owner_pack) \
+    WHEN 'action' THEN (SELECT a.pack FROM action a WHERE a.id = key.owner_action AND a.management_origin = 'pack') \
+    WHEN 'sensor' THEN (SELECT s.pack FROM sensor s WHERE s.id = key.owner_sensor AND s.management_origin = 'pack') \
+    ELSE NULL END)";
+
+#[cfg(test)]
+mod recorded_filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recorded_filters_retain_owner_envelopes_and_narrowing_constraints() {
+        let grant = serde_json::from_value(json!({"resource":"keys","actions":["read"],
+            "constraints":{"pack_refs":["local"],"encrypted":true}}))
+        .unwrap();
+        let filter =
+            KeyGrantFilter::from_recorded_grant(&grant, KeyOwnershipScope::ManagedPack(42))
+                .unwrap();
+        assert!(matches!(
+            filter.ownership,
+            KeyOwnershipScope::ManagedPack(42)
+        ));
+        assert_eq!(filter.pack_refs, Some(vec!["local".into()]));
+        assert_eq!(filter.encrypted, Some(true));
+        let mut query = QueryBuilder::<Postgres>::new("SELECT id FROM key WHERE ");
+        push_grant_clause(&mut query, 17, &filter);
+        let sql = query.sql();
+        assert!(sql.contains("a.management_origin = 'pack'"));
+        assert!(sql.contains("s.management_origin = 'pack'"));
+        assert!(sql.contains("scoped_pack.ref = ANY("));
+        assert!(!sql.contains("LIKE"));
+    }
+
+    #[test]
+    fn recorded_filters_reject_unpopulated_context_and_non_read_capabilities() {
+        for constraints in [
+            json!({"visibility":["public"]}),
+            json!({"execution_scope":"self"}),
+            json!({"attributes":{"team":"ops"}}),
+        ] {
+            let grant = serde_json::from_value(
+                json!({"resource":"keys","actions":["read"],"constraints":constraints}),
+            )
+            .unwrap();
+            assert!(KeyGrantFilter::from_recorded_grant(&grant, KeyOwnershipScope::Any).is_none());
+        }
+        for value in [
+            json!({"resource":"keys","actions":["use"]}),
+            json!({"resource":"events","actions":["read"]}),
+        ] {
+            let grant = serde_json::from_value(value).unwrap();
+            assert!(KeyGrantFilter::from_recorded_grant(&grant, KeyOwnershipScope::Any).is_none());
+        }
+    }
 }

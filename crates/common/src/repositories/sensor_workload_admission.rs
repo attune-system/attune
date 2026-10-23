@@ -33,7 +33,16 @@ impl SensorWorkloadAdmissionRepository {
         pool: &PgPool,
         input: AcquireSensorWorkloadInput,
     ) -> Result<AcquireEligibleSensorWorkloadOutcome> {
+        Self::acquire_with_encryption_key(pool, input, None).await
+    }
+
+    pub async fn acquire_with_encryption_key(
+        pool: &PgPool,
+        input: AcquireSensorWorkloadInput,
+        encryption_key: Option<&str>,
+    ) -> Result<AcquireEligibleSensorWorkloadOutcome> {
         let mut tx = pool.begin().await?;
+        super::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
         SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
         if !Self::lock_worker_capacity(&mut tx, input.worker_id, input.sensor_id).await? {
             tx.commit().await?;
@@ -54,7 +63,15 @@ impl SensorWorkloadAdmissionRepository {
         let outcome = match outcome {
             AcquireSensorWorkloadOutcome::Acquired(lease) => {
                 match SensorWorkloadRepository::begin_process_with_conn(&mut tx, lease).await? {
-                    Some(workload) => AcquireEligibleSensorWorkloadOutcome::Acquired(workload),
+                    Some(workload) => {
+                        super::sensor_schema::SensorSchemaRepository::admit(
+                            &mut tx,
+                            &workload,
+                            encryption_key,
+                        )
+                        .await?;
+                        AcquireEligibleSensorWorkloadOutcome::Acquired(workload)
+                    }
                     None => {
                         tx.rollback().await?;
                         return Ok(AcquireEligibleSensorWorkloadOutcome::Ineligible);
@@ -109,6 +126,7 @@ impl SensorWorkloadAdmissionRepository {
         input: SensorWorkloadLeaseInput,
     ) -> Result<RenewEligibleSensorWorkloadOutcome> {
         let mut tx = pool.begin().await?;
+        super::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
         SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
         if !SensorAdmissionRepository::worker_is_eligible_for_active_workload(
             &mut tx,

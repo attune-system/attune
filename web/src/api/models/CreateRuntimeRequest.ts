@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { Value } from "./Value";
 /**
  * Request DTO for creating a runtime.
  */
@@ -18,10 +19,7 @@ export type CreateRuntimeRequest = {
    * Runtime execution configuration
    */
   execution_config?: Record<string, any>;
-  /**
-   * Optional installation metadata
-   */
-  installation?: any | null;
+  installation?: null | Value;
   /**
    * Display name
    */

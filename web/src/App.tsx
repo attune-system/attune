@@ -21,6 +21,7 @@ const PacksPage = lazy(() => import("@/pages/packs/PacksPage"));
 const PackCreatePage = lazy(() => import("@/pages/packs/PackCreatePage"));
 const PackInstallPage = lazy(() => import("@/pages/packs/PackInstallPage"));
 const PackEditPage = lazy(() => import("@/pages/packs/PackEditPage"));
+const PackApprovalsPage = lazy(() => import("@/pages/packs/PackApprovalsPage"));
 const PackTestDetailPage = lazy(
   () => import("@/pages/packs/PackTestDetailPage"),
 );
@@ -91,6 +92,9 @@ const IdentityDetailPage = lazy(
 const PermissionSetDetailPage = lazy(
   () => import("@/pages/access-control/PermissionSetDetailPage"),
 );
+const PermissionSetCreatePage = lazy(
+  () => import("@/pages/access-control/PermissionSetCreatePage"),
+);
 
 function PageLoader() {
   return (
@@ -144,6 +148,10 @@ function App() {
                   />
                   <Route path="packs/:ref" element={<PacksPage />} />
                   <Route path="packs/:ref/edit" element={<PackEditPage />} />
+                  <Route
+                    path="packs/:ref/approvals"
+                    element={<PackApprovalsPage />}
+                  />
                   <Route path="actions" element={<ActionsPage />} />
                   <Route path="runtimes" element={<RuntimesPage />} />
                   <Route path="runtimes/new" element={<RuntimesPage />} />
@@ -221,6 +229,10 @@ function App() {
                   <Route
                     path="access-control/identities/:id"
                     element={<IdentityDetailPage />}
+                  />
+                  <Route
+                    path="access-control/permission-sets/new"
+                    element={<PermissionSetCreatePage />}
                   />
                   <Route
                     path="access-control/permission-sets/:ref"

@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { Value } from "./Value";
 /**
  * Standard API response wrapper
  */
@@ -15,7 +16,7 @@ export type ApiResponse_RuntimeResponse = {
     distributions: Record<string, any>;
     execution_config: Record<string, any>;
     id: number;
-    installation: any | null;
+    installation?: null | Value;
     name: string;
     pack?: number | null;
     pack_ref?: string | null;

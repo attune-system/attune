@@ -1,10 +1,9 @@
 //! Read-only validation for an unpacked Attune pack directory.
 
-use crate::action_visibility::collect_workflow_action_refs;
 use crate::dashboard_spec::validate_dashboard_spec;
 use crate::pack_cache_definition::{CacheDefinitionOwnerType, CacheDefinitionYaml};
 use crate::policy_control::parse_policy_controls;
-use crate::queue_definition::parse_work_queue_definition_yaml;
+use crate::queue_definition::parse_work_queue_definition_metadata;
 use crate::rbac::{validate_cache_grant_constraints, Grant};
 use crate::schema::RefValidator;
 use crate::workflow::parser::parse_workflow_yaml;
@@ -16,6 +15,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 const COMPONENT_DIRS: &[&str] = &[
+    "types",
     "permission_sets",
     "runtimes",
     "triggers",
@@ -32,20 +32,63 @@ const MAX_TRAVERSED_ENTRIES: usize = 10_000;
 const MAX_METADATA_FILES: usize = 2_000;
 const MAX_DIAGNOSTICS: usize = 1_000;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum PackDiagnosticSeverity {
+    #[default]
     Error,
     Warning,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct PackDiagnostic {
     pub severity: PackDiagnosticSeverity,
     pub code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_chain: Vec<String>,
+}
+
+impl PackDiagnostic {
+    pub fn at(
+        file: impl Into<String>,
+        field: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: Some(file.into()),
+            metadata_path: Some(field.into()),
+            code: "pack.metadata_invalid".into(),
+            message: message.into(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +108,7 @@ pub struct PackCheckReport {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct LocalReference {
+    metadata_path: String,
     source_path: String,
     source_kind: &'static str,
     target_kind: &'static str,
@@ -81,6 +125,8 @@ struct PackChecker {
     traversal_limited: bool,
     metadata_limited: bool,
     diagnostics_limited: bool,
+    type_registry: crate::value_schema::RegistryView,
+    type_dependencies: BTreeSet<String>,
 }
 
 /// Validate all metadata that the pack registrar discovers without contacting an Attune server.
@@ -114,6 +160,8 @@ pub fn check_pack(path: impl AsRef<Path>) -> PackCheckReport {
         traversal_limited: false,
         metadata_limited: false,
         diagnostics_limited: false,
+        type_registry: crate::value_schema::RegistryView::new(),
+        type_dependencies: BTreeSet::new(),
     };
     checker.run();
     checker.finish()
@@ -159,6 +207,58 @@ impl PackChecker {
         }
 
         self.check_manifest();
+        if let Some(pack_ref) = self.report.pack_ref.clone() {
+            match crate::pack_registry::schema_types::read_definitions(&self.root, &pack_ref) {
+                Ok(definitions) => {
+                    let bodies = definitions
+                        .iter()
+                        .map(|(type_ref, definition)| (type_ref.clone(), definition.schema.clone()))
+                        .collect();
+                    if let Err(error) = crate::value_schema::check_local_graph(
+                        &bodies,
+                        crate::value_schema::Limits::default(),
+                    ) {
+                        let reference = error
+                            .source_ref
+                            .as_ref()
+                            .or_else(|| error.reference_chain.first());
+                        let file = reference
+                            .and_then(|reference| {
+                                crate::pack_registry::diagnostics::source_for_ref(
+                                    &self.root, "types", reference,
+                                )
+                            })
+                            .unwrap_or_else(|| "types".into());
+                        if let crate::Error::Deployment { details, .. } =
+                            crate::pack_registry::diagnostics::schema_error(&file, "/schema", error)
+                        {
+                            for diagnostic in details.diagnostics {
+                                self.push_diagnostic(diagnostic);
+                            }
+                        }
+                    }
+                    self.type_registry = definitions
+                        .into_iter()
+                        .map(|(type_ref, definition)| {
+                            (
+                                type_ref,
+                                crate::value_schema::RegistryEntry::Candidate(definition.schema),
+                            )
+                        })
+                        .collect();
+                }
+                Err(crate::Error::Deployment { details, .. }) => {
+                    for diagnostic in details.diagnostics {
+                        self.push_diagnostic(diagnostic);
+                    }
+                }
+                Err(error) => self.error(
+                    Some("types"),
+                    "schema.invalid_type_definition",
+                    error.to_string(),
+                ),
+            }
+        }
         for component in COMPONENT_DIRS {
             self.check_component_dir(component);
         }
@@ -189,7 +289,7 @@ impl PackChecker {
 
     fn check_manifest(&mut self) {
         let path = self.root.join("pack.yaml");
-        let Some(value) = self.read_yaml(&path, "manifest") else {
+        let Some(mut value) = self.read_yaml(&path, "manifest") else {
             if !path.exists() {
                 self.error(
                     Some("pack.yaml"),
@@ -199,6 +299,35 @@ impl PackChecker {
             }
             return;
         };
+        let label_field = if value.get("label").is_some() {
+            "label"
+        } else {
+            "name"
+        };
+        let schema_field = if value.get("conf_schema").is_some() {
+            "conf_schema"
+        } else {
+            "config_schema"
+        };
+        let meta_field = if value.get("meta").is_some() {
+            "meta"
+        } else {
+            "metadata"
+        };
+        let tags_field = if value.get("tags").is_some() {
+            "tags"
+        } else {
+            "keywords"
+        };
+        match crate::pack_registry::diagnostics::read_manifest(&self.root) {
+            Ok(normalized) => value = normalized,
+            Err(crate::Error::Deployment { details, .. }) => {
+                for diagnostic in details.diagnostics {
+                    self.push_diagnostic(diagnostic);
+                }
+            }
+            Err(_) => {}
+        }
         let Some(map) = value.as_mapping() else {
             self.error(
                 Some("pack.yaml"),
@@ -210,33 +339,62 @@ impl PackChecker {
 
         if let Some(pack_ref) = self.required_string(map, "ref", "pack.yaml") {
             if let Err(error) = RefValidator::validate_pack_ref(&pack_ref) {
-                self.error(Some("pack.yaml"), "manifest.invalid_ref", error.to_string());
+                self.error_at(
+                    "pack.yaml",
+                    "ref",
+                    "manifest.invalid_ref",
+                    error.to_string(),
+                );
             } else {
                 self.report.pack_ref = Some(pack_ref);
             }
         }
         if let Some(version) = self.required_string(map, "version", "pack.yaml") {
             if let Err(error) = semver::Version::parse(&version) {
-                self.error(
-                    Some("pack.yaml"),
+                self.error_at(
+                    "pack.yaml",
+                    "version",
                     "manifest.invalid_version",
                     format!("Pack version must be semantic version syntax: {error}"),
                 );
             }
             self.report.version = Some(version);
         }
-        self.optional_type(map, "label", "string", "pack.yaml");
+        self.optional_type(map, label_field, "string", "pack.yaml");
         self.optional_type(map, "description", "string", "pack.yaml");
         self.optional_type(map, "author", "string", "pack.yaml");
         self.optional_type(map, "email", "string", "pack.yaml");
         self.optional_type(map, "enabled", "boolean", "pack.yaml");
         self.optional_type(map, "system", "boolean", "pack.yaml");
         self.optional_type(map, "config", "object", "pack.yaml");
-        self.optional_type(map, "meta", "object", "pack.yaml");
-        self.optional_type(map, "tags", "array", "pack.yaml");
+        self.optional_type(map, meta_field, "object", "pack.yaml");
+        self.optional_type(map, tags_field, "array", "pack.yaml");
         self.optional_type(map, "runtime_deps", "array", "pack.yaml");
         self.optional_type(map, "dependencies", "array", "pack.yaml");
-        self.check_flat_schema(map, "conf_schema", "pack.yaml");
+        if let Err(error) =
+            serde_yaml_ng::from_value::<crate::pack_ownership::PackOwnershipMetadata>(value.clone())
+        {
+            self.error_at(
+                "pack.yaml",
+                "owner_roles",
+                "manifest.invalid_owner_roles",
+                error.to_string(),
+            );
+        }
+        if let Some(dependencies) = yaml_get(map, "dependencies") {
+            match serde_yaml_ng::from_value::<Vec<String>>(dependencies.clone())
+                .map_err(|_| crate::Error::validation("Invalid pack dependency list"))
+                .and_then(|values| crate::pack_registry::schema_types::parse_dependencies(&values))
+            {
+                Ok(dependencies) => self.type_dependencies = dependencies.into_keys().collect(),
+                Err(error) => self.error(
+                    Some("pack.yaml"),
+                    "schema.invalid_dependencies",
+                    error.to_string(),
+                ),
+            }
+        }
+        self.check_flat_schema(map, schema_field, "pack.yaml");
         self.check_worker_placement(
             map,
             "worker_selector",
@@ -323,7 +481,97 @@ impl PackChecker {
         };
 
         self.check_environment_metadata(component, &value, &rel);
+        self.check_flat_schema_alias(
+            map,
+            &[
+                "param_schema",
+                "out_schema",
+                "conf_schema",
+                "event_config_schema",
+            ],
+            &rel,
+        );
         match component {
+            "types" => {
+                self.check_owned_ref(map, component, "schema_type", &rel, false);
+                let Some(schema) = yaml_get(map, "schema") else {
+                    self.error(
+                        Some(&rel),
+                        "schema.missing_type_body",
+                        "Named type requires a single-value schema body",
+                    );
+                    return;
+                };
+                let schema = match serde_json::to_value(schema) {
+                    Ok(schema) => schema,
+                    Err(_) => {
+                        self.error(
+                            Some(&rel),
+                            "schema.invalid_type_body",
+                            "Invalid named type schema value",
+                        );
+                        return;
+                    }
+                };
+                match crate::value_schema::inspect_definition(
+                    crate::value_schema::SchemaContext::SingleValue,
+                    &schema,
+                    crate::value_schema::Limits::default(),
+                ) {
+                    Ok(refs) => {
+                        for reference in refs {
+                            let owner = reference
+                                .type_ref
+                                .split_once('.')
+                                .map(|(pack, _)| pack)
+                                .unwrap_or("");
+                            if Some(owner) != self.report.pack_ref.as_deref()
+                                && !self.type_dependencies.contains(owner)
+                            {
+                                self.error(
+                                    Some(&rel),
+                                    "schema.undeclared_dependency",
+                                    "External named type requires a declared pack dependency",
+                                );
+                            }
+                            if Some(owner) == self.report.pack_ref.as_deref()
+                                && !self.type_registry.contains_key(&reference.type_ref)
+                            {
+                                self.error(
+                                    Some(&rel),
+                                    "schema.missing_local_type",
+                                    "Named type references a missing local definition",
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.error(Some(&rel), "schema.invalid_type_body", error.to_string())
+                    }
+                }
+                let source = yaml_get(map, "ref")
+                    .and_then(YamlValue::as_str)
+                    .unwrap_or(&rel);
+                match crate::value_schema::compile(
+                    crate::value_schema::SourceIdentity::Authoring {
+                        component_ref: source.into(),
+                    },
+                    crate::value_schema::SchemaContext::SingleValue,
+                    &schema,
+                    &self.type_registry,
+                    crate::value_schema::Limits::default(),
+                ) {
+                    Ok(_) => {}
+                    Err(error)
+                        if error.code == crate::value_schema::ErrorCode::MissingReference =>
+                    {
+                        self.warning(Some(&rel), "schema.external_reference_unverified", "Named type graph requires server-side external revision/policy validation");
+                    }
+                    Err(error) => {
+                        self.error(Some(&rel), "schema.invalid_type_body", error.to_string())
+                    }
+                }
+            }
             "queues" => self.check_queue(path, &rel),
             "dashboards" => self.check_dashboard(&value, &rel),
             "permission_sets" => self.check_permission_set(map, &rel),
@@ -378,15 +626,22 @@ impl PackChecker {
             );
             return;
         };
-        match serde_yaml_ng::from_value::<Vec<Grant>>(grants.clone()) {
+        match crate::pack_registry::diagnostics::decode_yaml_value::<Vec<Grant>>(
+            rel,
+            "/grants",
+            grants.clone(),
+        ) {
             Ok(grants) => {
-                for grant in grants {
+                for (index, grant) in grants.into_iter().enumerate() {
                     if grant.actions.is_empty() {
                         self.error(
                             Some(rel),
                             "permission_set.empty_actions",
                             "Grant actions cannot be empty",
                         );
+                        if let Some(last) = self.report.diagnostics.last_mut() {
+                            last.metadata_path = Some(format!("/grants/{index}/actions"));
+                        }
                     }
                     if let Some(constraints) = grant.constraints {
                         if let Err(error) = validate_cache_grant_constraints(&constraints) {
@@ -395,6 +650,11 @@ impl PackChecker {
                             }
                         }
                     }
+                }
+            }
+            Err(crate::Error::Deployment { details, .. }) => {
+                for diagnostic in details.diagnostics {
+                    self.push_diagnostic(diagnostic);
                 }
             }
             Err(error) => self.error(
@@ -406,12 +666,55 @@ impl PackChecker {
     }
 
     fn check_action(&mut self, map: &Mapping, rel: &str) {
+        for (field, allowed) in [
+            ("parameter_delivery", &["stdin", "file"][..]),
+            ("parameter_format", &["json", "yaml", "dotenv"][..]),
+            ("output_format", &["text", "json", "yaml", "jsonl"][..]),
+            (
+                "reference_visibility",
+                &["public", "private", "restricted"][..],
+            ),
+        ] {
+            if let Some(value) = yaml_get(map, field) {
+                if !value
+                    .as_str()
+                    .is_some_and(|v| allowed.contains(&v.to_lowercase().as_str()))
+                {
+                    self.error_at(
+                        rel,
+                        field,
+                        "metadata.invalid_field",
+                        format!("Expected one of: {}", allowed.join(", ")),
+                    );
+                }
+            }
+        }
+        for field in [
+            "timeout_seconds",
+            "log_retention_limit",
+            "artifact_retention_limit",
+        ] {
+            if let Some(value) = yaml_get(map, field) {
+                if !value
+                    .as_i64()
+                    .is_some_and(|v| v > 0 && v <= i32::MAX as i64)
+                {
+                    self.error_at(
+                        rel,
+                        field,
+                        "metadata.invalid_field",
+                        "Expected a positive integer no greater than 2147483647",
+                    );
+                }
+            }
+        }
         self.check_owned_ref(map, "actions", "action", rel, false);
         self.check_flat_schema(map, "parameters", rel);
         self.check_flat_schema_alias(map, &["output", "output_schema"], rel);
         self.optional_type(map, "enabled", "boolean", rel);
         self.optional_type(map, "runner_type", "string", rel);
-        self.optional_type(map, "default_execution_permission_set_refs", "array", rel);
+        self.check_string_array(map, "default_execution_permission_set_refs", rel);
+        self.check_string_array(map, "reference_allowed_pack_refs", rel);
 
         if let Some(workflow_file) = self.optional_string(map, "workflow_file", rel) {
             self.check_referenced_workflow(&workflow_file, rel);
@@ -439,6 +742,11 @@ impl PackChecker {
     }
 
     fn check_sensor(&mut self, map: &Mapping, rel: &str) {
+        self.optional_type(map, "config", "object", rel);
+        self.optional_type(map, "worker_selector", "object", rel);
+        self.optional_type(map, "worker_tolerations", "array", rel);
+        self.optional_type(map, "worker_affinity", "object", rel);
+        self.check_string_array(map, "reference_allowed_pack_refs", rel);
         self.check_owned_ref(map, "sensors", "sensor", rel, false);
         self.check_flat_schema(map, "parameters", rel);
         let entrypoint = self.required_string(map, "entry_point", rel);
@@ -459,12 +767,33 @@ impl PackChecker {
             }
         }
         let triggers = yaml_get(map, "trigger_types").or_else(|| yaml_get(map, "trigger_type"));
+        let field = if yaml_get(map, "trigger_types").is_some() {
+            "trigger_types"
+        } else {
+            "trigger_type"
+        };
+        if yaml_get(map, "trigger_types").is_some() && yaml_get(map, "trigger_type").is_some() {
+            self.error_at(
+                rel,
+                "trigger_types",
+                "sensor.ambiguous_trigger_types",
+                "Declare trigger_types or trigger_type, not both",
+            );
+        }
         match triggers {
-            Some(YamlValue::String(value)) => self.add_reference(rel, "sensor", "trigger", value),
+            Some(YamlValue::String(value, _)) if field == "trigger_type" => {
+                self.add_reference_at(rel, "sensor", "trigger", value, "/trigger_type")
+            }
             Some(YamlValue::Sequence(values)) => {
-                for value in values {
+                for (index, value) in values.iter().enumerate() {
                     if let Some(value) = value.as_str() {
-                        self.add_reference(rel, "sensor", "trigger", value);
+                        self.add_reference_at(
+                            rel,
+                            "sensor",
+                            "trigger",
+                            value,
+                            &format!("/{field}/{index}"),
+                        );
                     } else {
                         self.error(
                             Some(rel),
@@ -594,10 +923,28 @@ impl PackChecker {
         let Some(content) = self.read_text(path, rel) else {
             return;
         };
-        match parse_work_queue_definition_yaml(&content) {
+        match parse_work_queue_definition_metadata(&content) {
             Ok(queue) => {
                 self.record_ref("queue", &queue.r#ref, rel, true);
                 self.add_reference(rel, "queue", "action", &queue.dispatch_action);
+                let mut fields = Mapping::new();
+                match serde_yaml_ng::to_value(&queue.item_schema) {
+                    Ok(schema) => {
+                        fields.insert(YamlValue::from("item_schema"), schema);
+                        self.check_flat_schema(&fields, "item_schema", rel);
+                    }
+                    Err(_) => self.error(
+                        Some(rel),
+                        "queue.invalid_definition",
+                        "Queue schema must contain JSON-compatible values",
+                    ),
+                }
+            }
+            Err(crate::Error::Deployment { details, .. }) => {
+                for mut diagnostic in details.diagnostics {
+                    diagnostic.path = Some(rel.into());
+                    self.push_diagnostic(diagnostic);
+                }
             }
             Err(error) => self.error(Some(rel), "queue.invalid_definition", error.to_string()),
         }
@@ -632,18 +979,27 @@ impl PackChecker {
             };
             if let Ok(value) = serde_yaml_ng::from_str::<YamlValue>(&content) {
                 self.check_environment_metadata("workflows", &value, &rel);
+                if let Some(map) = value.as_mapping() {
+                    self.check_flat_schema_alias(
+                        map,
+                        &["parameters", "output", "param_schema", "out_schema"],
+                        &rel,
+                    );
+                }
             }
             match parse_workflow_yaml(&content) {
                 Ok(workflow) => {
                     if !workflow.r#ref.is_empty() {
                         self.record_ref("workflow", &workflow.r#ref, &rel, false);
                     }
-                    for action in collect_workflow_action_refs(&workflow) {
-                        self.add_reference(&rel, "workflow", "action", &action);
+                    for (action, path) in
+                        crate::action_visibility::collect_workflow_action_uses(&workflow)
+                    {
+                        self.add_reference_at(&rel, "workflow", "action", &action, &path);
                     }
                 }
                 Err(error) if strict => {
-                    self.error(Some(&rel), "workflow.invalid_definition", error.to_string())
+                    self.workflow_error(&rel, error);
                 }
                 Err(error) => self.warning(
                     Some(&rel),
@@ -658,8 +1014,9 @@ impl PackChecker {
         let relative = Path::new(workflow_file);
         if !matches!(relative.components().next(), Some(Component::Normal(part)) if part == "workflows")
         {
-            self.error(
-                Some(source),
+            self.error_at(
+                source,
+                "workflow_file",
                 "action.workflow_path",
                 format!("Workflow file '{workflow_file}' must be located under actions/workflows/"),
             );
@@ -674,8 +1031,9 @@ impl PackChecker {
             return;
         };
         if !path.is_file() {
-            self.error(
-                Some(source),
+            self.error_at(
+                source,
+                "workflow_file",
                 "action.workflow_missing",
                 format!("Workflow file '{workflow_file}' does not exist"),
             );
@@ -686,21 +1044,32 @@ impl PackChecker {
         };
         if let Ok(value) = serde_yaml_ng::from_str::<YamlValue>(&content) {
             self.check_environment_metadata("workflows", &value, &self.relative(&path));
+            if let Some(map) = value.as_mapping() {
+                self.check_flat_schema_alias(
+                    map,
+                    &["parameters", "output", "param_schema", "out_schema"],
+                    &self.relative(&path),
+                );
+            }
         }
         match parse_workflow_yaml(&content) {
             Ok(workflow) => {
                 if !workflow.r#ref.is_empty() {
                     self.validate_owned_component_ref("workflow", &workflow.r#ref, source);
                 }
-                for action in collect_workflow_action_refs(&workflow) {
-                    self.add_reference(source, "workflow", "action", &action);
+                for (action, metadata_path) in
+                    crate::action_visibility::collect_workflow_action_uses(&workflow)
+                {
+                    self.add_reference_at(
+                        &self.relative(&path),
+                        "workflow",
+                        "action",
+                        &action,
+                        &metadata_path,
+                    );
                 }
             }
-            Err(error) => self.error(
-                Some(source),
-                "action.invalid_workflow",
-                format!("Invalid workflow file '{workflow_file}': {error}"),
-            ),
+            Err(error) => self.workflow_error(&self.relative(&path), error),
         }
     }
 
@@ -730,6 +1099,11 @@ impl PackChecker {
                         reference.source_kind, reference.target_kind, qualified
                     ),
                 );
+                if let Some(diagnostic) = self.report.diagnostics.last_mut() {
+                    if !reference.metadata_path.is_empty() {
+                        diagnostic.metadata_path = Some(reference.metadata_path);
+                    }
+                }
             }
         }
     }
@@ -793,7 +1167,17 @@ impl PackChecker {
         match serde_yaml_ng::from_str(&content) {
             Ok(value) => Some(value),
             Err(error) => {
-                self.error(Some(&rel), "metadata.invalid_yaml", error.to_string());
+                self.error(
+                    Some(&rel),
+                    "metadata.invalid_yaml",
+                    "Invalid YAML syntax. Check the indicated location.",
+                );
+                if let Some(location) = error.location() {
+                    if let Some(diagnostic) = self.report.diagnostics.last_mut() {
+                        diagnostic.line = Some(location.line());
+                        diagnostic.column = Some(location.column());
+                    }
+                }
                 None
             }
         }
@@ -920,13 +1304,14 @@ impl PackChecker {
             RefValidator::validate_component_ref(&qualified)
         };
         if let Err(error) = validation {
-            self.error(Some(rel), "component.invalid_ref", error.to_string());
+            self.error_at(rel, "ref", "component.invalid_ref", error.to_string());
             return;
         }
         if let Some(pack_ref) = self.report.pack_ref.as_deref() {
             if !qualified.starts_with(&format!("{pack_ref}.")) {
-                self.error(
-                    Some(rel),
+                self.error_at(
+                    rel,
+                    "ref",
                     "component.ref_pack_mismatch",
                     format!("Ref '{qualified}' must belong to pack '{pack_ref}'"),
                 );
@@ -934,8 +1319,9 @@ impl PackChecker {
         }
         let refs = self.refs.entry(kind).or_default();
         if let Some(first) = refs.insert(qualified.clone(), rel.to_string()) {
-            self.error(
-                Some(rel),
+            self.error_at(
+                rel,
+                "ref",
                 "component.duplicate_ref",
                 format!("Duplicate {kind} ref '{qualified}' (first defined in {first})"),
             );
@@ -944,13 +1330,14 @@ impl PackChecker {
 
     fn validate_owned_component_ref(&mut self, kind: &str, value: &str, rel: &str) {
         if let Err(error) = RefValidator::validate_component_ref(value) {
-            self.error(Some(rel), "component.invalid_ref", error.to_string());
+            self.error_at(rel, "ref", "component.invalid_ref", error.to_string());
             return;
         }
         if let Some(pack_ref) = self.report.pack_ref.as_deref() {
             if !value.starts_with(&format!("{pack_ref}.")) {
-                self.error(
-                    Some(rel),
+                self.error_at(
+                    rel,
+                    "ref",
                     "component.ref_pack_mismatch",
                     format!("{kind} ref '{value}' must belong to pack '{pack_ref}'"),
                 );
@@ -960,20 +1347,22 @@ impl PackChecker {
 
     fn required_string(&mut self, map: &Mapping, field: &str, rel: &str) -> Option<String> {
         match yaml_get(map, field) {
-            Some(YamlValue::String(value)) if !value.trim().is_empty() => {
+            Some(YamlValue::String(value, _)) if !value.trim().is_empty() => {
                 Some(value.trim().to_string())
             }
             Some(_) => {
-                self.error(
-                    Some(rel),
+                self.error_at(
+                    rel,
+                    field,
                     "metadata.invalid_field",
                     format!("Field '{field}' must be a non-empty string"),
                 );
                 None
             }
             None => {
-                self.error(
-                    Some(rel),
+                self.error_at(
+                    rel,
+                    field,
                     "metadata.missing_field",
                     format!("Missing required field '{field}'"),
                 );
@@ -985,10 +1374,13 @@ impl PackChecker {
     fn optional_string(&mut self, map: &Mapping, field: &str, rel: &str) -> Option<String> {
         let value = yaml_get(map, field)?;
         match value {
-            YamlValue::String(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+            YamlValue::String(value, _) if !value.trim().is_empty() => {
+                Some(value.trim().to_string())
+            }
             _ => {
-                self.error(
-                    Some(rel),
+                self.error_at(
+                    rel,
+                    field,
                     "metadata.invalid_field",
                     format!("Field '{field}' must be a non-empty string"),
                 );
@@ -1009,11 +1401,33 @@ impl PackChecker {
             _ => true,
         };
         if !valid {
-            self.error(
-                Some(rel),
+            self.error_at(
+                rel,
+                field,
                 "metadata.invalid_field_type",
                 format!("Field '{field}' must be an {expected}"),
             );
+        }
+    }
+
+    fn check_string_array(&mut self, map: &Mapping, field: &str, file: &str) {
+        self.optional_type(map, field, "array", file);
+        if let Some(values) = yaml_get(map, field).and_then(YamlValue::as_sequence) {
+            for (index, value) in values.iter().enumerate() {
+                if !value.as_str().is_some_and(|value| !value.trim().is_empty()) {
+                    self.error(
+                        Some(file),
+                        "metadata.invalid_array_entry",
+                        "Expected a non-empty string",
+                    );
+                    if let Some(diagnostic) = self.report.diagnostics.last_mut() {
+                        diagnostic.metadata_path = Some(format!(
+                            "{}/{index}",
+                            crate::pack_registry::diagnostics::pointer(field)
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -1022,8 +1436,9 @@ impl PackChecker {
             return;
         };
         let Some(fields) = schema.as_mapping() else {
-            self.error(
-                Some(rel),
+            self.error_at(
+                rel,
+                field,
                 "schema.not_object",
                 format!("Field '{field}' must use Attune's flat per-field object format"),
             );
@@ -1036,18 +1451,64 @@ impl PackChecker {
                     "schema.invalid_field",
                     format!("Each '{field}' entry must have a string name and object definition"),
                 );
-                continue;
+                if let Some(diagnostic) = self.report.diagnostics.last_mut() {
+                    let base = crate::pack_registry::diagnostics::pointer(field);
+                    diagnostic.metadata_path = Some(
+                        name.as_str()
+                            .map(|name| {
+                                format!(
+                                    "{base}{}",
+                                    crate::pack_registry::diagnostics::pointer(name)
+                                )
+                            })
+                            .unwrap_or(base),
+                    );
+                }
+                return;
             }
-            if definition.get("type").and_then(YamlValue::as_str).is_none() {
-                self.error(
-                    Some(rel),
-                    "schema.missing_type",
-                    format!(
-                        "Schema field '{}.{}' requires string 'type'",
-                        field,
-                        name.as_str().unwrap_or("?")
-                    ),
+        }
+        let schema = match serde_json::to_value(schema) {
+            Ok(schema) => schema,
+            Err(_) => {
+                self.error_at(
+                    rel,
+                    field,
+                    "schema.invalid_yaml_value",
+                    format!("Field '{field}' must contain JSON-compatible schema values"),
                 );
+                return;
+            }
+        };
+        if let Err(error) = crate::value_schema::compile(
+            crate::value_schema::SourceIdentity::Authoring {
+                component_ref: format!("{rel}#{field}"),
+            },
+            crate::value_schema::SchemaContext::FlatDocument,
+            &schema,
+            &self.type_registry,
+            crate::value_schema::Limits::default(),
+        ) {
+            if error.code == crate::value_schema::ErrorCode::MissingReference {
+                self.warning(
+                    Some(rel),
+                    "schema.external_reference_unverified",
+                    "Named schema references require server-side validation",
+                );
+                return;
+            }
+            self.error(
+                Some(rel),
+                "schema.invalid_definition",
+                format!("Invalid '{field}' schema: {error}"),
+            );
+            if let Some(diagnostic) = self.report.diagnostics.last_mut() {
+                diagnostic.code = error.code.as_str().into();
+                diagnostic.reference_chain = error.reference_chain.clone();
+                diagnostic.metadata_path = Some(format!(
+                    "{}{}",
+                    crate::pack_registry::diagnostics::pointer(field),
+                    error.path
+                ));
             }
         }
     }
@@ -1116,12 +1577,58 @@ impl PackChecker {
         target_kind: &'static str,
         target_ref: &str,
     ) {
+        let path = match (source_kind, target_kind) {
+            ("rule", "action") | ("policy", "action") => "/action_ref",
+            ("rule", "trigger") => "/trigger_ref",
+            ("queue", "action") => "/dispatch_action",
+            ("cache", _) => "/owner_ref",
+            _ => "",
+        };
+        self.add_reference_at(source_path, source_kind, target_kind, target_ref, path);
+    }
+
+    fn add_reference_at(
+        &mut self,
+        source_path: &str,
+        source_kind: &'static str,
+        target_kind: &'static str,
+        target_ref: &str,
+        metadata_path: &str,
+    ) {
         self.references.insert(LocalReference {
+            metadata_path: metadata_path.into(),
             source_path: source_path.to_string(),
             source_kind,
             target_kind,
             target_ref: target_ref.to_string(),
         });
+    }
+
+    fn workflow_error(&mut self, file: &str, error: crate::workflow::parser::ParseError) {
+        let metadata_path = match &error {
+            crate::workflow::parser::ParseError::InvalidTaskReference(_) => Some("/tasks".into()),
+            crate::workflow::parser::ParseError::InvalidField { field, .. }
+                if field.starts_with('/') =>
+            {
+                Some(field.clone())
+            }
+            _ => None,
+        };
+        let location = match &error {
+            crate::workflow::parser::ParseError::YamlError(error) => error.location(),
+            _ => None,
+        };
+        let message = if location.is_some() {
+            "Invalid workflow YAML syntax".into()
+        } else {
+            error.to_string()
+        };
+        self.error(Some(file), "workflow.invalid_definition", message);
+        if let Some(diagnostic) = self.report.diagnostics.last_mut() {
+            diagnostic.metadata_path = metadata_path;
+            diagnostic.line = location.as_ref().map(|location| location.line());
+            diagnostic.column = location.as_ref().map(|location| location.column());
+        }
     }
 
     fn qualify(&self, value: &str) -> String {
@@ -1147,6 +1654,34 @@ impl PackChecker {
         self.diagnostic(PackDiagnosticSeverity::Error, path, code, message);
     }
 
+    fn error_at(
+        &mut self,
+        file: &str,
+        field: &str,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.error(Some(file), code, message);
+        if let Some(diagnostic) = self.report.diagnostics.last_mut() {
+            diagnostic.metadata_path = Some(crate::pack_registry::diagnostics::pointer(field));
+        }
+    }
+
+    fn push_diagnostic(&mut self, diagnostic: PackDiagnostic) {
+        let previous = self.report.diagnostics.len();
+        self.diagnostic(
+            diagnostic.severity,
+            diagnostic.path.as_deref(),
+            &diagnostic.code,
+            &diagnostic.message,
+        );
+        if self.report.diagnostics.len() > previous && !self.diagnostics_limited {
+            if let Some(last) = self.report.diagnostics.last_mut() {
+                *last = diagnostic;
+            }
+        }
+    }
+
     fn warning(&mut self, path: Option<&str>, code: impl Into<String>, message: impl Into<String>) {
         self.diagnostic(PackDiagnosticSeverity::Warning, path, code, message);
     }
@@ -1168,20 +1703,31 @@ impl PackChecker {
                 code: "limits.diagnostics_exceeded".to_string(),
                 path: None,
                 message: format!("Validation produced at least {MAX_DIAGNOSTICS} diagnostics"),
+                ..PackDiagnostic::default()
             });
             return;
         }
+        let component = path.and_then(|path| {
+            self.refs.iter().find_map(|(kind, refs)| {
+                refs.iter()
+                    .find(|(_, source)| source.as_str() == path)
+                    .map(|(reference, _)| ((*kind).to_string(), reference.clone()))
+            })
+        });
         self.report.diagnostics.push(PackDiagnostic {
             severity,
             code: code.into(),
             path: path.map(str::to_string),
             message: message.into(),
+            component_kind: component.as_ref().map(|(kind, _)| kind.clone()),
+            component_ref: component.map(|(_, reference)| reference),
+            ..PackDiagnostic::default()
         });
     }
 }
 
 fn yaml_get<'a>(map: &'a Mapping, field: &str) -> Option<&'a YamlValue> {
-    map.get(YamlValue::String(field.to_string()))
+    map.get(YamlValue::from(field))
 }
 
 fn is_yaml(path: &Path) -> bool {
@@ -1196,10 +1742,47 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[test]
+    fn e2e_fixture_pack_uses_valid_flat_schemas_and_action_linked_workflows() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/packs/test_pack");
+        let report = check_pack(root);
+        assert!(
+            report.valid,
+            "Invalid E2E fixture metadata: {:?}",
+            report.diagnostics
+        );
+    }
+
     fn write(root: &Path, path: &str, content: &str) {
         let path = root.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn invalid_workflow_transition_identifies_the_authored_tasks_field() {
+        let root = TempDir::new().unwrap();
+        write(root.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
+        write(
+            root.path(),
+            "actions/run.yaml",
+            "ref: demo.run\nrunner_type: native\nentry_point: run\n",
+        );
+        let workflow_path = "actions/workflows/broken.workflow.yaml";
+        write(root.path(), workflow_path, "version: '1.0'\ntasks:\n  - name: bad\n    action: demo.run\n    next:\n      - do: [absent_task]\n");
+        let report = check_pack(root.path());
+        assert!(!report.valid);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "workflow.invalid_definition"
+                    && diagnostic.path.as_deref() == Some(workflow_path)
+                    && diagnostic.metadata_path.as_deref() == Some("/tasks")
+                    && diagnostic.message.contains("absent_task")
+            }),
+            "{:?}",
+            report.diagnostics
+        );
     }
 
     #[test]
@@ -1229,6 +1812,44 @@ mod tests {
         assert!(report.valid, "{:?}", report.diagnostics);
         assert_eq!(report.files_checked, 5);
         assert_eq!(report.pack_ref.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn authored_and_metadata_schema_fields_use_common_definition_checks() {
+        for field in [
+            "parameters",
+            "output",
+            "output_schema",
+            "param_schema",
+            "out_schema",
+            "conf_schema",
+            "event_config_schema",
+        ] {
+            let root = TempDir::new().unwrap();
+            write(root.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
+            write(root.path(), "actions/run.yaml", &format!("ref: demo.run\nrunner_type: native\nentry_point: run\n{field}:\n  value:\n    type: object\n    properties:\n      child:\n        type: integer\n        default: invalid\n"));
+            let report = check_pack(root.path());
+            assert!(!report.valid, "{field}");
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "schema.invalid_default"
+                        && diagnostic.metadata_path.as_deref()
+                            == Some(format!("/{field}/value/properties/child/default").as_str())),
+                "{field}: {:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn composition_only_fields_and_local_defs_are_not_mistaken_for_malformed_flat_fields() {
+        let root = TempDir::new().unwrap();
+        write(root.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\nconf_schema:\n  value:\n    anyOf:\n      - type: string\n      - type: integer\n");
+        write(root.path(), "actions/run.yaml", "ref: demo.run\nrunner_type: native\nentry_point: run\nparameters:\n  value:\n    type: object\n    properties:\n      nested:\n        type: string\n    required: [nested]\n");
+        let report = check_pack(root.path());
+        assert!(report.valid, "{:?}", report.diagnostics);
     }
 
     #[test]
@@ -1363,6 +1984,85 @@ mod tests {
             .diagnostics
             .iter()
             .any(|item| item.code == "limits.metadata_file_too_large"));
+    }
+
+    #[test]
+    fn queue_named_schema_uses_the_local_graph_and_defers_external_resolution() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pack.yaml",
+            "ref: demo\nversion: 1.0.0\ndependencies: [external@^1]\n",
+        );
+        write(
+            dir.path(),
+            "actions/run.yaml",
+            "ref: demo.run\nlabel: Run\nrunner_type: native\nentry_point: run.py\n",
+        );
+        write(
+            dir.path(),
+            "types/count.yaml",
+            "ref: demo.count\nlabel: Count\nschema: {type: integer, minimum: 0}\n",
+        );
+        write(dir.path(), "queues/queue.yaml", "ref: demo.queue\nlabel: Queue\ndispatch_action: demo.run\nitem_schema:\n  count: {type: demo.count, default: 0}\n");
+        assert!(check_pack(dir.path()).valid);
+        write(dir.path(), "queues/queue.yaml", "ref: demo.queue\nlabel: Queue\ndispatch_action: demo.run\nitem_schema:\n  count: {type: demo.count, default: -1}\n");
+        assert!(!check_pack(dir.path()).valid);
+        write(dir.path(), "queues/queue.yaml", "ref: demo.queue\nlabel: Queue\ndispatch_action: demo.run\nitem_schema:\n  count: {type: external.count}\n");
+        let report = check_pack(dir.path());
+        assert!(report.valid);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "schema.external_reference_unverified"));
+    }
+
+    #[test]
+    fn named_types_check_local_graph_and_report_external_resolution_separately() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pack.yaml",
+            "ref: demo\nversion: 1.0.0\ndependencies: [external@^1]\n",
+        );
+        write(
+            dir.path(),
+            "types/value.yaml",
+            "ref: demo.value\nlabel: Value\nschema: {type: string}\n",
+        );
+        assert!(check_pack(dir.path()).diagnostics.is_empty());
+        write(
+            dir.path(),
+            "types/value.yaml",
+            "ref: demo.value\nlabel: Value\nschema: {type: external.value}\n",
+        );
+        let report = check_pack(dir.path());
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "schema.external_reference_unverified"));
+        assert!(!report
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "schema.undeclared_dependency"));
+        write(
+            dir.path(),
+            "types/value.yaml",
+            "ref: demo.value\nlabel: Value\nschema: {type: demo.absent}\n",
+        );
+        assert!(check_pack(dir.path())
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "schema.missing_local_type"));
+        write(
+            dir.path(),
+            "types/value.yaml",
+            "ref: demo.value\nlabel: Value\nschema: {type: demo.value}\n",
+        );
+        assert!(check_pack(dir.path())
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "schema.cycle"));
     }
 
     #[test]

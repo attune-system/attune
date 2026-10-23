@@ -8,7 +8,8 @@ import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
  */
 export type SaveWorkflowFileRequest = {
   /**
-   * The full workflow definition as JSON (will be serialized to YAML on disk)
+   * The full workflow definition as JSON. Tasks with a templated action must
+   * declare allowed_action_refs, an array of 1 to 256 literal action refs.
    */
   definition: Record<string, any>;
   /**
@@ -30,7 +31,7 @@ export type SaveWorkflowFileRequest = {
   /**
    * Output schema (flat format)
    */
-  out_schema: any | null;
+  out_schema: Record<string, any> | null;
   /**
    * Pack reference this workflow belongs to
    */
@@ -38,7 +39,7 @@ export type SaveWorkflowFileRequest = {
   /**
    * Parameter schema (flat format with inline required/secret)
    */
-  param_schema: any | null;
+  param_schema: Record<string, any> | null;
   /**
    * Pack refs allowed to reference the companion workflow action when visibility is restricted.
    */
@@ -47,7 +48,7 @@ export type SaveWorkflowFileRequest = {
   /**
    * Tags for categorization
    */
-  tags?: any[] | null;
+  tags?: Array<string> | null;
   /**
    * Workflow version (semantic versioning recommended)
    */

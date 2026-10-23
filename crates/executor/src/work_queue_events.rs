@@ -12,7 +12,6 @@ use attune_common::{
             WorkQueueDispatchRepository, WorkQueueDispatchSearchFilters, WorkQueueItemRepository,
             WorkQueueItemSearchFilters,
         },
-        Create, EventRepository,
     },
 };
 use chrono::Utc;
@@ -176,23 +175,10 @@ async fn emit_queue_lifecycle_event(
     queue: &WorkQueue,
     payload: JsonValue,
 ) -> Result<Option<Event>> {
-    let trigger_id: Option<Id> = sqlx::query_scalar("SELECT id FROM trigger WHERE ref = $1")
-        .bind(trigger_ref)
-        .fetch_optional(pool)
-        .await?;
-
-    let Some(trigger_id) = trigger_id else {
-        warn!(
-            "Skipping work queue lifecycle event '{}' for queue '{}' because trigger is not registered",
-            trigger_ref, queue.r#ref
-        );
-        return Ok(None);
-    };
-
-    let event = EventRepository::create(
+    let event = attune_common::repositories::event_schema::EventSchemaRepository::create_internal(
         pool,
         CreateEventInput {
-            trigger: Some(trigger_id),
+            trigger: None,
             trigger_ref: trigger_ref.to_string(),
             config: None,
             payload: Some(payload),
@@ -202,10 +188,16 @@ async fn emit_queue_lifecycle_event(
             rule: None,
             rule_ref: None,
         },
+        None,
     )
     .await?;
+    let Some(event) = event else {
+        warn!("Skipping work queue lifecycle event '{}' for queue '{}' because trigger is not registered", trigger_ref, queue.r#ref);
+        return Ok(None);
+    };
 
     let mq_payload = EventCreatedPayload {
+        event_created: Some(event.created),
         event_id: event.id,
         trigger_id: event.trigger,
         trigger_ref: event.trigger_ref.clone(),

@@ -1,0 +1,28 @@
+{
+  "enabled_for_controlled_acceptance": false,
+  "database_url": "postgres://RUN_SCOPED_SETUP_ROLE:PRIVATE_PASSWORD@127.0.0.1:OWNED_PORT/OWNED_DATABASE",
+  "maintenance_access_token_file": "/owned/private/maintenance-access-token",
+  "jwt_secret_file": "/owned/private/api-jwt-verification-secret",
+  "encryption_key_file": "/owned/private/api-encryption-key",
+  "access": {
+    "run_id": "owned-run",
+    "project": "eaccept-owned-run-native-blob_and_shared",
+    "generation": "ACTUAL_CONTROLLER_GENERATION_UUID",
+    "mode": "blob_and_shared",
+    "maintenance_identity": "ACTUAL_UNSCOPED_MAINTENANCE_ID",
+    "producer_action_ref": "f_native_settlement.producer",
+    "schema": "OWNED_SCHEMA",
+    "database_name": "OWNED_DATABASE",
+    "database_role": "RUN_SCOPED_SETUP_ROLE"
+  },
+  "controller": {
+    "endpoint": "https://127.0.0.1:OWNED_CONTROLLER_PORT/",
+    "issuer": "attune-owned-native-filesystem-controller",
+    "audience": "attune-legacy-file-audit",
+    "verification_key_file": "/owned/private/controller-rsa-public.pem",
+    "client_identity_file": "/owned/private/api-manager-identity.pem",
+    "ca_certificate_file": "/owned/private/controller-ca.pem",
+    "storage": {"provider": "filesystem", "root": "/ACTUAL/API/CONFIGURED/BLOB/ROOT"},
+    "artifacts_dir": "/ACTUAL/API/CONFIGURED/SHARED/ROOT"
+  }
+}

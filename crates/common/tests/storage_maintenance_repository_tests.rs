@@ -9,7 +9,9 @@ use attune_common::{
             CreateArtifactVersionInput,
         },
         execution::{CreateExecutionInput, ExecutionRepository},
+        file_evidence_retention::FileEvidenceRetentionRepository as Evidence,
         log_stream::LogStreamRepository,
+        maintenance::MaintenanceRepository,
         object_maintenance::ObjectMaintenanceRepository,
         storage_maintenance::StorageMaintenanceRepository,
         Create,
@@ -36,6 +38,38 @@ fn artifact_input(suffix: &str) -> CreateArtifactInput {
         content_type: None,
         data: None,
     }
+}
+
+// Exercise the same graph-first claim/metadata-delete seam as the supervisor.
+// Exact provider cleanup remains separately owned by the deletion ledger.
+async fn collect_version_overflow(pool: &sqlx::PgPool, artifact: i64) -> usize {
+    let mut deleted = 0;
+    for candidate in MaintenanceRepository::find_expired_artifact_versions(pool, 100)
+        .await
+        .unwrap()
+    {
+        if candidate.artifact != artifact {
+            continue;
+        }
+        let mut tx = pool.begin().await.unwrap();
+        Evidence::lock_reclamation(&mut tx).await.unwrap();
+        if MaintenanceRepository::claim_expired_artifact_version(&mut tx, candidate.id)
+            .await
+            .unwrap()
+            .is_some()
+            && Evidence::request_cleanup(&mut tx, &[candidate.id])
+                .await
+                .unwrap()
+                == [candidate.id]
+            && ArtifactVersionRepository::delete(&mut *tx, candidate.id)
+                .await
+                .unwrap()
+        {
+            deleted += 1;
+        }
+        tx.commit().await.unwrap();
+    }
+    deleted
 }
 
 #[tokio::test]
@@ -289,7 +323,7 @@ async fn ready_object_pages_advance_past_a_healthy_prefix() {
 }
 
 #[tokio::test]
-async fn versions_policy_ignores_pending_uploads_until_they_are_ready() {
+async fn versions_policy_ignores_pending_uploads_and_defers_ready_cleanup_to_graph_first_gc() {
     let pool = create_test_pool().await.expect("test database");
     let mut input = artifact_input("versions");
     input.retention_limit = 1;
@@ -368,6 +402,14 @@ async fn versions_policy_ignores_pending_uploads_until_they_are_ready() {
         ArtifactVersionRepository::count_by_artifact(&pool, artifact.id)
             .await
             .unwrap(),
+        2,
+        "Ready publication must not perform reclamation in its effect transaction"
+    );
+    assert_eq!(collect_version_overflow(&pool, artifact.id).await, 1);
+    assert_eq!(
+        ArtifactVersionRepository::count_by_artifact(&pool, artifact.id)
+            .await
+            .unwrap(),
         1
     );
     assert!(ArtifactVersionRepository::find_by_id(&pool, first.id)
@@ -388,7 +430,7 @@ async fn versions_policy_ignores_pending_uploads_until_they_are_ready() {
 }
 
 #[tokio::test]
-async fn concurrent_ready_transitions_obey_the_versions_limit() {
+async fn concurrent_ready_transitions_defer_the_versions_limit_to_graph_first_gc() {
     let pool = create_test_pool().await.expect("test database");
     let mut input = artifact_input("concurrent_versions");
     input.retention_limit = 1;
@@ -424,6 +466,13 @@ async fn concurrent_ready_transitions_obey_the_versions_limit() {
     first_result.unwrap();
     second_result.unwrap();
 
+    assert_eq!(
+        ArtifactVersionRepository::count_by_artifact(&pool, artifact.id)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(collect_version_overflow(&pool, artifact.id).await, 1);
     assert_eq!(
         ArtifactVersionRepository::count_by_artifact(&pool, artifact.id)
             .await

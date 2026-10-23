@@ -34,6 +34,16 @@ completed, or expired attempts release that protection. The existing object
 maintenance ledger owns eventual exact-version deletion, including uploads
 abandoned before database publication.
 
+## Optional isolated API effects
+
+`testing.candidate_api_effects: true` requests a separate bounded runtime context
+after archive verification. It does not turn the archive-download credential
+into an execution token. Candidate Keys, triggers and events use isolated tables
+and never enter production rules or notifications. Finishing tests revokes the
+context before activation. Deployment must verify closed-context evidence for
+opt-in attempts, including results returned by older workers. See
+[candidate API effects and bootstrap admission](candidate-api-effects.md).
+
 ## Rollout
 
 Apply `20261012000001_pack_install_candidate_objects.sql` and roll out updated

@@ -25,6 +25,9 @@ static NEXT_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 pub struct AppState {
     /// Database connection pool
     pub db: PgPool,
+    /// Shared max-one startup-only cancellation channel for this replica.
+    pub reclamation_cancellation:
+        Arc<attune_common::repositories::reclamation_cancellation::CancellationOwner>,
     /// JWT configuration
     pub jwt_config: Arc<JwtConfig>,
     /// CORS allowed origins
@@ -43,8 +46,11 @@ pub struct AppState {
     pub audit_emitter: AuditEmitter,
     /// Durable immutable storage. Only the API receives provider credentials.
     pub blob_store: Arc<dyn BlobStore>,
+    pub file_transfers: crate::file_transfers::FileTransfers,
+    pub legacy_file_controller: Arc<attune_common::file_legacy_controller::StorageLegacyController>,
     /// Process-unique namespace for caches shared by multiple app states.
     pub(crate) cache_namespace: u64,
+    authorization_metadata_cache_enabled: bool,
     pack_projection_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -88,7 +94,15 @@ impl AppState {
                 }),
             ),
         };
-        Self::new_with_audit_and_blob_store(db, config, audit_emitter, blob_store)
+        let controller =
+            attune_common::file_legacy_controller::StorageLegacyController::configured(
+                &config,
+                db.clone(),
+            )
+            .unwrap_or_else(|_| panic!("invalid native legacy audit controller configuration"));
+        let mut state = Self::new_with_audit_and_blob_store(db, config, audit_emitter, blob_store);
+        state.legacy_file_controller = controller;
+        state
     }
 
     /// Create application state with an already constructed durable storage backend.
@@ -130,6 +144,18 @@ impl AppState {
         );
 
         Self {
+            legacy_file_controller:
+                attune_common::file_legacy_controller::StorageLegacyController::unsupported(
+                    &config,
+                    db.clone(),
+                )
+                .expect("failed to identify custom storage audit scope"),
+            file_transfers: crate::file_transfers::FileTransfers::new(
+                config.artifacts.protected_file_memory_budget_bytes,
+                config.artifacts.file_transfer_concurrency,
+            ),
+            reclamation_cancellation:
+                attune_common::repositories::reclamation_cancellation::CancellationOwner::new(&db),
             db,
             jwt_config: Arc::new(jwt_config),
             cors_origins,
@@ -141,17 +167,30 @@ impl AppState {
             audit_emitter,
             blob_store,
             cache_namespace: NEXT_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
+            authorization_metadata_cache_enabled: true,
             pack_projection_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Count fresh authorization metadata reads in isolated benchmarks without
+    /// clearing caches or changing process-global configuration.
+    pub fn without_authorization_metadata_cache(mut self) -> Self {
+        self.authorization_metadata_cache_enabled = false;
+        self
+    }
+
     /// Create an authorization service connected to the application's audit writer.
     pub fn authorization_service(&self) -> AuthorizationService {
-        AuthorizationService::new_with_audit_and_cache_namespace(
+        let service = AuthorizationService::new_with_audit_and_cache_namespace(
             self.db.clone(),
             self.audit_emitter.clone(),
             self.cache_namespace,
-        )
+        );
+        if self.authorization_metadata_cache_enabled {
+            service
+        } else {
+            service.without_metadata_cache()
+        }
     }
 
     /// Set the message queue publisher (called once at startup or after reconnection)

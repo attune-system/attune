@@ -12,7 +12,7 @@ while IFS= read -r path; do
       rust=true ;;
   esac
   case "$path" in
-    web/*|.github/workflows/ci.yml) web=true ;;
+    web/*|crates/api/*|crates/common/*|Cargo.toml|Cargo.lock|.github/workflows/ci.yml) web=true ;;
   esac
   case "$path" in
     .dockerignore|.github/workflows/*|docker/*|migrations/*|packaging/*|scripts/*|Makefile|config.*|docker-compose*.yaml|docker-compose*.yml)

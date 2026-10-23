@@ -142,6 +142,8 @@ if [[ "$DO_STARTUP" == true ]]; then
 fi
 
 RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/attune-e2e-${RUN_ID}.XXXXXX")"
+BOOTSTRAP_OWNED=false
+BOOTSTRAP_ROOT=""
 export ATTUNE_E2E_RUN_ID="$RUN_ID"
 ATTUNE_TEST_RUN_ID="${ATTUNE_TEST_RUN_ID:-r$(printf '%s' "$RUN_ID" | sha256sum | cut -c1-19)}"
 if [[ ! "$ATTUNE_TEST_RUN_ID" =~ ^[a-z0-9][a-z0-9-]{0,19}$ ]]; then
@@ -253,9 +255,24 @@ wait_for_registered_worker() {
 }
 
 # ── Cleanup handler ───────────────────────────────────────────────────────
+bootstrap_credential() {
+  compose run --rm --no-deps --user "$(id -u):$(id -g)" \
+    --volume "$BOOTSTRAP_ROOT:/run/attune-e2e-bootstrap" \
+    --entrypoint python3 e2e-tests \
+    /app/tests/e2e/configure_bootstrap.py "$1" --directory /run/attune-e2e-bootstrap
+}
+
 cleanup() {
   local exit_code=$?
   local cleanup_code=0
+  local bootstrap_revoke_failed=false
+  if [[ "$BOOTSTRAP_OWNED" == true ]]; then
+    if ! bootstrap_credential revoke; then
+      log_error "Could not revoke the owned E2E bootstrap credential"
+      cleanup_code=1
+      bootstrap_revoke_failed=true
+    fi
+  fi
   if [[ "$DO_TEARDOWN" == true && "$STACK_STARTED" == true ]]; then
     echo ""
     log_info "Tearing down owned Docker stack '${COMPOSE_PROJECT_NAME}'..."
@@ -270,6 +287,17 @@ cleanup() {
     log_info "Owned stack '${COMPOSE_PROJECT_NAME}' left running (--no-teardown)."
   else
     log_info "No stack was started; no teardown was needed."
+  fi
+  [[ $exit_code -ne 0 || $cleanup_code -eq 0 ]] || exit_code=$cleanup_code
+  if [[ -n "$BOOTSTRAP_ROOT" ]]; then
+    if [[ "$bootstrap_revoke_failed" == true ]]; then
+      # Retain only the private, non-secret owner/token ID descriptor so an
+      # operator can retry revocation if the API or teardown failed.
+      rm -f -- "$BOOTSTRAP_ROOT/token"
+      log_error "Bootstrap revocation needs recovery; descriptor retained at $BOOTSTRAP_ROOT/credential.json"
+    else
+      rm -rf -- "$BOOTSTRAP_ROOT"
+    fi
   fi
   rm -rf -- "$RUN_ROOT"
   exit $exit_code
@@ -299,6 +327,23 @@ fi
 if [[ "$DO_STARTUP" == true ]]; then
   STACK_STARTED=true
   log_header "Starting Attune services (run: ${RUN_ID}, project: ${COMPOSE_PROJECT_NAME})..."
+  # Bootstrap publication is authenticated even while managed runtime
+  # credentials remain disabled. Seed the test identity and API first, then
+  # issue a disposable publication token through the public API.
+  compose up -d postgres rabbitmq migrations init-agent init-pack-binaries api notifier init-user
+  compose wait init-user
+  if [[ -z "${ATTUNE_BOOTSTRAP_TOKEN:-}" ]]; then
+    # The project is already Docker-shared. Host /tmp may not be shared with
+    # Docker Desktop, so keep this private bind mount under the owned checkout.
+    mkdir -p "$PROJECT_ROOT/.scratch"
+    BOOTSTRAP_ROOT="$(mktemp -d "$PROJECT_ROOT/.scratch/e2e-bootstrap-${RUN_ID}.XXXXXX")"
+    BOOTSTRAP_OWNED=true
+    bootstrap_credential issue
+    IFS= read -r ATTUNE_BOOTSTRAP_TOKEN < "$BOOTSTRAP_ROOT/token"
+    export ATTUNE_BOOTSTRAP_TOKEN
+  fi
+  compose up -d init-packs
+  compose wait init-packs
   SERVICES=(
     postgres rabbitmq
     migrations init-user init-pack-binaries init-packs init-agent
@@ -351,6 +396,11 @@ if [[ "$DO_STARTUP" == true ]]; then
   wait_for_registered_worker "worker-" 180
   if [[ "$DO_STANDALONE" == true ]]; then
     wait_for_registered_worker "standalone" 180
+  fi
+  if [[ "$BOOTSTRAP_OWNED" == true ]]; then
+    bootstrap_credential revoke
+    BOOTSTRAP_OWNED=false
+    unset ATTUNE_BOOTSTRAP_TOKEN
   fi
   log_success "Stack ready"
 fi

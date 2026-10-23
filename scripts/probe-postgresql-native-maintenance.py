@@ -92,7 +92,7 @@ class Session:
 
 
 class Server:
-    def __init__(self, image, run_id, report):
+    def __init__(self, image, run_id, report, postgres_args=()):
         self.image = image
         self.run_id = run_id
         self.name = f"attune-native-{run_id}-{image.split(':')[1]}"
@@ -102,6 +102,7 @@ class Server:
         self.volume_owned = False
         self.sessions = []
         self.report = report
+        self.postgres_args = tuple(postgres_args)
 
     def psql(self, name="probe"):
         return ["docker", "exec", "-i", "-e", f"PGAPPNAME={name}", self.name,
@@ -168,7 +169,8 @@ class Server:
                 "docker", "run", "-d", "--pull=never", "--name", self.name,
                 "--label", f"{LABEL}={self.run_id}", "--publish", "127.0.0.1::5432",
                 "--mount", f"type=volume,src={self.volume},dst={mount}",
-                "-e", "POSTGRES_HOST_AUTH_METHOD=trust", self.image).stdout.strip()
+                "-e", "POSTGRES_HOST_AUTH_METHOD=trust", self.image,
+                *self.postgres_args).stdout.strip()
             deadline = time.monotonic() + 30
             while True:
                 ready = command(*self.psql(), input="SELECT true;", check=False)
@@ -210,7 +212,7 @@ class Server:
                     info = json.loads(inspected.stdout)[0]
                     require(info["Config"]["Labels"].get(LABEL) == self.run_id,
                             "container ownership changed")
-                    command("docker", "rm", "-f", "-v", info["Id"])
+                    command("docker", "rm", "-f", "-v", info["Id"], timeout=180)
             except Exception as error:
                 errors.append(str(error))
         if self.volume_owned:
@@ -219,7 +221,7 @@ class Server:
                 if inspected.returncode == 0:
                     info = json.loads(inspected.stdout)[0]
                     require(info["Labels"].get(LABEL) == self.run_id, "volume ownership changed")
-                    command("docker", "volume", "rm", self.volume)
+                    command("docker", "volume", "rm", self.volume, timeout=180)
             except Exception as error:
                 errors.append(str(error))
         self.report["cleanup_errors"] = errors

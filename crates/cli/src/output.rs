@@ -11,6 +11,12 @@ use terminal_size::{terminal_size, Width};
 /// Minimum width to use for table layout, even if the terminal is narrower.
 const MIN_TABLE_WIDTH: u16 = 60;
 
+/// A command has already emitted its complete report to stdout. Returning this
+/// error preserves a failing exit status without appending a second document.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ReportedFailure(pub String);
+
 /// Output format for CLI commands
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq)]
 pub enum OutputFormat {

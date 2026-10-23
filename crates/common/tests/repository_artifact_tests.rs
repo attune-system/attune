@@ -591,6 +591,68 @@ async fn shared_file_log_stream_persists_backend_without_object_metadata() {
 }
 
 #[tokio::test]
+async fn supervisor_reclaims_sealed_object_logs_after_retention_override() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("object_log_retention_override");
+    let mut input = fixture.create_input("object_log");
+    input.retention_limit = 9;
+    let artifact = ArtifactRepository::create(&pool, input).await.unwrap();
+    let mut versions = Vec::new();
+    for index in 0..3 {
+        let version = ArtifactVersionRepository::create_log_pending(
+            &pool,
+            artifact.id,
+            &artifact.r#ref,
+            LogStreamBackend::ObjectSegments,
+            "text/plain".into(),
+            None,
+            None,
+            Some("sensor".into()),
+        )
+        .await
+        .unwrap();
+        let stream = LogStreamRepository::create(&pool, version.id, 1024, 500)
+            .await
+            .unwrap();
+        if index < 2 {
+            let mut tx = pool.begin().await.unwrap();
+            LogStreamRepository::seal(&mut tx, stream.id, false)
+                .await
+                .unwrap();
+            ArtifactVersionRepository::mark_body_ready_in_transaction(
+                &mut tx,
+                version.id,
+                "segments:0",
+                0,
+                &"a".repeat(64),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        versions.push(version.id);
+    }
+    ArtifactRepository::update(
+        &pool,
+        artifact.id,
+        UpdateArtifactInput {
+            retention_policy: Some(RetentionPolicyType::Versions),
+            retention_limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let expired = MaintenanceRepository::find_expired_artifact_versions(&pool, 10)
+        .await
+        .unwrap();
+    assert!(expired.iter().any(|candidate| candidate.id == versions[0]));
+    assert!(!expired.iter().any(|candidate| candidate.id == versions[1]));
+    assert!(!expired.iter().any(|candidate| candidate.id == versions[2]));
+}
+
+#[tokio::test]
 async fn test_log_failure_state_is_sanitized_and_cannot_be_overwritten_by_ready() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("degraded_log_state");

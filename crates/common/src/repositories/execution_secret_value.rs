@@ -22,7 +22,115 @@ pub struct ExecutionSecretValue {
 
 pub struct ExecutionSecretValueRepository;
 
+/// Authorization reads recorded origins, never ciphertext or encryption keys.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SecretProvenanceRow {
+    pub entity_type: String,
+    pub entity_id: Id,
+    pub json_path: String,
+    pub source_kind: String,
+    pub source_ref: Option<String>,
+}
+
 impl ExecutionSecretValueRepository {
+    /// Read only the exact source sites in one disclosure frontier. Zipped
+    /// selectors must not turn into a cross product of entity kinds and IDs.
+    pub async fn find_bounded_provenance_by_sites(
+        conn: &mut PgConnection,
+        sites: &[(String, Id, String)],
+    ) -> Result<Vec<SecretProvenanceRow>> {
+        if sites.len() > 256 {
+            return Err(crate::Error::PermissionDenied(
+                "Provenance frontier exceeds its bound".into(),
+            ));
+        }
+        let kinds: Vec<_> = sites.iter().map(|site| site.0.as_str()).collect();
+        let ids: Vec<_> = sites.iter().map(|site| site.1).collect();
+        let paths: Vec<_> = sites.iter().map(|site| site.2.as_str()).collect();
+        sqlx::query_as(
+            "WITH bounded AS ( \
+               SELECT p.entity_type, p.entity_id, p.json_path, p.source_kind, p.source_ref \
+               FROM execution_secret_value p \
+               JOIN UNNEST($1::TEXT[], $2::BIGINT[], $3::TEXT[]) AS wanted(kind, id, path) \
+                 ON p.entity_type = wanted.kind AND p.entity_id = wanted.id AND p.json_path = wanted.path \
+               ORDER BY p.entity_type, p.entity_id, p.json_path LIMIT 257 \
+             ), budgeted AS ( \
+               SELECT entity_type, entity_id, json_path, source_kind, source_ref, \
+                 SUM(COALESCE(octet_length(source_ref), 0)) \
+                 OVER (ORDER BY entity_type, entity_id, json_path) AS origin_bytes FROM bounded \
+             ) SELECT entity_type, entity_id, json_path, source_kind, \
+               CASE WHEN origin_bytes <= 1048576 THEN source_ref ELSE NULL END AS source_ref \
+               FROM budgeted ORDER BY entity_type, entity_id, json_path",
+        )
+        .bind(kinds)
+        .bind(ids)
+        .bind(paths)
+        .fetch_all(conn)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Runtime disclosure returns one overflow row and at most 1 MiB of origin
+    /// text. Oversized origins become unavailable, never silently authorized.
+    /// Ciphertext and encryption metadata are not projected.
+    pub async fn find_bounded_provenance<'e, E>(
+        executor: E,
+        entity_types: &[&str],
+        entity_ids: &[Id],
+    ) -> Result<Vec<SecretProvenanceRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(
+            "WITH bounded AS ( \
+               SELECT entity_type, entity_id, json_path, source_kind, source_ref \
+               FROM execution_secret_value WHERE entity_type = ANY($1) AND entity_id = ANY($2) \
+               ORDER BY entity_type, entity_id, json_path LIMIT 257 \
+             ), budgeted AS ( \
+               SELECT entity_type, entity_id, json_path, source_kind, source_ref, \
+                 SUM(COALESCE(octet_length(source_ref), 0)) OVER (ORDER BY entity_type, entity_id, json_path) AS origin_bytes \
+               FROM bounded \
+             ) SELECT entity_type, entity_id, json_path, source_kind, \
+               CASE WHEN origin_bytes <= 1048576 THEN source_ref ELSE NULL END AS source_ref \
+               FROM budgeted ORDER BY entity_type, entity_id, json_path",
+        ).bind(entity_types).bind(entity_ids).fetch_all(executor).await.map_err(Into::into)
+    }
+
+    pub async fn find_provenance_by_entities<'e, E>(
+        executor: E,
+        entity_types: &[&str],
+        entity_ids: &[Id],
+    ) -> Result<Vec<SecretProvenanceRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(
+            "SELECT entity_type, entity_id, json_path, source_kind, source_ref \
+             FROM execution_secret_value WHERE entity_type = ANY($1) AND entity_id = ANY($2) \
+             ORDER BY entity_type, entity_id, json_path",
+        )
+        .bind(entity_types)
+        .bind(entity_ids)
+        .fetch_all(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Replace a mutable value's complete encrypted projection in its owning
+    /// transaction. Removing a secret field must also remove its old ciphertext.
+    pub async fn replace_entity_with_conn(
+        connection: &mut PgConnection,
+        entity_type: &str,
+        entity_id: Id,
+        values: &[PreparedSecretValue],
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM execution_secret_value WHERE entity_type = $1 AND entity_id = $2")
+            .bind(entity_type)
+            .bind(entity_id)
+            .execute(&mut *connection)
+            .await?;
+        Self::upsert_many_with_conn(connection, entity_type, entity_id, values).await
+    }
     pub async fn upsert_many<'e, E>(
         executor: E,
         entity_type: &str,
@@ -139,6 +247,31 @@ impl ExecutionSecretValueRepository {
                 source_ref: row.source_ref,
             })
             .collect())
+    }
+
+    /// Bind a prepared input buffer to the actual typed source row through
+    /// restoration. Call during source preparation, before destination locks.
+    pub async fn find_stored_at(
+        connection: &mut sqlx::PgConnection,
+        entity_type: &str,
+        entity_id: Id,
+        path: &str,
+    ) -> Result<Option<StoredSecretValue>> {
+        let row = sqlx::query_as::<_, ExecutionSecretValue>(
+            "SELECT id, entity_type, entity_id, json_path, source_kind, source_ref, encrypted_value, encryption_key_hash, created FROM execution_secret_value WHERE entity_type=$1 AND entity_id=$2 AND json_path=$3 FOR SHARE",
+        )
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(path)
+        .fetch_optional(connection)
+        .await?;
+        Ok(row.map(|row| StoredSecretValue {
+            json_path: row.json_path,
+            encrypted_value: row.encrypted_value,
+            encryption_key_hash: row.encryption_key_hash,
+            source_kind: row.source_kind,
+            source_ref: row.source_ref,
+        }))
     }
 
     pub async fn copy_entity<'e, E>(

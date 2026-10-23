@@ -12,6 +12,7 @@ import type {
 import FormData from "form-data";
 
 import { ApiError } from "./ApiError";
+import { deploymentErrorText } from "@/lib/deployment-error";
 import type { ApiRequestOptions } from "./ApiRequestOptions";
 import type { ApiResult } from "./ApiResult";
 import { CancelablePromise } from "./CancelablePromise";
@@ -291,24 +292,24 @@ export const catchErrorCodes = (
 
   const error = errors[result.status];
   if (error) {
-    throw new ApiError(options, result, error);
+    throw new ApiError(
+      options,
+      result,
+      deploymentErrorText({ body: result.body }, error),
+    );
   }
 
   if (!result.ok) {
     const errorStatus = result.status ?? "unknown";
     const errorStatusText = result.statusText ?? "unknown";
-    const errorBody = (() => {
-      try {
-        return JSON.stringify(result.body, null, 2);
-      } catch (e) {
-        return undefined;
-      }
-    })();
 
     throw new ApiError(
       options,
       result,
-      `Generic Error: status: ${errorStatus}; status text: ${errorStatusText}; body: ${errorBody}`,
+      deploymentErrorText(
+        { body: result.body },
+        `Request failed: ${errorStatus} ${errorStatusText}. Check API availability and install status before retrying.`,
+      ),
     );
   }
 };

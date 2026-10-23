@@ -93,8 +93,8 @@ setting is an application invariant, not authorization against someone who
 holds arbitrary SQL access.
 
 Pack cleanup selects lifecycle pack ownership. Transferred platform rows have
-no pack foreign key, so uninstall cannot cascade into them. The Rust loader and
-the bounded Python bootstrap bridge accept exact bundled platform YAML as a no-op and reject altered
+no pack foreign key, so uninstall cannot cascade into them. The Rust loader
+accepts exact bundled platform YAML as a no-op and rejects altered
 definitions. This exception exists for bundled-core upgrades, not for arbitrary
 platform overrides. New external releases must omit those files. Remove the
 exception and its bundled-file parity test when bundled-core support is removed.
@@ -151,22 +151,14 @@ binary after this migration.
 It waits for the API, creates its temporary identity using `core.admin`, and
 uploads the bundled core content through the existing API path.
 
-The volume-mode `docker/init-packs.sh` continues to invoke the updated
-`load_core_pack.py`; existing Compose and shared-volume Helm ordering is retained.
-Before the first API reconciliation it creates pack-owned source definitions.
-After reconciliation, repeated runs compare each declared built-in against the
-catalog's persisted source snapshot and return its existing ID without writing
-the row or its runtime-version children. Changed definitions, ad-hoc claims,
-foreign pack owners, and namespace mismatches fail and roll back the load.
-Comparison uses JSON types, so a boolean changed to an integer is not an exact
-definition match.
-
-The loader checks the compatibility epoch/revision and holds a shared catalog
-state lock for its entire transaction. Reconciliation holds an exclusive lock on
-that same row before locking component tables. Neither path can check ownership
-against one catalog revision and write against another. The loader never enables
-`attune.catalog_write` or changes platform ownership. Deploy the updated loader
-with the compatible services; old loader credentials must still remain revoked.
+Volume-mode `docker/init-packs.sh` now assembles a private candidate and uses that
+same API publisher. `load_core_pack.py` is an API-only wrapper; direct SQL loading
+is removed. Bootstrap checks the API protocol before upload and requires a
+current core runtime-policy revision bound to the active release afterward.
+The publish job does not wait for worker hosts that depend on its completion.
+See [candidate effects and bootstrap admission](../deployment/candidate-api-effects.md).
+Old loader credentials must remain revoked. A new readiness check does not fence
+an old writer that never reads it.
 
 This bridge remains only until source bootstrap is replaced by the required-pack
 installer. It does not implement that coordinator or change the wire formats.
@@ -176,9 +168,10 @@ installer. It does not implement that coordinator or change the wire formats.
 Use a disposable stock PostgreSQL 16 or newer cluster. Compose and CI default
 to PostgreSQL 18, with no TimescaleDB extension required. Each integration test
 owns and removes its database clone. See [Running tests](../testing/running-tests.md)
-for database setup and invocation ownership. The Python boundary tests require `psycopg2-binary`
-and `PyYAML`; set `ATTUNE_TEST_PYTHON` to a virtualenv interpreter if they are not
-installed for `python3`. `ATTUNE__DATABASE__URL` can select a disposable test
+for database setup and invocation ownership. The API publisher requires
+`psycopg2-binary` and `PyYAML`; the removed SQL-entrypoint rejection test needs
+only Python 3. `ATTUNE_TEST_PYTHON` can select a virtualenv interpreter.
+`ATTUNE__DATABASE__URL` can select a disposable test
 database instead of the default local `attune_test`.
 
 ```sh
@@ -192,7 +185,7 @@ The integration tests cover fresh and concurrent reconciliation, repeat
 idempotency, an actual pre-migration schema with existing grants and references,
 ownership conflicts, platform mutation guards, legacy core refresh, omission,
 first release activation, uninstall, and newer revision/epoch rejection. Boundary
-tests run the real Python bootstrap repeatedly after reconciliation and reject
-changed built-ins. A two-connection test pauses activation after its projection
+tests prove the removed Python SQL entry rejects direct-loader arguments without
+changing platform rows or assignments. A two-connection test pauses activation after its projection
 sweep, proves that insertion waits for its commit, and then runs release retention
 to prove the inserted component does not pin the previous release.

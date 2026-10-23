@@ -56,7 +56,7 @@ The Attune Web UI is a single-page application (SPA) that provides a comprehensi
 - **Generated Artifacts**:
   - TypeScript interfaces for all DTOs (requests/responses)
   - API client with methods for all 86 endpoints
-  - Type-safe parameter validation
+   - Compile-time request types, not runtime request validation
   - Automatic bearer token injection
 
 **Usage Pattern**:
@@ -77,19 +77,17 @@ const actions = await ActionsService.listActions({
 # Run whenever API spec changes
 npm run generate:api
 
-# Implemented as:
-openapi-typescript-codegen \
-  --input http://localhost:8080/api-spec/openapi.json \
-  --output ./src/api \
-  --client axios \
-  --useOptions
+# Export the current Rust spec and check the client without writing files
+npm run check:api
 ```
 
-**Configuration** (`openapi-codegen.config.json`):
+The generator is `web/scripts/generate-api.mjs`. See [API contract checks](../web-ui/api-contracts.md) for generation details and request tests.
+
+**Configuration**:
 - Client: axios (configurable for auth, interceptors)
 - Type generation: all request/response types
 - Service generation: one service class per tag (PacksService, ActionsService, etc.)
-- Enum handling: TypeScript enums for all OpenAPI enums
+- Enum handling: TypeScript enums, with literal discriminated unions for inline patch operations
 
 #### **Axios**
 - **Purpose**: HTTP client for API requests

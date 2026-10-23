@@ -436,6 +436,27 @@ async fn authorize_policy_action(
     ctx.pack_ref = pack_ref.map(str::to_string);
     ctx.owner_ref = action_ref.map(str::to_string);
     ctx.target_ref = target_ref.map(str::to_string);
+    if action == Action::Create {
+        if let Some(reference) = pack_ref {
+            ctx.managing_pack_id = attune_common::repositories::pack::PackRepository::find_by_ref(
+                &state.db, reference,
+            )
+            .await?
+            .map(|pack| pack.id);
+        }
+    }
+    if let Some(reference) = target_ref {
+        if let Some(policy) = PolicyRepository::find_by_ref(&state.db, reference).await? {
+            ctx.target_id = Some(policy.id);
+            ctx.managing_pack_id =
+                attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                    &state.db,
+                    attune_common::repositories::runtime_target::ComponentTarget::Policy,
+                    policy.id,
+                )
+                .await?;
+        }
+    }
     state
         .authorization_service()
         .authorize(
@@ -463,7 +484,7 @@ async fn list_visible_policies(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
     ) {
-        let grants = state.authorization_service().effective_grants(user).await?;
+        let grants = state.authorization_service().resolved_grants(user).await?;
         filters.visibility = Some(build_policy_visibility_filter(&grants));
     }
 
@@ -502,6 +523,7 @@ fn build_policy_visibility_filter(grants: &[Grant]) -> PolicyVisibilityFilter {
             continue;
         }
         scopes.push(PolicyVisibilityScope {
+            managing_pack_id: constraints.managing_pack_id,
             pack_refs: constraints.pack_refs.clone(),
             action_refs: constraints.owner_refs.clone(),
             refs: constraints.refs.clone(),
@@ -516,6 +538,12 @@ fn build_policy_visibility_filter(grants: &[Grant]) -> PolicyVisibilityFilter {
 /// owner identity, artifact visibility, execution scope, or encryption
 /// flag), meaning the grant could never match any policy row.
 fn policy_grant_context_feasible(constraints: &GrantConstraints) -> bool {
+    if constraints.pack_owner.is_some() {
+        return false;
+    }
+    if constraints.pack_state.is_some() {
+        return false;
+    }
     if let Some(owner) = constraints.owner {
         // `ctx.owner_identity_id` is always `None` for policies, so only
         // `SelfOnly` (which requires a match) is infeasible; `Any`/`None`

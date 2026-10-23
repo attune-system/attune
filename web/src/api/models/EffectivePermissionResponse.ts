@@ -16,7 +16,7 @@ export type EffectivePermissionResponse = {
   /**
    * Optional grant constraints describing permission scope granularity.
    */
-  constraints?: any | null;
+  constraints?: Record<string, any> | null;
   /**
    * RBAC resource name.
    */

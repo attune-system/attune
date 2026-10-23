@@ -13,6 +13,170 @@ use attune_common::repositories::{
 mod helpers;
 
 #[tokio::test]
+async fn test_permission_set_creation_round_trip_and_duplicate_ref() {
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
+    let request = json!({
+        "ref": "custom.operator",
+        "label": "Operator",
+        "description": "Run deployment actions",
+        "grants": [{"resource": "actions", "actions": ["read", "execute"], "constraints": {"refs": ["deploy.release"]}}]
+    });
+    let response = ctx
+        .post("/api/v1/permissions/sets", request.clone(), ctx.token())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["data"]["id"].as_i64().unwrap() > 0);
+    for field in ["ref", "label", "description", "grants"] {
+        assert_eq!(body["data"][field], request[field]);
+    }
+    assert_eq!(body["data"]["management_origin"], "ad_hoc");
+    assert!(body["data"]["pack_ref"].is_null());
+    assert_eq!(body["data"]["roles"], json!([]));
+    let fetched: serde_json::Value = ctx
+        .get(
+            "/api/v1/permissions/sets/by-ref/custom.operator",
+            ctx.token(),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched["data"], body["data"]);
+    let duplicate = ctx
+        .post("/api/v1/permissions/sets", request, ctx.token())
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    let reserved = ctx
+        .post(
+            "/api/v1/permissions/sets",
+            json!({"ref": "core.admin", "grants": []}),
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reserved.status(), StatusCode::CONFLICT);
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_permission_set_creation_validates_refs_grants_and_ownership() {
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
+    for request in [
+        json!({"ref": "invalid", "grants": []}),
+        json!({"ref": "Custom.operator", "grants": []}),
+        json!({"ref": "custom.bad/name", "grants": []}),
+        json!({"ref": "custom.operator", "grants": {}}),
+        json!({"ref": "custom.operator", "grants": [{"resource": "actions", "actions": []}]}),
+        json!({"ref": "custom.operator", "grants": [{"resource": "actions", "actions": ["decrypt"]}]}),
+        json!({"ref": "custom.operator", "grants": [{"resource": "actions", "actions": ["read"], "constraints": {"ids": [1]}}]}),
+        json!({"ref": "custom.operator", "grants": [{"resource": "actions", "actions": ["read"], "constraints": {"pack_refs": ["deploy"], "refs": ["deploy.release"]}}]}),
+        json!({"ref": "custom.operator", "grants": [], "pack_ref": "core"}),
+        json!({"ref": "custom.operator", "grants": [], "management_origin": "platform"}),
+    ] {
+        let response = ctx
+            .post("/api/v1/permissions/sets", request.clone(), ctx.token())
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "accepted invalid request: {request}"
+        );
+    }
+    let response = ctx
+        .post(
+            "/api/v1/permissions/sets",
+            json!({"ref": "custom.empty", "grants": []}),
+            ctx.token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_permission_set_creation_requires_auth_and_manage_authority() {
+    use attune_api::authz::AuthorizationService;
+    use attune_common::repositories::{
+        identity::{
+            CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            PermissionAssignmentRepository, PermissionSetRepository,
+        },
+        Create,
+    };
+    let mut ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let token = ctx.token.take().unwrap();
+    let request = json!({"ref": "custom.operator", "grants": []});
+    assert_eq!(
+        ctx.post("/api/v1/permissions/sets", request.clone(), None)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        ctx.post("/api/v1/permissions/sets", request.clone(), Some(&token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let read_only = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "custom.reader".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([{"resource": "permissions", "actions": ["read"]}]),
+        },
+    )
+    .await
+    .unwrap();
+    let identity = ctx.user.as_ref().unwrap().id;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: read_only.id,
+        },
+    )
+    .await
+    .unwrap();
+    AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    assert_eq!(
+        ctx.get("/api/v1/permissions/sets", Some(&token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        ctx.post("/api/v1/permissions/sets", request, Some(&token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_identity_crud_and_permission_assignment_flow() {
     let ctx = TestContext::new()
         .await

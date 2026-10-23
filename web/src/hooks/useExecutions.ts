@@ -161,7 +161,7 @@ export function useRequestExecution() {
       actionRef: string;
       parameters?: Record<string, unknown>;
     }) => {
-      const response = await __request(OpenAPI, {
+      return __request<{ data: ExecutionResponse }>(OpenAPI, {
         method: "POST",
         url: "/api/v1/executions/execute",
         body: {
@@ -170,9 +170,6 @@ export function useRequestExecution() {
         },
         mediaType: "application/json",
       });
-      return response as {
-        data: { id: number; status: string; action_ref: string };
-      };
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["executions"] });

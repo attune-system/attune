@@ -131,11 +131,13 @@ def test_http_runner_error_handling(client: AttuneClient, test_pack):
     final_exec = wait_for_execution_status(
         client=client,
         execution_id=execution["id"],
-        expected_status="completed",
+        expected_status="failed",
         timeout=30,
     )
 
     result = final_exec.get("result", {})
+    assert result["exit_code"] == 1
+    result = json.loads(result["stdout"])
     assert result.get("status_code") == 404
     assert result.get("success") is False
     print(f"✓ HTTP 404 captured as failed execution: {execution['id']}")

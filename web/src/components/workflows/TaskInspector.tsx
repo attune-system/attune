@@ -26,12 +26,14 @@ import {
   EDGE_TYPE_COLORS,
   classifyTransitionWhen,
   transitionLabel,
+  retainUnrenderedTaskInputs,
 } from "@/types/workflow";
 import ParamSchemaForm, {
   extractProperties,
   type ParamSchema,
 } from "@/components/common/ParamSchemaForm";
 import { useAction } from "@/hooks/useActions";
+import TaskActionSelector from "./TaskActionSelector";
 
 /** Preset color swatches for quick transition color selection */
 const TRANSITION_COLOR_SWATCHES = [
@@ -53,6 +55,7 @@ interface TaskInspectorProps {
   availableActions: PaletteAction[];
   onUpdate: (taskId: string, updates: Partial<WorkflowTask>) => void;
   onClose: () => void;
+  taskPath?: string;
   /** When set, auto-expand transitions section, scroll to this index, and flash-highlight it */
   highlightTransitionIndex?: number | null;
 }
@@ -168,10 +171,11 @@ export default function TaskInspector({
   onUpdate,
   onClose,
   highlightTransitionIndex,
+  taskPath = `/tasks/${task.name.replace(/~/g, "~0").replace(/\//g, "~1")}`,
 }: TaskInspectorProps) {
   // Fetch full action details (including param_schema) on demand
   const { data: actionDetail, isLoading: actionLoading } = useAction(
-    task.action || "",
+    task.action.includes("{{") ? "" : task.action || "",
   );
   const transitionRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const [flashIndex, setFlashIndex] = useState<number | null>(null);
@@ -194,6 +198,7 @@ export default function TaskInspector({
   const [localWithItems, setLocalWithItems] = useState(initialWithItems);
   const [localTimeout, setLocalTimeout] = useState(initialTimeout);
   const [localDelay, setLocalDelay] = useState(initialDelay);
+  const [newInputName, setNewInputName] = useState("");
 
   // Reset local state when the selected task changes
   if (trackedTaskId !== task.id) {
@@ -201,6 +206,7 @@ export default function TaskInspector({
     setLocalWithItems(initialWithItems);
     setLocalTimeout(initialTimeout);
     setLocalDelay(initialDelay);
+    setNewInputName("");
   }
 
   // Adjust state synchronously when highlightTransitionIndex prop changes
@@ -429,10 +435,14 @@ export default function TaskInspector({
           <div className="space-y-3">
             {/* Task Name */}
             <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">
+              <label
+                htmlFor={`task-name-${task.id}`}
+                className="block text-xs font-medium text-gray-700 mb-1"
+              >
                 Task Name
               </label>
               <input
+                id={`task-name-${task.id}`}
                 type="text"
                 value={localName}
                 onChange={(e) => setLocalName(e.target.value)}
@@ -458,17 +468,11 @@ export default function TaskInspector({
           <div className="space-y-3">
             {/* Action Reference */}
             <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">
-                Action Reference
-              </label>
-              <SearchableSelect
-                value={task.action || ""}
-                onChange={(v) => update({ action: String(v) })}
-                options={availableActions.map((action) => ({
-                  value: action.ref,
-                  label: `${action.ref} (${action.label})`,
-                }))}
-                placeholder="-- Select an action --"
+              <TaskActionSelector
+                task={task}
+                path={taskPath}
+                availableActions={availableActions}
+                onChange={update}
               />
               {(fetchedAction?.description || selectedAction?.description) && (
                 <p className="text-[10px] text-gray-400 mt-1">
@@ -493,19 +497,116 @@ export default function TaskInspector({
                   schema={actionParamSchema}
                   values={task.input}
                   onChange={(newValues) => {
-                    update({ input: newValues });
+                    update({
+                      input: retainUnrenderedTaskInputs({
+                        stored: task.input,
+                        edited: newValues,
+                        renderedFields: Object.keys(schemaProperties),
+                      }),
+                    });
                   }}
                   allowTemplates
                   hideTemplateHint
                   className="text-xs"
                 />
+                {task.sourceTask && (
+                  <p className="text-xs text-gray-500">
+                    This is a current authoring preview, not the retained task
+                    contract. Unedited stored inputs stay explicit; the server
+                    validates the admitted target.
+                  </p>
+                )}
               </div>
             )}
             {task.action && !actionLoading && !hasSchema && (
               <p className="text-[10px] text-gray-400 italic">
-                This action has no declared parameters.
+                {task.action.includes("{{")
+                  ? "Parameters are validated against the actual admitted target's schema on the server."
+                  : fetchedAction
+                    ? "This action has no declared parameters."
+                    : "No parameter schema preview is available for this action."}
               </p>
             )}
+            <fieldset className="space-y-2">
+              <legend className="text-xs font-medium text-gray-700">
+                Stored inputs outside the current preview
+              </legend>
+              {Object.entries(task.input)
+                .filter(([name]) => !Object.hasOwn(schemaProperties, name))
+                .map(([name, value]) => (
+                  <div key={name}>
+                    <label className="text-xs text-gray-600">
+                      {name}
+                      {typeof value === "string" ? (
+                        <input
+                          aria-label={`Stored input ${name}`}
+                          value={value}
+                          onChange={(event) =>
+                            update({
+                              input: {
+                                ...task.input,
+                                [name]: event.target.value,
+                              },
+                            })
+                          }
+                          className="w-full border border-gray-300 rounded px-2 py-1 text-xs font-mono"
+                        />
+                      ) : (
+                        <span className="block text-xs">
+                          Stored literal or structured value
+                        </span>
+                      )}
+                    </label>
+                    <button
+                      type="button"
+                      aria-label={`Remove stored input ${name}`}
+                      className="text-xs text-gray-600"
+                      onClick={() =>
+                        update({
+                          input: Object.fromEntries(
+                            Object.entries(task.input).filter(
+                              ([key]) => key !== name,
+                            ),
+                          ),
+                        })
+                      }
+                    >
+                      Remove input
+                    </button>
+                  </div>
+                ))}
+              <label className="block text-xs text-gray-600">
+                New input name
+                <input
+                  aria-label="New task input name"
+                  value={newInputName}
+                  onChange={(event) => setNewInputName(event.target.value)}
+                  className="w-full border border-gray-300 rounded px-2 py-1 text-xs"
+                />
+              </label>
+              <button
+                type="button"
+                className="text-xs text-blue-600 disabled:text-gray-400"
+                disabled={
+                  !newInputName.trim() ||
+                  Object.hasOwn(task.input, newInputName.trim()) ||
+                  Object.hasOwn(schemaProperties, newInputName.trim())
+                }
+                onClick={() => {
+                  update({
+                    input: { ...task.input, [newInputName.trim()]: "" },
+                  });
+                  setNewInputName("");
+                }}
+              >
+                Add task input
+              </button>
+              <p className="text-xs text-gray-500">
+                Strings and template expressions can be edited here. Other
+                stored values stay intact unless explicitly removed. The server
+                validates values against the actual admitted target.
+              </p>
+            </fieldset>
 
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">
@@ -528,6 +629,8 @@ export default function TaskInspector({
                 Optional. Use comma/newline-separated refs, a JSON string array,
                 or a template resolving to a ref or ref array. When omitted, the
                 action&apos;s default execution permission sets are used.
+                Rendered selections can only reduce each target&apos;s admitted
+                ceiling, never copy parent authority or grant new capabilities.
               </p>
             </div>
           </div>

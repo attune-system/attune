@@ -3,17 +3,32 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ActionResponse } from "@/api";
+import {
+  ExecutionOptionsAuthoritySource,
+  type ActionsService,
+  type ActionResponse,
+} from "@/api";
 import ExecuteActionModal from "./ExecuteActionModal";
 
 vi.mock("@/contexts/AuthContext", () => ({
   useAuth: () => ({
-    user: { assigned_permission_set_refs: ["core.admin"] },
+    user: { assigned_permission_set_refs: [] },
   }),
 }));
 
 vi.mock("@/hooks/usePermissions", () => ({
   usePermissionSets: () => ({ data: [] }),
+}));
+
+let optionsData:
+  Awaited<ReturnType<typeof ActionsService.getExecutionOptions>> | undefined;
+let optionsError = false;
+vi.mock("@/hooks/useExecutionOptions", () => ({
+  useExecutionOptions: () => ({
+    data: optionsData,
+    isLoading: false,
+    isError: optionsError,
+  }),
 }));
 
 function CurrentPath() {
@@ -39,9 +54,155 @@ const action: ActionResponse = {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  optionsData = undefined;
+  optionsError = false;
 });
 
 describe("ExecuteActionModal", () => {
+  it("shows server-owned defaults and policy revision without personal IAM discovery", async () => {
+    optionsData = {
+      data: {
+        action_ref: action.ref,
+        authority_source: ExecutionOptionsAuthoritySource.PACK,
+        default_permission_set_refs: ["local.approved"],
+        selectable_permission_set_refs: ["local.approved"],
+        default_selection_available: true,
+        policy_revision_id: 19,
+      },
+    };
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <ExecuteActionModal
+            action={{
+              ...action,
+              default_execution_permission_set_refs: ["stale.projection"],
+            }}
+            onClose={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(
+      screen.getByRole("button", { name: /Execution Token Access/ }),
+    ).toHaveTextContent("local.approved");
+    expect(screen.queryByText("stale.projection")).not.toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: /Execution Token Access/ }),
+    );
+    expect(
+      screen.getByText(/Pack-approved policy revision 19/),
+    ).toBeInTheDocument();
+  });
+
+  it("preserves rerun refs when preview fails instead of converting them to opt-out", async () => {
+    optionsError = true;
+    let submitted: unknown;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (_input, init) => {
+        if (typeof init?.body === "string") submitted = JSON.parse(init.body);
+        return new Response(JSON.stringify({ data: { id: 42 } }), {
+          status: 201,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <ExecuteActionModal
+            action={action}
+            initialPermissionSetRefs={["local.previous"]}
+            onClose={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: /Execution Token Access/ }),
+    );
+    expect(
+      screen.getByText(/Permission choices could not be loaded/),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Execute" }));
+    await waitFor(() =>
+      expect(submitted).toHaveProperty("permission_set_refs", [
+        "local.previous",
+      ]),
+    );
+  });
+
+  it.each([
+    {
+      name: "action defaults",
+      initialRefs: undefined,
+      expectedRefs: undefined,
+    },
+    { name: "explicit token opt-out", initialRefs: [], expectedRefs: [] },
+    {
+      name: "explicit rerun refs",
+      initialRefs: ["local.emitter"],
+      expectedRefs: ["local.emitter"],
+    },
+  ])(
+    "preserves $name without personal permission-set membership",
+    async ({ initialRefs, expectedRefs }) => {
+      optionsData = {
+        data: {
+          action_ref: action.ref,
+          authority_source: ExecutionOptionsAuthoritySource.PACK,
+          default_permission_set_refs: ["local.emitter"],
+          selectable_permission_set_refs: [],
+          default_selection_available: false,
+          policy_revision_id: 7,
+        },
+      };
+      let submitted: unknown;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>(async (_input, init) => {
+          if (typeof init?.body === "string") submitted = JSON.parse(init.body);
+          return new Response(JSON.stringify({ data: { id: 42 } }), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          });
+        }),
+      );
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ExecuteActionModal
+              action={{
+                ...action,
+                default_execution_permission_set_refs: ["local.emitter"],
+              }}
+              initialPermissionSetRefs={initialRefs}
+              onClose={vi.fn()}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Execute" }));
+      await waitFor(() => {
+        expect(submitted).toHaveProperty("action_ref", action.ref);
+        if (expectedRefs === undefined)
+          expect(submitted).not.toHaveProperty("permission_set_refs");
+        else
+          expect(submitted).toHaveProperty("permission_set_refs", expectedRefs);
+      });
+    },
+  );
+
   it("shows a visible warning and blocks reserved environment names", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

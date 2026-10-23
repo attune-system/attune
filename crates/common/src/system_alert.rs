@@ -7,7 +7,7 @@ use tracing::warn;
 use crate::{
     models::{event::Event, Id, JsonDict},
     mq::{EventCreatedPayload, MessageEnvelope, MessageType, Publisher},
-    repositories::{event::CreateEventInput, Create, EventRepository},
+    repositories::{event::CreateEventInput, event_schema::EventSchemaRepository},
     Result,
 };
 
@@ -41,23 +41,10 @@ pub async fn emit_core_alert(
     publisher: Option<&Publisher>,
     alert: SystemAlert,
 ) -> Result<Option<Event>> {
-    let trigger_id: Option<Id> = sqlx::query_scalar("SELECT id FROM trigger WHERE ref = $1")
-        .bind(CORE_ALERT_TRIGGER_REF)
-        .fetch_optional(pool)
-        .await?;
-
-    let Some(trigger_id) = trigger_id else {
-        warn!(
-            "Skipping system alert '{}' because trigger '{}' is not registered",
-            alert.failure_type, CORE_ALERT_TRIGGER_REF
-        );
-        return Ok(None);
-    };
-
-    let event = EventRepository::create(
+    let event = EventSchemaRepository::create_internal(
         pool,
         CreateEventInput {
-            trigger: Some(trigger_id),
+            trigger: None,
             trigger_ref: CORE_ALERT_TRIGGER_REF.to_string(),
             config: None,
             payload: Some(alert.payload()),
@@ -67,11 +54,17 @@ pub async fn emit_core_alert(
             rule: None,
             rule_ref: None,
         },
+        None,
     )
     .await?;
+    let Some(event) = event else {
+        warn!("Skipping system alert because its trigger is not registered");
+        return Ok(None);
+    };
 
     if let Some(publisher) = publisher {
         let payload = EventCreatedPayload {
+            event_created: Some(event.created),
             event_id: event.id,
             trigger_id: event.trigger,
             trigger_ref: event.trigger_ref.clone(),

@@ -70,6 +70,82 @@ impl TestDatabase {
         Self::create_with_migrations(config, &migrations).await
     }
 
+    /// A rare upgrade fixture that needs REAL applied migration history. Normal
+    /// fast templates replay raw SQL and deliberately have no runner ledger.
+    /// Use SQLx itself here, including its runner-claim migration; never seed a
+    /// lookalike _sqlx_migrations table or guess a history schema in a test.
+    pub async fn create_before_with_history(
+        config: &DatabaseConfig,
+        migration_filename: &str,
+    ) -> Result<Self> {
+        let cutoff: i64 = migration_filename
+            .split_once('_')
+            .and_then(|(version, _)| version.parse().ok())
+            .ok_or_else(|| Error::invalid_state("invalid history fixture migration filename"))?;
+        let mut migrator = sqlx::migrate!("../../migrations");
+        if !migrator.iter().any(|migration| migration.version == cutoff) {
+            return Err(Error::invalid_state(
+                "history fixture cutoff is not an embedded migration",
+            ));
+        }
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .iter()
+                .filter(|migration| migration.version < cutoff)
+                .cloned()
+                .collect(),
+        );
+        let db = Self::create_with_migrations(config, &[]).await?;
+        let result: Result<()> = async {
+            let mut connection = db.pool().acquire().await?;
+            // The owned application schema is the same one used by this
+            // fixture's Database pool. Let the verified runner create/resolve
+            // its ledger on that connection's search_path.
+            let schema = db.schema().replace('"', "\"\"");
+            sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("SELECT set_config('search_path', quote_ident($1), false)")
+                .bind(db.schema())
+                .execute(&mut *connection)
+                .await?;
+            migrator.run(&mut *connection).await.map_err(|error| {
+                Error::invalid_state(format!("SQLx history fixture migration failed: {error}"))
+            })?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            return match db.cleanup().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(Error::invalid_state(format!(
+                    "history fixture setup failed: {error}; owned cleanup failed: {cleanup}"
+                ))),
+            };
+        }
+        Ok(db)
+    }
+
+    /// Read the runner-created ledger through SQLx on the owning application
+    /// connection. Raw-replay fixtures correctly return an error, not invented
+    /// empty history or source-file checksums masquerading as applied history.
+    pub async fn migration_history(&self) -> Result<Vec<(i64, Vec<u8>)>> {
+        use sqlx::migrate::Migrate;
+        let mut connection = self.pool().acquire().await?;
+        let applied = connection
+            .list_applied_migrations()
+            .await
+            .map_err(|error| {
+                Error::invalid_state(format!("SQLx fixture history unavailable: {error}"))
+            })?;
+        let mut history: Vec<_> = applied
+            .into_iter()
+            .map(|migration| (migration.version, migration.checksum.into_owned()))
+            .collect();
+        history.sort_unstable_by_key(|(version, _)| *version);
+        Ok(history)
+    }
+
     async fn create_with_migrations(
         config: &DatabaseConfig,
         migrations: &[(PathBuf, String)],
@@ -212,6 +288,21 @@ impl Deref for TestDatabase {
 
     fn deref(&self) -> &Self::Target {
         self.pool()
+    }
+}
+
+impl<'p> sqlx::Acquire<'p> for &'p TestDatabase {
+    type Database = Postgres;
+    type Connection = sqlx::pool::PoolConnection<Postgres>;
+
+    fn acquire(self) -> BoxFuture<'p, std::result::Result<Self::Connection, sqlx::Error>> {
+        sqlx::Acquire::acquire(self.pool())
+    }
+
+    fn begin(
+        self,
+    ) -> BoxFuture<'p, std::result::Result<sqlx::Transaction<'p, Postgres>, sqlx::Error>> {
+        sqlx::Acquire::begin(self.pool())
     }
 }
 

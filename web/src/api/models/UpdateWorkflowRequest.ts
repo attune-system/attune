@@ -7,9 +7,11 @@
  */
 export type UpdateWorkflowRequest = {
   /**
-   * Workflow definition
+   * Workflow definition. A task with a templated action requires a finite
+   * literal allowed_action_refs array. Rendered permissions only reduce its
+   * admitted per-target ceiling.
    */
-  definition: any | null;
+  definition: Record<string, any> | null;
   /**
    * Workflow description
    */
@@ -21,15 +23,15 @@ export type UpdateWorkflowRequest = {
   /**
    * Output schema
    */
-  out_schema: any | null;
+  out_schema: Record<string, any> | null;
   /**
    * Parameter schema (StackStorm-style with inline required/secret)
    */
-  param_schema: any | null;
+  param_schema: Record<string, any> | null;
   /**
    * Tags
    */
-  tags?: any[] | null;
+  tags?: Array<string> | null;
   /**
    * Workflow version
    */

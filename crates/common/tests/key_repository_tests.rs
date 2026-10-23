@@ -15,6 +15,67 @@ use attune_common::{
 };
 use helpers::*;
 
+#[tokio::test]
+async fn key_schema_assignment_is_verified_transactional_and_removed_with_owner() {
+    use attune_common::{
+        repositories::{
+            key_schema::{KeySchemaAssignment, KeySchemaRepository},
+            schema_contract::SchemaContractRepository,
+        },
+        value_schema::{SchemaContext, SourceIdentity},
+    };
+    let db = create_test_pool().await.unwrap();
+    let key = KeyFixture::new_system_unique("typed", "value")
+        .create(&db)
+        .await
+        .unwrap();
+    let schema = serde_json::json!({"type": "string", "minLength": 2});
+    let mut transaction = db.begin().await.unwrap();
+    let contract = SchemaContractRepository::materialize_assignment(
+        &mut transaction,
+        SourceIdentity::Assigned {
+            component_ref: key.r#ref.clone(),
+            assignment_id: uuid::Uuid::new_v4(),
+        },
+        SchemaContext::SingleValue,
+        &schema,
+    )
+    .await
+    .unwrap();
+    let assignment = KeySchemaAssignment {
+        authored_schema: schema.clone(),
+        contract,
+    };
+    KeySchemaRepository::set(&mut transaction, key.id, Some(&assignment))
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let stored = KeySchemaRepository::find(&db, key.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.contract.binding_digest,
+        assignment.contract.binding_digest
+    );
+    assert!(KeySchemaRepository::prepare_value(&stored, &serde_json::json!("x"), false).is_err());
+    let mut transaction = db.begin().await.unwrap();
+    KeySchemaRepository::set(&mut transaction, key.id, None)
+        .await
+        .unwrap();
+    transaction.rollback().await.unwrap();
+    assert!(KeySchemaRepository::find(&db, key.id)
+        .await
+        .unwrap()
+        .is_some());
+    KeyRepository::delete(&db, key.id).await.unwrap();
+    assert!(KeySchemaRepository::find(&db, key.id)
+        .await
+        .unwrap()
+        .is_none());
+    db.cleanup().await.unwrap();
+}
+
 // ============================================================================
 // CREATE Tests - System Owner
 // ============================================================================

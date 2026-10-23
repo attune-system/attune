@@ -42,6 +42,11 @@ pub struct CreateTriggerRequest {
     #[schema(value_type = Object, nullable = true, example = json!({"payload": {"type": "object", "description": "Event payload data", "required": true}}))]
     pub out_schema: Option<JsonValue>,
 
+    /// Flat schema for sensor-supplied event configuration, not trigger-instance parameters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object, nullable = true)]
+    pub event_config_schema: Option<JsonValue>,
+
     /// Whether the trigger is enabled
     #[serde(default = "default_true")]
     #[schema(example = true)]
@@ -60,7 +65,11 @@ pub struct CreateTriggerRequest {
 
 /// Request DTO for updating a trigger
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateTriggerRequest {
+    /// Allow a changed live contract despite admitted emitters. Ordinary confirmation is not acknowledgement.
+    #[serde(default)]
+    pub acknowledge_incompatible_rollout: bool,
     /// Human-readable label
     #[validate(length(min = 1, max = 255))]
     #[schema(example = "Webhook Trigger (Updated)")]
@@ -71,12 +80,16 @@ pub struct UpdateTriggerRequest {
     pub description: Option<TriggerStringPatch>,
 
     /// Parameter schema (StackStorm-style with inline required/secret)
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(nullable = true)]
     pub param_schema: Option<TriggerJsonPatch>,
 
     /// Output schema
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(nullable = true)]
     pub out_schema: Option<TriggerJsonPatch>,
+
+    /// Replace or clear the sensor-supplied event configuration schema.
+    #[schema(nullable = true)]
+    pub event_config_schema: Option<TriggerJsonPatch>,
 
     /// Whether the trigger is enabled
     #[schema(example = true)]
@@ -93,18 +106,111 @@ pub struct UpdateTriggerRequest {
     pub reference_allowed_pack_refs: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", content = "value", rename_all = "snake_case")]
 pub enum TriggerStringPatch {
     Set(String),
     Clear,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", content = "value", rename_all = "snake_case")]
 pub enum TriggerJsonPatch {
     Set(JsonValue),
     Clear,
+}
+
+// Distinct operation schemas keep generated clients from collapsing the two
+// inline `op` enums into a single SET-only enum. The wire format remains the
+// existing tagged set/clear union.
+#[derive(ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerSetOperation {
+    Set,
+}
+
+#[derive(ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerClearOperation {
+    Clear,
+}
+
+#[derive(ToSchema)]
+#[serde(untagged)]
+pub enum TriggerStringPatchSchema {
+    Set {
+        op: TriggerSetOperation,
+        value: String,
+    },
+    Clear {
+        op: TriggerClearOperation,
+    },
+}
+
+#[derive(ToSchema)]
+#[serde(untagged)]
+pub enum TriggerJsonPatchSchema {
+    Set {
+        op: TriggerSetOperation,
+        value: JsonValue,
+    },
+    Clear {
+        op: TriggerClearOperation,
+    },
+}
+
+impl utoipa::PartialSchema for TriggerStringPatch {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <TriggerStringPatchSchema as utoipa::PartialSchema>::schema()
+    }
+}
+impl ToSchema for TriggerStringPatch {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        TriggerStringPatchSchema::schemas(schemas);
+    }
+}
+impl utoipa::PartialSchema for TriggerJsonPatch {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <TriggerJsonPatchSchema as utoipa::PartialSchema>::schema()
+    }
+}
+impl ToSchema for TriggerJsonPatch {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        TriggerJsonPatchSchema::schemas(schemas);
+    }
+}
+
+/// Response DTO for trigger information
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TriggerRolloutResponse {
+    pub trigger_id: i64,
+    pub execution_ids: Vec<i64>,
+    pub workload_ids: Vec<i64>,
+    pub requires_acknowledgement: bool,
+}
+
+impl From<attune_common::repositories::trigger_rollout::TriggerRolloutImpact>
+    for TriggerRolloutResponse
+{
+    fn from(impact: attune_common::repositories::trigger_rollout::TriggerRolloutImpact) -> Self {
+        let requires_acknowledgement = impact.requires_acknowledgement();
+        Self {
+            trigger_id: impact.trigger_id,
+            execution_ids: impact.execution_ids,
+            workload_ids: impact.workload_ids,
+            requires_acknowledgement,
+        }
+    }
 }
 
 /// Response DTO for trigger information
@@ -145,6 +251,10 @@ pub struct TriggerResponse {
     /// Output schema
     #[schema(value_type = Object, nullable = true)]
     pub out_schema: Option<JsonValue>,
+
+    /// Flat schema for sensor-supplied event configuration.
+    #[schema(value_type = Object, nullable = true)]
+    pub event_config_schema: Option<JsonValue>,
 
     /// Whether webhooks are enabled for this trigger
     #[schema(example = false)]
@@ -424,6 +534,19 @@ pub struct UpdateSensorRequest {
     #[schema(value_type = Object, nullable = true)]
     pub param_schema: Option<SensorJsonPatch>,
 
+    /// Persistent overrides, replacing each supplied top-level field completely.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::common::deserialize_present_value"
+    )]
+    #[schema(value_type = Object, nullable = true)]
+    pub config: Option<JsonValue>,
+
+    /// Remove these top-level overrides and use current release defaults. Null is not reset.
+    #[serde(default)]
+    pub config_reset_fields: Vec<String>,
+
     /// Whether the sensor is enabled
     #[schema(example = false)]
     pub enabled: Option<bool>,
@@ -454,6 +577,14 @@ pub struct UpdateSensorRequest {
 
     /// Patch the per-sensor retention limit override for registered stdout/stderr log artifacts.
     pub log_retention_limit: Option<LogRetentionLimitPatch>,
+}
+
+/// Explicit operational revocation, separate from disablement or human IAM edits.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SensorRuntimeRevocationRequest {
+    /// Revoke only this immutable revision. Omit to revoke every sensor generation.
+    pub metadata_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -523,6 +654,14 @@ pub struct SensorResponse {
     /// Parameter schema (StackStorm-style with inline required/secret)
     #[schema(value_type = Object, nullable = true)]
     pub param_schema: Option<JsonValue>,
+
+    /// Current configuration projection. Secret fields remain redacted by default.
+    pub config: Option<JsonValue>,
+    /// Original contract for the current configuration revision.
+    pub config_schema_binding: Option<JsonValue>,
+
+    /// Current immutable executable/purpose admission over pinned code bytes.
+    pub managed_metadata_revision: Option<i64>,
 
     /// Worker labels required for this sensor process.
     pub worker_selector: BTreeMap<String, String>,
@@ -635,6 +774,7 @@ impl From<attune_common::models::trigger::Trigger> for TriggerResponse {
             enabled: trigger.enabled,
             param_schema: trigger.param_schema,
             out_schema: trigger.out_schema,
+            event_config_schema: trigger.event_config_schema,
             webhook_enabled: trigger.webhook_enabled,
             webhook_key: trigger.webhook_key,
             is_adhoc: trigger.is_adhoc,
@@ -675,6 +815,16 @@ impl From<attune_common::models::trigger::Sensor> for SensorResponse {
         let worker_selector = sensor.worker_selector_labels();
         let worker_tolerations = sensor.worker_toleration_specs();
         let worker_affinity = sensor.worker_affinity_spec();
+        let config = sensor.config.clone().map(|value| {
+            attune_common::secret_values::configuration_metadata_projection(
+                &sensor.r#ref,
+                sensor
+                    .param_schema
+                    .as_ref()
+                    .unwrap_or(&serde_json::json!({})),
+                value,
+            )
+        });
 
         Self {
             id: sensor.id,
@@ -688,6 +838,9 @@ impl From<attune_common::models::trigger::Sensor> for SensorResponse {
             runtime_ref: sensor.runtime_ref,
             enabled: sensor.enabled,
             param_schema: sensor.param_schema,
+            config,
+            config_schema_binding: None,
+            managed_metadata_revision: None,
             worker_selector,
             worker_tolerations,
             worker_affinity,
@@ -757,6 +910,7 @@ mod tests {
             description: None,
             param_schema: None,
             out_schema: None,
+            event_config_schema: None,
             enabled: true,
             reference_visibility: None,
             reference_allowed_pack_refs: Vec::new(),
@@ -793,10 +947,12 @@ mod tests {
     #[test]
     fn test_update_trigger_request_all_none() {
         let req = UpdateTriggerRequest {
+            acknowledge_incompatible_rollout: false,
             label: None,
             description: None,
             param_schema: None,
             out_schema: None,
+            event_config_schema: None,
             enabled: None,
             reference_visibility: None,
             reference_allowed_pack_refs: None,
@@ -809,10 +965,12 @@ mod tests {
     #[test]
     fn test_update_sensor_request_partial() {
         let req = UpdateSensorRequest {
+            config_reset_fields: vec![],
             label: Some("Updated Sensor".to_string()),
             description: None,
             entrypoint: Some("/sensors/test_v2.py".to_string()),
             param_schema: None,
+            config: None,
             enabled: Some(false),
             worker_selector: None,
             worker_tolerations: None,
@@ -824,5 +982,20 @@ mod tests {
         };
 
         assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn configuration_null_is_not_an_implicit_reset() {
+        let omitted: UpdateSensorRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(omitted.config.is_none());
+        let explicit: UpdateSensorRequest =
+            serde_json::from_value(serde_json::json!({"config":null})).unwrap();
+        assert_eq!(explicit.config, Some(serde_json::Value::Null));
+        let field: UpdateSensorRequest = serde_json::from_value(serde_json::json!({
+            "config":{"nullable":null},"config_reset_fields":["other"]
+        }))
+        .unwrap();
+        assert_eq!(field.config.unwrap()["nullable"], serde_json::Value::Null);
+        assert_eq!(field.config_reset_fields, ["other"]);
     }
 }

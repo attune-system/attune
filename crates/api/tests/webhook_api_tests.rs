@@ -8,7 +8,7 @@ use attune_common::repositories::{
     },
     pack::{CreatePackInput, PackRepository},
     trigger::{CreateTriggerInput, TriggerRepository},
-    Create,
+    Create, FindById,
 };
 use axum::{
     body::Body,
@@ -67,6 +67,7 @@ async fn create_test_trigger(
         description: Some(format!("Test trigger {}", trigger_ref)),
         enabled: true,
         param_schema: None,
+        event_config_schema: None,
         out_schema: None,
         sensor: None,
         sensor_ref: None,
@@ -353,7 +354,8 @@ async fn test_receive_webhook() {
             }
         },
         "headers": {
-            "X-Test-Header": "test-value"
+            "X-Test-Header": "test-value",
+            "Authorization": "Bearer private-header-fixture"
         },
         "source_ip": "192.168.1.1",
         "user_agent": "Test Agent/1.0"
@@ -390,6 +392,40 @@ async fn test_receive_webhook() {
         json["data"]["message"].as_str().unwrap(),
         "Webhook received successfully"
     );
+    let event_id = json["data"]["event_id"].as_i64().unwrap();
+    let event =
+        attune_common::repositories::event::EventRepository::find_by_id(&ctx.pool, event_id)
+            .await
+            .unwrap()
+            .unwrap();
+    let public = serde_json::to_string(&event.config).unwrap();
+    assert!(!public.contains(&webhook_info.webhook_key));
+    assert!(!public.contains("private-header-fixture"));
+    let secrets = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+        &ctx.pool, attune_common::secret_values::ENTITY_EVENT_CONFIG, event_id,
+    ).await.unwrap();
+    assert_eq!(secrets.len(), 2);
+    let restored = attune_common::secret_values::restore_secret_values(
+        event.config.unwrap(),
+        &secrets,
+        ctx.state.config.security.encryption_key.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored["webhook_key"], webhook_info.webhook_key);
+    assert_eq!(
+        restored["headers"]["Authorization"],
+        "Bearer private-header-fixture"
+    );
+    let binding =
+        attune_common::repositories::event_schema::EventSchemaRepository::find(&ctx.pool, event_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(binding.webhook);
+    binding
+        .validate_restored(event.payload.as_ref(), Some(&restored))
+        .unwrap();
+    ctx.cleanup().await.unwrap();
 }
 
 #[tokio::test]

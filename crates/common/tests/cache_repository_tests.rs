@@ -4108,6 +4108,11 @@ async fn create_core_native_runtime(pool: &PgPool) {
 fn write_pack_owner_components(root: &std::path::Path, pack_ref: &str) {
     write_pack_file(
         root,
+        "pack.yaml",
+        &format!("ref: {pack_ref}\nlabel: Cache owner fixture\nversion: '1.0.0'\n"),
+    );
+    write_pack_file(
+        root,
         "actions/refresh.yaml",
         &format!(
             "ref: {pack_ref}.refresh\nlabel: Refresh\nrunner_type: native\n\
@@ -4119,9 +4124,22 @@ fn write_pack_owner_components(root: &std::path::Path, pack_ref: &str) {
         "sensors/watcher.yaml",
         &format!(
             "ref: {pack_ref}.watcher\nlabel: Watcher\nrunner_type: native\n\
-             entry_point: watcher\n"
+             entry_point: watcher\ntrigger_types: [{pack_ref}.updated]\n"
         ),
     );
+    write_pack_file(
+        root,
+        "triggers/updated.yaml",
+        &format!("ref: {pack_ref}.updated\nlabel: Updated\nparameters: {{}}\n"),
+    );
+}
+
+#[test]
+fn cache_owner_pack_fixture_passes_authoring_checks() {
+    let root = TempDir::new().unwrap();
+    write_pack_owner_components(root.path(), "cache_fixture");
+    let report = attune_common::pack_check::check_pack(root.path());
+    assert!(report.valid, "{:?}", report.diagnostics);
 }
 
 #[tokio::test]
@@ -4416,8 +4434,30 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
 
     fs::remove_file(temp.path().join("actions/refresh.yaml")).unwrap();
     fs::remove_file(temp.path().join("sensors/watcher.yaml")).unwrap();
+    let invalid = loader.load_all(temp.path()).await.unwrap_err();
+    let attune_common::Error::Deployment { details, .. } = invalid else {
+        panic!("expected a located deployment diagnostic, got {invalid:?}");
+    };
+    for path in ["caches/action_catalog.yaml", "caches/sensor_catalog.yaml"] {
+        assert!(details.diagnostics.iter().any(|diagnostic| diagnostic.code
+            == "reference.missing_local_target"
+            && diagnostic.path.as_deref() == Some(path)));
+    }
+    assert!(ActionRepository::find_by_ref(&pool, &action_ref)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(SensorRepository::find_by_ref(&pool, &sensor_ref)
+        .await
+        .unwrap()
+        .is_some());
+    // An owning component and its managed declarations must be omitted
+    // together. Invalid dangling declarations cannot partly retire owners.
+    fs::remove_file(temp.path().join("caches/action_catalog.yaml")).unwrap();
+    fs::remove_file(temp.path().join("caches/sensor_catalog.yaml")).unwrap();
     let owner_removed = loader.load_all(temp.path()).await.unwrap();
-    assert!(owner_removed.caches_skipped >= 2);
+    assert_eq!(owner_removed.caches_loaded, 0);
+    assert_eq!(owner_removed.caches_skipped, 1);
     assert!(ActionRepository::find_by_ref(&pool, &action_ref)
         .await
         .unwrap()

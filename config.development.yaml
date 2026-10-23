@@ -72,6 +72,10 @@ security:
 packs_base_dir: ./packs
 packs:
   transport: volume
+  # Local iteration only. Each changed upload remains a distinct release.
+  republish:
+    mode: suffix
+    suffix: "-dev"
 
 # Runtime environments directory (virtualenvs, node_modules, etc.)
 # Isolated from pack directories to keep packs clean and read-only.

@@ -24,6 +24,10 @@ export type ApiResponse_TriggerResponse = {
      */
     enabled: boolean;
     /**
+     * Flat schema for sensor-supplied event configuration.
+     */
+    event_config_schema: Record<string, any> | null;
+    /**
      * Trigger ID
      */
     id: number;
@@ -38,7 +42,7 @@ export type ApiResponse_TriggerResponse = {
     /**
      * Output schema
      */
-    out_schema: any | null;
+    out_schema: Record<string, any> | null;
     /**
      * Pack ID (optional)
      */
@@ -50,7 +54,7 @@ export type ApiResponse_TriggerResponse = {
     /**
      * Parameter schema (StackStorm-style with inline required/secret)
      */
-    param_schema: any | null;
+    param_schema: Record<string, any> | null;
     /**
      * Unique reference identifier
      */

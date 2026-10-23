@@ -15,10 +15,12 @@ use attune_common::{
         jwt::{generate_token, generate_worker_token, validate_token, JwtConfig, TokenType},
     },
     blob_store::{body_from_file, BlobStore, FilesystemBlobStore, ObjectKey},
+    config::{PackRepublishConfig, PackRepublishMode},
     models::{ManagementOrigin, Pack},
     pack_registry::calculate_directory_checksum,
     platform_catalog::ManagedComponentKind,
     repositories::{
+        action::ActionRepository,
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
@@ -32,12 +34,14 @@ use attune_common::{
     },
 };
 use axum::http::StatusCode;
+use futures::StreamExt;
 use helpers::{Result, TestContext};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::time::Duration;
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 use attune_api::pack_release_upgrade::upgrade_legacy_pack_releases;
 
@@ -77,13 +81,1405 @@ print("Test action executed")
     Ok(temp_dir)
 }
 
+fn write_candidate_test_entrypoint(pack_dir: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(pack_dir.join("tests"))?;
+    fs::write(pack_dir.join("tests/run.sh"), "#!/bin/sh\nexit 0\n")?;
+    Ok(())
+}
+
+async fn register_pack_role_user(ctx: &TestContext, permission_ref: &str) -> Result<(String, i64)> {
+    let login = format!("pack_claim_{}", uuid::Uuid::new_v4().simple());
+    let response = ctx.post("/auth/register", json!({
+        "login": login, "password": "TestPassword123!", "display_name": "Pack namespace test",
+    }), None).await?;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await?;
+    let token = body["data"]["access_token"].as_str().unwrap().to_string();
+    let identity = IdentityRepository::find_by_login(&ctx.pool, &login)
+        .await?
+        .unwrap();
+    let set = PermissionSetRepository::find_by_ref(&ctx.pool, permission_ref)
+        .await?
+        .unwrap();
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    Ok((token, identity.id))
+}
+
+async fn namespace_claim_test_context() -> Result<TestContext> {
+    let ctx = TestContext::new().await?.with_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let identity = ctx.user.as_ref().unwrap().id;
+    let admin = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await?
+        .unwrap();
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: admin.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    Ok(ctx)
+}
+
 #[tokio::test]
-async fn restricted_uploader_cannot_register_broad_permission_sets() -> Result<()> {
+async fn owner_roles_use_current_membership_previous_deployment_policy_and_preserve_primary_owner(
+) -> Result<()> {
+    use attune_common::repositories::{
+        identity::{CreateIdentityRoleAssignmentInput, IdentityRoleAssignmentRepository},
+        Delete,
+    };
+    let ctx = namespace_claim_test_context().await?;
+    let original_owner = ctx.user.as_ref().unwrap().id;
+    let (member, member_id) = register_pack_role_user(&ctx, "core.editor").await?;
+    let (outsider, outsider_id) = register_pack_role_user(&ctx, "core.editor").await?;
+    let source = create_test_pack_dir("owner_roles_team", "1.0.0")?;
+    let baseline = fs::read_to_string(source.path().join("pack.yaml"))?;
+    fs::create_dir(source.path().join("actions"))?;
+    fs::write(source.path().join("actions/run.yaml"), "ref: owner_roles_team.run\nlabel: Run\nrunner_type: shell\nentry_point: run.sh\nparameter_delivery: stdin\nparameter_format: json\noutput_format: text\nreference_visibility: private\ndefault_execution_permission_set_refs: []\n")?;
+    fs::write(source.path().join("actions/run.sh"), "#!/bin/sh\nexit 0\n")?;
+    let write_candidate = |version: &str, roles: Option<&[&str]>| -> Result<()> {
+        let mut yaml = baseline.replace("version: 1.0.0", &format!("version: {version}"));
+        if let Some(roles) = roles {
+            yaml.push_str(&format!(
+                "\nowner_roles: {}\n",
+                serde_json::to_string(roles)?
+            ));
+        }
+        fs::write(source.path().join("pack.yaml"), yaml)?;
+        Ok(())
+    };
+    write_candidate("1.0.0", Some(&["platform-team", "platform-team"]))?;
+    let request =
+        || json!({"path": source.path().to_string_lossy(), "force": true, "skip_tests": true});
+    let response = ctx
+        .post("/api/v1/packs/register", request(), ctx.token())
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    assert!(
+        IdentityRoleAssignmentRepository::find_by_identity(&ctx.pool, member_id)
+            .await?
+            .is_empty(),
+        "a declaration must not assign roles"
+    );
+    let path = "/api/v1/packs/owner_roles_team";
+    assert_eq!(
+        ctx.put(path, json!({"label": "Not a member"}), Some(&member))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let membership = IdentityRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: member_id,
+            role: "platform-team".into(),
+            source: "test".into(),
+            managed: false,
+        },
+    )
+    .await?;
+    let response = ctx
+        .put(path, json!({"label": "Team configured"}), Some(&member))
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await?
+    );
+    IdentityRoleAssignmentRepository::delete(&ctx.pool, membership.id).await?;
+    // No cache invalidation: ownership membership must be read authoritatively.
+    assert_eq!(
+        ctx.put(path, json!({"label": "Revoked"}), Some(&member))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    IdentityRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: member_id,
+            role: "platform-team".into(),
+            source: "test".into(),
+            managed: false,
+        },
+    )
+    .await?;
+
+    let component = register_pack_index_user(
+        &ctx,
+        json!([
+            {"resource":"actions","actions":["read","update"],"constraints":{"pack_owner":"self"}},
+            {"resource":"packs","actions":["read"],"constraints":{"owner":"self"}}
+        ]),
+    )
+    .await?;
+    let jwt = JwtConfig {
+        secret: ctx.state.config.security.jwt_secret.clone().unwrap(),
+        access_token_expiration: 300,
+        refresh_token_expiration: 3600,
+    };
+    let component_id = validate_token(&component, &jwt)?.sub.parse::<i64>()?;
+    let component_membership = IdentityRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: component_id,
+            role: "platform-team".into(),
+            source: "test".into(),
+            managed: false,
+        },
+    )
+    .await?;
+    assert_eq!(
+        ctx.get(path, Some(&component)).await?.status(),
+        StatusCode::OK
+    );
+    let list: serde_json::Value = ctx
+        .get("/api/v1/packs?q=owner_roles_team", Some(&component))
+        .await?
+        .json()
+        .await?;
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        ctx.get("/api/v1/actions/owner_roles_team.run", Some(&component))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let response = ctx
+        .put(
+            "/api/v1/actions/owner_roles_team.run",
+            json!({"label":"Team action"}),
+            Some(&component),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await?
+    );
+    let sets = PermissionSetRepository::find_by_identity(&ctx.pool, component_id).await?;
+    let execution_token = attune_common::auth::jwt::generate_execution_token_with_permission_sets(
+        component_id,
+        1234,
+        "owner_roles_team.run",
+        &jwt,
+        Some(300),
+        &sets.iter().map(|set| set.r#ref.clone()).collect::<Vec<_>>(),
+    )?;
+    let execution_user = attune_api::auth::middleware::AuthenticatedUser {
+        claims: validate_token(&execution_token, &jwt)?,
+    };
+    let snapshot = ctx
+        .state
+        .authorization_service()
+        .load_snapshot(&execution_user)
+        .await?
+        .unwrap();
+    assert!(
+        snapshot.grants.is_empty(),
+        "execution credentials must not borrow human owner-role membership"
+    );
+    IdentityRoleAssignmentRepository::delete(&ctx.pool, component_membership.id).await?;
+    assert_eq!(
+        ctx.get(path, Some(&component)).await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    let list: serde_json::Value = ctx
+        .get("/api/v1/packs?q=owner_roles_team", Some(&component))
+        .await?
+        .json()
+        .await?;
+    assert!(list["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        ctx.get("/api/v1/actions/owner_roles_team.run", Some(&component))
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        ctx.put(
+            "/api/v1/actions/owner_roles_team.run",
+            json!({"label":"Revoked"}),
+            Some(&component)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    IdentityRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: outsider_id,
+            role: "attacker-team".into(),
+            source: "test".into(),
+            managed: false,
+        },
+    )
+    .await?;
+    write_candidate("2.0.0", Some(&["attacker-team"]))?;
+    assert_eq!(
+        ctx.post("/api/v1/packs/register", request(), Some(&outsider))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN,
+        "candidate roles must not authorize their own replacement"
+    );
+    let configure_only =
+        register_pack_index_user(&ctx, json!([{"resource":"packs","actions":["configure"]}]))
+            .await?;
+    assert_eq!(
+        ctx.put(
+            path,
+            json!({"owner_roles":["attacker-team"]}),
+            Some(&configure_only)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.put(path, json!({"is_standard":true}), Some(&configure_only))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.put(path, json!({"is_standard":false}), Some(&configure_only))
+            .await?.status(),
+        StatusCode::FORBIDDEN,
+        "a protected-field no-op still requires Install; it must not gain authority from a stale pre-lock value"
+    );
+    let response = ctx
+        .put(
+            path,
+            json!({"owner_roles":["platform-team","platform-team"]}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await?
+    );
+    write_candidate("3.0.0", None)?;
+    let response = ctx
+        .post("/api/v1/packs/register", request(), Some(&member))
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let pack = PackRepository::find_by_ref(&ctx.pool, "owner_roles_team")
+        .await?
+        .unwrap();
+    assert_eq!(pack.owner_roles, vec!["platform-team"]);
+    assert_eq!(pack.installed_by, Some(original_owner));
+    write_candidate("4.0.0", Some(&[]))?;
+    let response = ctx
+        .post("/api/v1/packs/register", request(), Some(&member))
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "an authorized member must be able to clear its own declaration: {}",
+        response.text().await?
+    );
+    assert_eq!(
+        ctx.put(path, json!({"label":"Cleared"}), Some(&member))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let scoped = register_pack_index_user(&ctx, json!([{"resource":"packs","actions":["install"],"constraints":{"refs":["owner_roles_team"]}}])).await?;
+    write_candidate("5.0.0", Some(&["automation-maintainers"]))?;
+    let response = ctx
+        .post("/api/v1/packs/register", request(), Some(&scoped))
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let pack = PackRepository::find_by_ref(&ctx.pool, "owner_roles_team")
+        .await?
+        .unwrap();
+    assert_eq!(pack.owner_roles, vec!["automation-maintainers"]);
+    assert_eq!(pack.installed_by, Some(original_owner));
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pack_owner_component_scope_has_structural_list_detail_update_and_create_parity(
+) -> Result<()> {
+    use attune_common::repositories::{
+        action::{ActionRepository, UpdateActionInput},
+        rule::RuleRepository,
+    };
+    let ctx = namespace_claim_test_context().await?;
+    let grants = ["actions", "rules", "policies", "queues"].map(|resource| {
+        json!({
+            "resource": resource, "actions": ["read", "update", "create"],
+            "constraints": {"pack_owner": "self"}
+        })
+    });
+    let token = register_pack_index_user(&ctx, json!(grants)).await?;
+    let claims = validate_token(
+        &token,
+        &JwtConfig {
+            secret: ctx.state.config.security.jwt_secret.clone().unwrap(),
+            access_token_expiration: 300,
+            refresh_token_expiration: 3600,
+        },
+    )?;
+    let identity = claims.sub.parse::<i64>()?;
+    let principal = attune_api::auth::middleware::AuthenticatedUser { claims };
+    let mut sources = Vec::new();
+    for reference in ["component_owned", "component_foreign"] {
+        let source = create_test_pack_dir(reference, "1.0.0")?;
+        for folder in ["actions", "triggers", "rules", "queues", "policies"] {
+            fs::create_dir(source.path().join(folder))?;
+        }
+        fs::write(source.path().join("actions/run.yaml"), format!(
+            "ref: {reference}.run\nlabel: Run\ndescription: Metadata ownership fixture\nrunner_type: shell\nentry_point: run.sh\nparameter_delivery: stdin\nparameter_format: json\noutput_format: text\nreference_visibility: private\ndefault_execution_permission_set_refs: []\n"))?;
+        fs::write(source.path().join("actions/run.sh"), "#!/bin/sh\nexit 0\n")?;
+        fs::write(
+            source.path().join("triggers/tick.yaml"),
+            format!("ref: {reference}.tick\nlabel: Tick\noutput: {{}}\n"),
+        )?;
+        fs::write(source.path().join("rules/run.yaml"), format!("ref: {reference}.run\nlabel: Run\ntrigger_ref: {reference}.tick\naction_ref: {reference}.run\npermission_set_refs: []\n"))?;
+        fs::write(source.path().join("queues/run.yaml"), format!("ref: {reference}.run\nlabel: Run\ndispatch_action: {reference}.run\npermission_set_refs: []\nreference_visibility: private\n"))?;
+        fs::write(
+            source.path().join("policies/run.yaml"),
+            format!(
+                "ref: {reference}.run\nlabel: Run\nconcurrency: {{limit: 2, method: enqueue}}\n"
+            ),
+        )?;
+        let response = ctx
+            .post(
+                "/api/v1/packs/register",
+                json!({"path": source.path().to_string_lossy(), "skip_tests": true}),
+                ctx.token(),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "{}",
+            response.text().await?
+        );
+        sources.push(source);
+    }
+    let owned = PackRepository::find_by_ref(&ctx.pool, "component_owned")
+        .await?
+        .unwrap();
+    PackRepository::set_installed_by(&ctx.pool, owned.id, identity).await?;
+    PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "component_owned.local".into(),
+            pack: Some(owned.id),
+            pack_ref: Some(owned.r#ref.clone()),
+            label: None,
+            description: None,
+            grants: json!([{"resource": "actions", "actions": ["read"]}]),
+        },
+    )
+    .await?;
+    let authz = ctx.state.authorization_service();
+    let snapshot = authz.load_snapshot(&principal).await?;
+    assert!(
+        !authz
+            .can_delegate_permission_sets_with_snapshot(
+                &principal,
+                snapshot.as_ref(),
+                &["component_owned.local".into()],
+            )
+            .await?,
+        "request-local owner narrowing must not replace canonical delegation constraints"
+    );
+    let response = ctx
+        .post(
+            "/api/v1/actions",
+            json!({
+                "ref": "component_owned.adhoc_existing", "pack_ref": "component_owned",
+                "label": "Ad hoc", "entrypoint": "run.sh", "reference_visibility": "private",
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let foreign = PackRepository::find_by_ref(&ctx.pool, "component_foreign")
+        .await?
+        .unwrap();
+    let prefix_only = helpers::create_test_action(
+        &ctx.pool,
+        foreign.id,
+        &foreign.r#ref,
+        "component_owned.prefix_only",
+    )
+    .await;
+    let error = prefix_only.expect_err("cross-namespace schema consumer must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("Schema consumer must belong to its declaring pack"),
+        "{error}"
+    );
+    let ownerless = helpers::create_test_pack(&ctx.pool, "component_ownerless").await?;
+    let missing_owner = helpers::create_test_action(
+        &ctx.pool,
+        ownerless.id,
+        &ownerless.r#ref,
+        "component_ownerless.run",
+    )
+    .await?;
+    ActionRepository::update(
+        &ctx.pool,
+        missing_owner.id,
+        UpdateActionInput {
+            reference_visibility: Some(attune_common::models::ActionReferenceVisibility::Private),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let runtime_owner = RuleRepository::find_by_ref(&ctx.pool, "component_owned.run")
+        .await?
+        .unwrap()
+        .owner_identity;
+    assert_ne!(runtime_owner, Some(identity));
+    for resource in ["actions", "rules", "policies", "queues"] {
+        let response = ctx
+            .get(&format!("/api/v1/{resource}"), Some(&token))
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "{resource}: {body}");
+        assert_eq!(
+            body["items"].as_array().unwrap().len(),
+            1,
+            "{resource}: {body}"
+        );
+        assert_eq!(body["items"][0]["ref"], "component_owned.run", "{resource}");
+        for (reference, allowed) in [
+            ("component_owned.run", true),
+            ("component_foreign.run", false),
+        ] {
+            let path = format!("/api/v1/{resource}/{reference}");
+            let response = ctx.get(&path, Some(&token)).await?;
+            assert_eq!(
+                response.status().is_success(),
+                allowed,
+                "{path}: {}",
+                response.text().await?
+            );
+            let update = if resource == "policies" {
+                json!({"name": "Scoped update"})
+            } else {
+                json!({"label": "Scoped update"})
+            };
+            let response = ctx.put(&path, update, Some(&token)).await?;
+            assert_eq!(
+                response.status(),
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{path}: {}",
+                response.text().await?
+            );
+        }
+    }
+    assert_eq!(
+        RuleRepository::find_by_ref(&ctx.pool, "component_owned.run")
+            .await?
+            .unwrap()
+            .owner_identity,
+        runtime_owner
+    );
+    for reference in [
+        "component_owned.prefix_only",
+        "component_ownerless.run",
+        "component_owned.adhoc_existing",
+    ] {
+        assert_eq!(
+            ctx.get(&format!("/api/v1/actions/{reference}"), Some(&token))
+                .await?
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    for (pack, allowed) in [("component_owned", true), ("component_foreign", false)] {
+        let response = ctx.post("/api/v1/policies", json!({
+            "ref": format!("{pack}.created"), "name": "Created policy",
+            "scope": {"type": "pack", "pack_ref": pack}, "concurrency": {"limit": 1, "method": "enqueue"},
+        }), Some(&token)).await?;
+        assert_eq!(
+            response.status(),
+            if allowed {
+                StatusCode::CREATED
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "{}",
+            response.text().await?
+        );
+    }
+    // Ad hoc creation is not structural ownership, even with an owned association.
+    let response = ctx.post("/api/v1/actions", json!({
+        "ref": "component_owned.adhoc", "pack_ref": "component_owned", "label": "Ad hoc", "entrypoint": "run.sh",
+    }), Some(&token)).await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        response.text().await?
+    );
+    let global = register_pack_index_user(
+        &ctx,
+        json!([
+            {"resource": "policies", "actions": ["read"], "constraints": {"pack_owner": "self"}},
+            {"resource": "policies", "actions": ["read"]}
+        ]),
+    )
+    .await?;
+    assert_eq!(
+        ctx.get("/api/v1/policies/component_foreign.run", Some(&global))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    ctx.cleanup().await?;
+    drop(sources);
+    Ok(())
+}
+
+#[tokio::test]
+async fn deployment_capability_rejects_other_actor_pack_and_transaction() -> Result<()> {
+    use attune_common::{
+        delegation::DelegationAuthority, pack_registry::PackComponentLoader,
+        repositories::pack::AuthorizedPackDeployment,
+    };
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    let actor = ctx.user.as_ref().unwrap().id;
+    let pack = helpers::create_test_pack(&ctx.pool, "capability_target").await?;
+    let other_pack = helpers::create_test_pack(&ctx.pool, "capability_other").await?;
+    let source = create_test_pack_dir(&pack.r#ref, "1.0.0")?;
+    let authority = DelegationAuthority::load(&ctx.pool, actor).await?;
+    let mut tx = ctx.pool.begin().await?;
+    let mut deployment = AuthorizedPackDeployment::capture(&mut tx, actor, &pack.r#ref).await?;
+    assert!(deployment.bind(&mut tx, other_pack.id).await.is_err());
+    deployment.bind(&mut tx, pack.id).await?;
+    for (id, reference, authority) in [
+        (other_pack.id, other_pack.r#ref.as_str(), authority.clone()),
+        (
+            pack.id,
+            pack.r#ref.as_str(),
+            DelegationAuthority::new(actor + 1, Default::default(), vec![]),
+        ),
+    ] {
+        let loader = PackComponentLoader::new(
+            &ctx.pool,
+            id,
+            reference,
+            &ctx.state.config.cache_admission,
+            authority,
+        );
+        assert!(loader
+            .load_authorized_deployment(&mut tx, source.path(), &deployment)
+            .await
+            .is_err());
+    }
+    tx.rollback().await?;
+    let mut next_tx = ctx.pool.begin().await?;
+    let loader = PackComponentLoader::new(
+        &ctx.pool,
+        pack.id,
+        &pack.r#ref,
+        &ctx.state.config.cache_admission,
+        authority,
+    );
+    assert!(loader
+        .load_authorized_deployment(&mut next_tx, source.path(), &deployment)
+        .await
+        .is_err());
+    next_tx.rollback().await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn uninstalled_only_install_authority_survives_atomic_first_upload() -> Result<()> {
+    use attune_common::{
+        delegation::DelegationAuthority,
+        repositories::runtime_authority::RuntimeAuthorityRepository,
+    };
+    let ctx = namespace_claim_test_context().await?;
+    for (reference, constraints) in [
+        ("claim_only", json!({"pack_state":"uninstalled"})),
+        (
+            "claim_scoped",
+            json!({"pack_state":"uninstalled", "pack_refs":["claim_scoped"]}),
+        ),
+    ] {
+        let token = register_pack_index_user(
+            &ctx,
+            json!([{
+                "resource":"packs", "actions":["install"], "constraints":constraints,
+            }]),
+        )
+        .await?;
+        let actor = validate_token(
+            &token,
+            &JwtConfig {
+                secret: ctx.state.config.security.jwt_secret.clone().unwrap(),
+                access_token_expiration: 300,
+                refresh_token_expiration: 3600,
+            },
+        )?
+        .sub
+        .parse::<i64>()?;
+        let source = create_test_pack_dir(reference, "1.0.0")?;
+        fs::create_dir(source.path().join("permission_sets"))?;
+        fs::write(source.path().join("permission_sets/admin.yaml"), format!(
+            "ref: {reference}.admin\nscope: external\ngrants:\n  - resource: permissions\n    actions: [manage]\n"
+        ))?;
+        fs::create_dir(source.path().join("actions"))?;
+        let action_path = source.path().join("actions/run.yaml");
+        // Trusted deployment cannot turn an unavailable foreign ref into a grant.
+        fs::write(&action_path, format!(
+            "ref: {reference}.run\nrunner_type: native\nentry_point: test.py\ndefault_execution_permission_set_refs: [missing_foreign.admin]\n"
+        ))?;
+        let denied = upload_test_pack_with_token(&ctx, source.path(), false, &token).await?;
+        assert_eq!(
+            denied.status(),
+            StatusCode::FORBIDDEN,
+            "{}",
+            denied.text().await?
+        );
+        assert!(PackRepository::find_by_ref(&ctx.pool, reference)
+            .await?
+            .is_none());
+
+        fs::write(&action_path, format!(
+            "ref: {reference}.run\nrunner_type: native\nentry_point: test.py\ndefault_execution_permission_set_refs: [{reference}.admin, core.admin]\n"
+        ))?;
+        let uploaded = upload_test_pack_with_token(&ctx, source.path(), false, &token).await?;
+        assert_eq!(
+            uploaded.status(),
+            StatusCode::CREATED,
+            "{}",
+            uploaded.text().await?
+        );
+        let pack = PackRepository::find_by_ref(&ctx.pool, reference)
+            .await?
+            .unwrap();
+        assert_eq!(pack.installed_by, Some(actor));
+        let action = ActionRepository::find_by_ref(&ctx.pool, &format!("{reference}.run"))
+            .await?
+            .unwrap();
+        assert_eq!(
+            action.default_execution_permission_set_refs,
+            vec![format!("{reference}.admin"), "core.admin".into()]
+        );
+        let mut connection = ctx.pool.acquire().await?;
+        let (approvals, _) =
+            RuntimeAuthorityRepository::list_approvals(&mut connection, pack.id, 100, 0).await?;
+        assert!(approvals
+            .iter()
+            .any(|approval| approval.issuer_identity == actor
+                && approval.grants.iter().any(|grant| grant.resource
+                    == attune_common::rbac::Resource::Permissions
+                    && grant.actions.contains(&attune_common::rbac::Action::Manage))));
+        drop(connection);
+        assert!(!DelegationAuthority::load(&ctx.pool, actor)
+            .await?
+            .manages_permissions());
+
+        // Primary ownership is attribution, not an implicit replacement grant.
+        for force in [false, true] {
+            let denied = upload_test_pack_with_token(&ctx, source.path(), force, &token).await?;
+            assert_eq!(
+                denied.status(),
+                if force {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::CONFLICT
+                },
+                "{}",
+                denied.text().await?
+            );
+        }
+        assert_eq!(
+            PackRepository::find_by_id(&ctx.pool, pack.id)
+                .await?
+                .unwrap()
+                .active_release,
+            pack.active_release
+        );
+        if reference == "claim_scoped" {
+            let outside = create_test_pack_dir("claim_outside", "1.0.0")?;
+            let denied = upload_test_pack_with_token(&ctx, outside.path(), false, &token).await?;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            assert!(PackRepository::find_by_ref(&ctx.pool, "claim_outside")
+                .await?
+                .is_none());
+        }
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn editor_claims_fresh_namespace_but_existing_deployments_require_matching_authority(
+) -> Result<()> {
+    let ctx = namespace_claim_test_context().await?;
+    let (owner_token, owner) = register_pack_role_user(&ctx, "core.editor").await?;
+    let (other_token, _) = register_pack_role_user(&ctx, "core.editor").await?;
+    let source = create_test_pack_dir("editor_claim", "1.0.0")?;
+    fs::create_dir(source.path().join("permission_sets"))?;
+    fs::write(source.path().join("permission_sets/admin.yaml"),
+        "ref: editor_claim.admin\nscope: external\ngrants:\n  - resource: permissions\n    actions: [manage]\n")?;
+    let request =
+        json!({"path": source.path().to_string_lossy(), "force": true, "skip_tests": true});
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            request.clone(),
+            Some(&owner_token),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    for (token, expected) in [
+        (&owner_token, StatusCode::CREATED),
+        (&other_token, StatusCode::FORBIDDEN),
+    ] {
+        let response = ctx
+            .post("/api/v1/packs/register", request.clone(), Some(token))
+            .await?;
+        assert_eq!(
+            response.status(),
+            expected,
+            "editor redeployment requires primary ownership or another matching grant: {}",
+            response.text().await?
+        );
+        let response = ctx.get("/api/v1/packs/editor_claim", Some(token)).await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "all editors retain system-wide pack read"
+        );
+        let response = ctx
+            .put(
+                "/api/v1/packs/editor_claim",
+                json!({"label": "Primary-owner configuration"}),
+                Some(token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            if expected == StatusCode::CREATED {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "editor configuration requires primary ownership: {}",
+            response.text().await?
+        );
+    }
+    let scoped = register_pack_index_user(
+        &ctx,
+        json!([{
+            "resource": "packs", "actions": ["install"], "constraints": {"refs": ["editor_claim"]}
+        }]),
+    )
+    .await?;
+    for token in [scoped.as_str(), ctx.token().unwrap()] {
+        let response = ctx
+            .post("/api/v1/packs/register", request.clone(), Some(token))
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "{}",
+            response.text().await?
+        );
+        let pack = PackRepository::find_by_ref(&ctx.pool, "editor_claim")
+            .await?
+            .unwrap();
+        assert_eq!(pack.installed_by, Some(owner));
+    }
+    let response = ctx
+        .get("/api/v1/permissions/assignments", Some(&owner_token))
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "deployment must not assign published grants"
+    );
+    PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: "ownerless_claim".into(),
+            label: "Ownerless".into(),
+            description: None,
+            version: "1.0.0".into(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: vec![],
+            runtime_deps: vec![],
+            dependencies: vec![],
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+    for reference in ["ownerless_claim", "core"] {
+        let source = create_test_pack_dir(reference, "1.0.0")?;
+        let response = ctx
+            .post(
+                "/api/v1/packs/register",
+                json!({
+                    "path": source.path().to_string_lossy(), "force": true, "skip_tests": true,
+                }),
+                Some(&other_token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{reference}: {}",
+            response.text().await?
+        );
+    }
+    assert_eq!(
+        PackRepository::find_by_ref(&ctx.pool, "ownerless_claim")
+            .await?
+            .unwrap()
+            .installed_by,
+        None
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pack_create_cannot_bypass_namespace_claim_authority() -> Result<()> {
+    let ctx = namespace_claim_test_context().await?;
+    let (editor, identity) = register_pack_role_user(&ctx, "core.editor").await?;
+    let create_only =
+        register_pack_index_user(&ctx, json!([{"resource": "packs", "actions": ["create"]}]))
+            .await?;
+    for (reference, token, standard) in [
+        ("core", editor.as_str(), false),
+        ("standard_claim", editor.as_str(), true),
+        ("create_only_claim", create_only.as_str(), false),
+    ] {
+        let response = ctx
+            .post(
+                "/api/v1/packs",
+                json!({
+                    "ref": reference, "label": "Claim", "version": "1.0.0", "is_standard": standard,
+                }),
+                Some(token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{reference}: {}",
+            response.text().await?
+        );
+    }
+    let response = ctx
+        .post(
+            "/api/v1/packs",
+            json!({
+                "ref": "created_claim", "label": "Claim", "version": "1.0.0",
+            }),
+            Some(&editor),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let pack = PackRepository::find_by_ref(&ctx.pool, "created_claim")
+        .await?
+        .unwrap();
+    assert_eq!(pack.installed_by, Some(identity));
+    let (other, _) = register_pack_role_user(&ctx, "core.editor").await?;
+    let source = create_test_pack_dir("created_claim", "1.0.0")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({
+                "path": source.path().to_string_lossy(), "force": true, "skip_tests": true,
+            }),
+            Some(&other),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_editor_first_uploads_have_one_primary_owner_and_no_late_overwrite() -> Result<()>
+{
+    let ctx = namespace_claim_test_context().await?;
+    let (first_token, first_identity) = register_pack_role_user(&ctx, "core.editor").await?;
+    let (second_token, second_identity) = register_pack_role_user(&ctx, "core.editor").await?;
+    let first = create_test_pack_dir("racing_claim", "1.0.0")?;
+    let second = create_test_pack_dir("racing_claim", "2.0.0")?;
+    let gate = ctx.state.lock_pack_projection("racing_claim").await;
+    let release_after_both_preflights = async move {
+        // The map and this guard retain two refs. Each waiting upload retains
+        // one more, after its last preflight and before activation starts.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::sync::Arc::strong_count(tokio::sync::OwnedMutexGuard::mutex(&gate)) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both first uploads must reach activation with an absent namespace");
+        drop(gate);
+    };
+    let (first_response, second_response, ()) = tokio::join!(
+        ctx.post(
+            "/api/v1/packs/register",
+            json!({"path": first.path().to_string_lossy(), "force": true, "skip_tests": true}),
+            Some(&first_token)
+        ),
+        ctx.post(
+            "/api/v1/packs/register",
+            json!({"path": second.path().to_string_lossy(), "force": true, "skip_tests": true}),
+            Some(&second_token)
+        ),
+        release_after_both_preflights,
+    );
+    let first_status = first_response?.status();
+    let second_status = second_response?.status();
+    let (owner, version, loser) = if first_status == StatusCode::CREATED {
+        (first_identity, "1.0.0", second_status)
+    } else {
+        assert_eq!(second_status, StatusCode::CREATED);
+        (second_identity, "2.0.0", first_status)
+    };
+    assert_eq!(
+        loser,
+        StatusCode::FORBIDDEN,
+        "the losing upload must reauthorize under the mutation lock"
+    );
+    let pack = PackRepository::find_by_ref(&ctx.pool, "racing_claim")
+        .await?
+        .unwrap();
+    assert_eq!(pack.installed_by, Some(owner));
+    assert_eq!(pack.version, version);
+    let active_yaml = fs::read_to_string(ctx.test_packs_dir.join("racing_claim/pack.yaml"))?;
+    assert!(active_yaml.contains(&format!("version: {version}")));
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_install_authority_admits_only_the_named_fresh_pack() -> Result<()> {
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let identity = ctx.user.as_ref().expect("authenticated installer").id;
+    let set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "fixture.scoped_install".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([{
+                "resource": "packs", "actions": ["install"],
+                "constraints": {"pack_refs": ["scoped_fresh"]}
+            }]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+
+    let allowed = create_test_pack_dir("scoped_fresh", "1.0.0")?;
+    fs::create_dir(allowed.path().join("permission_sets"))?;
+    fs::write(allowed.path().join("permission_sets/admin.yaml"),
+        "ref: scoped_fresh.admin\nscope: external\ngrants:\n  - resource: permissions\n    actions: [manage]\n")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": allowed.path().to_string_lossy(), "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    assert!(PackRepository::find_by_ref(&ctx.pool, "scoped_fresh")
+        .await?
+        .is_some());
+    assert!(
+        PermissionSetRepository::find_by_ref(&ctx.pool, "scoped_fresh.admin")
+            .await?
+            .is_some()
+    );
+    let response = ctx
+        .get("/api/v1/permissions/assignments", ctx.token())
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "publishing must not assign the policy to the uploader"
+    );
+
+    let denied = create_test_pack_dir("outside_scope", "1.0.0")?;
+    fs::create_dir(denied.path().join("permission_sets"))?;
+    fs::write(denied.path().join("permission_sets/admin.yaml"),
+        "ref: outside_scope.admin\nscope: external\ngrants:\n  - resource: permissions\n    actions: [manage]\n")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": denied.path().to_string_lossy(), "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(PackRepository::find_by_ref(&ctx.pool, "outside_scope")
+        .await?
+        .is_none());
+    assert!(PackInstallRepository::new(ctx.pool.clone())
+        .find_latest_by_pack_ref("outside_scope")
+        .await?
+        .is_none());
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_action_api_edit_readmits_metadata_over_the_same_immutable_release() -> Result<()> {
+    use attune_common::repositories::{
+        executable_snapshot::ExecutableSnapshotRepository,
+        managed_executable::ManagedExecutableRepository,
+        runtime_authority::RuntimeAuthorityRepository,
+    };
+    let ctx = TestContext::new().await?.with_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let admin = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await?
+        .unwrap();
+    let identity = ctx.user.as_ref().unwrap().id;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: admin.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    let source = create_test_pack_dir("metadata_edit", "1.0.0")?;
+    fs::create_dir_all(source.path().join("actions"))?;
+    fs::write(
+        source.path().join("actions/run.yaml"),
+        "ref: metadata_edit.run\nrunner_type: native\nentry_point: run.sh\n",
+    )?;
+    fs::write(source.path().join("actions/run.sh"), "#!/bin/sh\nexit 0\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            source.path().join("actions/run.sh"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+    }
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_string_lossy(),"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    let pack = PackRepository::find_by_ref(&ctx.pool, "metadata_edit")
+        .await?
+        .unwrap();
+    let mut tx = ctx.pool.begin().await?;
+    let before = RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
+        .await?
+        .unwrap();
+    let binding = before.policy.invocations[0].binding.clone();
+    let immutable =
+        ManagedExecutableRepository::resolve_invocation(&mut tx, &before.policy, &binding).await?;
+    tx.rollback().await?;
+    let response = ctx
+        .put(
+            "/api/v1/actions/metadata_edit.run",
+            json!({"entrypoint":"actions/edited.sh"}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "action metadata update should succeed"
+    );
+    let mut tx = ctx.pool.begin().await?;
+    let after = RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
+        .await?
+        .unwrap();
+    assert_ne!(before.id, after.id);
+    assert_eq!(before.policy.release_id, after.policy.release_id);
+    let edited =
+        ManagedExecutableRepository::resolve_invocation(&mut tx, &after.policy, &binding).await?;
+    assert_eq!(edited.executable.action.entrypoint, "actions/edited.sh");
+    let old =
+        ManagedExecutableRepository::resolve_invocation(&mut tx, &before.policy, &binding).await?;
+    assert_eq!(
+        old.executable.action.entrypoint,
+        immutable.executable.action.entrypoint
+    );
+    let live =
+        ExecutableSnapshotRepository::resolve_for_action(&mut *tx, immutable.executable.action.id)
+            .await?;
+    assert_eq!(
+        live.executable.action.entrypoint,
+        edited.executable.action.entrypoint
+    );
+    tx.rollback().await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_nested_workflows_resolve_later_candidate_action_declarations() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let source = create_test_pack_dir("nested_candidates", "1.0.0")?;
+    fs::create_dir_all(source.path().join("actions/workflows"))?;
+    fs::write(
+        source.path().join("actions/00_outer.yaml"),
+        "ref: nested_candidates.outer\nworkflow_file: workflows/outer.workflow.yaml\n",
+    )?;
+    fs::write(
+        source.path().join("actions/99_inner.yaml"),
+        "ref: nested_candidates.inner\nworkflow_file: workflows/inner.workflow.yaml\n",
+    )?;
+    fs::write(
+        source.path().join("actions/leaf.yaml"),
+        "ref: nested_candidates.leaf\nrunner_type: native\nentry_point: leaf.sh\n",
+    )?;
+    fs::write(
+        source.path().join("actions/leaf.sh"),
+        "#!/bin/sh\nprintf '{}\\n'\n",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            source.path().join("actions/leaf.sh"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+    }
+    fs::write(
+        source.path().join("actions/workflows/outer.workflow.yaml"),
+        "version: '1.0'\ntasks:\n  - name: inner\n    action: nested_candidates.inner\n",
+    )?;
+    fs::write(
+        source.path().join("actions/workflows/inner.workflow.yaml"),
+        "version: '1.0'\ntasks:\n  - name: leaf\n    action: nested_candidates.leaf\n",
+    )?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": source.path().to_string_lossy(), "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    for reference in [
+        "nested_candidates.outer",
+        "nested_candidates.inner",
+        "nested_candidates.leaf",
+    ] {
+        assert!(
+            attune_common::repositories::action::ActionRepository::find_by_ref(
+                &ctx.pool, reference
+            )
+            .await?
+            .is_some()
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trusted_upload_publishes_unused_human_iam_without_runtime_grants_or_assignments(
+) -> Result<()> {
+    use attune_common::{
+        delegation::DelegationAuthority,
+        repositories::{
+            identity::IdentityRoleAssignmentRepository,
+            runtime_authority::RuntimeAuthorityRepository,
+        },
+    };
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    let uploader = ctx.user.as_ref().unwrap().id;
+    let assigned_before = PermissionSetRepository::find_by_identity(&ctx.pool, uploader)
+        .await?
+        .into_iter()
+        .map(|set| set.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let roles_before = IdentityRoleAssignmentRepository::find_by_identity(&ctx.pool, uploader)
+        .await?
+        .into_iter()
+        .map(|assignment| assignment.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let source = create_test_pack_dir("human_iam", "1.0.0")?;
+    fs::create_dir(source.path().join("permission_sets"))?;
+    for (name, scope, constraints) in [
+        ("local_maintainer", "pack", json!({"pack_owner":"self"})),
+        (
+            "global_maintainer",
+            "external",
+            json!({"pack_owner":"self"}),
+        ),
+        ("owner_maintainer", "external", json!({"owner":"self"})),
+    ] {
+        fs::write(
+            source.path().join(format!("permission_sets/{name}.yaml")),
+            serde_yaml_ng::to_string(&json!({
+                "ref":format!("human_iam.{name}"), "scope":scope,
+                "grants":[{"resource":"packs","actions":["configure","delete"],"constraints":constraints}]
+            }))?,
+        )?;
+    }
+    let response = upload_test_pack(&ctx, source.path(), false).await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let pack = PackRepository::find_by_ref(&ctx.pool, "human_iam")
+        .await?
+        .unwrap();
+    assert_eq!(pack.installed_by, Some(uploader));
+    for (name, selector) in [
+        ("local_maintainer", "pack_owner"),
+        ("global_maintainer", "pack_owner"),
+        ("owner_maintainer", "owner"),
+    ] {
+        let set = PermissionSetRepository::find_by_ref(&ctx.pool, &format!("human_iam.{name}"))
+            .await?
+            .unwrap();
+        assert_eq!(set.pack, Some(pack.id));
+        assert_eq!(set.grants[0]["constraints"][selector], "self");
+        let grants = serde_json::from_value::<Vec<attune_common::rbac::Grant>>(set.grants)?;
+        assert!(
+            !DelegationAuthority::load(&ctx.pool, uploader)
+                .await?
+                .covers(&grants),
+            "publication must not give the uploader its broader human IAM grants"
+        );
+    }
+    let assigned_after = PermissionSetRepository::find_by_identity(&ctx.pool, uploader)
+        .await?
+        .into_iter()
+        .map(|set| set.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(assigned_after, assigned_before);
+    let roles_after = IdentityRoleAssignmentRepository::find_by_identity(&ctx.pool, uploader)
+        .await?
+        .into_iter()
+        .map(|assignment| assignment.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(roles_after, roles_before);
+    let mut connection = ctx.pool.acquire().await?;
+    let policy = RuntimeAuthorityRepository::current_policy(&mut connection, pack.id)
+        .await?
+        .unwrap();
+    assert_eq!(pack.active_release, Some(policy.policy.release_id));
+    assert!(policy.policy.invocations.is_empty());
+    let (approvals, total) =
+        RuntimeAuthorityRepository::list_approvals(&mut connection, pack.id, 100, 0).await?;
+    assert_eq!(total, 0);
+    assert!(approvals.is_empty());
+    drop(connection);
+    ctx.cleanup().await?;
+    source.close()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trusted_uploader_can_register_broad_permission_sets_without_acquiring_them() -> Result<()>
+{
     let ctx = TestContext::new().await?.with_pack_install_auth().await?;
     let source = create_test_pack_dir("delegation_fixture", "1.0.0")?;
     fs::create_dir(source.path().join("permission_sets"))?;
     fs::write(source.path().join("permission_sets/escalate.yaml"),
-        "ref: delegation_fixture.escalate\ngrants:\n  - resource: identities\n    actions: [read, create, update, delete]\n  - resource: permissions\n    actions: [read, manage]\n")?;
+        "ref: delegation_fixture.escalate\nscope: external\ngrants:\n  - resource: identities\n    actions: [read, create, update, delete]\n  - resource: permissions\n    actions: [read, manage]\n")?;
     let response = ctx
         .post(
             "/api/v1/packs/register",
@@ -95,43 +1491,354 @@ async fn restricted_uploader_cannot_register_broad_permission_sets() -> Result<(
         .await?;
     assert_eq!(
         response.status(),
-        StatusCode::FORBIDDEN,
-        "A pack installer must not publish grants it cannot delegate"
+        StatusCode::CREATED,
+        "A trusted pack installer may publish broader grants: {}",
+        response.text().await?
     );
     assert!(
         PermissionSetRepository::find_by_ref(&ctx.pool, "delegation_fixture.escalate")
             .await?
-            .is_none()
+            .is_some()
     );
     assert!(PackRepository::find_by_ref(&ctx.pool, "delegation_fixture")
         .await?
-        .is_none());
-    ctx.cleanup().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn restricted_uploader_cannot_attach_admin_defaults_rules_or_queues() -> Result<()> {
-    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
-    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
-    for (index, (folder, content)) in [
-        ("actions", "ref: delegation_0.run\nrunner_type: native\nentry_point: run\ndefault_execution_permission_set_refs: [core.admin]\n"),
-        ("rules", "ref: delegation_1.run\ntrigger_ref: core.alert\naction_ref: delegation_1.run\npermission_set_refs: [core.admin]\n"),
-        ("queues", "ref: delegation_2.run\nlabel: Run\ndispatch_action: delegation_2.run\npermission_set_refs: [core.admin]\n"),
-    ].into_iter().enumerate() {
-        let source = create_test_pack_dir(&format!("delegation_{index}"), "1.0.0")?;
-        fs::create_dir(source.path().join(folder))?;
-        fs::write(source.path().join(folder).join("run.yaml"), content)?;
-        let response = ctx.post("/api/v1/packs/register", json!({"path":source.path().to_str().unwrap(),"force":true,"skip_tests":true}), ctx.token()).await?;
+        .is_some());
+    for path in ["/api/v1/identities", "/api/v1/permissions/assignments"] {
+        let response = ctx.get(path, ctx.token()).await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(PackRepository::find_by_ref(&ctx.pool, &format!("delegation_{index}")).await?.is_none());
     }
     ctx.cleanup().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn registered_rules_and_pack_keep_the_registering_identity() -> Result<()> {
+async fn core_editor_can_upload_event_pack_and_edit_components_without_admin_delegation(
+) -> Result<()> {
+    use attune_common::repositories::{
+        action::ActionRepository, rule::RuleRepository, trigger::TriggerRepository,
+    };
+    let ctx = TestContext::new().await?.with_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let editor = PermissionSetRepository::find_by_ref(&ctx.pool, "core.editor")
+        .await?
+        .unwrap();
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: ctx.user.as_ref().unwrap().id,
+            permset: editor.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(
+        ctx.user.as_ref().unwrap().id,
+    )
+    .await;
+    let source = create_test_pack_dir("editor_events", "1.0.0")?;
+    for directory in ["actions", "triggers", "rules", "permission_sets"] {
+        fs::create_dir(source.path().join(directory))?;
+    }
+    fs::write(source.path().join("actions/emit.yaml"),
+        "ref: editor_events.emit\nlabel: Emit\nrunner_type: shell\nentry_point: emit.sh\nparameter_delivery: stdin\nparameter_format: json\noutput_format: text\ndefault_execution_permission_set_refs: []\n")?;
+    fs::write(
+        source.path().join("actions/emit.sh"),
+        "#!/bin/sh\ncat >/dev/null\nprintf 'fixture\\n'\n",
+    )?;
+    fs::write(
+        source.path().join("triggers/start.yaml"),
+        "ref: editor_events.start\nlabel: Start\noutput: {}\n",
+    )?;
+    fs::write(source.path().join("permission_sets/events.yaml"),
+        "ref: editor_events.events\nlabel: Emit events\ngrants:\n  - resource: events\n    actions: [create]\n    constraints:\n      refs: [editor_events.start]\n")?;
+    fs::write(source.path().join("rules/emit.yaml"),
+        "ref: editor_events.emit\nlabel: Emit\ntrigger_ref: editor_events.start\naction_ref: editor_events.emit\npermission_set_refs: [editor_events.events]\n")?;
+    let response = upload_test_pack(&ctx, source.path(), false).await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let rule = RuleRepository::find_by_ref(&ctx.pool, "editor_events.emit")
+        .await?
+        .unwrap();
+    assert_eq!(
+        rule.permission_set_refs,
+        Some(vec!["editor_events.events".into()])
+    );
+    assert!(
+        rule.owner_identity.is_some(),
+        "pack rule must have an explicit runtime owner"
+    );
+    let action = ActionRepository::find_by_ref(&ctx.pool, "editor_events.emit")
+        .await?
+        .unwrap();
+    assert!(
+        action.default_execution_permission_set_refs.is_empty(),
+        "event access must come from the rule, not action defaults"
+    );
+    let trigger = TriggerRepository::find_by_ref(&ctx.pool, "editor_events.start")
+        .await?
+        .unwrap();
+    for (path, body) in [
+        (
+            format!("/api/v1/actions/{}", action.r#ref),
+            json!({"label":"Editor action update"}),
+        ),
+        (
+            format!("/api/v1/triggers/{}", trigger.r#ref),
+            json!({"label":"Editor trigger update"}),
+        ),
+        (
+            format!("/api/v1/rules/{}", rule.r#ref),
+            json!({"label":"Editor rule update"}),
+        ),
+    ] {
+        let response = ctx.put(&path, body, ctx.token()).await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path}: {}",
+            response.text().await?
+        );
+    }
+    let source = create_test_pack_dir("editor_escalation", "1.0.0")?;
+    fs::create_dir(source.path().join("permission_sets"))?;
+    fs::write(
+        source.path().join("permission_sets/admin.yaml"),
+        "ref: editor_escalation.admin\nscope: external\ngrants:\n  - resource: permissions\n    actions: [manage]\n",
+    )?;
+    let response = upload_test_pack(&ctx, source.path(), false).await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "trusted editor may deploy broader policy: {}",
+        response.text().await?
+    );
+    assert!(PackRepository::find_by_ref(&ctx.pool, "editor_escalation")
+        .await?
+        .is_some());
+    assert!(
+        PermissionSetRepository::find_by_ref(&ctx.pool, "editor_escalation.admin")
+            .await?
+            .is_some()
+    );
+    let response = ctx
+        .get("/api/v1/permissions/assignments", ctx.token())
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = ctx
+        .post(
+            "/api/v1/events",
+            json!({"trigger_ref":"editor_events.start", "payload":{}}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "user tokens must not emit events directly"
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trusted_uploader_can_deploy_broader_permission_refs_on_pack_components() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    for (index, (folder, content)) in [
+        ("actions", "ref: delegation_0.run\nrunner_type: shell\nentry_point: run.sh\ndefault_execution_permission_set_refs: [core.admin]\n"),
+        ("rules", "ref: delegation_1.run\ntrigger_ref: core.alert\naction_ref: delegation_1.run\npermission_set_refs: [core.admin]\n"),
+        ("queues", "ref: delegation_2.run\nlabel: Run\ndispatch_action: delegation_2.run\npermission_set_refs: [core.admin]\n"),
+    ].into_iter().enumerate() {
+        let source = create_test_pack_dir(&format!("delegation_{index}"), "1.0.0")?;
+        fs::create_dir(source.path().join("actions"))?;
+        fs::write(source.path().join("actions/run.sh"), "#!/bin/sh\ncat >/dev/null\nprintf 'fixture\\n'\n")?;
+        fs::write(source.path().join("actions/run.yaml"), format!(
+            "ref: delegation_{index}.run\nrunner_type: shell\nentry_point: run.sh\n"
+        ))?;
+        fs::create_dir_all(source.path().join(folder))?;
+        fs::write(source.path().join(folder).join("run.yaml"), content)?;
+        let response = ctx.post("/api/v1/packs/register", json!({"path":source.path().to_str().unwrap(),"force":true,"skip_tests":true}), ctx.token()).await?;
+        assert_eq!(response.status(), StatusCode::CREATED, "{folder}: {}", response.text().await?);
+        assert!(PackRepository::find_by_ref(&ctx.pool, &format!("delegation_{index}")).await?.is_some());
+    }
+    let response = ctx
+        .get("/api/v1/permissions/assignments", ctx.token())
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn registration_binds_named_schemas_across_component_kinds() -> Result<()> {
+    use attune_common::repositories::{
+        action::ActionRepository,
+        executable_snapshot::ExecutableSnapshotRepository,
+        schema_contract::SchemaContractRepository,
+        trigger::{SensorRepository, TriggerRepository},
+        work_queue::WorkQueueRepository,
+    };
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let source = create_test_pack_dir("named_consumers", "1.0.0")?;
+    for directory in [
+        "types",
+        "actions",
+        "actions/workflows",
+        "triggers",
+        "sensors",
+        "queues",
+        "rules",
+    ] {
+        fs::create_dir_all(source.path().join(directory))?;
+    }
+    fs::write(source.path().join("pack.yaml"), "ref: named_consumers\nlabel: Named consumers\nversion: 1.0.0\nconf_schema:\n  count: {type: named_consumers.count, default: 5}\n")?;
+    fs::write(
+        source.path().join("types/count.yaml"),
+        "ref: named_consumers.count\nlabel: Count\nschema: {type: integer, minimum: 0}\n",
+    )?;
+    fs::write(source.path().join("actions/run.yaml"), "ref: named_consumers.run\nlabel: Run\nrunner_type: native\nentry_point: test.py\nparameters:\n  count: {type: named_consumers.count, required: true, default: 5}\noutput:\n  count: {type: named_consumers.count}\n")?;
+    fs::write(source.path().join("actions/flow.yaml"), "ref: named_consumers.flow\nlabel: Flow\nrunner_type: workflow\nworkflow_file: workflows/flow.workflow.yaml\n")?;
+    fs::write(source.path().join("actions/workflows/flow.workflow.yaml"), "ref: named_consumers.flow\nlabel: Flow\nversion: 1.0.0\nparameters:\n  count: {type: named_consumers.count, default: 5}\ntasks:\n  - name: run\n    action: named_consumers.run\n    input:\n      count: '{{ parameters.count }}'\n    next: []\n")?;
+    fs::write(source.path().join("triggers/probe.yaml"), "ref: named_consumers.probe\nlabel: Probe\nparameters:\n  count: {type: named_consumers.count, default: 5}\noutput:\n  count: {type: named_consumers.count}\nevent_config_schema:\n  count: {type: named_consumers.count}\n")?;
+    fs::write(source.path().join("sensors/probe.yaml"), "ref: named_consumers.sensor\nlabel: Sensor\nrunner_type: native\nentry_point: test.py\nenabled: false\nparameters:\n  count: {type: named_consumers.count, default: 5}\ntrigger_types: [named_consumers.probe]\n")?;
+    fs::write(source.path().join("queues/probe.yaml"), "ref: named_consumers.queue\nlabel: Queue\ndispatch_action: named_consumers.run\nitem_schema:\n  count: {type: named_consumers.count, default: 5}\naction_params:\n  count: '{{ queue.item.payload.count }}'\n")?;
+    fs::write(source.path().join("rules/probe.yaml"), "ref: named_consumers.rule\nlabel: Rule\ntrigger_ref: named_consumers.probe\naction_ref: named_consumers.run\naction_params: {}\npermission_set_refs: []\n")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_str().unwrap(),"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    let _: serde_json::Value = response.json().await?;
+    let action = ActionRepository::find_by_ref(&ctx.pool, "named_consumers.run")
+        .await?
+        .unwrap();
+    let mut transaction = ctx.pool.begin().await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action(&mut *transaction, action.id).await?;
+    let binding = SchemaContractRepository::materialize_action(&mut transaction, &snapshot).await?;
+    let input = attune_common::value_schema::CompiledContract::new(&binding.input)?;
+    assert_eq!(input.apply_defaults(&json!({}))?, json!({"count":5}));
+    assert!(input.validate(&json!({"count":-1})).is_err());
+    assert_eq!(binding.input.dependencies.len(), 1);
+    transaction.rollback().await?;
+    assert!(
+        TriggerRepository::find_by_ref(&ctx.pool, "named_consumers.probe")
+            .await?
+            .is_some()
+    );
+    assert!(
+        SensorRepository::find_by_ref(&ctx.pool, "named_consumers.sensor")
+            .await?
+            .is_some()
+    );
+    assert!(
+        WorkQueueRepository::find_by_ref(&ctx.pool, "named_consumers.queue")
+            .await?
+            .is_some()
+    );
+    let original_pack = PackRepository::find_by_ref(&ctx.pool, "named_consumers")
+        .await?
+        .unwrap();
+    assert_eq!(original_pack.config["count"], 5);
+    // The candidate is valid on its own. Only preserved configuration makes
+    // deployment incompatible, so this exercises transactional migration.
+    for path in [
+        "pack.yaml",
+        "actions/run.yaml",
+        "actions/workflows/flow.workflow.yaml",
+        "triggers/probe.yaml",
+        "sensors/probe.yaml",
+        "queues/probe.yaml",
+    ] {
+        let path = source.path().join(path);
+        let contents = fs::read_to_string(&path)?
+            .replace("default: 5", "default: 7")
+            .replace("version: 1.0.0", "version: 1.1.0");
+        fs::write(path, contents)?;
+    }
+    fs::write(
+        source.path().join("types/count.yaml"),
+        "ref: named_consumers.count\nlabel: Count\nschema: {type: integer, minimum: 6}\n",
+    )?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path().to_str().unwrap(),"skip_tests":true}),
+            ctx.token(),
+        )
+        .await?;
+    assert!(
+        !response.status().is_success(),
+        "Incompatible preserved named configuration must reject deployment"
+    );
+    let unchanged_pack = PackRepository::find_by_ref(&ctx.pool, "named_consumers")
+        .await?
+        .unwrap();
+    assert_eq!(unchanged_pack.active_release, original_pack.active_release);
+    assert_eq!(unchanged_pack.version, original_pack.version);
+    assert_eq!(unchanged_pack.config, original_pack.config);
+    assert_eq!(
+        ActionRepository::find_by_ref(&ctx.pool, "named_consumers.run")
+            .await?
+            .unwrap()
+            .param_schema,
+        action.param_schema
+    );
+    let mut transaction = ctx.pool.begin().await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action(&mut *transaction, action.id).await?;
+    let unchanged_binding =
+        SchemaContractRepository::materialize_action(&mut transaction, &snapshot).await?;
+    assert_eq!(unchanged_binding.input, binding.input);
+    transaction.rollback().await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_rule_required_defaults_preserve_authored_parameter_maps() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let source = create_test_pack_dir("rule_defaults", "1.0.0")?;
+    fs::create_dir(source.path().join("actions"))?;
+    fs::write(source.path().join("actions/run.yaml"),
+        "ref: rule_defaults.run\nlabel: Run\nrunner_type: native\nentry_point: test.py\nparameters:\n  count:\n    type: integer\n    required: true\n    default: 5\n")?;
+    fs::create_dir(source.path().join("rules"))?;
+    fs::write(source.path().join("rules/run.yaml"),
+        "ref: rule_defaults.run\nlabel: Run\ntrigger_ref: core.alert\naction_ref: rule_defaults.run\naction_params: {}\npermission_set_refs: []\n")?;
+    ctx.post(
+        "/api/v1/packs/register",
+        json!({"path":source.path().to_str().unwrap(),"skip_tests":true}),
+        ctx.token(),
+    )
+    .await?
+    .assert_status(StatusCode::CREATED);
+    let rule = attune_common::repositories::rule::RuleRepository::find_by_ref(
+        &ctx.pool,
+        "rule_defaults.run",
+    )
+    .await?
+    .unwrap();
+    assert_eq!(rule.action_params, json!({}));
+    assert_eq!(rule.trigger_params, json!({}));
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_pack_keeps_attribution_and_rules_use_system_owned_authority() -> Result<()> {
     let ctx = TestContext::new().await?.with_pack_install_auth().await?;
     PlatformCatalogRepository::reconcile(&ctx.pool).await?;
     let source = create_test_pack_dir("owned_rules", "1.0.0")?;
@@ -147,8 +1854,12 @@ async fn registered_rules_and_pack_keep_the_registering_identity() -> Result<()>
         )
         .await?;
     let status = response.status();
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    let _: serde_json::Value = response.json().await?;
     let identity = attune_common::auth::jwt::validate_token(
         ctx.token().unwrap(),
         &JwtConfig {
@@ -169,7 +1880,19 @@ async fn registered_rules_and_pack_keep_the_registering_identity() -> Result<()>
     .await?
     .unwrap();
     assert_eq!(pack.installed_by, Some(identity));
-    assert_eq!(rule.owner_identity, Some(identity));
+    assert_ne!(rule.owner_identity, Some(identity));
+    let mut connection = ctx.pool.acquire().await?;
+    let authority = attune_common::repositories::rule_authority::RuleAuthorityRepository::current(
+        &mut connection,
+        &rule,
+    )
+    .await?
+    .unwrap();
+    assert_eq!(rule.owner_identity, Some(authority.identity_id));
+    assert_eq!(authority.pack_id, pack.id);
+    assert!(authority.execution_permission_set_refs.is_empty());
+    assert!(authority.input_grants.is_empty());
+    drop(connection);
     assert_eq!(rule.permission_set_refs, Some(Vec::new()));
     ctx.cleanup().await?;
     Ok(())
@@ -177,7 +1900,7 @@ async fn registered_rules_and_pack_keep_the_registering_identity() -> Result<()>
 
 #[tokio::test]
 async fn assigned_pack_set_cannot_be_broadened_to_authorize_its_own_replacement() -> Result<()> {
-    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    let ctx = TestContext::new().await?.with_auth().await?;
     let pack = helpers::create_test_pack(&ctx.pool, "self_grant").await?;
     let current = PermissionSetRepository::create(
         &ctx.pool,
@@ -187,7 +1910,7 @@ async fn assigned_pack_set_cannot_be_broadened_to_authorize_its_own_replacement(
             pack_ref: Some(pack.r#ref.clone()),
             label: None,
             description: None,
-            grants: json!([{ "resource":"packs", "actions":["read","install"]}]),
+            grants: json!([{ "resource":"packs", "actions":["read","install"], "constraints":{"pack_refs":["different_pack"]}}]),
         },
     )
     .await?;
@@ -209,7 +1932,8 @@ async fn assigned_pack_set_cannot_be_broadened_to_authorize_its_own_replacement(
         },
     )
     .await?;
-    // Replacement rights are independent of policy-administration rights.
+    // Configure does not confer deployment authority for this pack, and the
+    // candidate cannot broaden its assigned set to admit its own deployment.
     let configure = PermissionSetRepository::create(
         &ctx.pool,
         CreatePermissionSetInput {
@@ -274,8 +1998,12 @@ async fn restricted_uploader_can_publish_grants_it_already_holds() -> Result<()>
         )
         .await?;
     let status = response.status();
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pack registration should succeed"
+    );
+    let _: serde_json::Value = response.json().await?;
     assert!(
         PermissionSetRepository::find_by_ref(&ctx.pool, "narrow_grant.read")
             .await?
@@ -390,9 +2118,11 @@ async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
 
     sqlx::raw_sql(
         r#"
+        CREATE SEQUENCE pack_delete_commit_probe;
         CREATE FUNCTION reject_pack_delete_commit() RETURNS trigger AS $$
         BEGIN
             IF OLD.ref = 'delete_commit_failure' THEN
+                PERFORM nextval('pack_delete_commit_probe');
                 RAISE EXCEPTION 'injected pack delete commit failure';
             END IF;
             RETURN OLD;
@@ -411,13 +2141,23 @@ async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
     let response = ctx
         .delete("/api/v1/packs/delete_commit_failure", ctx.token())
         .await?;
-    assert!(!response.status().is_success());
+    let response = response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     let error: serde_json::Value = response.json().await?;
-    assert!(
-        error
-            .to_string()
-            .contains("injected pack delete commit failure"),
-        "deletion error did not contain the expected fixed diagnostic"
+    assert_eq!(
+        error,
+        json!({"error":"Database operation temporarily unavailable; please retry", "code":"RETRYABLE_DATABASE_ERROR"})
+    );
+    // Sequence advancement survives rollback. This proves the deferred COMMIT
+    // trigger actually ran, without weakening conservative commit classification
+    // or exposing raw database diagnostics in the public response.
+    let probe: (i64, bool) =
+        sqlx::query_as("SELECT last_value,is_called FROM pack_delete_commit_probe")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(
+        probe,
+        (1, true),
+        "must exercise exactly the deferred commit failure"
     );
     assert!(PackRepository::find_by_ref(&ctx.pool, &pack.r#ref)
         .await?
@@ -549,6 +2289,166 @@ actions:
     fs::write(temp_dir.path().join("test.py"), "print('test')")?;
 
     Ok(temp_dir)
+}
+
+#[tokio::test]
+async fn global_pack_permissions_override_installer_ownership_without_bypassing_scopes(
+) -> Result<()> {
+    let ctx = TestContext::new().await?.with_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let editor = PermissionSetRepository::find_by_ref(&ctx.pool, "core.editor")
+        .await?
+        .unwrap();
+    let installer = ctx.user.as_ref().unwrap().id;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: installer,
+            permset: editor.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(installer).await;
+    let source = create_test_pack_dir("shared_visibility", "1.0.0")?;
+    let response = upload_test_pack(&ctx, source.path(), false).await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let pack = PackRepository::find_by_ref(&ctx.pool, "shared_visibility")
+        .await?
+        .unwrap();
+    assert_eq!(pack.installed_by, Some(installer));
+
+    for permission_ref in ["core.editor", "core.admin"] {
+        let login = format!("pack_visibility_{}", uuid::Uuid::new_v4().simple());
+        let response = ctx.post("/auth/register", json!({
+            "login": login, "password": "TestPassword123!", "display_name": "Pack visibility reader",
+        }), None).await?;
+        assert!(response.status().is_success());
+        let body: serde_json::Value = response.json().await?;
+        let token = body["data"]["access_token"].as_str().unwrap();
+        let identity = IdentityRepository::find_by_login(&ctx.pool, &login)
+            .await?
+            .unwrap();
+        let set = PermissionSetRepository::find_by_ref(&ctx.pool, permission_ref)
+            .await?
+            .unwrap();
+        PermissionAssignmentRepository::create(
+            &ctx.pool,
+            CreatePermissionAssignmentInput {
+                identity: identity.id,
+                permset: set.id,
+            },
+        )
+        .await?;
+        attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+        let me: serde_json::Value = ctx.get("/auth/me", Some(token)).await?.json().await?;
+        assert_eq!(
+            me["data"]["assigned_permission_set_refs"],
+            json!([permission_ref])
+        );
+        let response = ctx
+            .get("/api/v1/packs/shared_visibility", Some(token))
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{permission_ref}");
+        let response = ctx
+            .get("/api/v1/packs?q=shared_visibility", Some(token))
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(
+            body["items"].as_array().unwrap().len(),
+            1,
+            "{permission_ref}"
+        );
+        assert_eq!(body["items"][0]["ref"], "shared_visibility");
+        assert_eq!(body["pagination"]["total_items"], 1);
+        let response = ctx
+            .put(
+                "/api/v1/packs/shared_visibility",
+                json!({"label": format!("Configured by {permission_ref}")}),
+                Some(token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            if permission_ref == "core.admin" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "{permission_ref}: {}",
+            response.text().await?
+        );
+    }
+
+    for (grants, visible) in [
+        (json!([{"resource":"packs","actions":["read"]}]), true),
+        (
+            json!([{"resource":"packs","actions":["read"],"constraints":{"pack_state":"uninstalled"}}]),
+            false,
+        ),
+        (
+            json!([{"resource":"packs","actions":["read"],"constraints":{"refs":["shared_visibility"]}}]),
+            true,
+        ),
+        (
+            json!([{"resource":"packs","actions":["read"],"constraints":{"owner":"self"}}]),
+            false,
+        ),
+        (
+            json!([{"resource":"packs","actions":["read"],"constraints":{"refs":["different_pack"]}}]),
+            false,
+        ),
+        (json!([{"resource":"packs","actions":["configure"]}]), false),
+        (json!([]), false),
+    ] {
+        let token = register_pack_index_user(&ctx, grants).await?;
+        let response = ctx
+            .get("/api/v1/packs/shared_visibility", Some(&token))
+            .await?;
+        assert_eq!(
+            response.status(),
+            if visible {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
+        let response = ctx
+            .get("/api/v1/packs?q=shared_visibility", Some(&token))
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(
+            body["items"].as_array().unwrap().len(),
+            usize::from(visible)
+        );
+        assert_eq!(body["pagination"]["total_items"], u64::from(visible));
+        if visible {
+            let response = ctx
+                .put(
+                    "/api/v1/packs/shared_visibility",
+                    json!({"label":"Read access must not grant configure"}),
+                    Some(&token),
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+    let after = PackRepository::find_by_ref(&ctx.pool, "shared_visibility")
+        .await?
+        .unwrap();
+    assert_eq!(
+        after.installed_by,
+        Some(installer),
+        "RBAC access must not transfer pack ownership"
+    );
+    ctx.cleanup().await?;
+    Ok(())
 }
 
 async fn register_pack_index_user(ctx: &TestContext, grants: serde_json::Value) -> Result<String> {
@@ -1133,14 +3033,16 @@ async fn test_install_pack_with_missing_dependency_fails() -> Result<()> {
         )
         .await?;
 
-    // Should fail with 400 Bad Request
+    let status = response.status();
+    let diagnostic: serde_json::Value = response.json().await?;
+    // Dependency validation uses the same 422 boundary as metadata validation.
     assert_eq!(
-        response.status(),
-        400,
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
         "Installation should fail when dependencies are missing"
     );
 
-    let body: serde_json::Value = response.json().await?;
+    let body = diagnostic;
     let error_msg = body["error"].as_str().unwrap();
     assert!(
         error_msg.contains("dependency validation failed") || error_msg.contains("missing-pack"),
@@ -1170,9 +3072,12 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
 
     assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     let body: serde_json::Value = response.json().await?;
-    assert!(body["error"]
-        .as_str()
-        .is_some_and(|message| message.contains("failed while loading components")));
+    assert!(body["details"]["diagnostics"]
+        .as_array()
+        .is_some_and(|diagnostics| diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "metadata.invalid_yaml"
+                && diagnostic["path"] == "caches/broken.yaml")));
     assert!(
         PackRepository::find_by_ref(&ctx.pool, "test_pack_load_failure")
             .await?
@@ -1635,6 +3540,7 @@ testing:
 "#,
     );
     fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
+    write_candidate_test_entrypoint(pack_dir.path())?;
 
     let response = ctx
         .post(
@@ -1649,18 +3555,16 @@ testing:
         )
         .await?;
 
-    if response.status() != axum::http::StatusCode::OK {
-        panic!("force install returned an unexpected status");
-    }
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(PackRepository::find_by_ref(&ctx.pool, "force-tested")
         .await?
-        .is_some());
+        .is_none());
     let installs = PackInstallRepository::new(ctx.pool.clone())
         .list_by_pack_ref("force-tested", 10, 0)
         .await?;
     assert_eq!(
         installs.first().map(|install| install.status.as_str()),
-        Some("succeeded")
+        Some("failed")
     );
     let failed_test_attempt = installs
         .iter()
@@ -1693,6 +3597,7 @@ testing:
 "#,
     );
     fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
+    write_candidate_test_entrypoint(pack_dir.path())?;
 
     let response = ctx
         .post(
@@ -2136,7 +4041,8 @@ async fn update_placement_write_failure_rolls_back_metadata() -> Result<()> {
 }
 
 #[tokio::test]
-async fn install_only_permission_cannot_replace_existing_pack() -> Result<()> {
+async fn install_only_permission_can_replace_another_users_pack_without_transferring_ownership(
+) -> Result<()> {
     let ctx = TestContext::new().await?.with_pack_install_auth().await?;
     let pack_dir = create_test_pack_dir("replacement_guard", "2.0.0")?;
     let mut pack_yaml = fs::read_to_string(pack_dir.path().join("pack.yaml"))?;
@@ -2154,7 +4060,8 @@ testing:
 "#,
     );
     fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
-    PackRepository::create(
+    write_candidate_test_entrypoint(pack_dir.path())?;
+    let existing = PackRepository::create(
         &ctx.pool,
         CreatePackInput {
             r#ref: "replacement_guard".to_string(),
@@ -2173,26 +4080,39 @@ testing:
     )
     .await?;
 
+    let owner_login = format!("primary_owner_{}", uuid::Uuid::new_v4().simple());
+    let response = ctx.post("/auth/register", json!({
+        "login": owner_login, "password": "TestPassword123!", "display_name": "Primary pack owner",
+    }), None).await?;
+    assert!(response.status().is_success());
+    let owner = IdentityRepository::find_by_login(&ctx.pool, &owner_login)
+        .await?
+        .unwrap();
+    PackRepository::set_installed_by(&ctx.pool, existing.id, owner.id).await?;
+
     let response = ctx
         .post(
             "/api/v1/packs/install",
             json!({
                 "source": pack_dir.path().to_string_lossy(),
                 "force": true,
-                "skip_tests": false
+                "skip_tests": true
             }),
-            None,
+            ctx.token(),
         )
         .await?;
-    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await?
+    );
     let persisted = PackRepository::find_by_ref(&ctx.pool, "replacement_guard")
         .await?
         .expect("existing pack");
-    assert_eq!(persisted.version, "1.0.0");
-    assert!(PackInstallRepository::new(ctx.pool.clone())
-        .find_latest_by_pack_ref("replacement_guard")
-        .await?
-        .is_none());
+    assert_eq!(persisted.version, "2.0.0");
+    assert_eq!(persisted.installed_by, Some(owner.id));
+    ctx.cleanup().await?;
 
     Ok(())
 }
@@ -2677,9 +4597,290 @@ async fn pack_releases_reject_conflicting_versions_and_preserve_previous_bytes()
     Ok(())
 }
 
+async fn upload_test_pack(
+    ctx: &TestContext,
+    source: &std::path::Path,
+    force: bool,
+) -> Result<helpers::TestResponse> {
+    upload_test_pack_with_token(ctx, source, force, ctx.token().unwrap()).await
+}
+
+async fn upload_test_pack_with_token(
+    ctx: &TestContext,
+    source: &std::path::Path,
+    force: bool,
+    token: &str,
+) -> Result<helpers::TestResponse> {
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gzip);
+    archive.append_dir_all(".", source)?;
+    let archive = archive.into_inner()?.finish()?;
+    let boundary = "attune-dev-version-test";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"force\"\r\n\r\n{force}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"skip_tests\"\r\n\r\ntrue\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"republish\"\r\n\r\n{{\"mode\":\"on\"}}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"pack\"; filename=\"pack.tar.gz\"\r\n\
+         Content-Type: application/gzip\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(&archive);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/packs/upload")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header("authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::from(body))?;
+    Ok(helpers::TestResponse::new(
+        ctx.app.clone().oneshot(request).await?,
+    ))
+}
+
 #[tokio::test]
-async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readiness() -> Result<()>
-{
+async fn dev_version_republish_applies_to_install_upload_and_registration() -> Result<()> {
+    let ctx = TestContext::new_with_dev_version_republish()
+        .await?
+        .with_admin_auth()
+        .await?;
+    let source = create_test_pack_dir("dev-version", "1.2.3-dev")?;
+    let installed = ctx.post(
+        "/api/v1/packs/install",
+        json!({"source": source.path().to_str().unwrap(), "skip_tests": true, "skip_deps": true}),
+        ctx.token(),
+    ).await?;
+    assert_eq!(installed.status(), StatusCode::OK);
+    let first = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "dev-version")
+        .await?
+        .unwrap();
+
+    fs::write(
+        source.path().join("test.py"),
+        "print('second dev release')\n",
+    )?;
+    let no_force = upload_test_pack(&ctx, source.path(), false).await?;
+    assert_eq!(no_force.status(), StatusCode::CONFLICT);
+    let uploaded = upload_test_pack(&ctx, source.path(), true).await?;
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    let second = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "dev-version")
+        .await?
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.digest, second.digest);
+    assert_eq!(first.version, second.version);
+
+    let repeated = upload_test_pack(&ctx, source.path(), true).await?;
+    assert_eq!(repeated.status(), StatusCode::CREATED);
+    assert_eq!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "dev-version")
+            .await?
+            .unwrap()
+            .id,
+        second.id,
+    );
+
+    fs::write(
+        source.path().join("test.py"),
+        "print('third dev release')\n",
+    )?;
+    let registered = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": source.path().to_str().unwrap(), "force": true, "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let third = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "dev-version")
+        .await?
+        .unwrap();
+    assert_ne!(second.id, third.id);
+    assert_eq!(third.version, "1.2.3-dev");
+    assert_eq!(
+        PackReleaseRepository::list_by_pack(&ctx.pool, first.pack)
+            .await?
+            .len(),
+        3
+    );
+    assert_eq!(
+        fs::read_to_string(std::path::Path::new(&second.content_path).join("test.py"))?,
+        "print('second dev release')\n",
+    );
+    let original = PackReleaseRepository::find_by_id(&ctx.pool, first.id)
+        .await?
+        .unwrap();
+    assert_eq!(original.digest, first.digest);
+    assert_eq!(original.content_path, first.content_path);
+    let mut stored = ctx
+        .state
+        .blob_store
+        .get_pinned(
+            &ObjectKey::new(first.object_key.unwrap())?,
+            &attune_common::blob_store::ProviderVersion::from_stored(
+                first.provider_version.unwrap(),
+            )?,
+            first.archive_size as u64,
+            hex::decode(&first.digest)?.try_into().unwrap(),
+            None,
+        )
+        .await?;
+    let mut archive = Vec::new();
+    while let Some(chunk) = stored.next().await {
+        archive.extend_from_slice(&chunk?);
+    }
+    assert_eq!(archive.len() as i64, first.archive_size);
+    assert_eq!(hex::encode(Sha256::digest(&archive)), first.digest);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dev_version_republish_cannot_be_enabled_by_an_upload_or_force() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let source = create_test_pack_dir("strict-dev-version", "1.2.3-dev")?;
+    assert_eq!(
+        upload_test_pack(&ctx, source.path(), false).await?.status(),
+        StatusCode::CREATED
+    );
+    let original = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "strict-dev-version")
+        .await?
+        .unwrap();
+    fs::write(
+        source.path().join("test.py"),
+        "print('changed dev bytes')\n",
+    )?;
+    let conflict = upload_test_pack(&ctx, source.path(), true).await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "strict-dev-version")
+            .await?
+            .unwrap()
+            .id,
+        original.id,
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dev_version_republish_still_rejects_other_duplicate_versions() -> Result<()> {
+    let ctx = TestContext::new_with_dev_version_republish()
+        .await?
+        .with_admin_auth()
+        .await?;
+    for (index, version) in ["1.2.3", "1.2.3-rc", "1.2.3-dev.1", "1.2.3-dev+build"]
+        .iter()
+        .enumerate()
+    {
+        let pack_ref = format!("strict-other-version-{index}");
+        let source = create_test_pack_dir(&pack_ref, version)?;
+        assert_eq!(
+            upload_test_pack(&ctx, source.path(), false).await?.status(),
+            StatusCode::CREATED
+        );
+        fs::write(source.path().join("test.py"), "print('changed bytes')\n")?;
+        let conflict = upload_test_pack(&ctx, source.path(), true).await?;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT, "{version}");
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pack_republish_on_allows_changed_stable_versions() -> Result<()> {
+    let ctx = TestContext::new_with_pack_republish(PackRepublishConfig {
+        mode: PackRepublishMode::On,
+        ..Default::default()
+    })
+    .await?
+    .with_admin_auth()
+    .await?;
+    let source = create_test_pack_dir("republish-stable", "1.2.3")?;
+    assert_eq!(
+        upload_test_pack(&ctx, source.path(), false).await?.status(),
+        StatusCode::CREATED
+    );
+    let first = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "republish-stable")
+        .await?
+        .unwrap();
+    fs::write(
+        source.path().join("test.py"),
+        "print('changed stable bytes')\n",
+    )?;
+    assert_eq!(
+        upload_test_pack(&ctx, source.path(), true).await?.status(),
+        StatusCode::CREATED
+    );
+    let second = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "republish-stable")
+        .await?
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.digest, second.digest);
+    assert_eq!(second.version, "1.2.3");
+    assert_eq!(
+        PackReleaseRepository::find_by_id(&ctx.pool, first.id)
+            .await?
+            .unwrap()
+            .digest,
+        first.digest,
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pack_republish_custom_suffix_replaces_the_default_suffix() -> Result<()> {
+    let ctx = TestContext::new_with_pack_republish(PackRepublishConfig {
+        mode: PackRepublishMode::Suffix,
+        suffix: "-snapshot".to_string(),
+    })
+    .await?
+    .with_admin_auth()
+    .await?;
+    for (index, version, allowed) in [
+        (0, "1.2.3-snapshot", true),
+        (1, "1.2.3-dev", false),
+        (2, "1.2.3", false),
+    ] {
+        let pack_ref = format!("custom-suffix-{index}");
+        let source = create_test_pack_dir(&pack_ref, version)?;
+        assert_eq!(
+            upload_test_pack(&ctx, source.path(), false).await?.status(),
+            StatusCode::CREATED
+        );
+        let first = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, &pack_ref)
+            .await?
+            .unwrap();
+        fs::write(
+            source.path().join("test.py"),
+            "print('changed custom suffix bytes')\n",
+        )?;
+        let republished = upload_test_pack(&ctx, source.path(), true).await?;
+        assert_eq!(
+            republished.status(),
+            if allowed {
+                StatusCode::CREATED
+            } else {
+                StatusCode::CONFLICT
+            },
+            "{version}"
+        );
+        let active = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, &pack_ref)
+            .await?
+            .unwrap();
+        assert_eq!(active.id != first.id, allowed, "{version}");
+        assert_eq!(active.version, version);
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_pack_upgrade_requires_api_readmission_without_blocking_platform_readiness(
+) -> Result<()> {
     let ctx = TestContext::new().await?;
     attune_common::repositories::platform_catalog::PlatformCatalogRepository::reconcile(&ctx.pool)
         .await?;
@@ -2757,23 +4958,14 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
     let blob_store = FilesystemBlobStore::new(ctx.test_packs_dir.join("blobs"))?;
     let report =
         upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
-    assert_eq!(report.upgraded, vec!["core"]);
-    assert!(report.failures.is_empty());
-
-    let release = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
-        .await?
-        .expect("active upgraded release");
-    assert_eq!(release.manifest["pack_ref"], "core");
-    assert_eq!(release.manifest["version"], "1.2.3");
-    assert!(release.manifest["files"]
-        .as_array()
-        .is_some_and(|files| files.iter().any(|file| file["path"] == "run.sh")));
-    let object = blob_store
-        .head(&ObjectKey::new(release.object_key.as_deref().unwrap())?)
-        .await?
-        .expect("uploaded immutable archive");
-    assert_eq!(object.size as i64, release.archive_size);
-    assert_eq!(hex::encode(object.sha256), release.digest);
+    assert!(report.upgraded.is_empty());
+    assert_eq!(report.failures.len(), 1);
+    assert!(report.failures[0].error.contains("readmission"));
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
+            .await?
+            .is_none()
+    );
     assert_eq!(
         PlatformCatalogRepository::origin_by_id(
             &ctx.pool,
@@ -2783,7 +4975,7 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
         .await?,
         Some(ManagementOrigin::Pack {
             pack_id: pack.id,
-            release_id: Some(release.id),
+            release_id: None,
         })
     );
 
@@ -2803,13 +4995,13 @@ async fn legacy_pack_upgrade_freezes_real_bytes_without_blocking_platform_readin
 
     let report =
         upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
-    assert_eq!(report.upgraded, vec!["core"]);
-    assert!(report.failures.is_empty());
-    let upgraded_release = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
-        .await?
-        .expect("upgraded active release");
-    assert_eq!(upgraded_release.version, "1.2.4");
-    assert_ne!(upgraded_release.digest, release.digest);
+    assert!(report.upgraded.is_empty());
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
+            .await?
+            .is_none()
+    );
 
     let upgraded_ready = ctx.get("/health/ready", None).await?;
     assert_eq!(upgraded_ready.status(), axum::http::StatusCode::OK);

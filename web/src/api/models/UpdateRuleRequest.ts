@@ -9,7 +9,7 @@ export type UpdateRuleRequest = {
   /**
    * Parameters to pass to the action when rule is triggered
    */
-  action_params: any | null;
+  action_params?: Record<string, any> | null;
   /**
    * Action reference to execute when rule matches
    */
@@ -17,7 +17,7 @@ export type UpdateRuleRequest = {
   /**
    * Conditions for rule evaluation
    */
-  conditions: any | null;
+  conditions?: Record<string, any> | null;
   /**
    * Rule description
    */
@@ -35,19 +35,19 @@ export type UpdateRuleRequest = {
    * keep the current value. Provide null to inherit the action default, or an
    * empty array to force no API token.
    */
-  permission_set_refs?: any[] | null;
+  permission_set_refs?: Array<string> | null;
   /**
    * Replacement sensor-worker affinity.
    */
-  sensor_worker_affinity: any | null;
+  sensor_worker_affinity?: Record<string, any> | null;
   /**
    * Replacement sensor-worker selector.
    */
-  sensor_worker_selector: any | null;
+  sensor_worker_selector?: Record<string, any> | null;
   /**
    * Replacement sensor-worker tolerations.
    */
-  sensor_worker_tolerations: any[] | null;
+  sensor_worker_tolerations?: Array<Record<string, any>> | null;
   /**
    * Optional template used to resolve execution trace tags for this rule.
    * Omit to keep current value. Provide null to clear.
@@ -56,7 +56,7 @@ export type UpdateRuleRequest = {
   /**
    * Parameters for trigger configuration and event filtering
    */
-  trigger_params: any | null;
+  trigger_params?: Record<string, any> | null;
   /**
    * Trigger reference that activates this rule
    */

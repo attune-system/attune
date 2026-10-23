@@ -419,6 +419,7 @@ fn check_source(root: &Path, manifest: &Manifest) -> Result<()> {
         if !matches!(
             parent,
             "" | "actions"
+                | "types"
                 | "sensors"
                 | "triggers"
                 | "runtimes"
@@ -432,22 +433,8 @@ fn check_source(root: &Path, manifest: &Manifest) -> Result<()> {
             continue;
         }
         let value = yaml(root, &file.path)?;
-        for field in ["param_schema", "out_schema", "conf_schema"] {
-            if let Some(schema) = value.get(field) {
-                let fields = schema
-                    .as_mapping()
-                    .context("schema must be a flat per-field mapping")?;
-                for (name, definition) in fields {
-                    ensure!(
-                        name.is_string()
-                            && definition.is_mapping()
-                            && definition.get("type").and_then(Value::as_str).is_some(),
-                        "{field} must use Attune flat schemas: {}",
-                        file.path
-                    );
-                }
-            }
-        }
+        // Schema checks, including authoring and metadata field names, belong to
+        // the shared pack checker below. Do not maintain a second shape converter.
         if matches!(parent, "actions" | "sensors") && value.get("launch").is_some() {
             typed_launches.insert(file.path.clone());
         }

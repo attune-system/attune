@@ -52,7 +52,8 @@ import {
   validateWorkflow,
   addTransitionTarget,
   removeTaskFromTransitions,
-  renameTaskInTransitions,
+  updateWorkflowTask,
+  locateWorkflowTasks,
   findStartingTaskIds,
 } from "@/types/workflow";
 
@@ -169,6 +170,7 @@ export default function WorkflowBuilderPage() {
       const defn = workflow.definition as Record<string, unknown> | undefined;
       const builderState = definitionToBuilderState(
         {
+          ...defn,
           ref: workflow.ref,
           label: workflow.label,
           description: workflow.description || undefined,
@@ -218,11 +220,14 @@ export default function WorkflowBuilderPage() {
   // React Query caches each response, so repeated refs don't cause extra requests.
   const uniqueActionRefs = useMemo(() => {
     const refs = new Set<string>();
-    for (const task of state.tasks) {
-      if (task.action) refs.add(task.action);
+    for (const { task } of locateWorkflowTasks(
+      state.tasks,
+      state.taskCollectionShape,
+    )) {
+      if (task.action && !task.action.includes("{{")) refs.add(task.action);
     }
     return [...refs];
-  }, [state.tasks]);
+  }, [state.tasks, state.taskCollectionShape]);
 
   const actionDetailQueries = useQueries({
     queries: uniqueActionRefs.map((ref) => ({
@@ -256,14 +261,19 @@ export default function WorkflowBuilderPage() {
     }>;
   }, [packsData]);
 
-  const selectedTask = useMemo(
-    () => state.tasks.find((t) => t.id === selectedTaskId) || null,
-    [state.tasks, selectedTaskId],
+  const locatedTasks = useMemo(
+    () => locateWorkflowTasks(state.tasks, state.taskCollectionShape),
+    [state.tasks, state.taskCollectionShape],
   );
+  const selectedEntry = useMemo(
+    () => locatedTasks.find(({ task }) => task.id === selectedTaskId),
+    [locatedTasks, selectedTaskId],
+  );
+  const selectedTask = selectedEntry?.task;
 
   const allTaskNames = useMemo(
-    () => state.tasks.map((t) => t.name),
-    [state.tasks],
+    () => (selectedEntry?.siblings ?? state.tasks).map((task) => task.name),
+    [state.tasks, selectedEntry],
   );
 
   const startingTaskIds = useMemo(
@@ -439,46 +449,9 @@ export default function WorkflowBuilderPage() {
   const handleUpdateTask = useCallback(
     (taskId: string, updates: Partial<WorkflowTask>) => {
       setState((prev) => {
-        // Detect a name change so we can propagate it to transitions
-        const oldName =
-          updates.name !== undefined
-            ? prev.tasks.find((t) => t.id === taskId)?.name
-            : undefined;
-        const newName = updates.name;
-        const isRename =
-          oldName !== undefined && newName !== undefined && oldName !== newName;
-
         return {
           ...prev,
-          tasks: prev.tasks.map((t) => {
-            if (t.id === taskId) {
-              // Apply the updates, then also fix self-referencing transitions
-              const merged = { ...t, ...updates };
-              if (isRename) {
-                const updatedNext = renameTaskInTransitions(
-                  merged.next,
-                  oldName,
-                  newName,
-                );
-                if (updatedNext !== merged.next) {
-                  return { ...merged, next: updatedNext };
-                }
-              }
-              return merged;
-            }
-            // Update transition `do` lists that reference the old name
-            if (isRename) {
-              const updatedNext = renameTaskInTransitions(
-                t.next,
-                oldName,
-                newName,
-              );
-              if (updatedNext !== t.next) {
-                return { ...t, next: updatedNext };
-              }
-            }
-            return t;
-          }),
+          tasks: updateWorkflowTask(prev.tasks, taskId, updates),
         };
       });
       setSaveSuccess(false);
@@ -1145,19 +1118,43 @@ export default function WorkflowBuilderPage() {
             />
 
             {/* Right: Task Inspector */}
-            {selectedTask && (
-              <TaskInspector
-                task={selectedTask}
-                allTaskNames={allTaskNames}
-                availableActions={paletteActions}
-                onUpdate={handleUpdateTask}
-                onClose={() => setSelectedTaskId(null)}
-                highlightTransitionIndex={
-                  highlightedTransition?.taskId === selectedTask.id
-                    ? highlightedTransition.transitionIndex
-                    : null
-                }
-              />
+            {(selectedTask ||
+              state.tasks.some((task) => task.tasks?.length)) && (
+              <div className="flex flex-col min-h-0">
+                <label className="px-3 py-2 text-xs border-l border-gray-200">
+                  Task to edit
+                  <select
+                    aria-label="Task to edit"
+                    value={selectedTaskId ?? ""}
+                    onChange={(event) =>
+                      setSelectedTaskId(event.target.value || null)
+                    }
+                    className="block w-full border border-gray-300 rounded mt-1"
+                  >
+                    <option value="">Choose a task</option>
+                    {locatedTasks.map(({ task, path }) => (
+                      <option key={task.id} value={task.id}>
+                        {task.name} ({path})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {selectedTask && (
+                  <TaskInspector
+                    task={selectedTask}
+                    taskPath={selectedEntry?.path}
+                    allTaskNames={allTaskNames}
+                    availableActions={paletteActions}
+                    onUpdate={handleUpdateTask}
+                    onClose={() => setSelectedTaskId(null)}
+                    highlightTransitionIndex={
+                      highlightedTransition?.taskId === selectedTask.id
+                        ? highlightedTransition.transitionIndex
+                        : null
+                    }
+                  />
+                )}
+              </div>
             )}
           </>
         )}

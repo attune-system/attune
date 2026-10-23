@@ -40,6 +40,7 @@ use attune_common::repositories::artifact_upload_grant::{
 };
 use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::pack_install::PackInstallRepository;
+use attune_common::repositories::worker_delivery::DeliveryOperation;
 use attune_common::repositories::{
     ExecutionRepository, FindById, FindByRef, ObjectMaintenanceRepository, PackReleaseRepository,
     SensorRepository, SensorWorkloadRepository,
@@ -53,6 +54,11 @@ use crate::{
     routes::artifacts::artifact_read_context_for_user,
     state::AppState,
 };
+
+/// Documentation-only raw archive bytes. Handlers stream the body unchanged.
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+pub struct PackArchiveBody(pub Vec<u8>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileOperation {
@@ -256,7 +262,12 @@ pub(crate) async fn upload_file(
             ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
                 .await
                 .map_err(map_repository_error)?
-                .filter(|version| version.body_state == Some(ArtifactBodyState::Pending))
+                .filter(|version| {
+                    matches!(
+                        version.body_state,
+                        Some(ArtifactBodyState::Pending | ArtifactBodyState::Ready)
+                    )
+                })
         {
             use futures::StreamExt;
             let digest = decode_hex_digest(digest)?;
@@ -288,7 +299,7 @@ pub(crate) async fn upload_file(
                     }
                 },
             );
-            publish_stream(&state, &version, body.boxed(), size, digest).await?;
+            publish_stream(&state, &user, &version, body.boxed(), size, digest).await?;
             debug!(
                 path = %file_path,
                 size,
@@ -299,6 +310,16 @@ pub(crate) async fn upload_file(
         }
     }
 
+    if crate::recorded_consumers::is_recorded(&user).map_err(map_api_error)?
+        || attune_common::worker_delivery::credential(&user.claims)
+            .map_err(map_transport_error)?
+            .is_some()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Recorded uploads require a pending immutable version, size and digest".into(),
+        ));
+    }
     use futures::StreamExt;
     let body = body
         .into_data_stream()
@@ -352,13 +373,25 @@ pub(crate) async fn download_file(
     Path(file_path): Path<String>,
     request_headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    authorize_file_transfer(&state, &user, &file_path, FileOperation::Read).await?;
+    ValidatedRelativePath::new(&file_path).map_err(map_transport_error)?;
 
     let version = ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
         .await
         .map_err(map_repository_error)?;
     match version {
         Some(version) => {
+            if let Some(response) = crate::routes::artifacts::protected_file_response(
+                &state,
+                &user,
+                &version,
+                &request_headers,
+            )
+            .await
+            .map_err(map_api_error)?
+            {
+                return Ok(response);
+            }
+            authorize_file_transfer(&state, &user, &file_path, FileOperation::Read).await?;
             if matches!(
                 version.body_state,
                 Some(ArtifactBodyState::Deleting | ArtifactBodyState::CleanupClaimed)
@@ -424,6 +457,21 @@ pub(crate) async fn download_file(
             }
         }
         None => {
+            let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
+            if file_path.starts_with("files/versions/")
+                || attune_common::repositories::file_origin::FileOriginRepository::guarded_path(
+                    &mut conn, &file_path,
+                )
+                .await
+                .map_err(map_transport_error)?
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Unregistered version staging is not downloadable".into(),
+                ));
+            }
+            drop(conn);
+            authorize_file_transfer(&state, &user, &file_path, FileOperation::Read).await?;
             return stream_volume_download(
                 &state.config.artifacts_dir,
                 &file_path,
@@ -496,10 +544,46 @@ async fn complete_file(
             )
         })?;
 
+    // Shared logs are durable files, not disposable upload staging files. Their
+    // only completion operation is seal; generic completion must never unlink one.
+    if LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+        .await
+        .map_err(map_repository_error)?
+        .is_some()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Runtime logs require the seal operation".into(),
+        ));
+    }
+
     if version.body_state == Some(ArtifactBodyState::Ready) {
+        let mut tx = state.db.begin().await.map_err(map_sqlx_error)?;
+        let effect = authorize_version_mutation(&state, &mut tx, &user, &version).await?;
+        let delivery_size = attune_common::repositories::file_origin::FileOriginRepository::body(
+            &state.db, version.id,
+        )
+        .await
+        .map_err(map_transport_error)?
+        .map_or(version.size_bytes.unwrap_or(0), |body| body.plaintext_bytes);
+        check_delivery_bounds(
+            &mut tx,
+            &user,
+            version.id,
+            None,
+            DeliveryOperation::Complete {
+                bytes: delivery_size,
+            },
+        )
+        .await?;
         let _ = VolumeTransport::new(&state.config.artifacts_dir)
             .delete_file(&file_path)
             .await;
+        effect
+            .ensure_fresh_on(&mut tx)
+            .await
+            .map_err(map_api_error)?;
+        effect.commit(tx).await.map_err(map_api_error)?;
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-attune-size",
@@ -514,8 +598,14 @@ async fn complete_file(
         ));
     }
 
-    let staged_path = std::path::Path::new(&state.config.artifacts_dir).join(&file_path);
-    publish_file(&state, &version, &staged_path).await?;
+    let relative = ValidatedRelativePath::new(&file_path).map_err(map_transport_error)?;
+    let staged_path = attune_common::artifact_transport::resolve_checked_path(
+        std::path::Path::new(&state.config.artifacts_dir),
+        &relative,
+    )
+    .await
+    .map_err(map_transport_error)?;
+    publish_file_authorized(&state, &user, &version, &staged_path).await?;
     let _ = VolumeTransport::new(&state.config.artifacts_dir)
         .delete_file(&file_path)
         .await;
@@ -590,6 +680,43 @@ async fn authorize_direct_artifact_upload(
                 "Artifact version not found".to_string(),
             )
         })?;
+    let protected = {
+        let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
+        attune_common::repositories::file_origin::FileOriginRepository::find(&mut conn, version.id)
+            .await
+            .map_err(map_transport_error)?
+            .is_some()
+    };
+    if protected {
+        return Ok(Json(DirectUploadResponse::ProxyRequired));
+    }
+    if attune_common::worker_delivery::credential(&user.claims)
+        .map_err(map_transport_error)?
+        .is_some()
+    {
+        let mut tx = state.db.begin().await.map_err(map_sqlx_error)?;
+        let effect = authorize_version_mutation(&state, &mut tx, &user, &version).await?;
+        check_delivery_bounds(
+            &mut tx,
+            &user,
+            version.id,
+            None,
+            DeliveryOperation::Complete {
+                bytes: i64::try_from(request.size_bytes).map_err(|_| {
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Artifact size overflow".into(),
+                    )
+                })?,
+            },
+        )
+        .await?;
+        effect
+            .ensure_fresh_on(&mut tx)
+            .await
+            .map_err(map_api_error)?;
+        effect.commit(tx).await.map_err(map_api_error)?;
+    }
     if version.body_state == Some(ArtifactBodyState::Ready) {
         let size_bytes = u64::try_from(version.size_bytes.unwrap_or_default()).map_err(|_| {
             (
@@ -694,6 +821,17 @@ async fn authorize_direct_artifact_upload(
     };
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
+    check_delivery_bounds(
+        &mut transaction,
+        &user,
+        version.id,
+        None,
+        DeliveryOperation::Complete {
+            bytes: request.size_bytes as i64,
+        },
+    )
+    .await?;
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, version.id)
             .await
@@ -776,7 +914,11 @@ async fn authorize_direct_artifact_upload(
             .map_err(map_repository_error)?;
         }
     }
-    transaction.commit().await.map_err(map_sqlx_error)?;
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
 
     Ok(Json(DirectUploadResponse::Upload {
         grant_token,
@@ -900,6 +1042,17 @@ async fn complete_direct_artifact_upload(
     }
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
+    check_delivery_bounds(
+        &mut transaction,
+        &user,
+        version.id,
+        None,
+        DeliveryOperation::Complete {
+            bytes: grant.expected_size,
+        },
+    )
+    .await?;
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, grant.artifact_version)
             .await
@@ -919,7 +1072,11 @@ async fn complete_direct_artifact_upload(
         if locked_grant.completed_provider_version.as_deref()
             == Some(stored.provider_version.as_stored())
         {
-            transaction.commit().await.map_err(map_sqlx_error)?;
+            effect
+                .ensure_fresh_on(&mut transaction)
+                .await
+                .map_err(map_api_error)?;
+            effect.commit(transaction).await.map_err(map_api_error)?;
             let mut headers = HeaderMap::new();
             headers.insert("x-attune-size", stored.size.to_string().parse().unwrap());
             return Ok((StatusCode::OK, headers));
@@ -981,7 +1138,11 @@ async fn complete_direct_artifact_upload(
             "Upload grant changed during completion".to_string(),
         ));
     }
-    transaction.commit().await.map_err(map_sqlx_error)?;
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
     let mut headers = HeaderMap::new();
     headers.insert("x-attune-size", stored.size.to_string().parse().unwrap());
     Ok((StatusCode::OK, headers))
@@ -1053,6 +1214,24 @@ async fn authorize_direct_log_segment_upload(
         size,
     )? {
         LogSegmentCommitDecision::Retry => {
+            if reserve_proxy_log_upload(
+                &state,
+                &user,
+                &stream,
+                artifact_version,
+                sequence,
+                size,
+                &request.sha256,
+                &format!("logs/{}/segments/{sequence}", stream.id),
+            )
+            .await?
+                != LogSegmentCommitDecision::Retry
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Log retry changed while validating delivery".into(),
+                ));
+            }
             return Ok(Json(DirectUploadResponse::AlreadyReady {
                 size_bytes: request.size_bytes,
             }));
@@ -1123,6 +1302,7 @@ async fn authorize_direct_log_segment_upload(
     };
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
@@ -1134,6 +1314,17 @@ async fn authorize_direct_log_segment_upload(
     let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    check_delivery_bounds(
+        &mut transaction,
+        &user,
+        artifact_version,
+        Some(stream.id),
+        DeliveryOperation::Append {
+            sequence,
+            end: delivery_append_end(&locked_stream, sequence, size)?,
+        },
+    )
+    .await?;
     let locked_grant = ArtifactUploadGrantRepository::find_log_segment_for_update(
         &mut transaction,
         artifact_version,
@@ -1155,7 +1346,11 @@ async fn authorize_direct_log_segment_upload(
         size,
     )? == LogSegmentCommitDecision::Retry
     {
-        transaction.commit().await.map_err(map_sqlx_error)?;
+        effect
+            .ensure_fresh_on(&mut transaction)
+            .await
+            .map_err(map_api_error)?;
+        effect.commit(transaction).await.map_err(map_api_error)?;
         return Ok(Json(DirectUploadResponse::AlreadyReady {
             size_bytes: request.size_bytes,
         }));
@@ -1207,7 +1402,11 @@ async fn authorize_direct_log_segment_upload(
             .map_err(map_repository_error)?;
         }
     }
-    transaction.commit().await.map_err(map_sqlx_error)?;
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
     Ok(Json(DirectUploadResponse::Upload {
         grant_token,
         method: "PUT".to_string(),
@@ -1255,7 +1454,7 @@ async fn complete_direct_log_segment_upload(
             "Log upload grant not found".to_string(),
         )
     })?;
-    authorize_log_version(&state, &user, grant.artifact_version).await?;
+    let version = authorize_log_version(&state, &user, grant.artifact_version).await?;
     let stream = LogStreamRepository::find_by_artifact_version(&state.db, grant.artifact_version)
         .await
         .map_err(map_repository_error)?
@@ -1299,6 +1498,7 @@ async fn complete_direct_log_segment_upload(
     }
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, grant.artifact_version)
             .await
@@ -1307,6 +1507,17 @@ async fn complete_direct_log_segment_upload(
     let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    check_delivery_bounds(
+        &mut transaction,
+        &user,
+        grant.artifact_version,
+        Some(stream.id),
+        DeliveryOperation::Append {
+            sequence,
+            end: delivery_append_end(&locked_stream, sequence, grant.expected_size)?,
+        },
+    )
+    .await?;
     let locked_grant =
         ArtifactUploadGrantRepository::find_by_token_for_update(&mut transaction, grant_token)
             .await
@@ -1321,7 +1532,11 @@ async fn complete_direct_log_segment_upload(
         if locked_grant.completed_provider_version.as_deref()
             == Some(stored.provider_version.as_stored())
         {
-            transaction.commit().await.map_err(map_sqlx_error)?;
+            effect
+                .ensure_fresh_on(&mut transaction)
+                .await
+                .map_err(map_api_error)?;
+            effect.commit(transaction).await.map_err(map_api_error)?;
             return Ok(StatusCode::OK);
         }
         return Err((
@@ -1381,7 +1596,11 @@ async fn complete_direct_log_segment_upload(
     {
         return Err((StatusCode::CONFLICT, "Log upload grant changed".into()));
     }
-    transaction.commit().await.map_err(map_sqlx_error)?;
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
     Ok(StatusCode::OK)
 }
 
@@ -1434,7 +1653,7 @@ async fn commit_log_segment(
     let existing = LogStreamRepository::find_segment_by_sequence(&state.db, stream.id, sequence)
         .await
         .map_err(map_repository_error)?;
-    match log_segment_commit_decision(
+    log_segment_commit_decision(
         existing
             .as_ref()
             .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
@@ -1443,15 +1662,13 @@ async fn commit_log_segment(
         sequence,
         &digest_hex,
         bytes.len() as i64,
-    )? {
-        LogSegmentCommitDecision::Retry => return Ok(StatusCode::OK),
-        LogSegmentCommitDecision::Commit => {}
-    }
+    )?;
 
     let key = ObjectKey::new(format!("logs/{}/segments/{sequence}", stream.id))
         .map_err(map_blob_error)?;
     if reserve_proxy_log_upload(
         &state,
+        &user,
         &stream,
         artifact_version,
         sequence,
@@ -1495,17 +1712,26 @@ async fn commit_log_segment(
     };
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
             .map_err(map_repository_error)?
             .ok_or_else(|| (StatusCode::CONFLICT, "Log artifact disappeared".to_string()))?;
-    if locked_version.body_state != Some(ArtifactBodyState::Pending) {
-        return Err((StatusCode::CONFLICT, "Log artifact is not pending".into()));
-    }
     let locked = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    check_delivery_bounds(
+        &mut transaction,
+        &user,
+        artifact_version,
+        Some(stream.id),
+        DeliveryOperation::Append {
+            sequence,
+            end: delivery_append_end(&locked, sequence, bytes.len() as i64)?,
+        },
+    )
+    .await?;
     let locked_grant = ArtifactUploadGrantRepository::find_log_segment_for_update(
         &mut transaction,
         artifact_version,
@@ -1516,7 +1742,7 @@ async fn commit_log_segment(
     let existing = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
         .await
         .map_err(map_repository_error)?;
-    match log_segment_commit_decision(
+    let decision = log_segment_commit_decision(
         existing
             .as_ref()
             .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
@@ -1525,7 +1751,9 @@ async fn commit_log_segment(
         sequence,
         &digest_hex,
         bytes.len() as i64,
-    )? {
+    )?;
+    check_log_segment_body_state(locked_version.body_state, locked.sealed, decision)?;
+    match decision {
         LogSegmentCommitDecision::Retry => {
             complete_proxy_log_grant(
                 &mut transaction,
@@ -1536,7 +1764,11 @@ async fn commit_log_segment(
                 stored.provider_version.as_stored(),
             )
             .await?;
-            transaction.commit().await.map_err(map_sqlx_error)?;
+            effect
+                .ensure_fresh_on(&mut transaction)
+                .await
+                .map_err(map_api_error)?;
+            effect.commit(transaction).await.map_err(map_api_error)?;
             return Ok(StatusCode::OK);
         }
         LogSegmentCommitDecision::Commit => {}
@@ -1569,7 +1801,11 @@ async fn commit_log_segment(
         stored.provider_version.as_stored(),
     )
     .await?;
-    transaction.commit().await.map_err(map_sqlx_error)?;
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
     debug!(
         artifact_version = version.id,
         stream_id = stream.id,
@@ -1580,8 +1816,13 @@ async fn commit_log_segment(
     Ok(StatusCode::CREATED)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Reserve an exact authorized version, stream, sequence, size, digest, and object key"
+)]
 async fn reserve_proxy_log_upload(
     state: &AppState,
+    user: &AuthenticatedUser,
     stream: &LogStream,
     artifact_version: i64,
     sequence: i64,
@@ -1595,17 +1836,30 @@ async fn reserve_proxy_log_upload(
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let settle_until = expires_at + DIRECT_UPLOAD_SETTLEMENT_GRACE;
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let initial = ArtifactVersionRepository::find_by_id(&mut *transaction, artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::FORBIDDEN, "Artifact version unavailable".into()))?;
+    let effect = authorize_version_mutation(state, &mut transaction, user, &initial).await?;
     let version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
             .map_err(map_repository_error)?
             .ok_or_else(|| (StatusCode::CONFLICT, "Log artifact disappeared".to_string()))?;
-    if version.body_state != Some(ArtifactBodyState::Pending) {
-        return Err((StatusCode::CONFLICT, "Log artifact is not pending".into()));
-    }
     let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    check_delivery_bounds(
+        &mut transaction,
+        user,
+        artifact_version,
+        Some(stream.id),
+        DeliveryOperation::Append {
+            sequence,
+            end: delivery_append_end(&locked_stream, sequence, size)?,
+        },
+    )
+    .await?;
     let existing_segment = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
         .await
         .map_err(map_repository_error)?;
@@ -1619,8 +1873,13 @@ async fn reserve_proxy_log_upload(
         sha256,
         size,
     )?;
+    check_log_segment_body_state(version.body_state, locked_stream.sealed, decision)?;
     if decision == LogSegmentCommitDecision::Retry {
-        transaction.commit().await.map_err(map_sqlx_error)?;
+        effect
+            .ensure_fresh_on(&mut transaction)
+            .await
+            .map_err(map_api_error)?;
+        effect.commit(transaction).await.map_err(map_api_error)?;
         return Ok(decision);
     }
     let grant = ArtifactUploadGrantRepository::find_log_segment_for_update(
@@ -1678,7 +1937,11 @@ async fn reserve_proxy_log_upload(
     ObjectMaintenanceRepository::reserve_upload(&mut *transaction, object_key, "log")
         .await
         .map_err(map_repository_error)?;
-    transaction.commit().await.map_err(map_sqlx_error)?;
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
     Ok(decision)
 }
 
@@ -1728,10 +1991,25 @@ fn log_segment_retry_matches(
     existing_sha256 == retry_sha256 && existing_size == retry_size
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum LogSegmentCommitDecision {
     Retry,
     Commit,
+}
+
+fn check_log_segment_body_state(
+    state: Option<ArtifactBodyState>,
+    sealed: bool,
+    decision: LogSegmentCommitDecision,
+) -> Result<(), (StatusCode, String)> {
+    if state == Some(ArtifactBodyState::Pending)
+        || (state == Some(ArtifactBodyState::Ready)
+            && sealed
+            && decision == LogSegmentCommitDecision::Retry)
+    {
+        return Ok(());
+    }
+    Err((StatusCode::CONFLICT, "Log artifact is not pending".into()))
 }
 
 fn log_segment_commit_decision(
@@ -1771,12 +2049,50 @@ async fn seal_log_stream(
     RequireAuth(user): RequireAuth,
     Path(artifact_version): Path<i64>,
     Query(query): Query<SealLogQuery>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let version = authorize_log_version(&state, &user, artifact_version).await?;
     let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
         .await
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
+    // Shared append uses source -> artifact advisory -> version -> stream ->
+    // flock. Sealing must acquire the same locks before taking its file snapshot.
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
+    let version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Worker log version unavailable".into(),
+                )
+            })?;
+    let stream = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    let proof =
+        encrypted_log_seal_proof(&mut transaction, &state, &user, &version, &stream, &headers)
+            .await?;
+    let mut verifier = proof.as_ref().map(|proof| {
+        attune_common::runtime_log_completion::FrameVerifier::new(
+            state
+                .config
+                .security
+                .encryption_key
+                .as_deref()
+                .expect("validated encryption key"),
+            proof.context.execution,
+            version.id,
+            proof
+                .permit
+                .max_plaintext_bytes
+                .expect("validated plaintext cap") as u64,
+            proof.permit.max_bytes as u64,
+        )
+    });
     let shared_snapshot = if stream.backend == LogStreamBackend::SharedFile {
         let file_path = version.file_path.as_deref().ok_or_else(|| {
             (
@@ -1784,16 +2100,28 @@ async fn seal_log_stream(
                 "Shared log has no file path".to_string(),
             )
         })?;
-        Some(
-            VolumeTransport::new(&state.config.artifacts_dir)
-                .seal_log_file(file_path)
+        let transport = VolumeTransport::new(&state.config.artifacts_dir);
+        let snapshot = if attune_common::worker_delivery::credential(&user.claims)
+            .map_err(map_transport_error)?
+            .is_some()
+        {
+            let permit = attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_version(&mut transaction,version.id)
+                .await.map_err(map_transport_error)?.ok_or_else(|| (StatusCode::FORBIDDEN,"Worker delivery permit unavailable".into()))?;
+            transport
+                .inspect_log_file(file_path, Some(permit.max_bytes as u64))
                 .await
-                .map_err(map_transport_error)?,
-        )
+        } else {
+            transport.inspect_log_file(file_path, None).await
+        };
+        Some(snapshot.map_err(map_transport_error)?)
     } else {
         None
     };
-    if stream.sealed {
+    if stream.sealed && proof.is_none() {
+        effect
+            .ensure_fresh_on(&mut transaction)
+            .await
+            .map_err(map_api_error)?;
         let unchanged = shared_snapshot.as_ref().is_none_or(|(_, size, digest)| {
             version.size_bytes == i64::try_from(*size).ok()
                 && version.sha256.as_deref() == Some(hex_digest(digest).as_str())
@@ -1810,9 +2138,12 @@ async fn seal_log_stream(
         };
     }
     if stream.backend == LogStreamBackend::ObjectSegments
-        && ArtifactUploadGrantRepository::active_log_segment_exists(&state.db, artifact_version)
-            .await
-            .map_err(map_repository_error)?
+        && ArtifactUploadGrantRepository::active_log_segment_exists(
+            &mut *transaction,
+            artifact_version,
+        )
+        .await
+        .map_err(map_repository_error)?
     {
         return Err((
             StatusCode::CONFLICT,
@@ -1822,7 +2153,7 @@ async fn seal_log_stream(
 
     let (size, digest) = match stream.backend {
         LogStreamBackend::ObjectSegments => {
-            let segments = LogStreamRepository::segments(&state.db, stream.id)
+            let segments = LogStreamRepository::segments_with_conn(&mut transaction, stream.id)
                 .await
                 .map_err(map_repository_error)?;
             validate_log_snapshot(&stream, &segments)?;
@@ -1830,7 +2161,11 @@ async fn seal_log_stream(
                 .map_err(map_log_stream_read_error)?;
             let mut hasher = Sha256::new();
             while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
-                hasher.update(chunk.map_err(map_blob_error)?);
+                let chunk = chunk.map_err(map_blob_error)?;
+                if let Some(verifier) = &mut verifier {
+                    verifier.update(&chunk).map_err(map_transport_error)?;
+                }
+                hasher.update(&chunk);
             }
             (stream.total_bytes, hex_digest(&hasher.finalize().into()))
         }
@@ -1842,11 +2177,63 @@ async fn seal_log_stream(
                     "Log size overflow".to_string(),
                 )
             })?;
+            if let Some(verifier) = &mut verifier {
+                let path = version
+                    .file_path
+                    .as_deref()
+                    .ok_or_else(|| (StatusCode::CONFLICT, "Shared log path unavailable".into()))?;
+                let mut reader = VolumeTransport::new(&state.config.artifacts_dir)
+                    .open_reader(path, 0)
+                    .await
+                    .map_err(map_transport_error)?;
+                let mut buffer = vec![0_u8; 64 * 1024];
+                loop {
+                    let count = reader.read(&mut buffer).await.map_err(|_| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Shared log verification failed".into(),
+                        )
+                    })?;
+                    if count == 0 {
+                        break;
+                    }
+                    verifier
+                        .update(&buffer[..count])
+                        .map_err(map_transport_error)?;
+                }
+            }
             (size, hex_digest(digest))
         }
     };
+    if let Some(proof) = &proof {
+        if proof.manifest.ciphertext_bytes != size as u64
+            || proof.manifest.ciphertext_sha256 != digest
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Encrypted log final bytes do not match the authenticated manifest".into(),
+            ));
+        }
+        verifier
+            .take()
+            .expect("encrypted verifier")
+            .finish(&proof.manifest)
+            .map_err(map_transport_error)?;
+        effect
+            .ensure_fresh_on(&mut transaction)
+            .await
+            .map_err(map_api_error)?;
+        attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::record(
+            &mut transaction,&proof.context,&proof.permit,&proof.manifest,&proof.authenticated,query.truncated).await.map_err(map_transport_error)?;
+        ArtifactVersionRepository::set_encrypted_log_manifest(
+            &mut transaction,
+            version.id,
+            &proof.authenticated,
+        )
+        .await
+        .map_err(map_transport_error)?;
+    }
 
-    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
     let current_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
@@ -1860,6 +2247,17 @@ async fn seal_log_stream(
     let locked = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    check_delivery_bounds(
+        &mut transaction,
+        &user,
+        artifact_version,
+        Some(stream.id),
+        DeliveryOperation::Seal {
+            sequences: locked.next_sequence,
+            bytes: size,
+        },
+    )
+    .await?;
     if locked.backend == LogStreamBackend::ObjectSegments
         && ArtifactUploadGrantRepository::active_log_segment_exists(
             &mut *transaction,
@@ -1878,8 +2276,15 @@ async fn seal_log_stream(
             locked.truncated,
             query.truncated,
             current_version.body_state,
-        ) {
-            transaction.commit().await.map_err(map_sqlx_error)?;
+        ) && proof.as_ref().is_none_or(|_| {
+            current_version.size_bytes == Some(size)
+                && current_version.sha256.as_deref() == Some(digest.as_str())
+        }) {
+            effect
+                .ensure_fresh_on(&mut transaction)
+                .await
+                .map_err(map_api_error)?;
+            effect.commit(transaction).await.map_err(map_api_error)?;
             return Ok(StatusCode::OK);
         }
         return Err((
@@ -1907,6 +2312,13 @@ async fn seal_log_stream(
             StatusCode::CONFLICT,
             "Log artifact is not pending".to_string(),
         ));
+    }
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    if let Some((snapshot, _, _)) = &shared_snapshot {
+        snapshot.freeze().map_err(map_transport_error)?;
     }
     match locked.backend {
         LogStreamBackend::ObjectSegments => {
@@ -1950,7 +2362,11 @@ async fn seal_log_stream(
             "Log artifact could not be marked ready".to_string(),
         ));
     }
-    transaction.commit().await.map_err(map_sqlx_error)?;
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
     info!(
         artifact_version,
         stream_id = stream.id,
@@ -1969,6 +2385,95 @@ fn log_stream_seal_is_complete(
     body_state: Option<ArtifactBodyState>,
 ) -> bool {
     sealed_truncated == requested_truncated && body_state == Some(ArtifactBodyState::Ready)
+}
+
+struct EncryptedLogSeal {
+    context: attune_common::repositories::worker_delivery::DeliveryContext,
+    permit: attune_common::repositories::worker_delivery::DeliveryPermit,
+    manifest: attune_common::runtime_log_completion::FinalLogManifest,
+    authenticated: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn encrypted_log_seal_proof(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    state: &AppState,
+    user: &AuthenticatedUser,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+    stream: &LogStream,
+    headers: &HeaderMap,
+) -> Result<Option<EncryptedLogSeal>, (StatusCode, String)> {
+    use attune_common::repositories::worker_delivery::WorkerDeliveryRepository;
+    let denied = || {
+        (
+            StatusCode::FORBIDDEN,
+            "Authenticated encrypted log final manifest required".into(),
+        )
+    };
+    let permit = WorkerDeliveryRepository::for_version(tx, version.id)
+        .await
+        .map_err(map_transport_error)?;
+    let encoding = version
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("log_encoding"))
+        .and_then(|value| value.as_str());
+    let encrypted = encoding.is_some()
+        || permit
+            .as_ref()
+            .is_some_and(|permit| permit.max_plaintext_bytes.is_some());
+    if !encrypted {
+        if headers.contains_key("x-attune-log-final-manifest") {
+            return Err(denied());
+        }
+        return Ok(None);
+    }
+    if encoding != Some(attune_common::runtime_read_log::ENCODING) {
+        return Err(denied());
+    }
+    let credential = attune_common::worker_delivery::credential(&user.claims)
+        .map_err(map_transport_error)?
+        .ok_or_else(denied)?;
+    let permit = permit.ok_or_else(denied)?;
+    let context =
+        WorkerDeliveryRepository::for_execution(tx, version.execution.ok_or_else(denied)?)
+            .await
+            .map_err(map_transport_error)?
+            .ok_or_else(denied)?;
+    if credential.permit != permit.id
+        || permit.context != context.id
+        || permit.log_stream != Some(stream.id)
+        || permit.max_plaintext_bytes.is_none()
+    {
+        return Err(denied());
+    }
+    let authenticated = headers
+        .get("x-attune-log-final-manifest")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(denied)?
+        .to_owned();
+    let key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(denied)?;
+    let manifest =
+        attune_common::runtime_log_completion::FinalLogManifest::open(key, &authenticated)
+            .map_err(map_transport_error)?;
+    if manifest.execution != context.execution
+        || manifest.version != version.id
+        || manifest.plaintext_bytes > permit.max_plaintext_bytes.unwrap_or_default() as u64
+        || manifest.ciphertext_bytes > permit.max_bytes as u64
+    {
+        return Err(denied());
+    }
+    Ok(Some(EncryptedLogSeal {
+        context,
+        permit,
+        manifest,
+        authenticated,
+    }))
 }
 
 fn validate_log_snapshot(
@@ -2008,6 +2513,15 @@ async fn authorize_log_version(
     user: &AuthenticatedUser,
     artifact_version: i64,
 ) -> Result<attune_common::models::artifact_version::ArtifactVersion, (StatusCode, String)> {
+    if attune_common::worker_delivery::credential(&user.claims)
+        .map_err(map_transport_error)?
+        .is_some_and(|credential| credential.version != artifact_version)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Worker delivery version mismatch".into(),
+        ));
+    }
     let version = ArtifactVersionRepository::find_by_id(&state.db, artifact_version)
         .await
         .map_err(map_repository_error)?
@@ -2027,23 +2541,252 @@ async fn authorize_log_version(
     Ok(version)
 }
 
-pub(crate) async fn publish_file(
+pub(crate) async fn publish_file_authorized(
     state: &AppState,
+    user: &AuthenticatedUser,
     version: &attune_common::models::artifact_version::ArtifactVersion,
     path: &std::path::Path,
 ) -> Result<(), (StatusCode, String)> {
-    let (size, digest) = hash_file(path).await.map_err(map_blob_error)?;
+    let mut limit = state.config.artifacts.max_upload_size;
+    if crate::recorded_consumers::is_recorded(user).map_err(map_api_error)?
+        || attune_common::worker_delivery::credential(&user.claims)
+            .map_err(map_transport_error)?
+            .is_some()
+    {
+        let mut connection = state.db.acquire().await.map_err(map_sqlx_error)?;
+        let permit =
+            attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_version(
+                &mut connection,
+                version.id,
+            )
+            .await
+            .map_err(map_transport_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "File delivery cap unavailable".into(),
+                )
+            })?;
+        limit = limit.min(permit.max_bytes as u64);
+    }
+    let mut reader = tokio::fs::File::open(path).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            "Artifact staging file unavailable".into(),
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await.map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Artifact staging read failed".into(),
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .filter(|size| *size <= limit)
+            .ok_or_else(|| {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Artifact exceeds its delivery byte cap".into(),
+                )
+            })?;
+        digest.update(&buffer[..count]);
+    }
+    let digest: [u8; 32] = digest.finalize().into();
+    drop(reader);
     let body = body_from_file(path).await.map_err(map_blob_error)?;
-    publish_stream(state, version, body, size, digest).await
+    publish_stream(state, user, version, body, size, digest).await
 }
 
 async fn publish_stream(
     state: &AppState,
+    user: &AuthenticatedUser,
     version: &attune_common::models::artifact_version::ArtifactVersion,
     body: BlobBody,
     size: u64,
     digest: [u8; 32],
 ) -> Result<(), (StatusCode, String)> {
+    let protected = {
+        let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
+        attune_common::repositories::file_origin::FileOriginRepository::find(&mut conn, version.id)
+            .await
+            .map_err(map_transport_error)?
+            .is_some()
+    };
+    let lease = state
+        .file_transfers
+        .upload(protected.then_some(size))
+        .map_err(|message| (StatusCode::TOO_MANY_REQUESTS, message))?;
+    let owned = state.clone();
+    let user = user.clone();
+    let version = version.clone();
+    state
+        .file_transfers
+        .spawn(lease, async move {
+            publish_stream_owned(&owned, &user, &version, body, size, digest).await
+        })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Owned file publication failed; native settlement may remain pending".into(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "API shutdown canceled owned publication; native operation is NOT declared settled"
+                    .into(),
+            )
+        })?
+}
+
+async fn publish_stream_owned(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+    body: BlobBody,
+    size: u64,
+    digest: [u8; 32],
+) -> Result<(), (StatusCode, String)> {
+    use attune_common::repositories::file_origin::FileOriginRepository;
+    use attune_common::runtime_file_body;
+    use futures::TryStreamExt;
+    let mut preparation = state.db.begin().await.map_err(map_sqlx_error)?;
+    let effect = authorize_version_mutation(state, &mut preparation, user, version).await?;
+    let source = FileOriginRepository::find(&mut preparation, version.id)
+        .await
+        .map_err(map_transport_error)?;
+    let delivery_size = size;
+    let (body, size, digest, file_proof) = if let Some(source) = source {
+        // Encrypt one bounded byte snapshot, not a second opening of staging.
+        let permit =
+            attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_version(
+                &mut preparation,
+                version.id,
+            )
+            .await
+            .map_err(map_transport_error)?
+            .ok_or_else(|| (StatusCode::FORBIDDEN, "File byte cap unavailable".into()))?;
+        let cap = state
+            .config
+            .artifacts
+            .max_upload_size
+            .min(permit.max_bytes as u64);
+        if size > cap {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "File byte cap exceeded".into(),
+            ));
+        }
+        let mut plaintext = Vec::new();
+        let mut incoming = body;
+        while let Some(chunk) = incoming.try_next().await.map_err(map_blob_error)? {
+            if (plaintext.len() as u64)
+                .checked_add(chunk.len() as u64)
+                .is_none_or(|n| n > cap)
+            {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "File byte cap exceeded".into(),
+                ));
+            }
+            plaintext.extend_from_slice(&chunk);
+        }
+        if plaintext.len() as u64 != size
+            || runtime_file_body::sha256(&plaintext) != hex_digest(&digest)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "File staging changed during upload".into(),
+            ));
+        }
+        let current =
+            ArtifactVersionRepository::find_by_id_for_update(&mut preparation, version.id)
+                .await
+                .map_err(map_repository_error)?
+                .ok_or_else(|| (StatusCode::FORBIDDEN, "File version unavailable".into()))?;
+        if current.body_state == Some(ArtifactBodyState::Ready) {
+            let proof = FileOriginRepository::body(&state.db, version.id)
+                .await
+                .map_err(map_transport_error)?
+                .ok_or_else(|| (StatusCode::FORBIDDEN, "Ready file proof unavailable".into()))?;
+            if proof.plaintext_bytes != size as i64 || proof.plaintext_sha256 != hex_digest(&digest)
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Ready file contains different bytes".into(),
+                ));
+            }
+            effect
+                .ensure_fresh_on(&mut preparation)
+                .await
+                .map_err(map_api_error)?;
+            effect.commit(preparation).await.map_err(map_api_error)?;
+            return Ok(());
+        }
+        let (ciphertext, manifest, authenticated) =
+            match FileOriginRepository::pending_body(&mut preparation, version.id)
+                .await
+                .map_err(map_transport_error)?
+            {
+                Some((proof, ciphertext)) => {
+                    if proof.plaintext_bytes != size as i64
+                        || proof.plaintext_sha256 != hex_digest(&digest)
+                    {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            "File upload is reserved for different bytes".into(),
+                        ));
+                    }
+                    (ciphertext, proof.manifest(), proof.authenticated_manifest)
+                }
+                None => {
+                    let sealed = runtime_file_body::seal(
+                        &plaintext,
+                        version.id,
+                        source.origin_read,
+                        state
+                            .config
+                            .security
+                            .encryption_key
+                            .as_deref()
+                            .ok_or_else(|| {
+                                (
+                                    StatusCode::FORBIDDEN,
+                                    "File encryption key unavailable".into(),
+                                )
+                            })?,
+                    )
+                    .map_err(map_transport_error)?;
+                    FileOriginRepository::stage(&mut preparation, &sealed.1, &sealed.2, &sealed.0)
+                        .await
+                        .map_err(map_transport_error)?;
+                    sealed
+                }
+            };
+        let digest = decode_hex_digest(&manifest.ciphertext_sha256)?;
+        (
+            body_from_bytes(ciphertext.into()),
+            manifest.ciphertext_bytes,
+            digest,
+            Some((manifest, authenticated)),
+        )
+    } else {
+        (body, size, digest, None)
+    };
+    effect
+        .ensure_fresh_on(&mut preparation)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(preparation).await.map_err(map_api_error)?;
     let key = ObjectKey::new(version.object_key.clone().ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2051,39 +2794,93 @@ async fn publish_stream(
         )
     })?)
     .map_err(map_blob_error)?;
-    reserve_proxy_artifact_upload(state, version, size, digest, key.as_str()).await?;
-    let stored = match state.blob_store.put(&key, body, digest).await {
-        Ok(stored) => stored,
-        Err(BlobStoreError::Conflict) => {
-            let stored = state
-                .blob_store
-                .head(&key)
-                .await
-                .map_err(map_blob_error)?
-                .ok_or_else(|| {
-                    (
-                        StatusCode::CONFLICT,
-                        "Artifact object write conflicted".to_string(),
-                    )
-                })?;
+    let retention_put = reserve_proxy_artifact_upload(
+        state,
+        user,
+        version,
+        size,
+        digest,
+        key.as_str(),
+        delivery_size,
+    )
+    .await?;
+    // The outer instance tracker owns preparation, native I/O and publication.
+    let blob_store = state.blob_store.clone();
+    let put_pool = state.db.clone();
+    let put_key = key.clone();
+    let result = async {
+        let result = async {
+            let outcome = if retention_put.is_some() {
+                blob_store
+                    .put_file_atomic(&put_key, body, size, digest)
+                    .await
+            } else {
+                blob_store.put(&put_key, body, digest).await
+            };
+            let stored = match outcome {
+                Ok(stored) => stored,
+                Err(BlobStoreError::Conflict) => {
+                    let stored = blob_store
+                        .head(&put_key)
+                        .await
+                        .map_err(map_blob_error)?
+                        .ok_or_else(|| {
+                            (
+                                StatusCode::CONFLICT,
+                                "Artifact object write conflicted".to_string(),
+                            )
+                        })?;
+                    if !stored_object_matches(&stored, size, digest) {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            "Artifact object key already contains different bytes".to_string(),
+                        ));
+                    }
+                    stored
+                }
+                Err(error) => return Err(map_blob_error(error)),
+            };
             if !stored_object_matches(&stored, size, digest) {
                 return Err((
-                    StatusCode::CONFLICT,
-                    "Artifact object key already contains different bytes".to_string(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Artifact object verification failed".to_string(),
                 ));
             }
-            stored
+            Ok::<_, (StatusCode, String)>(stored)
         }
-        Err(error) => return Err(map_blob_error(error)),
-    };
-    if !stored_object_matches(&stored, size, digest) {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Artifact object verification failed".to_string(),
-        ));
-    }
+        .await;
+        attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::finish_put(&put_pool,retention_put,result.as_ref().ok()).await.map_err(map_transport_error)?;
+        result
+    }.await;
+    let stored = result?;
     let digest_hex = hex_digest(&digest);
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let effect = authorize_version_mutation(state, &mut transaction, user, version).await?;
+    if LogStreamRepository::find_by_artifact_version_with_conn(&mut transaction, version.id)
+        .await
+        .map_err(map_repository_error)?
+        .is_some()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Runtime logs require segment/seal operations".into(),
+        ));
+    }
+    check_delivery_bounds(
+        &mut transaction,
+        user,
+        version.id,
+        None,
+        DeliveryOperation::Complete {
+            bytes: i64::try_from(delivery_size).map_err(|_| {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Artifact size overflow".into(),
+                )
+            })?,
+        },
+    )
+    .await?;
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, version.id)
             .await
@@ -2112,7 +2909,11 @@ async fn publish_stream(
                 "Artifact body state changed during upload".to_string(),
             ));
         }
-        transaction.commit().await.map_err(map_sqlx_error)?;
+        effect
+            .ensure_fresh_on(&mut transaction)
+            .await
+            .map_err(map_api_error)?;
+        effect.commit(transaction).await.map_err(map_api_error)?;
         return Ok(());
     }
     if locked_version.body_state != Some(ArtifactBodyState::Pending)
@@ -2149,6 +2950,11 @@ async fn publish_stream(
     )
     .await
     .map_err(map_repository_error)?;
+    if let Some((manifest, authenticated)) = &file_proof {
+        FileOriginRepository::complete(&mut transaction, manifest, authenticated)
+            .await
+            .map_err(map_transport_error)?;
+    }
     ArtifactVersionRepository::mark_body_ready_in_transaction(
         &mut transaction,
         version.id,
@@ -2179,17 +2985,28 @@ async fn publish_stream(
             ));
         }
     }
-    transaction.commit().await.map_err(map_sqlx_error)?;
+    if file_proof.is_some() {
+        FileOriginRepository::finish(&mut transaction, version.id)
+            .await
+            .map_err(map_transport_error)?;
+    }
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
     Ok(())
 }
 
 async fn reserve_proxy_artifact_upload(
     state: &AppState,
+    user: &AuthenticatedUser,
     version: &attune_common::models::artifact_version::ArtifactVersion,
     size: u64,
     digest: [u8; 32],
     object_key: &str,
-) -> Result<(), (StatusCode, String)> {
+    delivery_size: u64,
+) -> Result<Option<uuid::Uuid>, (StatusCode, String)> {
     let size = i64::try_from(size).map_err(|_| {
         (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -2207,6 +3024,35 @@ async fn reserve_proxy_artifact_upload(
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let settle_until = expires_at + DIRECT_UPLOAD_SETTLEMENT_GRACE;
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    // PUT admission must enter the graph before authority, artifact/version or
+    // grant locks, not acquire the gate late inside begin_put after targets.
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(
+        &mut transaction,
+    )
+    .await
+    .map_err(map_transport_error)?;
+    let effect = authorize_version_mutation(state, &mut transaction, user, version).await?;
+    if LogStreamRepository::find_by_artifact_version_with_conn(&mut transaction, version.id)
+        .await
+        .map_err(map_repository_error)?
+        .is_some()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Runtime logs require segment/seal operations".into(),
+        ));
+    }
+    check_delivery_bounds(
+        &mut transaction,
+        user,
+        version.id,
+        None,
+        DeliveryOperation::Complete {
+            bytes: i64::try_from(delivery_size)
+                .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "File size overflow".into()))?,
+        },
+    )
+    .await?;
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, version.id)
             .await
@@ -2217,6 +3063,19 @@ async fn reserve_proxy_artifact_upload(
                     "Artifact version disappeared".to_string(),
                 )
             })?;
+    if locked_version.body_state == Some(ArtifactBodyState::Ready)
+        && locked_version.object_key.as_deref() == Some(object_key)
+        && locked_version.size_bytes == Some(size)
+        && locked_version.sha256.as_deref() == Some(sha256.as_str())
+    {
+        effect
+            .ensure_fresh_on(&mut transaction)
+            .await
+            .map_err(map_api_error)?;
+        let retention_put=attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::begin_put(&mut transaction,version.id).await.map_err(map_transport_error)?;
+        effect.commit(transaction).await.map_err(map_api_error)?;
+        return Ok(retention_put);
+    }
     if locked_version.body_state != Some(ArtifactBodyState::Pending)
         || locked_version.object_key.as_deref() != Some(object_key)
     {
@@ -2280,7 +3139,13 @@ async fn reserve_proxy_artifact_upload(
     ObjectMaintenanceRepository::reserve_upload(&mut *transaction, object_key, "artifact")
         .await
         .map_err(map_repository_error)?;
-    transaction.commit().await.map_err(map_sqlx_error)
+    let retention_put=attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::begin_put(&mut transaction,version.id).await.map_err(map_transport_error)?;
+    effect
+        .ensure_fresh_on(&mut transaction)
+        .await
+        .map_err(map_api_error)?;
+    effect.commit(transaction).await.map_err(map_api_error)?;
+    Ok(retention_put)
 }
 
 pub(crate) async fn stream_object_body(
@@ -2585,7 +3450,45 @@ pub(crate) async fn check_file(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
+    ValidatedRelativePath::new(&file_path).map_err(|error| map_transport_error(error).0)?;
+    if let Some(version) =
+        ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        if let Some(response) = crate::routes::artifacts::protected_file_response(
+            &state,
+            &user,
+            &version,
+            &HeaderMap::new(),
+        )
+        .await
+        .map_err(|_| StatusCode::FORBIDDEN)?
+        {
+            use futures::TryStreamExt;
+            let (mut parts, body) = response.into_parts();
+            let proof = attune_common::repositories::file_origin::FileOriginRepository::body(
+                &state.db, version.id,
+            )
+            .await
+            .map_err(|_| StatusCode::FORBIDDEN)?
+            .ok_or(StatusCode::FORBIDDEN)?;
+            parts.headers.insert(
+                header::CONTENT_LENGTH,
+                proof
+                    .plaintext_bytes
+                    .to_string()
+                    .parse()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+            // HEAD must run the post-blob authority check even though Hyper
+            // will never poll a response body. Never report ciphertext length.
+            let mut body = body.into_data_stream();
+            let _ = body.try_next().await.map_err(|_| StatusCode::FORBIDDEN)?;
+            return Ok(axum::response::Response::from_parts(parts, Body::empty()));
+        }
+    }
     authorize_file_transfer(&state, &user, &file_path, FileOperation::Read)
         .await
         .map_err(|(status, _)| status)?;
@@ -2610,7 +3513,7 @@ pub(crate) async fn check_file(
                 stream.total_bytes.to_string().parse().unwrap(),
             );
             headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
-            return Ok((StatusCode::OK, headers));
+            return Ok((StatusCode::OK, headers).into_response());
         }
         if version.body_state == Some(ArtifactBodyState::Ready) {
             let mut headers = HeaderMap::new();
@@ -2622,7 +3525,7 @@ pub(crate) async fn check_file(
                 header::CONTENT_TYPE,
                 mime_from_extension(&file_path).parse().unwrap(),
             );
-            return Ok((StatusCode::OK, headers));
+            return Ok((StatusCode::OK, headers).into_response());
         }
     }
 
@@ -2635,7 +3538,7 @@ pub(crate) async fn check_file(
             headers.insert("Content-Length", size.to_string().parse().unwrap());
             let content_type = mime_from_extension(&file_path);
             headers.insert("Content-Type", content_type.parse().unwrap());
-            Ok((StatusCode::OK, headers))
+            Ok((StatusCode::OK, headers).into_response())
         }
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(error) => Err(map_transport_error(error).0),
@@ -2697,38 +3600,56 @@ fn mime_from_extension(path: &str) -> &'static str {
 ///
 /// These are mounted under `/api/v1/internal/files/` in the main router.
 pub fn routes() -> Router<Arc<AppState>> {
+    let delivery = axum::Extension(crate::recorded_files::WorkerDeliveryConsumer);
+    let recorded =
+        axum::Extension(crate::auth::middleware::RecordedRuntimeConsumer::ArtifactDataMutation);
+    let recorded_read =
+        axum::Extension(crate::auth::middleware::RecordedRuntimeConsumer::ArtifactVersionRead);
     Router::new()
-        .route("/internal/files/{*file_path}", get(download_file))
-        .route("/internal/files/{*file_path}", put(upload_file))
-        .route("/internal/files/{*file_path}", head(check_file))
+        .route(
+            "/internal/files/{*file_path}",
+            get(download_file).layer(recorded_read),
+        )
+        .route(
+            "/internal/files/{*file_path}",
+            put(upload_file)
+                .layer::<_, std::convert::Infallible>(delivery)
+                .layer(recorded),
+        )
+        .route(
+            "/internal/files/{*file_path}",
+            head(check_file).layer(recorded_read),
+        )
         .route("/internal/files/{*file_path}", delete(delete_file_handler))
         .route(
             "/internal/artifacts/complete/{*file_path}",
-            post(complete_file),
+            post(complete_file)
+                .layer::<_, std::convert::Infallible>(delivery)
+                .layer(recorded),
         )
         .route(
             "/internal/artifacts/direct-upload/{*file_path}",
-            post(authorize_direct_artifact_upload),
+            post(authorize_direct_artifact_upload).layer(delivery),
         )
         .route(
             "/internal/artifact-upload-grants/{grant_token}/complete",
-            post(complete_direct_artifact_upload),
+            post(complete_direct_artifact_upload).layer(delivery),
         )
         .route(
             "/internal/logs/{artifact_version}/segments/{sequence}",
-            put(commit_log_segment),
+            put(commit_log_segment).layer(delivery),
         )
         .route(
             "/internal/logs/{artifact_version}/segments/{sequence}/direct-upload",
-            post(authorize_direct_log_segment_upload),
+            post(authorize_direct_log_segment_upload).layer(delivery),
         )
         .route(
             "/internal/log-upload-grants/{grant_token}/complete",
-            post(complete_direct_log_segment_upload),
+            post(complete_direct_log_segment_upload).layer(delivery),
         )
         .route(
             "/internal/logs/{artifact_version}/seal",
-            post(seal_log_stream),
+            post(seal_log_stream).layer(delivery),
         )
         .route(
             "/internal/packs/{pack_ref}/archive",
@@ -2780,8 +3701,8 @@ pub(crate) async fn delete_file_handler(
         ("pack_ref" = String, Path, description = "Pack reference identifier")
     ),
     responses(
-        (status = 200, description = "Pack archive", content_type = "application/gzip"),
-        (status = 206, description = "Requested pack archive byte range", content_type = "application/gzip"),
+        (status = 200, description = "Pack archive", body = inline(PackArchiveBody), content_type = "application/gzip"),
+        (status = 206, description = "Requested pack archive byte range", body = inline(PackArchiveBody), content_type = "application/gzip"),
         (status = 416, description = "Requested range is not satisfiable"),
         (status = 400, description = "Invalid pack reference"),
         (status = 401, description = "Unauthorized"),
@@ -2945,7 +3866,7 @@ fn map_pack_blob_error(error: BlobStoreError) -> (StatusCode, String) {
         ("x-attune-pack-candidate-token" = String, Header, description = "Attempt-scoped candidate access token")
     ),
     responses(
-        (status = 200, description = "Candidate pack archive", content_type = "application/gzip"),
+        (status = 200, description = "Candidate pack archive", body = inline(PackArchiveBody), content_type = "application/gzip"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Candidate not found")
     ),
@@ -3357,9 +4278,113 @@ async fn authorize_file_transfer(
     operation: FileOperation,
 ) -> Result<(), (StatusCode, String)> {
     ValidatedRelativePath::new(file_path).map_err(map_transport_error)?;
+    {
+        let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
+        let version = ArtifactVersionRepository::find_unique_by_file_path(&mut *conn, file_path)
+            .await
+            .map_err(map_repository_error)?;
+        let guarded = attune_common::repositories::file_origin::FileOriginRepository::guarded_path(
+            &mut conn, file_path,
+        )
+        .await
+        .map_err(map_transport_error)?;
+        if (file_path.starts_with("files/versions/") && version.is_none())
+            || (guarded
+                && match version.as_ref() {
+                    Some(version) => {
+                        attune_common::repositories::file_origin::FileOriginRepository::find(
+                            &mut conn, version.id,
+                        )
+                        .await
+                        .map_err(map_transport_error)?
+                        .is_none()
+                    }
+                    None => true,
+                })
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Version staging has no live source binding".into(),
+            ));
+        }
+    }
+
+    if operation == FileOperation::Mutate
+        && !crate::recorded_consumers::is_recorded(user).map_err(map_api_error)?
+        && attune_common::worker_delivery::credential(&user.claims)
+            .map_err(map_transport_error)?
+            .is_none()
+    {
+        let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
+        if let Some(version) =
+            ArtifactVersionRepository::find_unique_by_file_path(&mut *conn, file_path)
+                .await
+                .map_err(map_repository_error)?
+        {
+            if attune_common::repositories::file_origin::FileOriginRepository::find(
+                &mut conn, version.id,
+            )
+            .await
+            .map_err(map_transport_error)?
+            .is_some()
+            {
+                return Err((StatusCode::FORBIDDEN,"Origin-bound staging requires its admitted process or exact worker delivery permit".into()));
+            }
+        }
+    }
+
+    if crate::recorded_consumers::is_recorded(user).map_err(map_api_error)? {
+        if operation != FileOperation::Mutate {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Recorded file reads require retained read provenance".into(),
+            ));
+        }
+        let mut tx = state.db.begin().await.map_err(map_sqlx_error)?;
+        let version = ArtifactVersionRepository::find_unique_by_file_path(&mut *tx, file_path)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| (StatusCode::FORBIDDEN, "Artifact version unavailable".into()))?;
+        if version.execution != user.execution_id() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "File version belongs to another execution".into(),
+            ));
+        }
+        let effect = authorize_version_mutation(state, &mut tx, user, &version).await?;
+        effect
+            .ensure_fresh_on(&mut tx)
+            .await
+            .map_err(map_api_error)?;
+        return Ok(());
+    }
 
     let allowed = match file_authorization_scope(user, operation)? {
-        FileAuthorizationScope::Worker => true,
+        FileAuthorizationScope::Worker => {
+            if operation == FileOperation::Mutate {
+                let mut tx = state.db.begin().await.map_err(map_sqlx_error)?;
+                if let Some(version) =
+                    ArtifactVersionRepository::find_unique_by_file_path(&mut *tx, file_path)
+                        .await
+                        .map_err(map_repository_error)?
+                {
+                    let effect = authorize_version_mutation(state, &mut tx, user, &version).await?;
+                    effect
+                        .ensure_fresh_on(&mut tx)
+                        .await
+                        .map_err(map_api_error)?;
+                } else if attune_common::worker_delivery::credential(&user.claims)
+                    .map_err(map_transport_error)?
+                    .is_some()
+                {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "Worker delivery version unavailable".into(),
+                    ));
+                }
+            }
+            true
+        }
         FileAuthorizationScope::ExecutionMutation(execution_id) => {
             ArtifactVersionRepository::file_path_owned_by_execution(
                 &state.db,
@@ -3410,6 +4435,177 @@ fn map_transport_error(error: attune_common::error::Error) -> (StatusCode, Strin
         }
         other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
+}
+
+fn map_api_error(error: crate::middleware::ApiError) -> (StatusCode, String) {
+    (StatusCode::FORBIDDEN, error.to_string())
+}
+
+async fn authorize_version_mutation(
+    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &AuthenticatedUser,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+) -> Result<crate::recorded_files::FileMutationProof, (StatusCode, String)> {
+    if crate::recorded_consumers::is_recorded(user).map_err(map_api_error)?
+        && version.execution != user.execution_id()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Recorded file version execution mismatch".into(),
+        ));
+    }
+    let process = user
+        .validate_recorded_runtime_authority(tx)
+        .await
+        .map_err(map_transport_error)?;
+    let process_delivery = if let Some(authority) = &process {
+        let context =
+            attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_execution(
+                tx,
+                authority.credential_binding().execution_id,
+            )
+            .await
+            .map_err(map_transport_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "File delivery context unavailable".into(),
+                )
+            })?;
+        Some(
+            attune_common::repositories::worker_delivery::WorkerDeliveryRepository::process_effect(
+                authority, &context,
+            )
+            .map_err(map_transport_error)?,
+        )
+    } else {
+        None
+    };
+    let mut worker = None;
+    if let Some(credential) =
+        attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
+    {
+        if credential.version != version.id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Worker delivery version mismatch".into(),
+            ));
+        }
+        worker = Some(
+            attune_common::repositories::worker_delivery::WorkerDeliveryRepository::require(
+                tx,
+                credential.permit,
+                credential.worker,
+                credential.instance,
+                version.id,
+            )
+            .await
+            .map_err(map_transport_error)?,
+        );
+    } else if user.claims.token_type == TokenType::Worker {
+        if let Some(execution) = version.execution {
+            if attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(tx, execution)
+                .await.map_err(map_transport_error)?.is_some() {
+                return Err((StatusCode::FORBIDDEN, "Recorded file delivery requires a purpose-specific worker permit".into()));
+            }
+        }
+    }
+    let file_origin_budget = if process.is_some() || worker.is_some() {
+        crate::file_origins::prepare_existing(
+            tx,
+            process.as_ref(),
+            version.id,
+            state.config.security.encryption_key.as_deref(),
+        )
+        .await
+        .map_err(map_api_error)?
+    } else {
+        None
+    };
+    let proof = crate::recorded_files::FileMutationProof {
+        credential_deadline: user.claims.exp,
+        process,
+        process_delivery,
+        worker,
+        file_origin_budget,
+    };
+    crate::recorded_files::authorize_publication(
+        tx,
+        proof.process.as_ref(),
+        version.id,
+        version.artifact,
+    )
+    .await
+    .map_err(map_api_error)?;
+    // Even legacy writers acquire the advisory lock before version/stream rows.
+    attune_common::repositories::artifact::ArtifactRepository::find_by_id_for_update(
+        tx,
+        version.artifact,
+    )
+    .await
+    .map_err(map_repository_error)?
+    .ok_or_else(|| (StatusCode::FORBIDDEN, "Artifact unavailable".into()))?;
+    if let Some(credential) =
+        attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
+    {
+        attune_common::repositories::worker_delivery::WorkerDeliveryRepository::require_owner_binding(
+            tx, credential.permit, version.id).await.map_err(map_transport_error)?;
+    }
+    crate::file_origins::require(tx, &proof, version.id)
+        .await
+        .map_err(map_api_error)?;
+    proof.ensure_fresh_on(tx).await.map_err(map_api_error)?;
+    Ok(proof)
+}
+
+async fn check_delivery_bounds(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &AuthenticatedUser,
+    version: i64,
+    stream: Option<i64>,
+    operation: attune_common::repositories::worker_delivery::DeliveryOperation,
+) -> Result<(), (StatusCode, String)> {
+    let Some(credential) =
+        attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
+    else {
+        return Ok(());
+    };
+    let permit =
+        attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_version(
+            tx, version,
+        )
+        .await
+        .map_err(map_transport_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Worker delivery permit unavailable".into(),
+            )
+        })?;
+    if credential.permit != permit.id || !permit.allows(stream, operation) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Worker delivery exceeds operation or byte/sequence bounds".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn delivery_append_end(
+    stream: &LogStream,
+    sequence: i64,
+    bytes: i64,
+) -> Result<i64, (StatusCode, String)> {
+    // Duplicate sequence admission still checks the digest/size at commit. A
+    // retry consumes no additional budget, including a retry at the byte cap.
+    if sequence < stream.next_sequence {
+        return Ok(stream.total_bytes);
+    }
+    stream
+        .total_bytes
+        .checked_add(bytes)
+        .ok_or_else(|| (StatusCode::FORBIDDEN, "Log size overflow".into()))
 }
 
 fn map_repository_error(error: attune_common::error::Error) -> (StatusCode, String) {
@@ -3593,6 +4789,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ready_log_bodies_allow_only_identical_retries_on_sealed_streams() {
+        assert!(check_log_segment_body_state(
+            Some(ArtifactBodyState::Ready),
+            true,
+            LogSegmentCommitDecision::Retry
+        )
+        .is_ok());
+        for (state, sealed, decision) in [
+            (
+                Some(ArtifactBodyState::Ready),
+                false,
+                LogSegmentCommitDecision::Retry,
+            ),
+            (
+                Some(ArtifactBodyState::Ready),
+                true,
+                LogSegmentCommitDecision::Commit,
+            ),
+            (None, true, LogSegmentCommitDecision::Retry),
+        ] {
+            assert_eq!(
+                check_log_segment_body_state(state, sealed, decision)
+                    .unwrap_err()
+                    .0,
+                StatusCode::CONFLICT
+            );
+        }
+    }
+
     #[tokio::test]
     async fn resolved_shared_file_snapshot_drives_range_read_without_another_lookup() {
         let directory = tempfile::tempdir().unwrap();
@@ -3748,12 +4974,14 @@ mod tests {
                     RequireAuth(worker.clone()),
                     Path(version.id),
                     Query(SealLogQuery { truncated: false }),
+                    HeaderMap::new(),
                 ),
                 seal_log_stream(
                     State(state.clone()),
                     RequireAuth(worker.clone()),
                     Path(version.id),
                     Query(SealLogQuery { truncated: false }),
+                    HeaderMap::new(),
                 )
             )
         })
@@ -3779,6 +5007,15 @@ mod tests {
         .into_response();
         assert_eq!(retry.status(), StatusCode::OK);
 
+        let conflicting_retry = commit_log_segment(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path((version.id, 0)),
+            Body::from("other bytes"),
+        )
+        .await;
+        assert_status_error(conflicting_retry, StatusCode::CONFLICT);
+
         let after_seal = commit_log_segment(
             State(state.clone()),
             RequireAuth(worker.clone()),
@@ -3793,6 +5030,7 @@ mod tests {
             RequireAuth(worker),
             Path(version.id),
             Query(SealLogQuery { truncated: true }),
+            HeaderMap::new(),
         )
         .await;
         assert_status_error(conflicting_seal, StatusCode::CONFLICT);
@@ -4111,10 +5349,12 @@ mod tests {
         let key = ObjectKey::new(version.object_key.clone().unwrap()).unwrap();
         let conflicting_proxy = reserve_proxy_artifact_upload(
             &state,
+            &worker,
             &version,
             content.len() as u64,
             sha256(b"different artifact body"),
             key.as_str(),
+            content.len() as u64,
         )
         .await
         .unwrap_err();
@@ -4379,6 +5619,7 @@ mod tests {
             RequireAuth(user(TokenType::Worker, None)),
             Path(version.id),
             Query(SealLogQuery { truncated: true }),
+            HeaderMap::new(),
         )
         .await
         .expect("seal")

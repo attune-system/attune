@@ -1,7 +1,8 @@
 import { useParams, Link } from "react-router-dom";
 import { useEvent } from "@/hooks/useEvents";
-import { useTrigger } from "@/hooks/useTriggers";
-import { CuratedDataCard } from "@/components/common/CuratedDataPanel";
+import ContractDataCard from "@/components/common/ContractDataCard";
+import { isJsonObject } from "@/components/common/curatedDataUtils";
+import EventExecutionEmitterCard from "./EventExecutionEmitterCard";
 
 export default function EventDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -9,10 +10,10 @@ export default function EventDetailPage() {
 
   const { data: eventData, isLoading, error } = useEvent(eventId);
   const event = eventData?.data;
-  const eventTraceTag = (
-    event as (typeof event & { trace_tag?: string | null }) | undefined
-  )?.trace_tag;
-  const { data: triggerData } = useTrigger(event?.trigger_ref || "");
+  const eventTraceTag = event?.trace_tag;
+  const binding: unknown = event?.schema_binding;
+  const payloadContract = isJsonObject(binding) ? binding.payload : undefined;
+  const configContract = isJsonObject(binding) ? binding.config : undefined;
 
   const formatDate = (dateString: string) => {
     return new Date(dateString).toLocaleString();
@@ -146,17 +147,25 @@ export default function EventDetailPage() {
             </div>
           </div>
 
-          <CuratedDataCard
+          <ContractDataCard
             title="Event Payload"
-            description="Payload fields emitted by the trigger, annotated with the trigger output schema when available."
-            schema={triggerData?.data?.out_schema}
+            contract={payloadContract}
             values={event.payload}
             emptyMessage="No payload data"
           />
+          {event.config != null && (
+            <ContractDataCard
+              title="Event configuration"
+              contract={configContract}
+              values={event.config}
+              emptyMessage="No configuration data"
+            />
+          )}
         </div>
 
         {/* Right Column - Quick Links and Info */}
         <div className="space-y-6">
+          <EventExecutionEmitterCard emitter={event.execution_emitter} />
           {/* Quick Links */}
           <div className="bg-white rounded-lg shadow">
             <div className="px-6 py-4 border-b border-gray-200">

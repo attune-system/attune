@@ -11,15 +11,19 @@ export type UpdatePackRequest = {
   /**
    * Configuration schema
    */
-  conf_schema: any | null;
+  conf_schema?: Record<string, any> | null;
   /**
-   * Pack configuration values
+   * Persistent overrides, replacing each supplied top-level field completely.
    */
-  config: any | null;
+  config?: Record<string, any> | null;
+  /**
+   * Remove these top-level overrides and use current release defaults. Null is not reset.
+   */
+  config_reset_fields?: Array<string>;
   /**
    * Pack dependencies (refs of required packs)
    */
-  dependencies?: any[] | null;
+  dependencies?: Array<string> | null;
   description?: null | PackDescriptionPatch;
   /**
    * Whether this is a standard pack
@@ -32,15 +36,20 @@ export type UpdatePackRequest = {
   /**
    * Pack metadata
    */
-  meta: any | null;
+  meta?: Record<string, any> | null;
+  /**
+   * Changing this declaration additionally requires target pack Install authority.
+   * Omit to preserve; [] clears. Null is not accepted.
+   */
+  owner_roles?: Array<string>;
   /**
    * Runtime dependencies (e.g., shell, python, nodejs)
    */
-  runtime_deps?: any[] | null;
+  runtime_deps?: Array<string> | null;
   /**
    * Tags for categorization
    */
-  tags?: any[] | null;
+  tags?: Array<string> | null;
   /**
    * Pack version
    */

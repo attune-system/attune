@@ -1,4 +1,4 @@
-import { useParams, Link } from "react-router-dom";
+import { useParams, useLocation, Link } from "react-router-dom";
 import {
   useExecution,
   useCancelExecution,
@@ -14,7 +14,6 @@ import { formatJsonValue } from "@/lib/format-utils";
 import { formatDistanceToNow } from "date-fns";
 import { ExecutionStatus } from "@/api";
 import type {
-  ActionResponse,
   EnforcementResponse,
   EventResponse,
   ExecutionResponse,
@@ -28,14 +27,9 @@ import {
   XCircle,
   RefreshCw,
 } from "lucide-react";
-import {
-  JsonValueDisplay,
-  SchemaValueRows,
-} from "@/components/common/CuratedDataPanel";
-import {
-  hasSchemaFields,
-  isJsonObject,
-} from "@/components/common/curatedDataUtils";
+import { JsonValueDisplay } from "@/components/common/CuratedDataPanel";
+import { ContractValueRows } from "@/components/common/ContractDataCard";
+import { isJsonObject } from "@/components/common/curatedDataUtils";
 import ExecuteActionModal from "@/components/common/ExecuteActionModal";
 import EntityHistoryPanel from "@/components/common/EntityHistoryPanel";
 import ExecutionArtifactsPanel from "@/components/executions/ExecutionArtifactsPanel";
@@ -161,6 +155,10 @@ interface TimelineEntry {
 }
 
 export default function ExecutionDetailPage() {
+  const navigationState: unknown = useLocation().state;
+  const previewMismatch =
+    isJsonObject(navigationState) &&
+    navigationState.schemaPreviewMismatch === true;
   const { id } = useParams<{ id: string }>();
   const { data: executionData, isLoading, error } = useExecution(Number(id));
   const execution = executionData?.data as ExecutionResponse | undefined;
@@ -278,6 +276,15 @@ export default function ExecutionDetailPage() {
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
+      {previewMismatch && (
+        <p
+          role="status"
+          className="mb-4 rounded border border-amber-300 bg-amber-50 p-3 text-sm"
+        >
+          The server accepted a different schema contract from the form preview.
+          This execution uses the stored contract shown below.
+        </p>
+      )}
       {/* Header */}
       <div className="mb-6">
         <Link
@@ -581,15 +588,15 @@ export default function ExecutionDetailPage() {
                     Parameters used for this execution, annotated with the
                     action parameter schema when available.
                   </p>
-                  <SchemaValueRows
-                    schema={
-                      (actionData?.data as ActionResponse | undefined)
-                        ?.param_schema
+                  <ContractValueRows
+                    contract={
+                      isJsonObject(execution.schema_binding)
+                        ? execution.schema_binding.input
+                        : undefined
                     }
                     values={execution.config}
                     emptyMessage="No configuration parameters were captured for this execution."
                     maskSecrets
-                    hideUnprovided
                   />
                 </div>
               )}
@@ -612,7 +619,11 @@ export default function ExecutionDetailPage() {
 
           <ExecutionResultCard
             result={execution.result}
-            action={actionData?.data as ActionResponse | undefined}
+            contract={
+              isJsonObject(execution.schema_binding)
+                ? execution.schema_binding.output
+                : undefined
+            }
             isWorkflow={isWorkflow}
           />
         </div>
@@ -951,11 +962,11 @@ function CompactJsonSection({
 
 function ExecutionResultCard({
   result,
-  action,
+  contract,
   isWorkflow,
 }: {
   result: unknown;
-  action?: ActionResponse;
+  contract?: unknown;
   isWorkflow: boolean;
 }) {
   if (!isJsonObject(result) || Object.keys(result).length === 0) {
@@ -1035,9 +1046,9 @@ function ExecutionResultCard({
           <h3 className="text-sm font-semibold text-gray-700 mb-2">
             Output Data
           </h3>
-          {isJsonObject(data) && hasSchemaFields(action?.out_schema) ? (
-            <SchemaValueRows
-              schema={action?.out_schema}
+          {contract !== undefined && contract !== null ? (
+            <ContractValueRows
+              contract={contract}
               values={data}
               emptyMessage="No structured output data was returned."
             />
@@ -1080,8 +1091,8 @@ function ExecutionResultCard({
           <h3 className="text-sm font-semibold text-gray-700 mb-2">
             Additional Result Fields
           </h3>
-          <SchemaValueRows
-            schema={null}
+          <ContractValueRows
+            contract={isWorkflow ? contract : undefined}
             values={Object.fromEntries(remainingEntries)}
             emptyMessage="No additional result fields."
           />

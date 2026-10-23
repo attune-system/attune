@@ -278,8 +278,7 @@ impl PackInstaller {
                 .map_err(|e| Error::internal(format!("Failed to execute git clone: {}", e)))?;
 
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(Error::internal(format!("Git clone failed: {}", stderr)));
+                return Err(Error::external_service("Git clone failed. Check repository access, network availability, and the requested source. Git stderr is omitted because it may contain credentials."));
             }
 
             // Checkout specific ref if provided
@@ -304,8 +303,7 @@ impl PackInstaller {
                         })?;
 
                 if !checkout_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&checkout_output.stderr);
-                    return Err(Error::internal(format!("Git checkout failed: {}", stderr)));
+                    return Err(Error::validation("Git checkout failed. Verify the requested branch, tag, or commit exists. Git stderr is omitted because it may contain credentials."));
                 }
             }
 

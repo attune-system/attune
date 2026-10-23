@@ -32,8 +32,8 @@ impl WorkflowTaskWaitRepository {
         };
         let query = format!(
             "INSERT INTO workflow_task_wait \
-                (workflow_execution, task_name, kind, inquiry, target_execution, work_queue_item, active_work_queue_item) \
-             VALUES ($1, $2, $3, $4, $5, $6, $6) \
+                 (workflow_execution, task_name, kind, inquiry, target_execution, work_queue_item, active_work_queue_item, active_inquiry) \
+              VALUES ($1, $2, $3, $4, $5, $6, $6, $4) \
              ON CONFLICT (workflow_execution, task_name) DO NOTHING \
              RETURNING {WORKFLOW_TASK_WAIT_SELECT_COLUMNS}"
         );
@@ -254,7 +254,7 @@ impl WorkflowTaskWaitRepository {
         }
         let query = format!(
             "UPDATE workflow_task_wait SET state = $2, result = $3, resolved_at = NOW(), \
-             active_work_queue_item = NULL, \
+             active_work_queue_item = NULL, active_inquiry = NULL, \
              released_at = CASE WHEN $2 = 'released' THEN NOW() ELSE NULL END \
              WHERE id = $1 AND state = $4 RETURNING {WORKFLOW_TASK_WAIT_SELECT_COLUMNS}"
         );
@@ -330,7 +330,7 @@ impl WorkflowTaskWaitRepository {
     {
         let query = format!(
             "UPDATE workflow_task_wait SET state = $2, result = $3, resolved_at = NOW(), \
-             active_work_queue_item = NULL \
+             active_work_queue_item = NULL, active_inquiry = NULL \
              WHERE workflow_execution = $1 AND state = $4 \
              RETURNING {WORKFLOW_TASK_WAIT_SELECT_COLUMNS}"
         );

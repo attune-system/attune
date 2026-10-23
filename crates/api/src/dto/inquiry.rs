@@ -48,6 +48,8 @@ pub struct InquiryResponse {
     /// Attune flat schema for expected response fields
     #[schema(value_type = Object, nullable = true)]
     pub response_schema: Option<JsonSchema>,
+    /// Original self-contained response contract. This contains no response values.
+    pub schema_binding: Option<JsonValue>,
 
     /// Fixed responses that provider controls may select.
     pub response_options: Vec<InquiryResponseOption>,
@@ -107,6 +109,7 @@ impl From<Inquiry> for InquiryResponse {
             purpose: inquiry.purpose,
             prompt: inquiry.prompt,
             response_schema: inquiry.response_schema,
+            schema_binding: None,
             response_options: inquiry.response_options,
             assigned_to: inquiry.assigned_to,
             assigned_to_login: None,
@@ -259,11 +262,44 @@ pub struct CreateInquiryResponse {
 }
 
 /// Request to respond to an inquiry (user-facing endpoint)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum InquiryRespondRequest {
+    Response(InquiryLiteralResponseRequest),
+    Option(InquiryOptionResponseRequest),
+}
+
+impl Validate for InquiryRespondRequest {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        match self {
+            Self::Response(request) => request.validate(),
+            Self::Option(request) => request.validate(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
-pub struct InquiryRespondRequest {
+#[serde(deny_unknown_fields)]
+pub struct InquiryLiteralResponseRequest {
     /// Response data conforming to the inquiry's response_schema
     #[schema(value_type = Object)]
     pub response: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InquiryOptionResponseRequest {
+    /// Select the stored option without exposing its protected response value.
+    #[validate(length(min = 1, max = 64))]
+    pub option_ref: String,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct InquiryDetailQuery {
+    /// Requires inquiry visibility, explicit decrypt authority, and recorded-origin access.
+    #[serde(default)]
+    pub include_secret_values: bool,
 }
 
 /// Query parameters for filtering inquiries

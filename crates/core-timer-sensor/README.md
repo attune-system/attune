@@ -79,8 +79,8 @@ The sensor requires the following environment variables:
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
 | `ATTUNE_API_URL` | Yes | Base URL of the Attune API | `http://localhost:8080` |
-| `ATTUNE_API_TOKEN` | Yes | Service account token | `eyJhbGci...` |
-| `ATTUNE_SENSOR_REF` | Yes | Sensor reference (must be `core.timer`) | `core.timer` |
+| `ATTUNE_API_TOKEN` | Yes | Token for the current admitted sensor generation | supplied by manager |
+| `ATTUNE_SENSOR_REF` | Yes | Registered sensor reference | `core.timer_sensor` |
 | `ATTUNE_NOTIFIER_WS_URL` | Yes | Notifier websocket URL; remote endpoints require `wss://` by default | `wss://notifier.example/ws` |
 | `ATTUNE_ALLOW_INSECURE_NOTIFIER_WS` | No | Allow non-loopback plaintext `ws://` on a trusted development network | `false` |
 | `ATTUNE_LOG_LEVEL` | No | Logging verbosity | `info` (default) |
@@ -89,59 +89,32 @@ The sensor requires the following environment variables:
 
 ```bash
 export ATTUNE_API_URL="http://localhost:8080"
-export ATTUNE_API_TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-export ATTUNE_SENSOR_REF="core.timer"
+export ATTUNE_API_TOKEN="$ADMITTED_SENSOR_TOKEN"
+export ATTUNE_SENSOR_REF="core.timer_sensor"
 export ATTUNE_NOTIFIER_WS_URL="ws://localhost:8081/ws"
 export ATTUNE_LOG_LEVEL="info"
 
-attune-core-timer-sensor
+printf '%s\n' '{"config":{},"triggers":[]}' | attune-core-timer-sensor
 ```
 
 ### Example: stdin Configuration
 
 ```bash
-echo '{
-  "api_url": "http://localhost:8080",
-  "api_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "sensor_ref": "core.timer",
-  "notifier_ws_url": "ws://localhost:8081/ws",
-  "log_level": "info"
-}' | attune-core-timer-sensor --stdin-config
+printf '%s\n' '{"config":{"check_interval_seconds":1},"triggers":[]}' | attune-core-timer-sensor
 ```
 
-## Service Account Setup
+Both examples require the connection metadata above. Stdin contains exactly one
+JSON object with `config` and `triggers` sections, followed by EOF. Values retain
+their JSON types. The old configuration environment variables and
+`--stdin-config` flag are not supported.
 
-Before running the sensor, you need to create a service account with the appropriate permissions:
+## Managed authentication
 
-```bash
-# Create service account (requires admin token)
-curl -X POST http://localhost:8080/service-accounts \
-  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "sensor:core.timer",
-    "scope": "sensor",
-    "description": "Timer sensor for interval-based triggers",
-    "ttl_hours": 72,
-    "metadata": {
-      "trigger_types": ["core.timer"]
-    }
-  }'
-
-# Response will include the token (save this - it's only shown once!)
-{
-  "identity_id": 123,
-  "name": "sensor:core.timer",
-  "scope": "sensor",
-  "token": "eyJhbGci...",  # Use this as ATTUNE_API_TOKEN
-  "expires_at": "2025-01-30T12:34:56Z"  # 72 hours from now
-}
-```
-
-**Important**: 
-- The token is only displayed once. Store it securely!
-- Sensor tokens expire after 24-72 hours and must be rotated
-- Plan to rotate the token before expiration (set up monitoring/alerts)
+The sensor manager admits a workload generation and provisions its fenced sensor
+token through `/auth/internal/sensor-token`. It supplies the initial settings and
+active rule configurations on stdin. Generic operator access and service-account
+tokens cannot emit sensor events. The manager renews credentials through a
+controlled process restart; no manual service-account setup is needed here.
 
 ## Timer Configuration
 
@@ -164,6 +137,32 @@ Examples:
 - Every 10 minutes: `{"type": "interval", "interval": 10, "unit": "minutes"}`
 - Every 1 hour: `{"type": "interval", "interval": 1, "unit": "hours"}`
 - Every 1 day: `{"type": "interval", "interval": 1, "unit": "days"}`
+
+#### Missed ticks and recovery
+
+Interval timers use a monotonic clock and first fire after one full interval.
+If scheduling resumes at least one full interval after the expected tick, the
+timer immediately attempts to publish one recovery event and logs a warning.
+It skips the remaining overdue ticks, then continues at the next future boundary
+on the original cadence. Ordinary scheduling jitter does not generate warnings.
+
+For a 10-second interval with the next tick due at second 10, resuming at second
+35 publishes once at 35 and continues at 40, 50, and 60. The warning records the
+rule ID, interval, estimated expected UTC time, recovery UTC time, delay, three
+missed ticks, and two skipped ticks. The expected UTC time is derived from the
+monotonic delay and the recovery wall clock, so it is an estimate if UTC changed.
+
+Each rule has at most one event publication in flight, including API retries.
+Slow or failed API calls do not stop future scheduling or accumulate a replay
+queue. Publication uses the existing bounded retry policy. A recovery event is
+not guaranteed to reach an unavailable API, and an ambiguous API response can
+still result in duplicate delivery on retry. `execution_count` counts publication
+cycles, not skipped ticks or individual retry attempts.
+
+Disabling, deleting, or replacing a timer cancels and joins its task, including
+pending API calls or retries. An event already accepted by the API cannot be
+retracted. Unchanged rule reconciliation preserves the cadence. Restarting the
+sensor starts a new cadence and does not replay downtime.
 
 ### DateTime Timer
 
@@ -354,8 +353,13 @@ The service account token has exceeded its TTL (24-72 hours). This is expected b
 ### Running Tests
 
 ```bash
-cargo test --package core-timer-sensor
+ATTUNE_TEST_RUN_ID=timer-local cargo test --manifest-path crates/core-timer-sensor/Cargo.toml --locked
 ```
+
+This crate is excluded from the root workspace and must be tested explicitly.
+The regression suite includes paused-clock tests for missed ticks and warnings,
+plus a real single-thread scheduler stall with a test-owned HTTP event API. No
+running Attune services are required.
 
 ### Building
 

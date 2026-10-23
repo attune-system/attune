@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.contracts.tsbuildinfo"
+  },
+  "include": ["contracts/**/*.ts"],
+  "exclude": []
+}

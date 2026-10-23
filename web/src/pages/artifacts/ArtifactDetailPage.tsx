@@ -1,7 +1,5 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
-import LiveStreamControl, {
-  DEFAULT_LIVE_LIST_MAX_ITEMS,
-} from "@/components/common/LiveStreamControl";
+import LiveStreamControl from "@/components/common/LiveStreamControl";
 import { useParams, Link } from "react-router-dom";
 import {
   ArrowLeft,
@@ -21,7 +19,13 @@ import {
   type ArtifactVersionSummary,
 } from "@/hooks/useArtifacts";
 import { useArtifactStream } from "@/hooks/useArtifactStream";
+import { useArtifactLivePage } from "@/hooks/useArtifactLivePage";
+import Pagination from "@/components/executions/Pagination";
 import { formatJsonValue } from "@/lib/format-utils";
+import {
+  ARTIFACT_PREVIEW_BYTES,
+  readArtifactPreview,
+} from "@/lib/artifact-preview";
 import { OpenAPI } from "@/api/core/OpenAPI";
 import {
   getArtifactTypeIcon,
@@ -52,41 +56,44 @@ function TextContentViewer({
   const [settledKey, setSettledKey] = useState<string | null>(null);
   const [content, setContent] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
 
   const isLoading = settledKey !== fetchKey;
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
 
     const token = localStorage.getItem("access_token");
     const url = versionNumber
       ? `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/versions/${versionNumber}/download`
       : `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/download`;
 
-    fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+    fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Range: `bytes=0-${ARTIFACT_PREVIEW_BYTES - 1}`,
+      },
+      signal: controller.signal,
+    })
       .then(async (response) => {
-        if (cancelled) return;
-        if (!response.ok) {
-          setLoadError(`HTTP ${response.status}: ${response.statusText}`);
-          setContent(null);
-          return;
-        }
-        const text = await response.text();
-        setContent(text);
+        const preview = await readArtifactPreview(response);
+        if (controller.signal.aborted) return;
+        setContent(preview.text);
+        setTruncated(preview.truncated);
         setLoadError(null);
       })
       .catch((e) => {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setLoadError(e instanceof Error ? e.message : "Unknown error");
           setContent(null);
         }
       })
       .finally(() => {
-        if (!cancelled) setSettledKey(fetchKey);
+        if (!controller.signal.aborted) setSettledKey(fetchKey);
       });
 
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, [artifactId, versionNumber, fetchKey]);
 
@@ -104,9 +111,17 @@ function TextContentViewer({
   }
 
   return (
-    <pre className="max-h-96 overflow-y-auto bg-gray-900 text-gray-100 rounded-lg p-4 text-xs font-mono whitespace-pre-wrap break-all">
-      {content || <span className="text-gray-500 italic">(empty)</span>}
-    </pre>
+    <div>
+      {truncated && (
+        <p className="mb-2 text-sm text-gray-600">
+          Preview limited to the first 64 KiB. Download the file to read the
+          full content.
+        </p>
+      )}
+      <pre className="max-h-96 overflow-y-auto bg-gray-900 text-gray-100 rounded-lg p-4 text-xs font-mono whitespace-pre-wrap break-all">
+        {content || <span className="text-gray-500 italic">(empty)</span>}
+      </pre>
+    </div>
   );
 }
 
@@ -471,11 +486,21 @@ function ArtifactVersionsList({
   onToggleLivePaused: () => void;
   isConnected: boolean;
 }) {
-  const { data, isLoading, error } = useArtifactVersions(artifact.id);
-  const versions = useMemo(
-    () => (data?.data || []).slice(0, DEFAULT_LIVE_LIST_MAX_ITEMS),
-    [data],
+  const [page, setPage] = useState(1);
+  const pageSize = 20;
+  useArtifactLivePage({
+    scope: "versions",
+    id: artifact.id,
+    page,
+    setPage,
+    paused: livePaused,
+  });
+  const { data, isLoading, error } = useArtifactVersions(
+    artifact.id,
+    livePaused,
+    { page, perPage: pageSize },
   );
+  const versions = data?.items ?? [];
 
   return (
     <div className="bg-white shadow rounded-lg overflow-hidden">
@@ -487,7 +512,7 @@ function ArtifactVersionsList({
               Versions
               {versions.length > 0 && (
                 <span className="ml-2 text-sm font-normal text-gray-500">
-                  ({versions.length})
+                  ({data?.pagination.total_items ?? versions.length})
                 </span>
               )}
             </h3>
@@ -496,8 +521,9 @@ function ArtifactVersionsList({
             paused={livePaused}
             onTogglePaused={onToggleLivePaused}
             connected={isConnected}
-            maxItems={DEFAULT_LIVE_LIST_MAX_ITEMS}
+            maxItems={pageSize}
             itemLabel="versions"
+            showRetentionHint={false}
           />
         </div>
       </div>
@@ -560,6 +586,19 @@ function ArtifactVersionsList({
           </table>
         </div>
       )}
+      {data && !error && (
+        <Pagination
+          page={page}
+          setPage={setPage}
+          pageSize={pageSize}
+          itemCount={versions.length}
+          total={data.pagination.total_items}
+          itemLabel="versions"
+        />
+      )}
+      <p className="px-6 py-3 text-xs text-gray-500">
+        Live refreshes and resuming updates return to page one.
+      </p>
     </div>
   );
 }
@@ -657,9 +696,9 @@ export default function ArtifactDetailPage() {
   const { id } = useParams<{ id: string }>();
   const artifactId = id ? Number(id) : undefined;
 
-  const { data, isLoading, error } = useArtifact(artifactId);
-  const artifact = data?.data;
   const [livePaused, setLivePaused] = useState(false);
+  const { data, isLoading, error } = useArtifact(artifactId, false, livePaused);
+  const artifact = data?.data;
 
   // Subscribe to real-time updates for this artifact
   const { isConnected } = useArtifactStream({

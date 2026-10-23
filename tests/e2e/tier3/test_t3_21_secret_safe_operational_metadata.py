@@ -169,7 +169,7 @@ def test_event_payload_secrets_require_event_decrypt(
         label="Secret Event Payload",
         pack_ref=pack_ref,
         description="E2E trigger with a secret payload field",
-        param_schema={
+        out_schema={
             "account": {"type": "string"},
             "token": {"type": "string", "secret": True},
         },
@@ -254,7 +254,7 @@ def test_event_to_enforcement_to_execution_keeps_readable_non_secret_mappings_re
         label="Secret Mapping Trigger",
         pack_ref=pack_ref,
         description="E2E trigger with a mapped secret payload field",
-        param_schema={
+        out_schema={
             "service": {"type": "string"},
             "api_key": {"type": "string", "secret": True},
         },
@@ -275,6 +275,19 @@ def test_event_to_enforcement_to_execution_keeps_readable_non_secret_mappings_re
         },
     )
 
+    key = _data(client.post("/api/v1/keys", json={
+        "local_ref": f"mapping_{unique_ref()}", "name": "Mapping fixture",
+        "owner_type": "pack", "owner_pack_ref": pack_ref,
+        "encrypted": True, "value": "mapped-secret-key",
+    }))
+    rejected = client.post("/api/v1/rules", json={
+        "ref": f"{pack_ref}.rejected_mapping_{unique_ref()}",
+        "pack_ref": pack_ref, "label": "Reject event selector for secret input",
+        "trigger_ref": trigger_ref, "action_ref": action["ref"],
+        "action_params": {"service": "billing", "api_key": "{{ event.payload.api_key }}"},
+    })
+    assert rejected.status_code == 422, rejected.text
+    assert "key" in rejected.text.lower(), rejected.text
     rule = client.create_rule(
         pack_ref=pack_ref,
         name=f"secret_mapping_rule_{unique_ref()}",
@@ -283,7 +296,7 @@ def test_event_to_enforcement_to_execution_keeps_readable_non_secret_mappings_re
         enabled=True,
         action_params={
             "service": "{{ event.payload.service }}",
-            "api_key": "{{ event.payload.api_key }}",
+            "api_key": "{{ keystore['" + key["ref"] + "'] }}",
         },
     )
 
@@ -313,6 +326,8 @@ def test_event_to_enforcement_to_execution_keeps_readable_non_secret_mappings_re
         api_base_url=api_base_url,
         test_timeout=test_timeout,
         grants=[
+            {"resource": "keys", "actions": ["read", "decrypt"],
+             "constraints": {"refs": [key["ref"]]}},
             {
                 "resource": "events",
                 "actions": ["read", "decrypt"],
