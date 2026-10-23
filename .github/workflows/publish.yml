@@ -533,6 +533,7 @@ jobs:
 
       - name: Package Linux CLI archive
         id: package-cli
+        continue-on-error: true
         shell: bash
         env:
           ARCH: ${{ matrix.arch }}
@@ -559,6 +560,9 @@ jobs:
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Linux CLI artifact
+        id: upload-cli
+        if: steps.package-cli.outcome == 'success'
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attune-linux-cli-${{ matrix.arch }}
@@ -568,8 +572,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Report optional Linux CLI archive failure
+        if: ${{ !cancelled() && (steps.package-cli.outcome == 'failure' || steps.upload-cli.outcome == 'failure') }}
+        run: |
+          echo "::warning::Linux CLI archive unavailable for ${{ matrix.arch }}; required runtime bundle remains independent."
+          echo "Optional Linux CLI archive unavailable for ${{ matrix.arch }}." >> "$GITHUB_STEP_SUMMARY"
+
   submit-macos-cli-notarization:
     name: Build and Submit macOS CLI (${{ matrix.arch }})
+    continue-on-error: true
     runs-on: ${{ matrix.runner }}
     needs: release-gate
     if: github.ref_type == 'tag'
@@ -755,11 +766,12 @@ jobs:
 
   finalize-macos-cli-notarization:
     name: Finalize macOS CLI (${{ matrix.arch }})
+    continue-on-error: true
     needs:
       - release-gate
       - submit-macos-cli-notarization
     runs-on: ${{ matrix.runner }}
-    if: github.ref_type == 'tag'
+    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.release-gate.result == 'success' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -951,6 +963,7 @@ jobs:
 
   build-windows-cli:
     name: Build Windows CLI (amd64)
+    continue-on-error: true
     runs-on: windows-latest
     needs: release-gate
     if: github.ref_type == 'tag'
@@ -980,7 +993,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           cargo build --locked --release --package attune-cli --bins
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\target\release\attune.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\target\release\attune-mcp.exe --version
 
       - name: Package Windows CLI archive
@@ -1026,12 +1041,17 @@ jobs:
 
   publish-homebrew-cask:
     name: Publish Homebrew Cask
+    continue-on-error: true
     runs-on: ubuntu-24.04
     needs:
       - release-gate
       - finalize-macos-cli-notarization
       - publish-github-release
-    if: github.ref_type == 'tag'
+    if: >-
+      !cancelled() && github.ref_type == 'tag' &&
+      needs.release-gate.result == 'success' &&
+      needs.publish-github-release.result == 'success' &&
+      needs.publish-github-release.outputs.macos_complete == 'true'
     concurrency:
       group: homebrew-cask-${{ github.repository }}
       cancel-in-progress: false
@@ -1117,12 +1137,18 @@ jobs:
 
   publish-arch-package-repository:
     name: Publish Arch Package Repository
+    continue-on-error: true
     runs-on: ubuntu-24.04
     needs:
       - release-gate
       - build-rust-bundles
       - publish-github-release
-    if: github.ref_type == 'tag'
+    if: >-
+      !cancelled() && github.ref_type == 'tag' &&
+      needs.release-gate.result == 'success' &&
+      needs.build-rust-bundles.result == 'success' &&
+      needs.publish-github-release.result == 'success' &&
+      needs.publish-github-release.outputs.linux_cli_complete == 'true'
     concurrency:
       group: arch-package-repository-${{ github.repository }}
       cancel-in-progress: false
@@ -1213,6 +1239,7 @@ jobs:
 
   build-linux-packages:
     name: Build Linux Packages (${{ matrix.arch }})
+    continue-on-error: true
     runs-on: ${{ matrix.runner_label }}
     needs:
       - metadata
@@ -1333,6 +1360,7 @@ jobs:
 
   sign-arch-packages:
     name: Sign Arch Packages (${{ matrix.arch }})
+    continue-on-error: true
     runs-on: ubuntu-24.04
     environment: release-signing
     needs:
@@ -1376,13 +1404,19 @@ jobs:
 
   publish-linux-packages-nexus:
     name: Publish Linux Packages to Nexus (${{ matrix.arch }})
+    continue-on-error: true
     runs-on: ${{ matrix.runner_label }}
     needs:
       - metadata
       - release-gate
       - build-linux-packages
       - sign-arch-packages
-    if: ${{ !contains(github.ref_name, '-') }}
+      - publish-github-release
+    if: >-
+      !cancelled() && !contains(github.ref_name, '-') &&
+      needs.release-gate.result == 'success' &&
+      needs.publish-github-release.result == 'success' &&
+      needs.publish-github-release.outputs.linux_packages == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1954,7 +1988,17 @@ jobs:
   publish-github-release:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
-    if: github.ref_type == 'tag'
+    # Desktop and package jobs may fail, but required release inputs may not.
+    if: >-
+      !cancelled() && github.ref_type == 'tag' &&
+      needs.metadata.result == 'success' &&
+      needs.release-gate.result == 'success' &&
+      needs.build-rust-bundles.result == 'success' &&
+      needs.build-docker-dist.result == 'success'
+    outputs:
+      macos_complete: ${{ steps.cli.outputs.macos_complete }}
+      linux_cli_complete: ${{ steps.cli.outputs.linux_cli_complete }}
+      linux_packages: ${{ steps.cli.outputs.linux_packages }}
     needs:
       - metadata
       - release-gate
@@ -1975,7 +2019,51 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Detect available optional CLI artifacts
+        id: cli
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          artifact_names="$(gh api --paginate "repos/${REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[] | select(.expired == false) | .name')"
+          has_artifact() { grep -Fxq "$1" <<< "$artifact_names"; }
+          windows=false
+          macos=false
+          macos_complete=false
+          linux_cli=false
+          linux_cli_complete=false
+          linux_packages=false
+          if has_artifact attune-windows-cli-amd64; then windows=true; fi
+          if has_artifact attune-macos-cli-amd64 || has_artifact attune-macos-cli-arm64; then macos=true; fi
+          if has_artifact attune-macos-cli-amd64 && has_artifact attune-macos-cli-arm64; then macos_complete=true; fi
+          if has_artifact attune-linux-cli-amd64 || has_artifact attune-linux-cli-arm64; then linux_cli=true; fi
+          if has_artifact attune-linux-cli-amd64 && has_artifact attune-linux-cli-arm64; then linux_cli_complete=true; fi
+          if has_artifact attune-linux-packages-amd64 && has_artifact attune-linux-packages-arm64 && \
+             has_artifact attune-linux-package-signatures-amd64 && has_artifact attune-linux-package-signatures-arm64; then
+            linux_packages=true
+          fi
+          {
+            echo "windows=$windows"
+            echo "macos=$macos"
+            echo "macos_complete=$macos_complete"
+            echo "linux_cli=$linux_cli"
+            echo "linux_cli_complete=$linux_cli_complete"
+            echo "linux_packages=$linux_packages"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Optional CLI release artifacts"
+            echo "Windows archive available: $windows"
+            echo "macOS archive available: $macos; both notarized architectures: $macos_complete"
+            echo "Linux CLI archive available: $linux_cli; both architectures: $linux_cli_complete"
+            echo "Complete signed Linux package set available: $linux_packages"
+            echo "Unavailable optional outputs are omitted; server release checks remain required."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Download Linux CLI archives
+        if: steps.cli.outputs.linux_cli == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: attune-linux-cli-*
@@ -1983,6 +2071,7 @@ jobs:
           merge-multiple: true
 
       - name: Download macOS CLI archives
+        if: steps.cli.outputs.macos == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: attune-macos-cli-*
@@ -1990,12 +2079,14 @@ jobs:
           merge-multiple: true
 
       - name: Download Windows CLI archive
+        if: steps.cli.outputs.windows == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: attune-windows-cli-amd64
           path: release-assets
 
       - name: Download Linux packages
+        if: steps.cli.outputs.linux_packages == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: attune-linux-packages-*
@@ -2003,6 +2094,7 @@ jobs:
           merge-multiple: true
 
       - name: Download Arch package signatures
+        if: steps.cli.outputs.linux_packages == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: attune-linux-package-signatures-*
@@ -2032,7 +2124,12 @@ jobs:
           VERSION: ${{ needs.metadata.outputs.image_tag }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          bash scripts/verify-release-assets.sh release-assets "$VERSION" "$TAG_NAME"
+          bash scripts/verify-release-assets.sh release-assets "$VERSION" "$TAG_NAME" \
+            --allow-missing-cli --allow-missing-linux-packages
+
+      - name: Verify available Linux package signatures
+        if: steps.cli.outputs.linux_packages == 'true'
+        run: |
           bash scripts/verify-arch-package-signatures.sh \
             release-assets packaging/keys/attune-arch-package-keyring.asc
 

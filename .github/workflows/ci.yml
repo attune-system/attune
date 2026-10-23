@@ -129,6 +129,8 @@ jobs:
 
       - name: Validate release scripts
         run: |
+          python3 -m pip install --disable-pip-version-check 'PyYAML==6.0.3'
+          python3 scripts/test_optional_cli_release.py
           bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh scripts/check-db-test-threads.sh scripts/database-test-ignore-policy.sh scripts/run-ci-rust-tests.sh scripts/run-integration-tests.sh scripts/run-rust-integration-tests.sh scripts/cleanup-test-schemas.sh scripts/ci-test-db-safety.sh scripts/test-test-isolation-guards.sh
           bash scripts/test-test-isolation-guards.sh
           bash scripts/test-arch-package-signatures.sh

@@ -6,9 +6,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{stream::BoxStream, StreamExt};
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, Write};
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{Read, Seek};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
