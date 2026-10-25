@@ -218,9 +218,12 @@ secrets. Their plaintext also requires read access to every recorded Key, plus
 decrypt access for encrypted Keys. Streams recheck these origins before each
 frame. Service mirroring and status/alert stderr excerpts remain disabled for
 these potentially sensitive generations.
-The bundled `core.admin` role grants trigger management, not `triggers:decrypt`.
-Assign an explicit sensor-scoped decrypt grant when an operator needs plaintext
-logs from an SDK-capable sensor.
+Catalog revision 3 adds global `triggers:decrypt` to the bundled `core.admin`
+permission set, alongside the other supported disclosure grants. Earlier catalogs
+omit this authority. For operators who do not need full administrator access,
+assign sensor-scoped `triggers:update` and `triggers:decrypt` grants instead.
+The decrypt requirement does not imply that a particular log line contains a
+secret; it protects logs from a generation capable of obtaining pack-owned Keys.
 
 ## Key values and approved operations
 

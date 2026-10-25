@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { RbacResource } from "@/api/models/RbacResource";
 import {
   draftToGrant,
   grantToDraft,
@@ -12,6 +13,33 @@ import {
   permissionSetAuthoring,
   type ParsedGrant,
 } from "@/components/access-control/grants";
+
+describe("global administrator permissions", () => {
+  it.each([
+    "packs",
+    "queues",
+    "queue_items",
+    "rules",
+    "triggers",
+    "artifacts",
+    "inquiries",
+  ])("preserves %s decrypt authority", (resource) => {
+    const grant = { resource, actions: ["decrypt", "read"] };
+    expect(RESOURCE_ACTIONS[resource]).toContain("decrypt");
+    expect(draftToGrant(grantToDraft(grant, 0))).toEqual(grant);
+  });
+
+  it("offers every RBAC resource", () => {
+    expect(Object.keys(RESOURCE_ACTIONS).sort()).toEqual(
+      Object.values(RbacResource).sort(),
+    );
+  });
+
+  it("offers worker management and enforcement decryption", () => {
+    expect(RESOURCE_ACTIONS.workers).toContain("manage");
+    expect(RESOURCE_ACTIONS.enforcements).toContain("decrypt");
+  });
+});
 
 describe("canonical authority scope authoring", () => {
   it.each([

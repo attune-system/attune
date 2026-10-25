@@ -1,12 +1,6 @@
 import type { ComponentType } from "react";
-import {
-  BarChart3,
-  Bot,
-  Globe,
-  History,
-  MessageSquare,
-  User,
-} from "lucide-react";
+import { Bot, ListTodo, MessageSquare, User } from "lucide-react";
+import type { RbacResource } from "@/api/models/RbacResource";
 import { navIcons } from "@/components/layout/navIcons";
 
 export interface GrantConstraints {
@@ -42,6 +36,11 @@ export const RESOURCE_META: Record<string, ResourceMeta> = {
     color: "text-yellow-500",
     label: "Actions",
   },
+  policies: {
+    icon: navIcons.policies,
+    color: "text-amber-600",
+    label: "Policies",
+  },
   rules: { icon: navIcons.rules, color: "text-blue-600", label: "Rules" },
   triggers: {
     icon: navIcons.triggers,
@@ -75,9 +74,6 @@ export const RESOURCE_META: Record<string, ResourceMeta> = {
     color: "text-indigo-500",
     label: "Artifacts",
   },
-  webhooks: { icon: Globe, color: "text-sky-600", label: "Webhooks" },
-  analytics: { icon: BarChart3, color: "text-rose-500", label: "Analytics" },
-  history: { icon: History, color: "text-gray-500", label: "History" },
   identities: { icon: User, color: "text-blue-700", label: "Identities" },
   permissions: {
     icon: navIcons.accessControl,
@@ -94,22 +90,32 @@ export const RESOURCE_META: Record<string, ResourceMeta> = {
     color: "text-blue-700",
     label: "Workers",
   },
-  sensors: {
-    icon: navIcons.sensors,
-    color: "text-purple-600",
-    label: "Sensors",
-  },
   queues: {
     icon: navIcons.queues,
     color: "text-emerald-600",
-    label: "Queues",
+    label: "Work Queues",
+  },
+  queue_items: {
+    icon: ListTodo,
+    color: "text-emerald-600",
+    label: "Queue Items",
+  },
+  dashboards: {
+    icon: navIcons.dashboard,
+    color: "text-rose-500",
+    label: "Dashboards",
+  },
+  retention: {
+    icon: navIcons.retention,
+    color: "text-teal-700",
+    label: "Data Retention",
   },
   audit_log: {
     icon: navIcons.auditLog,
     color: "text-slate-600",
     label: "Audit Log",
   },
-};
+} satisfies Record<RbacResource, ResourceMeta>;
 
 export const ACTION_STYLE: Record<string, string> = {
   read: "bg-slate-100 text-slate-700",
