@@ -54,6 +54,13 @@ export interface ConcurrencyPolicyRequest {
   parameters?: string[];
 }
 
+export interface ResourceConcurrency {
+  namespace: string;
+  limit: number;
+  method: PolicyMethod;
+  participants: { action: string; resource_parameter: string }[];
+}
+
 export interface RateLimitPolicyRequest {
   max_executions: number;
   window_seconds: number;
@@ -65,6 +72,7 @@ export interface QuotaPolicyRequest {
 }
 
 export interface PolicySummary {
+  resource_concurrency?: ResourceConcurrency | null;
   id: number;
   ref: string;
   name: string;
@@ -83,6 +91,7 @@ export interface PolicySummary {
 export type PolicyResponse = PolicySummary;
 
 export interface CreatePolicyRequest {
+  resource_concurrency?: ResourceConcurrency | null;
   ref: string;
   name: string;
   description?: string | null;
@@ -96,6 +105,7 @@ export interface CreatePolicyRequest {
 }
 
 export interface UpdatePolicyRequest {
+  resource_concurrency?: ResourceConcurrency | null;
   name?: string;
   description?: string | null;
   enabled?: boolean;

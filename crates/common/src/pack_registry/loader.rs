@@ -2522,6 +2522,7 @@ impl TransactionalPackComponentLoader<'_> {
                 )
                 .await?;
                 let update = UpdatePolicyInput {
+                    resource_concurrency: Some(controls.resource_concurrency),
                     enabled: None,
                     priority: Some(priority),
                     parameters: Some(parameters),
@@ -2554,6 +2555,7 @@ impl TransactionalPackComponentLoader<'_> {
             }
 
             let create = CreatePolicyInput {
+                resource_concurrency: controls.resource_concurrency,
                 r#ref: policy_ref.clone(),
                 pack: Some(self.pack_id),
                 pack_ref: Some(self.pack_ref.clone()),

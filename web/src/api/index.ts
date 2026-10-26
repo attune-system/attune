@@ -359,6 +359,8 @@ export type { RegisterRequest } from "./models/RegisterRequest";
 export type { RegistrationSummary } from "./models/RegistrationSummary";
 export type { RendererInputApprovalRequest } from "./models/RendererInputApprovalRequest";
 export type { ResolvedWorkQueueDispatchTuningResponse } from "./models/ResolvedWorkQueueDispatchTuningResponse";
+export type { ResourceConcurrency } from "./models/ResourceConcurrency";
+export type { ResourceParticipant } from "./models/ResourceParticipant";
 export type { RetentionConfig } from "./models/RetentionConfig";
 export { RetentionPolicyType } from "./models/RetentionPolicyType";
 export type { RetentionTargetConfig } from "./models/RetentionTargetConfig";

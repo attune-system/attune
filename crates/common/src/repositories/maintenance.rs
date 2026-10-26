@@ -457,13 +457,13 @@ impl MaintenanceRepository {
              LEFT JOIN execution_reschedule_state rs ON rs.execution_id = e.id
              WHERE e.status = 'requested'
                AND e.updated < $1
-               AND COALESCE(rs.attempt_count, 0) < $2
+               AND (COALESCE(rs.attempt_count, 0) < $2 OR shared_resource_waiter_ready(e.id))
                AND (rs.last_attempt_at IS NULL OR rs.last_attempt_at < $1)
                AND NOT EXISTS (
                     SELECT 1
                     FROM execution_admission_entry admission
                     WHERE admission.execution_id = e.id
-                      AND admission.status = 'queued'
+                       AND admission.status = 'queued' AND NOT shared_resource_waiter_ready(e.id)
                )
              ORDER BY COALESCE(rs.last_attempt_at, e.updated) ASC, e.updated ASC, e.id ASC
              LIMIT $3",
@@ -497,13 +497,13 @@ impl MaintenanceRepository {
                  LEFT JOIN execution_reschedule_state rs ON rs.execution_id = e.id
                  WHERE e.id = $1
                    AND e.status = 'requested'
-                   AND COALESCE(rs.attempt_count, 0) < $2
+                   AND (COALESCE(rs.attempt_count, 0) < $2 OR shared_resource_waiter_ready(e.id))
                    AND ($6 OR rs.last_attempt_at IS NULL OR rs.last_attempt_at < $3)
                    AND NOT EXISTS (
                         SELECT 1
                         FROM execution_admission_entry admission
                         WHERE admission.execution_id = e.id
-                          AND admission.status = 'queued'
+                           AND admission.status = 'queued' AND NOT shared_resource_waiter_ready(e.id)
                    )
                  FOR UPDATE OF e
              ),
@@ -757,7 +757,8 @@ impl MaintenanceRepository {
                      UPDATE execution_admission_entry entry
                      SET status = 'active', activated_at = NOW(), updated = NOW()
                      FROM next_queued
-                     WHERE entry.id = next_queued.id
+                      WHERE entry.id = next_queued.id
+                        AND NOT EXISTS (SELECT 1 FROM execution_resource_admission resource WHERE resource.execution_id = entry.execution_id AND NOT resource.active)
                      RETURNING entry.execution_id",
                 )
                 .bind(state_id)

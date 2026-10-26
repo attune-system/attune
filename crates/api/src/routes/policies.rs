@@ -171,11 +171,21 @@ pub async fn create_policy(
 ) -> ApiResult<impl IntoResponse> {
     request.validate()?;
     validate_policy_features(
-        request.concurrency.is_some(),
+        request.concurrency.is_some() || request.resource_concurrency.is_some(),
         request.rate_limit.is_some(),
         !request.quotas.is_empty(),
     )?;
     validate_quotas(&request.quotas)?;
+    if let Some(resource) = &request.resource_concurrency {
+        resource.validate()?;
+        if request.concurrency.is_some()
+            || request.rate_limit.is_some()
+            || !request.quotas.is_empty()
+            || matches!(request.scope.r#type, PolicyScopeType::Action)
+        {
+            return Err(ApiError::BadRequest("Shared resource policies require global or pack scope and cannot contain standard controls".into()));
+        }
+    }
 
     if PolicyRepository::find_by_ref(&state.db, &request.r#ref)
         .await?
@@ -199,6 +209,11 @@ pub async fn create_policy(
     .await?;
 
     let input = CreatePolicyInput {
+        resource_concurrency: request
+            .resource_concurrency
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?,
         r#ref: request.r#ref,
         pack: resolved.pack,
         pack_ref: resolved.pack_ref,
@@ -268,6 +283,11 @@ pub async fn update_policy(
     validate_update_keeps_feature(&existing, &request)?;
 
     let update = UpdatePolicyInput {
+        resource_concurrency: request
+            .resource_concurrency
+            .map(|value| value.map(serde_json::to_value).transpose())
+            .transpose()
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?,
         enabled: request.enabled,
         priority: request.priority,
         parameters: request.concurrency.as_ref().map(|concurrency| {
@@ -630,5 +650,20 @@ fn validate_update_keeps_feature(
                 .map(|value| !value.is_empty())
                 .unwrap_or(false)
         });
-    validate_policy_features(has_concurrency, has_rate_limit, has_quotas)
+    let shared = request
+        .resource_concurrency
+        .as_ref()
+        .map(|value| value.is_some())
+        .unwrap_or(existing.resource_concurrency.is_some());
+    if shared && (has_concurrency || has_rate_limit || has_quotas || existing.action.is_some()) {
+        return Err(ApiError::BadRequest(
+            "Shared resource policies cannot contain standard controls or target a single action"
+                .into(),
+        ));
+    }
+    validate_policy_features(has_concurrency || shared, has_rate_limit, has_quotas)?;
+    if let Some(Some(resource)) = &request.resource_concurrency {
+        resource.validate()?;
+    }
+    Ok(())
 }

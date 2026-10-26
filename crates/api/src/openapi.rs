@@ -683,6 +683,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PolicyScopeResponse,
             ConcurrencyPolicyRequest,
             ConcurrencyPolicyResponse,
+            attune_common::resource_concurrency::ResourceConcurrency,
+            attune_common::resource_concurrency::ResourceParticipant,
             RateLimitPolicyRequest,
             RateLimitPolicyResponse,
             QuotaPolicyRequest,

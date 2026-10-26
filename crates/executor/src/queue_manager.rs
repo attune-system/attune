@@ -163,6 +163,10 @@ pub struct ExecutionQueueManager {
 }
 
 impl ExecutionQueueManager {
+    pub fn max_queue_length(&self) -> usize {
+        self.config.max_queue_length
+    }
+
     /// Create a new execution queue manager
     #[allow(dead_code)]
     pub fn new(config: QueueConfig) -> Self {

@@ -1387,32 +1387,6 @@ impl ExecutionScheduler {
             return Ok(());
         }
 
-        // Check if this action is a workflow (has workflow_def set)
-        if action.workflow_def.is_some() {
-            info!(
-                "Action '{}' is a workflow, orchestrating instead of dispatching to worker",
-                action.r#ref
-            );
-            let result = Self::process_workflow_execution(
-                pool,
-                publisher,
-                request_context.round_robin_counter,
-                request_context.artifacts_dir,
-                request_context.workflow_log_transport,
-                request_context.workflow_log_segment_max_bytes,
-                request_context.workflow_log_flush_interval_ms,
-                request_context.encryption_key,
-                &execution,
-                &action,
-                metadata_caches,
-            )
-            .await;
-            if result.is_err() {
-                Self::revert_scheduling_claim(pool, execution_id).await?;
-            }
-            return result;
-        }
-
         // Apply parameter defaults from the action's param_schema.
         // This mirrors what `process_workflow_execution` does for workflows
         // so that non-workflow executions also get missing parameters filled
@@ -1438,15 +1412,21 @@ impl ExecutionScheduler {
             }
         };
 
-        match policy_enforcer
-            .enforce_for_scheduling(
-                action.id,
-                Some(action.pack),
-                execution_id,
-                execution_config.as_ref(),
-            )
-            .await
-        {
+        let policy_result = if action.workflow_def.is_some() {
+            policy_enforcer
+                .enforce_shared_for_workflow(action.id, execution_id, execution_config.as_ref())
+                .await
+        } else {
+            policy_enforcer
+                .enforce_for_scheduling(
+                    action.id,
+                    Some(action.pack),
+                    execution_id,
+                    execution_config.as_ref(),
+                )
+                .await
+        };
+        match policy_result {
             Ok(SchedulingPolicyOutcome::Queued) => {
                 if ExecutionRepository::update_if_status(
                     pool,
@@ -1519,6 +1499,29 @@ impl ExecutionScheduler {
                 }
                 return Err(err);
             }
+        }
+
+        // A workflow holds a shared slot only when its own action participates.
+        // Child actions use their normal, independent scheduling admissions.
+        if action.workflow_def.is_some() {
+            let result = Self::process_workflow_execution(
+                pool,
+                publisher,
+                request_context.round_robin_counter,
+                request_context.artifacts_dir,
+                request_context.workflow_log_transport,
+                request_context.workflow_log_segment_max_bytes,
+                request_context.workflow_log_flush_interval_ms,
+                request_context.encryption_key,
+                &execution,
+                &action,
+                metadata_caches,
+            )
+            .await;
+            if result.is_err() {
+                Self::revert_scheduling_claim(pool, execution_id).await?;
+            }
+            return result;
         }
 
         // Regular action: select appropriate worker only after policy

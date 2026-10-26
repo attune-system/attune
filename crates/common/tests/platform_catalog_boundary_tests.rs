@@ -218,6 +218,7 @@ async fn component_insert_waits_for_activation_and_does_not_pin_old_release() {
         PolicyRepository::create(
             &mut *connection,
             CreatePolicyInput {
+                resource_concurrency: None,
                 r#ref: "concurrent.policy".into(),
                 pack: Some(pack.id),
                 pack_ref: Some(pack.r#ref),
