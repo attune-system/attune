@@ -1,0 +1,23 @@
+{
+  "actions": ["create", "delete", "execute", "read", "update"],
+  "artifacts": ["create", "decrypt", "delete", "read", "update"],
+  "audit_log": ["read"],
+  "caches": ["create", "delete", "read", "update"],
+  "dashboards": ["create", "delete", "read", "update"],
+  "enforcements": ["decrypt", "read"],
+  "events": ["create", "decrypt", "read"],
+  "executions": ["cancel", "decrypt", "read", "update"],
+  "identities": ["create", "delete", "read", "update"],
+  "inquiries": ["create", "decrypt", "delete", "read", "respond", "update"],
+  "keys": ["create", "decrypt", "delete", "read", "update", "use"],
+  "packs": ["configure", "create", "decrypt", "delete", "install", "read"],
+  "permissions": ["manage", "read"],
+  "policies": ["create", "delete", "read", "update"],
+  "queue_items": ["create", "decrypt", "delete", "read", "update"],
+  "queues": ["create", "decrypt", "delete", "read", "update"],
+  "retention": ["read", "update"],
+  "rules": ["create", "decrypt", "delete", "read", "update"],
+  "runtimes": ["create", "delete", "read", "update"],
+  "triggers": ["create", "decrypt", "delete", "read", "update"],
+  "workers": ["manage", "read"]
+}

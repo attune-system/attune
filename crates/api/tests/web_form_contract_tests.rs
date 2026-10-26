@@ -28,6 +28,40 @@ fn fixtures() -> Value {
     .unwrap()
 }
 
+#[test]
+fn permission_grant_options_match_backend_resource_actions() {
+    use attune_common::rbac::Resource;
+
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../web/src/test/fixtures/permission-grant-options.json"
+    ))
+    .unwrap();
+    let mut expected = serde_json::Map::new();
+    for resource in Resource::ALL {
+        let name = serde_json::to_value(resource).unwrap();
+        let mut actions: Vec<String> =
+            serde_json::from_value(serde_json::to_value(resource.supported_actions()).unwrap())
+                .unwrap();
+        actions.sort();
+        assert!(expected
+            .insert(name.as_str().unwrap().to_string(), json!(actions))
+            .is_none());
+    }
+    let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+    let mut schema_resources: Vec<String> =
+        serde_json::from_value(openapi["components"]["schemas"]["RbacResource"]["enum"].clone())
+            .unwrap();
+    schema_resources.sort();
+    let mut backend_resources: Vec<_> = expected.keys().cloned().collect();
+    backend_resources.sort();
+    assert_eq!(backend_resources, schema_resources);
+    assert_eq!(
+        Value::Object(expected),
+        fixture,
+        "Permission editor contract drifted from backend grant validation"
+    );
+}
+
 async fn extract<T: DeserializeOwned>(body: Value) -> Result<T, JsonRejection> {
     let request = Request::builder()
         .header("content-type", "application/json")

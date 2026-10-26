@@ -340,6 +340,15 @@ async fn embedded_migrator_uses_attune_history_on_fresh_database() {
 }
 
 async fn assert_postgresql_schema(pool: &sqlx::PgPool) {
+    // Fresh fixtures retain the partition job's initial due time from the same
+    // migration transaction that seeded the leaves. A template may be cloned or
+    // inspected on a later UTC day, so the current clock is not its seed date.
+    let initial_day: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT date_trunc('day', next_due, 'UTC') FROM native_maintenance_schedule WHERE job = 'partition'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
     for (table, column) in [
         ("event", "created"),
         ("execution_history", "time"),
@@ -353,14 +362,9 @@ async fn assert_postgresql_schema(pool: &sqlx::PgPool) {
         .fetch_all(pool)
         .await
         .unwrap();
-        let today: chrono::DateTime<chrono::Utc> =
-            sqlx::query_scalar("SELECT date_trunc('day', now(), 'UTC')")
-                .fetch_one(pool)
-                .await
-                .unwrap();
         assert_eq!(leaves.len(), 8, "{table} initial leaf count");
         for (offset, (name, lower, upper)) in leaves.into_iter().enumerate() {
-            assert_eq!(lower, today + chrono::Duration::days(offset as i64));
+            assert_eq!(lower, initial_day + chrono::Duration::days(offset as i64));
             assert_eq!(upper, lower + chrono::Duration::days(1));
             assert_eq!(name, format!("{table}_p{}", lower.format("%Y%m%d")));
             sqlx::query(
@@ -843,6 +847,47 @@ async fn migrated_fixture_has_native_postgresql_schema() {
     let pool = create_read_only_test_pool().await.unwrap();
     assert_postgresql_schema(&pool).await;
     pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn migrated_fixture_partition_window_survives_utc_day_rollover() {
+    use futures::FutureExt;
+    let (database, database_url) = create_embedded_migration_database().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mut migrator = sqlx::migrate!("../../migrations");
+        let migration = migrator
+            .migrations
+            .to_mut()
+            .iter_mut()
+            .find(|migration| migration.version == 20261006000001)
+            .unwrap();
+        // Only this disposable fixture uses a historical installation clock.
+        // Recompute its checksum before applying it; never alter an applied
+        // migration or the canonical files on disk.
+        *migration = sqlx::migrate::Migration::new(
+            migration.version,
+            migration.description.clone(),
+            migration.migration_type,
+            migration
+                .sql
+                .replace("now()", "TIMESTAMPTZ '2000-01-02 23:59:59+00'")
+                .into(),
+            migration.no_tx,
+        );
+        sqlx::query("CREATE SCHEMA attune")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        migrator.run(database.pool()).await.unwrap();
+        assert_postgresql_schema(database.pool()).await;
+    })
+    .catch_unwind()
+    .await;
+    database.close().await;
+    Postgres::force_drop_database(&database_url).await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]

@@ -54,6 +54,58 @@ pub enum Action {
     Use,
 }
 
+impl Resource {
+    pub const ALL: &'static [Self] = &[
+        Self::Packs,
+        Self::Actions,
+        Self::Policies,
+        Self::Queues,
+        Self::QueueItems,
+        Self::Rules,
+        Self::Triggers,
+        Self::Executions,
+        Self::Events,
+        Self::Enforcements,
+        Self::Inquiries,
+        Self::Keys,
+        Self::Caches,
+        Self::Artifacts,
+        Self::Runtimes,
+        Self::Workers,
+        Self::Dashboards,
+        Self::Retention,
+        Self::Identities,
+        Self::Permissions,
+        Self::AuditLog,
+    ];
+
+    /// Valid grant actions. Token-type and recorded-origin checks still apply.
+    pub fn supported_actions(self) -> &'static [Action] {
+        use Action::*;
+        match self {
+            Self::Packs => &[Read, Create, Install, Configure, Delete, Decrypt],
+            Self::Actions => &[Read, Create, Update, Delete, Execute],
+            Self::Policies
+            | Self::Caches
+            | Self::Runtimes
+            | Self::Dashboards
+            | Self::Identities => &[Read, Create, Update, Delete],
+            Self::Queues | Self::QueueItems | Self::Rules | Self::Triggers | Self::Artifacts => {
+                &[Read, Create, Update, Delete, Decrypt]
+            }
+            Self::Executions => &[Read, Update, Cancel, Decrypt],
+            Self::Events => &[Read, Create, Decrypt],
+            Self::Enforcements => &[Read, Decrypt],
+            Self::Inquiries => &[Read, Create, Update, Delete, Respond, Decrypt],
+            Self::Keys => &[Read, Create, Update, Delete, Decrypt, Use],
+            Self::Workers => &[Read, Manage],
+            Self::Retention => &[Read, Update],
+            Self::Permissions => &[Read, Manage],
+            Self::AuditLog => &[Read],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[schema(as = RbacOwnerConstraint)]

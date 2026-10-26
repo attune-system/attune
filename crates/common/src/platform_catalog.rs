@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::{Error, Result};
 
 pub const COMPATIBILITY_EPOCH: i32 = 1;
-pub const CATALOG_REVISION: i32 = 2;
+pub const CATALOG_REVISION: i32 = 3;
 
 /// Platform component namespaces are reserved even without an installed pack.
 pub fn reserved_pack_namespace(reference: &str) -> bool {
@@ -122,6 +122,65 @@ pub(crate) fn is_legacy_definition(kind: ManagedComponentKind, definition: &Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_includes_global_disclosure_and_event_publication() {
+        use crate::rbac::{Action, AuthorizationContext, Grant, Resource};
+        let definition = definitions()
+            .unwrap()
+            .into_iter()
+            .find(|(_, definition)| definition["ref"] == "core.admin")
+            .unwrap()
+            .1;
+        let grants: Vec<Grant> = serde_json::from_value(definition["grants"].clone()).unwrap();
+        let context = AuthorizationContext::new(42);
+        for (resource, action) in [
+            (Resource::Packs, Action::Decrypt),
+            (Resource::Queues, Action::Decrypt),
+            (Resource::QueueItems, Action::Decrypt),
+            (Resource::Rules, Action::Decrypt),
+            (Resource::Triggers, Action::Decrypt),
+            (Resource::Artifacts, Action::Decrypt),
+            (Resource::Inquiries, Action::Decrypt),
+            (Resource::Events, Action::Create),
+        ] {
+            assert!(
+                grants
+                    .iter()
+                    .any(|grant| grant.allows(resource, action, &context)),
+                "admin missing global {resource:?}:{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_covers_exactly_every_supported_global_permission() {
+        use crate::rbac::{Grant, Resource};
+        let definition = definitions()
+            .unwrap()
+            .into_iter()
+            .find(|(_, definition)| definition["ref"] == "core.admin")
+            .unwrap()
+            .1;
+        let grants: Vec<Grant> = serde_json::from_value(definition["grants"].clone()).unwrap();
+        assert_eq!(grants.len(), Resource::ALL.len());
+        for resource in Resource::ALL {
+            let matches: Vec<_> = grants
+                .iter()
+                .filter(|grant| grant.resource == *resource)
+                .collect();
+            assert_eq!(matches.len(), 1, "admin must define {resource:?} once");
+            let grant = matches[0];
+            assert!(grant.constraints.is_none(), "admin grants must be global");
+            assert_eq!(grant.actions.len(), resource.supported_actions().len());
+            for action in resource.supported_actions() {
+                assert!(
+                    grant.actions.contains(action),
+                    "admin missing {resource:?}:{action:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn editor_can_author_event_packs_without_administrative_grants() {

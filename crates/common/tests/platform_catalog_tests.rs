@@ -137,6 +137,112 @@ async fn fresh_catalog_is_complete_idempotent_and_serialized_without_core() {
 }
 
 #[tokio::test]
+async fn catalog_upgrade_repairs_admin_without_replacing_assignments() {
+    use attune_common::rbac::{Action, Grant, Resource};
+
+    let db = create_test_pool().await.unwrap();
+    let definition: Value = serde_yaml_ng::from_str(include_str!(
+        "../src/platform_catalog/permission_sets/admin.yaml"
+    ))
+    .unwrap();
+    let expected_grants = definition["grants"].clone();
+    let mut legacy: Vec<Grant> = serde_json::from_value(expected_grants.clone()).unwrap();
+    for grant in &mut legacy {
+        if matches!(
+            grant.resource,
+            Resource::Packs
+                | Resource::Queues
+                | Resource::QueueItems
+                | Resource::Rules
+                | Resource::Triggers
+                | Resource::Artifacts
+                | Resource::Inquiries
+        ) {
+            grant.actions.retain(|action| *action != Action::Decrypt);
+        }
+        if grant.resource == Resource::Events {
+            grant.actions.retain(|action| *action != Action::Create);
+        }
+        if grant.resource == Resource::Permissions {
+            grant
+                .actions
+                .extend([Action::Create, Action::Update, Action::Delete]);
+        }
+    }
+    // Seed the previous catalog directly. Downgrading a revision-3 platform row
+    // is intentionally forbidden, even for catalog writes.
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SELECT set_config('attune.catalog_write', 'on', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO permission_set (ref, label, description, grants, catalog_revision) VALUES ($1->>'ref', $1->>'label', $1->>'description', $2, 2)")
+        .bind(&definition)
+        .bind(serde_json::to_value(legacy).unwrap())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE platform_catalog_state SET revision = 2 WHERE singleton")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let admin = PermissionSetRepository::find_by_ref(&db, "core.admin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(admin.grants, expected_grants);
+    assert_eq!(
+        Catalog::origin(&db, Kind::PermissionSet, "core.admin")
+            .await
+            .unwrap(),
+        Some(ManagementOrigin::Platform {
+            catalog_revision: 2
+        })
+    );
+    let identity = IdentityFixture::new("catalog-upgrade-admin")
+        .create(&db)
+        .await
+        .unwrap();
+    let assignment = PermissionAssignmentRepository::create(
+        &db,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: admin.id,
+        },
+    )
+    .await
+    .unwrap();
+    Catalog::reconcile(&db).await.unwrap();
+    let upgraded = PermissionSetRepository::find_by_ref(&db, "core.admin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(upgraded.id, admin.id);
+    assert_eq!(upgraded.grants, expected_grants);
+    assert_eq!(
+        PermissionAssignmentRepository::get_by_id(&db, assignment.id)
+            .await
+            .unwrap()
+            .permset,
+        admin.id
+    );
+    assert_eq!(
+        Catalog::origin(&db, Kind::PermissionSet, "core.admin")
+            .await
+            .unwrap(),
+        Some(ManagementOrigin::Platform {
+            catalog_revision: CATALOG_REVISION
+        })
+    );
+    let before = snapshot(&db).await;
+    Catalog::reconcile(&db).await.unwrap();
+    assert_eq!(snapshot(&db).await, before);
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn maintenance_reconciliation_preserves_builtin_ids_assignments_and_external_refs() {
     let db = create_test_pool().await.unwrap();
     let core = PackFixture::new("core").create(&db).await.unwrap();
