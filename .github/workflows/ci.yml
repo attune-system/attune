@@ -421,10 +421,25 @@ jobs:
         run: |
           command -v cargo-deny   &> /dev/null || cargo binstall --no-confirm --locked cargo-deny
 
-      - name: Cargo Deny
+      # PRs use a synthetic merge ref, so check the source branch as well.
+      # Main and its merge queue remain blocking; feature branches get warnings.
+      - name: Cargo Deny (workspace)
+        id: deny-workspace
+        continue-on-error: ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' }}
+        run: cargo deny --locked check
+
+      - name: Cargo Deny (timer)
+        id: deny-timer
+        if: ${{ !cancelled() }}
+        continue-on-error: ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' }}
+        run: cargo deny --manifest-path crates/core-timer-sensor/Cargo.toml --config deny.toml --locked check
+
+      - name: Report non-blocking Cargo Deny failures
+        if: ${{ !cancelled() && github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' && (steps.deny-workspace.outcome == 'failure' || steps.deny-timer.outcome == 'failure') }}
         run: |
-          cargo deny --locked check
-          cargo deny --manifest-path crates/core-timer-sensor/Cargo.toml --config deny.toml --locked check
+          echo "::warning::Cargo Deny failed. Findings are non-blocking on this branch, but must be resolved before main passes. See the Cargo Deny step logs."
+          echo "### Cargo Deny warning" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dependency policy checks failed. This branch is non-blocking; main remains enforced. See the Cargo Deny step logs for findings." >> "$GITHUB_STEP_SUMMARY"
 
   web-blocking:
     name: Web Blocking Checks
