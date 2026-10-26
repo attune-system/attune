@@ -10723,17 +10723,7 @@ impl ExecutionScheduler {
     }
 
     async fn revert_scheduling_claim(pool: &PgPool, execution_id: i64) -> Result<()> {
-        if ExecutionRepository::update_if_status(
-            pool,
-            execution_id,
-            ExecutionStatus::Scheduling,
-            UpdateExecutionInput {
-                status: Some(ExecutionStatus::Requested),
-                ..Default::default()
-            },
-        )
-        .await?
-        .is_none()
+        if !attune_common::repositories::execution_admission::ExecutionAdmissionRepository::revert_prestart_workflow(pool, execution_id).await?
         {
             debug!(
                 "Execution {} left Scheduling before claim revert after workflow-start error",

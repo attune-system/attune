@@ -86,31 +86,52 @@ impl ExecutionAdmissionRepository {
         standard: Option<StandardConcurrencyAdmission>,
     ) -> Result<Option<AdmissionEnqueueOutcome>> {
         use crate::{models::PolicyMethod, resource_concurrency::resource_digest};
-        let mut tx = pool.begin().await?;
-        // The execution lock also excludes terminal transitions during admission.
-        let status: Option<String> =
-            sqlx::query_scalar("SELECT status::text FROM execution WHERE id = $1 FOR UPDATE")
-                .bind(execution_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if !status.as_deref().is_some_and(|status| {
-            matches!(status, "requested" | "scheduling" | "scheduled" | "running")
-        }) {
-            return Err(crate::Error::validation(
-                "Policy violation: execution is not eligible for admission",
-            ));
-        }
-        let retained = sqlx::query("SELECT policy_id, resource_group, active FROM execution_resource_admission WHERE execution_id = $1")
+        let (mut tx, retained, participant) = loop {
+            let mut tx = pool.begin().await?;
+            // The execution lock also excludes terminal transitions during admission.
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status::text FROM execution WHERE id = $1 FOR UPDATE")
+                    .bind(execution_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if !status.as_deref().is_some_and(|status| {
+                matches!(status, "requested" | "scheduling" | "scheduled" | "running")
+            }) {
+                return Err(crate::Error::validation(
+                    "Policy violation: execution is not eligible for admission",
+                ));
+            }
+            let retained = sqlx::query("SELECT policy_id, resource_group, active FROM execution_resource_admission WHERE execution_id = $1")
             .bind(execution_id).fetch_optional(&mut *tx).await?;
-        let participant = if retained
-            .as_ref()
-            .is_some_and(|entry| entry.get::<bool, _>("active"))
-        {
-            None
-        } else {
-            sqlx::query(
-            "SELECT p.id, p.ref, p.resource_concurrency, m.resource_parameter FROM policy p JOIN resource_concurrency_participant m ON m.policy_id = p.id JOIN action a ON a.ref = m.action_ref WHERE a.id = $1 AND p.effective_enabled AND p.retired_at IS NULL FOR UPDATE OF p"
-        ).bind(action_id).fetch_optional(&mut *tx).await?
+            let participant = if retained
+                .as_ref()
+                .is_some_and(|entry| entry.get::<bool, _>("active"))
+            {
+                None
+            } else {
+                let candidate: Option<Id> = sqlx::query_scalar(
+                "SELECT m.policy_id FROM resource_concurrency_participant m JOIN action a ON a.ref = m.action_ref WHERE a.id = $1"
+            ).bind(action_id).fetch_optional(&mut *tx).await?;
+                if let Some(policy_id) = candidate {
+                    sqlx::query("SELECT id FROM policy WHERE id = $1 FOR UPDATE")
+                        .bind(policy_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                }
+                // READ COMMITTED locking joins can return a new policy with old
+                // membership after waiting for an edit. Resolve membership in a
+                // fresh statement, and never use a replacement policy without its
+                // lock. Restart rather than accumulating locks in arbitrary order.
+                let current = sqlx::query(
+                "SELECT p.id, p.ref, p.resource_concurrency, m.resource_parameter FROM policy p JOIN resource_concurrency_participant m ON m.policy_id = p.id JOIN action a ON a.ref = m.action_ref WHERE a.id = $1 AND p.effective_enabled AND p.retired_at IS NULL"
+            ).bind(action_id).fetch_optional(&mut *tx).await?;
+                if current.as_ref().map(|row| row.get::<Id, _>("id")) != candidate {
+                    tx.rollback().await?;
+                    continue;
+                }
+                current
+            };
+            break (tx, retained, participant);
         };
 
         // Already admitted executions retain their original identity even after
@@ -363,6 +384,45 @@ impl ExecutionAdmissionRepository {
         execution_id: Id,
     ) -> Result<Option<AdmissionSlotReleaseOutcome>> {
         let mut tx = pool.begin().await?;
+        let outcome = Self::release_active_slot_in_tx(&mut tx, execution_id).await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Entry dispatch begins only after the parent leaves Scheduling for Running.
+    /// Lock that lifecycle boundary while reverting and releasing both slots.
+    pub async fn revert_prestart_workflow(pool: &PgPool, execution_id: Id) -> Result<bool> {
+        use crate::models::ExecutionStatus;
+        use crate::repositories::execution::{ExecutionRepository, UpdateExecutionInput};
+        let mut tx = pool.begin().await?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status::text FROM execution WHERE id = $1 FOR UPDATE")
+                .bind(execution_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if status.as_deref() != Some("scheduling") {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        ExecutionRepository::update_if_status(
+            &mut *tx,
+            execution_id,
+            ExecutionStatus::Scheduling,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Requested),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Self::release_active_slot_in_tx(&mut tx, execution_id).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn release_active_slot_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        execution_id: Id,
+    ) -> Result<Option<AdmissionSlotReleaseOutcome>> {
         // Scheduling failures before worker publication may return the execution
         // to Requested. Release both constraints, including shared-only owners.
         // Running/Canceling reservations can only be released by terminal state.
@@ -370,35 +430,32 @@ impl ExecutionAdmissionRepository {
             "SELECT EXISTS (SELECT 1 FROM execution_resource_admission WHERE execution_id = $1)",
         )
         .bind(execution_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if shared {
             let status: Option<String> =
                 sqlx::query_scalar("SELECT status::text FROM execution WHERE id = $1 FOR UPDATE")
                     .bind(execution_id)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(&mut **tx)
                     .await?;
             if matches!(status.as_deref(), Some("requested" | "scheduling")) {
                 sqlx::query("UPDATE execution_resource_admission SET active = false WHERE execution_id = $1")
-                    .bind(execution_id).execute(&mut *tx).await?;
+                    .bind(execution_id).execute(&mut **tx).await?;
                 tracing::info!(
                     execution_id,
                     "Shared resource pre-dispatch reservation released"
                 );
             }
         }
-        let Some(entry) = Self::find_execution_entry_for_update(&mut tx, execution_id).await?
-        else {
-            tx.commit().await?;
+        let Some(entry) = Self::find_execution_entry_for_update(tx, execution_id).await? else {
             return Ok(None);
         };
 
         if entry.status != "active" {
-            tx.commit().await?;
             return Ok(None);
         }
 
-        let state = Self::lock_existing_state(&mut tx, entry.action_id, entry.group_key.clone())
+        let state = Self::lock_existing_state(tx, entry.action_id, entry.group_key.clone())
             .await?
             .ok_or_else(|| {
                 crate::Error::internal("missing execution_admission_state for active execution")
@@ -406,14 +463,13 @@ impl ExecutionAdmissionRepository {
 
         sqlx::query("DELETE FROM execution_admission_entry WHERE execution_id = $1")
             .bind(execution_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
-        Self::increment_total_completed(&mut tx, state.id).await?;
+        Self::increment_total_completed(tx, state.id).await?;
 
-        let next_execution_id = Self::promote_next_queued(&mut tx, &state).await?;
-        Self::refresh_queue_stats(&mut tx, state.action_id).await?;
-        tx.commit().await?;
+        let next_execution_id = Self::promote_next_queued(tx, &state).await?;
+        Self::refresh_queue_stats(tx, state.action_id).await?;
 
         Ok(Some(AdmissionSlotReleaseOutcome {
             action_id: state.action_id,

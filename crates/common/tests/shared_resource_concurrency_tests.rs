@@ -12,7 +12,7 @@ use attune_common::{
             StandardConcurrencyAdmission,
         },
         maintenance::MaintenanceRepository,
-        Create, Update,
+        Create, FindById, Update,
     },
     test_database::TestDatabase,
 };
@@ -136,6 +136,224 @@ async fn finish(pool: &PgPool, id: i64, status: ExecutionStatus) {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn admission_revalidates_membership_after_blocked_policy_edit() {
+    for change in ["path", "remove", "disable", "reenable", "reassign"] {
+        let db = database().await;
+        let pool = db.pool();
+        let actions = actions(pool).await;
+        let p = PolicyRepository::create(pool, policy(&actions, PolicyMethod::Enqueue))
+            .await
+            .unwrap();
+        let mut replacement = policy(&actions, PolicyMethod::Enqueue);
+        replacement.r#ref = "test.replacement".into();
+        replacement.enabled = false;
+        let replacement = PolicyRepository::create(pool, replacement).await.unwrap();
+        let config = json!({"org_id":"old-org", "new_org":"same-org"});
+        let id = execution(pool, &actions[0], config.clone()).await;
+        let replica = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                pool.connect_options()
+                    .as_ref()
+                    .clone()
+                    .options([("search_path", db.schema())]),
+            )
+            .await
+            .unwrap();
+        let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&replica)
+            .await
+            .unwrap();
+        let mut editor = pool.begin().await.unwrap();
+        let editor_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *editor)
+            .await
+            .unwrap();
+        let mut spec = policy(&actions, PolicyMethod::Enqueue)
+            .resource_concurrency
+            .unwrap();
+        spec["participants"][0]["resource_parameter"] = json!("new_org");
+        if change == "remove" {
+            spec["participants"] = json!([spec["participants"][1].clone()]);
+        }
+        sqlx::query("UPDATE policy SET resource_concurrency = $2 WHERE id = $1")
+            .bind(p.id)
+            .bind(&spec)
+            .execute(&mut *editor)
+            .await
+            .unwrap();
+        if matches!(change, "disable" | "reenable" | "reassign") {
+            sqlx::query("UPDATE policy SET enabled = false WHERE id = $1")
+                .bind(p.id)
+                .execute(&mut *editor)
+                .await
+                .unwrap();
+        }
+        if change == "reenable" {
+            sqlx::query("UPDATE policy SET enabled = true WHERE id = $1")
+                .bind(p.id)
+                .execute(&mut *editor)
+                .await
+                .unwrap();
+        }
+        if change == "reassign" {
+            sqlx::query(
+                "UPDATE policy SET enabled = true, resource_concurrency = $2 WHERE id = $1",
+            )
+            .bind(replacement.id)
+            .bind(&spec)
+            .execute(&mut *editor)
+            .await
+            .unwrap();
+        }
+        let action = actions[0].clone();
+        let reader = replica.clone();
+        let pending = tokio::spawn(async move { admit(&reader, &action, id, &config).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT $2 = ANY(pg_blocking_pids($1))")
+                    .bind(reader_pid)
+                    .bind(editor_pid)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admission must wait on the uncommitted policy edit");
+        editor.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(change, "remove" | "disable") {
+            assert_eq!(outcome, None, "{change}");
+        } else {
+            assert_eq!(outcome, Some(Outcome::Acquired), "{change}");
+            let expected_policy = if change == "reassign" {
+                replacement.id
+            } else {
+                p.id
+            };
+            let actual: (i64, String) = sqlx::query_as("SELECT policy_id, resource_group FROM execution_resource_admission WHERE execution_id = $1")
+                .bind(id).fetch_one(pool).await.unwrap();
+            assert_eq!(
+                actual,
+                (
+                    expected_policy,
+                    attune_common::resource_concurrency::resource_digest(
+                        Some(&json!({"new_org":"same-org"})),
+                        "new_org"
+                    )
+                    .unwrap()
+                ),
+                "{change}"
+            );
+            let next_config = json!({"org_id":"different-old-org", "new_org":"same-org"});
+            let next = execution(pool, &actions[0], next_config.clone()).await;
+            assert_eq!(
+                admit(pool, &actions[0], next, &next_config).await,
+                Some(Outcome::Enqueued)
+            );
+        }
+        replica.close().await;
+        db.cleanup().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn workflow_prestart_compensation_releases_both_constraints_only_before_running() {
+    let db = database().await;
+    let pool = db.pool();
+    let actions = actions(pool).await;
+    PolicyRepository::create(pool, policy(&actions, PolicyMethod::Enqueue))
+        .await
+        .unwrap();
+    let config = json!({"org_id":"org"});
+    let owner = execution(pool, &actions[0], config.clone()).await;
+    finish(pool, owner, ExecutionStatus::Scheduling).await;
+    let standard = || {
+        Some(StandardConcurrencyAdmission {
+            limit: 1,
+            method: PolicyMethod::Enqueue,
+            group_key: None,
+        })
+    };
+    assert_eq!(
+        Admission::admit_shared_resource(
+            pool,
+            100,
+            actions[0].id,
+            owner,
+            Some(&config),
+            standard()
+        )
+        .await
+        .unwrap(),
+        Some(Outcome::Acquired)
+    );
+    assert!(Admission::revert_prestart_workflow(pool, owner)
+        .await
+        .unwrap());
+    assert_eq!(
+        ExecutionRepository::find_by_id(pool, owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Requested
+    );
+    assert_eq!(Admission::wait_status(pool, owner).await.unwrap(), None);
+    let active: bool = sqlx::query_scalar(
+        "SELECT active FROM execution_resource_admission WHERE execution_id = $1",
+    )
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!active);
+    assert!(!Admission::revert_prestart_workflow(pool, owner)
+        .await
+        .unwrap());
+    assert_eq!(
+        Admission::admit_shared_resource(
+            pool,
+            100,
+            actions[0].id,
+            owner,
+            Some(&config),
+            standard()
+        )
+        .await
+        .unwrap(),
+        Some(Outcome::Acquired)
+    );
+    for status in [ExecutionStatus::Running, ExecutionStatus::Canceling] {
+        finish(pool, owner, status).await;
+        assert!(!Admission::revert_prestart_workflow(pool, owner)
+            .await
+            .unwrap());
+        assert_eq!(
+            Admission::wait_status(pool, owner).await.unwrap(),
+            Some(true)
+        );
+        let active: bool = sqlx::query_scalar(
+            "SELECT active FROM execution_resource_admission WHERE execution_id = $1",
+        )
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(active);
+    }
+    db.cleanup().await.unwrap();
 }
 
 #[tokio::test]

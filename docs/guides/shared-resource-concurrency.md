@@ -65,6 +65,10 @@ occupancy never depends on a process-local counter. Locking is per policy, so
 admission transactions for different resources briefly serialize, but their
 running executions do not block one another.
 
+Admission resolves participant paths after acquiring the policy lock. If an
+edit moves the action to another policy while admission waits, it restarts and
+locks the new policy before resolving the resource identifier.
+
 `execution_resource_admission` associates each active reservation or waiting
 request with one execution. Its execution primary key makes duplicate messages
 idempotent. Queued requests consume no shared capacity. Standard completion and
@@ -92,8 +96,11 @@ executor logs record shared admission decisions.
 
 Workflow child actions acquire their own reservations through normal
 scheduling. A workflow parent acquires none unless its action explicitly
-participates. An explicitly participating parent holds its own reservation
-until terminal. Avoid assigning a parent and its children the same resource
+participates. A startup error that returns a parent from `scheduling` to
+`requested` releases both concurrency reservations in the same transaction.
+Once the parent is `running`, startup/dispatch errors retain capacity because
+child operations may already be in flight. Its reservation then lasts until
+terminal. Avoid assigning a parent and its children the same resource
 with a limit that prevents the children from running.
 
 ## Policy changes and operational limits
