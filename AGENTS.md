@@ -231,7 +231,7 @@ Use docs for specifics instead of expanding this file:
 - Never put raw secrets, token values, decrypted key material, or artifact content into audit-event details.
 
 ## Web UI Essentials
-- Generated API client lives under `web/src/api/`; regenerate with `npm run generate:api` when needed.
+- Generated API client lives under `web/src/api/`. After API contract changes or platform/API version bumps, run `npm run generate:api` and `npm run check:api` from `web/`, then commit the generated client changes. Verify that exported `web/openapi.json` `info.version` and `web/src/api/core/OpenAPI.ts` `VERSION` match `[workspace.package].version`; the JSON spec is ignored build output.
 - Dashboard runtime + authoring exist; use the dashboard types/contracts codepaths already in the repo.
 - Workflow builder edits the two-file workflow/action representation.
 - Execution detail pages include workflow timeline visualization driven by workflow definition + child executions.
