@@ -1701,6 +1701,9 @@ jobs:
             .
             --platform "${{ matrix.platform }}"
             --file "${{ matrix.image.dockerfile }}"
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}"
+            --label "org.opencontainers.image.revision=${{ github.sha }}"
+            --label "org.opencontainers.image.version=${{ needs.metadata.outputs.image_tag }}"
             --provenance=false
             --sbom=false
           )
@@ -1820,6 +1823,9 @@ jobs:
             .
             --platform "${{ matrix.platform }}"
             --file docker/Dockerfile.web
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}"
+            --label "org.opencontainers.image.revision=${{ github.sha }}"
+            --label "org.opencontainers.image.version=${{ needs.metadata.outputs.image_tag }}"
             --provenance=false
             --sbom=false
           )
