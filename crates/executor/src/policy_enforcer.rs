@@ -188,6 +188,12 @@ pub struct PolicyEnforcer {
 }
 
 impl PolicyEnforcer {
+    fn max_queue_length(&self) -> usize {
+        self.queue_manager
+            .as_ref()
+            .map(|queue| queue.max_queue_length())
+            .unwrap_or_else(|| crate::queue_manager::QueueConfig::default().max_queue_length)
+    }
     /// Create a new policy enforcer
     #[allow(dead_code)]
     pub fn new(pool: PgPool) -> Self {
@@ -306,7 +312,23 @@ impl PolicyEnforcer {
             return Err(anyhow::anyhow!("Policy violation: {}", violation));
         }
 
-        if let Some(concurrency) = self.resolve_concurrency_policy(action_id, pack_id).await? {
+        let concurrency = self.resolve_concurrency_policy(action_id, pack_id).await?;
+        let standard = concurrency.as_ref().map(|policy| {
+            attune_common::repositories::execution_admission::StandardConcurrencyAdmission {
+                limit: policy.limit,
+                method: policy.method,
+                group_key: self.build_parameter_group_key(&policy.parameters, config),
+            }
+        });
+        if let Some(outcome) = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::admit_shared_resource(
+            &self.pool, self.max_queue_length(), action_id, execution_id, config, standard,
+        ).await? {
+            return Ok(match outcome {
+                attune_common::repositories::execution_admission::AdmissionEnqueueOutcome::Acquired => SchedulingPolicyOutcome::Ready,
+                attune_common::repositories::execution_admission::AdmissionEnqueueOutcome::Enqueued => SchedulingPolicyOutcome::Queued,
+            });
+        }
+        if let Some(concurrency) = concurrency {
             let group_key = self.build_parameter_group_key(&concurrency.parameters, config);
 
             if let Some(queue_manager) = &self.queue_manager {
@@ -352,6 +374,34 @@ impl PolicyEnforcer {
         }
 
         Ok(SchedulingPolicyOutcome::Ready)
+    }
+
+    /// Preserve workflow standard-policy behavior while allowing an explicitly
+    /// participating workflow action to own a shared resource reservation.
+    pub async fn enforce_shared_for_workflow(
+        &self,
+        action_id: Id,
+        execution_id: Id,
+        config: Option<&JsonValue>,
+    ) -> Result<SchedulingPolicyOutcome> {
+        use attune_common::repositories::execution_admission::{
+            AdmissionEnqueueOutcome, ExecutionAdmissionRepository,
+        };
+        Ok(
+            match ExecutionAdmissionRepository::admit_shared_resource(
+                &self.pool,
+                self.max_queue_length(),
+                action_id,
+                execution_id,
+                config,
+                None,
+            )
+            .await?
+            {
+                Some(AdmissionEnqueueOutcome::Enqueued) => SchedulingPolicyOutcome::Queued,
+                _ => SchedulingPolicyOutcome::Ready,
+            },
+        )
     }
 
     async fn resolve_policy(&self, action_id: Id, pack_id: Option<Id>) -> Result<ExecutionPolicy> {
@@ -844,22 +894,9 @@ impl PolicyEnforcer {
 }
 
 fn extract_parameter_value(config: Option<&JsonValue>, path: &str) -> JsonValue {
-    let mut current = match config {
-        Some(value) => value,
-        None => return JsonValue::Null,
-    };
-
-    for segment in path.split('.') {
-        match current {
-            JsonValue::Object(map) => match map.get(segment) {
-                Some(next) => current = next,
-                None => return JsonValue::Null,
-            },
-            _ => return JsonValue::Null,
-        }
-    }
-
-    current.clone()
+    attune_common::resource_concurrency::parameter_value(config, path)
+        .cloned()
+        .unwrap_or(JsonValue::Null)
 }
 
 fn parse_policy_quotas(value: &JsonValue) -> Option<HashMap<String, u64>> {

@@ -7,6 +7,7 @@ import type { PaginationMeta } from "./PaginationMeta";
 import type { PolicyScopeResponse } from "./PolicyScopeResponse";
 import type { QuotaPolicyResponse } from "./QuotaPolicyResponse";
 import type { RateLimitPolicyResponse } from "./RateLimitPolicyResponse";
+import type { ResourceConcurrency } from "./ResourceConcurrency";
 /**
  * Paginated response wrapper
  */
@@ -25,6 +26,7 @@ export type PaginatedResponse_PolicySummary = {
     quotas: Array<QuotaPolicyResponse>;
     rate_limit?: null | RateLimitPolicyResponse;
     ref: string;
+    resource_concurrency?: null | ResourceConcurrency;
     retired_at?: string | null;
     scope: PolicyScopeResponse;
     tags: Array<string>;
