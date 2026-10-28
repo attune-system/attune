@@ -48,6 +48,10 @@ export class PacksService {
       id: number;
       name?: string | null;
       position: number;
+      /**
+       * Exact source origins mapped to redacted archive/Git request headers.
+       */
+      source_headers: Record<string, any>;
       updated: string;
       url: string;
     }>;
@@ -84,6 +88,10 @@ export class PacksService {
       id: number;
       name?: string | null;
       position: number;
+      /**
+       * Exact source origins mapped to redacted archive/Git request headers.
+       */
+      source_headers: Record<string, any>;
       updated: string;
       url: string;
     };
@@ -212,6 +220,10 @@ export class PacksService {
       id: number;
       name?: string | null;
       position: number;
+      /**
+       * Exact source origins mapped to redacted archive/Git request headers.
+       */
+      source_headers: Record<string, any>;
       updated: string;
       url: string;
     };

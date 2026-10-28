@@ -23,6 +23,7 @@ pub struct CreatePackRegistryIndexInput {
     pub position: Option<i32>,
     pub enabled: bool,
     pub headers: serde_json::Value,
+    pub source_headers: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -32,9 +33,11 @@ pub struct UpdatePackRegistryIndexInput {
     pub position: Option<i32>,
     pub enabled: Option<bool>,
     pub headers: Option<serde_json::Value>,
+    pub source_headers: Option<serde_json::Value>,
 }
 
-const COLUMNS: &str = "id, name, url, position, enabled, is_standard, headers, created, updated";
+const COLUMNS: &str =
+    "id, name, url, position, enabled, is_standard, headers, source_headers, created, updated";
 
 #[async_trait::async_trait]
 impl FindById for PackRegistryIndexRepository {
@@ -124,13 +127,14 @@ impl PackRegistryIndexRepository {
     {
         let url = normalize_url(&input.url)?;
         validate_encrypted_headers(&input.headers)?;
+        let source_headers = normalize_encrypted_source_headers(&input.source_headers)?;
         if matches!(input.position, Some(position) if position < 0) {
             return Err(Error::validation("Index position must be non-negative"));
         }
 
         let query = format!(
             r#"
-            INSERT INTO pack_registry_index (name, url, position, enabled, headers)
+            INSERT INTO pack_registry_index (name, url, position, enabled, headers, source_headers)
             VALUES (
                 $1,
                 $2,
@@ -145,7 +149,8 @@ impl PackRegistryIndexRepository {
                     )
                 ),
                 $4,
-                $5
+                $5,
+                $6
             )
             RETURNING {}
             "#,
@@ -157,6 +162,7 @@ impl PackRegistryIndexRepository {
             .bind(input.position)
             .bind(input.enabled)
             .bind(input.headers)
+            .bind(source_headers)
             .fetch_one(executor)
             .await
             .map_err(Into::into)
@@ -171,6 +177,11 @@ impl PackRegistryIndexRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let url = input.url.as_deref().map(normalize_url).transpose()?;
+        let source_headers = input
+            .source_headers
+            .as_ref()
+            .map(normalize_encrypted_source_headers)
+            .transpose()?;
         if let Some(headers) = &input.headers {
             validate_encrypted_headers(headers)?;
         }
@@ -188,7 +199,8 @@ impl PackRegistryIndexRepository {
                 url = COALESCE($4, url),
                 position = COALESCE($5, position),
                 enabled = COALESCE($6, enabled),
-                headers = COALESCE($7, headers)
+                headers = COALESCE($7, headers),
+                source_headers = COALESCE($8, source_headers)
             WHERE id = $1
             RETURNING {}
             "#,
@@ -202,6 +214,7 @@ impl PackRegistryIndexRepository {
             .bind(input.position)
             .bind(input.enabled)
             .bind(input.headers)
+            .bind(source_headers)
             .fetch_one(executor)
             .await
             .map_err(|e| match e {
@@ -258,6 +271,25 @@ fn validate_encrypted_headers(headers: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn normalize_encrypted_source_headers(
+    source_headers: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let origins = source_headers.as_object().ok_or_else(|| {
+        Error::validation(
+            "Managed source headers must be an object of origins and encrypted headers",
+        )
+    })?;
+    let mut normalized = serde_json::Map::new();
+    for (origin, headers) in origins {
+        let origin = crate::pack_registry::normalize_source_origin(origin)?;
+        validate_encrypted_headers(headers)?;
+        if normalized.insert(origin, headers.clone()).is_some() {
+            return Err(Error::validation("Duplicate source header origin"));
+        }
+    }
+    Ok(serde_json::Value::Object(normalized))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +317,26 @@ mod tests {
         .is_err());
         assert!(validate_encrypted_headers(&serde_json::json!("ciphertext")).is_ok());
         assert!(validate_encrypted_headers(&serde_json::json!("[REDACTED]")).is_err());
+    }
+
+    #[test]
+    fn managed_source_headers_require_exact_origins_and_encrypted_values() {
+        for invalid in [
+            serde_json::json!({"https://example.com/path": "ciphertext"}),
+            serde_json::json!({"http://example.com": "ciphertext"}),
+            serde_json::json!({"https://example.com": {"Authorization": "plaintext-secret"}}),
+            serde_json::json!({"https://example.com": "[REDACTED]"}),
+            serde_json::json!({"https://example.com": "one", "https://example.com:443/": "two"}),
+            serde_json::json!(null),
+        ] {
+            assert!(normalize_encrypted_source_headers(&invalid).is_err());
+        }
+        assert_eq!(
+            normalize_encrypted_source_headers(
+                &serde_json::json!({"HTTPS://EXAMPLE.COM.:443/": "ciphertext"})
+            )
+            .unwrap(),
+            serde_json::json!({"https://example.com": "ciphertext"})
+        );
     }
 }

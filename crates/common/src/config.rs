@@ -763,6 +763,10 @@ fn default_sensor_shutdown_timeout() -> u64 {
     30
 }
 
+/// Exact source origins mapped to HTTP headers for registry archives and Git clones.
+pub type RegistrySourceHeaders =
+    std::collections::HashMap<String, std::collections::HashMap<String, String>>;
+
 /// Pack registry index configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryIndexConfig {
@@ -780,9 +784,15 @@ pub struct RegistryIndexConfig {
     /// Human-readable registry name
     pub name: Option<String>,
 
-    /// Custom HTTP headers for authenticated registries
+    /// Custom HTTP headers for the index and its same-origin registry sources.
+    /// Never inherited by cross-origin sources or direct installs.
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+
+    /// Exact HTTPS origins mapped to archive/Git headers. Same-origin values
+    /// override index headers; other origins receive only their own headers.
+    #[serde(default)]
+    pub source_headers: RegistrySourceHeaders,
 }
 
 fn default_registry_priority() -> u32 {

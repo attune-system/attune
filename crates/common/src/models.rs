@@ -790,6 +790,7 @@ pub mod pack_registry_index {
         pub enabled: bool,
         pub is_standard: bool,
         pub headers: JsonDict,
+        pub source_headers: JsonDict,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }

@@ -3349,12 +3349,16 @@ fn encrypt_managed_headers_with_key(
         .unwrap_or_default();
     for (name, value) in &mut requested {
         if value == "[REDACTED]" {
-            *value = existing.get(name).cloned().ok_or_else(|| {
-                ApiError::BadRequest(format!(
-                    "Redacted registry header '{}' has no existing value",
-                    name
-                ))
-            })?;
+            *value = existing
+                .iter()
+                .find(|(existing_name, _)| existing_name.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "Redacted registry header '{}' has no existing value",
+                        name
+                    ))
+                })?;
         }
     }
     let plaintext = serde_json::to_value(requested)
@@ -3406,6 +3410,87 @@ fn plaintext_managed_headers(
     Ok(plaintext)
 }
 
+fn source_headers_from_json(
+    source_headers: serde_json::Value,
+) -> ApiResult<attune_common::config::RegistrySourceHeaders> {
+    let origins = source_headers.as_object().ok_or_else(|| {
+        ApiError::BadRequest(
+            "Source headers must be a JSON object keyed by HTTPS origin".to_string(),
+        )
+    })?;
+    let mut result = attune_common::config::RegistrySourceHeaders::new();
+    for (origin, headers) in origins {
+        let origin = attune_common::pack_registry::normalize_source_origin(origin)
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        if result
+            .insert(origin, headers_from_json(headers.clone())?)
+            .is_some()
+        {
+            return Err(ApiError::BadRequest(
+                "Duplicate source header origin".to_string(),
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn encrypt_managed_source_headers(
+    state: &AppState,
+    requested: serde_json::Value,
+    existing: Option<&serde_json::Value>,
+) -> ApiResult<serde_json::Value> {
+    if requested.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(requested);
+    }
+    encrypt_managed_source_headers_with_key(requested, existing, registry_encryption_key(state)?)
+}
+
+fn encrypt_managed_source_headers_with_key(
+    requested: serde_json::Value,
+    existing: Option<&serde_json::Value>,
+    encryption_key: &str,
+) -> ApiResult<serde_json::Value> {
+    let requested = source_headers_from_json(requested)?;
+    let existing = existing
+        .cloned()
+        .map(source_headers_from_json)
+        .transpose()?
+        .unwrap_or_default();
+    let mut encrypted = serde_json::Map::new();
+    for (origin, headers) in requested {
+        let existing_headers = existing
+            .get(&origin)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+        let headers = serde_json::to_value(headers)
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+        let value = if headers.as_object().is_some_and(serde_json::Map::is_empty) {
+            headers
+        } else {
+            encrypt_managed_headers_with_key(headers, existing_headers.as_ref(), encryption_key)?
+        };
+        encrypted.insert(origin, value);
+    }
+    Ok(serde_json::Value::Object(encrypted))
+}
+
+fn plaintext_managed_source_headers(
+    state: &AppState,
+    stored: &serde_json::Value,
+) -> ApiResult<serde_json::Value> {
+    let origins = stored.as_object().ok_or_else(|| {
+        ApiError::InternalServerError("Invalid stored source headers".to_string())
+    })?;
+    let mut plaintext = serde_json::Map::new();
+    for (origin, headers) in origins {
+        plaintext.insert(origin.clone(), plaintext_managed_headers(state, headers)?);
+    }
+    let plaintext = serde_json::Value::Object(plaintext);
+    source_headers_from_json(plaintext.clone())?;
+    Ok(plaintext)
+}
+
 async fn registry_index_response(
     state: &AppState,
     index: attune_common::models::PackRegistryIndex,
@@ -3413,8 +3498,11 @@ async fn registry_index_response(
     attune_common::pack_registry::validate_remote_pack_url(&index.url)
         .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
     let (index, headers) = decrypt_managed_headers(state, index).await?;
+    let source_headers = plaintext_managed_source_headers(state, &index.source_headers)?;
     Ok(PackRegistryIndexResponse::from_index_and_headers(
-        index, headers,
+        index,
+        headers,
+        source_headers,
     ))
 }
 
@@ -3467,6 +3555,10 @@ async fn effective_pack_registry(
             enabled: index.enabled,
             name: index.name,
             headers: headers_from_json(headers)?,
+            source_headers: source_headers_from_json(plaintext_managed_source_headers(
+                state,
+                &index.source_headers,
+            )?)?,
         });
     }
     if static_bootstrap_enabled {
@@ -3523,6 +3615,10 @@ async fn selected_managed_pack_registry(
         enabled: index.enabled,
         name: index.name,
         headers: headers_from_json(headers)?,
+        source_headers: source_headers_from_json(plaintext_managed_source_headers(
+            state,
+            &index.source_headers,
+        )?)?,
     }];
     Ok(EffectivePackRegistry {
         config,
@@ -3651,6 +3747,7 @@ pub async fn create_pack_index(
     authorize_global_pack_registry_action(&state, &user, Action::Configure).await?;
     let url = validate_managed_registry_url(&state, &request.url).await?;
     let headers = encrypt_managed_headers(&state, request.headers, None)?;
+    let source_headers = encrypt_managed_source_headers(&state, request.source_headers, None)?;
     let index = PackRegistryIndexRepository::create(
         &state.db,
         CreatePackRegistryIndexInput {
@@ -3659,6 +3756,7 @@ pub async fn create_pack_index(
             position: request.position,
             enabled: request.enabled,
             headers,
+            source_headers,
         },
     )
     .await?;
@@ -3731,6 +3829,17 @@ pub async fn update_pack_index(
             position: request.position,
             enabled: request.enabled,
             headers,
+            source_headers: match request.source_headers {
+                Some(requested) => Some(encrypt_managed_source_headers(
+                    &state,
+                    requested,
+                    Some(&plaintext_managed_source_headers(
+                        &state,
+                        &existing.source_headers,
+                    )?),
+                )?),
+                None => None,
+            },
         },
     )
     .await?;
@@ -3827,6 +3936,7 @@ fn emit_pack_index_audit(
                 "position": index.position,
                 "enabled": index.enabled,
                 "headers_configured": headers_configured,
+                "source_headers_configured": !index.source_headers.as_object().is_some_and(serde_json::Map::is_empty),
             }));
     if let Ok(identity_id) = user.identity_id() {
         builder = builder.actor_identity(identity_id);
@@ -6616,6 +6726,7 @@ mod tests {
                 enabled: true,
                 name: Some("Test".to_string()),
                 headers: Default::default(),
+                source_headers: Default::default(),
             }],
             approved_public_hosts: Vec::new(),
             approved_private_hosts: vec!["127.0.0.1".to_string()],
@@ -6797,6 +6908,53 @@ mod tests {
     }
 
     #[test]
+    fn managed_source_headers_encrypt_each_origin_and_bind_redactions_to_it() {
+        const KEY: &str = "0123456789abcdef0123456789abcdef";
+        let existing = serde_json::json!({
+            "https://artifacts.example.com": {"Authorization": "Bearer archive-secret"},
+            "https://git.example.com": {"Authorization": "Basic git-secret"}
+        });
+        let encrypted =
+            encrypt_managed_source_headers_with_key(existing.clone(), None, KEY).unwrap();
+        assert!(!encrypted.to_string().contains("archive-secret"));
+        assert!(!encrypted.to_string().contains("git-secret"));
+        for origin in ["https://artifacts.example.com", "https://git.example.com"] {
+            assert!(encrypted[origin].is_string());
+            assert_eq!(
+                attune_common::crypto::decrypt_json(&encrypted[origin], KEY).unwrap(),
+                existing[origin]
+            );
+        }
+
+        let requested = serde_json::json!({
+            "https://ARTIFACTS.example.com:443/": {
+                "authorization": "[REDACTED]",
+                "X-Api-Key": "rotated-key"
+            }
+        });
+        let updated =
+            encrypt_managed_source_headers_with_key(requested, Some(&existing), KEY).unwrap();
+        let decrypted =
+            attune_common::crypto::decrypt_json(&updated["https://artifacts.example.com"], KEY)
+                .unwrap();
+        assert_eq!(decrypted["authorization"], "Bearer archive-secret");
+        assert_eq!(decrypted["X-Api-Key"], "rotated-key");
+        assert!(updated.get("https://git.example.com").is_none());
+
+        assert!(encrypt_managed_source_headers_with_key(
+            serde_json::json!({"https://other.example.com": {"Authorization": "[REDACTED]"}}),
+            Some(&existing),
+            KEY,
+        )
+        .is_err());
+        assert_eq!(
+            encrypt_managed_source_headers_with_key(serde_json::json!({}), Some(&existing), KEY)
+                .unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
     fn standard_marker_controls_static_registry_bootstrap() {
         let now = chrono::Utc::now();
         let standard = attune_common::models::PackRegistryIndex {
@@ -6807,6 +6965,7 @@ mod tests {
             enabled: true,
             is_standard: true,
             headers: serde_json::json!({}),
+            source_headers: serde_json::json!({}),
             created: now,
             updated: now,
         };
@@ -6818,6 +6977,7 @@ mod tests {
             enabled: true,
             is_standard: false,
             headers: serde_json::json!({}),
+            source_headers: serde_json::json!({}),
             created: now,
             updated: now,
         };
@@ -6841,6 +7001,7 @@ mod tests {
                 enabled: false,
                 is_standard: true,
                 headers: serde_json::json!({}),
+                source_headers: serde_json::json!({}),
                 created: now,
                 updated: now,
             },
@@ -6852,6 +7013,7 @@ mod tests {
                 enabled: true,
                 is_standard: false,
                 headers: serde_json::json!({}),
+                source_headers: serde_json::json!({}),
                 created: now,
                 updated: now,
             },
@@ -6879,6 +7041,7 @@ mod tests {
                 enabled: true,
                 name: Some("Lower priority".to_string()),
                 headers: Default::default(),
+                source_headers: Default::default(),
             },
             attune_common::config::RegistryIndexConfig {
                 url: "https://company.example:443/index.json".to_string(),
@@ -6886,6 +7049,7 @@ mod tests {
                 enabled: true,
                 name: Some("Higher priority".to_string()),
                 headers: Default::default(),
+                source_headers: Default::default(),
             },
         ];
 
