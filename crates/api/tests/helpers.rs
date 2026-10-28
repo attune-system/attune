@@ -129,6 +129,28 @@ impl TestContext {
         Self::new_with_options(cache_admission, false, false, false, None, None).await
     }
 
+    /// Configure fixture-specific outbound policy before creating accounts or requests.
+    #[allow(dead_code)]
+    pub async fn with_pack_registry(
+        mut self,
+        registry: attune_common::config::PackRegistryConfig,
+    ) -> Result<Self> {
+        self.state
+            .reclamation_cancellation
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await?;
+        let mut config = self.state.config.as_ref().clone();
+        config.pack_registry = registry;
+        let state = Arc::new(attune_api::state::AppState::new_with_audit(
+            self.pool.clone(),
+            config,
+            self.audit_writer.as_ref().unwrap().emitter.clone(),
+        ));
+        self.app = attune_api::server::Server::new(state.clone()).router();
+        self.state = state;
+        Ok(self)
+    }
+
     #[allow(dead_code)]
     pub async fn new_without_registry_encryption_key() -> Result<Self> {
         Self::new_with_options(

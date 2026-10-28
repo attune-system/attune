@@ -223,9 +223,9 @@ impl PackInstaller {
 
         match source {
             PackSource::Git { url, git_ref } => {
-                self.install_from_git(&url, git_ref.as_deref()).await
+                self.install_from_git(&url, git_ref.as_deref(), None).await
             }
-            PackSource::Archive { url } => self.install_from_archive_url(&url, None).await,
+            PackSource::Archive { url } => self.install_from_archive_url(&url, None, None).await,
             PackSource::LocalDirectory { path } => self.install_from_local_directory(&path).await,
             PackSource::LocalArchive { path } => self.install_from_local_archive(&path).await,
             PackSource::Registry { pack_ref, version } => {
@@ -236,11 +236,17 @@ impl PackInstaller {
     }
 
     /// Install from git repository
-    async fn install_from_git(&self, url: &str, git_ref: Option<&str>) -> Result<InstalledPack> {
+    async fn install_from_git(
+        &self,
+        url: &str,
+        git_ref: Option<&str>,
+        registry_url: Option<&str>,
+    ) -> Result<InstalledPack> {
         if git_ref.is_some_and(|git_ref| git_ref.starts_with('-')) {
             return Err(Error::validation("Git refs must not start with '-'"));
         }
         let validated = self.validate_git_source(url).await?;
+        let headers = self.source_headers(registry_url, &validated.url)?;
         tracing::info!(
             source_url = %remote_url_origin_for_log(url),
             ?git_ref,
@@ -257,20 +263,15 @@ impl PackInstaller {
         let result = async {
             // Clone the repository
             let mut clone_cmd = Command::new("git");
+            let environment = crate::child_process_environment::ChildProcessEnvironment::capture(&[])?;
+            environment.apply(clone_cmd.as_std_mut());
             clone_cmd
                 .args(git_clone_arguments(&validated, &install_dir, git_ref)?)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_COUNT", "0")
                 .env("GIT_TERMINAL_PROMPT", "0")
-                .env_remove("GIT_SSL_NO_VERIFY")
-                .env_remove("HTTP_PROXY")
-                .env_remove("HTTPS_PROXY")
-                .env_remove("ALL_PROXY")
-                .env_remove("http_proxy")
-                .env_remove("https_proxy")
-                .env_remove("all_proxy")
                 .kill_on_drop(true);
+            super::source_headers::apply_git_source_headers(&mut clone_cmd, &validated.url, &headers)?;
 
             let output = tokio::time::timeout(self.install_timeout, clone_cmd.output())
                 .await
@@ -284,6 +285,7 @@ impl PackInstaller {
             // Checkout specific ref if provided
             if let Some(ref_spec) = git_ref {
                 let mut checkout_cmd = Command::new("git");
+                environment.apply(checkout_cmd.as_std_mut());
                 checkout_cmd
                     .arg("-C")
                     .arg(&install_dir)
@@ -340,6 +342,7 @@ impl PackInstaller {
         &self,
         url: &str,
         expected_checksum: Option<&str>,
+        registry_url: Option<&str>,
     ) -> Result<InstalledPack> {
         let url = crate::pack_registry::validate_remote_pack_url(url)?;
         tracing::info!(
@@ -348,7 +351,7 @@ impl PackInstaller {
         );
 
         // Download the archive
-        let archive_path = self.download_archive(url.as_str()).await?;
+        let archive_path = self.download_archive(url.as_str(), registry_url).await?;
         let result = async {
             // Verify checksum if provided
             let mut checksum_verified = false;
@@ -537,14 +540,17 @@ impl PackInstaller {
             .iter()
             .find(|source| matches!(source, InstallSource::Archive { .. }))
             .cloned();
-        let mut installed = match self.install_registry_source(install_source.clone()).await {
+        let mut installed = match self
+            .install_registry_source(install_source.clone(), &registry_url)
+            .await
+        {
             Ok(installed) => installed,
             Err(git_error) if matches!(install_source, InstallSource::Git { .. }) => {
                 let Some(archive) = fallback_archive else {
                     return Err(git_error);
                 };
                 tracing::warn!("Git pack source failed; trying verified archive fallback");
-                match self.install_registry_source(archive).await {
+                match self.install_registry_source(archive, &registry_url).await {
                     Ok(installed) => installed,
                     Err(archive_error) => {
                         return Err(Error::internal(format!(
@@ -566,6 +572,7 @@ impl PackInstaller {
     async fn install_registry_source(
         &self,
         install_source: InstallSource,
+        registry_url: &str,
     ) -> Result<InstalledPack> {
         match install_source {
             InstallSource::Git {
@@ -573,11 +580,14 @@ impl PackInstaller {
                 git_ref,
                 checksum,
             } => {
-                let installed = self.install_from_git(&url, git_ref.as_deref()).await?;
+                let installed = self
+                    .install_from_git(&url, git_ref.as_deref(), Some(registry_url))
+                    .await?;
                 self.verify_registry_git_install(installed, &checksum).await
             }
             InstallSource::Archive { url, checksum } => {
-                self.install_from_archive_url(&url, Some(&checksum)).await
+                self.install_from_archive_url(&url, Some(&checksum), Some(registry_url))
+                    .await
             }
         }
     }
@@ -633,15 +643,30 @@ impl PackInstaller {
         Ok(pack_entry.install_sources[0].clone())
     }
 
-    /// Download an archive from a URL
-    async fn download_archive(&self, url: &str) -> Result<PathBuf> {
+    /// Direct sources have no registry credential context.
+    fn source_headers(
+        &self,
+        registry_url: Option<&str>,
+        source_url: &Url,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        match (&self.registry_client, registry_url) {
+            (Some(client), Some(registry_url)) => client.source_headers(registry_url, source_url),
+            _ => Ok(Default::default()),
+        }
+    }
+
+    /// Download an archive through the pinned outbound client without redirects.
+    async fn download_archive(&self, url: &str, registry_url: Option<&str>) -> Result<PathBuf> {
         let validated = self.outbound_policy.validate(url).await?;
         let parsed_url = validated.url.clone();
         // The policy structurally validates the URL, rejects special addresses, disables
         // redirects/proxies, and pins the checked DNS answers into this reqwest client.
-        let response = validated
-            .client
-            .get(validated.url)
+        let headers = self.source_headers(registry_url, &validated.url)?;
+        let mut request = validated.client.get(validated.url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| Error::internal(format!("Failed to download archive: {}", e)))?;
@@ -1023,6 +1048,151 @@ mod tests {
         archive.into_inner().unwrap().finish().unwrap()
     }
 
+    fn serve_test_archive(
+        listener: tokio::net::TcpListener,
+        archive: Vec<u8>,
+        require_auth: bool,
+    ) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let byte = stream.read_u8().await.unwrap();
+                    request.push(byte);
+                    assert!(request.len() < 16 * 1024);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                let authenticated = request.contains("authorization: bearer registry-test\r\n")
+                    && request.contains("x-api-key: registry-key\r\n");
+                let status = if require_auth && !authenticated {
+                    "401 Unauthorized"
+                } else {
+                    "200 OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    archive.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(&archive).await.unwrap();
+                request
+            })
+            .await
+            .expect("archive fixture timed out")
+        })
+    }
+
+    fn authenticated_registry_config(index_url: &str) -> PackRegistryConfig {
+        PackRegistryConfig {
+            indices: vec![crate::config::RegistryIndexConfig {
+                url: index_url.to_string(),
+                priority: 0,
+                enabled: true,
+                name: None,
+                headers: std::collections::HashMap::from([
+                    (
+                        "Authorization".to_string(),
+                        "Bearer registry-test".to_string(),
+                    ),
+                    ("X-Api-Key".to_string(), "registry-key".to_string()),
+                ]),
+                source_headers: Default::default(),
+            }],
+            approved_public_hosts: Vec::new(),
+            approved_private_hosts: vec!["127.0.0.1".to_string()],
+            allow_http: true,
+            ..Default::default()
+        }
+    }
+
+    fn test_archive_entry(url: &str, checksum: &str) -> PackIndexEntry {
+        serde_json::from_value(serde_json::json!({
+            "ref": "registry-test",
+            "label": "Registry Test",
+            "description": "test",
+            "version": "1.2.3",
+            "author": "Test",
+            "license": "MIT",
+            "keywords": [],
+            "runtime_deps": [],
+            "install_sources": [{"type": "archive", "url": url, "checksum": checksum}],
+            "contents": {
+                "actions": [], "sensors": [], "triggers": [], "rules": [], "workflows": []
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_archive_inherits_same_origin_index_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let index_url = format!("http://{address}/index.json");
+        let archive = test_pack_archive();
+        let checksum_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(checksum_file.path(), &archive).unwrap();
+        let checksum = format!(
+            "sha256:{}",
+            calculate_file_checksum(checksum_file.path()).unwrap()
+        );
+        let server = serve_test_archive(listener, archive, true);
+        let temp = tempfile::tempdir().unwrap();
+        let installer =
+            PackInstaller::new(temp.path(), Some(authenticated_registry_config(&index_url)))
+                .await
+                .unwrap();
+
+        let result = installer
+            .install_resolved_registry_pack(
+                test_archive_entry(&format!("http://{address}/pack.tar.gz"), &checksum),
+                index_url,
+            )
+            .await;
+        let request = server.await.unwrap();
+
+        assert!(request.contains("authorization: bearer registry-test\r\n"));
+        assert!(request.contains("x-api-key: registry-key\r\n"));
+        let installed = result.unwrap();
+        assert!(installed.checksum_verified);
+        assert!(installed.path.join("pack.yaml").is_file());
+    }
+
+    #[tokio::test]
+    async fn registry_archive_does_not_send_index_headers_to_another_port() {
+        let index_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let index_url = format!("http://{}/index.json", index_listener.local_addr().unwrap());
+        let archive_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let archive_url = format!(
+            "http://{}/pack.tar.gz",
+            archive_listener.local_addr().unwrap()
+        );
+        let archive = test_pack_archive();
+        let checksum_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(checksum_file.path(), &archive).unwrap();
+        let checksum = format!(
+            "sha256:{}",
+            calculate_file_checksum(checksum_file.path()).unwrap()
+        );
+        let server = serve_test_archive(archive_listener, archive, false);
+        let temp = tempfile::tempdir().unwrap();
+        let installer =
+            PackInstaller::new(temp.path(), Some(authenticated_registry_config(&index_url)))
+                .await
+                .unwrap();
+
+        let result = installer
+            .install_resolved_registry_pack(test_archive_entry(&archive_url, &checksum), index_url)
+            .await;
+        let request = server.await.unwrap();
+
+        assert!(!request.contains("authorization:"));
+        assert!(!request.contains("x-api-key:"));
+        assert!(result.unwrap().checksum_verified);
+    }
+
     #[tokio::test]
     async fn test_checksum_parsing() {
         let checksum = Checksum::parse("sha256:abc123def456").unwrap();
@@ -1311,7 +1481,7 @@ mod tests {
             .await
             .unwrap();
         assert!(installer
-            .install_from_git("https://example.com/repo.git", Some("--config"))
+            .install_from_git("https://example.com/repo.git", Some("--config"), None)
             .await
             .unwrap_err()
             .to_string()
@@ -1371,7 +1541,11 @@ mod tests {
         let installer = PackInstaller::new(temp.path(), Some(config)).await.unwrap();
 
         let error = installer
-            .install_from_git("https://127.0.0.1:1/unavailable.git", Some("deadbeef"))
+            .install_from_git(
+                "https://127.0.0.1:1/unavailable.git",
+                Some("deadbeef"),
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -1519,7 +1693,11 @@ mod tests {
         let installer = PackInstaller::new(temp.path(), Some(config)).await.unwrap();
 
         let installed = installer
-            .install_from_archive_url(&format!("http://{address}/pack.tar.gz"), Some(&checksum))
+            .install_from_archive_url(
+                &format!("http://{address}/pack.tar.gz"),
+                Some(&checksum),
+                None,
+            )
             .await
             .unwrap();
         server.await.unwrap();
@@ -1585,6 +1763,7 @@ mod tests {
             .install_from_archive_url(
                 &format!("http://{address}/pack.tar.gz"),
                 Some(&format!("sha256:{}", "0".repeat(64))),
+                None,
             )
             .await
             .unwrap_err();

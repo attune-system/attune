@@ -62,7 +62,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
 # rest of docker/ and packaging/ after compilation so harness-only changes do
 # not invalidate the expensive workspace test build.
 COPY crates/ ./crates/
+COPY tests/fixtures/tls.rs ./tests/fixtures/tls.rs
 COPY web/src/test/fixtures/form-requests.json ./web/src/test/fixtures/form-requests.json
+COPY web/src/test/fixtures/permission-grant-options.json ./web/src/test/fixtures/permission-grant-options.json
 COPY migrations/ ./migrations/
 COPY docker/extract-rust-test-artifacts.py ./docker/extract-rust-test-artifacts.py
 COPY docker/run-migrations.sh ./docker/run-migrations.sh

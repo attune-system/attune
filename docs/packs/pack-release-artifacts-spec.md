@@ -932,9 +932,17 @@ bytes and therefore requires a new release version.
 
 ### Credentials
 
-Index credentials and artifact-host credentials are separate secrets. Attune
-MUST NOT forward index request headers to archive hosts by default. An operator
-may configure host-bound credentials for a specific artifact origin.
+Archive downloads and Git clones from the selected index's own origin reuse its configured
+request headers. The scheme, hostname, and effective port MUST all match;
+matching only the hostname is insufficient. An operator may configure
+`source_headers` for exact HTTPS origins on that index. Same-origin source
+headers add to or override index headers case-insensitively. Cross-origin
+sources receive only their explicitly configured source headers, never the
+index headers. Direct installs receive no registry headers. Attune MUST NOT
+borrow credentials from another configured index. Downloaded index JSON cannot
+extend this configuration. Outbound host/network approval remains required
+independently. API-managed source headers are encrypted and redacted on read.
+Git secret headers MUST NOT appear in process arguments.
 All remote paths reuse the existing outbound client with redirects disabled,
 DNS/IP validation, pinned resolved addresses, and proxy bypass. Credentials are
 bound to scheme, host, and port and never copied from the index to another
@@ -1646,7 +1654,7 @@ subsequent specification revision changes the contract.
 | JAR distribution | Self-contained JAR for MVP | Avoids Maven resolution and mutable dependency downloads |
 | Java classpath | Explicit ordered entries, no globs | Keeps command construction deterministic |
 | Signature enforcement | Detached archive evidence, mandatory independent core lock | Avoids recursive signing and index-only bootstrap trust |
-| Private source auth | Host-bound artifact credentials | Prevents index credentials leaking to another origin |
+| Private source auth | Same-origin inheritance and explicit per-origin source headers | Prevents index credentials leaking to other origins |
 | Required content health | Platform-only internal readiness, separate content gate | Keeps bootstrap and repair API calls reachable |
 | Omitted components | Per-install `remove`, `disable`, or `retain` policy | Preserves stable IDs and operator overrides while letting deployments choose admission behavior |
 | Ownership migration | Coordinated maintenance with compatibility epoch | Prevents old loaders deleting newly platform-owned rows |

@@ -162,7 +162,8 @@ Each registry hosts an **index file** (typically `index.json`) that catalogs ava
 ### Configured Index Ordering
 
 The web client's **Manage Pack Indices** dialog configures each managed index's
-name, direct HTTPS JSON URL, enabled state, and HTTP headers. **Edit** changes an
+name, direct HTTPS JSON URL, enabled state, HTTP headers, and origin-specific
+source headers. **Edit** changes an
 existing index. Header values are encrypted on the server and returned as
 `[REDACTED]`; leaving that value in an edited header preserves the stored value.
 An empty header object removes all configured headers.
@@ -221,7 +222,7 @@ The API exposes the configured index and browse surfaces under:
 | Endpoint | Description |
 |----------|-------------|
 | `GET /api/v1/pack-indices` | List API-managed indices in search order |
-| `POST /api/v1/pack-indices` | Add an index (`url`, optional `name`, `position`, `enabled`, `headers`); omitted `position` appends to the end |
+| `POST /api/v1/pack-indices` | Add an index (`url`, optional `name`, `position`, `enabled`, `headers`, `source_headers`); omitted `position` appends to the end |
 | `PUT /api/v1/pack-indices/{id}` | Update an index |
 | `DELETE /api/v1/pack-indices/{id}` | Delete an index |
 | `GET /api/v1/pack-indices/packs?q=...` | Browse de-duplicated indexed packs using first-index-wins order |
@@ -442,9 +443,23 @@ For authenticated registries, configure custom HTTP headers:
 
 Index and pack-source URLs must not contain query parameters. Put index
 credentials in validated headers so they can be encrypted and redacted rather
-than logged or persisted as part of a URL. Authenticated pack-source downloads
-do not currently support custom headers and must use another supported delivery
-model. Migration 26 strips query strings from managed-index and pack-provenance
+than logged or persisted as part of a URL. Registry archive downloads reuse the
+selected index's configured headers when the source URL has the same
+origin as that index URL: scheme, hostname, and effective port must all match.
+Paths may differ, and an explicit default port matches an omitted default port.
+Headers are never borrowed from another configured index, even on the same
+origin. Use `source_headers` to configure additional or replacement headers for
+archive downloads and Git clones from this index. Keys are exact HTTPS origins,
+with only a scheme, hostname, and optional port. Paths, wildcards, query
+parameters, fragments, and credentials are rejected. Header names are
+case-insensitive. On the index's own origin, source headers override matching
+index headers and add new ones. On other origins, only the explicitly configured
+source headers are sent; index credentials are never inherited. Unlisted origins
+receive no headers. Other ports and subdomains are not implicitly trusted.
+This operator-managed configuration is not read from downloaded index JSON.
+Source headers do not bypass outbound host/network approval. Direct archive
+and Git installs never inherit registry headers. Redirects remain disabled.
+Migration 26 strips query strings from managed-index and pack-provenance
 URLs, disables affected indices for review, and limits audit redaction to the
 `source` field of `pack.installed` events. Operators upgrading from versions
 that accepted query credentials must still review stored URLs and rotate those
@@ -458,11 +473,21 @@ pack_registry:
       headers:
         Authorization: "Bearer replace-with-literal-token"
         X-Custom-Header: "value"
+      source_headers:
+        https://artifacts.example.com:
+          Authorization: "Bearer separate-artifact-token"
+          X-Custom-Header: "archive-value"
+        https://git.example.com:8443:
+          Authorization: "Basic replace-with-encoded-git-credentials"
 ```
 
 Attune YAML values are literal: `${TOKEN}` placeholders are not interpolated.
 Prefer API-managed headers supplied from a secret store; they are encrypted at
-rest and redacted on read.
+rest and redacted on read. API-managed `source_headers` are encrypted per origin
+and redacted in the same way. When editing, `[REDACTED]` preserves a stored value
+only for the same origin and header. Use an empty `source_headers` object to
+remove all source overrides. Git receives secret headers through environment
+configuration, not command arguments.
 
 ---
 
@@ -1050,7 +1075,6 @@ Future enhancement: GPG signature verification for pack archives:
 
 ### Version 1.3
 
-- **Private pack authentication**: Token-based authentication for private packs
 - **Pack mirroring**: Automatic mirroring of registry indices for redundancy
 - **Delta updates**: Only download changed files when updating packs
 

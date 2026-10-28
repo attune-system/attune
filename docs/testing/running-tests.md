@@ -56,6 +56,28 @@ native stack limit is unchanged. The Windows CLI workflow runs the same script.
 
 ## Docker-owned integration runs
 
+### Private pack-source authentication
+
+The normal API suite includes managed-index HTTPS Git installation and
+authenticated Git-to-archive fallback, plus synchronized source-header rotation,
+preservation, and removal tests. Run these against an owned test database:
+
+```bash
+ATTUNE_TEST_RUN_ID=source-auth1 cargo test -p attune-api --test pack_registry_tests source_auth:: -- --test-threads=4
+ATTUNE_TEST_RUN_ID=source-races1 cargo test -p attune-api --test pack_registry_tests source_header_races:: -- --test-threads=4
+```
+
+The HTTPS cases run on Unix and require Git, Python 3, `/bin/sh`, and IPv4/IPv6
+loopback. Each test starts private HTTPS origins and a fresh test subprocess
+with an isolated CA bundle. A test-only Git launcher supplies that CA to the
+real Git process and records its arguments; it does not supply credentials or
+disable certificate verification. No host trust stores or process-global
+environments are changed. The PostgreSQL tests observe actual advisory-lock
+waiters to order requests, rather than using fixed sleeps. These tests are not
+ignored and run in the standard CI API suite and Docker Rust-test image.
+
+### Runner commands
+
 Use the runner scripts rather than raw Compose. They generate or require explicit run identities, refuse existing project resources before startup/build, remove only stacks they started, and do not publish fixed host ports.
 
 ```bash

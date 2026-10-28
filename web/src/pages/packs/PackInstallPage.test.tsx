@@ -26,6 +26,9 @@ const index = {
   position: 0,
   enabled: true,
   headers: { Authorization: "[REDACTED]" },
+  source_headers: {
+    "https://artifacts.example.com": { Authorization: "[REDACTED]" },
+  },
   created: "2026-09-30T00:00:00Z",
   updated: "2026-09-30T00:00:00Z",
 };
@@ -276,6 +279,11 @@ it("sends the configured source, enabled state, and authentication headers on cr
   fireEvent.change(screen.getByLabelText("HTTP headers"), {
     target: { value: '{"Authorization":"Bearer test-value"}' },
   });
+  fireEvent.change(screen.getByLabelText("Source headers by origin"), {
+    target: {
+      value: '{"https://git.example.com":{"Authorization":"Basic git-token"}}',
+    },
+  });
   await userEvent.click(
     screen.getByRole("checkbox", {
       name: "Enabled for pack discovery and installation",
@@ -289,6 +297,9 @@ it("sends the configured source, enabled state, and authentication headers on cr
         url: "https://registry.example.com/new.json",
         enabled: false,
         headers: { Authorization: "Bearer test-value" },
+        source_headers: {
+          "https://git.example.com": { Authorization: "Basic git-token" },
+        },
       },
     }),
   );
@@ -306,6 +317,9 @@ it("allows editing without replacing stored redacted credentials", async () => {
   expect(screen.getByLabelText("HTTP headers")).toHaveValue(
     JSON.stringify(index.headers, null, 2),
   );
+  expect(screen.getByLabelText("Source headers by origin")).toHaveValue(
+    JSON.stringify(index.source_headers, null, 2),
+  );
   fireEvent.change(screen.getByLabelText("Index URL"), {
     target: { value: "https://registry.example.com/main/index.json" },
   });
@@ -318,6 +332,7 @@ it("allows editing without replacing stored redacted credentials", async () => {
         url: "https://registry.example.com/main/index.json",
         enabled: true,
         headers: { Authorization: "[REDACTED]" },
+        source_headers: index.source_headers,
       },
     }),
   );
@@ -367,6 +382,7 @@ it("keeps the edit form's enabled state consistent after toggling its index", as
         name: "Renamed index",
         url: index.url,
         headers: index.headers,
+        source_headers: index.source_headers,
         enabled: false,
       },
     }),
@@ -403,6 +419,22 @@ it("rejects non-string header values before submitting", async () => {
   expect(create).not.toHaveBeenCalled();
 });
 
+it("rejects non-string source header values before submitting", async () => {
+  const create = vi.spyOn(PacksService, "createPackIndex");
+  await openIndices();
+  fireEvent.change(screen.getByLabelText("Index URL"), {
+    target: { value: "https://registry.example.com/new.json" },
+  });
+  fireEvent.change(screen.getByLabelText("Source headers by origin"), {
+    target: { value: '{"https://git.example.com":{"Authorization":42}}' },
+  });
+  await userEvent.click(screen.getByRole("button", { name: "Add Index" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "HTTP header values must all be strings",
+  );
+  expect(create).not.toHaveBeenCalled();
+});
+
 it("allows clearing the name and headers when editing", async () => {
   const update = vi
     .spyOn(PacksService, "updatePackIndex")
@@ -417,6 +449,9 @@ it("allows clearing the name and headers when editing", async () => {
   fireEvent.change(screen.getByLabelText("HTTP headers"), {
     target: { value: "{}" },
   });
+  fireEvent.change(screen.getByLabelText("Source headers by origin"), {
+    target: { value: "{}" },
+  });
   await userEvent.click(screen.getByRole("button", { name: "Save index" }));
   await waitFor(() =>
     expect(update).toHaveBeenCalledWith({
@@ -426,6 +461,7 @@ it("allows clearing the name and headers when editing", async () => {
         url: index.url,
         enabled: true,
         headers: {},
+        source_headers: {},
       },
     }),
   );
