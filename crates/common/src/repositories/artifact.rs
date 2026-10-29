@@ -2208,7 +2208,11 @@ impl ArtifactVersionRepository {
              FROM artifact_version WHERE artifact=$1 RETURNING {}", artifact_version::SELECT_COLUMNS))
             .bind(artifact).bind(execution).bind(backend == crate::models::LogStreamBackend::ObjectSegments)
             .bind(meta).fetch_one(&mut *connection).await?;
-        let path = compute_file_path(reference, version.version, "text/plain")?;
+        let path = format!(
+            "files/versions/{}/{}",
+            version.id,
+            compute_file_path(reference, version.version, "text/plain")?
+        );
         Self::update_file_path(connection, version.id, &path).await?;
         version.file_path = Some(path);
         Ok(version)
@@ -2266,7 +2270,11 @@ impl ArtifactVersionRepository {
                 Err(error) => return Err(error),
             }
         };
-        let file_path = compute_file_path(artifact_ref, version.version, &content_type)?;
+        let file_path = format!(
+            "files/versions/{}/{}",
+            version.id,
+            compute_file_path(artifact_ref, version.version, &content_type)?
+        );
         Self::update_file_path(executor, version.id, &file_path).await?;
         version.file_path = Some(file_path);
         Ok(version)

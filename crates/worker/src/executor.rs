@@ -39,7 +39,7 @@ use attune_common::repositories::execution_secret_value::ExecutionSecretValueRep
 use attune_common::repositories::runtime::WorkerRepository;
 use attune_common::repositories::runtime::SELECT_COLUMNS as RUNTIME_SELECT_COLUMNS;
 use attune_common::repositories::runtime_version::RuntimeVersionRepository;
-use attune_common::repositories::{Create, FindById, FindByRef, Update};
+use attune_common::repositories::{FindById, FindByRef, Update};
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::secret_values::{
     prepare_secret_values, redact_bound_action_result, ENTITY_EXECUTION_RESULT,
@@ -1622,71 +1622,66 @@ impl ActionExecutor {
         let content_type = default_content_type_for_artifact(ArtifactType::FileText);
         let classification = classify_artifact(&artifact_ref, ArtifactType::FileText);
 
-        let artifact = match ArtifactRepository::find_by_ref(pool, &artifact_ref).await? {
-            Some(existing) => {
-                if existing.retention_policy != retention.policy
-                    || existing.retention_limit != retention.limit
-                    || existing.classification != classification
-                    || existing.visibility != ArtifactVisibility::Private
-                {
-                    ArtifactRepository::update(
-                        pool,
-                        existing.id,
-                        UpdateArtifactInput {
-                            visibility: Some(ArtifactVisibility::Private),
-                            classification: Some(classification),
-                            retention_policy: Some(retention.policy),
-                            retention_limit: Some(retention.limit),
-                            ..Default::default()
-                        },
-                    )
-                    .await?
-                } else {
-                    existing
-                }
-            }
-            None => {
-                ArtifactRepository::create(
-                    pool,
-                    CreateArtifactInput {
-                        r#ref: artifact_ref.clone(),
-                        scope: OwnerType::Action,
-                        owner: execution.action_ref.clone(),
-                        r#type: ArtifactType::FileText,
-                        visibility: ArtifactVisibility::Private,
-                        classification,
-                        retention_policy: retention.policy,
-                        retention_limit: retention.limit,
-                        name: Some(format!("{} {}", execution.action_ref, stream.as_str())),
-                        description: Some(format!(
-                            "Captured {} for action '{}' (retention: {:?} {})",
-                            stream.as_str(),
-                            execution.action_ref,
-                            retention.policy,
-                            retention.limit
-                        )),
-                        content_type: Some(content_type.clone()),
-                        data: None,
-                    },
-                )
-                .await?
-            }
-        };
-
-        let version = ArtifactVersionRepository::create_log_pending(
-            pool,
+        let mut transaction = pool.begin().await?;
+        let artifact = ArtifactRepository::create_or_get(
+            &mut transaction,
+            CreateArtifactInput {
+                r#ref: artifact_ref.clone(),
+                scope: OwnerType::Action,
+                owner: execution.action_ref.clone(),
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification,
+                retention_policy: retention.policy,
+                retention_limit: retention.limit,
+                name: Some(format!("{} {}", execution.action_ref, stream.as_str())),
+                description: Some(format!(
+                    "Captured {} for action '{}' (retention: {:?} {})",
+                    stream.as_str(),
+                    execution.action_ref,
+                    retention.policy,
+                    retention.limit
+                )),
+                content_type: Some(content_type.clone()),
+                data: None,
+            },
+        )
+        .await?;
+        // Match version-writer lock order before changing parent metadata.
+        let artifact = ArtifactRepository::find_by_id_for_update(&mut transaction, artifact.id)
+            .await?
+            .ok_or_else(|| Error::Internal("Log artifact disappeared during allocation".into()))?;
+        if artifact.retention_policy != retention.policy
+            || artifact.retention_limit != retention.limit
+            || artifact.classification != classification
+            || artifact.visibility != ArtifactVisibility::Private
+        {
+            ArtifactRepository::update(
+                &mut *transaction,
+                artifact.id,
+                UpdateArtifactInput {
+                    visibility: Some(ArtifactVisibility::Private),
+                    classification: Some(classification),
+                    retention_policy: Some(retention.policy),
+                    retention_limit: Some(retention.limit),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        let version = ArtifactVersionRepository::create_log_pending_with_conn(
+            &mut transaction,
             artifact.id,
             &artifact.r#ref,
             backend,
-            content_type,
-            Some(execution.id),
-            Some(serde_json::json!({
+            execution.id,
+            serde_json::json!({
                 "stream": stream.as_str(),
                 "execution_id": execution.id,
-            })),
-            Some("worker".to_string()),
+            }),
         )
         .await?;
+        transaction.commit().await?;
 
         info!(
             execution_id = execution.id,
@@ -2428,8 +2423,85 @@ mod tests {
     use attune_common::auth::jwt::{generate_execution_token, validate_token, JwtConfig};
     use attune_common::config::Config;
     use attune_common::models::enums::ArtifactClassification;
+    use attune_common::repositories::Create;
     use attune_common::test_database::TestDatabase;
     use chrono::Utc;
+
+    #[tokio::test]
+    async fn concurrent_first_log_allocations_share_one_artifact_and_distinct_paths() {
+        use attune_common::repositories::execution::CreateExecutionInput;
+        use attune_common::repositories::List;
+        use std::collections::HashSet;
+
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let directory = tempfile::tempdir().unwrap();
+        let transport = VolumeTransport::new(directory.path().to_str().unwrap());
+        let action_ref = "test.concurrent_log_first_allocation";
+        let mut executions = Vec::new();
+        for _ in 0..10 {
+            executions.push(
+                ExecutionRepository::create(
+                    database.pool(),
+                    CreateExecutionInput {
+                        action_ref: action_ref.into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let start = tokio::sync::Barrier::new(executions.len());
+        let allocations = futures::future::join_all(executions.iter().map(|execution| {
+            let (database, directory, transport, start) =
+                (&database, &directory, &transport, &start);
+            async move {
+                start.wait().await;
+                ActionExecutor::allocate_execution_log_artifact_with(
+                    database.pool(),
+                    directory.path(),
+                    transport,
+                    execution,
+                    LogRetentionSettings {
+                        policy: RetentionPolicyType::Versions,
+                        limit: 1,
+                    },
+                    ExecutionLogArtifactStream::Stderr,
+                    LogStreamBackend::SharedFile,
+                )
+                .await
+                .unwrap()
+            }
+        }))
+        .await;
+        let artifacts = ArtifactRepository::list(database.pool()).await.unwrap();
+        assert_eq!(
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.owner == action_ref)
+                .count(),
+            1,
+            "Concurrent first executions must not create duplicate log artifact rows"
+        );
+        let paths: HashSet<_> = allocations.iter().map(|(_, path, _)| path).collect();
+        assert_eq!(paths.len(), executions.len());
+        for (_, path, version) in allocations {
+            assert_eq!(
+                ArtifactVersionRepository::find_unique_by_file_path(database.pool(), &path)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                version
+            );
+        }
+        database.cleanup().await.unwrap();
+    }
 
     #[tokio::test]
     async fn finalization_preserves_zero_byte_file_version() {
