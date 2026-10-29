@@ -33,6 +33,7 @@ pub struct PgListener {
     channels: Vec<String>,
     ignore_close_event: bool,
     eager_reconnect: bool,
+    abort_on_drop: bool,
 }
 
 /// An asynchronous notification from Postgres.
@@ -72,6 +73,7 @@ impl PgListener {
             channels: Vec::new(),
             ignore_close_event: false,
             eager_reconnect: true,
+            abort_on_drop: false,
         })
     }
 
@@ -109,6 +111,15 @@ impl PgListener {
     /// have been.
     pub fn eager_reconnect(&mut self, val: bool) {
         self.eager_reconnect = val;
+    }
+
+    /// Close dedicated listener sockets directly on drop or detected I/O failure.
+    ///
+    /// Unlike normal cleanup, this does not spawn a task to send `UNLISTEN` or
+    /// return the connection to the pool. Use when a broken connection must be
+    /// discarded without waiting for the server, including after cancellation.
+    pub fn abort_on_drop(&mut self) {
+        self.abort_on_drop = true;
     }
 
     /// Starts listening for notifications on a channel.
@@ -291,8 +302,12 @@ impl PgListener {
                 {
                     if let Some(mut conn) = self.connection.take() {
                         self.buffer_tx = conn.inner.stream.notifications.take();
-                        // Close the connection in a background task, so we can continue.
-                        conn.close_on_drop();
+                        if self.abort_on_drop {
+                            drop(conn.detach());
+                        } else {
+                            // Close the connection in a background task, so we can continue.
+                            conn.close_on_drop();
+                        }
                     }
 
                     if self.eager_reconnect {
@@ -357,6 +372,10 @@ impl PgListener {
 impl Drop for PgListener {
     fn drop(&mut self) {
         if let Some(mut conn) = self.connection.take() {
+            if self.abort_on_drop {
+                drop(conn.detach());
+                return;
+            }
             let fut = async move {
                 let _ = conn.execute("UNLISTEN *").await;
 
