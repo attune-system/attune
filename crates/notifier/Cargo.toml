@@ -55,5 +55,6 @@ uuid = { workspace = true }
 dashmap = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 mockall = { workspace = true }
 tempfile = { workspace = true }
