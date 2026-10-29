@@ -674,6 +674,91 @@ mod runtime_read_result_tests {
     }
 }
 
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    const KEY: &str = "synthetic-recorded-secret-encryption-key";
+
+    #[test]
+    fn recorded_secret_fingerprint_survives_serialization_and_restoration() {
+        let origin = serde_json::to_string(&crate::secret_provenance::SecretProvenance {
+            origins: vec![crate::repositories::runtime_read::RuntimeReadRepository::reference(42)],
+            templates: Vec::new(),
+        })
+        .unwrap();
+        let prepared = prepare_secret_values(
+            vec![SecretValueInput {
+                json_path: "/credential".into(),
+                value: json!({"token": "synthetic-only"}),
+                source_kind: "provenance".into(),
+                source_ref: Some(origin.clone()),
+            }],
+            KEY,
+        )
+        .unwrap();
+        let serialized = serde_json::to_value(&prepared).unwrap();
+        let decoded: Vec<PreparedSecretValue> = serde_json::from_value(serialized).unwrap();
+        let mut stored: Vec<StoredSecretValue> = decoded
+            .into_iter()
+            .map(|field| StoredSecretValue {
+                json_path: field.json_path,
+                encrypted_value: field.encrypted_value,
+                encryption_key_hash: Some(field.encryption_key_hash),
+                source_kind: field.source_kind,
+                source_ref: field.source_ref,
+            })
+            .collect();
+        assert_eq!(stored[0].source_ref.as_deref(), Some(origin.as_str()));
+        assert_eq!(
+            stored[0].encryption_key_hash.as_deref(),
+            Some(crypto::hash_encryption_key(KEY).as_str())
+        );
+        let redacted = json!({"credential": redaction_marker(), "public": 7});
+        assert_eq!(
+            restore_secret_values(redacted.clone(), &stored, KEY).unwrap(),
+            json!({"credential": {"token": "synthetic-only"}, "public": 7})
+        );
+        assert!(restore_secret_values(
+            redacted.clone(),
+            &stored,
+            "different-synthetic-server-secret-32"
+        )
+        .is_err());
+        stored[0].encryption_key_hash = Some(crypto::hash_encryption_key(
+            "different-synthetic-server-secret-32",
+        ));
+        assert!(restore_secret_values(redacted, &stored, KEY).is_err());
+    }
+
+    #[test]
+    fn old_fingerprint_requires_explicit_conversion_but_ciphertext_is_unchanged() {
+        let value = json!("historical-synthetic-secret");
+        let encrypted = crypto::encrypt_json(&value, KEY).unwrap();
+        let old_hash: String = Sha256::digest(KEY.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut stored = vec![StoredSecretValue {
+            json_path: String::new(),
+            encrypted_value: encrypted.clone(),
+            encryption_key_hash: Some(old_hash),
+            source_kind: "local".into(),
+            source_ref: None,
+        }];
+        assert!(restore_secret_values(redaction_marker(), &stored, KEY).is_err());
+        assert_eq!(crypto::decrypt_json(&encrypted, KEY).unwrap(), value);
+        // Only the verifier changes. This is not a populated-store migration.
+        stored[0].encryption_key_hash = Some(crypto::hash_encryption_key(KEY));
+        assert_eq!(
+            restore_secret_values(redaction_marker(), &stored, KEY).unwrap(),
+            value
+        );
+        assert_eq!(stored[0].encrypted_value, encrypted);
+    }
+}
+
 pub fn merge_schema_secret_redactions(
     value: JsonValue,
     existing_sources: &[SecretPathSource],

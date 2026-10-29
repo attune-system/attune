@@ -8,7 +8,7 @@ use attune_common::repositories::{
 #[tokio::test]
 async fn initial_and_linked_next_file_pins_keep_actual_frontier_epoch_and_physical_entries_until_settlement(
 ) {
-    super::native_storage_custody_case(true).await;
+    super::native_storage_custody_case(true, false).await;
 }
 
 pub(super) async fn capture_linked_cache(

@@ -933,7 +933,6 @@ async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
 #[ignore = "integration test - requires PostgreSQL and versioned S3 storage"]
 async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames() -> Result<()> {
     use attune_common::{
-        crypto,
         repositories::{
             execution_secret_value::ExecutionSecretValueRepository,
             identity::UpdatePermissionSetInput,
@@ -952,7 +951,7 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
         .encryption_key
         .as_deref()
         .ok_or("fixture encryption key missing")?;
-    let key = KeyRepository::create(
+    let key = KeyRepository::create_encrypted_in_pool(
         harness.database.pool(),
         CreateKeyInput {
             local_ref: "object_stream_origin".into(),
@@ -966,9 +965,10 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
             owner_sensor_ref: None,
             name: "Object stream fixture origin".into(),
             encrypted: true,
-            encryption_key_hash: Some(crypto::hash_encryption_key(encryption)),
-            value: crypto::encrypt_json(&serde_json::json!("owned input fixture"), encryption)?,
+            encryption_key_hash: None,
+            value: serde_json::json!("owned input fixture"),
         },
+        encryption,
     )
     .await?;
     let provenance = SecretProvenance::key(attune_common::key_access::key_origin(&key));

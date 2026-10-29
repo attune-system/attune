@@ -93,7 +93,7 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
     )
     .await
     .unwrap();
-    let key = KeyRepository::create(
+    let key = KeyRepository::create_encrypted_in_pool(
         &db,
         CreateKeyInput {
             local_ref: format!("worker_input_{}", pack.id),
@@ -107,10 +107,10 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
             owner_sensor_ref: None,
             name: "Accepted input".into(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(ENCRYPTION_KEY)),
-            value: attune_common::crypto::encrypt_json(&json!("accepted value"), ENCRYPTION_KEY)
-                .unwrap(),
+            encryption_key_hash: None,
+            value: json!("accepted value"),
         },
+        ENCRYPTION_KEY,
     )
     .await
     .unwrap();

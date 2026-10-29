@@ -252,6 +252,39 @@ impl Create for KeyRepository {
     }
 }
 
+impl KeyRepository {
+    /// Reserve identity before encryption. No placeholder or plaintext row is inserted.
+    /// Pass the caller's transaction for atomic schema/authority changes.
+    pub async fn create_encrypted(
+        conn: &mut sqlx::PgConnection,
+        mut input: CreateKeyInput,
+        master: &str,
+    ) -> Result<Key> {
+        if !input.encrypted || input.encryption_key_hash.is_some() {
+            return Err(crate::Error::validation(
+                "Encrypted Key creation requires plaintext input and no supplied fingerprint",
+            ));
+        }
+        let id: i64 = sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('key', 'id'))")
+            .fetch_one(&mut *conn)
+            .await?;
+        input.value = crate::crypto::keystore::encrypt_json(&input.value, master, id)?;
+        input.encryption_key_hash = Some(crate::crypto::keystore::fingerprint(master, id)?);
+        sqlx::query_as::<_, Key>(
+            "INSERT INTO key (id, local_ref, owner_type, owner_identity, owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted, encryption_key_hash, value) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted, encryption_key_hash, value, created, updated"
+        ).bind(id).bind(&input.local_ref).bind(input.owner_type).bind(input.owner_identity).bind(input.owner_pack).bind(&input.owner_pack_ref).bind(input.owner_action).bind(&input.owner_action_ref).bind(input.owner_sensor).bind(&input.owner_sensor_ref).bind(&input.name).bind(input.encrypted).bind(&input.encryption_key_hash).bind(&input.value).fetch_one(&mut *conn).await.map_err(Into::into)
+    }
+
+    pub async fn create_encrypted_in_pool(
+        pool: &sqlx::PgPool,
+        input: CreateKeyInput,
+        master: &str,
+    ) -> Result<Key> {
+        let mut conn = pool.acquire().await?;
+        Self::create_encrypted(&mut conn, input, master).await
+    }
+}
+
 #[async_trait::async_trait]
 impl Update for KeyRepository {
     type UpdateInput = UpdateKeyInput;

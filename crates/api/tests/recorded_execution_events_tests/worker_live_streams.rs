@@ -62,7 +62,7 @@ impl WorkerLog {
             .encryption_key
             .as_deref()
             .unwrap();
-        let key = KeyRepository::create(
+        let key = KeyRepository::create_encrypted_in_pool(
             &fixture.ctx.pool,
             CreateKeyInput {
                 local_ref: format!("accepted_live_{}", uuid::Uuid::new_v4().simple()),
@@ -76,12 +76,10 @@ impl WorkerLog {
                 owner_sensor_ref: None,
                 name: "Accepted live input".into(),
                 encrypted: true,
-                encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption)),
-                value: attune_common::crypto::encrypt_json(
-                    &json!("accepted-input-value"),
-                    encryption,
-                )?,
+                encryption_key_hash: None,
+                value: json!("accepted-input-value"),
             },
+            encryption,
         )
         .await?;
         grant_human(
@@ -367,7 +365,7 @@ impl WorkerLog {
             .encryption_key
             .as_deref()
             .unwrap();
-        let key = KeyRepository::create(
+        let key = KeyRepository::create_encrypted_in_pool(
             &fixture.ctx.pool,
             CreateKeyInput {
                 local_ref: format!("live_worker_{}", self.execution),
@@ -381,12 +379,10 @@ impl WorkerLog {
                 owner_sensor_ref: None,
                 name: "Worker live source".into(),
                 encrypted: true,
-                encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption)),
-                value: attune_common::crypto::encrypt_json(
-                    &json!("worker-late-key-value"),
-                    encryption,
-                )?,
+                encryption_key_hash: None,
+                value: json!("worker-late-key-value"),
             },
+            encryption,
         )
         .await?;
         let response = fixture
@@ -872,7 +868,7 @@ async fn foreign_worker_log_uses_fixed_execution_artifact_and_key_origin_approva
             .encryption_key
             .as_deref()
             .unwrap();
-        let key = KeyRepository::create(
+        let key = KeyRepository::create_encrypted_in_pool(
             &fixture.ctx.pool,
             CreateKeyInput {
                 local_ref: "fixed_foreign_live_source".into(),
@@ -886,12 +882,10 @@ async fn foreign_worker_log_uses_fixed_execution_artifact_and_key_origin_approva
                 owner_sensor_ref: None,
                 name: "Fixed foreign source".into(),
                 encrypted: true,
-                encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption)),
-                value: attune_common::crypto::encrypt_json(
-                    &json!("fixed-foreign-source-value"),
-                    encryption,
-                )?,
+                encryption_key_hash: None,
+                value: json!("fixed-foreign-source-value"),
             },
+            encryption,
         )
         .await?;
         let mut grants = exact_log_grants(&log);

@@ -327,7 +327,7 @@ impl FilePutRecovery {
         self.token
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, sqlx::FromRow)]
 struct Node {
     kind: String,
     id: i64,
@@ -881,6 +881,85 @@ impl Closure {
 }
 
 impl FileEvidenceRetentionRepository {
+    /// Read-only maintenance proof. Reuses the same typed bounded traversal as
+    /// retention, but cannot create pins, readmit evidence or acquire authority.
+    pub(in crate::repositories) async fn encryption_conversion_evidence(
+        conn: &mut PgConnection,
+        version: i64,
+    ) -> Result<usize> {
+        let (root, reservation, state): (i64, Value, String) = sqlx::query_as(
+            "SELECT root_read,reservation,evidence_state FROM file_evidence_owner WHERE version=$1",
+        )
+        .bind(version)
+        .fetch_one(&mut *conn)
+        .await?;
+        if state != "retained" {
+            return Err(denied());
+        }
+        let origin = RuntimeReadRepository::find(&mut *conn, root).await?;
+        let sources = reservation
+            .get("receipts")
+            .and_then(Value::as_array)
+            .ok_or_else(denied)?;
+        let digest =
+            crate::value_schema::digest(&serde_json::json!({"origin":origin,"receipts":sources}))
+                .map_err(|_| denied())?;
+        if reservation.get("source_digest").and_then(Value::as_str) != Some(digest.as_str()) {
+            return Err(denied());
+        }
+        let mut closure = Closure::default();
+        closure.charge(&reservation)?;
+        closure.rows(sources.len())?;
+        for source in sources {
+            if source.get("source_kind").and_then(Value::as_str) == Some("provenance") {
+                let provenance: SecretProvenance = serde_json::from_str(
+                    source
+                        .get("source_ref")
+                        .and_then(Value::as_str)
+                        .ok_or_else(denied)?,
+                )?;
+                closure.origins(&provenance, 0)?;
+            }
+        }
+        closure.push("execution_runtime_read_origin", root, 0)?;
+        while let Some((node, depth)) = closure.pop()? {
+            if depth > 32 {
+                return Err(denied());
+            }
+            if !closure.seen.insert(node.clone()) {
+                continue;
+            }
+            if closure.seen.len() + closure.proof_rows > MAX_NODES {
+                return Err(denied());
+            }
+            Self::expand(conn, &node, depth, &mut closure).await?;
+        }
+        let rows: Vec<Node> = sqlx::query_as(
+            "SELECT kind,source AS id,NULLIF(source_created,'-infinity'::TIMESTAMPTZ) AS created,NULLIF(source_generation,0) AS generation FROM file_evidence_pin WHERE owner=$1"
+        ).bind(version).fetch_all(&mut *conn).await?;
+        let actual: BTreeSet<Node> = rows.into_iter().collect();
+        if actual != closure.seen
+            || closure
+                .pending_cache_origins
+                .iter()
+                .any(|origin| !closure.cache_audit_origins.contains(origin))
+            || closure
+                .pending_iteration_origins
+                .iter()
+                .any(|origin| !closure.iteration_archive_origins.contains(origin))
+            || closure
+                .pending_success_metadata_origins
+                .iter()
+                .any(|origin| !closure.success_metadata_origins.contains(origin))
+            || closure
+                .pending_wait_completion_origins
+                .iter()
+                .any(|origin| !closure.wait_completion_origins.contains(origin))
+        {
+            return Err(denied());
+        }
+        Ok(closure.bytes)
+    }
     /// Caller entered exclusive graph admission BEFORE source/target locks.
     /// Epoch rows are independent historical identities, not live source grants.
     pub async fn collect_cache_epochs(conn: &mut PgConnection, limit: i64) -> Result<u64> {

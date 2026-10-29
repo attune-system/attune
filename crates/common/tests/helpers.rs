@@ -1642,8 +1642,8 @@ impl KeyFixture {
         self
     }
 
-    pub async fn create(self, pool: &PgPool) -> Result<Key> {
-        let input = key::CreateKeyInput {
+    fn into_input(self) -> key::CreateKeyInput {
+        key::CreateKeyInput {
             local_ref: self.local_ref,
             owner_type: self.owner_type,
             owner_identity: self.owner_identity,
@@ -1657,8 +1657,18 @@ impl KeyFixture {
             encrypted: self.encrypted,
             encryption_key_hash: self.encryption_key_hash,
             value: self.value,
-        };
+        }
+    }
 
-        KeyRepository::create(pool, input).await
+    pub async fn create(self, pool: &PgPool) -> Result<Key> {
+        KeyRepository::create(pool, self.into_input()).await
+    }
+
+    /// The fixture value is plaintext; identity is reserved before encryption.
+    pub async fn create_encrypted(self, pool: &PgPool, master: &str) -> Result<Key> {
+        let mut input = self.into_input();
+        input.encrypted = true;
+        input.encryption_key_hash = None;
+        KeyRepository::create_encrypted_in_pool(pool, input, master).await
     }
 }

@@ -52,6 +52,19 @@ pub(super) struct ResultViewSource {
     pub(super) mappings: Vec<NativeResultPointerMapping>,
 }
 
+pub(super) fn convert_encryption_metadata(
+    source: &mut ResultViewSource,
+    conversion: &crate::repositories::encryption_conversion::VerifierConversion<'_>,
+) -> Result<()> {
+    validate_storage(source)?;
+    for contributor in &source.contributors {
+        contributor.validate()?;
+    }
+    super::encryption_conversion::fields(&mut source.fields, conversion)?;
+    source.version["ciphertext_digest"] = json!(hash(&serde_json::to_value(&source.fields)?)?);
+    validate_storage(source)
+}
+
 pub struct PreparedNativeResultView {
     pub(crate) transaction: String,
     pub(crate) renderer: Id,

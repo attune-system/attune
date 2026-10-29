@@ -44,6 +44,7 @@ pub mod dashboard;
 pub mod dashboard_iam;
 pub mod declared_input;
 pub mod declared_input_materialization;
+pub mod encryption_conversion;
 pub mod entity_history;
 pub mod event;
 pub mod event_origin;
