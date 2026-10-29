@@ -357,7 +357,7 @@ async fn late_key(fixture: &Fixture, log: &PendingLog) -> Result<Id> {
         .encryption_key
         .as_deref()
         .unwrap();
-    let key = KeyRepository::create(
+    let key = KeyRepository::create_encrypted_in_pool(
         &fixture.ctx.pool,
         CreateKeyInput {
             local_ref: "live_late_key".into(),
@@ -371,9 +371,10 @@ async fn late_key(fixture: &Fixture, log: &PendingLog) -> Result<Id> {
             owner_sensor_ref: None,
             name: "Late SDK key".into(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption_key)),
-            value: attune_common::crypto::encrypt_json(&json!("late-key-value"), encryption_key)?,
+            encryption_key_hash: None,
+            value: json!("late-key-value"),
         },
+        encryption_key,
     )
     .await?;
     let response = fixture

@@ -378,7 +378,6 @@ async fn fixture_with_key_actions(
 
 async fn create_signing_target(ctx: &TestContext) -> Result<()> {
     use attune_common::{
-        crypto,
         models::OwnerType,
         repositories::key::{CreateKeyInput, KeyRepository},
     };
@@ -388,7 +387,7 @@ async fn create_signing_target(ctx: &TestContext) -> Result<()> {
         "profiles":{"test":{"issuer":"approved-client","audience":"https://example.test",
             "subjects":["approved-subject"],"pack_refs":["recorded_emitter"],"max_ttl_seconds":120}}
     });
-    KeyRepository::create(
+    KeyRepository::create_encrypted_in_pool(
         &ctx.pool,
         CreateKeyInput {
             local_ref: "recorded_signer".into(),
@@ -402,9 +401,10 @@ async fn create_signing_target(ctx: &TestContext) -> Result<()> {
             owner_sensor_ref: None,
             name: "Recorded signer".into(),
             encrypted: true,
-            encryption_key_hash: Some(crypto::hash_encryption_key(encryption)),
-            value: crypto::encrypt_json(&value, encryption)?,
+            encryption_key_hash: None,
+            value,
         },
+        encryption,
     )
     .await?;
     Ok(())
@@ -732,8 +732,8 @@ async fn fixture_with_original_input_deadlines(
             models::OwnerType,
             repositories::key::{CreateKeyInput, KeyRepository},
         };
-        let original = KeyRepository::create(
-            &mut *tx,
+        let original = KeyRepository::create_encrypted(
+            &mut tx,
             CreateKeyInput {
                 local_ref: local_ref.into(),
                 owner_type: OwnerType::Pack,
@@ -746,9 +746,10 @@ async fn fixture_with_original_input_deadlines(
                 owner_sensor_ref: None,
                 name: "Original file input".into(),
                 encrypted: true,
-                encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption)),
-                value: attune_common::crypto::encrypt_json(&json!(value), encryption)?,
+                encryption_key_hash: None,
+                value: json!(value),
             },
+            encryption,
         )
         .await?;
         // Actual original caller consent, captured before the accepted seal.
@@ -3326,7 +3327,6 @@ async fn recorded_key_creation_checks_real_ownership_before_uniqueness_and_survi
 async fn recorded_key_mutations_require_selected_local_rights_and_preserve_material_disclosure_checks(
 ) -> Result<()> {
     use attune_common::{
-        crypto,
         models::OwnerType,
         repositories::key::{CreateKeyInput, KeyRepository},
     };
@@ -3351,12 +3351,21 @@ async fn recorded_key_mutations_require_selected_local_rights_and_preserve_mater
         owner_sensor_ref: None,
         name: "Mutation fixture".into(),
         encrypted: true,
-        encryption_key_hash: Some(crypto::hash_encryption_key(encryption)),
-        value: crypto::encrypt_json(&json!("protected original"), encryption).unwrap(),
+        encryption_key_hash: None,
+        value: json!("protected original"),
     };
-    let local = KeyRepository::create(&fixture.ctx.pool, input("mutable", OwnerType::Pack)).await?;
-    let foreign =
-        KeyRepository::create(&fixture.ctx.pool, input("not_mutable", OwnerType::System)).await?;
+    let local = KeyRepository::create_encrypted_in_pool(
+        &fixture.ctx.pool,
+        input("mutable", OwnerType::Pack),
+        encryption,
+    )
+    .await?;
+    let foreign = KeyRepository::create_encrypted_in_pool(
+        &fixture.ctx.pool,
+        input("not_mutable", OwnerType::System),
+        encryption,
+    )
+    .await?;
     IdentityRepository::update(
         &fixture.ctx.pool,
         fixture.requester,

@@ -94,6 +94,29 @@ impl AcceptedContributorManifest {
     }
 }
 type Contributor = AcceptedContributorManifest;
+
+/// Only the typed ciphertext fields change. Config/schema/contributor payloads
+/// are deliberately opaque, even if user JSON resembles encryption metadata.
+pub(in crate::repositories) fn convert_encryption_metadata(
+    value: &Value,
+    conversion: &super::encryption_conversion::VerifierConversion<'_>,
+) -> Result<Value> {
+    let mut body: Body = serde_json::from_value(value.clone())?;
+    if serde_json::to_value(&body)? != *value {
+        return Err(denied());
+    }
+    controls::validate(&body)?;
+    for contributor in &body.contributors {
+        contributor.validate()?;
+    }
+    for field in &mut body.fields {
+        field.provenance()?;
+        conversion.field(&field.encrypted_value, &mut field.encryption_key_hash)?;
+    }
+    let converted = serde_json::to_value(body)?;
+    bounded(&converted)?;
+    Ok(converted)
+}
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Body {

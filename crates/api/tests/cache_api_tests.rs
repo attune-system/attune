@@ -2571,7 +2571,7 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Resu
         .encryption_key
         .as_deref()
         .expect("test encryption key");
-    let own_key = KeyRepository::create(
+    let own_key = KeyRepository::create_encrypted_in_pool(
         &ctx.pool,
         CreateKeyInput {
             local_ref: "sensor_credentials".to_string(),
@@ -2585,12 +2585,10 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Resu
             owner_sensor_ref: None,
             name: "Sensor credentials".to_string(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption_key)),
-            value: attune_common::crypto::encrypt_json(
-                &json!({"token": "sensor-secret"}),
-                encryption_key,
-            )?,
+            encryption_key_hash: None,
+            value: json!({"token": "sensor-secret"}),
         },
+        encryption_key,
     )
     .await?;
     let other_key = KeyRepository::create(

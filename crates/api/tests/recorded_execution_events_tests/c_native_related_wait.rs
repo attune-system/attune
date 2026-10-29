@@ -289,8 +289,8 @@ pub(super) async fn related_wait(
         action:Some(leaf.id),action_ref:leaf.r#ref.clone(),parent:Some(root.id),status:ExecutionStatus::Running,config:Some(json!({})),
         permission_set_refs:producer_refs.clone(),workflow_task:Some(serde_json::from_value(json!({"workflow_execution":workflow.id,"task_name":"producer","retry_count":0,"max_retries":0,"timed_out":false}))?),..Default::default()
     },&leaf_pin).await?;
-    let original = KeyRepository::create(
-        &mut *tx,
+    let original = KeyRepository::create_encrypted(
+        &mut tx,
         CreateKeyInput {
             local_ref: "c_related_original".into(),
             owner_type: OwnerType::Pack,
@@ -303,9 +303,10 @@ pub(super) async fn related_wait(
             owner_sensor_ref: None,
             name: "Original related source".into(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(key)),
-            value: attune_common::crypto::encrypt_json(&json!("related-wait-original"), key)?,
+            encryption_key_hash: None,
+            value: json!("related-wait-original"),
         },
+        key,
     )
     .await?;
     let original_provenance =
@@ -1102,9 +1103,10 @@ pub(super) async fn related_wait(
         &fixture.ctx.pool,
         original.id,
         UpdateKeyInput {
-            value: Some(attune_common::crypto::encrypt_json(
+            value: Some(attune_common::crypto::keystore::encrypt_json(
                 &json!("wrong-current-value"),
                 key,
+                original.id,
             )?),
             ..Default::default()
         },

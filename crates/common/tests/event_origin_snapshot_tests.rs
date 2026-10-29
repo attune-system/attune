@@ -1,3 +1,5 @@
+#[path = "support/encryption_compatibility.rs"]
+mod encryption_compatibility;
 mod helpers;
 use attune_common::{
     event_schema::EventSchemaBinding,
@@ -97,6 +99,9 @@ async fn partition_twins_keep_distinct_schema_ciphertext_and_template_origins() 
         .unwrap();
     assert_ne!(first_source, second_source);
     tx.commit().await.unwrap();
+    // Convert both immutable snapshots and their direct field copies, without
+    // conflating events that share an ID across two partition identities.
+    encryption_compatibility::legacy_upgrade_roundtrip(&db, key).await;
     let tables: Vec<i64> =
         sqlx::query_scalar("SELECT tableoid::BIGINT FROM event WHERE id = $1 ORDER BY created")
             .bind(first.id)

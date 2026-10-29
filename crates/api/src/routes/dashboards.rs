@@ -2939,14 +2939,14 @@ async fn build_key_value_source_data(
                             "Encryption key not configured on server".to_string(),
                         )
                     })?;
-            key.value = attune_common::crypto::decrypt_json(&key.value, encryption_key).map_err(
-                |error| {
+            key.value =
+                attune_common::crypto::keystore::decrypt_json(&key.value, encryption_key, key.id)
+                    .map_err(|error| {
                     ApiError::InternalServerError(format!(
                         "Failed to decrypt key '{}': {}",
                         key.r#ref, error
                     ))
-                },
-            )?;
+                })?;
         } else {
             key.value = JsonValue::Null;
         }

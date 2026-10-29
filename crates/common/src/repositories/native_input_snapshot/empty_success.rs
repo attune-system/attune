@@ -9,6 +9,19 @@ pub(super) struct EmptySuccessWitness {
     original: Box<Body>,
     digest: String,
 }
+
+pub(super) fn convert_encryption_metadata(
+    source: &mut EmptySuccessWitness,
+    conversion: &crate::repositories::encryption_conversion::VerifierConversion<'_>,
+    depth: usize,
+) -> Result<()> {
+    if hash(&serde_json::to_value(&source.original)?)? != source.digest {
+        return Err(denied());
+    }
+    super::encryption_conversion::convert_body(&mut source.original, conversion, depth)?;
+    source.digest = hash(&serde_json::to_value(&source.original)?)?;
+    Ok(())
+}
 pub(crate) struct PreparedEmptySuccessWitness {
     source: EmptySuccessWitness,
     held: ReleasedNativeEmptyIteration,

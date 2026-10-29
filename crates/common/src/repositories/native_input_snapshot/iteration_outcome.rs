@@ -127,6 +127,23 @@ pub(super) struct IterationOutcomeSource {
     members_digest: String,
 }
 
+pub(super) fn convert_encryption_metadata(
+    source: &mut IterationOutcomeSource,
+    conversion: &crate::repositories::encryption_conversion::VerifierConversion<'_>,
+) -> Result<()> {
+    validate_storage(source)?;
+    for member in &mut source.members {
+        for observation in [&mut member.original, &mut member.latest] {
+            for contributor in &observation.contributors {
+                contributor.validate()?;
+            }
+            super::encryption_conversion::fields(&mut observation.input_fields, conversion)?;
+        }
+    }
+    source.members_digest = hash(&serde_json::to_value(&source.members)?)?;
+    validate_storage(source)
+}
+
 /// Authenticated frozen observation for C/F. Its manifests are independent
 /// ceilings. Neither metadata nor these read-only getters confer reader rights.
 pub struct NativeIterationOutcomeEvidence {

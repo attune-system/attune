@@ -150,6 +150,8 @@ pub(super) async fn complete(
         &store,
     )
     .await;
+    super::super::file_native_retention_cases::upgrade_held_file(pool, &held_file, &store, key)
+        .await;
     let pinned: Vec<Id> = sqlx::query_scalar("SELECT source FROM file_evidence_pin WHERE owner=$1 AND kind='runtime_native_input_snapshot' ORDER BY source")
         .bind(held_file.version).fetch_all(pool).await.unwrap();
     assert!(

@@ -8,7 +8,6 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use attune_common::{
-    crypto::decrypt_json,
     models::{
         enums::{ExecutionStatus, WorkQueueDispatchStatus, WorkQueueItemStatus},
         key::Key,
@@ -522,7 +521,7 @@ impl WorkQueueDispatcher {
                 key.r#ref
             )
         })?;
-        decrypt_json(&key.value, encryption_key)
+        attune_common::crypto::keystore::decrypt_json(&key.value, encryption_key, key.id)
             .with_context(|| format!("failed to decrypt queue tunable key '{}'", key.r#ref))
     }
 
@@ -1983,9 +1982,10 @@ mod tests {
     #[test]
     fn resolve_key_value_decrypts_encrypted_tunables() {
         let encryption_key = "a".repeat(32);
-        let encrypted = attune_common::crypto::encrypt_json(
+        let encrypted = attune_common::crypto::keystore::encrypt_json(
             &json!({"dispatch": {"batch_size": 3}}),
             &encryption_key,
+            1,
         )
         .expect("value should encrypt");
         let key = Key {
@@ -2018,9 +2018,10 @@ mod tests {
     #[test]
     fn resolve_key_value_requires_encryption_key_for_encrypted_values() {
         let encryption_key = "a".repeat(32);
-        let encrypted = attune_common::crypto::encrypt_json(
+        let encrypted = attune_common::crypto::keystore::encrypt_json(
             &json!({"dispatch": {"batch_size": 3}}),
             &encryption_key,
+            1,
         )
         .expect("value should encrypt");
         let key = Key {

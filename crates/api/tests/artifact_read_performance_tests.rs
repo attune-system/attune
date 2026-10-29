@@ -1501,7 +1501,7 @@ async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result
     link(&ctx, log, id).await?;
     // Disclosure retains the actual Key identity. A fabricated ID and owner
     // tuple cannot stand in for a source whose grants are being tested.
-    let key = attune_common::repositories::key::KeyRepository::create(
+    let key = attune_common::repositories::key::KeyRepository::create_encrypted_in_pool(
         &ctx.pool,
         attune_common::repositories::key::CreateKeyInput {
             local_ref: "fixture_private".into(),
@@ -1516,16 +1516,14 @@ async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result
             name: "Owned disclosure source".into(),
             encrypted: true,
             encryption_key_hash: None,
-            value: attune_common::crypto::encrypt_json(
-                &json!("fixture material"),
-                ctx.state
-                    .config
-                    .security
-                    .encryption_key
-                    .as_deref()
-                    .ok_or("fixture key missing")?,
-            )?,
+            value: json!("fixture material"),
         },
+        ctx.state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .ok_or("fixture key missing")?,
     )
     .await?;
     let origin = SecretProvenance::key(attune_common::key_access::key_origin(&key));
