@@ -63,6 +63,17 @@ def condition_matches(condition, results, *, cancelled=False, tag=True, outputs=
 
 
 class OptionalCliReleaseTests(unittest.TestCase):
+    def test_macos_notarization_uses_matching_current_runners(self):
+        expected = [
+            {"arch": "amd64", "runner": "macos-26-intel"},
+            {"arch": "arm64", "runner": "macos-26"},
+        ]
+        for name in ("submit-macos-cli-notarization", "finalize-macos-cli-notarization"):
+            with self.subTest(job=name):
+                job = JOBS[name]
+                self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
+                self.assertEqual(job["strategy"]["matrix"]["include"], expected)
+
     def test_condition_interpreter_rejects_executable_python(self):
         for expression in ("().__class__", "__import__('os')", "True or unknown()",
                            "1 == 1", "'non-boolean'", "[True]", "'a' + 'b' == 'ab'"):
