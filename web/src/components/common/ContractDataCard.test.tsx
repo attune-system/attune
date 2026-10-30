@@ -43,6 +43,40 @@ it("renders resolved titles in position order without weakening inherited secrec
 afterEach(cleanup);
 
 describe("stored contract displays", () => {
+  it("rejects inherited reference targets and permits own prototype-like names", () => {
+    const definitions = {};
+    Object.setPrototypeOf(definitions, { constructor: { type: "string" } });
+    const contract = {
+      annotated_schema: { $ref: "#/$defs/constructor", $defs: definitions },
+    };
+    const { rerender } = render(
+      <ContractDataCard
+        title="Event"
+        contract={contract}
+        values="private-inherited-value"
+        emptyMessage="Empty"
+      />,
+    );
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(
+      screen.queryByText("private-inherited-value"),
+    ).not.toBeInTheDocument();
+    Object.defineProperty(definitions, "constructor", {
+      value: { type: "string" },
+      enumerable: true,
+    });
+    rerender(
+      <ContractDataCard
+        title="Event"
+        contract={contract}
+        values="own-value"
+        emptyMessage="Empty"
+      />,
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("own-value")).toBeInTheDocument();
+  });
+
   it("resolves shared references, occurrence annotations, and nested array fields", () => {
     const contract = {
       annotated_schema: {

@@ -284,7 +284,8 @@ class Lane:
     def wire(self, role, path, body=None, method="POST", expected=(200,), drop_reply=False):
         require(path.startswith("/") and not path.startswith("//") and "?" not in path,
                 "InvalidNativeTestPath")
-        connection = http.client.HTTPSConnection("127.0.0.1", self.config["port"],
+        # tls() requires verified TLS 1.3 and a client certificate; the peer is pinned below.
+        connection = http.client.HTTPSConnection("127.0.0.1", self.config["port"],  # nosemgrep: python.lang.security.audit.httpsconnection-detected.httpsconnection-detected
                                                   context=self.tls(role), timeout=8)
         try:
             connection.connect()
@@ -625,14 +626,26 @@ def case_cert_role_attempts(lane):
     lane.quarantine()
 
 
+CASE_HANDLERS = {
+    "paused_combined": case_paused_combined,
+    "same_boot_restart": case_same_boot_restart,
+    "lost_delete_reply": case_lost_delete_reply,
+    "untracked_pid": case_untracked_pid,
+    "mount_replacement": case_mount_replacement,
+    "external_hardlink": case_external_hardlink,
+    "cert_role_attempts": case_cert_role_attempts,
+}
+
+
 def run_case(binding, name, execute_owned_live=False, allow_mount_fault=False):
+    require(name in CASE_HANDLERS, "InvalidLiveCase")
     lane = Lane.__new__(Lane)
     lane.daemon, lane.cgroup, lane.roots = None, None, {}
     try:
         Lane.__init__(lane, binding, name, execute_owned_live, allow_mount_fault)
         lane.start()
         lane.prepare()
-        globals()["case_" + name](lane)
+        CASE_HANDLERS[name](lane)
         lane.stop()
         if name in NEGATIVES:
             lane.retained()  # Killing a daemon must not retire native obligations.
