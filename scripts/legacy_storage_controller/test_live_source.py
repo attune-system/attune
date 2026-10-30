@@ -21,6 +21,22 @@ class LiveLaneSourceTests(unittest.TestCase):
         self.assertNotIn("unittest.mock", self.source)
         self.assertNotIn("Mock(", self.source)
 
+    def test_live_dispatch_is_an_explicit_allowlist_before_lane_construction(self):
+        handlers = next(node.value for node in self.tree.body
+                        if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "CASE_HANDLERS"
+                                for target in node.targets))
+        self.assertIsInstance(handlers, ast.Dict)
+        names = [ast.literal_eval(key) for key in handlers.keys]
+        self.assertEqual(set(names), {
+            "paused_combined", "same_boot_restart", "lost_delete_reply", "untracked_pid",
+            "mount_replacement", "external_hardlink", "cert_role_attempts",
+        })
+        self.assertEqual([value.id for value in handlers.values], ["case_" + name for name in names])
+        run = self.functions["run_case"]
+        self.assertLess(run.index('require(name in CASE_HANDLERS'), run.index('Lane.__new__'))
+        self.assertNotIn("globals()", self.source)
+
     def test_live_gates_precede_sqlite_or_process_actions(self):
         main = self.functions["main"]
         self.assertLess(main.index('require(args.execute_owned_live'), main.index('run_journal_cases(root)'))

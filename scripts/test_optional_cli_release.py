@@ -1,5 +1,6 @@
 """Offline regression checks for optional CLI release failure isolation."""
 
+import ast
 import os
 from pathlib import Path
 import re
@@ -41,13 +42,49 @@ def condition_matches(condition, results, *, cancelled=False, tag=True, outputs=
         lambda match: repr("true" if (outputs or {}).get(match[1], False) else "false"), expression,
     )
     expression = expression.replace("&&", " and ").replace("||", " or ")
-    # Only evaluate the small boolean expression left after resolving known inputs.
-    if not re.fullmatch(r"[\s\w'()=!-]+", expression):
+    # Interpret only boolean literals/operators and literal equality. Never run code.
+    def resolve(node):
+        if isinstance(node, ast.Constant) and type(node.value) in (bool, str):
+            return node.value
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+            values = [resolve(value) for value in node.values]
+            if all(type(value) is bool for value in values):
+                return all(values) if isinstance(node.op, ast.And) else any(values)
+        if (isinstance(node, ast.Compare) and len(node.ops) == 1
+                and isinstance(node.ops[0], (ast.Eq, ast.NotEq))):
+            left, right = resolve(node.left), resolve(node.comparators[0])
+            return left == right if isinstance(node.ops[0], ast.Eq) else left != right
         raise AssertionError(f"Unrecognized release condition: {expression}")
-    return eval(expression, {"__builtins__": {}}, {})
+
+    result = resolve(ast.parse(expression, mode="eval").body)
+    if type(result) is not bool:
+        raise AssertionError(f"Release condition must be boolean: {expression}")
+    return result
 
 
 class OptionalCliReleaseTests(unittest.TestCase):
+    def test_condition_interpreter_rejects_executable_python(self):
+        for expression in ("().__class__", "__import__('os')", "True or unknown()",
+                           "1 == 1", "'non-boolean'", "[True]", "'a' + 'b' == 'ab'"):
+            with self.subTest(expression=expression), self.assertRaises(AssertionError):
+                condition_matches(expression, {})
+
+    def test_release_ref_is_passed_as_data_not_executable_shell(self):
+        step = next(step for step in JOBS["build-docker-dist"]["steps"]
+                    if step.get("name") == "Build docker dist bundle")
+        self.assertEqual(step["env"]["RELEASE_REF_NAME"], "${{ github.ref_name }}")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts/package-docker-dist.sh").write_text('printf "%s" "$2" > "$OUTPUT"\n')
+            reference = 'v1-$(touch INJECTED)-`touch INJECTED2`'
+            output = root / "output"
+            subprocess.run(["bash", "-euo", "pipefail", "-c", step["run"]], cwd=root,
+                           env={**os.environ, "RELEASE_REF_NAME": reference, "OUTPUT": str(output)}, check=True)
+            self.assertEqual(output.read_text(), f"artifacts/attune-docker-dist-{reference}.tar.gz")
+            self.assertFalse((root / "INJECTED").exists())
+            self.assertFalse((root / "INJECTED2").exists())
+
     def test_only_cli_distribution_jobs_allow_failure(self):
         self.assertEqual(
             {name for name, job in JOBS.items() if job.get("continue-on-error") is True},

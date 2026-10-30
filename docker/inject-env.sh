@@ -17,7 +17,8 @@ sanitize_url_origin() {
   case "$url" in
     http://*) scheme=http; authority=${url#http://} ;;
     https://*) scheme=https; authority=${url#https://} ;;
-    ws://*) scheme=ws; authority=${url#ws://} ;;
+    # This shell branch only redacts a configured URL for logs; it opens no socket.
+    ws://*) scheme=ws; authority=${url#ws://} ;; # nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
     wss://*) scheme=wss; authority=${url#wss://} ;;
     *) printf '%s\n' '<url configured>'; return ;;
   esac
