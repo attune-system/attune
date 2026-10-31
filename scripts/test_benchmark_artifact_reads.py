@@ -16,8 +16,226 @@ spec = importlib.util.spec_from_file_location("artifact_benchmark", SCRIPT)
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 
+NORMAL_NOTIFIER_TESTS = [
+    "websocket_server::tests::test_filter_acl_all_requires_admin_or_all_operational_reads",
+    "websocket_server::tests::test_dispatch_preserves_sensor_trigger_ref_semantics",
+    "websocket_server::tests::broadcast_lag_loses_artifact_updates_without_closing_client_subscriptions",
+    "postgres_listener::tests::listener_recreation_keeps_receivers_open_but_cannot_replay_artifact_changes",
+]
+NOTIFIER_PROFILE_TEST = "websocket_server::tests::artifact_load::artifact_notification_authorization_load_profile"
+
 
 class ArtifactBenchmarkRunnerTests(unittest.TestCase):
+    def test_library_compilation_uses_lib_switch_without_name_filter(self):
+        messages = [
+            {"reason": "compiler-artifact", "target": {"name": "attune-notifier", "kind": ["bin"]}, "executable": "/owned/notifier-bin"},
+            {"reason": "compiler-artifact", "target": {"name": "attune_notifier", "kind": ["lib"]}, "executable": "/owned/notifier-lib"},
+        ]
+        result = subprocess.CompletedProcess([], 0, "\n".join(map(json.dumps, messages)), "")
+        with patch.object(benchmark.subprocess, "run", return_value=result) as run:
+            executable = benchmark.compile_test("attune_notifier", "attune-notifier", "--lib")
+        self.assertEqual(executable, "/owned/notifier-lib")
+        self.assertEqual(run.call_args.args[0], [
+            "cargo", "test", "-p", "attune-notifier", "--lib", "--no-run", "--message-format=json",
+        ])
+
+    def test_named_test_and_binary_compilation_keep_their_target_selectors(self):
+        for kind, name in [("--test", "artifact_read_performance_tests"), ("--bin", "attune-notifier")]:
+            with self.subTest(kind=kind):
+                message = {"reason": "compiler-artifact", "target": {"name": name}, "executable": "/owned/test"}
+                result = subprocess.CompletedProcess([], 0, json.dumps(message), "")
+                with patch.object(benchmark.subprocess, "run", return_value=result) as run:
+                    self.assertEqual(benchmark.compile_test(name, "attune-notifier", kind), "/owned/test")
+                self.assertEqual(run.call_args.args[0], [
+                    "cargo", "test", "-p", "attune-notifier", kind, name, "--no-run", "--message-format=json",
+                ])
+
+    def test_library_compilation_rejects_the_binary_only_artifact(self):
+        message = {"reason": "compiler-artifact", "target": {"name": "attune-notifier", "kind": ["bin"]}, "executable": "/owned/notifier-bin"}
+        result = subprocess.CompletedProcess([], 0, json.dumps(message), "")
+        with patch.object(benchmark.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "did not report an executable for attune_notifier"):
+                benchmark.compile_test("attune_notifier", "attune-notifier", "--lib")
+
+    def test_notifier_missing_inventory_aborts_before_database_setup(self):
+        for flags, names in [
+            (["--with-notifier-tests"], []),
+            (["--notifier-profile"], ["tests::test_mask_connection_url"]),
+            (["--notifier-profile"], NORMAL_NOTIFIER_TESTS),
+            (["--notifier-profile"], NORMAL_NOTIFIER_TESTS + ["wrong_prefix::" + NOTIFIER_PROFILE_TEST]),
+        ]:
+            with self.subTest(flags=flags, names=names), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / "evidence"
+                def run(args, **kwargs):
+                    if args[0] == "git":
+                        return subprocess.CompletedProcess(args, 0, "revision\n", "")
+                    if "--list" in args:
+                        return subprocess.CompletedProcess(args, 0, "\n".join(f"{name}: test" for name in names), "")
+                    raise AssertionError("no test executable may run after a missing inventory")
+                with patch.object(benchmark, "ROOT", root), \
+                        patch.object(benchmark.subprocess, "run", side_effect=run), \
+                        patch.object(benchmark, "compile_test", return_value="test-executable"), \
+                        patch.object(benchmark, "load_protocol", side_effect=AssertionError("database setup must not start")) as protocol, \
+                        patch("sys.argv", [str(SCRIPT), "--output", str(output), *flags]), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(benchmark.main(), 1)
+                protocol.assert_not_called()
+                evidence = json.loads((output / "evidence.json").read_text())
+                self.assertIn("required notifier test", evidence["error"])
+                self.assertFalse(evidence["passed"])
+                self.assertEqual(evidence["cases"], [])
+
+    def test_missing_notifier_report_keeps_case_failed_after_clean_teardown(self):
+        teardowns = []
+        class Server:
+            def __init__(self, image, run_id, case):
+                self.case, self.name = case, "owned"
+            def __enter__(self):
+                self.case["port"] = "127.0.0.1:12345"
+                return self
+            def __exit__(self, *args):
+                self.case["cleanup_errors"] = []
+                teardowns.append(self.case["major"])
+            def sql(self, _):
+                return ""
+        def run(args, **kwargs):
+            if args[0] == "git":
+                return subprocess.CompletedProcess(args, 0, "revision\n", "")
+            if "--list" in args:
+                names = [NOTIFIER_PROFILE_TEST] if "--ignored" in args else NORMAL_NOTIFIER_TESTS
+                return subprocess.CompletedProcess(args, 0, "\n".join(f"{name}: test" for name in names), "")
+            if args[0] == "notifier-lib":
+                names = [NOTIFIER_PROFILE_TEST] if "--ignored" in args else NORMAL_NOTIFIER_TESTS
+                for name in names:
+                    kwargs["stdout"].write(f"test {name} ... ok\n")
+            kwargs["stdout"].write("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
+            return subprocess.CompletedProcess(args, 0)
+        protocol = SimpleNamespace(Server=Server, command=lambda *args: SimpleNamespace(stdout="owned fixture df"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "evidence"
+            with patch.object(benchmark, "ROOT", root), \
+                    patch.object(benchmark.subprocess, "run", side_effect=run), \
+                    patch.object(benchmark, "compile_test", side_effect=lambda test, package, kind, **kwargs: "notifier-lib" if kind == "--lib" else "artifact-test") as build, \
+                    patch.object(benchmark, "load_protocol", return_value=protocol), \
+                    patch("sys.argv", [str(SCRIPT), "--output", str(output), "--versions", "16", "18", "--notifier-profile"]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(benchmark.main(), 1)
+            self.assertEqual(build.call_args_list[1].args, ("attune_notifier", "attune-notifier", "--lib"))
+            evidence = json.loads((output / "evidence.json").read_text())
+            self.assertIn("notifier profile selection did not produce its report", evidence["error"])
+            self.assertFalse(evidence["passed"])
+            self.assertTrue(evidence["source_unchanged"])
+            self.assertEqual(len(evidence["cases"]), 1)
+            self.assertFalse(evidence["cases"][0]["passed"])
+            self.assertEqual(evidence["cases"][0]["test_exit_codes"], [0, 0, 0])
+            self.assertEqual(evidence["cases"][0]["cleanup_errors"], [])
+            self.assertEqual(teardowns, ["16"])
+
+    def test_zero_notifier_execution_cannot_pass_even_with_complete_inventory(self):
+        class Server:
+            def __init__(self, image, run_id, case):
+                self.case, self.name = case, "owned"
+            def __enter__(self):
+                self.case["port"] = "127.0.0.1:12345"
+                return self
+            def __exit__(self, *args):
+                self.case["cleanup_errors"] = []
+            def sql(self, _):
+                return ""
+        def run(args, **kwargs):
+            if args[0] == "git":
+                return subprocess.CompletedProcess(args, 0, "revision\n", "")
+            if "--list" in args:
+                return subprocess.CompletedProcess(args, 0, "\n".join(f"{name}: test" for name in NORMAL_NOTIFIER_TESTS), "")
+            kwargs["stdout"].write("running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out\n")
+            return subprocess.CompletedProcess(args, 0)
+        protocol = SimpleNamespace(Server=Server, command=lambda *args: SimpleNamespace(stdout="owned fixture df"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "evidence"
+            with patch.object(benchmark, "ROOT", root), \
+                    patch.object(benchmark.subprocess, "run", side_effect=run), \
+                    patch.object(benchmark, "compile_test", return_value="test-executable"), \
+                    patch.object(benchmark, "load_protocol", return_value=protocol), \
+                    patch("sys.argv", [str(SCRIPT), "--output", str(output), "--versions", "18", "--with-notifier-tests"]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(benchmark.main(), 1)
+            evidence = json.loads((output / "evidence.json").read_text())
+            self.assertIn("did not pass required notifier test", evidence["error"])
+            self.assertFalse(evidence["cases"][0]["passed"])
+            self.assertFalse(evidence["passed"])
+            self.assertEqual(evidence["cases"][0]["cleanup_errors"], [])
+
+    def test_complete_notifier_runs_require_current_sources_passed_sentinels_and_owned_cleanup(self):
+        for mode, flags, expected in [
+            ("clean", ["--with-notifier-tests"], 0),
+            ("clean", ["--notifier-profile"], 0),
+            ("changed-source", ["--notifier-profile"], 1),
+            ("cleanup-error", ["--notifier-profile"], 1),
+            ("cleanup-unreported", ["--notifier-profile"], 1),
+            ("ignored-auth-sentinel", ["--with-notifier-tests"], 1),
+        ]:
+            with self.subTest(mode=mode, flags=flags), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "Cargo.lock").write_text("fixture lock")
+                output = root / "evidence"
+                executions, inventories, teardowns = [], [], []
+                class Server:
+                    def __init__(self, image, run_id, case):
+                        self.case, self.name = case, "owned"
+                    def __enter__(self):
+                        self.case["port"] = "127.0.0.1:12345"
+                        return self
+                    def __exit__(self, *args):
+                        teardowns.append(self.case["major"])
+                        if mode != "cleanup-unreported":
+                            self.case["cleanup_errors"] = ["owned teardown failed"] if mode == "cleanup-error" else []
+                    def sql(self, _):
+                        return ""
+                def run(args, **kwargs):
+                    if args[0] == "git":
+                        return subprocess.CompletedProcess(args, 0, "revision\n", "")
+                    if "--list" in args:
+                        inventories.append(args)
+                        names = [NOTIFIER_PROFILE_TEST] if "--ignored" in args else NORMAL_NOTIFIER_TESTS
+                        return subprocess.CompletedProcess(args, 0, "\n".join(f"{name}: test" for name in names), "")
+                    executions.append(args)
+                    if args[0] == "notifier-lib":
+                        names = [NOTIFIER_PROFILE_TEST] if "--ignored" in args else NORMAL_NOTIFIER_TESTS
+                        if mode == "ignored-auth-sentinel":
+                            names = names[1:]
+                        for name in names:
+                            kwargs["stdout"].write(f"test {name} ... \x1b[32mok\x1b[0m\n")
+                        if "--ignored" in args:
+                            report = Path(kwargs["env"]["ATTUNE_ARTIFACT_BENCHMARK_OUTPUT"]) / "notifier-authorization-profile.json"
+                            report.write_text(json.dumps({"cases": [], "scope": "mock notifier report"}))
+                        if mode == "changed-source":
+                            (root / "Cargo.lock").write_text("changed fixture lock")
+                    return subprocess.CompletedProcess(args, 0)
+                protocol = SimpleNamespace(Server=Server, command=lambda *args: SimpleNamespace(stdout="owned fixture df"))
+                with patch.object(benchmark, "ROOT", root), \
+                        patch.object(benchmark.subprocess, "run", side_effect=run), \
+                        patch.object(benchmark, "compile_test", side_effect=lambda test, package, kind, **kwargs: "notifier-lib" if kind == "--lib" else "artifact-test") as build, \
+                        patch.object(benchmark, "load_protocol", return_value=protocol), \
+                        patch("sys.argv", [str(SCRIPT), "--output", str(output), "--versions", "16", "18", *flags]), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(benchmark.main(), expected)
+                self.assertEqual(build.call_args_list[1].args, ("attune_notifier", "attune-notifier", "--lib"))
+                evidence = json.loads((output / "evidence.json").read_text())
+                self.assertEqual(evidence["passed"], expected == 0)
+                self.assertTrue(all(case["passed"] == (expected == 0) for case in evidence["cases"]))
+                self.assertEqual(evidence["source_unchanged"], mode != "changed-source")
+                self.assertEqual(teardowns, [case["major"] for case in evidence["cases"]])
+                if expected == 0:
+                    self.assertEqual(teardowns, ["16", "18"])
+                    self.assertEqual(len(executions), 6 if "--notifier-profile" in flags else 4)
+                    self.assertEqual(inventories[0], ["notifier-lib", "--list"])
+                    if "--notifier-profile" in flags:
+                        self.assertEqual(inventories[1], ["notifier-lib", "--ignored", "--exact", NOTIFIER_PROFILE_TEST, "--list"])
+                        self.assertEqual(executions[2], ["notifier-lib", "--ignored", "--exact", NOTIFIER_PROFILE_TEST, "--nocapture", "--test-threads=4"])
+
     def test_inequivalent_paired_reference_cannot_certify_the_new_policy(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'evidence'

@@ -4,6 +4,20 @@ The [implementation checkpoint](../plans/artifacts-postgresql-implementation.md)
 records local results and incomplete gates. A passing query-count test does not
 certify page latency, deployed behavior, or storage capacity.
 
+Execution-specific selector diagnostics must use
+`ArtifactRepository::explain_execution_summary_scan()`, which shares the real
+lateral reader's builder. Retain the fixed old execution, actual visibility
+context, cursor and candidate limit (21 for a page of 20). This separate EXPLAIN
+is not automatically the SQLx cached prepared plan. Do not relabel earlier
+global-with-execution-filter plans as execution-specific evidence.
+
+Small `RetainedHistory` fixtures model historical read targets with real released
+schema/executable data and captured ownership, not independently admitted or
+executed workloads. Their metadata-only historical versions do not establish
+log-body capacity or protected transport throughput. Large-profile admission
+scope, resource budgets and actual body-consumption measurements must remain
+explicit in any later acceptance report.
+
 The [selected-read plan](../plans/execution-scoped-artifact-reads.md) replaces the
 historical aggregate-disclosure contract with safe metadata and selected-version
 content authorization. Its high-history, source-isolation, transport-revocation,

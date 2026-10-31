@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -30,6 +31,13 @@ from artifact_read_reports import compare_paired_reference, summarize_cardinalit
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST = "artifact_read_performance_tests"
+NOTIFIER_TESTS = (
+    "websocket_server::tests::test_filter_acl_all_requires_admin_or_all_operational_reads",
+    "websocket_server::tests::test_dispatch_preserves_sensor_trigger_ref_semantics",
+    "websocket_server::tests::broadcast_lag_loses_artifact_updates_without_closing_client_subscriptions",
+    "postgres_listener::tests::listener_recreation_keeps_receivers_open_but_cannot_replay_artifact_changes",
+)
+NOTIFIER_PROFILE_TEST = "websocket_server::tests::artifact_load::artifact_notification_authorization_load_profile"
 
 
 def snapshot(root=None):
@@ -77,8 +85,11 @@ def compile_test(test=TEST, package="attune-api", target_kind="--test", *, root=
         env["ATTUNE_BUILD_GIT_SHA"] = build_revision
     if target_dir is not None:
         env["CARGO_TARGET_DIR"] = str(target_dir)
+    # --lib is a switch, not a named target selector. Passing the artifact name
+    # after it would instead install a positional libtest name filter in Cargo.
+    target = [target_kind] if target_kind == "--lib" else [target_kind, test]
     result = subprocess.run(
-        ["cargo", "test", "-p", package, target_kind, test, "--no-run", "--message-format=json"],
+        ["cargo", "test", "-p", package, *target, "--no-run", "--message-format=json"],
         cwd=root, env=env,
         capture_output=True, text=True, timeout=2400,
     )
@@ -238,11 +249,24 @@ def main():
         if args.with_key_usage_tests:
             executables.append(("key-usage-tests.log", build("key_usage_tests"), []))
         if args.with_notifier_tests or args.notifier_profile:
-            notifier = build("attune-notifier", "attune-notifier", "--bin")
+            # WebSocket authorization/listener tests belong to the library. The
+            # identically packaged binary has only connection-URL masking tests.
+            notifier = build("attune_notifier", "attune-notifier", "--lib")
+            notifier_selections = [([], NOTIFIER_TESTS)]
+            if args.notifier_profile:
+                notifier_selections.append((["--ignored", "--exact", NOTIFIER_PROFILE_TEST], (NOTIFIER_PROFILE_TEST,)))
+            for selection, required in notifier_selections:
+                listing = subprocess.run([notifier, *selection, "--list"], cwd=source_root,
+                    env=os.environ.copy(), capture_output=True, text=True, check=True, timeout=30).stdout
+                names = {line.strip().removesuffix(": test") for line in listing.splitlines()
+                         if line.strip().endswith(": test")}
+                for name in required:
+                    if name not in names:
+                        raise RuntimeError(f"built notifier executable does not contain required notifier test {name}; no database tests started")
             executables.append(("notifier-tests.log", notifier, []))
             if args.notifier_profile:
                 executables.append(("notifier-profile.log", notifier, ["--ignored","--exact",
-                    "websocket_server::tests::artifact_load::artifact_notification_authorization_load_profile"]))
+                    NOTIFIER_PROFILE_TEST]))
         if args.workload_profile:
             executables.append(("workload-profile.log", artifact_executable, ["--ignored", "--exact",
                 "source_origins::workload::artifact_partition_and_maintenance_workload_profile"]))
@@ -273,6 +297,17 @@ def main():
                                                cwd=source_root, env=env, stdout=log, stderr=subprocess.STDOUT,
                                                timeout=2400)
                     case["test_exit_codes"].append(tests.returncode)
+                    required = (NOTIFIER_TESTS if filename == "notifier-tests.log" else
+                                (NOTIFIER_PROFILE_TEST,) if filename == "notifier-profile.log" else ())
+                    if required and tests.returncode == 0:
+                        # A zero-exit libtest process can still select no tests
+                        # (or ignore a required sentinel). Inventory alone is
+                        # not proof that the requested checks actually passed.
+                        text = re.sub(r"\x1b\[[0-9;]*m", "", (output / filename).read_text())
+                        completed = {line.strip() for line in text.splitlines()}
+                        for name in required:
+                            if f"test {name} ... ok" not in completed:
+                                raise RuntimeError(f"{filename} did not pass required notifier test {name}; zero selected tests is not passing evidence")
                 summaries = {}
                 for path in output.glob("*-plan.json"):
                     summaries[path.name] = summarize_explain(json.loads(path.read_text()))
@@ -297,7 +332,7 @@ def main():
                     "df", "-Pk", server.sql("SHOW data_directory;")).stdout.splitlines()
                 remaining = server.sql("SELECT datname FROM pg_database WHERE datname LIKE 'attune_db_%' ORDER BY datname;")
                 case["remaining_fixture_databases"] = remaining.splitlines() if remaining else []
-                case["passed"] = all(code == 0 for code in case["test_exit_codes"]) and not remaining
+                case_checks_passed = all(code == 0 for code in case["test_exit_codes"]) and not remaining
                 if args.notifier_profile and not (output / "notifier-authorization-profile.json").exists():
                     raise RuntimeError("notifier profile selection did not produce its report")
                 if args.paired_reference:
@@ -307,7 +342,11 @@ def main():
                     acceptance = compare_paired_reference(json.loads(paired.read_text()), snapshot(source_root) == sources)
                     (output / "paired-reference-acceptance.json").write_text(json.dumps(acceptance, indent=2) + "\n")
                     case["paired_reference_acceptance"] = acceptance
-                    case["passed"] = case["passed"] and acceptance['passed']
+                    case_checks_passed = case_checks_passed and acceptance['passed']
+                # The fixture's teardown uses this flag to check leaked sessions.
+                # Set it only after every selected report/acceptance check; the
+                # final evidence also requires successful owned cleanup below.
+                case["passed"] = case_checks_passed and snapshot(source_root) == sources
     except Exception as error:
         evidence["error"] = str(error)
     finally:
@@ -315,6 +354,9 @@ def main():
         evidence["source_changes"] = sorted(name for name in sources.keys() | after.keys()
                                             if sources.get(name) != after.get(name))
         evidence["source_unchanged"] = not evidence["source_changes"]
+        for case in evidence["cases"]:
+            case["passed"] = (case["passed"] and evidence["source_unchanged"]
+                              and case.get("cleanup_errors") == [])
         live = snapshot()
         evidence["live_source_changes_since_capture"] = sorted(name for name in sources.keys() | live.keys()
             if sources.get(name) != live.get(name))

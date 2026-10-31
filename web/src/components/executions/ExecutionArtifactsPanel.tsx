@@ -29,6 +29,11 @@ import ArtifactCursorControls from "@/components/common/ArtifactCursorControls";
 import { formatJsonValue } from "@/lib/format-utils";
 import { OpenAPI } from "@/api/core/OpenAPI";
 import {
+  appendArtifactPreviewTail,
+  ArtifactSseDecoder,
+  ArtifactSseProtocolError,
+} from "@/lib/artifact-live-preview";
+import {
   ARTIFACT_PREVIEW_BYTES,
   readArtifactPreview,
 } from "@/lib/artifact-preview";
@@ -176,6 +181,32 @@ function TextFileDetail({
     setIsStreaming(true);
     setStreamDone(false);
     let offset: string | undefined;
+    let preview = { text: "", truncated: false };
+    let previewChanged = false;
+    let denied = false;
+    let scrollFrame: number | undefined;
+    let publishFrame: number | undefined;
+    const publishPreview = (force = false) => {
+      if ((!previewChanged && !force) || denied) return;
+      previewChanged = false;
+      setContent(preview.text);
+      setTruncated(preview.truncated);
+      setLoadError(null);
+      setIsLoadingContent(false);
+      setIsWaiting(false);
+      if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
+      scrollFrame = requestAnimationFrame(() => {
+        scrollFrame = undefined;
+        scrollToBottom();
+      });
+    };
+    const queuePreview = () => {
+      if (publishFrame !== undefined || !previewChanged || denied) return;
+      publishFrame = requestAnimationFrame(() => {
+        publishFrame = undefined;
+        if (!controller.signal.aborted) publishPreview();
+      });
+    };
 
     const handleStreamEvent = (eventName: string, data: string) => {
       switch (eventName) {
@@ -187,26 +218,30 @@ function TextFileDetail({
           }
           break;
         case "content":
-          setContent((previous) =>
-            offset === undefined ? data : (previous ?? "") + data,
+          preview = appendArtifactPreviewTail(
+            preview,
+            data,
+            offset === undefined,
           );
-          setLoadError(null);
-          setIsLoadingContent(false);
-          setIsWaiting(false);
-          requestAnimationFrame(scrollToBottom);
+          previewChanged = true;
           break;
         case "append":
-          setContent((prev) => (prev ?? "") + data);
-          setLoadError(null);
-          requestAnimationFrame(scrollToBottom);
+          preview = appendArtifactPreviewTail(preview, data);
+          previewChanged = true;
           break;
         case "done":
+          if (publishFrame !== undefined) cancelAnimationFrame(publishFrame);
+          publishFrame = undefined;
+          publishPreview(true);
           setStreamDone(true);
           setIsStreaming(false);
           setIsWaiting(false);
           controller.abort();
           break;
         case "error":
+          denied = true;
+          if (publishFrame !== undefined) cancelAnimationFrame(publishFrame);
+          publishFrame = undefined;
           setLoadError("Content unavailable or access denied");
           setIsLoadingContent(false);
           setIsStreaming(false);
@@ -219,16 +254,51 @@ function TextFileDetail({
       let eventName = "message";
       let eventId: string | undefined;
       const dataLines: string[] = [];
-      for (const line of block.split(/\r?\n/)) {
+      for (const line of block.split(/\r\n|\r|\n/)) {
         if (line.startsWith("event:")) {
-          eventName = line.slice("event:".length).trim();
+          eventName = line.slice("event:".length).replace(/^ /, "");
         } else if (line.startsWith("data:")) {
           dataLines.push(line.slice("data:".length).replace(/^ /, ""));
         } else if (line.startsWith("id:")) {
-          const value = line.slice(3).trim();
-          if (/^\d+$/.test(value)) eventId = value;
+          const value = line.slice(3).replace(/^ /, "");
+          if (
+            eventId !== undefined ||
+            !/^(0|[1-9][0-9]{0,19})$/.test(value) ||
+            BigInt(value) > 18446744073709551615n
+          ) {
+            throw new ArtifactSseProtocolError("Invalid execution log cursor");
+          }
+          eventId = value;
         }
       }
+      if (
+        (eventName !== "message" && dataLines.length === 0) ||
+        (["content", "append"].includes(eventName) && eventId === undefined) ||
+        (dataLines.length > 0 &&
+          !["content", "append", "done", "waiting", "error"].includes(
+            eventName,
+          ))
+      ) {
+        throw new ArtifactSseProtocolError("Invalid execution log event");
+      }
+      // Both transports send a strictly advancing raw-byte cursor for every
+      // data event (legacy catch-up may send multiple `content` events). Empty
+      // reads produce waiting/idle, not duplicate data. Check before displaying
+      // any payload or overwriting the exact u64 resume string.
+      if (eventId !== undefined) {
+        const previous = BigInt(offset ?? "0");
+        const next = BigInt(eventId);
+        if (
+          (["content", "append"].includes(eventName) && next <= previous) ||
+          (eventName === "done" && next < previous)
+        ) {
+          throw new ArtifactSseProtocolError(
+            "Execution log cursor did not advance",
+          );
+        }
+      }
+      // Protected done carries the final cursor (equality is expected). Legacy
+      // done carries only data; neither form invents or changes a resume cursor.
       handleStreamEvent(eventName, dataLines.join("\n"));
       if (
         eventId !== undefined &&
@@ -265,23 +335,17 @@ function TextFileDetail({
             once: true,
           });
           try {
-            const decoder = new TextDecoder();
-            let buffer = "";
+            const decoder = new ArtifactSseDecoder();
             while (!controller.signal.aborted) {
               const { value, done } = await reader.read();
               if (done || controller.signal.aborted) break;
-              buffer += decoder.decode(value, { stream: true });
-              let separatorIndex = buffer.search(/\r?\n\r?\n/);
-              while (separatorIndex >= 0 && !controller.signal.aborted) {
-                const block = buffer.slice(0, separatorIndex);
-                buffer = buffer.slice(
-                  buffer[separatorIndex] === "\r"
-                    ? separatorIndex + 4
-                    : separatorIndex + 2,
-                );
-                if (block.trim()) consumeSseBlock(block);
-                separatorIndex = buffer.search(/\r?\n\r?\n/);
-              }
+              decoder.push(value, (block) => {
+                consumeSseBlock(block);
+                return !controller.signal.aborted;
+              });
+              // Keep only one pending publication of the latest bounded tail,
+              // even when transport reads outrun React/browser painting.
+              queuePreview();
             }
           } finally {
             controller.signal.removeEventListener("abort", cancelReader);
@@ -291,15 +355,16 @@ function TextFileDetail({
               reader.releaseLock();
             }
           }
-        } catch {
+        } catch (error) {
+          if (error instanceof ArtifactSseProtocolError) {
+            handleStreamEvent("error", "");
+          }
           // Authorization/rate-limit failures and guarded SSE error events never
           // reconnect. Each new transport is independently authorized by the API.
         }
         if (controller.signal.aborted) return;
         if (!retryable || attempt === 1) {
-          setLoadError("Content unavailable or access denied");
-          setIsLoadingContent(false);
-          setIsStreaming(false);
+          handleStreamEvent("error", "");
           return;
         }
         await new Promise<void>((resolve) => {
@@ -316,6 +381,8 @@ function TextFileDetail({
 
     return () => {
       controller.abort();
+      if (publishFrame !== undefined) cancelAnimationFrame(publishFrame);
+      if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
       streamAbortRef.current = null;
       setIsStreaming(false);
       setIsWaiting(false);
@@ -417,8 +484,10 @@ function TextFileDetail({
         <div className="flex-1 overflow-hidden p-4">
           {truncated && (
             <p className="text-xs text-gray-500">
-              Preview limited to the first 64 KiB. Download the file to read the
-              full content.
+              {liveStream
+                ? "Live preview limited to the most recent 64 KiB; older output was omitted."
+                : "Preview limited to the first 64 KiB."}{" "}
+              Download the file to read the full content.
             </p>
           )}
           {isLoadingContent && !isWaiting && (

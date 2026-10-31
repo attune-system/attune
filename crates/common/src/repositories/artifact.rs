@@ -477,10 +477,48 @@ impl ArtifactRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        Self::execution_summary_scan_query(filters, read_ctx, after, false)?
+            .build_query_as()
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Explain the execution-specific lateral SELECT with the reader's exact
+    /// projections, predicates, binds, cursor, and candidate limit. This is a
+    /// separate EXPLAIN statement, not the connection's cached prepared plan.
+    /// Run explicitly over owned fixtures, never on an artifact request path.
+    pub async fn explain_execution_summary_scan<'e, E>(
+        executor: E,
+        filters: &ArtifactSearchFilters,
+        read_ctx: Option<&ArtifactReadContext>,
+        after: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<serde_json::Value>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        Self::execution_summary_scan_query(filters, read_ctx, after, true)?
+            .build_query_scalar()
+            .fetch_one(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    fn execution_summary_scan_query(
+        filters: &ArtifactSearchFilters,
+        read_ctx: Option<&ArtifactReadContext>,
+        after: Option<(DateTime<Utc>, i64)>,
+        explain: bool,
+    ) -> Result<QueryBuilder<'static, Postgres>> {
         let execution = filters.execution.ok_or_else(|| {
             crate::Error::validation("Execution artifact selection requires an execution")
         })?;
-        let mut query = QueryBuilder::<Postgres>::new(
+        let mut query = QueryBuilder::<Postgres>::new(if explain {
+            "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) "
+        } else {
+            ""
+        });
+        query.push(
             "SELECT a.id, a.ref, a.scope, a.owner, a.type, a.visibility, a.classification, a.name, \
              selected.content_type, selected.size_bytes, a.created, a.updated, \
              selected.id AS selected_id, selected.version AS selected_version, \
@@ -510,11 +548,7 @@ impl ArtifactRepository {
         query
             .push(" ORDER BY a.created DESC, a.id DESC LIMIT ")
             .push_bind(i64::from(filters.limit.min(101)));
-        query
-            .build_query_as()
-            .fetch_all(executor)
-            .await
-            .map_err(Into::into)
+        Ok(query)
     }
 
     /// Diagnostic SELECT over owned benchmark data, using the handler's exact

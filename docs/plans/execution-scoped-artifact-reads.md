@@ -428,12 +428,62 @@ after sensor revocation; the test-only 403-to-masked-404 correction was rerun in
 the complete Key suite on both PostgreSQL versions. No production source changed
 after the passing broad selected-read/recorded-consumer/storage runs.
 
-Still unverified: 100,000/604,800 retained-execution profiles, 30-sample latency
+At that checkpoint, still unverified: 100,000/604,800 retained-execution profiles,
+30-sample latency
 ratios/absolute SLOs, one-Hz full-stack browser soak, sustained-write backlog,
 full workspace/service CI lanes, external SDK publication, and actual deployment.
 The old `--paired-reference` benchmark is deliberately blocked because its
 aggregate-disclosure policy is not equivalent to selected-content authorization.
-No schema/index migration, database reset, commit, push, or deployment was made.
+No schema/index migration, database reset, commit, push, or deployment had been
+made at that checkpoint.
+
+### Published implementation and next foundation (2026-10-31)
+
+The initial implementation was committed and pushed as
+`bcb67df1f35ae051438f64b148281a21af59cc95` on
+`bugfix/execution-scoped-artifact-reads`, based on `main` at `5aee8756`.
+Required Linux CI-equivalent validations passed on the exact committed source:
+5,026 workspace test executions, standalone timer tests, broker integration,
+versioned S3 correctness, supported golden/native-controller/CLI checks,
+warning-free workspace check and all-target/all-feature Clippy, Node 22 web checks
+and 568 tests, release-configuration checks, cargo-deny and Gitleaks. The 36-test
+full-stack smoke run includes all five live-API SSE cases and completed credential
+revocation/owned teardown. Enabled commit hooks passed without changing source.
+
+The workspace run's 62 ignored cases include the six explicitly deferred
+deployment scenarios; they are not passing release coverage. Native Windows and
+macOS validation remains with PR CI. Semgrep advisory remained failed/partial;
+its only changed-line match was fixed-input test regex interpolation, not an
+identified new vulnerability. GitHub API sign-in was explicitly deferred, so PR
+creation is pending rather than claimed complete. No deployment is authorized.
+
+The next foundation source adds the real execution-selector EXPLAIN seam, small
+bounded retained-read-target fixtures with rollback/security tests, and a bounded
+UTF-8 live-preview tail with unchanged complete stream offsets. Independent review
+and targeted/full required validation must pass before its milestone commit.
+This foundation does not yet implement or certify the large-cardinality profile
+or real-browser one-Hz soak. Browser runner work is a separate follow-on slice.
+
+The unchanged-source post-commit workload attempt at `bcb67df1` exposed a stale
+notifier target in the benchmark runner. PostgreSQL 16 artifact/key and explicit
+partition/maintenance/cardinality programs exited zero, but the notifier binary
+contained only three startup tests and selected zero load-profile tests. The
+required notifier report was absent, so the overall run failed and PostgreSQL 18
+was not attempted. Source stayed unchanged and owned teardown succeeded. Retain
+that failed evidence at
+`/tmp/opencode/artifact-existing-workload-gates-20261031/evidence.json`; it is not
+a passing notifier or complete workload-matrix result. The next runner correction
+selects the library target and checks required identities before setup, with
+corrected PostgreSQL 16/18 execution still required.
+
+Foundation targeted checks now pass on both PostgreSQL 16 and 18: two execution
+selector diagnostics tests and all 49 routine artifact/source/history tests,
+including seven retained-fixture/security/lock-order cases. The three explicit
+workload/reference cases remain outside that routine run. PostgreSQL 18's
+floating-point EXPLAIN row-count representation is compared exactly rather than
+rounded. The 102 focused web tests and 20 runner-helper tests pass. These checks
+do not replace exact-state required CI before the milestone commit or certify
+the still-required corrected workload matrix, large profile or browser soak.
 
 ## 4. Recommended delivery order
 

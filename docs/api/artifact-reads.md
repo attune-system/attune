@@ -74,6 +74,19 @@ state and return to the first page. Pause updates to browse older pages; resumin
 starts a new browse. Previous navigation uses the client's cursor stack, not an
 inferred page number or total.
 
+Completed text previews read at most the first 64 KiB using a range request.
+Running execution-log previews retain a rolling tail of at most 64 KiB of UTF-8
+text and display a notice after older text is discarded. This display bound does
+not change the full server byte offset used for reconnection, the selected
+execution/version, content authorization, or the explicit full-download operation.
+Malformed or oversized live protocol frames terminate the preview rather than
+growing an unbounded pending-frame buffer. These are application-retention bounds,
+not a bound on the browser's networking allocations or a browser-soak result.
+The pending-event cap is 8 MiB to accommodate the legacy server's 1 MiB data
+chunks with SSE line expansion; protected frames use 16 KiB chunks. Keep this
+protocol cap coherent with those server contracts. It is not a claim that the
+entire preview or browser consumes only 64 KiB or 8 MiB.
+
 `attune artifact version list` retains its full-history output by traversing
 server cursors. JSON/YAML output remains an array. It does not silently truncate
 at the server's first page. Traversal is not a snapshot across concurrent changes.

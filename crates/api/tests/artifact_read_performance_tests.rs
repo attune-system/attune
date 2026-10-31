@@ -11,6 +11,10 @@ mod helpers;
 mod managed_fixture;
 #[path = "artifact_workload/reference.rs"]
 mod reference;
+#[path = "artifact_workload/retained_fixture.rs"]
+mod retained_fixture;
+#[path = "artifact_workload/selected_history.rs"]
+mod selected_history;
 #[path = "artifact_read_performance/source_origins.rs"]
 mod source_origins;
 
@@ -1497,9 +1501,8 @@ async fn runtime_log_metadata_and_selected_body_never_load_unrelated_history() -
     let mut already_created = 0;
     let mut selected_execution = None;
     for retained in [1, 256, 257, 1000] {
-        let mut latest = 0;
         for _ in already_created..retained {
-            latest = execution(&ctx, &action_ref).await?;
+            let latest = execution(&ctx, &action_ref).await?;
             selected_execution.get_or_insert(latest);
             link(&ctx, stdout, latest).await?;
             link(&ctx, stderr, latest).await?;
@@ -1625,15 +1628,29 @@ async fn runtime_log_metadata_and_selected_body_never_load_unrelated_history() -
                     .effective_grants(&user)
                     .await?,
             };
-            let plan = ArtifactRepository::explain_summary_scan(
+            // The execution route uses the lateral selector, not the global
+            // summary query with an execution filter. This separate EXPLAIN is
+            // not certification of SQLx's cached prepared statement.
+            let plan = ArtifactRepository::explain_execution_summary_scan(
                 &ctx.pool,
                 &ArtifactSearchFilters {
-                    execution: Some(latest),
+                    execution: Some(selected_execution),
+                    limit: 21,
                     ..Default::default()
                 },
                 Some(&read_ctx),
+                None,
             )
             .await?;
+            source_origins::save_report(
+                "artifact-execution-summary-scope",
+                &json!({
+                    "explain_scope": "same execution-specific repository SELECT and binds; separate EXPLAIN statement, not cached prepared plan",
+                    "selected_execution": selected_execution,
+                    "per_page": 20,
+                    "candidate_limit": 21
+                }),
+            )?;
             if let Some(output) = std::env::var_os("ATTUNE_ARTIFACT_BENCHMARK_OUTPUT") {
                 use std::io::Write;
                 let path =

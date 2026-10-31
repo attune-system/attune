@@ -5,6 +5,7 @@ import {
   screen,
   waitFor,
   cleanup,
+  act,
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import axios from "axios";
@@ -47,6 +48,19 @@ const page = (items: unknown[], next_cursor: string | null = null) => ({
   next_cursor,
   has_more: next_cursor !== null,
 });
+function logFrames(chunks: string[], start = 0) {
+  let offset = start;
+  const wire = chunks
+    .map((text, index) => {
+      offset += new TextEncoder().encode(text).length;
+      return `id: ${offset}\nevent: ${index === 0 ? "content" : "append"}\n${text
+        .split("\n")
+        .map((line) => `data: ${line}\n`)
+        .join("")}\n`;
+    })
+    .join("");
+  return { wire, offset };
+}
 const clients: QueryClient[] = [];
 function mount(ui: React.ReactNode, route = "/") {
   const client = new QueryClient({
@@ -68,6 +82,421 @@ afterEach(() => {
 });
 
 describe("artifact browsing through production hooks", () => {
+  it.each([
+    "200 KiB ASCII",
+    "1 MiB newline expansion",
+    "1 MiB lossy UTF-8 expansion",
+  ])(
+    "accepts a fragmented legacy frame containing %s with bounded display",
+    async (kind) => {
+      localStorage.setItem("access_token", "test-token");
+      vi.spyOn(axios, "request").mockResolvedValue({
+        status: 200,
+        data: page([{ ...header, selected_version: selected }]),
+        headers: {},
+      });
+      const newline = kind === "1 MiB newline expansion";
+      const lossy = kind === "1 MiB lossy UTF-8 expansion";
+      const size = newline || lossy ? 1024 * 1024 : 200 * 1024;
+      const wire = new TextEncoder().encode(
+        `id: ${size}\nevent: content\n${newline ? "data: \n".repeat(size + 1) : `data: ${(lossy ? "�" : "x").repeat(size)}\n`}\nevent: done\ndata: Log stream sealed\n\n`,
+      );
+      let position = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (position === wire.length) {
+            controller.close();
+            return;
+          }
+          const end = Math.min(wire.length, position + 8191);
+          controller.enqueue(wire.subarray(position, end));
+          position = end;
+        },
+      });
+      const fetch = vi.fn().mockResolvedValue(new Response(body));
+      vi.stubGlobal("fetch", fetch);
+      const view = mount(
+        <ExecutionArtifactsPanel executionId={10} isRunning />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+      await screen.findByText("Stream complete", {}, { timeout: 4000 });
+      const text = view.container.querySelector("pre")?.textContent;
+      expect(new TextEncoder().encode(text ?? "").length).toBe(
+        lossy ? 65535 : 65536,
+      );
+      expect(
+        text ===
+          (lossy ? "�".repeat(21845) : (newline ? "\n" : "x").repeat(65536)),
+      ).toBe(true);
+      expect(
+        screen.queryByText(/Content unavailable or access denied/),
+      ).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([
+    "empty legacy",
+    "nonempty legacy",
+    "empty protected",
+    "protected equal cursor",
+  ])(
+    "completes %s logs without inventing another content cursor",
+    async (kind) => {
+      localStorage.setItem("access_token", "test-token");
+      vi.spyOn(axios, "request").mockResolvedValue({
+        status: 200,
+        data: page([{ ...header, selected_version: selected }]),
+        headers: {},
+      });
+      const empty = kind === "empty legacy" || kind === "empty protected";
+      const data = empty
+        ? ""
+        : "id: 5\nevent: content\ndata: hello\n\n" +
+          // Legacy SendInitial emits `content` for every catch-up chunk.
+          (kind === "nonempty legacy"
+            ? "id: 11\nevent: content\ndata:  world\n\n"
+            : "");
+      const doneId =
+        kind === "protected equal cursor"
+          ? "id: 5\n"
+          : kind === "empty protected"
+            ? "id: 0\n"
+            : "";
+      const fetch = vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            `${data}${doneId}event: done\ndata: Log stream sealed\n\n`,
+          ),
+        );
+      vi.stubGlobal("fetch", fetch);
+      const view = mount(
+        <ExecutionArtifactsPanel executionId={10} isRunning />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+      await screen.findByText("Stream complete");
+      expect(view.container.querySelector("pre")?.textContent).toBe(
+        empty
+          ? "(empty)"
+          : kind === "nonempty legacy"
+            ? "hello world"
+            : "hello",
+      );
+      expect(
+        screen.queryByText(
+          /Content unavailable or access denied|Loading content/,
+        ),
+      ).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([
+    { event: "append", id: "100", reconnect: false },
+    { event: "append", id: "90", reconnect: false },
+    { event: "content", id: "100", reconnect: true },
+    { event: "content", id: "90", reconnect: true },
+  ])(
+    "rejects non-increasing $event cursor $id before rendering its data",
+    async ({ event, id, reconnect }) => {
+      localStorage.setItem("access_token", "test-token");
+      vi.spyOn(axios, "request").mockResolvedValue({
+        status: 200,
+        data: page([{ ...header, selected_version: selected }]),
+        headers: {},
+      });
+      const first = `id: 100\nevent: content\ndata: ${"x".repeat(100)}\n\n`;
+      const invalid = `id: ${id}\nevent: ${event}\ndata: duplicated or rewound content\n\n`;
+      const cancel = vi.fn();
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode((reconnect ? "" : first) + invalid),
+          );
+        },
+        cancel,
+      });
+      const fetch = reconnect
+        ? vi
+            .fn()
+            .mockResolvedValueOnce(new Response(first))
+            .mockResolvedValueOnce(new Response(body))
+        : vi.fn().mockResolvedValue(new Response(body));
+      vi.stubGlobal("fetch", fetch);
+      const view = mount(
+        <ExecutionArtifactsPanel executionId={10} isRunning />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+      await screen.findByText(
+        /Content unavailable or access denied/,
+        {},
+        { timeout: 2500 },
+      );
+      await waitFor(() => expect(body.locked).toBe(false));
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledTimes(reconnect ? 2 : 1);
+      if (reconnect) expect(fetch.mock.calls[1][0]).toMatch(/\?offset=100$/);
+      expect(fetch.mock.calls.at(-1)?.[1].signal.aborted).toBe(true);
+      expect(view.container.querySelector("pre")).toBeNull();
+      expect(
+        screen.queryByText("duplicated or rewound content"),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    {
+      label: "ASCII whitespace",
+      chunks: [...Array<string>(12).fill("x".repeat(16384)), " \tend\n"],
+      expected: "x".repeat(65530) + " \tend\n",
+    },
+    {
+      label: "multibyte boundaries",
+      chunks: [...Array<string>(12).fill("界".repeat(5461)), "😀 \t"],
+      expected: "界".repeat(21843) + "😀 \t",
+    },
+  ])(
+    "bounds running preview to a UTF-8 tail preserving $label",
+    async ({ chunks, expected }) => {
+      localStorage.setItem("access_token", "test-token");
+      vi.spyOn(axios, "request").mockResolvedValue({
+        status: 200,
+        data: page([{ ...header, selected_version: selected }]),
+        headers: {},
+      });
+      const { wire, offset } = logFrames(chunks);
+      const fetch = vi
+        .fn()
+        .mockResolvedValue(
+          new Response(`${wire}id: ${offset}\nevent: done\ndata: verified\n\n`),
+        );
+      vi.stubGlobal("fetch", fetch);
+      const view = mount(
+        <ExecutionArtifactsPanel executionId={10} isRunning />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+      await screen.findByText("Stream complete");
+      const text = view.container.querySelector("pre")?.textContent;
+      expect(text).toBe(expected);
+      expect(new TextEncoder().encode(text ?? "").length).toBeLessThanOrEqual(
+        65536,
+      );
+      expect(text).not.toContain("�");
+      expect(
+        screen.getByText(/Live preview limited to the most recent 64 KiB/),
+      ).toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("resumes content frames at the complete server offset after the displayed prefix is dropped", async () => {
+    localStorage.setItem("access_token", "test-token");
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      data: page([{ ...header, selected_version: selected }]),
+      headers: {},
+    });
+    const first = logFrames(Array<string>(5).fill("x".repeat(16384)));
+    const second = logFrames([" \ttail\n"], first.offset);
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(first.wire))
+      .mockResolvedValueOnce(
+        new Response(
+          `${second.wire}id: ${second.offset}\nevent: done\ndata: verified\n\n`,
+        ),
+      );
+    vi.stubGlobal("fetch", fetch);
+    const view = mount(<ExecutionArtifactsPanel executionId={10} isRunning />);
+    fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await screen.findByText("Stream complete", {}, { timeout: 2500 });
+    expect(fetch.mock.calls[1][0]).toMatch(
+      /\/executions\/10\/logs\/stdout\/stream\?offset=81920$/,
+    );
+    const text = view.container.querySelector("pre")?.textContent;
+    expect(text?.length).toBe(65536);
+    expect(text?.endsWith(" \ttail\n")).toBe(true);
+    expect(
+      screen.getByText(/Live preview limited to the most recent 64 KiB/),
+    ).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves a complete server u64 resume ID without rounding or truncating it", async () => {
+    localStorage.setItem("access_token", "test-token");
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      data: page([{ ...header, selected_version: selected }]),
+      headers: {},
+    });
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response("id: 18446744073709551614\nevent: content\ndata: x\n\n"),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          "id: 18446744073709551615\nevent: content\ndata: y\n\nid: 18446744073709551615\nevent: done\ndata: verified\n\n",
+        ),
+      );
+    vi.stubGlobal("fetch", fetch);
+    const view = mount(<ExecutionArtifactsPanel executionId={10} isRunning />);
+    fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await screen.findByText("Stream complete", {}, { timeout: 2500 });
+    expect(fetch.mock.calls[1][0]).toMatch(/\?offset=18446744073709551614$/);
+    expect(view.container.querySelector("pre")?.textContent).toBe("xy");
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a fresh reconnect denial authoritative over any previously retained preview", async () => {
+    localStorage.setItem("access_token", "test-token");
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      data: page([{ ...header, selected_version: selected }]),
+      headers: {},
+    });
+    const first = logFrames(Array<string>(5).fill("x".repeat(16384)));
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(first.wire))
+      .mockResolvedValueOnce(
+        new Response("private revocation reason", { status: 403 }),
+      );
+    vi.stubGlobal("fetch", fetch);
+    const view = mount(<ExecutionArtifactsPanel executionId={10} isRunning />);
+    fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await screen.findByText(/Live preview limited to the most recent 64 KiB/);
+    await screen.findByText(
+      /Content unavailable or access denied/,
+      {},
+      { timeout: 2500 },
+    );
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[1][0]).toMatch(
+      /\/executions\/10\/logs\/stdout\/stream\?offset=81920$/,
+    );
+    expect(fetch.mock.calls[1][1].signal.aborted).toBe(true);
+    expect(view.container.querySelector("pre")).toBeNull();
+    expect(
+      screen.queryByText("private revocation reason"),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    "oversized",
+    "invalid-id",
+    "missing-id",
+    "missing-data",
+    "invalid-utf8",
+  ])(
+    "stops and disposes a %s SSE frame without retry or selected-sibling fallback",
+    async (kind) => {
+      localStorage.setItem("access_token", "test-token");
+      vi.spyOn(axios, "request").mockResolvedValue({
+        status: 200,
+        data: page([{ ...header, selected_version: selected }]),
+        headers: {},
+      });
+      const encode = (text: string) => new TextEncoder().encode(text);
+      const bytes =
+        kind === "oversized"
+          ? encode(
+              `id: 9\nevent: content\ndata: ${"x".repeat(8 * 1024 * 1024 + 1)}`,
+            )
+          : kind === "missing-id"
+            ? encode("event: content\ndata: private frame\n\n")
+            : kind === "missing-data"
+              ? encode("id: 9\nevent: content\n\n")
+              : kind === "invalid-id"
+                ? encode(
+                    "id: not-an-offset\nevent: content\ndata: private frame\n\n",
+                  )
+                : new Uint8Array([
+                    ...encode("id: 9\nevent: content\ndata: "),
+                    255,
+                    ...encode("\n\n"),
+                  ]);
+      const cancel = vi.fn();
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(bytes);
+        },
+        cancel,
+      });
+      const fetch = vi.fn().mockResolvedValue(new Response(body));
+      vi.stubGlobal("fetch", fetch);
+      mount(<ExecutionArtifactsPanel executionId={10} isRunning />);
+      fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+      await screen.findByText(/Content unavailable or access denied/);
+      await waitFor(() => expect(body.locked).toBe(false));
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetch.mock.calls[0][1].signal.aborted).toBe(true);
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(screen.queryByText("private frame")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["revocation", "unmount"])(
+    "disposes a truncated active preview on %s without changing its selected execution",
+    async (reason) => {
+      localStorage.setItem("access_token", "test-token");
+      vi.spyOn(axios, "request").mockResolvedValue({
+        status: 200,
+        data: page([{ ...header, selected_version: selected }]),
+        headers: {},
+      });
+      const first = logFrames(Array<string>(5).fill("x".repeat(16384)));
+      let writer!: ReadableStreamDefaultController<Uint8Array>;
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          writer = controller;
+          controller.enqueue(new TextEncoder().encode(first.wire));
+        },
+        cancel,
+      });
+      const fetch = vi.fn().mockResolvedValue(new Response(body));
+      vi.stubGlobal("fetch", fetch);
+      const view = mount(
+        <ExecutionArtifactsPanel executionId={10} isRunning />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+      await screen.findByText(/Live preview limited to the most recent 64 KiB/);
+      if (reason === "unmount") view.unmount();
+      else {
+        await act(async () =>
+          writer.enqueue(
+            new TextEncoder().encode(
+              "event: error\ndata: private revocation reason\n\nid: 81926\nevent: append\ndata: sibling content\n\n",
+            ),
+          ),
+        );
+        await screen.findByText(/Content unavailable or access denied/);
+        expect(
+          screen.queryByText(/private revocation reason|sibling content/),
+        ).not.toBeInTheDocument();
+        expect(view.container.querySelector("pre")).toBeNull();
+      }
+      await waitFor(() => expect(body.locked).toBe(false));
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(fetch.mock.calls[0][0]).toMatch(
+        /\/executions\/10\/logs\/stdout\/stream$/,
+      );
+      expect(fetch.mock.calls[0][1].signal.aborted).toBe(true);
+    },
+  );
+
   it("previews the execution-selected version with a bounded range, never the shared latest", async () => {
     vi.spyOn(axios, "request").mockResolvedValue({
       status: 200,
