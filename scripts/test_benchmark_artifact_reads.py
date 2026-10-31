@@ -18,45 +18,19 @@ spec.loader.exec_module(benchmark)
 
 
 class ArtifactBenchmarkRunnerTests(unittest.TestCase):
-    def test_paired_reference_selection_enforces_targets_instead_of_only_labeling_the_run(self):
-        class Server:
-            def __init__(self, image, run_id, case):
-                self.case, self.name = case, 'owned'
-            def __enter__(self):
-                self.case['port'] = '127.0.0.1:12345'
-                return self
-            def __exit__(self, *args):
-                self.case['cleanup_errors'] = []
-            def sql(self, _):
-                return ''
-        protocol = SimpleNamespace(Server=Server, command=lambda *args: SimpleNamespace(stdout='owned fixture df'))
-        for seconds, expected in [(.1,0),(.9,1)]:
-            with self.subTest(seconds=seconds), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                output = root / 'evidence'
-                def run(args, **kwargs):
-                    if args[0] == 'git':
-                        return subprocess.CompletedProcess(args,0,'revision\n','')
-                    if args[-1] == '--list':
-                        return subprocess.CompletedProcess(args,0,'reference::paired_serial_reference_latency_and_query_gate: test\n','')
-                    if '--ignored' in args:
-                        sample = dict(comparison_kind='controlled-serial-reference-not-historical-revision',
-                            identical_response_bodies=True, query_reduction_target=.90,p95_reduction_target=.70,
-                            fixture='paired',permissions='same',cache_state='warm',concurrency=1,completed_requests=20,
-                            baseline=[dict(status=200,handler_seconds=1,queries=dict(statements=807)) for _ in range(20)],
-                            treatment=[dict(status=200,handler_seconds=seconds,queries=dict(statements=10)) for _ in range(20)])
-                        (Path(kwargs['env']['ATTUNE_ARTIFACT_BENCHMARK_OUTPUT'])/'paired-serial-reference.json').write_text(json.dumps(sample))
-                    return subprocess.CompletedProcess(args,0)
-                with patch.object(benchmark,'ROOT',root), \
-                        patch.object(benchmark.subprocess,'run',side_effect=run), \
-                        patch.object(benchmark,'compile_test',return_value='test-executable'), \
-                        patch.object(benchmark,'load_protocol',return_value=protocol), \
-                        patch('sys.argv',[str(SCRIPT),'--output',str(output),'--versions','18','--paired-reference']), \
-                        contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(benchmark.main(),expected)
-                evidence = json.loads((output/'evidence.json').read_text())
-                self.assertEqual(evidence['passed'],expected==0)
-                self.assertEqual(evidence['cases'][0]['paired_reference_acceptance']['passed'],expected==0)
+    def test_inequivalent_paired_reference_cannot_certify_the_new_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'evidence'
+            stderr = io.StringIO()
+            with patch('sys.argv', [str(SCRIPT), '--output', str(output), '--paired-reference']), \
+                    patch.object(benchmark, 'compile_test', side_effect=AssertionError('unexpected build')), \
+                    patch.object(benchmark, 'load_protocol', side_effect=AssertionError('unexpected fixture')), \
+                    contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    benchmark.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn('matched-policy reference is required', stderr.getvalue())
+            self.assertFalse(output.exists())
 
     def test_owned_database_removal_has_a_bounded_docker_teardown_budget(self):
         protocol = benchmark.load_protocol()
@@ -173,6 +147,12 @@ class ArtifactBenchmarkRunnerTests(unittest.TestCase):
             self.assertEqual(manifest["revision"], "fixture-revision")
             self.assertEqual(len(manifest["source_sha256"]["config.test.yaml"]), 64)
             self.assertNotIn("fixture-private-value", stdout.getvalue())
+            self.assertEqual(manifest['runtime_log_history_gate']['unrelated_history_queries'], 0)
+            self.assertIn('no exact totals', manifest['artifact_page_contract'])
+            frontier = manifest['source_frontier_query_gates']
+            self.assertEqual(frontier['statements_at_64'], frontier['disclosure_ceiling_at_64'] + frontier['fixed_guard_query_allowance'] + frontier['structural_owner_query_allowance'])
+            self.assertEqual(frontier['statements_at_65'], frontier['disclosure_ceiling_at_65'] + frontier['fixed_guard_query_allowance'] + frontier['structural_owner_query_allowance'])
+            self.assertEqual(frontier['additional_frontier_query_limit'], 15)
 
     def test_existing_output_is_rejected_before_building(self):
         with tempfile.TemporaryDirectory() as directory, \

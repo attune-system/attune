@@ -149,12 +149,14 @@ def main():
     cli.add_argument("--stage", choices=("baseline", "treatment"), default="baseline")
     cli.add_argument("--with-key-usage-tests", action="store_true", help="also run existing recorded-key and sensor disclosure regressions")
     cli.add_argument("--workload-profile", action="store_true", help="also run the explicit 1/7/30/90-partition, prepared-batch, and maintenance/capacity stress profile")
-    cli.add_argument("--paired-reference", action="store_true", help="require identical serial-reference/batched responses, 90%% fewer queries, and 70%% lower warm p95 on the same owned fixture; not a historical-build comparison")
+    cli.add_argument("--paired-reference", action="store_true", help="blocked pending a matched selected-version-policy reference; the former aggregate-disclosure comparison cannot certify this implementation")
     cli.add_argument("--with-notifier-tests", action="store_true", help="also run notifier authorization, broadcast-loss, and real PostgreSQL listener-gap tests")
     cli.add_argument("--notifier-profile", action="store_true", help="also measure real notifier visibility SQL and per-identity fan-out for 1/16/64 identities with 1/4 tabs; includes notifier tests")
     cli.add_argument("--snapshot-source", action="store_true", help="build a hash-checked source copy under the unused output directory; retain it as evidence without copying build caches or local credentials")
     cli.add_argument("--dry-run", action="store_true", help="show source fingerprint and cases without building or starting Docker")
     args = cli.parse_args()
+    if args.paired_reference:
+        cli.error("--paired-reference is unverified: the former whole-history disclosure reference is not equivalent to the selected-version policy; a matched-policy reference is required")
     if args.output.exists() or args.output.is_symlink():
         cli.error("--output already exists; choose a new run-owned directory")
     args.output = args.output.absolute()
@@ -172,12 +174,22 @@ def main():
         "with_notifier_tests": args.with_notifier_tests,
         "notifier_profile": args.notifier_profile,
         "snapshot_source": args.snapshot_source,
-        "artifact_candidate_batch_size": 256, "execution_disclosure_batch_size": 64,
+        "artifact_page_contract": "items,next_cursor,has_more; per_page=20 default,100 maximum; no exact totals",
+        "execution_disclosure_batch_size": 64,
+        "runtime_log_history_gate": {"retained_executions": [1, 256, 257, 1000],
+            "unrelated_history_queries": 0, "metadata_disclosure_evidence_queries": 0,
+            "selected_body": "fixed first execution and immutable version"},
         "measurement_scope": "request-scoped SQLx statement events and real Axum responses",
-        "source_frontier_query_gates": {"batch_size": 64, "query_budget_basis": "application statements excluding exact driver discovery and pool setup", "statements_at_64": 25,
-                                        "statements_at_65": 40, "within_batch_source_reads": "constant"},
+        "source_frontier_query_gates": {"batch_size": 64, "query_budget_basis": "application statements excluding exact driver discovery and pool setup; security work remains counted",
+            "read_scope": "selected version content, not metadata",
+            "disclosure_ceiling_at_64": 25, "disclosure_ceiling_at_65": 40,
+            "fixed_guard_query_allowance": 10, "structural_owner_query_allowance": 4,
+            "statements_at_64": 39, "statements_at_65": 54,
+            "within_batch_application_queries": "constant", "additional_frontier_query_limit": 15,
+            "within_batch_source_reads": "constant"},
         "host": {"system": platform.system(), "machine": platform.machine(), "logical_cpus": os.cpu_count()},
         "limitations": ["no network/browser TTFB", "no fixed-source baseline p95 certification",
+                          "100000/604800 execution scale, live-write/browser soak, and absolute latency SLO remain unverified",
                          "pool acquisition includes connection creation/health checks, not only queue wait",
                          "Linux poll CPU is request/disclosure work, not a database CPU measurement"],
         "cases": [], "passed": False,

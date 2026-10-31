@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { ArtifactClassification } from "./ArtifactClassification";
 import type { ArtifactType } from "./ArtifactType";
+import type { ArtifactVersionSummary } from "./ArtifactVersionSummary";
 import type { ArtifactVisibility } from "./ArtifactVisibility";
 import type { OwnerType } from "./OwnerType";
 /**
@@ -42,8 +43,9 @@ export type ArtifactSummary = {
    * Owner scope
    */
   scope: OwnerType;
+  selected_version?: null | ArtifactVersionSummary;
   /**
-   * Size of latest version in bytes
+   * Display size: execution-selected when scoped; omitted for global runtime logs.
    */
   size_bytes?: number | null;
   /**

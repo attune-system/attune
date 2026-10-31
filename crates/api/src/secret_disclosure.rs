@@ -208,17 +208,6 @@ pub(crate) async fn authorize_file_origin_with_receipts(
     user: &AuthenticatedUser,
     origin_read: i64,
 ) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
-    let snapshot = state
-        .authorization_service()
-        .load_snapshot(user)
-        .await
-        .map_err(|error| file_origin_error(HumanFileOriginStage::Snapshot, error))?
-        .ok_or_else(|| {
-            file_origin_error(
-                HumanFileOriginStage::Snapshot,
-                ApiError::Forbidden("File origin disclosure requires identity access".into()),
-            )
-        })?;
     let provenance = SecretProvenance {
         origins: vec![
             attune_common::repositories::runtime_read::RuntimeReadRepository::reference(
@@ -240,16 +229,23 @@ pub(crate) async fn authorize_file_origin_with_receipts(
         .await
         .map_err(|error| file_origin_error(HumanFileOriginStage::Frontier, error))?
         .shared();
-    let mut records = DisclosureRecords::default();
-    records
-        .prepare(
-            &state.db,
-            user,
-            &snapshot.grants,
-            [("provenance", Some(encoded.as_str()))],
+    let snapshot = receipts.lock().await.credential_snapshot().ok_or_else(|| {
+        file_origin_error(
+            HumanFileOriginStage::Snapshot,
+            ApiError::Forbidden("File origin disclosure requires retained identity access".into()),
         )
-        .await
-        .map_err(|error| file_origin_error(HumanFileOriginStage::Records, error))?;
+    })?;
+    let mut records = DisclosureRecords::default();
+    prepare_records_with_guard(
+        state,
+        user,
+        &snapshot.grants,
+        &mut records,
+        [("provenance", Some(encoded.as_str()))],
+        Some(&receipts),
+    )
+    .await
+    .map_err(|error| file_origin_error(HumanFileOriginStage::Records, error))?;
     let mut caller = AuthorizationContext::new(snapshot.identity_id);
     caller.identity_attributes = snapshot.identity_attributes.clone();
     let mut budget = RuntimeOriginBudget::with_guard(receipts.clone());
@@ -493,13 +489,14 @@ async fn authorize_runtime_log_cached_impl(
     receipt_guard: Option<crate::receipt_disclosure::SharedHumanReceiptGuard>,
 ) -> ApiResult<()> {
     for action in [Action::Read, Action::Decrypt] {
-        crate::routes::executions::authorize_execution_projection(
+        authorize_execution_with_guard(
             state,
             user,
             execution,
             action,
             Some(snapshot),
             &mut records.visibility,
+            receipt_guard.as_ref(),
         )
         .await?;
     }
@@ -540,6 +537,58 @@ async fn authorize_runtime_log_cached_impl(
     let freshness = std::mem::take(&mut authorization.runtime_budget.receipt_freshness);
     authorization.records.retain_receipt_freshness(freshness)?;
     Ok(())
+}
+
+/// Retained Access IAM or separate legacy token caps are authoritative. Neither
+/// path reacquires the pool or loads cached/pre-guard allows during disclosure.
+async fn authorize_execution_with_guard(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    execution: &ExecutionAuthorizationRow,
+    action: Action,
+    snapshot: Option<&crate::authz::AuthorizationSnapshot>,
+    visibility: &mut crate::routes::executions::ExecutionVisibilityCache,
+    guard: Option<&crate::receipt_disclosure::SharedHumanReceiptGuard>,
+) -> ApiResult<()> {
+    if let Some(guard) = guard {
+        let mut held = guard.lock().await;
+        let current = held
+            .credential_snapshot()
+            .ok_or_else(|| ApiError::Forbidden("Current disclosure IAM is unavailable".into()))?;
+        crate::routes::executions::authorize_execution_projection_on(
+            state,
+            user,
+            execution,
+            action,
+            &current,
+            visibility,
+            held.connection(),
+        )
+        .await
+    } else {
+        crate::routes::executions::authorize_execution_projection(
+            state, user, execution, action, snapshot, visibility,
+        )
+        .await
+    }
+}
+
+async fn prepare_records_with_guard<'a>(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    grants: &[attune_common::rbac::Grant],
+    records: &mut DisclosureRecords,
+    secrets: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    guard: Option<&crate::receipt_disclosure::SharedHumanReceiptGuard>,
+) -> ApiResult<()> {
+    if let Some(guard) = guard {
+        let mut held = guard.lock().await;
+        records
+            .prepare_on(held.connection(), user, grants, secrets)
+            .await
+    } else {
+        records.prepare(&state.db, user, grants, secrets).await
+    }
 }
 
 pub async fn authorize_sensor_runtime_log(
@@ -586,13 +635,14 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
     sensor_ref: &str,
     receipt_guard: &crate::receipt_disclosure::SharedHumanReceiptGuard,
 ) -> ApiResult<()> {
-    receipt_guard.lock().await.close_sources();
+    let mut held = receipt_guard.lock().await;
+    held.close_sources();
     use attune_common::repositories::sensor_schema::{
         SensorSchemaRepository, ENTITY_SENSOR_GENERATION_CONFIG,
         ENTITY_SENSOR_GENERATION_RULE_CONFIG,
     };
     let (id, expected_digest) =
-        SensorSchemaRepository::find_log_generation(&state.db, artifact_version)
+        SensorSchemaRepository::find_log_generation(held.connection(), artifact_version)
             .await?
             .ok_or_else(|| {
                 ApiError::Forbidden("Sensor log disclosure requires its admitted generation".into())
@@ -600,7 +650,9 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
     let mut records = DisclosureRecords::default();
     // Use the same prepared generation proof as recursive sensor origins.
     // Seeding a decoded row alone would skip its structural owner evidence.
-    records.load_generations(&state.db, &[id]).await?;
+    records
+        .load_generations_on(held.connection(), &[id])
+        .await?;
     let binding = records
         .generations
         .get(&id)
@@ -614,7 +666,7 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
     let mut secrets = Vec::new();
     let mut rule_secrets = Vec::new();
     for row in ExecutionSecretValueRepository::find_provenance_by_entities(
-        &state.db,
+        held.connection(),
         &[
             ENTITY_SENSOR_GENERATION_CONFIG,
             ENTITY_SENSOR_GENERATION_RULE_CONFIG,
@@ -630,9 +682,10 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
         }
     }
     let deliveries =
-        SensorSchemaRepository::log_delivery_origins(&state.db, artifact_version).await?;
+        SensorSchemaRepository::log_delivery_origins(held.connection(), artifact_version).await?;
     for batch in deliveries.chunks(64) {
-        let rows = SensorSchemaRepository::find_delivery_disclosure_rows(&state.db, batch).await?;
+        let rows =
+            SensorSchemaRepository::find_delivery_disclosure_rows(held.connection(), batch).await?;
         for row in rows {
             if row.generation_binding != id {
                 return Err(ApiError::Forbidden(
@@ -648,14 +701,14 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
         }
         secrets.extend(
             ExecutionSecretValueRepository::find_provenance_by_entities(
-                &state.db,
+                held.connection(),
                 &[attune_common::repositories::sensor_schema::ENTITY_SENSOR_RULE_DELIVERY_CONFIG],
                 batch,
             )
             .await?,
         );
     }
-    let key_origins = SensorSchemaRepository::key_read_origins(&state.db, id).await?;
+    let key_origins = SensorSchemaRepository::key_read_origins(held.connection(), id).await?;
     if secrets.is_empty()
         && rule_secrets.is_empty()
         && key_origins.is_empty()
@@ -663,17 +716,9 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
     {
         return Ok(());
     }
-    let held_snapshot = receipt_guard.lock().await.iam_snapshot();
-    let snapshot = match held_snapshot {
-        Some(snapshot) => snapshot,
-        None => state
-            .authorization_service()
-            .load_snapshot(user)
-            .await?
-            .ok_or_else(|| {
-                ApiError::Forbidden("Sensor log secret disclosure requires identity access".into())
-            })?,
-    };
+    let snapshot = held.credential_snapshot().ok_or_else(|| {
+        ApiError::Forbidden("Sensor log secret disclosure requires retained identity access".into())
+    })?;
     let mut caller = AuthorizationContext::new(snapshot.identity_id);
     caller.identity_attributes = snapshot.identity_attributes;
     let mut key_ownership =
@@ -692,7 +737,8 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
         for batch in ids.chunks(64) {
             key_ownership.extend(
                 attune_common::repositories::iam_ownership::VerifiedKeyOrigins::load(
-                    &state.db, batch,
+                    held.connection(),
+                    batch,
                 )
                 .await?,
             );
@@ -741,11 +787,11 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
         ));
     }
     records
-        .load_sensor_sources(&state.db, user, &snapshot.grants, &sources)
+        .load_sensor_sources_on(held.connection(), user, &snapshot.grants, &sources)
         .await?;
     records
-        .prepare(
-            &state.db,
+        .prepare_on(
+            held.connection(),
             user,
             &snapshot.grants,
             secrets
@@ -794,6 +840,7 @@ pub(crate) async fn authorize_sensor_runtime_log_prepared(
         }
     }
     secrets.extend(rule_secrets);
+    drop(held);
     let mut runtime_budget = RuntimeOriginBudget::with_guard(receipt_guard.clone());
     let mut authorization = OriginAuthorization {
         runtime_budget: &mut runtime_budget,
@@ -1191,9 +1238,12 @@ impl OriginAuthorization<'_> {
                         }
                     } else if let Some(source) = &source {
                         let execution_id = source.site().execution;
-                        self.records
-                            .load_executions(&state.db, &[execution_id])
-                            .await?;
+                        {
+                            let mut guard = shared.lock().await;
+                            self.records
+                                .load_executions_on(guard.connection(), &[execution_id])
+                                .await?;
+                        }
                         let Some(execution) = self.records.execution(execution_id) else {
                             return Ok(self
                                 .runtime_budget
@@ -1205,13 +1255,14 @@ impl OriginAuthorization<'_> {
                             grants: grants.to_vec(),
                         };
                         for action in [Action::Read, Action::Decrypt] {
-                            match crate::routes::executions::authorize_execution_projection(
+                            match authorize_execution_with_guard(
                                 state,
                                 user,
                                 &execution,
                                 action,
                                 Some(&snapshot),
                                 &mut self.records.visibility,
+                                self.runtime_budget.receipt_guard.as_ref(),
                             )
                             .await
                             {
@@ -1250,14 +1301,15 @@ impl OriginAuthorization<'_> {
                         })?;
                         let mut records = DisclosureRecords::default();
                         records.inherit_frozen_parents(self.records)?;
-                        records
-                            .prepare(
-                                &state.db,
-                                user,
-                                grants,
-                                [("provenance", Some(reference.as_str()))],
-                            )
-                            .await?;
+                        prepare_records_with_guard(
+                            state,
+                            user,
+                            grants,
+                            &mut records,
+                            [("provenance", Some(reference.as_str()))],
+                            self.runtime_budget.receipt_guard.as_ref(),
+                        )
+                        .await?;
                         let mut child = OriginAuthorization {
                             state,
                             user,
@@ -1408,14 +1460,15 @@ impl OriginAuthorization<'_> {
                                     let site = source.row_site(&row)?;
                                     let mut records = DisclosureRecords::default();
                                     records.inherit_frozen_parents(self.records)?;
-                                    records
-                                        .prepare(
-                                            &state.db,
-                                            user,
-                                            grants,
-                                            [(&*row.source_kind, row.source_ref.as_deref())],
-                                        )
-                                        .await?;
+                                    prepare_records_with_guard(
+                                        state,
+                                        user,
+                                        grants,
+                                        &mut records,
+                                        [(&*row.source_kind, row.source_ref.as_deref())],
+                                        self.runtime_budget.receipt_guard.as_ref(),
+                                    )
+                                    .await?;
                                     let mut child = OriginAuthorization {
                                         state,
                                         user,
@@ -1465,14 +1518,15 @@ impl OriginAuthorization<'_> {
                                     let site = source.row_site(&row)?;
                                     let mut records = DisclosureRecords::default();
                                     records.inherit_frozen_parents(self.records)?;
-                                    records
-                                        .prepare(
-                                            &state.db,
-                                            user,
-                                            grants,
-                                            [(&*row.source_kind, row.source_ref.as_deref())],
-                                        )
-                                        .await?;
+                                    prepare_records_with_guard(
+                                        state,
+                                        user,
+                                        grants,
+                                        &mut records,
+                                        [(&*row.source_kind, row.source_ref.as_deref())],
+                                        self.runtime_budget.receipt_guard.as_ref(),
+                                    )
+                                    .await?;
                                     let mut child = OriginAuthorization {
                                         state,
                                         user,
@@ -1736,13 +1790,14 @@ impl OriginAuthorization<'_> {
                                     &[Action::Read, Action::Decrypt]
                                 };
                                 for &action in actions {
-                                    crate::routes::executions::authorize_execution_projection(
+                                    authorize_execution_with_guard(
                                         state,
                                         user,
                                         &execution,
                                         action,
                                         None,
                                         &mut self.records.visibility,
+                                        self.runtime_budget.receipt_guard.as_ref(),
                                     )
                                     .await
                                     .map_err(|error| {
@@ -1758,13 +1813,24 @@ impl OriginAuthorization<'_> {
                                 ) {
                                     continue;
                                 }
-                                let binding = {
-                                    let mut connection = state.db.acquire().await?;
-                                    attune_common::repositories::schema_contract::SchemaContractRepository::find(
-                                        &mut connection,
-                                        attune_common::repositories::schema_contract::BindingOwner::Execution,
+                                let binding = if let Some(shared) =
+                                    self.runtime_budget.receipt_guard.as_ref()
+                                {
+                                    let mut held = shared.lock().await;
+                                    SchemaContractRepository::find(
+                                        held.connection(),
+                                        BindingOwner::Execution,
                                         id,
-                                    ).await?
+                                    )
+                                    .await?
+                                } else {
+                                    let mut connection = state.db.acquire().await?;
+                                    SchemaContractRepository::find(
+                                        &mut connection,
+                                        BindingOwner::Execution,
+                                        id,
+                                    )
+                                    .await?
                                 };
                                 if binding.is_none() {
                                     return Ok(self
@@ -1956,16 +2022,17 @@ impl OriginAuthorization<'_> {
                                             "Runtime read evidence is unavailable".into(),
                                         )
                                     })?;
-                                child_records
-                                    .prepare(
-                                        &state.db,
-                                        user,
-                                        grants,
-                                        references.iter().map(|reference| {
-                                            ("provenance", Some(reference.as_str()))
-                                        }),
-                                    )
-                                    .await?;
+                                prepare_records_with_guard(
+                                    state,
+                                    user,
+                                    grants,
+                                    &mut child_records,
+                                    references
+                                        .iter()
+                                        .map(|reference| ("provenance", Some(reference.as_str()))),
+                                    self.runtime_budget.receipt_guard.as_ref(),
+                                )
+                                .await?;
                                 let mut child = OriginAuthorization {
                                     state,
                                     user,
@@ -2117,13 +2184,14 @@ impl OriginAuthorization<'_> {
                             grants: grants.to_vec(),
                         };
                         for action in [Action::Read, Action::Decrypt] {
-                            match crate::routes::executions::authorize_execution_projection(
+                            match authorize_execution_with_guard(
                                 state,
                                 user,
                                 &execution,
                                 action,
                                 Some(&snapshot),
                                 &mut self.records.visibility,
+                                self.runtime_budget.receipt_guard.as_ref(),
                             )
                             .await
                             {

@@ -4,6 +4,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { request } from "@/api/core/request";
 import { useArtifactVersions, useExecutionArtifacts } from "./useArtifacts";
+import { queryClient } from "@/lib/query-client";
 
 vi.mock("@/contexts/WebSocketContext", () => ({
   useWebSocketContext: () => ({ connected: true }),
@@ -16,14 +17,8 @@ vi.mock("@/api/core/request", async () => {
         new CancelablePromise((resolve) =>
           resolve({
             items: [],
-            pagination: {
-              page: 1,
-              page_size: 20,
-              total_items: 0,
-              total_pages: 0,
-              has_previous: false,
-              has_next: false,
-            },
+            next_cursor: null,
+            has_more: false,
           }),
         ),
     ),
@@ -39,7 +34,7 @@ describe("artifact server-page requests", () => {
 
   function provider() {
     const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+      defaultOptions: queryClient.getDefaultOptions(),
     });
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -50,7 +45,8 @@ describe("artifact server-page requests", () => {
 
   it("requests the selected execution page and exposes pagination metadata", async () => {
     const hook = renderHook(
-      () => useExecutionArtifacts(42, false, { page: 3, perPage: 20 }),
+      () =>
+        useExecutionArtifacts(42, false, { cursor: "older-runs", perPage: 20 }),
       { wrapper: provider() },
     );
     dispose.unshift(hook.unmount);
@@ -60,10 +56,10 @@ describe("artifact server-page requests", () => {
       expect.objectContaining({
         url: "/api/v1/executions/{execution_id}/artifacts",
         path: { execution_id: 42 },
-        query: { page: 3, per_page: 20, type: undefined },
+        query: { cursor: "older-runs", per_page: 20, type: undefined },
       }),
     );
-    expect(hook.result.current.data?.pagination.total_items).toBe(0);
+    expect(hook.result.current.data?.has_more).toBe(false);
   });
 
   it("discovers progress with a filtered one-row request", async () => {
@@ -76,14 +72,18 @@ describe("artifact server-page requests", () => {
     expect(request).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
-        query: { page: 1, per_page: 1, type: "progress" },
+        query: { cursor: undefined, per_page: 1, type: "progress" },
       }),
     );
   });
 
   it("requests a bounded history page instead of fetching and slicing all versions", async () => {
     const hook = renderHook(
-      () => useArtifactVersions(42, true, { page: 2, perPage: 20 }),
+      () =>
+        useArtifactVersions(42, true, {
+          cursor: "older-versions",
+          perPage: 20,
+        }),
       { wrapper: provider() },
     );
     dispose.unshift(hook.unmount);
@@ -93,7 +93,7 @@ describe("artifact server-page requests", () => {
       expect.objectContaining({
         url: "/api/v1/artifacts/{id}/versions",
         path: { id: 42 },
-        query: { page: 2, per_page: 20 },
+        query: { cursor: "older-versions", per_page: 20 },
       }),
     );
     expect(hook.result.current.data?.items).toEqual([]);
@@ -101,16 +101,16 @@ describe("artifact server-page requests", () => {
 
   it("keeps a loaded paused page unchanged on shared invalidation but loads manual navigation", async () => {
     const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+      defaultOptions: queryClient.getDefaultOptions(),
     });
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     );
     const hook = renderHook(
       () => {
-        const [page, setPage] = useState(1);
-        const query = useExecutionArtifacts(42, true, { page }, true);
-        return { query, setPage };
+        const [cursor, setCursor] = useState<string>();
+        const query = useExecutionArtifacts(42, true, { cursor }, true);
+        return { query, setCursor };
       },
       { wrapper },
     );
@@ -124,13 +124,13 @@ describe("artifact server-page requests", () => {
       client.invalidateQueries({ queryKey: ["artifacts", "execution", 42] }),
     );
     expect(request).toHaveBeenCalledOnce();
-    act(() => hook.result.current.setPage(2));
+    act(() => hook.result.current.setCursor("older-runs"));
     await waitFor(() => expect(hook.result.current.query.isSuccess).toBe(true));
     expect(request).toHaveBeenCalledTimes(2);
     expect(request).toHaveBeenLastCalledWith(
       expect.anything(),
       expect.objectContaining({
-        query: { page: 2, per_page: 20, type: undefined },
+        query: { cursor: "older-runs", per_page: 20, type: undefined },
       }),
     );
   });

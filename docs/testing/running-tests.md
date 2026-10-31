@@ -293,9 +293,10 @@ requests, and 20 completed requests across four concurrent clients separately.
 It also measures 2/20/100 attached artifacts with bounded pages and a 10 MiB
 progress body excluded from summaries. Cache invalidation is not a cold database.
 
-Add `--paired-reference` to enforce the 90% query and 70% warm-p95 reduction gates
-against a controlled serial reader on the same fixture. It is not a historical
-revision comparison. Add `--notifier-profile` for database-backed per-identity
+The historical `--paired-reference` gate is blocked after the selected-version
+policy change: its aggregate-content reference no longer exercises equivalent
+authorization work. Do not claim the old 90% query/70% warm-p95 reductions as new
+selected-read acceptance. Add `--notifier-profile` for database-backed per-identity
 delivery/SQL measurements. See
 [the executable acceptance gates](../deployment/artifact-read-acceptance.md#executable-local-gates)
 for scope, sample ordering, and failure rules. The serial route exists only in the

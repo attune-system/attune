@@ -49,6 +49,47 @@ def _get(client: AttuneClient, path: str, expected: int = 200):
     return resp.json().get("data", resp.json())
 
 
+def _assert_execution_log_content(
+    client: AttuneClient, execution_id: int, stream: str, expected: str
+) -> None:
+    """Wait for finalization and read only this execution's selected log version."""
+    last_status = None
+
+    def _selected_log_ready() -> bool:
+        nonlocal last_status
+        response = client._request(
+            "GET",
+            f"/api/v1/executions/{execution_id}/artifacts",
+            params={"per_page": 100, "type": "file_text"},
+        )
+        assert response.status_code == 200, (
+            f"Execution artifact list failed: {response.status_code}"
+        )
+        rows = response.json()["items"]
+        matches = [row for row in rows if row["ref"].endswith(f".{stream}.log")]
+        if not matches:
+            return False
+        assert len(matches) == 1, f"Expected one {stream} artifact for execution"
+        artifact = matches[0]
+        selected = artifact["selected_version"]
+        assert selected["execution"] == execution_id
+        download = client._request(
+            "GET",
+            f"/api/v1/artifacts/{artifact['id']}/versions/{selected['version']}/download",
+            params={"version_id": selected["id"]},
+        )
+        last_status = download.status_code
+        assert last_status in (200, 404), f"Unexpected log download status: {last_status}"
+        return last_status == 200 and expected in download.text
+
+    wait_for_condition(
+        _selected_log_ready,
+        timeout=30,
+        poll_interval=0.5,
+        error_message=f"Selected {stream} log for execution {execution_id} was not available",
+    )
+
+
 def _create_execution_with_selector(
     client: AttuneClient,
     action_ref: str,
@@ -409,31 +450,7 @@ class TestStandaloneWorkerTransport:
             f"Expected stdout_ok=true: {result}"
         )
 
-        # Try to retrieve stdout log via the execution log stream endpoint
-        # GET /api/v1/executions/{id}/logs/stdout/stream returns SSE
-        # We use a simple download instead.
-        # The stdout artifact should be accessible via execution artifacts
-        artifacts_resp = client._request(
-            "GET", f"/api/v1/artifacts",
-            params={"execution": exec_id},
-        )
-        if artifacts_resp.status_code == 200:
-            artifacts = artifacts_resp.json().get("data", artifacts_resp.json())
-            if isinstance(artifacts, list):
-                stdout_arts = [
-                    a for a in artifacts
-                    if "stdout" in (a.get("ref") or "").lower()
-                ]
-                # If stdout artifacts exist, verify they have content
-                for art in stdout_arts:
-                    art_id = art["id"]
-                    download_resp = client._request(
-                        "GET", f"/api/v1/artifacts/{art_id}/download"
-                    )
-                    # 200 = file content; 204 = empty; 404 = file not on this server
-                    assert download_resp.status_code in (200, 204, 404), (
-                        f"Artifact download unexpected: {download_resp.status_code}"
-                    )
+        _assert_execution_log_content(client, exec_id, "stdout", "stdout_ok")
 
     def test_stderr_log_accessible(
         self, client, standalone_worker_available, sa_pack, sa_pack_ref
@@ -456,31 +473,7 @@ class TestStandaloneWorkerTransport:
         )
         assert final["status"] == "completed"
 
-        # Give the worker time to finalize logs
-        time.sleep(3)
-
-        # Check stderr artifact exists
-        artifacts_resp = client._request(
-            "GET", f"/api/v1/artifacts",
-            params={"execution": exec_id},
-        )
-        if artifacts_resp.status_code == 200:
-            artifacts = artifacts_resp.json().get("data", artifacts_resp.json())
-            if isinstance(artifacts, list):
-                stderr_arts = [
-                    a for a in artifacts
-                    if "stderr" in (a.get("ref") or "").lower()
-                ]
-                if stderr_arts:
-                    art = stderr_arts[0]
-                    download_resp = client._request(
-                        "GET", f"/api/v1/artifacts/{art['id']}/download"
-                    )
-                    if download_resp.status_code == 200:
-                        content = download_resp.text
-                        assert "stderr-line-1" in content, (
-                            f"Expected stderr content, got: {content[:200]}"
-                        )
+        _assert_execution_log_content(client, exec_id, "stderr", "stderr-line-1")
 
     def test_file_artifact_copied_from_standalone_worker(
         self, client, standalone_worker_available, sa_pack, sa_pack_ref
@@ -521,29 +514,34 @@ class TestStandaloneWorkerTransport:
         assert artifact["owner"] == action_ref
 
         versions = []
-        page = 1
+        cursor = None
+        seen_cursors = set()
         while True:
+            params = {"per_page": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
             versions_resp = client._request(
-                "GET", f"/api/v1/artifacts/{artifact['id']}/versions?page={page}&per_page=100"
+                "GET", f"/api/v1/artifacts/{artifact['id']}/versions", params=params
             )
             assert versions_resp.status_code == 200, (
                 f"Version list failed: {versions_resp.status_code} {versions_resp.text}"
             )
             version_page = versions_resp.json()
             versions.extend(version_page["items"])
-            if not version_page["pagination"]["has_next"]:
+            cursor = version_page["next_cursor"]
+            if cursor is None:
                 break
-            assert version_page["items"], "An advancing version page must not be empty"
-            page += 1
+            assert cursor not in seen_cursors, "Version cursor did not advance"
+            seen_cursors.add(cursor)
         matching_versions = [
             version for version in versions
             if version.get("execution") == exec_id
-            and version.get("file_path") == file_path
         ]
         assert matching_versions, (
             f"No version linked to execution={exec_id} file_path={file_path}: "
             f"{versions}"
         )
+        selected_version = max(matching_versions, key=lambda version: version["version"])
 
         expected_body = f"{expected_content}\n"
         download_resp = None
@@ -551,7 +549,9 @@ class TestStandaloneWorkerTransport:
         def _artifact_downloaded() -> bool:
             nonlocal download_resp
             download_resp = client._request(
-                "GET", f"/api/v1/artifacts/{artifact['id']}/download"
+                "GET",
+                f"/api/v1/artifacts/{artifact['id']}/versions/{selected_version['version']}/download",
+                params={"version_id": selected_version["id"]},
             )
             return (
                 download_resp.status_code == 200

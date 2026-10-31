@@ -4,7 +4,7 @@ import { Search, X, Eye, EyeOff, Download, Package } from "lucide-react";
 import LiveStreamControl, {
   DEFAULT_LIVE_LIST_MAX_ITEMS,
 } from "@/components/common/LiveStreamControl";
-import Pagination from "@/components/executions/Pagination";
+import ArtifactCursorControls from "@/components/common/ArtifactCursorControls";
 import {
   useArtifactsList,
   type ArtifactSummary,
@@ -13,7 +13,7 @@ import {
   type OwnerType,
 } from "@/hooks/useArtifacts";
 import { useArtifactStream } from "@/hooks/useArtifactStream";
-import { useArtifactLivePage } from "@/hooks/useArtifactLivePage";
+import { useArtifactCursorPage } from "@/hooks/useArtifactCursorPage";
 import {
   TYPE_OPTIONS,
   VISIBILITY_OPTIONS,
@@ -48,6 +48,7 @@ const ArtifactsResultsTable = memo(
     hasActiveFilters: boolean;
     clearFilters: () => void;
   }) => {
+    const [downloadError, setDownloadError] = useState<string | null>(null);
     if (isLoading && artifacts.length === 0) {
       return (
         <div className="bg-white shadow rounded-lg">
@@ -92,6 +93,9 @@ const ArtifactsResultsTable = memo(
 
     return (
       <div className="relative">
+        {downloadError && (
+          <p className="text-sm text-red-600">{downloadError}</p>
+        )}
         <div className="mb-2 h-4 text-xs text-gray-500">
           {isFetching && (
             <div className="flex items-center gap-2">
@@ -217,9 +221,17 @@ const ArtifactsResultsTable = memo(
                           </Link>
                           {isDownloadable(artifact.type) && (
                             <button
-                              onClick={() =>
-                                downloadArtifact(artifact.id, artifact.ref)
-                              }
+                              onClick={() => {
+                                setDownloadError(null);
+                                void downloadArtifact(
+                                  artifact.id,
+                                  artifact.ref,
+                                ).catch(() =>
+                                  setDownloadError(
+                                    "Content unavailable or access denied",
+                                  ),
+                                );
+                              }}
                               className="text-gray-500 hover:text-blue-600"
                               title="Download latest version"
                             >
@@ -249,7 +261,7 @@ ArtifactsResultsTable.displayName = "ArtifactsResultsTable";
 export default function ArtifactsPage() {
   const [searchParams] = useSearchParams();
 
-  const [page, setPage] = useState(1);
+  const [livePaused, setLivePaused] = useState(false);
   const pageSize = 20;
 
   const [nameFilter, setNameFilter] = useState(searchParams.get("name") || "");
@@ -289,9 +301,27 @@ export default function ArtifactsPage() {
     return () => clearTimeout(t);
   }, [executionFilter]);
 
+  const browse = useArtifactCursorPage(
+    "list",
+    livePaused,
+    undefined,
+    JSON.stringify([
+      debouncedName,
+      typeFilter,
+      visibilityFilter,
+      scopeFilter,
+      debouncedOwner,
+      debouncedExecution,
+    ]),
+  );
+  const resetBrowse = browse.reset;
+
   // Build query params
   const queryParams = useMemo(() => {
-    const params: Record<string, unknown> = { page, perPage: pageSize };
+    const params: Record<string, unknown> = {
+      cursor: browse.cursor,
+      perPage: pageSize,
+    };
     if (debouncedName) params.name = debouncedName;
     if (typeFilter) params.type = typeFilter;
     if (visibilityFilter) params.visibility = visibilityFilter;
@@ -303,7 +333,7 @@ export default function ArtifactsPage() {
     }
     return params;
   }, [
-    page,
+    browse.cursor,
     pageSize,
     debouncedName,
     typeFilter,
@@ -312,9 +342,6 @@ export default function ArtifactsPage() {
     debouncedOwner,
     debouncedExecution,
   ]);
-
-  const [livePaused, setLivePaused] = useState(false);
-  useArtifactLivePage({ scope: "list", page, setPage, paused: livePaused });
 
   const { data, isLoading, isFetching, error } = useArtifactsList(
     queryParams,
@@ -328,7 +355,6 @@ export default function ArtifactsPage() {
   });
 
   const artifacts = useMemo(() => data?.items || [], [data]);
-  const total = data?.pagination?.total_items || 0;
 
   const hasActiveFilters =
     !!nameFilter ||
@@ -345,8 +371,8 @@ export default function ArtifactsPage() {
     setScopeFilter("");
     setOwnerFilter("");
     setExecutionFilter("");
-    setPage(1);
-  }, []);
+    resetBrowse();
+  }, [resetBrowse]);
 
   return (
     <div className="p-6 pb-28">
@@ -403,7 +429,7 @@ export default function ArtifactsPage() {
               value={nameFilter}
               onChange={(e) => {
                 setNameFilter(e.target.value);
-                setPage(1);
+                browse.reset();
               }}
               placeholder="Search by name..."
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
@@ -419,7 +445,7 @@ export default function ArtifactsPage() {
               value={typeFilter}
               onChange={(e) => {
                 setTypeFilter(e.target.value as ArtifactType | "");
-                setPage(1);
+                browse.reset();
               }}
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
             >
@@ -441,7 +467,7 @@ export default function ArtifactsPage() {
               value={visibilityFilter}
               onChange={(e) => {
                 setVisibilityFilter(e.target.value as ArtifactVisibility | "");
-                setPage(1);
+                browse.reset();
               }}
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
             >
@@ -463,7 +489,7 @@ export default function ArtifactsPage() {
               value={scopeFilter}
               onChange={(e) => {
                 setScopeFilter(e.target.value as OwnerType | "");
-                setPage(1);
+                browse.reset();
               }}
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
             >
@@ -486,7 +512,7 @@ export default function ArtifactsPage() {
               value={ownerFilter}
               onChange={(e) => {
                 setOwnerFilter(e.target.value);
-                setPage(1);
+                browse.reset();
               }}
               placeholder="e.g. mypack.deploy"
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
@@ -503,7 +529,7 @@ export default function ArtifactsPage() {
               value={executionFilter}
               onChange={(e) => {
                 setExecutionFilter(e.target.value);
-                setPage(1);
+                browse.reset();
               }}
               placeholder="Execution ID"
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
@@ -513,7 +539,7 @@ export default function ArtifactsPage() {
 
         {data && (
           <div className="mt-3 text-sm text-gray-600">
-            Showing {artifacts.length} of {total} artifacts
+            Showing {artifacts.length} artifacts
             {hasActiveFilters && " (filtered)"}
           </div>
         )}
@@ -529,14 +555,14 @@ export default function ArtifactsPage() {
         clearFilters={clearFilters}
       />
 
-      <Pagination
-        page={page}
-        setPage={setPage}
-        pageSize={pageSize}
-        itemCount={artifacts.length}
-        total={total}
-        itemLabel="artifacts"
-        floating
+      <ArtifactCursorControls
+        hasPrevious={browse.hasPrevious}
+        hasMore={!!data?.has_more && !!data?.next_cursor}
+        onPrevious={browse.previous}
+        onNext={() => {
+          if (data?.next_cursor) browse.next(data.next_cursor);
+        }}
+        disabled={isLoading}
       />
     </div>
   );

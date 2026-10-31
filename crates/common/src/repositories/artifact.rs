@@ -1,5 +1,7 @@
 //! Artifact and ArtifactVersion repositories for database operations
 
+mod selection;
+
 use crate::artifact_transport::ValidatedRelativePath;
 use crate::models::{
     artifact::*,
@@ -86,6 +88,27 @@ pub struct ArtifactSearchResult<T = Artifact> {
 
 pub const ARTIFACT_READ_BATCH_SIZE: usize = 256;
 
+/// Reviewed runtime-log header allowlist. Never read a body, description,
+/// arbitrary JSON, or aggregate latest-version display fields through this row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ArtifactMetadataRow {
+    pub id: i64,
+    pub r#ref: String,
+    pub scope: OwnerType,
+    pub owner: String,
+    pub r#type: ArtifactType,
+    pub visibility: ArtifactVisibility,
+    pub classification: ArtifactClassification,
+    pub name: Option<String>,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+    pub retention_policy: RetentionPolicyType,
+    pub retention_limit: i32,
+}
+
+pub const METADATA_SELECT_COLUMNS: &str =
+    "id, ref, scope, owner, type, visibility, classification, name, created, updated, retention_policy, retention_limit";
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ArtifactSummaryRow {
     pub id: i64,
@@ -103,7 +126,21 @@ pub struct ArtifactSummaryRow {
 }
 
 pub const SUMMARY_SELECT_COLUMNS: &str =
-    "id, ref, scope, owner, type, visibility, classification, name, content_type, size_bytes, created, updated";
+    "id, ref, scope, owner, type, visibility, classification, name, CASE WHEN classification = 'runtime_log' THEN NULL ELSE content_type END AS content_type, CASE WHEN classification = 'runtime_log' THEN NULL ELSE size_bytes END AS size_bytes, created, updated";
+
+/// Metadata for the highest version belonging to exactly one requested run.
+/// No body, arbitrary JSON, storage locator, or provider credential is selected.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExecutionArtifactSummaryRow {
+    #[sqlx(flatten)]
+    pub artifact: ArtifactSummaryRow,
+    pub selected_id: i64,
+    pub selected_version: i32,
+    pub selected_execution: Option<i64>,
+    pub selected_content_type: Option<String>,
+    pub selected_size_bytes: Option<i64>,
+    pub selected_created: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ArtifactReadContext {
@@ -305,6 +342,38 @@ impl Delete for ArtifactRepository {
 }
 
 impl ArtifactRepository {
+    pub async fn find_metadata_by_id<'e, E>(
+        executor: E,
+        id: i64,
+    ) -> Result<Option<ArtifactMetadataRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(&format!(
+            "SELECT {METADATA_SELECT_COLUMNS} FROM artifact WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_metadata_by_ref<'e, E>(
+        executor: E,
+        reference: &str,
+    ) -> Result<Option<ArtifactMetadataRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as(&format!(
+            "SELECT {METADATA_SELECT_COLUMNS} FROM artifact WHERE ref = $1"
+        ))
+        .bind(reference)
+        .fetch_optional(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn find_by_id_for_update(
         connection: &mut PgConnection,
         id: i64,
@@ -365,17 +434,6 @@ impl ArtifactRepository {
         Self::search_internal(executor, filters, Some(read_ctx), SELECT_COLUMNS).await
     }
 
-    pub async fn search_summaries<'e, E>(
-        executor: E,
-        filters: &ArtifactSearchFilters,
-        read_ctx: Option<&ArtifactReadContext>,
-    ) -> Result<ArtifactSearchResult<ArtifactSummaryRow>>
-    where
-        E: Executor<'e, Database = Postgres> + Copy + 'e,
-    {
-        Self::search_internal(executor, filters, read_ctx, SUMMARY_SELECT_COLUMNS).await
-    }
-
     pub async fn find_summary_by_id<'e, E>(
         executor: E,
         id: i64,
@@ -392,8 +450,7 @@ impl ArtifactRepository {
         .map_err(Into::into)
     }
 
-    /// A count-free keyset scan. The caller applies disclosure before public
-    /// pagination and shares those decisions with its exact eligible total.
+    /// A count-free keyset scan bounded by the requested candidate budget.
     pub async fn scan_summaries<'e, E>(
         executor: E,
         filters: &ArtifactSearchFilters,
@@ -404,6 +461,56 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         Self::summary_scan_query(filters, read_ctx, after, false)
+            .build_query_as()
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Select one highest version per (artifact, execution), never global latest.
+    pub async fn scan_execution_summaries<'e, E>(
+        executor: E,
+        filters: &ArtifactSearchFilters,
+        read_ctx: Option<&ArtifactReadContext>,
+        after: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<ExecutionArtifactSummaryRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let execution = filters.execution.ok_or_else(|| {
+            crate::Error::validation("Execution artifact selection requires an execution")
+        })?;
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT a.id, a.ref, a.scope, a.owner, a.type, a.visibility, a.classification, a.name, \
+             selected.content_type, selected.size_bytes, a.created, a.updated, \
+             selected.id AS selected_id, selected.version AS selected_version, \
+             selected.execution AS selected_execution, selected.content_type AS selected_content_type, \
+             selected.size_bytes AS selected_size_bytes, selected.created AS selected_created \
+             FROM artifact a JOIN LATERAL (SELECT id, version, execution, content_type, size_bytes, created \
+             FROM artifact_version WHERE artifact = a.id AND execution = ",
+        );
+        query
+            .push_bind(execution)
+            .push(" ORDER BY version DESC, id DESC LIMIT 1) selected ON TRUE");
+        let mut has_where = false;
+        push_artifact_filters(&mut query, filters, "a", &mut has_where);
+        if let Some(ctx) = read_ctx {
+            push_where_prefix(&mut query, &mut has_where);
+            push_artifact_version_read_predicate(&mut query, ctx, "a", "selected");
+        }
+        if let Some((created, id)) = after {
+            push_where_prefix(&mut query, &mut has_where);
+            query
+                .push("(a.created, a.id) < (")
+                .push_bind(created)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        query
+            .push(" ORDER BY a.created DESC, a.id DESC LIMIT ")
+            .push_bind(i64::from(filters.limit.min(101)));
+        query
             .build_query_as()
             .fetch_all(executor)
             .await
@@ -468,7 +575,7 @@ impl ArtifactRepository {
         }
         query
             .push(" ORDER BY a.created DESC, a.id DESC LIMIT ")
-            .push_bind(ARTIFACT_READ_BATCH_SIZE as i64);
+            .push_bind(i64::from(filters.limit.min(101)));
         query
     }
 
@@ -1451,46 +1558,58 @@ pub const VERSION_SUMMARY_SELECT_COLUMNS: &str =
     "id, version, execution, content_type, size_bytes, file_path, body_state, object_key, provider_version, sha256, created_by, created";
 
 impl ArtifactVersionRepository {
+    /// Keep the recorded history consumer's existing whole-artifact bound
+    /// without materializing bodies or calculating an exact historical count.
+    pub async fn exceeds_recorded_history_bound<'e, E>(executor: E, artifact: i64) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM artifact_version WHERE artifact = $1 ORDER BY version DESC, id DESC OFFSET 256 LIMIT 1)")
+            .bind(artifact).fetch_one(executor).await.map_err(Into::into)
+    }
+
+    /// A metadata-only cursor page; visibility is evaluated again on every read.
+    pub async fn scan_summaries<'e, E>(
+        executor: E,
+        artifact_id: i64,
+        read_ctx: Option<&ArtifactReadContext>,
+        limit: u32,
+        after: Option<(i32, i64)>,
+    ) -> Result<Vec<ArtifactVersionSummaryRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if !(1..=101).contains(&limit) {
+            return Err(crate::Error::validation("Invalid version candidate budget"));
+        }
+        let columns = "av.id, av.version, av.execution, av.content_type, av.size_bytes, \
+            NULL::text AS file_path, NULL::artifact_body_state_enum AS body_state, \
+            NULL::text AS object_key, NULL::text AS provider_version, NULL::text AS sha256, \
+            NULL::text AS created_by, av.created";
+        let mut query = Self::summary_query(artifact_id, read_ctx, columns);
+        if let Some((version, id)) = after {
+            query
+                .push(" AND (av.version, av.id) < (")
+                .push_bind(version)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        query
+            .push(" ORDER BY av.version DESC, av.id DESC LIMIT ")
+            .push_bind(i64::from(limit));
+        query
+            .build_query_as()
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
     pub async fn bounded_summaries<'e, E: Executor<'e, Database = Postgres>>(
         executor: E,
         artifact: i64,
     ) -> Result<Vec<ArtifactVersionSummaryRow>> {
         sqlx::query_as(&format!("SELECT {VERSION_SUMMARY_SELECT_COLUMNS} FROM artifact_version WHERE artifact = $1 ORDER BY version DESC LIMIT 257"))
             .bind(artifact).fetch_all(executor).await.map_err(Into::into)
-    }
-
-    pub async fn page_summaries<'e, E>(
-        executor: E,
-        artifact_id: i64,
-        read_ctx: Option<&ArtifactReadContext>,
-        limit: u32,
-        offset: u32,
-    ) -> Result<ArtifactSearchResult<ArtifactVersionSummaryRow>>
-    where
-        E: Executor<'e, Database = Postgres> + Copy + 'e,
-    {
-        if !(1..=100).contains(&limit) {
-            return Err(crate::Error::validation(
-                "Version page size must be between 1 and 100",
-            ));
-        }
-        let total = Self::summary_query(artifact_id, read_ctx, "COUNT(*)")
-            .build_query_scalar::<i64>()
-            .fetch_one(executor)
-            .await?;
-        let columns = VERSION_SUMMARY_SELECT_COLUMNS
-            .split(',')
-            .map(|column| format!("av.{}", column.trim()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut query = Self::summary_query(artifact_id, read_ctx, &columns);
-        query
-            .push(" ORDER BY av.version DESC, av.id DESC LIMIT ")
-            .push_bind(i64::from(limit))
-            .push(" OFFSET ")
-            .push_bind(i64::from(offset));
-        let rows = query.build_query_as().fetch_all(executor).await?;
-        Ok(ArtifactSearchResult { rows, total })
     }
 
     fn summary_query(
@@ -1763,18 +1882,6 @@ impl ArtifactVersionRepository {
             .fetch_all(executor)
             .await
             .map_err(Into::into)
-    }
-
-    /// Get the latest version for an artifact (without binary content)
-    pub async fn find_selected_for_share(
-        connection: &mut PgConnection,
-        artifact: i64,
-        version: Option<i32>,
-    ) -> Result<Option<ArtifactVersion>> {
-        sqlx::query_as::<_, ArtifactVersion>(&format!(
-            "SELECT {} FROM artifact_version WHERE artifact = $1 AND ($2::INTEGER IS NULL OR version = $2) ORDER BY version DESC LIMIT 1 FOR SHARE",
-            artifact_version::SELECT_COLUMNS_WITH_CONTENT,
-        )).bind(artifact).bind(version).fetch_optional(connection).await.map_err(Into::into)
     }
 
     pub async fn mark_encrypted_log<'e, E: Executor<'e, Database = Postgres>>(

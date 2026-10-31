@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
 import LiveStreamControl from "@/components/common/LiveStreamControl";
-import { useParams, Link } from "react-router-dom";
+import { useParams, Link, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
   Download,
@@ -19,8 +19,8 @@ import {
   type ArtifactVersionSummary,
 } from "@/hooks/useArtifacts";
 import { useArtifactStream } from "@/hooks/useArtifactStream";
-import { useArtifactLivePage } from "@/hooks/useArtifactLivePage";
-import Pagination from "@/components/executions/Pagination";
+import { useArtifactCursorPage } from "@/hooks/useArtifactCursorPage";
+import ArtifactCursorControls from "@/components/common/ArtifactCursorControls";
 import { formatJsonValue } from "@/lib/format-utils";
 import {
   ARTIFACT_PREVIEW_BYTES,
@@ -44,15 +44,17 @@ import {
 function TextContentViewer({
   artifactId,
   versionNumber,
+  versionId,
   label,
 }: {
   artifactId: number;
   versionNumber?: number;
+  versionId?: number;
   label: string;
 }) {
   // Track a fetch key so that when deps change we re-derive initial state
   // instead of calling setState synchronously inside useEffect.
-  const fetchKey = `${artifactId}:${versionNumber ?? "latest"}`;
+  const fetchKey = `${artifactId}:${versionNumber ?? "latest"}:${versionId ?? ""}`;
   const [settledKey, setSettledKey] = useState<string | null>(null);
   const [content, setContent] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -65,7 +67,7 @@ function TextContentViewer({
 
     const token = localStorage.getItem("access_token");
     const url = versionNumber
-      ? `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/versions/${versionNumber}/download`
+      ? `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/versions/${versionNumber}/download?version_id=${versionId}`
       : `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/download`;
 
     fetch(url, {
@@ -82,9 +84,9 @@ function TextContentViewer({
         setTruncated(preview.truncated);
         setLoadError(null);
       })
-      .catch((e) => {
+      .catch(() => {
         if (!controller.signal.aborted) {
-          setLoadError(e instanceof Error ? e.message : "Unknown error");
+          setLoadError("Content unavailable or access denied");
           setContent(null);
         }
       })
@@ -95,7 +97,7 @@ function TextContentViewer({
     return () => {
       controller.abort();
     };
-  }, [artifactId, versionNumber, fetchKey]);
+  }, [artifactId, versionNumber, versionId, fetchKey]);
 
   if (isLoading) {
     return (
@@ -107,7 +109,7 @@ function TextContentViewer({
   }
 
   if (loadError) {
-    return <div className="py-4 text-sm text-red-600">Error: {loadError}</div>;
+    return <div className="py-4 text-sm text-red-600">{loadError}</div>;
   }
 
   return (
@@ -224,6 +226,7 @@ function VersionRow({
   artifactType: string;
 }) {
   const [showPreview, setShowPreview] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const canPreview = artifactType === "file_text";
   const canDownload =
     artifactType === "file_text" ||
@@ -232,37 +235,18 @@ function VersionRow({
     artifactType === "file_datatable";
 
   const handleDownload = useCallback(async () => {
-    const token = localStorage.getItem("access_token");
-    const url = `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/versions/${version.version}/download`;
-
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    if (!response.ok) {
-      console.error(
-        `Download failed: ${response.status} ${response.statusText}`,
+    setDownloadError(null);
+    try {
+      await downloadArtifact(
+        artifactId,
+        artifactRef,
+        version.version,
+        version.id,
       );
-      return;
+    } catch {
+      setDownloadError("Content unavailable or access denied");
     }
-
-    const disposition = response.headers.get("Content-Disposition");
-    let filename = `${artifactRef.replace(/\./g, "_")}_v${version.version}.bin`;
-    if (disposition) {
-      const match = disposition.match(/filename="?([^"]+)"?/);
-      if (match) filename = match[1];
-    }
-
-    const blob = await response.blob();
-    const blobUrl = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = blobUrl;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(blobUrl);
-  }, [artifactId, artifactRef, version]);
+  }, [artifactId, artifactRef, version.version, version.id]);
 
   return (
     <>
@@ -321,12 +305,20 @@ function VersionRow({
           </div>
         </td>
       </tr>
+      {downloadError && (
+        <tr>
+          <td colSpan={7} className="px-4 py-3 text-sm text-red-600">
+            {downloadError}
+          </td>
+        </tr>
+      )}
       {showPreview && (
         <tr>
           <td colSpan={7} className="px-4 py-3">
             <TextContentViewer
               artifactId={artifactId}
               versionNumber={version.version}
+              versionId={version.id}
               label={`v${version.version}`}
             />
           </td>
@@ -355,7 +347,20 @@ function MetadataField({
   );
 }
 
-function ArtifactMetadata({ artifact }: { artifact: ArtifactResponse }) {
+function ArtifactMetadata({
+  artifact,
+  versionNumber,
+  versionId,
+  selectionLabel,
+  selectionValid,
+}: {
+  artifact: ArtifactResponse;
+  versionNumber?: number;
+  versionId?: number;
+  selectionLabel: string;
+  selectionValid: boolean;
+}) {
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const typeBadge = getArtifactTypeBadge(artifact.type);
   const scopeBadge = getScopeBadge(artifact.scope);
 
@@ -377,13 +382,23 @@ function ArtifactMetadata({ artifact }: { artifact: ArtifactResponse }) {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            {isDownloadable(artifact.type) && (
+            {selectionValid && isDownloadable(artifact.type) && (
               <button
-                onClick={() => downloadArtifact(artifact.id, artifact.ref)}
+                onClick={() => {
+                  setDownloadError(null);
+                  void downloadArtifact(
+                    artifact.id,
+                    artifact.ref,
+                    versionNumber,
+                    versionId,
+                  ).catch(() =>
+                    setDownloadError("Content unavailable or access denied"),
+                  );
+                }}
                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm"
               >
                 <Download className="h-4 w-4" />
-                Download Latest
+                Download {selectionLabel}
               </button>
             )}
           </div>
@@ -391,6 +406,9 @@ function ArtifactMetadata({ artifact }: { artifact: ArtifactResponse }) {
       </div>
 
       <div className="px-6 py-5">
+        {downloadError && (
+          <p className="mb-3 text-sm text-red-600">{downloadError}</p>
+        )}
         <dl className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-4">
           <MetadataField label="Type">
             <span
@@ -477,29 +495,21 @@ function ArtifactMetadata({ artifact }: { artifact: ArtifactResponse }) {
 
 function ArtifactVersionsList({
   artifact,
+  query,
+  browse,
   livePaused,
   onToggleLivePaused,
   isConnected,
 }: {
   artifact: ArtifactResponse;
+  query: ReturnType<typeof useArtifactVersions>;
+  browse: ReturnType<typeof useArtifactCursorPage>;
   livePaused: boolean;
   onToggleLivePaused: () => void;
   isConnected: boolean;
 }) {
-  const [page, setPage] = useState(1);
   const pageSize = 20;
-  useArtifactLivePage({
-    scope: "versions",
-    id: artifact.id,
-    page,
-    setPage,
-    paused: livePaused,
-  });
-  const { data, isLoading, error } = useArtifactVersions(
-    artifact.id,
-    livePaused,
-    { page, perPage: pageSize },
-  );
+  const { data, isLoading, error } = query;
   const versions = data?.items ?? [];
 
   return (
@@ -512,7 +522,7 @@ function ArtifactVersionsList({
               Versions
               {versions.length > 0 && (
                 <span className="ml-2 text-sm font-normal text-gray-500">
-                  ({data?.pagination.total_items ?? versions.length})
+                  ({versions.length} shown)
                 </span>
               )}
             </h3>
@@ -587,13 +597,14 @@ function ArtifactVersionsList({
         </div>
       )}
       {data && !error && (
-        <Pagination
-          page={page}
-          setPage={setPage}
-          pageSize={pageSize}
-          itemCount={versions.length}
-          total={data.pagination.total_items}
-          itemLabel="versions"
+        <ArtifactCursorControls
+          hasPrevious={browse.hasPrevious}
+          hasMore={data.has_more && !!data.next_cursor}
+          onPrevious={browse.previous}
+          onNext={() => {
+            if (data.next_cursor) browse.next(data.next_cursor);
+          }}
+          disabled={isLoading}
         />
       )}
       <p className="px-6 py-3 text-xs text-gray-500">
@@ -607,7 +618,17 @@ function ArtifactVersionsList({
 // Inline content preview (progress / text for latest)
 // ============================================================================
 
-function InlineContentPreview({ artifact }: { artifact: ArtifactResponse }) {
+function InlineContentPreview({
+  artifact,
+  versionNumber,
+  versionId,
+  selectionLabel,
+}: {
+  artifact: ArtifactResponse;
+  versionNumber?: number;
+  versionId?: number;
+  selectionLabel: string;
+}) {
   if (artifact.type === "progress") {
     return (
       <div className="bg-white shadow rounded-lg overflow-hidden">
@@ -628,11 +649,17 @@ function InlineContentPreview({ artifact }: { artifact: ArtifactResponse }) {
       <div className="bg-white shadow rounded-lg overflow-hidden">
         <div className="px-6 py-4 border-b border-gray-200">
           <h3 className="text-lg font-semibold text-gray-900">
-            Content Preview (Latest)
+            Content Preview ({selectionLabel})
           </h3>
         </div>
         <div className="px-6 py-5">
-          <TextContentViewer artifactId={artifact.id} label="content" />
+          <TextContentViewer
+            key={`${artifact.id}:${versionNumber ?? "latest"}:${versionId ?? ""}`}
+            artifactId={artifact.id}
+            versionNumber={versionNumber}
+            versionId={versionId}
+            label="content"
+          />
         </div>
       </div>
     );
@@ -695,14 +722,46 @@ function InlineContentPreview({ artifact }: { artifact: ArtifactResponse }) {
 export default function ArtifactDetailPage() {
   const { id } = useParams<{ id: string }>();
   const artifactId = id ? Number(id) : undefined;
+  const [searchParams] = useSearchParams();
+  const rawVersion = searchParams.get("version");
+  const rawVersionId = searchParams.get("version_id");
+  const rawExecution = searchParams.get("execution");
+  const versionNumber =
+    rawVersion && /^\d+$/.test(rawVersion) && Number(rawVersion) > 0
+      ? Number(rawVersion)
+      : undefined;
+  const versionId =
+    rawVersionId && /^\d+$/.test(rawVersionId) && Number(rawVersionId) > 0
+      ? Number(rawVersionId)
+      : undefined;
+  const selectionValid =
+    ((rawVersion === null && rawVersionId === null) ||
+      (versionNumber !== undefined && versionId !== undefined)) &&
+    (rawExecution === null ||
+      (/^\d+$/.test(rawExecution) &&
+        Number(rawExecution) > 0 &&
+        versionNumber !== undefined));
+  const selectionLabel = versionNumber
+    ? `${rawExecution ? `Execution #${rawExecution}, ` : ""}v${versionNumber}`
+    : "Latest";
 
   const [livePaused, setLivePaused] = useState(false);
+  const browse = useArtifactCursorPage("versions", livePaused, artifactId);
+  // History authorizes independently and only needs the route ID, not a header.
+  const versionsQuery = useArtifactVersions(artifactId, livePaused, {
+    cursor: browse.cursor,
+    perPage: 20,
+  });
   const { data, isLoading, error } = useArtifact(artifactId, false, livePaused);
   const artifact = data?.data;
+  const selectedVersion = versionsQuery.data?.items.find(
+    (version) => version.version === versionNumber && version.id === versionId,
+  );
 
   // Subscribe to real-time updates for this artifact
   const { isConnected } = useArtifactStream({
     artifactId,
+    executionId: rawExecution ? Number(rawExecution) : undefined,
     enabled: true,
     paused: livePaused,
   });
@@ -758,17 +817,44 @@ export default function ArtifactDetailPage() {
       </div>
 
       {/* Metadata card */}
-      <ArtifactMetadata artifact={artifact} />
+      <ArtifactMetadata
+        artifact={
+          artifact.classification === "runtime_log"
+            ? {
+                ...artifact,
+                content_type: selectedVersion?.content_type,
+                size_bytes: selectedVersion?.size_bytes,
+              }
+            : artifact
+        }
+        versionNumber={versionNumber}
+        versionId={versionId}
+        selectionLabel={selectionLabel}
+        selectionValid={selectionValid}
+      />
 
       {/* Inline content preview */}
       <div className="mt-6">
-        <InlineContentPreview artifact={artifact} />
+        {selectionValid ? (
+          <InlineContentPreview
+            artifact={artifact}
+            versionNumber={versionNumber}
+            versionId={versionId}
+            selectionLabel={selectionLabel}
+          />
+        ) : (
+          <p className="text-sm text-red-600">
+            Content unavailable or access denied
+          </p>
+        )}
       </div>
 
       {/* Versions list */}
       <div className="mt-6">
         <ArtifactVersionsList
           artifact={artifact}
+          query={versionsQuery}
+          browse={browse}
           livePaused={livePaused}
           onToggleLivePaused={() => setLivePaused((paused) => !paused)}
           isConnected={isConnected}

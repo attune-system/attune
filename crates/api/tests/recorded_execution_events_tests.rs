@@ -1,3 +1,5 @@
+#[path = "recorded_execution_events_tests/artifact_selector.rs"]
+mod artifact_selector;
 #[path = "recorded_execution_events_tests/c_execution_detail.rs"]
 mod c_execution_detail;
 #[path = "recorded_execution_events_tests/c_file_b_key_grants.rs"]
@@ -80,6 +82,53 @@ struct Fixture {
     policy_id: Id,
     pack_id: Id,
     signing_approval_id: Id,
+}
+
+async fn recorded_artifact_listing(fixture: &Fixture) -> Result<Vec<Value>> {
+    let mut cursor = None::<String>;
+    let mut seen = std::collections::HashSet::new();
+    let mut listed = Vec::new();
+    // These fixtures own at most two artifacts. Permit empty resumable pages,
+    // but fail rather than hang if navigation never reaches the end.
+    for _ in 0..10 {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("per_page", "1");
+        if let Some(cursor) = &cursor {
+            query.append_pair("cursor", cursor);
+        }
+        let response = fixture
+            .ctx
+            .get(
+                &format!("/api/v1/artifacts?{}", query.finish()),
+                Some(&fixture.token),
+            )
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("pagination").is_none(), "{body}");
+        assert!(body.get("total_items").is_none(), "{body}");
+        let items = body["items"].as_array().ok_or("artifact items missing")?;
+        assert!(
+            items.len() <= 1,
+            "bounded recorded artifact request returned too many items"
+        );
+        listed.extend(items.iter().cloned());
+        let has_more = body["has_more"]
+            .as_bool()
+            .ok_or("artifact has_more missing")?;
+        assert!(body.get("next_cursor").is_some(), "{body}");
+        cursor = body["next_cursor"].as_str().map(str::to_owned);
+        assert_eq!(cursor.is_some(), has_more, "{body}");
+        if !has_more {
+            assert!(body["next_cursor"].is_null(), "{body}");
+            return Ok(listed);
+        }
+        let next = cursor.as_ref().ok_or("artifact cursor missing")?;
+        assert!(!next.is_empty(), "empty artifact continuation");
+        assert!(seen.insert(next.clone()), "artifact continuation repeated");
+    }
+    Err("recorded fixture artifact listing exceeded its 10-page budget".into())
 }
 
 mod connected_recorded_notifier {
@@ -1008,13 +1057,8 @@ async fn recorded_artifact_secret_delivery_captures_runtime_read_provenance() ->
         )
         .await?;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-    let page = fixture
-        .ctx
-        .get("/api/v1/artifacts", Some(&fixture.token))
-        .await?;
-    assert_eq!(page.status(), StatusCode::OK);
-    let body: Value = page.json().await?;
-    assert_eq!(body["pagination"]["total_items"], 0);
+    assert!(recorded_artifact_listing(&fixture).await?.is_empty(),
+        "recorded collections must still reject the deleted Key source, even if a human could see safe metadata");
     fixture.ctx.cleanup().await?;
     Ok(())
 }
@@ -2431,14 +2475,18 @@ async fn recorded_artifact_progress_is_transactional_local_and_terminal_fenced()
     assert_eq!(readable.status(), StatusCode::OK);
     let body: Value = readable.json().await?;
     assert_eq!(body["data"]["data"][0], "previous private data");
-    let page = fixture
-        .ctx
-        .get("/api/v1/artifacts?per_page=1", Some(&fixture.token))
-        .await?;
-    assert_eq!(page.status(), StatusCode::OK);
-    let body: Value = page.json().await?;
-    assert_eq!(body["items"].as_array().unwrap().len(), 1);
-    assert_eq!(body["pagination"]["total_items"], 2);
+    let listed = recorded_artifact_listing(&fixture).await?;
+    let mut listed_ids = listed
+        .iter()
+        .map(|row| row["id"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    listed_ids.sort_unstable();
+    let mut expected_ids = vec![id, generic_id];
+    expected_ids.sort_unstable();
+    assert_eq!(
+        listed_ids, expected_ids,
+        "recorded cursor traversal must retain both authorized artifacts, not truncate at one page"
+    );
     // A sink without origin encryption cannot launder a protected SDK read.
     let tainted_write = fixture
         .ctx
@@ -3886,17 +3934,25 @@ async fn recorded_key_reads_are_scoped_idempotently_tracked_and_forwarded_into_e
     )
     .await?;
     let artifact_path = format!("/api/v1/executions/{}/artifacts", execution.id);
-    let hidden: Value = fixture
-        .ctx
-        .get(&artifact_path, Some(&viewer_token))
-        .await?
-        .json()
-        .await?;
+    let metadata = fixture.ctx.get(&artifact_path, Some(&viewer_token)).await?;
+    assert_eq!(metadata.status(), StatusCode::OK);
+    let metadata: Value = metadata.json().await?;
     assert_eq!(
-        hidden["items"].as_array().map(Vec::len),
-        Some(0),
-        "{hidden}"
+        metadata["items"].as_array().map(Vec::len),
+        Some(1),
+        "safe human metadata must not inherit body-disclosure requirements"
     );
+    assert_eq!(metadata["items"][0]["id"], log.id);
+    assert_eq!(
+        metadata["items"][0]["selected_version"]["execution"],
+        execution.id
+    );
+    for field in ["data", "content_json", "meta", "file_path"] {
+        assert!(
+            metadata["items"][0].get(field).is_none(),
+            "artifact summary exposed {field}"
+        );
+    }
     assert!(attune_api::secret_disclosure::authorize_runtime_log(
         &fixture.ctx.state,
         &viewer,
@@ -3904,6 +3960,15 @@ async fn recorded_key_reads_are_scoped_idempotently_tracked_and_forwarded_into_e
     )
     .await
     .is_err());
+    let content_path = format!("/api/v1/artifacts/{}/versions/1", log.id);
+    assert_eq!(
+        fixture
+            .ctx
+            .get(&content_path, Some(&viewer_token))
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
     let key_set = PermissionSetRepository::create(&fixture.ctx.pool, CreatePermissionSetInput {
         r#ref: "fixture.sdk_log_key".into(), pack: None, pack_ref: None, label: None, description: None,
         grants: json!([{"resource":"keys","actions":["read"],"constraints":{"refs":[key.r#ref]}}]),
@@ -3920,6 +3985,14 @@ async fn recorded_key_reads_are_scoped_idempotently_tracked_and_forwarded_into_e
         .await;
     attune_api::secret_disclosure::authorize_runtime_log(&fixture.ctx.state, &viewer, &execution)
         .await?;
+    assert_eq!(
+        fixture
+            .ctx
+            .get(&content_path, Some(&viewer_token))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
     let visible: Value = fixture
         .ctx
         .get(&artifact_path, Some(&viewer_token))

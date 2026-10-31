@@ -23,11 +23,17 @@ import {
   type ArtifactType,
 } from "@/hooks/useArtifacts";
 import { useArtifactStream } from "@/hooks/useArtifactStream";
-import { useArtifactLivePage } from "@/hooks/useArtifactLivePage";
+import { useArtifactCursorPage } from "@/hooks/useArtifactCursorPage";
 import LiveStreamControl from "@/components/common/LiveStreamControl";
-import Pagination from "./Pagination";
+import ArtifactCursorControls from "@/components/common/ArtifactCursorControls";
 import { formatJsonValue } from "@/lib/format-utils";
 import { OpenAPI } from "@/api/core/OpenAPI";
+import {
+  ARTIFACT_PREVIEW_BYTES,
+  readArtifactPreview,
+} from "@/lib/artifact-preview";
+import { downloadArtifact } from "@/pages/artifacts/artifactHelpers";
+import { Link } from "react-router-dom";
 
 interface ExecutionArtifactsPanelProps {
   executionId: number;
@@ -78,46 +84,11 @@ function getArtifactTypeBadge(type: ArtifactType): {
   }
 }
 
-function formatBytes(bytes: number | null): string {
+function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null || bytes === 0) return "—";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/** Download the latest version of an artifact using a fetch with auth token. */
-async function downloadArtifact(artifactId: number, artifactRef: string) {
-  const token = localStorage.getItem("access_token");
-  const url = `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/download`;
-
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
-
-  if (!response.ok) {
-    console.error(`Download failed: ${response.status} ${response.statusText}`);
-    return;
-  }
-
-  // Extract filename from Content-Disposition header or fall back to ref
-  const disposition = response.headers.get("Content-Disposition");
-  let filename = artifactRef.replace(/\./g, "_") + ".bin";
-  if (disposition) {
-    const match = disposition.match(/filename="?([^"]+)"?/);
-    if (match) filename = match[1];
-  }
-
-  const blob = await response.blob();
-  const blobUrl = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = blobUrl;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(blobUrl);
 }
 
 // ============================================================================
@@ -125,24 +96,44 @@ async function downloadArtifact(artifactId: number, artifactRef: string) {
 // ============================================================================
 
 interface TextFileDetailProps {
-  artifactId: number;
-  artifactName: string | null;
+  artifact: ArtifactSummary;
+  executionId: number;
   isRunning?: boolean;
   onClose: () => void;
 }
 
 function TextFileDetail({
-  artifactId,
-  artifactName,
+  artifact,
+  executionId,
   isRunning = false,
   onClose,
 }: TextFileDetailProps) {
+  const artifactId = artifact.id;
+  const versionNumber =
+    artifact.selected_version?.execution === executionId
+      ? artifact.selected_version.version
+      : undefined;
+  const versionId = artifact.selected_version?.id;
+  const stream =
+    artifact.classification === "runtime_log" &&
+    artifact.scope === "action" &&
+    artifact.owner !== "" &&
+    artifact.ref.startsWith(`${artifact.owner}.`)
+      ? // Both canonical forms are rooted in this exact action owner. The owner
+        // ID only identifies the recorded naming form; the execution SSE route
+        // independently resolves and authorizes the actual execution log.
+        /^(?:owner_[1-9][0-9]*\.)?(stdout|stderr)\.log$/.exec(
+          artifact.ref.slice(artifact.owner.length + 1),
+        )?.[1]
+      : undefined;
+  const liveStream = isRunning && !!stream;
   const [content, setContent] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isLoadingContent, setIsLoadingContent] = useState(true);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isWaiting, setIsWaiting] = useState(false);
   const [streamDone, setStreamDone] = useState(false);
+  const [truncated, setTruncated] = useState(false);
   const preRef = useRef<HTMLPreElement>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   // Track whether the user has scrolled away from the bottom so we can
@@ -169,12 +160,12 @@ function TextFileDetail({
   // ---- Streaming path (used when execution is running) ----
   /* eslint-disable react-hooks/set-state-in-effect -- subscribes to an external SSE stream and records its lifecycle */
   useEffect(() => {
-    if (!isRunning) return;
+    if (!liveStream) return;
 
     const token = localStorage.getItem("access_token");
     if (!token) {
       queueMicrotask(() => {
-        setLoadError("No authentication token available");
+        setLoadError("Content unavailable or access denied");
         setIsLoadingContent(false);
       });
       return;
@@ -184,6 +175,7 @@ function TextFileDetail({
     streamAbortRef.current = controller;
     setIsStreaming(true);
     setStreamDone(false);
+    let offset: string | undefined;
 
     const handleStreamEvent = (eventName: string, data: string) => {
       switch (eventName) {
@@ -195,7 +187,9 @@ function TextFileDetail({
           }
           break;
         case "content":
-          setContent(data);
+          setContent((previous) =>
+            offset === undefined ? data : (previous ?? "") + data,
+          );
           setLoadError(null);
           setIsLoadingContent(false);
           setIsWaiting(false);
@@ -213,66 +207,110 @@ function TextFileDetail({
           controller.abort();
           break;
         case "error":
-          if (data) {
-            setLoadError(data);
-          }
+          setLoadError("Content unavailable or access denied");
+          setIsLoadingContent(false);
+          setIsStreaming(false);
+          controller.abort();
           break;
       }
     };
 
     const consumeSseBlock = (block: string) => {
       let eventName = "message";
+      let eventId: string | undefined;
       const dataLines: string[] = [];
       for (const line of block.split(/\r?\n/)) {
         if (line.startsWith("event:")) {
           eventName = line.slice("event:".length).trim();
         } else if (line.startsWith("data:")) {
-          dataLines.push(line.slice("data:".length).trimStart());
+          dataLines.push(line.slice("data:".length).replace(/^ /, ""));
+        } else if (line.startsWith("id:")) {
+          const value = line.slice(3).trim();
+          if (/^\d+$/.test(value)) eventId = value;
         }
       }
       handleStreamEvent(eventName, dataLines.join("\n"));
+      if (
+        eventId !== undefined &&
+        (eventName === "content" || eventName === "append")
+      )
+        offset = eventId;
     };
 
     void (async () => {
-      try {
-        const response = await fetch(
-          `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/stream`,
-          {
-            headers: { Authorization: `Bearer ${token}` },
-            signal: controller.signal,
-          },
-        );
-        if (!response.ok || !response.body) {
-          throw new Error(`Stream failed with status ${response.status}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        while (!controller.signal.aborted) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let separatorIndex = buffer.search(/\r?\n\r?\n/);
-          while (separatorIndex >= 0) {
-            const block = buffer.slice(0, separatorIndex);
-            buffer = buffer.slice(
-              buffer[separatorIndex] === "\r"
-                ? separatorIndex + 4
-                : separatorIndex + 2,
-            );
-            if (block.trim()) {
-              consumeSseBlock(block);
-            }
-            separatorIndex = buffer.search(/\r?\n\r?\n/);
+      for (
+        let attempt = 0;
+        attempt < 2 && !controller.signal.aborted;
+        attempt++
+      ) {
+        let retryable = true;
+        try {
+          const response = await fetch(
+            `${OpenAPI.BASE}/api/v1/executions/${executionId}/logs/${stream}/stream${offset === undefined ? "" : `?offset=${offset}`}`,
+            {
+              headers: { Authorization: `Bearer ${token}` },
+              signal: controller.signal,
+            },
+          );
+          if (!response.ok || !response.body) {
+            retryable = [500, 502, 503, 504].includes(response.status);
+            await response.body?.cancel();
+            throw new Error("Stream unavailable");
           }
+          const reader = response.body.getReader();
+          const cancelReader = () => {
+            void reader.cancel().catch(() => {});
+          };
+          controller.signal.addEventListener("abort", cancelReader, {
+            once: true,
+          });
+          try {
+            const decoder = new TextDecoder();
+            let buffer = "";
+            while (!controller.signal.aborted) {
+              const { value, done } = await reader.read();
+              if (done || controller.signal.aborted) break;
+              buffer += decoder.decode(value, { stream: true });
+              let separatorIndex = buffer.search(/\r?\n\r?\n/);
+              while (separatorIndex >= 0 && !controller.signal.aborted) {
+                const block = buffer.slice(0, separatorIndex);
+                buffer = buffer.slice(
+                  buffer[separatorIndex] === "\r"
+                    ? separatorIndex + 4
+                    : separatorIndex + 2,
+                );
+                if (block.trim()) consumeSseBlock(block);
+                separatorIndex = buffer.search(/\r?\n\r?\n/);
+              }
+            }
+          } finally {
+            controller.signal.removeEventListener("abort", cancelReader);
+            try {
+              await reader.cancel();
+            } finally {
+              reader.releaseLock();
+            }
+          }
+        } catch {
+          // Authorization/rate-limit failures and guarded SSE error events never
+          // reconnect. Each new transport is independently authorized by the API.
         }
-      } catch (err) {
-        if (!controller.signal.aborted) {
-          setLoadError(err instanceof Error ? err.message : "Stream failed");
+        if (controller.signal.aborted) return;
+        if (!retryable || attempt === 1) {
+          setLoadError("Content unavailable or access denied");
+          setIsLoadingContent(false);
+          setIsStreaming(false);
+          return;
         }
-      } finally {
-        setIsStreaming(false);
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            clearTimeout(timer);
+            controller.signal.removeEventListener("abort", finish);
+            resolve();
+          };
+          const timer = setTimeout(finish, 1000);
+          controller.signal.addEventListener("abort", finish, { once: true });
+        });
       }
     })();
 
@@ -282,40 +320,56 @@ function TextFileDetail({
       setIsStreaming(false);
       setIsWaiting(false);
     };
-  }, [artifactId, isRunning, scrollToBottom]);
+  }, [executionId, stream, liveStream, scrollToBottom]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
   // ---- Fetch fallback (used when not running, or SSE never connected) ----
-  const fetchContent = useCallback(async () => {
-    const token = localStorage.getItem("access_token");
-    const url = `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/download`;
-    try {
-      const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!response.ok) {
-        setLoadError(`HTTP ${response.status}: ${response.statusText}`);
+  const fetchContent = useCallback(
+    async (signal: AbortSignal) => {
+      if (versionNumber === undefined) {
+        setLoadError("Content unavailable or access denied");
         setIsLoadingContent(false);
         return;
       }
-      const text = await response.text();
-      setContent(text);
-      setLoadError(null);
-    } catch (e) {
-      setLoadError(e instanceof Error ? e.message : "Unknown error");
-    } finally {
-      setIsLoadingContent(false);
-      setIsWaiting(false);
-    }
-  }, [artifactId]);
+      const token = localStorage.getItem("access_token");
+      const url = `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/versions/${versionNumber}/download?version_id=${versionId}`;
+      try {
+        const response = await fetch(url, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Range: `bytes=0-${ARTIFACT_PREVIEW_BYTES - 1}`,
+          },
+          signal,
+        });
+        const preview = await readArtifactPreview(response);
+        if (signal.aborted) return;
+        setContent(preview.text);
+        setTruncated(preview.truncated);
+        setLoadError(null);
+      } catch {
+        if (!signal.aborted)
+          setLoadError("Content unavailable or access denied");
+      } finally {
+        if (!signal.aborted) {
+          setIsLoadingContent(false);
+          setIsWaiting(false);
+        }
+      }
+    },
+    [artifactId, versionNumber, versionId],
+  );
 
   // When NOT running (execution completed), use download endpoint to get final content.
   // This also handles the transition from running → completed (stream was aborted,
   // now fetch the full file).
   useEffect(() => {
-    if (isRunning) return;
-    queueMicrotask(() => void fetchContent());
-  }, [isRunning, fetchContent]);
+    if (liveStream) return;
+    const controller = new AbortController();
+    queueMicrotask(() => {
+      if (!controller.signal.aborted) void fetchContent(controller.signal);
+    });
+    return () => controller.abort();
+  }, [liveStream, fetchContent]);
 
   return (
     <div
@@ -329,7 +383,10 @@ function TextFileDetail({
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200">
           <h3 className="text-base font-semibold text-gray-900 flex items-center gap-2">
             <FileText className="h-4 w-4 text-blue-500" />
-            {artifactName ?? "Text File"}
+            {artifact.name ?? "Text File"} — Execution #{executionId},{" "}
+            {liveStream
+              ? `live ${stream}`
+              : `v${versionNumber ?? "unavailable"}`}
           </h3>
           <div className="flex items-center gap-2">
             {isStreaming && !streamDone && (
@@ -349,6 +406,7 @@ function TextFileDetail({
             )}
             <button
               onClick={onClose}
+              aria-label="Close preview"
               className="text-gray-400 hover:text-gray-600 p-1 rounded"
             >
               <X className="h-4 w-4" />
@@ -357,6 +415,12 @@ function TextFileDetail({
         </div>
 
         <div className="flex-1 overflow-hidden p-4">
+          {truncated && (
+            <p className="text-xs text-gray-500">
+              Preview limited to the first 64 KiB. Download the file to read the
+              full content.
+            </p>
+          )}
           {isLoadingContent && !isWaiting && (
             <div className="flex items-center gap-2 py-2 text-sm text-gray-500">
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -540,23 +604,16 @@ function ExecutionArtifactsView({
   executionId,
   isRunning = false,
 }: ExecutionArtifactsPanelProps) {
-  const [page, setPage] = useState(1);
   const pageSize = 20;
   const [paused, setPaused] = useState(false);
-  useArtifactLivePage({
-    scope: "execution",
-    id: executionId,
-    page,
-    setPage,
-    paused,
-  });
+  const browse = useArtifactCursorPage("execution", paused, executionId);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [previewProgressId, setPreviewProgressId] = useState<number | null>(
     null,
   );
-  const [previewTextFileId, setPreviewTextFileId] = useState<number | null>(
-    null,
-  );
+  const [previewTextFile, setPreviewTextFile] =
+    useState<ArtifactSummary | null>(null);
 
   // Subscribe to real-time artifact notifications for this execution.
   // WebSocket-driven cache invalidation replaces most of the polling need,
@@ -566,7 +623,7 @@ function ExecutionArtifactsView({
   const { data, isLoading, error } = useExecutionArtifacts(
     executionId,
     isRunning,
-    { page, perPage: pageSize },
+    { cursor: browse.cursor, perPage: pageSize },
     paused,
   );
 
@@ -574,10 +631,14 @@ function ExecutionArtifactsView({
     return data?.items ?? [];
   }, [data]);
 
-  const total = data?.pagination.total_items ?? artifacts.length;
-
   // Don't render anything if there are no artifacts and we're not loading
-  if (!isLoading && total === 0 && page === 1 && !error) {
+  if (
+    !isLoading &&
+    artifacts.length === 0 &&
+    !browse.hasPrevious &&
+    !data?.has_more &&
+    !error
+  ) {
     return null;
   }
 
@@ -589,7 +650,9 @@ function ExecutionArtifactsView({
           <Package className="h-4 w-4 text-indigo-500" />
           <h2 className="text-lg font-semibold">Artifacts</h2>
           {!isLoading && (
-            <span className="text-xs text-gray-500">({total})</span>
+            <span className="text-xs text-gray-500">
+              ({artifacts.length} shown)
+            </span>
           )}
           {isRunning && (
             <div className="flex items-center gap-1.5 text-xs text-blue-600">
@@ -610,6 +673,9 @@ function ExecutionArtifactsView({
 
       {/* Content */}
       <div className="px-4 pb-4">
+        {downloadError && (
+          <p className="text-sm text-red-600">{downloadError}</p>
+        )}
         {isLoading && (
           <div className="flex items-center justify-center py-8">
             <Loader2 className="h-5 w-5 animate-spin text-gray-400" />
@@ -679,12 +745,14 @@ function ExecutionArtifactsView({
                         >
                           {artifact.ref}
                         </dd>
-                        {artifact.size_bytes != null &&
-                          artifact.size_bytes > 0 && (
+                        {artifact.selected_version?.size_bytes != null &&
+                          artifact.selected_version.size_bytes > 0 && (
                             <>
                               <dt className="text-gray-500">Size</dt>
                               <dd className="text-gray-700">
-                                {formatBytes(artifact.size_bytes)}
+                                {formatBytes(
+                                  artifact.selected_version.size_bytes,
+                                )}
                               </dd>
                             </>
                           )}
@@ -695,12 +763,25 @@ function ExecutionArtifactsView({
                           })}
                         </dd>
                       </dl>
+                      <p className="text-xs text-gray-500">
+                        Execution #{executionId}, v
+                        {artifact.selected_version?.version ?? "unavailable"}
+                      </p>
                       <div className="flex items-center gap-1 pt-1">
+                        {artifact.selected_version?.execution ===
+                          executionId && (
+                          <Link
+                            className="text-xs text-blue-600"
+                            to={`/artifacts/${artifact.id}?execution=${executionId}&version=${artifact.selected_version.version}&version_id=${artifact.selected_version.id}`}
+                          >
+                            View details
+                          </Link>
+                        )}
                         {(isProgress || isTextFile) && (
                           <button
                             onClick={() => {
                               if (isProgress) setPreviewProgressId(artifact.id);
-                              else setPreviewTextFileId(artifact.id);
+                              else setPreviewTextFile(artifact);
                             }}
                             className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-gray-100 text-gray-600 hover:text-blue-600"
                           >
@@ -710,9 +791,28 @@ function ExecutionArtifactsView({
                         )}
                         {isFile && (
                           <button
-                            onClick={() =>
-                              downloadArtifact(artifact.id, artifact.ref)
+                            disabled={
+                              artifact.selected_version?.execution !==
+                              executionId
                             }
+                            onClick={() => {
+                              if (
+                                artifact.selected_version?.execution !==
+                                executionId
+                              )
+                                return;
+                              setDownloadError(null);
+                              void downloadArtifact(
+                                artifact.id,
+                                artifact.ref,
+                                artifact.selected_version.version,
+                                artifact.selected_version.id,
+                              ).catch(() =>
+                                setDownloadError(
+                                  "Content unavailable or access denied",
+                                ),
+                              );
+                            }}
                             className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-gray-100 text-gray-600 hover:text-blue-600"
                           >
                             <Download className="h-3.5 w-3.5" />
@@ -729,13 +829,14 @@ function ExecutionArtifactsView({
         )}
 
         {data && !error && (
-          <Pagination
-            page={page}
-            setPage={setPage}
-            pageSize={pageSize}
-            itemCount={artifacts.length}
-            total={total}
-            itemLabel="artifacts"
+          <ArtifactCursorControls
+            hasPrevious={browse.hasPrevious}
+            hasMore={data.has_more && !!data.next_cursor}
+            onPrevious={browse.previous}
+            onNext={() => {
+              if (data.next_cursor) browse.next(data.next_cursor);
+            }}
+            disabled={isLoading}
           />
         )}
         <p className="mt-3 text-xs text-gray-500">
@@ -750,14 +851,13 @@ function ExecutionArtifactsView({
             onClose={() => setPreviewProgressId(null)}
           />
         )}
-        {previewTextFileId != null && (
+        {previewTextFile != null && (
           <TextFileDetail
-            artifactId={previewTextFileId}
-            artifactName={
-              artifacts.find((a) => a.id === previewTextFileId)?.name ?? null
-            }
+            key={`${previewTextFile.id}:${previewTextFile.selected_version?.id}`}
+            artifact={previewTextFile}
+            executionId={executionId}
             isRunning={isRunning}
-            onClose={() => setPreviewTextFileId(null)}
+            onClose={() => setPreviewTextFile(null)}
           />
         )}
       </div>

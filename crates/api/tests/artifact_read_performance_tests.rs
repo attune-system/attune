@@ -60,6 +60,57 @@ const DRIVER_ENUM_BY_OID: &str =
 const POOL_SESSION_SETUP: &str =
     "select set_config('search_path', $1, false), set_config('application_name', $2, false)";
 
+// These are selected-CONTENT ceilings, not relaxed metadata or driver exclusions.
+// PG18's first selected-route run measured 30 application statements for both
+// 1/64 execution origins, versus the inherited aggregate-metadata ceiling of 20.
+// The fixed guarded route now includes three advisory locks, one BEGIN, three
+// retained-current-IAM reads, two version revalidation/pinning reads, and one
+// sensor-generation dispatch probe (10 statements). Keep all of them counted.
+// The subsequent structural-owner survival check adds at most four statements
+// for these action-owned fixtures: bound artifact, action, pack, and pack owner.
+// A duplicate initial IAM snapshot/selection is still an optimization candidate,
+// not permission to remove the held-current-IAM/source/target checks.
+const SELECTED_CONTENT_FIXED_GUARD_QUERIES: usize = 10;
+const SELECTED_CONTENT_OWNER_SURVIVAL_QUERIES: usize = 4;
+
+fn selected_content_query_ceiling(disclosure_ceiling: usize) -> usize {
+    disclosure_ceiling
+        + SELECTED_CONTENT_FIXED_GUARD_QUERIES
+        + SELECTED_CONTENT_OWNER_SURVIVAL_QUERIES
+}
+
+fn assert_selected_content_query_safety(queries: &QueryMetrics) {
+    assert_eq!(
+        queries.artifact_count_reads, 0,
+        "content selected an exact artifact total"
+    );
+    assert_eq!(
+        queries.artifact_linked_history_reads, 0,
+        "content enumerated unrelated linked history"
+    );
+    assert_eq!(
+        queries.ciphertext_reads, 0,
+        "disclosure preparation selected ciphertext"
+    );
+    assert_eq!(
+        queries.source_payload_reads, 0,
+        "disclosure preparation selected source payloads"
+    );
+    // The log contains two IAM loads (preselection + held current IAM). Do not
+    // let the explicit fixed-work allowance hide another full snapshot reload.
+    for category in ["permission_set", "identity_role_assignment"] {
+        assert!(
+            queries
+                .statement_categories
+                .get(category)
+                .copied()
+                .unwrap_or(0)
+                <= 2,
+            "selected content repeated an IAM snapshot: {category}"
+        );
+    }
+}
+
 #[derive(Clone, Default, Serialize)]
 struct QueryMetrics {
     statements: usize,
@@ -71,6 +122,8 @@ struct QueryMetrics {
     ciphertext_reads: usize,
     source_scope_reads: usize,
     source_payload_reads: usize,
+    artifact_count_reads: usize,
+    artifact_linked_history_reads: usize,
     pool_acquisitions: usize,
     pool_acquire_seconds: f64,
     execution_disclosure_poll_cpu_seconds: Option<f64>,
@@ -119,6 +172,15 @@ impl Visit for QueryMetrics {
         let primary_table = sql
             .split_once(" from ")
             .and_then(|(_, tail)| tail.split_whitespace().next());
+        if sql.contains("count(") && matches!(primary_table, Some("artifact" | "artifact_version"))
+        {
+            self.artifact_count_reads += 1;
+        }
+        if sql.starts_with("select distinct execution from artifact_version")
+            || sql.starts_with("select distinct artifact, execution from artifact_version")
+        {
+            self.artifact_linked_history_reads += 1;
+        }
         // Keep diagnostics independent of values and SQL text. In particular,
         // distinguish cache misses from repeated graph/disclosure reads.
         let category = match primary_table {
@@ -455,6 +517,27 @@ fn query_budget_excludes_only_exact_pool_setup_and_preserves_application_limit()
         assert_eq!(metrics.application_statements(), 26);
         assert!(metrics.application_statements() > 25);
     });
+}
+
+#[test]
+fn query_observer_counts_exact_artifact_totals_and_both_linked_history_shapes() {
+    let observer = RequestQueries::default();
+    let subscriber = tracing_subscriber::registry().with(observer.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        for sql in [
+            "SELECT COUNT(*) FROM artifact WHERE visibility = $1",
+            "SELECT COUNT(*) FROM artifact_version WHERE artifact = $1",
+            "SELECT DISTINCT execution FROM artifact_version WHERE artifact = $1",
+            "SELECT DISTINCT artifact, execution FROM artifact_version WHERE artifact = ANY($1)",
+            "SELECT id, execution FROM artifact_version WHERE artifact = $1 AND version = $2",
+        ] {
+            tracing::event!(target: "sqlx::query", tracing::Level::DEBUG, db.statement = sql);
+        }
+    });
+    let metrics = observer.0.lock().unwrap();
+    assert_eq!(metrics.statements, 5);
+    assert_eq!(metrics.artifact_count_reads, 2);
+    assert_eq!(metrics.artifact_linked_history_reads, 2);
 }
 
 #[test]
@@ -900,6 +983,38 @@ async fn link(ctx: &TestContext, artifact: i64, execution: i64) -> Result<()> {
     Ok(())
 }
 
+async fn assert_safe_runtime_log_header(ctx: &TestContext, artifact: i64) -> Result<()> {
+    let response = ctx
+        .get(&format!("/api/v1/artifacts/{artifact}"), ctx.token())
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    let header = body["data"].as_object().ok_or("header missing")?;
+    assert_eq!(header.get("id"), Some(&json!(artifact)));
+    assert_eq!(header.get("classification"), Some(&json!("runtime_log")));
+    for key in header.keys() {
+        assert!(
+            [
+                "id",
+                "ref",
+                "scope",
+                "owner",
+                "type",
+                "visibility",
+                "classification",
+                "name",
+                "created",
+                "updated",
+                "retention_policy",
+                "retention_limit"
+            ]
+            .contains(&key.as_str()),
+            "runtime-log header exposed non-allowlisted field {key}"
+        );
+    }
+    Ok(())
+}
+
 async fn secret_origins(ctx: &TestContext, id: i64, origins: Vec<SecretOrigin>) -> Result<()> {
     let provenance = SecretProvenance {
         origins,
@@ -1002,7 +1117,8 @@ async fn distinct_execution_origins_and_workflow_children_use_frontier_batches()
             origins.push(execution_origin(source));
         }
         secret_origins(&ctx, destination, origins.clone()).await?;
-        let path = format!("/api/v1/artifacts/{log}");
+        let path = format!("/api/v1/artifacts/{log}/versions/1");
+        assert_safe_runtime_log_header(&ctx, log).await?;
         let _ = ctx.get(&path, ctx.token()).await?.bytes().await?;
         if count == 64 {
             // Exercise connection-local type discovery without background audit
@@ -1053,10 +1169,18 @@ async fn distinct_execution_origins_and_workflow_children_use_frontier_batches()
     let small = measurements[0].1.queries.graph_record_reads;
     let large = measurements[1].1.queries.graph_record_reads;
     let total = measurements[1].1.queries.application_statements();
+    assert_eq!(
+        measurements[0].1.queries.application_statements(),
+        total,
+        "selected execution-origin work must stay constant within one frontier batch"
+    );
+    for (_, sample) in &measurements {
+        assert_selected_content_query_safety(&sample.queries);
+    }
     ctx.cleanup().await?;
     assert!(
-        large == small && total <= 20,
-        "graph-record reads grew from {small} to {large}, or application total {total} exceeded 20; {report}"
+        large == small && total <= selected_content_query_ceiling(20),
+        "graph-record reads grew from {small} to {large}, or selected-content application total {total} exceeded its disclosure + fixed-guard ceiling; {report}"
     );
     Ok(())
 }
@@ -1079,7 +1203,8 @@ async fn shared_origin_depth_budget_and_cycles_are_checked_on_every_traversal() 
     )
     .await?;
     link(&ctx, log, destination).await?;
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     let mut previous = leaf;
     let mut chain = Vec::new();
     for _ in 0..31 {
@@ -1139,7 +1264,8 @@ async fn batched_execution_sources_fail_closed_for_missing_paths_and_expiry() ->
     )
     .await?;
     link(&ctx, log, destination).await?;
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     secret_origins(&ctx, destination, vec![execution_origin(source)]).await?;
     assert_eq!(
         ctx.get(&path, ctx.token()).await?.status(),
@@ -1323,7 +1449,7 @@ async fn workflow_source_visibility_uses_root_but_self_scope_uses_child_owner() 
         .await;
         AuthorizationService::invalidate_permission_set_caches().await;
         assert_eq!(
-            ctx.get(&format!("/api/v1/artifacts/{log}"), ctx.token())
+            ctx.get(&format!("/api/v1/artifacts/{log}/versions/1"), ctx.token())
                 .await?
                 .status(),
             expected
@@ -1336,7 +1462,7 @@ async fn workflow_source_visibility_uses_root_but_self_scope_uses_child_owner() 
         .execute(&ctx.pool)
         .await?;
     assert_eq!(
-        ctx.get(&format!("/api/v1/artifacts/{log}"), ctx.token())
+        ctx.get(&format!("/api/v1/artifacts/{log}/versions/1"), ctx.token())
             .await?
             .status(),
         StatusCode::NOT_FOUND
@@ -1346,7 +1472,7 @@ async fn workflow_source_visibility_uses_root_but_self_scope_uses_child_owner() 
 }
 
 #[tokio::test]
-async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<()> {
+async fn runtime_log_metadata_and_selected_body_never_load_unrelated_history() -> Result<()> {
     let ctx = TestContext::new_without_authorization_metadata_cache()
         .await?
         .with_auth()
@@ -1367,21 +1493,25 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
     )
     .await?;
     let mut samples = Vec::new();
+    let mut selected_samples = Vec::new();
     let mut already_created = 0;
-    for retained in [1, 64, 100] {
+    let mut selected_execution = None;
+    for retained in [1, 256, 257, 1000] {
         let mut latest = 0;
         for _ in already_created..retained {
             latest = execution(&ctx, &action_ref).await?;
+            selected_execution.get_or_insert(latest);
             link(&ctx, stdout, latest).await?;
             link(&ctx, stderr, latest).await?;
         }
         already_created = retained;
-        let path = format!("/api/v1/executions/{latest}/artifacts");
+        let selected_execution = selected_execution.ok_or("selected execution missing")?;
+        let path = format!("/api/v1/executions/{selected_execution}/artifacts");
         ArtifactRepository::analyze_read_fixtures(&ctx.pool).await?;
         let _ = ctx.get(&path, ctx.token()).await?.bytes().await?;
         // Driver enum metadata is connection-local. Exercise pool churn so the
         // application-query gate cannot accidentally depend on warmed sockets.
-        if retained == 100 {
+        if retained == 1000 {
             // Finish the warm-up request's background audit work before closing
             // sockets, so it cannot warm replacement connections outside the
             // measured request subscriber.
@@ -1395,13 +1525,32 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
             }
         }
         let (sample, body) = measure(&ctx, &path).await?;
-        if retained == 100 {
+        if retained == 1000 {
             assert!(
                 sample.queries.driver_metadata_reads() > 0,
                 "Fresh-connection regression did not exercise SQLx type discovery"
             );
         }
         assert_eq!(sample.status, 200, "{body}");
+        assert_eq!(sample.queries.artifact_count_reads, 0);
+        assert_eq!(sample.queries.artifact_linked_history_reads, 0);
+        assert_eq!(sample.queries.source_scope_reads, 0);
+        for category in [
+            "execution_secret_value",
+            "runtime_schema_binding",
+            "execution_key_read_origin",
+        ] {
+            assert_eq!(
+                sample
+                    .queries
+                    .statement_categories
+                    .get(category)
+                    .copied()
+                    .unwrap_or(0),
+                0,
+                "metadata loaded disclosure evidence: {category}"
+            );
+        }
         assert_eq!(
             body["items"]
                 .as_array()
@@ -1409,8 +1558,48 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
                 .len(),
             2
         );
+        for item in body["items"].as_array().ok_or("items missing")? {
+            assert_eq!(item["selected_version"]["execution"], selected_execution);
+            assert_eq!(item["selected_version"]["version"], 1);
+        }
+        let (selected, content) =
+            measure(&ctx, &format!("/api/v1/artifacts/{stdout}/versions/1")).await?;
+        assert_eq!(selected.status, 200, "{content}");
+        assert_eq!(content["data"]["version"], 1);
+        assert_eq!(selected.queries.artifact_linked_history_reads, 0);
+        assert_eq!(selected.queries.ciphertext_reads, 0);
+        selected_samples.push((retained, selected));
+        for metadata_path in [
+            format!("/api/v1/artifacts/{stdout}"),
+            format!("/api/v1/artifacts/{stdout}/versions?per_page=20"),
+        ] {
+            let (metadata, body) = measure(&ctx, &metadata_path).await?;
+            assert_eq!(metadata.status, 200, "{body}");
+            assert_eq!(metadata.queries.artifact_count_reads, 0);
+            assert_eq!(metadata.queries.artifact_linked_history_reads, 0);
+            assert_eq!(metadata.queries.source_scope_reads, 0);
+            assert_eq!(
+                metadata
+                    .queries
+                    .statement_categories
+                    .get("execution_secret_value")
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+            assert_eq!(
+                metadata
+                    .queries
+                    .statement_categories
+                    .get("runtime_schema_binding")
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+            assert_eq!(metadata.queries.payload_projection_reads, 0);
+        }
         samples.push((retained, sample));
-        if retained == 100 {
+        if retained == 1000 {
             let user = attune_api::auth::middleware::AuthenticatedUser {
                 claims: attune_api::auth::jwt::validate_token(
                     ctx.token().ok_or("fixture token missing")?,
@@ -1472,18 +1661,43 @@ async fn runtime_log_history_queries_grow_by_batches_not_executions() -> Result<
     // Only the application scaling budget excludes catalog type discovery and
     // the exact per-connection setup statement; RBAC cache misses still count.
     let small = samples[0].1.queries.application_statements();
-    let within_batch = samples[1].1.queries.application_statements();
-    let large = samples[2].1.queries.application_statements();
+    let large = samples
+        .last()
+        .ok_or("samples missing")?
+        .1
+        .queries
+        .application_statements();
+    let selected_small = selected_samples[0].1.queries.graph_record_reads;
+    source_origins::save_report("runtime-log-selected-body", &selected_samples)?;
+    for (_, sample) in &selected_samples {
+        assert_eq!(
+            sample.queries.graph_record_reads, selected_small,
+            "fixed selected body loaded more execution roots as sibling history grew"
+        );
+        assert_selected_content_query_safety(&sample.queries);
+        assert_eq!(
+            sample.queries.application_statements(),
+            selected_samples[0].1.queries.application_statements(),
+            "fixed selected body application queries grew with unrelated siblings"
+        );
+        // The no-origin body measured 25 at 1/256/257/1000 siblings on PG18.
+        // Only the four owner-survival statements are additional here. Metadata
+        // below retains its original <=20 ceiling and zero-disclosure contract.
+        assert!(sample.queries.application_statements() <= 25 + SELECTED_CONTENT_OWNER_SURVIVAL_QUERIES,
+            "fixed selected body exceeded its measured guarded baseline plus owner-survival work: {}",
+            serde_json::to_string(sample)?);
+    }
     ctx.cleanup().await?;
     assert!(
-        within_batch <= small + 4 && large <= within_batch + 7 && large <= 20,
-        "history authorization grew from {small} to {large} statements beyond the batch query budget; {report}"
+        large == small && large <= 20,
+        "metadata queries grew from {small} to {large} with unrelated history; {report}"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result<()> {
+async fn runtime_log_metadata_visibility_does_not_bypass_selected_content_disclosure() -> Result<()>
+{
     use attune_common::repositories::{key::KeyRepository, Delete};
     let ctx = TestContext::new_without_authorization_metadata_cache()
         .await?
@@ -1549,8 +1763,9 @@ async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result
     assert_eq!(global.status(), StatusCode::OK);
     let body: Value = global.json().await?;
     assert_eq!(body["items"][0]["id"], log);
+    assert_safe_runtime_log_header(&ctx, log).await?;
     assert_eq!(
-        ctx.get(&format!("/api/v1/artifacts/{log}"), ctx.token())
+        ctx.get(&format!("/api/v1/artifacts/{log}/versions/1"), ctx.token())
             .await?
             .status(),
         StatusCode::NOT_FOUND
@@ -1560,22 +1775,21 @@ async fn global_summary_visibility_does_not_bypass_detail_disclosure() -> Result
         .await?
         .json()
         .await?;
-    assert!(list["items"]
-        .as_array()
-        .ok_or("artifact array missing")?
-        .is_empty());
+    assert_eq!(list["items"][0]["id"], log);
+    assert_eq!(list["items"][0]["selected_version"]["execution"], id);
     grant(&ctx, "fixture.origin_read", json!([
         {"resource":"keys","actions":["read","decrypt"],"constraints":{"refs":["system.fixture_private"],"owner_types":["system"]}}
     ])).await?;
     assert_eq!(
-        ctx.get(&format!("/api/v1/artifacts/{log}"), ctx.token())
+        ctx.get(&format!("/api/v1/artifacts/{log}/versions/1"), ctx.token())
             .await?
             .status(),
         StatusCode::OK
     );
     assert!(KeyRepository::delete(&ctx.pool, key.id).await?);
+    assert_safe_runtime_log_header(&ctx, log).await?;
     assert_eq!(
-        ctx.get(&format!("/api/v1/artifacts/{log}"), ctx.token())
+        ctx.get(&format!("/api/v1/artifacts/{log}/versions/1"), ctx.token())
             .await?
             .status(),
         StatusCode::NOT_FOUND,
@@ -1636,7 +1850,8 @@ async fn summaries_exclude_large_artifact_and_version_payloads() -> Result<()> {
 }
 
 #[tokio::test]
-async fn missing_linked_executions_deny_logs_instead_of_disappearing_from_a_batch() -> Result<()> {
+async fn missing_sibling_execution_denies_its_content_not_readable_selected_content() -> Result<()>
+{
     let ctx = TestContext::new_without_authorization_metadata_cache()
         .await?
         .with_auth()
@@ -1652,11 +1867,18 @@ async fn missing_linked_executions_deny_logs_instead_of_disappearing_from_a_batc
     .await?;
     link(&ctx, log, execution).await?;
     link(&ctx, log, i64::MAX).await?;
+    assert_safe_runtime_log_header(&ctx, log).await?;
     assert_eq!(
-        ctx.get(&format!("/api/v1/artifacts/{log}"), ctx.token())
+        ctx.get(&format!("/api/v1/artifacts/{log}/versions/2"), ctx.token())
             .await?
             .status(),
         StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        ctx.get(&format!("/api/v1/artifacts/{log}/versions/1"), ctx.token())
+            .await?
+            .status(),
+        StatusCode::OK
     );
     let list: Value = ctx
         .get(
@@ -1666,17 +1888,49 @@ async fn missing_linked_executions_deny_logs_instead_of_disappearing_from_a_batc
         .await?
         .json()
         .await?;
-    assert!(list["items"]
-        .as_array()
-        .ok_or("artifact array missing")?
-        .is_empty());
+    assert_eq!(list["items"][0]["id"], log);
+    assert_eq!(list["items"][0]["selected_version"]["version"], 1);
+    assert_eq!(list["items"][0]["selected_version"]["execution"], execution);
+    // A metadata-visible later run with denied provenance is different from the
+    // missing/invisible version above: latest must select it and deny its body,
+    // never scan older history for a body that happens to be readable.
+    let denied = self::execution(&ctx, &action_ref).await?;
+    secret_origins(&ctx, denied, vec![execution_origin(i64::MAX)]).await?;
+    link(&ctx, log, denied).await?;
+    assert_safe_runtime_log_header(&ctx, log).await?;
+    let history: Value = ctx
+        .get(&format!("/api/v1/artifacts/{log}/versions"), ctx.token())
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        history["items"][0]["version"], 3,
+        "version metadata visibility is not a body-disclosure promise"
+    );
+    for path in [
+        format!("/api/v1/artifacts/{log}/versions/latest"),
+        format!("/api/v1/artifacts/{log}/download"),
+        format!("/api/v1/artifacts/{log}/versions/3/download"),
+    ] {
+        assert_eq!(
+            ctx.get(&path, ctx.token()).await?.status(),
+            StatusCode::NOT_FOUND,
+            "latest must not fall back to a readable sibling: {path}"
+        );
+    }
+    assert_eq!(
+        ctx.get(&format!("/api/v1/artifacts/{log}/versions/1"), ctx.token())
+            .await?
+            .status(),
+        StatusCode::OK
+    );
     ctx.cleanup().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn disclosure_repository_failures_are_not_successful_empty_lists_or_detail_404s() -> Result<()>
-{
+async fn selected_disclosure_repository_failures_are_not_masked_and_metadata_still_works(
+) -> Result<()> {
     let ctx = TestContext::new_without_authorization_metadata_cache()
         .await?
         .with_auth()
@@ -1696,22 +1950,29 @@ async fn disclosure_repository_failures_are_not_successful_empty_lists_or_detail
     sqlx::query("ALTER TABLE execution_secret_value RENAME TO fixture_unavailable_secret_values")
         .execute(&ctx.pool)
         .await?;
-    for path in [
-        format!("/api/v1/artifacts/{log}"),
-        format!("/api/v1/executions/{execution}/artifacts"),
-    ] {
-        assert_eq!(
-            ctx.get(&path, ctx.token()).await?.status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
+    assert_eq!(
+        ctx.get(&format!("/api/v1/artifacts/{log}/versions/1"), ctx.token())
+            .await?
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_safe_runtime_log_header(&ctx, log).await?;
+    let response = ctx
+        .get(
+            &format!("/api/v1/executions/{execution}/artifacts"),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list: Value = response.json().await?;
+    assert_eq!(list["items"][0]["id"], log);
     ctx.cleanup().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn execution_pages_count_disclosure_eligible_rows_after_a_denied_candidate_batch(
-) -> Result<()> {
+async fn execution_cursor_pages_include_safe_metadata_without_scanning_denied_bodies() -> Result<()>
+{
     let ctx = TestContext::new_without_authorization_metadata_cache()
         .await?
         .with_auth()
@@ -1738,8 +1999,7 @@ async fn execution_pages_count_disclosure_eligible_rows_after_a_denied_candidate
         link(&ctx, id, execution).await?;
         expected.push(id);
     }
-    // A whole first scan batch can be SQL-visible but fail runtime disclosure.
-    // No offset/limit may be applied before that gate or reused as an exact total.
+    // SQL-visible log metadata remains pageable even when sibling bodies deny.
     for n in 0..260 {
         let id = artifact(
             &ctx,
@@ -1750,32 +2010,46 @@ async fn execution_pages_count_disclosure_eligible_rows_after_a_denied_candidate
         .await?;
         link(&ctx, id, execution).await?;
         link(&ctx, id, i64::MAX).await?;
+        expected.push(id);
     }
     expected.reverse();
-    for (offset, id) in expected.iter().enumerate() {
-        let response = ctx
-            .get(
-                &format!(
-                    "/api/v1/executions/{execution}/artifacts?page={}&per_page=1",
-                    offset + 1
-                ),
-                ctx.token(),
-            )
-            .await?;
+    let mut cursor = None::<String>;
+    for (page, expected_items) in expected.chunks(100).enumerate() {
+        let mut path = format!("/api/v1/executions/{execution}/artifacts?per_page=100");
+        if let Some(cursor) = &cursor {
+            path.push('&');
+            path.push_str(
+                &url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("cursor", cursor)
+                    .finish(),
+            );
+        }
+        let response = ctx.get(&path, ctx.token()).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = response.json().await?;
+        let items = body["items"].as_array().ok_or("page items missing")?;
+        assert_eq!(items.len(), expected_items.len());
         assert_eq!(
-            body["items"].as_array().ok_or("page items missing")?.len(),
-            1
+            items
+                .iter()
+                .map(|item| item["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            expected_items
         );
-        assert_eq!(body["items"][0]["id"], *id);
-        assert_eq!(body["pagination"]["total_items"], 3);
-        assert_eq!(body["pagination"]["total_pages"], 3);
-        assert_eq!(body["pagination"]["has_next"], offset < 2);
+        assert!(body.get("pagination").is_none());
+        assert!(body.get("total_items").is_none());
+        let has_more = (page + 1) * 100 < expected.len();
+        assert_eq!(body["has_more"], has_more);
+        cursor = body["next_cursor"].as_str().map(str::to_string);
+        assert_eq!(cursor.is_some(), has_more);
+        for item in items {
+            assert_eq!(item["selected_version"]["execution"], execution);
+        }
     }
+    assert!(cursor.is_none());
     let body: Value = ctx
         .get(
-            &format!("/api/v1/executions/{execution}/artifacts?page=4&per_page=1"),
+            &format!("/api/v1/executions/{execution}/artifacts?type=url&per_page=1"),
             ctx.token(),
         )
         .await?
@@ -1785,7 +2059,8 @@ async fn execution_pages_count_disclosure_eligible_rows_after_a_denied_candidate
         .as_array()
         .ok_or("page items missing")?
         .is_empty());
-    assert_eq!(body["pagination"]["total_items"], 3);
+    assert_eq!(body["has_more"], false);
+    assert!(body["next_cursor"].is_null());
     let body: Value = ctx
         .get(
             &format!("/api/v1/executions/{execution}/artifacts?type=progress&per_page=1"),
@@ -1798,7 +2073,7 @@ async fn execution_pages_count_disclosure_eligible_rows_after_a_denied_candidate
         body["items"][0]["id"], progress,
         "filtered progress discovery must not depend on page one of all artifacts"
     );
-    assert_eq!(body["pagination"]["total_items"], 1);
+    assert_eq!(body["has_more"], false);
     let body: Value = ctx
         .get(
             &format!("/api/v1/artifacts?execution={execution}&per_page=1"),
@@ -1807,16 +2082,16 @@ async fn execution_pages_count_disclosure_eligible_rows_after_a_denied_candidate
         .await?
         .json()
         .await?;
-    assert_eq!(
-        body["pagination"]["total_items"], 263,
-        "global-list totals remain visibility-only"
-    );
+    assert_eq!(body["items"].as_array().ok_or("items missing")?.len(), 1);
+    assert_eq!(body["has_more"], true);
+    assert!(body.get("pagination").is_none());
+    assert!(body.get("total_items").is_none());
     ctx.cleanup().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn history_pages_count_visible_versions_and_exclude_hidden_newer_versions() -> Result<()> {
+async fn history_cursor_pages_exclude_hidden_newer_versions_without_exact_totals() -> Result<()> {
     let ctx = TestContext::new_without_authorization_metadata_cache()
         .await?
         .with_auth()
@@ -1846,18 +2121,26 @@ async fn history_pages_count_visible_versions_and_exclude_hidden_newer_versions(
     )
     .await;
     AuthorizationService::invalidate_permission_set_caches().await;
-    for (page, version) in [(1, 3), (2, 1)] {
-        let response = ctx
-            .get(
-                &format!("/api/v1/artifacts/{id}/versions?page={page}&per_page=1"),
-                ctx.token(),
-            )
-            .await?;
+    let mut cursor = None::<String>;
+    for version in [3, 1] {
+        let mut path = format!("/api/v1/artifacts/{id}/versions?per_page=1");
+        if let Some(cursor) = &cursor {
+            path.push('&');
+            path.push_str(
+                &url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("cursor", cursor)
+                    .finish(),
+            );
+        }
+        let response = ctx.get(&path, ctx.token()).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = response.json().await?;
         assert_eq!(body["items"][0]["version"], version);
-        assert_eq!(body["pagination"]["total_items"], 2);
-        assert_eq!(body["pagination"]["has_next"], page == 1);
+        assert!(body.get("pagination").is_none());
+        assert!(body.get("total_items").is_none());
+        assert_eq!(body["has_more"], version == 3);
+        cursor = body["next_cursor"].as_str().map(str::to_string);
+        assert_eq!(cursor.is_some(), version == 3);
     }
     let latest: Value = ctx
         .get(
@@ -1876,7 +2159,7 @@ async fn history_pages_count_visible_versions_and_exclude_hidden_newer_versions(
 }
 
 #[tokio::test]
-async fn artifact_page_boundaries_reject_invalid_sizes_and_overflow() -> Result<()> {
+async fn artifact_cursor_pages_reject_invalid_sizes_and_malformed_cursors() -> Result<()> {
     let ctx = TestContext::new_without_authorization_metadata_cache()
         .await?
         .with_auth()
@@ -1887,10 +2170,10 @@ async fn artifact_page_boundaries_reject_invalid_sizes_and_overflow() -> Result<
         "/api/v1/artifacts/1/versions",
     ] {
         for query in [
-            "page=0",
             "per_page=0",
             "per_page=101",
-            "page=4294967295&per_page=100",
+            "per_page=4294967295",
+            "cursor=not-a-valid-cursor",
         ] {
             assert_eq!(
                 ctx.get(&format!("{base}?{query}"), ctx.token())

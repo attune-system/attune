@@ -93,13 +93,13 @@ use crate::{
     authz::{execution_has_standard_access, execution_standard_pack_refs, AuthorizationCheck},
     dto::{
         artifact::{
-            AllocateFileVersionByRefRequest, AppendProgressRequest, ArtifactJsonPatch,
-            ArtifactPageParams, ArtifactQueryParams, ArtifactResponse, ArtifactStringPatch,
-            ArtifactSummary, ArtifactVersionResponse, ArtifactVersionSummary,
+            AllocateFileVersionByRefRequest, AppendProgressRequest, ArtifactCursorPage,
+            ArtifactJsonPatch, ArtifactPageParams, ArtifactQueryParams, ArtifactResponse,
+            ArtifactStringPatch, ArtifactSummary, ArtifactVersionResponse, ArtifactVersionSummary,
             CreateArtifactRequest, CreateFileVersionRequest, CreateVersionJsonRequest,
             ExecutionArtifactQueryParams, SetDataRequest, UpdateArtifactRequest,
         },
-        common::PaginatedResponse,
+        artifact_content::ArtifactContentSelector,
         ApiResponse, SuccessResponse,
     },
     http_range::{insert_range_headers, range_not_satisfiable, range_status, resolve_range},
@@ -227,7 +227,8 @@ fn validate_artifact_ref_request(artifact_ref: &str) -> ApiResult<()> {
     tag = "artifacts",
     params(ArtifactQueryParams),
     responses(
-        (status = 200, description = "List of artifacts", body = PaginatedResponse<ArtifactSummary>),
+        (status = 200, description = "Metadata-visible cursor page", body = ArtifactCursorPage<ArtifactSummary>),
+        (status = 400, description = "Invalid cursor or page size"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -236,7 +237,7 @@ pub async fn list_artifacts(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ArtifactQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let pagination = query.pagination().map_err(ApiError::BadRequest)?;
+    query.validate().map_err(ApiError::BadRequest)?;
     let filters = ArtifactSearchFilters {
         scope: query.scope,
         owner: query.owner.clone(),
@@ -245,19 +246,16 @@ pub async fn list_artifacts(
         classification: query.classification,
         execution: query.execution,
         name_contains: query.name.clone(),
-        limit: query.limit(),
-        offset: query.offset(),
+        limit: query.per_page,
+        offset: 0,
     };
 
     let result = crate::artifact_reads::ArtifactReads::new(&state, &user)
         .await?
-        .global_summaries(&filters)
+        .global_summaries(&filters, query.cursor.as_deref())
         .await?;
 
-    let items: Vec<ArtifactSummary> = result.rows.into_iter().map(ArtifactSummary::from).collect();
-
-    let response = PaginatedResponse::new(items, &pagination, result.total as u64);
-    Ok((StatusCode::OK, Json(response)))
+    Ok((StatusCode::OK, Json(result)))
 }
 
 /// Get a single artifact by ID
@@ -297,6 +295,29 @@ pub async fn get_artifact(
             Json(ApiResponse::new(ArtifactResponse::from(artifact))),
         ));
     }
+    let header = ArtifactRepository::find_metadata_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {id} not found")))?;
+    if header.classification == ArtifactClassification::RuntimeLog
+        && user.claims.token_type == TokenType::Access
+    {
+        crate::artifact_reads::ArtifactReads::new(&state, &user)
+            .await?
+            .authorize_metadata_header(id, header.classification)
+            .await
+            .map_err(|error| {
+                crate::artifact_reads::mask_detail_denial(
+                    error,
+                    format!("Artifact with ID {id} not found"),
+                )
+            })?;
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(ArtifactResponse::runtime_log_header(
+                header,
+            ))),
+        ));
+    }
     let artifact = ArtifactRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
@@ -333,7 +354,7 @@ pub async fn get_artifact_by_ref(
     State(state): State<Arc<AppState>>,
     Path(artifact_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let artifact = ArtifactRepository::find_by_ref(&state.db, &artifact_ref)
+    let header = ArtifactRepository::find_metadata_by_ref(&state.db, &artifact_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact '{}' not found", artifact_ref)))?;
 
@@ -341,7 +362,7 @@ pub async fn get_artifact_by_ref(
         let artifact = crate::recorded_reads::artifact(
             &state.db,
             &user,
-            artifact.id,
+            header.id,
             Some(&artifact_ref),
             state.config.security.encryption_key.as_deref(),
         )
@@ -358,6 +379,29 @@ pub async fn get_artifact_by_ref(
         ));
     }
 
+    if header.classification == ArtifactClassification::RuntimeLog
+        && user.claims.token_type == TokenType::Access
+    {
+        crate::artifact_reads::ArtifactReads::new(&state, &user)
+            .await?
+            .authorize_metadata_header(header.id, header.classification)
+            .await
+            .map_err(|error| {
+                crate::artifact_reads::mask_detail_denial(
+                    error,
+                    format!("Artifact '{artifact_ref}' not found"),
+                )
+            })?;
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(ArtifactResponse::runtime_log_header(
+                header,
+            ))),
+        ));
+    }
+    let artifact = ArtifactRepository::find_by_id(&state.db, header.id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Artifact '{artifact_ref}' not found")))?;
     authorize_artifact_action(&state, &user, Action::Read, &artifact)
         .await
         .map_err(|error| {
@@ -750,14 +794,14 @@ pub async fn delete_artifact(
 // Artifacts by Execution
 // ============================================================================
 
-/// List a disclosure-eligible page of artifacts for a given execution.
+/// List metadata and the highest exact-execution version for each artifact.
 #[utoipa::path(
     get,
     path = "/api/v1/executions/{execution_id}/artifacts",
     tag = "artifacts",
     params(("execution_id" = i64, Path, description = "Execution ID"), ExecutionArtifactQueryParams),
     responses(
-        (status = 200, description = "Eligible artifacts with exact totals", body = PaginatedResponse<ArtifactSummary>),
+        (status = 200, description = "Execution-selected metadata cursor page", body = ArtifactCursorPage<ArtifactSummary>),
         (status = 400, description = "Invalid pagination"),
     ),
     security(("bearer_auth" = []))
@@ -768,28 +812,19 @@ pub async fn list_artifacts_by_execution(
     Path(execution_id): Path<i64>,
     Query(query): Query<ExecutionArtifactQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let pagination = query.pagination().map_err(ApiError::BadRequest)?;
+    query.validate().map_err(ApiError::BadRequest)?;
     let filters = ArtifactSearchFilters {
         r#type: query.r#type,
         execution: Some(execution_id),
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        limit: query.per_page,
+        offset: 0,
         ..Default::default()
     };
     let result = crate::artifact_reads::ArtifactReads::new(&state, &user)
         .await?
-        .execution_summaries(&filters)
+        .execution_summaries(&filters, query.cursor.as_deref())
         .await?;
-    let items: Vec<ArtifactSummary> = result.rows.into_iter().map(ArtifactSummary::from).collect();
-
-    Ok((
-        StatusCode::OK,
-        Json(PaginatedResponse::new(
-            items,
-            &pagination,
-            result.total as u64,
-        )),
-    ))
+    Ok((StatusCode::OK, Json(result)))
 }
 
 // ============================================================================
@@ -925,7 +960,7 @@ pub async fn set_artifact_data(
     tag = "artifacts",
     params(("id" = i64, Path, description = "Artifact ID"), ArtifactPageParams),
     responses(
-        (status = 200, description = "Visible versions with exact totals", body = PaginatedResponse<ArtifactVersionSummary>),
+        (status = 200, description = "Visible version metadata cursor page", body = ArtifactCursorPage<ArtifactVersionSummary>),
         (status = 400, description = "Invalid pagination"),
         (status = 404, description = "Artifact not found"),
     ),
@@ -937,40 +972,24 @@ pub async fn list_versions(
     Path(id): Path<i64>,
     Query(query): Query<ArtifactPageParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let pagination = query.pagination().map_err(ApiError::BadRequest)?;
-    if crate::recorded_consumers::is_recorded(&user)? {
-        let versions = crate::recorded_reads::history(
-            &state.db,
-            &user,
+    query.validate().map_err(ApiError::BadRequest)?;
+    // Invalid browse state is a request error even when the target is absent;
+    // reject it before database selection, just like invalid page sizes.
+    if query.cursor.is_some() {
+        crate::artifact_cursor::Cursor::versions(
+            query.cursor.as_deref(),
             id,
-            state.config.security.encryption_key.as_deref(),
-        )
-        .await?;
-        let total = versions.len();
-        let items: Vec<ArtifactVersionSummary> = versions
-            .into_iter()
-            .skip(pagination.offset() as usize)
-            .take(pagination.limit() as usize)
-            .map(|version| {
-                let mut summary = ArtifactVersionSummary::from(version);
-                // History is metadata, not an arbitrary admitted JSON channel.
-                summary.created_by = None;
-                summary
-            })
-            .collect();
-        return Ok((
-            StatusCode::OK,
-            Json(PaginatedResponse::new(items, &pagination, total as u64)),
-        ));
+            Some(state.jwt_config.secret.as_str()),
+        )?;
     }
     // Verify artifact exists
-    let artifact = ArtifactRepository::find_summary_by_id(&state.db, id)
+    let artifact = ArtifactRepository::find_metadata_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
     let versions = crate::artifact_reads::ArtifactReads::new(&state, &user)
         .await?
-        .version_summaries(&artifact, &pagination)
+        .version_summaries(&artifact, query.per_page, query.cursor.as_deref())
         .await
         .map_err(|error| {
             crate::artifact_reads::mask_detail_denial(
@@ -978,26 +997,7 @@ pub async fn list_versions(
                 format!("Artifact with ID {} not found", id),
             )
         })?;
-    let items: Vec<ArtifactVersionSummary> = versions
-        .rows
-        .into_iter()
-        .map(|version| {
-            let mut summary = ArtifactVersionSummary::from(version);
-            if is_file_backed_type(artifact.r#type) {
-                summary.created_by = None;
-            }
-            summary
-        })
-        .collect();
-
-    Ok((
-        StatusCode::OK,
-        Json(PaginatedResponse::new(
-            items,
-            &pagination,
-            versions.total as u64,
-        )),
-    ))
+    Ok((StatusCode::OK, Json(versions)))
 }
 
 /// Get a specific version's metadata and JSON content (no binary)
@@ -1006,6 +1006,7 @@ pub async fn list_versions(
     path = "/api/v1/artifacts/{id}/versions/{version}",
     tag = "artifacts",
     params(
+        ArtifactContentSelector,
         ("id" = i64, Path, description = "Artifact ID"),
         ("version" = i32, Path, description = "Version number"),
     ),
@@ -1019,16 +1020,19 @@ pub async fn get_version(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((id, version)): Path<(i64, i32)>,
+    Query(selector): Query<ArtifactContentSelector>,
 ) -> ApiResult<impl IntoResponse> {
     if crate::recorded_consumers::is_recorded(&user)? {
-        let (artifact, selected, _) = crate::recorded_reads::version(
+        let (artifact, selected, _) = crate::recorded_reads::version_with_id(
             &state.db,
             &user,
             id,
             Some(version),
+            selector.version_id,
             state.config.security.encryption_key.as_deref(),
         )
         .await?;
+        ensure_selected_version_id(&selector, &selected)?;
         return Ok((
             StatusCode::OK,
             Json(ApiResponse::new(ArtifactVersionResponse::projection(
@@ -1042,15 +1046,6 @@ pub async fn get_version(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
-    authorize_artifact_action(&state, &user, Action::Read, &artifact)
-        .await
-        .map_err(|error| {
-            crate::artifact_reads::mask_detail_denial(
-                error,
-                format!("Artifact with ID {} not found", id),
-            )
-        })?;
-
     let ver = match artifact_read_context_for_user(&state, &user).await? {
         Some(read_ctx) => {
             ArtifactVersionRepository::find_readable_by_version(&state.db, id, version, &read_ctx)
@@ -1061,6 +1056,9 @@ pub async fn get_version(
     .ok_or_else(|| {
         ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
     })?;
+
+    ensure_selected_version_id(&selector, &ver)?;
+    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
 
     Ok((
         StatusCode::OK,
@@ -1076,7 +1074,7 @@ pub async fn get_version(
     get,
     path = "/api/v1/artifacts/{id}/versions/latest",
     tag = "artifacts",
-    params(("id" = i64, Path, description = "Artifact ID")),
+    params(ArtifactContentSelector, ("id" = i64, Path, description = "Artifact ID")),
     responses(
         (status = 200, description = "Latest version", body = inline(ApiResponse<ArtifactVersionResponse>)),
         (status = 404, description = "Artifact not found or no versions"),
@@ -1087,16 +1085,19 @@ pub async fn get_latest_version(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(selector): Query<ArtifactContentSelector>,
 ) -> ApiResult<impl IntoResponse> {
     if crate::recorded_consumers::is_recorded(&user)? {
-        let (artifact, selected, _) = crate::recorded_reads::version(
+        let (artifact, selected, _) = crate::recorded_reads::version_with_id(
             &state.db,
             &user,
             id,
             None,
+            selector.version_id,
             state.config.security.encryption_key.as_deref(),
         )
         .await?;
+        ensure_selected_version_id(&selector, &selected)?;
         return Ok((
             StatusCode::OK,
             Json(ApiResponse::new(ArtifactVersionResponse::projection(
@@ -1109,15 +1110,6 @@ pub async fn get_latest_version(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
-    authorize_artifact_action(&state, &user, Action::Read, &artifact)
-        .await
-        .map_err(|error| {
-            crate::artifact_reads::mask_detail_denial(
-                error,
-                format!("Artifact with ID {} not found", id),
-            )
-        })?;
-
     let ver = match artifact_read_context_for_user(&state, &user).await? {
         Some(read_ctx) => {
             ArtifactVersionRepository::find_latest_readable(&state.db, id, &read_ctx).await?
@@ -1125,6 +1117,9 @@ pub async fn get_latest_version(
         None => ArtifactVersionRepository::find_latest(&state.db, id).await?,
     }
     .ok_or_else(|| ApiError::NotFound(format!("No readable versions found for artifact {}", id)))?;
+
+    ensure_selected_version_id(&selector, &ver)?;
+    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
 
     Ok((
         StatusCode::OK,
@@ -1508,6 +1503,7 @@ pub async fn upload_version(
     path = "/api/v1/artifacts/{id}/versions/{version}/download",
     tag = "artifacts",
     params(
+        ArtifactContentSelector,
         ("id" = i64, Path, description = "Artifact ID"),
         ("version" = i32, Path, description = "Version number"),
     ),
@@ -1523,23 +1519,23 @@ pub async fn download_version(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((id, version)): Path<(i64, i32)>,
+    Query(selector): Query<ArtifactContentSelector>,
     request_headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     if crate::recorded_consumers::is_recorded(&user)? {
-        return download_recorded_version(state, user, id, Some(version), request_headers).await;
+        return download_recorded_version(
+            state,
+            user,
+            id,
+            Some(version),
+            selector,
+            request_headers,
+        )
+        .await;
     }
     let artifact = ArtifactRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
-
-    authorize_artifact_action(&state, &user, Action::Read, &artifact)
-        .await
-        .map_err(|error| {
-            crate::artifact_reads::mask_detail_denial(
-                error,
-                format!("Artifact with ID {} not found", id),
-            )
-        })?;
 
     // First try without content (cheaper query) to check for file_path
     let ver = match artifact_read_context_for_user(&state, &user).await? {
@@ -1552,6 +1548,9 @@ pub async fn download_version(
     .ok_or_else(|| {
         ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
     })?;
+
+    ensure_selected_version_id(&selector, &ver)?;
+    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
 
     if let Some(response) = protected_file_response(&state, &user, &ver, &request_headers).await? {
         return Ok(response);
@@ -1579,7 +1578,7 @@ pub async fn download_version(
     authorize_sensor_log_version_content(&state, &user, &artifact, ver.id).await?;
     if ver.body_state == Some(ArtifactBodyState::Ready) {
         let response = serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await?;
-        return guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await;
+        return guard_selected_log_download(&state, &user, &artifact, &ver, response).await;
     }
     if matches!(
         ver.body_state,
@@ -1602,7 +1601,7 @@ pub async fn download_version(
             &request_headers,
         )
         .await?;
-        return guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await;
+        return guard_selected_log_download(&state, &user, &artifact, &ver, response).await;
     }
 
     // DB-stored version: need to fetch with content
@@ -1613,7 +1612,7 @@ pub async fn download_version(
         })?;
 
     let response = serve_db_content(&artifact.r#ref, version, &ver, &request_headers)?;
-    guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await
+    guard_selected_log_download(&state, &user, &artifact, &ver, response).await
 }
 
 /// Download the latest version's content
@@ -1621,7 +1620,7 @@ pub async fn download_version(
     get,
     path = "/api/v1/artifacts/{id}/download",
     tag = "artifacts",
-    params(("id" = i64, Path, description = "Artifact ID")),
+    params(ArtifactContentSelector, ("id" = i64, Path, description = "Artifact ID")),
     responses(
         (status = 200, description = "Binary file content of latest version", content_type = "application/octet-stream"),
         (status = 206, description = "Requested byte range", content_type = "application/octet-stream"),
@@ -1634,23 +1633,15 @@ pub async fn download_latest(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(selector): Query<ArtifactContentSelector>,
     request_headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     if crate::recorded_consumers::is_recorded(&user)? {
-        return download_recorded_version(state, user, id, None, request_headers).await;
+        return download_recorded_version(state, user, id, None, selector, request_headers).await;
     }
     let artifact = ArtifactRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
-
-    authorize_artifact_action(&state, &user, Action::Read, &artifact)
-        .await
-        .map_err(|error| {
-            crate::artifact_reads::mask_detail_denial(
-                error,
-                format!("Artifact with ID {} not found", id),
-            )
-        })?;
 
     let read_ctx = artifact_read_context_for_user(&state, &user).await?;
     // First try without content (cheaper query) to check for file_path.
@@ -1662,6 +1653,11 @@ pub async fn download_latest(
         None => ArtifactVersionRepository::find_latest(&state.db, id).await?,
     };
     let Some(ver) = latest else {
+        if selector.version_id.is_some() {
+            return Err(ApiError::NotFound("Artifact version not found".into()));
+        }
+        // Even an empty log response requires the retained content gate.
+        authorize_artifact_action(&state, &user, Action::Read, &artifact).await?;
         if read_ctx.is_some()
             && ArtifactVersionRepository::find_latest(&state.db, id)
                 .await?
@@ -1681,6 +1677,8 @@ pub async fn download_latest(
         )));
     };
 
+    ensure_selected_version_id(&selector, &ver)?;
+    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
     let version = ver.version;
     if let Some(response) = protected_file_response(&state, &user, &ver, &request_headers).await? {
         return Ok(response);
@@ -1706,7 +1704,7 @@ pub async fn download_latest(
     authorize_sensor_log_version_content(&state, &user, &artifact, ver.id).await?;
     if ver.body_state == Some(ArtifactBodyState::Ready) {
         let response = serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await?;
-        return guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await;
+        return guard_selected_log_download(&state, &user, &artifact, &ver, response).await;
     }
     if matches!(
         ver.body_state,
@@ -1732,7 +1730,7 @@ pub async fn download_latest(
             .await
             {
                 Ok(response) => {
-                    return guard_sensor_log_download(&state, &user, &artifact, ver.id, response)
+                    return guard_selected_log_download(&state, &user, &artifact, &ver, response)
                         .await
                 }
                 Err(ApiError::NotFound(_)) => {
@@ -1754,7 +1752,7 @@ pub async fn download_latest(
             &request_headers,
         )
         .await?;
-        return guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await;
+        return guard_selected_log_download(&state, &user, &artifact, &ver, response).await;
     }
 
     // DB-stored version: need to fetch with content
@@ -1763,7 +1761,7 @@ pub async fn download_latest(
         .ok_or_else(|| ApiError::NotFound(format!("No versions found for artifact {}", id)))?;
 
     let response = serve_db_content(&artifact.r#ref, ver.version, &ver, &request_headers)?;
-    guard_sensor_log_download(&state, &user, &artifact, ver.id, response).await
+    guard_selected_log_download(&state, &user, &artifact, &ver, response).await
 }
 
 fn verified_body_sse(response: axum::response::Response) -> axum::response::Response {
@@ -1802,13 +1800,231 @@ fn verified_body_sse(response: axum::response::Response) -> axum::response::Resp
     Sse::new(stream).into_response()
 }
 
-async fn authorize_artifact_read_with_receipts(
+async fn authorize_selected_artifact_version(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     artifact: &attune_common::models::artifact::Artifact,
-) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
-    crate::artifact_reads::ArtifactReads::authorize_detail_with_receipts(state, user, artifact)
+    selected: &attune_common::models::ArtifactVersion,
+) -> ApiResult<()> {
+    // Only human Access reads adopt the selected-runtime-log policy. Recorded
+    // credentials use their typed handlers; other legacy credentials retain
+    // their existing aggregate/sensor-specific disclosure contract.
+    let result = if crate::recorded_consumers::is_recorded(user)? {
+        Err(ApiError::Forbidden(
+            "Recorded content requires its typed reader".into(),
+        ))
+    } else if user.claims.token_type != TokenType::Access {
+        async {
+            let guard =
+                authorize_artifact_delivery_with_receipts(state, user, artifact, selected).await?;
+            crate::receipt_disclosure::HumanReceiptGuard::finish_shared(guard)
+                .await?
+                .ensure_fresh()?;
+            if user.claims.exp <= chrono::Utc::now().timestamp() {
+                return Err(ApiError::Unauthorized("Artifact credential expired".into()));
+            }
+            Ok(())
+        }
         .await
+    } else {
+        crate::artifact_reads::ArtifactReads::authorize_selected_version(
+            state, user, artifact, selected,
+        )
+        .await
+    };
+    result.map_err(|error| {
+        crate::artifact_reads::mask_detail_denial(
+            error,
+            format!("Artifact with ID {} not found", artifact.id),
+        )
+    })
+}
+
+/// Preserve credential dispatch through delivery, not just at initial selection.
+/// Legacy execution reads keep their aggregate bound; sensor sources retain the
+/// generation/delivery proof rather than borrowing human metadata visibility.
+async fn authorize_artifact_delivery_with_receipts(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    artifact: &attune_common::models::Artifact,
+    selected: &attune_common::models::ArtifactVersion,
+) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
+    use attune_common::repositories::sensor_schema::SensorSchemaRepository;
+    let denied = || ApiError::Forbidden("Artifact delivery is unavailable".into());
+    if crate::recorded_consumers::is_recorded(user)? || selected.artifact != artifact.id {
+        return Err(denied());
+    }
+    if user.claims.token_type == TokenType::Access {
+        return crate::artifact_reads::ArtifactReads::authorize_selected_version_with_receipts(
+            state, user, artifact, selected,
+        )
+        .await;
+    }
+    let guard = if let Some((binding, _)) =
+        SensorSchemaRepository::find_log_generation(&state.db, selected.id).await?
+    {
+        let sensor_ref = SensorSchemaRepository::find_by_binding_id(&state.db, binding)
+            .await?
+            .ok_or_else(denied)?
+            .0
+            .executable
+            .sensor
+            .r#ref;
+        let receipts = crate::secret_disclosure::authorize_sensor_runtime_log_with_receipts(
+            state,
+            user,
+            selected.id,
+            &sensor_ref,
+        )
+        .await?;
+        crate::artifact_reads::ArtifactReads::authorize_detail_with_prepared_receipts(
+            state, user, artifact, receipts,
+        )
+        .await?
+    } else {
+        if sensor_log_artifact_parts(&artifact.r#ref).is_some()
+            || (artifact.scope == OwnerType::Sensor
+                && artifact.classification == ArtifactClassification::RuntimeLog)
+        {
+            return Err(denied());
+        }
+        if user.claims.token_type == TokenType::Execution {
+            crate::artifact_reads::ArtifactReads::authorize_detail_with_receipts(
+                state, user, artifact,
+            )
+            .await?
+        } else {
+            authorize_artifact_action(state, user, Action::Read, artifact).await?;
+            crate::receipt_disclosure::HumanReceiptGuard::for_rows(state, user, &[])
+                .await?
+                .shared()
+        }
+    };
+    let mut held = guard.lock().await;
+    let pinned = ArtifactVersionRepository::find_pinned_for_share(held.connection(), selected.id)
+        .await?
+        .ok_or_else(denied)?;
+    if pinned.artifact != selected.artifact
+        || pinned.version != selected.version
+        || pinned.execution != selected.execution
+        || pinned.file_path != selected.file_path
+        || pinned.object_key != selected.object_key
+        || pinned.provider_version != selected.provider_version
+        || (selected.body_state == Some(ArtifactBodyState::Ready)
+            && (pinned.body_state != selected.body_state
+                || pinned.sha256 != selected.sha256
+                || pinned.size_bytes != selected.size_bytes))
+    {
+        return Err(denied());
+    }
+    drop(held);
+    Ok(guard)
+}
+
+fn ensure_selected_version_id(
+    selector: &ArtifactContentSelector,
+    selected: &attune_common::models::ArtifactVersion,
+) -> ApiResult<()> {
+    if selector
+        .version_id
+        .is_some_and(|expected| expected != selected.id)
+    {
+        return Err(ApiError::NotFound("Artifact version not found".into()));
+    }
+    Ok(())
+}
+
+/// A live log pins source identity, not the pending body's completion fields.
+/// Refresh only this immutable ID; never reselect latest or a sibling version.
+async fn authorize_artifact_stream_frame(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    opened_artifact: &attune_common::models::Artifact,
+    opened: &attune_common::models::ArtifactVersion,
+    stream_pin: Option<(i64, LogStreamBackend)>,
+) -> ApiResult<()> {
+    let denied = || ApiError::Forbidden("Artifact stream source changed".into());
+    if user.claims.exp <= chrono::Utc::now().timestamp() {
+        return Err(denied());
+    }
+    let artifact = ArtifactRepository::find_by_id(&state.db, opened_artifact.id)
+        .await?
+        .ok_or_else(denied)?;
+    if artifact.r#ref != opened_artifact.r#ref
+        || artifact.scope != opened_artifact.scope
+        || artifact.owner != opened_artifact.owner
+        || artifact.r#type != opened_artifact.r#type
+        || artifact.classification != opened_artifact.classification
+    {
+        return Err(denied());
+    }
+    let mut seal_race = None;
+    for _ in 0..2 {
+        let current = ArtifactVersionRepository::find_by_id(&state.db, opened.id)
+            .await?
+            .ok_or_else(denied)?;
+        let stream = LogStreamRepository::find_by_artifact_version(&state.db, opened.id).await?;
+        if !same_live_artifact_source(opened, &current, stream_pin, stream.as_ref()) {
+            return Err(denied());
+        }
+        if let Some(error) = seal_race.take() {
+            // One pending-to-ready seal may race source preparation. Retry only
+            // after that actual transition, and repeat full current authority.
+            if current.body_state != Some(ArtifactBodyState::Ready) {
+                return Err(error);
+            }
+        }
+        match authorize_selected_artifact_version(state, user, &artifact, &current).await {
+            Ok(()) => return Ok(()),
+            Err(error @ (ApiError::Forbidden(_) | ApiError::NotFound(_)))
+                if current.body_state == Some(ArtifactBodyState::Pending)
+                    && stream_pin.is_some() =>
+            {
+                seal_race = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(seal_race.unwrap_or_else(denied))
+}
+
+fn same_live_artifact_source(
+    opened: &attune_common::models::ArtifactVersion,
+    current: &attune_common::models::ArtifactVersion,
+    stream_pin: Option<(i64, LogStreamBackend)>,
+    stream: Option<&attune_common::models::log_stream::LogStream>,
+) -> bool {
+    if current.id != opened.id
+        || current.artifact != opened.artifact
+        || current.version != opened.version
+        || current.execution != opened.execution
+        || current.file_path != opened.file_path
+        || current.object_key != opened.object_key
+        || stream.map(|stream| (stream.id, stream.backend)) != stream_pin
+        || protected_log_marker(current)
+    {
+        return false;
+    }
+    match (opened.body_state, current.body_state) {
+        (Some(ArtifactBodyState::Pending), Some(ArtifactBodyState::Ready)) => {
+            stream.is_some_and(|stream| {
+                stream.artifact_version == current.id
+                    && stream.sealed
+                    && stream.sealed_at.is_some()
+                    && current.size_bytes == Some(stream.total_bytes)
+                    && current.sha256.is_some()
+            })
+        }
+        (Some(ArtifactBodyState::Ready), Some(ArtifactBodyState::Ready)) => {
+            current.provider_version == opened.provider_version
+                && current.sha256 == opened.sha256
+                && current.size_bytes == opened.size_bytes
+        }
+        (None, None) | (Some(ArtifactBodyState::Pending), Some(ArtifactBodyState::Pending)) => {
+            current.provider_version == opened.provider_version
+        }
+        _ => false,
+    }
 }
 
 pub(crate) async fn authorize_human_live_log(
@@ -1836,7 +2052,13 @@ pub(crate) async fn authorize_human_live_log(
     }
     // Prepare all receipt sources before target locks. G still evaluates its
     // current human matcher; the same source transaction pins the selected log.
-    let receipts = authorize_artifact_read_with_receipts(state, user, &artifact).await?;
+    let selected = ArtifactVersionRepository::find_by_id(&state.db, pin.version)
+        .await?
+        .ok_or_else(denied)?;
+    let receipts = crate::artifact_reads::ArtifactReads::authorize_selected_version_with_receipts(
+        state, user, &artifact, &selected,
+    )
+    .await?;
     let (owner, active) = {
         let mut held = receipts.lock().await;
         let conn = held.connection();
@@ -1936,7 +2158,10 @@ async fn download_human_encrypted_log(
                     return Err(denied());
                 }
                 let receipts =
-                    authorize_artifact_read_with_receipts(&state, &user, &current).await?;
+                    crate::artifact_reads::ArtifactReads::authorize_selected_version_with_receipts(
+                        &state, &user, &current, &selected,
+                    )
+                    .await?;
                 let mut held = receipts.lock().await;
                 let conn = held.connection();
                 let target = RuntimeTargetRepository::resolve(
@@ -1997,16 +2222,19 @@ async fn download_recorded_version(
     user: AuthenticatedUser,
     id: i64,
     number: Option<i32>,
+    selector: ArtifactContentSelector,
     headers: HeaderMap,
 ) -> ApiResult<axum::response::Response> {
-    let (artifact, selected, captured) = crate::recorded_reads::version(
+    let (artifact, selected, captured) = crate::recorded_reads::version_with_id(
         &state.db,
         &user,
         id,
         number,
+        selector.version_id,
         state.config.security.encryption_key.as_deref(),
     )
     .await?;
+    ensure_selected_version_id(&selector, &selected)?;
     if let Some(response) = protected_file_response(&state, &user, &selected, &headers).await? {
         return Ok(response);
     }
@@ -2080,11 +2308,12 @@ pub(crate) async fn protected_file_response(
     }
     let recorded = crate::recorded_consumers::is_recorded(user)?;
     let (artifact, captured) = if recorded {
-        let (artifact, selected, captured) = crate::recorded_reads::version(
+        let (artifact, selected, captured) = crate::recorded_reads::version_with_id(
             &state.db,
             user,
             version.artifact,
             Some(version.version),
+            Some(version.id),
             state.config.security.encryption_key.as_deref(),
         )
         .await?;
@@ -2267,41 +2496,32 @@ async fn authorize_file_chunk(
     Ok(())
 }
 
-async fn guard_sensor_log_download(
+async fn guard_selected_log_download(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     artifact: &attune_common::models::artifact::Artifact,
-    version: i64,
+    selected: &attune_common::models::ArtifactVersion,
     response: axum::response::Response,
 ) -> ApiResult<axum::response::Response> {
     use attune_common::repositories::sensor_schema::SensorSchemaRepository;
-    let sensor_ref = if let Some((binding, _)) =
-        SensorSchemaRepository::find_log_generation(&state.db, version).await?
-    {
-        SensorSchemaRepository::find_by_binding_id(&state.db, binding)
+    if artifact.classification != ArtifactClassification::RuntimeLog
+        && sensor_log_artifact_parts(&artifact.r#ref).is_none()
+        && SensorSchemaRepository::find_log_generation(&state.db, selected.id)
             .await?
-            .ok_or_else(|| ApiError::Forbidden("Sensor log generation has expired".into()))?
-            .0
-            .executable
-            .sensor
-            .r#ref
-    } else if let Some((sensor_ref, _)) = sensor_log_artifact_parts(&artifact.r#ref) {
-        sensor_ref
-    } else if artifact.scope == OwnerType::Sensor
-        && artifact.classification == ArtifactClassification::RuntimeLog
+            .is_none()
     {
-        artifact.owner.clone()
-    } else {
         return Ok(response);
-    };
+    }
+    let selected = selected.clone();
     let state = state.clone();
     let user = user.clone();
     let artifact_id = artifact.id;
+    let classification = artifact.classification;
     let (parts, body) = response.into_parts();
     let authorize = move || {
         let state = state.clone();
         let user = user.clone();
-        let sensor_ref = sensor_ref.clone();
+        let selected = selected.clone();
         async move {
             let allowed = async {
                 if user.claims.exp <= chrono::Utc::now().timestamp() {
@@ -2312,42 +2532,37 @@ async fn guard_sensor_log_download(
                 let artifact = ArtifactRepository::find_by_id(&state.db, artifact_id)
                     .await?
                     .ok_or_else(|| ApiError::Forbidden("Artifact source is unavailable".into()))?;
-                let sensor_receipts =
-                    crate::secret_disclosure::authorize_sensor_runtime_log_with_receipts(
-                        &state,
-                        &user,
-                        version,
-                        &sensor_ref,
-                    )
-                    .await?;
-                let receipts = crate::artifact_reads::ArtifactReads::new(&state, &user)
-                    .await?
-                    .authorize_detail_with_prepared_receipts(&artifact, sensor_receipts)
-                    .await?;
+                if artifact.classification != classification {
+                    return Err(ApiError::Forbidden(
+                        "Runtime log classification changed".into(),
+                    ));
+                }
+                let receipts =
+                    authorize_artifact_delivery_with_receipts(&state, &user, &artifact, &selected)
+                        .await?;
                 Ok::<_, ApiError>(receipts)
             }
             .await;
-            let receipts = allowed.map_err(|_| {
-                std::io::Error::other("Sensor log disclosure authority is unavailable")
-            })?;
+            let receipts = allowed
+                .map_err(|_| std::io::Error::other("Log disclosure authority is unavailable"))?;
             if user.claims.exp <= chrono::Utc::now().timestamp() {
-                return Err(std::io::Error::other("Sensor log credential expired"));
+                return Err(std::io::Error::other("Log credential expired"));
             }
             let receipts = crate::receipt_disclosure::HumanReceiptGuard::finish_shared(receipts)
                 .await
-                .map_err(|_| std::io::Error::other("Sensor log receipt expired"))?;
+                .map_err(|_| std::io::Error::other("Log receipt expired"))?;
             receipts
                 .ensure_fresh()
-                .map_err(|_| std::io::Error::other("Sensor log receipt expired"))?;
+                .map_err(|_| std::io::Error::other("Log receipt expired"))?;
             if user.claims.exp <= chrono::Utc::now().timestamp() {
-                return Err(std::io::Error::other("Sensor log credential expired"));
+                return Err(std::io::Error::other("Log credential expired"));
             }
             Ok(())
         }
     };
-    authorize().await.map_err(|_| {
-        ApiError::Forbidden("Sensor log disclosure authority is unavailable".into())
-    })?;
+    authorize()
+        .await
+        .map_err(|_| ApiError::NotFound("Log disclosure authority is unavailable".into()))?;
     let stream = crate::recorded_reads::guarded_chunks(body.into_data_stream(), authorize);
     Ok(axum::response::Response::from_parts(
         parts,
@@ -3502,7 +3717,7 @@ fn action_name_lower(action: Action) -> &'static str {
     }
 }
 
-fn sensor_log_artifact_parts(artifact_ref: &str) -> Option<(String, &'static str)> {
+pub(crate) fn sensor_log_artifact_parts(artifact_ref: &str) -> Option<(String, &'static str)> {
     let rest = artifact_ref.strip_prefix("sensor.")?;
     if let Some(sensor_ref) = rest.strip_suffix(".stdout") {
         Some((sensor_ref.to_string(), "stdout"))
@@ -3931,6 +4146,7 @@ async fn checked_tail_path(
     path = "/api/v1/artifacts/{id}/stream",
     tag = "artifacts",
     params(
+        ArtifactContentSelector,
         ("id" = i64, Path, description = "Artifact ID"),
     ),
     responses(
@@ -3944,11 +4160,24 @@ pub async fn stream_artifact(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(selector): Query<ArtifactContentSelector>,
 ) -> ApiResult<axum::response::Response> {
     if crate::recorded_consumers::is_recorded(&user)? {
-        let candidate = ArtifactVersionRepository::find_latest(&state.db, id)
+        let candidate_id = ArtifactVersionRepository::find_selection_identity(&state.db, id, None)
             .await?
             .ok_or_else(|| ApiError::NotFound("Log version unavailable".into()))?;
+        if selector
+            .version_id
+            .is_some_and(|expected| expected != candidate_id)
+        {
+            return Err(ApiError::NotFound("Artifact version not found".into()));
+        }
+        let candidate = ArtifactVersionRepository::find_by_id(&state.db, candidate_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Log version unavailable".into()))?;
+        if candidate.artifact != id {
+            return Err(ApiError::NotFound("Log version unavailable".into()));
+        }
         if candidate
             .meta
             .as_ref()
@@ -3959,14 +4188,16 @@ pub async fn stream_artifact(
             let pin = crate::live_logs::LogPin::select(&state, &user, candidate).await?;
             return Ok(verified_body_sse(pin.response(state, user).await?));
         }
-        let (artifact, selected, captured) = crate::recorded_reads::version(
+        let (artifact, selected, captured) = crate::recorded_reads::version_with_id(
             &state.db,
             &user,
             id,
-            None,
+            Some(candidate.version),
+            Some(candidate.id),
             state.config.security.encryption_key.as_deref(),
         )
         .await?;
+        ensure_selected_version_id(&selector, &selected)?;
         if selected.body_state != Some(ArtifactBodyState::Ready)
             || !selected
                 .content_type
@@ -3994,15 +4225,6 @@ pub async fn stream_artifact(
     let artifact = ArtifactRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
-
-    authorize_artifact_action(&state, &user, Action::Read, &artifact)
-        .await
-        .map_err(|error| {
-            crate::artifact_reads::mask_detail_denial(
-                error,
-                format!("Artifact with ID {} not found", id),
-            )
-        })?;
 
     if !is_file_backed_type(artifact.r#type) {
         return Err(ApiError::BadRequest(format!(
@@ -4037,6 +4259,8 @@ pub async fn stream_artifact(
         }
     };
 
+    ensure_selected_version_id(&selector, &ver)?;
+    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
     if user.claims.token_type == TokenType::Access
         && ver
             .meta
@@ -4087,6 +4311,10 @@ pub async fn stream_artifact(
     authorize_sensor_log_version_content(&state, &user, &artifact, ver.id).await?;
     let execution_id = ver.execution;
     let log_stream = LogStreamRepository::find_by_artifact_version(&state.db, ver.id).await?;
+    let selected_version = ver.clone();
+    let stream_pin = log_stream
+        .as_ref()
+        .map(|stream| (stream.id, stream.backend));
 
     // --- build the SSE stream via unfold -----------------------------------
     let initial_state = match log_stream {
@@ -4580,7 +4808,7 @@ pub async fn stream_artifact(
     use futures::StreamExt;
     let disclosure_state = state.clone();
     let disclosure_user = user.clone();
-    let version_id = ver.id;
+    let opened_artifact = Arc::new(artifact);
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = ended.clone();
     let stream = stream
@@ -4591,21 +4819,14 @@ pub async fn stream_artifact(
             let state = disclosure_state.clone();
             let user = disclosure_user.clone();
             let ended = ended.clone();
+            let selected = selected_version.clone();
+            let artifact = opened_artifact.clone();
             async move {
-                let allowed = async {
-                    if user.claims.exp <= chrono::Utc::now().timestamp() {
-                        return Err(ApiError::Forbidden(
-                            "Log stream credentials have expired".into(),
-                        ));
-                    }
-                    let artifact = ArtifactRepository::find_by_id(&state.db, id)
-                        .await?
-                        .ok_or_else(|| {
-                            ApiError::Forbidden("Artifact source is unavailable".into())
-                        })?;
-                    authorize_artifact_action(&state, &user, Action::Read, &artifact).await?;
-                    authorize_sensor_log_version_content(&state, &user, &artifact, version_id).await
-                }
+                // Full source/IAM/JWT checks remain the final application wait
+                // before exposing every frame, including waiting/done frames.
+                let allowed = authorize_artifact_stream_frame(
+                    &state, &user, &artifact, &selected, stream_pin,
+                )
                 .await;
                 if allowed.is_err() {
                     ended.store(true, std::sync::atomic::Ordering::Release);

@@ -4,30 +4,28 @@ The [implementation checkpoint](../plans/artifacts-postgresql-implementation.md)
 records local results and incomplete gates. A passing query-count test does not
 certify page latency, deployed behavior, or storage capacity.
 
+The [selected-read plan](../plans/execution-scoped-artifact-reads.md) replaces the
+historical aggregate-disclosure contract with safe metadata and selected-version
+content authorization. Its high-history, source-isolation, transport-revocation,
+and browser-soak gates must be validated independently. Previous batching results
+do not certify these new semantics or a deployed build.
+
 ## Executable local gates
 
 ```bash
 python3 scripts/benchmark-artifact-reads.py --stage treatment --versions 16 18 \
   --snapshot-source --with-key-usage-tests --with-notifier-tests \
-  --workload-profile --paired-reference --notifier-profile \
+  --workload-profile --notifier-profile \
   --output /tmp/opencode/artifact-read-acceptance
 ```
 
-`--paired-reference` mounts two test-only paths under the same Axum router. One
-uses the production execution-artifact handler. The other deliberately performs
-serial per-artifact/per-execution reads while calling the same repository
-visibility and runtime-log disclosure functions. A routine differential test
-checks eligible pages and missing-origin denials before the performance selection.
-The reference is not part of the production router or an alternate API format.
-
-The paired selection keeps two logs, 100 retained executions, caller grants, and
-responses identical. It records separate auth-cache-invalidation samples, then
-alternates reader order over 20 complete warm samples each. The runner fails unless
-all bodies match, the serial reference exceeds the 20-statement ceiling, the batched
-reader stays within it, queries fall by at least 90%, and warm handler p95 falls by
-at least 70%. Failures and unchanged-source checks are retained in the manifest.
-These are controlled batching results, not a reconstructed historical build,
-browser/network latency, or certification of the deployed revision.
+`--paired-reference` is intentionally blocked for the selected-read contract.
+The old reference authorized all historical content while the production metadata
+reader no longer does. Comparing them would measure different policy/work rather
+than certify a performance improvement. Historical 90%-query/70%-p95 batching
+results remain in their original evidence; they are not a passing new-policy
+latency gate. Collect a new fixed-source, equivalent-policy baseline and the
+operator-approved absolute latency target before certifying rollout.
 
 `--notifier-profile` measures real artifact-visibility queries and fan-out for
 1/16/64 permitted identities, each with 1/4 tabs, plus a denied identity. It checks

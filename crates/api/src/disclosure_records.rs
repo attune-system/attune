@@ -153,14 +153,14 @@ pub(crate) struct DisclosureRecords {
 }
 
 impl DisclosureRecords {
-    pub(crate) async fn load_sensor_sources(
+    pub(crate) async fn load_sensor_sources_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         user: &AuthenticatedUser,
         grants: &[Grant],
         sources: &HashSet<(String, i64, String)>,
     ) -> ApiResult<()> {
-        self.load_sources(db, user, grants, sources).await
+        self.load_sources_on(db, user, grants, sources).await
     }
 
     pub(crate) fn frozen_parent_matches(
@@ -277,6 +277,20 @@ impl DisclosureRecords {
         grants: &[Grant],
         secrets: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     ) -> ApiResult<()> {
+        let mut connection = db.acquire().await?;
+        self.prepare_on(&mut connection, user, grants, secrets)
+            .await
+    }
+
+    /// Read source evidence on the caller's retained transaction. This caches
+    /// records only; recursive authorization still uses the held IAM/source guard.
+    pub(crate) async fn prepare_on<'a>(
+        &mut self,
+        db: &mut sqlx::PgConnection,
+        user: &AuthenticatedUser,
+        grants: &[Grant],
+        secrets: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    ) -> ApiResult<()> {
         let mut frontier = secrets
             .into_iter()
             .map(|(kind, reference)| (kind.to_string(), reference.map(str::to_string)))
@@ -336,7 +350,7 @@ impl DisclosureRecords {
                 for batch in keys.chunks(SOURCE_BATCH_SIZE) {
                     self.key_ownership.extend(
                         attune_common::repositories::iam_ownership::VerifiedKeyOrigins::load(
-                            db, batch,
+                            &mut *db, batch,
                         )
                         .await?,
                     );
@@ -352,7 +366,7 @@ impl DisclosureRecords {
             }) {
                 let queues = queues.into_iter().collect::<Vec<_>>();
                 for batch in queues.chunks(SOURCE_BATCH_SIZE) {
-                    self.queue_origin_packs.extend(attune_common::repositories::iam_ownership::IamOwnershipRepository::queue_origin_packs(db, batch).await?);
+                    self.queue_origin_packs.extend(attune_common::repositories::iam_ownership::IamOwnershipRepository::queue_origin_packs(&mut *db, batch).await?);
                     self.queue_origins_loaded.extend(batch.iter().copied());
                 }
             }
@@ -392,16 +406,16 @@ impl DisclosureRecords {
                     self.exact_events_seen.extend(batch);
                     continue;
                 }
-                let evidence = EventOriginRepository::evidence_many(db, batch).await?;
+                let evidence = EventOriginRepository::evidence_many(&mut *db, batch).await?;
                 if !evidence.is_empty() {
-                    let mut connection = db.acquire().await?;
+                    let connection = &mut *db;
                     let identity = user.identity_id().map_err(|_| {
                         crate::middleware::ApiError::Forbidden(
                             "Event source identity is unavailable".into(),
                         )
                     })?;
                     let mut scopes =
-                        EventOriginRepository::human_scopes(&mut connection, &evidence, identity)
+                        EventOriginRepository::human_scopes(connection, &evidence, identity)
                             .await?;
                     let identities = evidence
                         .iter()
@@ -480,7 +494,7 @@ impl DisclosureRecords {
                         "Runtime read disclosure exceeds its bound".into(),
                     ));
                 }
-                let read = RuntimeReadRepository::find(db, *id).await?;
+                let read = RuntimeReadRepository::find(&mut *db, *id).await?;
                 let bytes = serde_json::to_vec(&read)
                     .map_err(|_| {
                         crate::middleware::ApiError::Forbidden(
@@ -519,7 +533,7 @@ impl DisclosureRecords {
                         "Runtime read disclosure exceeds its bound".into(),
                     ));
                 }
-                self.load_executions(db, &execution_ids).await?;
+                self.load_executions_on(&mut *db, &execution_ids).await?;
                 let mut provenance = SecretProvenance::default();
                 for parent in &read.provenance {
                     provenance.merge(parent.clone());
@@ -562,7 +576,8 @@ impl DisclosureRecords {
                     execution_ids.push(*id);
                 }
             }
-            self.load_execution_provenance(db, &execution_ids).await?;
+            self.load_execution_provenance_on(&mut *db, &execution_ids)
+                .await?;
             for (kind, mut ids) in by_kind {
                 if matches!(
                     kind.as_str(),
@@ -574,7 +589,7 @@ impl DisclosureRecords {
                 ids.dedup();
                 for batch in ids.chunks(SOURCE_BATCH_SIZE) {
                     let rows = ExecutionSecretValueRepository::find_provenance_by_entities(
-                        db,
+                        &mut *db,
                         &[kind.as_str()],
                         batch,
                     )
@@ -590,8 +605,9 @@ impl DisclosureRecords {
                     }
                 }
             }
-            self.load_executions(db, &execution_ids).await?;
-            self.load_sources(db, user, grants, &sources).await?;
+            self.load_executions_on(&mut *db, &execution_ids).await?;
+            self.load_sources_on(&mut *db, user, grants, &sources)
+                .await?;
             frontier = sources
                 .into_iter()
                 .filter(|(kind, _, _)| {
@@ -606,7 +622,7 @@ impl DisclosureRecords {
             let identity = user.identity_id().map_err(|_| {
                 crate::middleware::ApiError::Unauthorized("Invalid disclosure identity".into())
             })?;
-            let row = IdentityRepository::find_by_id(db, identity)
+            let row = IdentityRepository::find_by_id(&mut *db, identity)
                 .await?
                 .ok_or_else(|| {
                     crate::middleware::ApiError::Unauthorized(
@@ -620,7 +636,7 @@ impl DisclosureRecords {
             };
             self.sensor_caller = Some(caller);
         }
-        self.load_sensor_rule_proofs(db, &self.sensor_sources.clone())
+        self.load_sensor_rule_proofs_on(&mut *db, &self.sensor_sources.clone())
             .await?;
         if grants.iter().any(|grant| {
             grant.resource == attune_common::rbac::Resource::Executions
@@ -630,12 +646,16 @@ impl DisclosureRecords {
                     .is_some_and(|scope| scope.managing_pack_id.is_some())
         }) {
             let ids = self.executions.keys().copied().collect::<Vec<_>>();
-            self.visibility.load_ownership(db, &ids).await?;
+            self.visibility.load_ownership_on(&mut *db, &ids).await?;
         }
         Ok(())
     }
 
-    async fn load_execution_provenance(&mut self, db: &sqlx::PgPool, ids: &[i64]) -> ApiResult<()> {
+    async fn load_execution_provenance_on(
+        &mut self,
+        db: &mut sqlx::PgConnection,
+        ids: &[i64],
+    ) -> ApiResult<()> {
         let mut missing = ids
             .iter()
             .copied()
@@ -653,7 +673,7 @@ impl DisclosureRecords {
         missing.dedup();
         for batch in missing.chunks(SOURCE_BATCH_SIZE) {
             let rows = ExecutionSecretValueRepository::find_provenance_by_entities(
-                db,
+                &mut *db,
                 &[
                     ENTITY_EXECUTION_CONFIG,
                     ENTITY_EXECUTION_RESULT,
@@ -693,6 +713,15 @@ impl DisclosureRecords {
         db: &sqlx::PgPool,
         ids: &[i64],
     ) -> ApiResult<()> {
+        let mut connection = db.acquire().await?;
+        self.load_executions_on(&mut connection, ids).await
+    }
+
+    pub(crate) async fn load_executions_on(
+        &mut self,
+        db: &mut sqlx::PgConnection,
+        ids: &[i64],
+    ) -> ApiResult<()> {
         let mut ids = ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
@@ -702,7 +731,7 @@ impl DisclosureRecords {
             .filter(|id| !self.executions.contains_key(id))
             .collect::<Vec<_>>();
         for batch in missing.chunks(SOURCE_BATCH_SIZE) {
-            let rows = ExecutionRepository::find_authorization_rows(db, batch).await?;
+            let rows = ExecutionRepository::find_authorization_rows(&mut *db, batch).await?;
             for id in batch {
                 self.executions.insert(*id, None);
             }
@@ -714,7 +743,9 @@ impl DisclosureRecords {
             .filter(|row| row.parent.is_none())
             .map(|row| row.action_ref.clone())
             .collect::<Vec<_>>();
-        self.visibility.load_public_actions(db, &refs).await?;
+        self.visibility
+            .load_public_actions_on(&mut *db, &refs)
+            .await?;
         let children = ids
             .into_iter()
             .filter(|id| {
@@ -724,13 +755,13 @@ impl DisclosureRecords {
                     .is_some_and(|row| row.parent.is_some())
             })
             .collect::<Vec<_>>();
-        self.visibility.load(db, &children).await?;
+        self.visibility.load_on(&mut *db, &children).await?;
         Ok(())
     }
 
-    async fn load_sources(
+    async fn load_sources_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         user: &AuthenticatedUser,
         grants: &[Grant],
         sources: &HashSet<(String, i64, String)>,
@@ -765,7 +796,7 @@ impl DisclosureRecords {
                             .collect::<Vec<_>>();
                         if !missing.is_empty() {
                             let rows = ComponentConfigurationRepository::find_disclosure_rows(
-                                db, &missing,
+                                &mut *db, &missing,
                             )
                             .await?;
                             for id in missing {
@@ -776,7 +807,9 @@ impl DisclosureRecords {
                             }
                         }
                     }
-                    ENTITY_EVENT_PAYLOAD => self.load_events(db, user, grants, batch).await?,
+                    ENTITY_EVENT_PAYLOAD => {
+                        self.load_events_on(&mut *db, user, grants, batch).await?
+                    }
                     ENTITY_INQUIRY_OPTIONS | ENTITY_INQUIRY_RESPONSE => {
                         let missing = batch
                             .iter()
@@ -785,11 +818,11 @@ impl DisclosureRecords {
                             .collect::<Vec<_>>();
                         if !missing.is_empty() {
                             let rows =
-                                InquiryRepository::find_disclosure_rows(db, &missing).await?;
+                                InquiryRepository::find_disclosure_rows(&mut *db, &missing).await?;
                             if self.inquiry_caller.is_none() {
                                 self.inquiry_caller = Some(
-                                    crate::routes::inquiries::inquiry_authorization_caller(
-                                        db, user,
+                                    crate::routes::inquiries::inquiry_authorization_caller_on(
+                                        &mut *db, user,
                                     )
                                     .await?,
                                 );
@@ -798,7 +831,7 @@ impl DisclosureRecords {
                                 .iter()
                                 .map(|row| row.created_by_execution)
                                 .collect::<Vec<_>>();
-                            self.load_executions(db, &creators).await?;
+                            self.load_executions_on(&mut *db, &creators).await?;
                             if grants.iter().any(|grant| {
                                 grant.resource == attune_common::rbac::Resource::Inquiries
                                     && grant
@@ -806,7 +839,9 @@ impl DisclosureRecords {
                                         .as_ref()
                                         .is_some_and(|scope| scope.managing_pack_id.is_some())
                             }) {
-                                self.visibility.load_ownership(db, &creators).await?;
+                                self.visibility
+                                    .load_ownership_on(&mut *db, &creators)
+                                    .await?;
                             }
                             // The inquiry endpoint checks participant/read and
                             // decrypt scope before inspecting its binding. Keep
@@ -829,7 +864,7 @@ impl DisclosureRecords {
                                     .collect::<Vec<_>>();
                                 if !ids.is_empty() {
                                     for (id, _) in
-                                        InquirySchemaRepository::find_many(db, &ids).await?
+                                        InquirySchemaRepository::find_many(&mut *db, &ids).await?
                                     {
                                         self.inquiry_bindings.insert(id);
                                     }
@@ -850,9 +885,10 @@ impl DisclosureRecords {
                             .filter(|id| !self.deliveries.contains_key(id))
                             .collect::<Vec<_>>();
                         if !missing.is_empty() {
-                            let rows =
-                                SensorSchemaRepository::find_delivery_disclosure_rows(db, &missing)
-                                    .await?;
+                            let rows = SensorSchemaRepository::find_delivery_disclosure_rows(
+                                &mut *db, &missing,
+                            )
+                            .await?;
                             for id in missing {
                                 self.deliveries.insert(id, None);
                             }
@@ -869,11 +905,11 @@ impl DisclosureRecords {
                             .map(|row| row.generation_binding)
                             .collect::<Vec<_>>();
                         let rules = retained.iter().map(|row| row.rule).collect::<Vec<_>>();
-                        self.load_generations(db, &generations).await?;
-                        self.load_rules(db, &rules).await?;
+                        self.load_generations_on(&mut *db, &generations).await?;
+                        self.load_rules_on(&mut *db, &rules).await?;
                     }
                     ENTITY_SENSOR_GENERATION_CONFIG | ENTITY_SENSOR_GENERATION_RULE_CONFIG => {
-                        self.load_generations(db, batch).await?
+                        self.load_generations_on(&mut *db, batch).await?
                     }
                     _ => {}
                 }
@@ -895,13 +931,13 @@ impl DisclosureRecords {
                 }
             }
         }
-        self.load_rules(db, &rules).await?;
+        self.load_rules_on(&mut *db, &rules).await?;
         Ok(())
     }
 
-    async fn load_sensor_rule_proofs(
+    async fn load_sensor_rule_proofs_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         sources: &HashSet<(String, i64, String)>,
     ) -> ApiResult<()> {
         let mut requests = Vec::new();
@@ -934,12 +970,14 @@ impl DisclosureRecords {
                 requests.push((source, generation, actual_pack));
             }
         }
-        self.sensor_rule_proofs.load_many(db, &requests).await
+        self.sensor_rule_proofs
+            .load_many_on(&mut *db, &requests)
+            .await
     }
 
-    async fn load_events(
+    async fn load_events_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         user: &AuthenticatedUser,
         grants: &[Grant],
         ids: &[i64],
@@ -953,7 +991,7 @@ impl DisclosureRecords {
             return Ok(());
         }
         let mut rows = HashMap::<i64, Vec<EventDisclosureRow>>::new();
-        for row in EventRepository::find_disclosure_rows(db, &missing).await? {
+        for row in EventRepository::find_disclosure_rows(&mut *db, &missing).await? {
             rows.entry(row.id).or_default().push(row);
         }
         for id in &missing {
@@ -970,7 +1008,7 @@ impl DisclosureRecords {
             .copied()
             .filter(|id| self.events.get(id).and_then(Option::as_ref).is_some())
             .collect::<Vec<_>>();
-        for (id, binding) in EventSchemaRepository::find_many(db, &retained).await? {
+        for (id, binding) in EventSchemaRepository::find_many(&mut *db, &retained).await? {
             self.event_bindings.insert(id, binding);
         }
         let needs_read = matches!(
@@ -993,7 +1031,7 @@ impl DisclosureRecords {
             .then_some(needs_read && user.claims.token_type == TokenType::Access)
         {
             let visible = EventRepository::visible_ids(
-                db,
+                &mut *db,
                 &retained,
                 &crate::routes::events::event_visibility_filter_from_grants(grants, public),
             )
@@ -1008,9 +1046,9 @@ impl DisclosureRecords {
         Ok(())
     }
 
-    pub(crate) async fn load_generations(
+    pub(crate) async fn load_generations_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         ids: &[i64],
     ) -> ApiResult<()> {
         let mut missing = ids
@@ -1022,9 +1060,9 @@ impl DisclosureRecords {
         missing.dedup();
         for batch in missing.chunks(SOURCE_BATCH_SIZE) {
             self.sensor_rule_proofs
-                .prepare_generations(db, batch)
+                .prepare_generations_on(&mut *db, batch)
                 .await?;
-            let rows = SensorSchemaRepository::find_disclosure_rows(db, batch).await?;
+            let rows = SensorSchemaRepository::find_disclosure_rows(&mut *db, batch).await?;
             for id in batch {
                 self.generations.insert(*id, None);
             }
@@ -1037,7 +1075,7 @@ impl DisclosureRecords {
         Ok(())
     }
 
-    async fn load_rules(&mut self, db: &sqlx::PgPool, ids: &[i64]) -> ApiResult<()> {
+    async fn load_rules_on(&mut self, db: &mut sqlx::PgConnection, ids: &[i64]) -> ApiResult<()> {
         let mut missing = ids
             .iter()
             .copied()
@@ -1046,7 +1084,7 @@ impl DisclosureRecords {
         missing.sort_unstable();
         missing.dedup();
         for batch in missing.chunks(SOURCE_BATCH_SIZE) {
-            let rows = RuleRepository::find_disclosure_refs(db, batch).await?;
+            let rows = RuleRepository::find_disclosure_refs(&mut *db, batch).await?;
             for id in batch {
                 self.rules.insert(*id, None);
             }
