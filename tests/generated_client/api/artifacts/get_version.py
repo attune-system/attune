@@ -7,13 +7,26 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.get_version_response_200 import GetVersionResponse200
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     id: int,
     version: int,
+    *,
+    version_id: int | None | Unset = UNSET,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    json_version_id: int | None | Unset
+    if isinstance(version_id, Unset):
+        json_version_id = UNSET
+    else:
+        json_version_id = version_id
+    params["version_id"] = json_version_id
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -21,6 +34,7 @@ def _get_kwargs(
             id=quote(str(id), safe=""),
             version=quote(str(version), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -60,12 +74,14 @@ def sync_detailed(
     version: int,
     *,
     client: AuthenticatedClient,
+    version_id: int | None | Unset = UNSET,
 ) -> Response[Any | GetVersionResponse200]:
     """Get a specific version's metadata and JSON content (no binary)
 
     Args:
         id (int):
         version (int):
+        version_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -78,6 +94,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         id=id,
         version=version,
+        version_id=version_id,
     )
 
     response = client.get_httpx_client().request(
@@ -92,12 +109,14 @@ def sync(
     version: int,
     *,
     client: AuthenticatedClient,
+    version_id: int | None | Unset = UNSET,
 ) -> Any | GetVersionResponse200 | None:
     """Get a specific version's metadata and JSON content (no binary)
 
     Args:
         id (int):
         version (int):
+        version_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -111,6 +130,7 @@ def sync(
         id=id,
         version=version,
         client=client,
+        version_id=version_id,
     ).parsed
 
 
@@ -119,12 +139,14 @@ async def asyncio_detailed(
     version: int,
     *,
     client: AuthenticatedClient,
+    version_id: int | None | Unset = UNSET,
 ) -> Response[Any | GetVersionResponse200]:
     """Get a specific version's metadata and JSON content (no binary)
 
     Args:
         id (int):
         version (int):
+        version_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -137,6 +159,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         id=id,
         version=version,
+        version_id=version_id,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -149,12 +172,14 @@ async def asyncio(
     version: int,
     *,
     client: AuthenticatedClient,
+    version_id: int | None | Unset = UNSET,
 ) -> Any | GetVersionResponse200 | None:
     """Get a specific version's metadata and JSON content (no binary)
 
     Args:
         id (int):
         version (int):
+        version_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -169,5 +194,6 @@ async def asyncio(
             id=id,
             version=version,
             client=client,
+            version_id=version_id,
         )
     ).parsed

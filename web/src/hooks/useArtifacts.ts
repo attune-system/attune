@@ -3,73 +3,28 @@ import { OpenAPI } from "@/api/core/OpenAPI";
 import { request as __request } from "@/api/core/request";
 import { artifactRequest } from "@/lib/artifact-request";
 import { useArtifactReconciliation } from "./useArtifactReconciliation";
+import type { ArtifactsService } from "@/api/services/ArtifactsService";
+import type { ArtifactType as ApiArtifactType } from "@/api/models/ArtifactType";
+import type { ArtifactVisibility as ApiArtifactVisibility } from "@/api/models/ArtifactVisibility";
+import type { OwnerType as ApiOwnerType } from "@/api/models/OwnerType";
+import type { RetentionPolicyType as ApiRetentionPolicyType } from "@/api/models/RetentionPolicyType";
 
-// Artifact types matching the backend ArtifactType enum
-export type ArtifactType =
-  | "file_binary"
-  | "file_datatable"
-  | "file_image"
-  | "file_text"
-  | "other"
-  | "progress"
-  | "url";
-
-export type ArtifactVisibility = "public" | "private";
-
-export type OwnerType = "system" | "pack" | "action" | "sensor" | "rule";
-
-export type RetentionPolicyType = "versions" | "days" | "hours" | "minutes";
-
-export interface ArtifactSummary {
-  id: number;
-  ref: string;
-  type: ArtifactType;
-  visibility: ArtifactVisibility;
-  name: string | null;
-  content_type: string | null;
-  size_bytes: number | null;
-  execution: number | null;
-  scope: OwnerType;
-  owner: string;
-  created: string;
-  updated: string;
-}
-
-export interface ArtifactResponse {
-  id: number;
-  ref: string;
-  scope: OwnerType;
-  owner: string;
-  type: ArtifactType;
-  visibility: ArtifactVisibility;
-  retention_policy: RetentionPolicyType;
-  retention_limit: number;
-  name: string | null;
-  description: string | null;
-  content_type: string | null;
-  size_bytes: number | null;
-  execution: number | null;
-  data?: unknown;
-  created: string;
-  updated: string;
-}
-
-export interface ArtifactVersionSummary {
-  id: number;
-  version: number;
-  execution: number | null;
-  content_type: string | null;
-  size_bytes: number | null;
-  created_by: string | null;
-  created: string;
-}
+export type ArtifactType = `${ApiArtifactType}`;
+export type ArtifactVisibility = `${ApiArtifactVisibility}`;
+export type OwnerType = `${ApiOwnerType}`;
+export type RetentionPolicyType = `${ApiRetentionPolicyType}`;
+export type { ArtifactSummary } from "@/api/models/ArtifactSummary";
+export type { ArtifactVersionSummary } from "@/api/models/ArtifactVersionSummary";
+export type ArtifactResponse = Awaited<
+  ReturnType<typeof ArtifactsService.getArtifact>
+>["data"];
 
 // ============================================================================
 // Search / List params
 // ============================================================================
 
 export interface ArtifactsListParams {
-  page?: number;
+  cursor?: string;
   perPage?: number;
   scope?: OwnerType;
   owner?: string;
@@ -83,27 +38,18 @@ export interface ArtifactsListParams {
 // Paginated list response shape
 // ============================================================================
 
-export interface PaginatedArtifacts {
-  items: ArtifactSummary[];
-  pagination: {
-    page: number;
-    page_size: number;
-    total_items: number;
-    total_pages: number;
-    has_previous: boolean;
-    has_next: boolean;
-  };
-}
+export type PaginatedArtifacts = Awaited<
+  ReturnType<typeof ArtifactsService.listArtifacts>
+>;
 
 export interface ArtifactPageParams {
-  page?: number;
+  cursor?: string;
   perPage?: number;
 }
 
-export interface PaginatedArtifactVersions {
-  items: ArtifactVersionSummary[];
-  pagination: PaginatedArtifacts["pagination"];
-}
+export type PaginatedArtifactVersions = Awaited<
+  ReturnType<typeof ArtifactsService.listVersions>
+>;
 
 // ============================================================================
 // Hooks
@@ -123,7 +69,7 @@ export function useArtifactsList(
     queryKey: ["artifacts", "list", params],
     queryFn: async ({ signal }) => {
       const query: Record<string, string> = {};
-      if (params.page) query.page = String(params.page);
+      if (params.cursor) query.cursor = params.cursor;
       if (params.perPage) query.per_page = String(params.perPage);
       if (params.scope) query.scope = params.scope;
       if (params.owner) query.owner = params.owner;
@@ -179,7 +125,7 @@ export function useExecutionArtifacts(
             execution_id: executionId!,
           },
           query: {
-            page: params.page ?? 1,
+            cursor: params.cursor,
             per_page: params.perPage ?? 20,
             type: params.type,
           },
@@ -249,7 +195,7 @@ export function useArtifactVersions(
           path: {
             id: artifactId!,
           },
-          query: { page: params.page ?? 1, per_page: params.perPage ?? 20 },
+          query: { cursor: params.cursor, per_page: params.perPage ?? 20 },
         }),
         signal,
       );

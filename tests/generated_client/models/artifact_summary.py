@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-from typing_extensions import Self
 
 from ..models.artifact_classification import ArtifactClassification
 from ..models.artifact_type import ArtifactType
 from ..models.artifact_visibility import ArtifactVisibility
 from ..models.owner_type import OwnerType
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.artifact_version_summary import ArtifactVersionSummary
+
 
 T = TypeVar("T", bound="ArtifactSummary")
 
@@ -36,7 +39,8 @@ class ArtifactSummary:
               Full RBAC enforcement is deferred; for now the field enables filtering.
         content_type (None | str | Unset): MIME content type
         name (None | str | Unset): Human-readable name
-        size_bytes (int | None | Unset): Size of latest version in bytes
+        selected_version (ArtifactVersionSummary | None | Unset):
+        size_bytes (int | None | Unset): Display size: execution-selected when scoped; omitted for global runtime logs.
     """
 
     classification: ArtifactClassification
@@ -50,10 +54,13 @@ class ArtifactSummary:
     visibility: ArtifactVisibility
     content_type: None | str | Unset = UNSET
     name: None | str | Unset = UNSET
+    selected_version: ArtifactVersionSummary | None | Unset = UNSET
     size_bytes: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.artifact_version_summary import ArtifactVersionSummary
+
         classification = self.classification.value
 
         created = self.created.isoformat()
@@ -84,6 +91,14 @@ class ArtifactSummary:
         else:
             name = self.name
 
+        selected_version: dict[str, Any] | None | Unset
+        if isinstance(self.selected_version, Unset):
+            selected_version = UNSET
+        elif isinstance(self.selected_version, ArtifactVersionSummary):
+            selected_version = self.selected_version.to_dict()
+        else:
+            selected_version = self.selected_version
+
         size_bytes: int | None | Unset
         if isinstance(self.size_bytes, Unset):
             size_bytes = UNSET
@@ -109,6 +124,8 @@ class ArtifactSummary:
             field_dict["content_type"] = content_type
         if name is not UNSET:
             field_dict["name"] = name
+        if selected_version is not UNSET:
+            field_dict["selected_version"] = selected_version
         if size_bytes is not UNSET:
             field_dict["size_bytes"] = size_bytes
 
@@ -116,6 +133,8 @@ class ArtifactSummary:
 
     @classmethod
     def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.artifact_version_summary import ArtifactVersionSummary
+
         d = dict(src_dict)
         classification = ArtifactClassification(d.pop("classification"))
 
@@ -153,6 +172,25 @@ class ArtifactSummary:
 
         name = _parse_name(d.pop("name", UNSET))
 
+        def _parse_selected_version(
+            data: object,
+        ) -> ArtifactVersionSummary | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                selected_version_type_1 = ArtifactVersionSummary.from_dict(data)
+
+                return selected_version_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(ArtifactVersionSummary | None | Unset, data)
+
+        selected_version = _parse_selected_version(d.pop("selected_version", UNSET))
+
         def _parse_size_bytes(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -174,6 +212,7 @@ class ArtifactSummary:
             visibility=visibility,
             content_type=content_type,
             name=name,
+            selected_version=selected_version,
             size_bytes=size_bytes,
         )
 

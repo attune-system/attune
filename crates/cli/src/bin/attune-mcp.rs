@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
@@ -133,6 +133,13 @@ struct CacheRefreshMetadata {
     expected_chunk_count: i64,
     expected_record_count: Option<i64>,
     expected_size_bytes: Option<i64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ArtifactCursorPage {
+    items: Vec<Value>,
+    next_cursor: Option<String>,
+    has_more: bool,
 }
 
 impl McpServer {
@@ -311,7 +318,7 @@ impl McpServer {
                     .post::<Value, _>("/executions/execute", &request)
                     .await
             }
-            "artifacts_list" => self.list_path("/artifacts", args).await,
+            "artifacts_list" => self.artifacts_list(args).await,
             "artifacts_get" => {
                 let artifact_ref = required_string(args, "ref")?;
                 self.client
@@ -734,6 +741,33 @@ impl McpServer {
             "cache_refresh_abort" => self.cache_refresh_abort(args).await,
             other => Err(anyhow!("Unknown tool '{other}'")),
         }
+    }
+
+    async fn artifacts_list(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        for key in args.keys() {
+            if !matches!(key.as_str(), "cursor" | "per_page") {
+                anyhow::bail!("Unknown artifacts_list argument '{key}'; use cursor and per_page");
+            }
+        }
+        let per_page = optional_i64(args, "per_page")?.unwrap_or(20);
+        if !(1..=100).contains(&per_page) {
+            anyhow::bail!("Argument 'per_page' must be between 1 and 100");
+        }
+        let mut path = format!("/artifacts?per_page={per_page}");
+        match args.get("cursor") {
+            Some(Value::String(cursor)) if !cursor.is_empty() && cursor.len() <= 4096 => {
+                path.push_str(&format!("&cursor={}", encode_path(cursor)));
+            }
+            Some(_) => {
+                anyhow::bail!("Argument 'cursor' must be a nonempty string of at most 4096 bytes")
+            }
+            None => {}
+        }
+        let page: ArtifactCursorPage = self.client.get_bare(&path).await?;
+        if page.has_more != page.next_cursor.is_some() || page.next_cursor.as_deref() == Some("") {
+            anyhow::bail!("Artifact response has inconsistent cursor navigation metadata");
+        }
+        serde_json::to_value(page).context("Failed to serialize artifact cursor page")
     }
 
     async fn list_path(&mut self, path: &str, args: &Map<String, Value>) -> Result<Value> {
@@ -1293,8 +1327,8 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "artifacts_list",
             title: "List artifacts",
-            description: "List artifacts visible to the authenticated user.",
-            input_schema: pagination_schema,
+            description: "List one bounded artifact page visible to the authenticated user. Returns items, next_cursor, and has_more; pass next_cursor as cursor to continue, including after an empty resumable page.",
+            input_schema: artifact_cursor_schema,
         },
         ToolDef {
             name: "artifacts_get",
@@ -1607,6 +1641,17 @@ fn pack_approval_revoke_schema() -> Value {
 
 fn info_schema() -> Value {
     json!({"type":"object", "properties":{}, "additionalProperties":false})
+}
+
+fn artifact_cursor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "cursor": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Opaque next_cursor from the previous artifact page; omit for the first page" },
+            "per_page": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Maximum items in this request" }
+        },
+        "additionalProperties": false
+    })
 }
 
 fn pagination_schema() -> Value {
@@ -2819,6 +2864,184 @@ mod tests {
 
     fn test_server(api_url: String) -> McpServer {
         test_server_with_access(api_url, PacksCheckAccess::Unrestricted)
+    }
+
+    #[tokio::test]
+    async fn artifacts_list_json_rpc_preserves_bounded_cursor_navigation() {
+        let api = MockServer::start().await;
+        let pages = [
+            json!({"items":[{"id":42,"selected_version":{"id":91,"execution":17,"version":3}}],"next_cursor":"opaque+/=","has_more":true}),
+            json!({"items":[],"next_cursor":"resume","has_more":true}),
+            json!({"items":[{"id":41}],"next_cursor":null,"has_more":false}),
+        ];
+        for (index, cursor) in [None, Some("opaque+/="), Some("resume")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut mock = Mock::given(method("GET"))
+                .and(path("/api/v1/artifacts"))
+                .and(query_param(
+                    "per_page",
+                    if index == 0 { "20" } else { "100" },
+                ));
+            if let Some(cursor) = cursor {
+                mock = mock.and(query_param("cursor", cursor));
+            } else {
+                mock = mock.and(|request: &wiremock::Request| {
+                    !request.url.query_pairs().any(|(key, _)| key == "cursor")
+                });
+            }
+            mock.respond_with(ResponseTemplate::new(200).set_body_json(pages[index].clone()))
+                .expect(1)
+                .mount(&api)
+                .await;
+        }
+        let mut server = test_server(api.uri());
+        for (index, args) in [
+            json!({}),
+            json!({"cursor":"opaque+/=","per_page":100}),
+            json!({"cursor":"resume","per_page":100}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = server
+                .handle_request(&json!({
+                    "jsonrpc":"2.0","id":index,"method":"tools/call",
+                    "params":{"name":"artifacts_list","arguments":args}
+                }))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            assert_eq!(response["result"]["structuredContent"], pages[index]);
+            let text: Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(text, pages[index]);
+            assert_eq!(
+                api.received_requests().await.unwrap().len(),
+                index + 1,
+                "one MCP call must not follow cursors implicitly"
+            );
+        }
+        for request in api.received_requests().await.unwrap() {
+            assert!(!request
+                .url
+                .query_pairs()
+                .any(|(key, _)| key == "page" || key == "offset"));
+        }
+        api.verify().await;
+    }
+
+    #[tokio::test]
+    async fn artifacts_list_advertises_cursors_without_changing_other_tools() {
+        let api = MockServer::start().await;
+        let response = test_server(api.uri())
+            .handle_request(&json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/list"
+            }))
+            .await
+            .unwrap()
+            .unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let artifact = tools
+            .iter()
+            .find(|tool| tool["name"] == "artifacts_list")
+            .unwrap();
+        let schema = &artifact["inputSchema"];
+        assert!(schema["properties"].get("cursor").is_some());
+        assert!(schema["properties"].get("page").is_none());
+        assert!(schema["properties"].get("offset").is_none());
+        assert_eq!(schema["properties"]["per_page"]["default"], 20);
+        assert_eq!(schema["properties"]["per_page"]["maximum"], 100);
+        assert_eq!(schema["additionalProperties"], false);
+        let events = tools
+            .iter()
+            .find(|tool| tool["name"] == "events_list")
+            .unwrap();
+        assert!(events["inputSchema"]["properties"].get("page").is_some());
+        assert!(api.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artifacts_list_rejects_offset_and_invalid_arguments_without_a_request() {
+        let api = MockServer::start().await;
+        let mut server = test_server(api.uri());
+        for args in [
+            json!({"page":2}),
+            json!({"offset":20}),
+            json!({"per_page":0}),
+            json!({"per_page":101}),
+            json!({"per_page":"20"}),
+            json!({"cursor":3}),
+            json!({"cursor":null}),
+            json!({"cursor":""}),
+            json!({"cursor":"x".repeat(4097)}),
+        ] {
+            let response = server
+                .handle_request(&json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"artifacts_list","arguments":args}
+                }))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response["result"]["isError"], true, "{response}");
+        }
+        assert!(api.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artifacts_list_does_not_turn_api_denial_into_an_empty_page() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/artifacts"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({"error":"Forbidden"})))
+            .expect(1)
+            .mount(&api)
+            .await;
+        let response = test_server(api.uri())
+            .handle_request(&json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"artifacts_list","arguments":{}}
+            }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(response["result"]["structuredContent"]["status"], 403);
+        assert!(response["result"]["structuredContent"]
+            .get("items")
+            .is_none());
+        api.verify().await;
+    }
+
+    #[tokio::test]
+    async fn artifacts_list_rejects_old_or_inconsistent_page_responses() {
+        for page in [
+            json!({"items":[],"pagination":{"has_next":false}}),
+            json!({"items":[],"next_cursor":null,"has_more":true}),
+            json!({"items":[],"next_cursor":"next","has_more":false}),
+        ] {
+            let api = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/artifacts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .expect(1)
+                .mount(&api)
+                .await;
+            let response = test_server(api.uri())
+                .handle_request(&json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"artifacts_list","arguments":{}}
+                }))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            api.verify().await;
+        }
     }
 
     #[tokio::test]

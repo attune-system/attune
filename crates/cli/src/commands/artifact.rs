@@ -36,13 +36,17 @@ pub enum ArtifactCommands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Page number
-        #[arg(long, default_value = "1")]
-        page: u32,
+        /// Continue from an opaque cursor returned by a previous request
+        #[arg(long)]
+        cursor: Option<String>,
 
-        /// Items per page
-        #[arg(long, default_value = "50")]
+        /// Items per request (1–100)
+        #[arg(long, default_value = "20", value_parser = clap::value_parser!(u32).range(1..=100))]
         per_page: u32,
+
+        /// Traverse every cursor and output all matching artifacts
+        #[arg(long)]
+        all: bool,
     },
     /// Show details of a specific artifact
     Show {
@@ -240,17 +244,18 @@ struct ArtifactResponse {
     owner: String,
     r#type: String,
     visibility: String,
+    classification: String,
     retention_policy: String,
     retention_limit: i32,
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     size_bytes: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     data: Option<JsonValue>,
     created: String,
     updated: String,
@@ -263,6 +268,9 @@ struct ArtifactSummary {
     artifact_ref: String,
     r#type: String,
     visibility: String,
+    classification: String,
+    #[serde(default)]
+    selected_version: Option<VersionSummary>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -300,6 +308,8 @@ struct VersionSummary {
     id: i64,
     version: i32,
     #[serde(default)]
+    execution: Option<i64>,
+    #[serde(default)]
     content_type: Option<String>,
     #[serde(default)]
     size_bytes: Option<i64>,
@@ -308,6 +318,13 @@ struct VersionSummary {
     #[serde(default)]
     created_by: Option<String>,
     created: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CursorPage<T> {
+    items: Vec<T>,
+    next_cursor: Option<String>,
+    has_more: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -357,8 +374,9 @@ pub async fn handle_artifact_command(
             visibility,
             execution,
             name,
-            page,
+            cursor,
             per_page,
+            all,
         } => {
             handle_list(
                 profile,
@@ -368,8 +386,9 @@ pub async fn handle_artifact_command(
                 visibility,
                 execution,
                 name,
-                page,
+                cursor,
                 per_page,
+                all,
                 api_url,
                 output_format,
             )
@@ -550,15 +569,16 @@ async fn handle_list(
     visibility: Option<String>,
     execution: Option<i64>,
     name: Option<String>,
-    page: u32,
+    cursor: Option<String>,
     per_page: u32,
+    all: bool,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 
-    let mut query_params = vec![format!("page={}", page), format!("per_page={}", per_page)];
+    let mut query_params = vec![format!("per_page={}", per_page)];
 
     if let Some(s) = scope {
         query_params.push(format!("scope={}", s));
@@ -580,11 +600,26 @@ async fn handle_list(
     }
 
     let path = format!("/artifacts?{}", query_params.join("&"));
-    let artifacts: Vec<ArtifactSummary> = client.get_paginated(&path).await?;
+    let response =
+        fetch_cursor_page::<ArtifactSummary>(&mut client, &path, cursor.as_deref()).await?;
+    let response = if all {
+        CursorPage {
+            items: collect_cursor_pages(&mut client, &path, response).await?,
+            next_cursor: None,
+            has_more: false,
+        }
+    } else {
+        response
+    };
+    let artifacts = &response.items;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
-            output::print_output(&artifacts, output_format)?;
+            if all {
+                output::print_output(&artifacts, output_format)?;
+            } else {
+                output::print_output(&response, output_format)?;
+            }
         }
         OutputFormat::Table => {
             if artifacts.is_empty() {
@@ -596,7 +631,7 @@ async fn handle_list(
                     vec!["Ref", "Name", "Type", "Visibility", "Size", "Created", "ID"],
                 );
 
-                for artifact in &artifacts {
+                for artifact in artifacts {
                     table.add_row(vec![
                         artifact.artifact_ref.clone(),
                         artifact.name.clone().unwrap_or_else(|| "-".to_string()),
@@ -610,6 +645,11 @@ async fn handle_list(
 
                 println!("{}", table);
                 output::print_info(&format!("{} artifact(s)", artifacts.len()));
+            }
+            if let Some(cursor) = response.next_cursor {
+                output::print_info(&format!(
+                    "More artifacts available; continue with --cursor {cursor}"
+                ));
             }
         }
     }
@@ -1010,32 +1050,49 @@ async fn fetch_all_version_summaries(
     client: &mut ApiClient,
     artifact_id: i64,
 ) -> Result<Vec<VersionSummary>> {
-    let mut page = 1u32;
-    let mut versions = Vec::new();
-    loop {
-        let path = format!("/artifacts/{artifact_id}/versions?page={page}&per_page=100");
-        let response = client
-            .get_paginated_response::<VersionSummary>(&path)
-            .await?;
-        let has_next = response
-            .pagination
-            .get("has_next")
-            .and_then(serde_json::Value::as_bool)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Version-list response is missing pagination.has_next")
-            })?;
-        if has_next && response.items.is_empty() {
-            anyhow::bail!("Version-list response returned an empty page with has_next=true");
-        }
-        versions.extend(response.items);
-        if !has_next {
-            break;
-        }
-        page = page
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("Version-list page number overflow"))?;
+    let path = format!("/artifacts/{artifact_id}/versions?per_page=100");
+    let first = fetch_cursor_page(client, &path, None).await?;
+    collect_cursor_pages(client, &path, first).await
+}
+
+async fn fetch_cursor_page<T: serde::de::DeserializeOwned>(
+    client: &mut ApiClient,
+    path: &str,
+    cursor: Option<&str>,
+) -> Result<CursorPage<T>> {
+    let path = match cursor {
+        Some(cursor) => format!("{path}&cursor={}", urlencoding::encode(cursor)),
+        None => path.to_string(),
+    };
+    let response: CursorPage<T> = client.get_bare(&path).await?;
+    if response.has_more != response.next_cursor.is_some()
+        || response.next_cursor.as_deref() == Some("")
+    {
+        anyhow::bail!("Artifact cursor response has inconsistent navigation metadata");
     }
-    Ok(versions)
+    Ok(response)
+}
+
+async fn collect_cursor_pages<T: serde::de::DeserializeOwned>(
+    client: &mut ApiClient,
+    path: &str,
+    first: CursorPage<T>,
+) -> Result<Vec<T>> {
+    let mut response = first;
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    loop {
+        items.extend(response.items);
+        let Some(cursor) = response.next_cursor else {
+            break;
+        };
+        if !seen.insert(cursor.clone()) {
+            anyhow::bail!("Artifact cursor response repeated a cursor");
+        }
+        // Recorded readers may legitimately return empty resumable pages.
+        response = fetch_cursor_page(client, path, Some(&cursor)).await?;
+    }
+    Ok(items)
 }
 
 async fn handle_version_show(
@@ -1295,18 +1352,26 @@ mod tests {
             Mock, MockServer, ResponseTemplate,
         };
         let server = MockServer::start().await;
-        for (page, version, has_next) in [(1, 2, true), (2, 1, false)] {
-            Mock::given(method("GET"))
+        for (cursor, version, next_cursor) in
+            [(None, 2, Some("next+/=")), (Some("next+/="), 1, None)]
+        {
+            let mut mock = Mock::given(method("GET"))
                 .and(path("/api/v1/artifacts/42/versions"))
-                .and(query_param("page", page.to_string()))
-                .and(query_param("per_page", "100"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "items":[{"id":version,"version":version,"created":"2026-10-14T00:00:00Z"}],
-                    "pagination":{"has_next":has_next}
-                })))
-                .expect(1)
-                .mount(&server)
-                .await;
+                .and(query_param("per_page", "100"));
+            if let Some(cursor) = cursor {
+                mock = mock.and(query_param("cursor", cursor));
+            } else {
+                mock = mock.and(|request: &wiremock::Request| {
+                    !request.url.query_pairs().any(|(key, _)| key == "cursor")
+                });
+            }
+            mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items":[{"id":version,"version":version,"created":"2026-10-14T00:00:00Z"}],
+                "next_cursor":next_cursor,"has_more":next_cursor.is_some()
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         }
         let mut client = ApiClient::new(server.uri(), None);
         let versions = fetch_all_version_summaries(&mut client, 42).await.unwrap();
@@ -1322,25 +1387,119 @@ mod tests {
                 .len(),
             2
         );
+        for request in server.received_requests().await.unwrap() {
+            assert!(!request.url.query_pairs().any(|(key, _)| key == "page"));
+        }
         server.verify().await;
     }
 
     #[tokio::test]
-    async fn version_list_rejects_missing_metadata_and_empty_advancing_pages() {
+    async fn version_list_rejects_missing_inconsistent_and_cyclic_cursors() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        for pagination in [serde_json::json!({}), serde_json::json!({"has_next":true})] {
+        for body in [
+            serde_json::json!({"items":[]}),
+            serde_json::json!({"items":[],"has_more":true,"next_cursor":null}),
+            serde_json::json!({"items":[],"has_more":false,"next_cursor":"next"}),
+            serde_json::json!({"items":[],"has_more":true,"next_cursor":""}),
+            serde_json::json!({"items":[],"has_more":true,"next_cursor":"repeated"}),
+        ] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"items":[],"pagination":pagination})),
-                )
-                .expect(1)
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
                 .mount(&server)
                 .await;
             let mut client = ApiClient::new(server.uri(), None);
             assert!(fetch_all_version_summaries(&mut client, 42).await.is_err());
             server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_artifact_request_preserves_cursor_without_fetching_more() {
+        use wiremock::{
+            matchers::{method, path, query_param},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/artifacts"))
+            .and(query_param("per_page", "1"))
+            .and(query_param("name", "a+b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items":[],"has_more":true,"next_cursor":"resume"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = ApiClient::new(server.uri(), None);
+        let response = fetch_cursor_page::<ArtifactSummary>(
+            &mut client,
+            "/artifacts?per_page=1&name=a%2Bb",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(response.items.is_empty(), "empty resumable pages are valid");
+        assert_eq!(response.next_cursor.as_deref(), Some("resume"));
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "items":[],"has_more":true,"next_cursor":"resume"
+            })
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn full_output_traverses_empty_resumable_pages() {
+        use wiremock::{
+            matchers::{method, query_param},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(|request: &wiremock::Request| {
+                !request.url.query_pairs().any(|(key, _)| key == "cursor")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items":[],"has_more":true,"next_cursor":"resume"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(query_param("cursor", "resume"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items":[1],"has_more":false,"next_cursor":null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = ApiClient::new(server.uri(), None);
+        let first = fetch_cursor_page::<i64>(&mut client, "/artifacts?per_page=1", None)
+            .await
+            .unwrap();
+        let items = collect_cursor_pages(&mut client, "/artifacts?per_page=1", first)
+            .await
+            .unwrap();
+        assert_eq!(items, vec![1]);
+        server.verify().await;
+    }
+
+    #[test]
+    fn list_accepts_cursor_and_all_but_rejects_offsets_and_invalid_bounds() {
+        assert!(Cli::try_parse_from([
+            "attune",
+            "artifact",
+            "list",
+            "--cursor",
+            "opaque",
+            "--per-page",
+            "100",
+            "--all"
+        ])
+        .is_ok());
+        for args in [["--page", "2"], ["--per-page", "0"], ["--per-page", "101"]] {
+            assert!(Cli::try_parse_from(["attune", "artifact", "list", args[0], args[1]]).is_err());
         }
     }
 

@@ -1,17 +1,17 @@
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.artifact_classification import ArtifactClassification
+from ...models.artifact_cursor_page_artifact_summary import (
+    ArtifactCursorPageArtifactSummary,
+)
 from ...models.artifact_type import ArtifactType
 from ...models.artifact_visibility import ArtifactVisibility
 from ...models.owner_type import OwnerType
-from ...models.paginated_response_artifact_summary import (
-    PaginatedResponseArtifactSummary,
-)
 from ...types import UNSET, Response, Unset
 
 
@@ -24,7 +24,7 @@ def _get_kwargs(
     classification: ArtifactClassification | None | Unset = UNSET,
     execution: int | None | Unset = UNSET,
     name: None | str | Unset = UNSET,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
 ) -> dict[str, Any]:
 
@@ -87,7 +87,12 @@ def _get_kwargs(
         json_name = name
     params["name"] = json_name
 
-    params["page"] = page
+    json_cursor: None | str | Unset
+    if isinstance(cursor, Unset):
+        json_cursor = UNSET
+    else:
+        json_cursor = cursor
+    params["cursor"] = json_cursor
 
     params["per_page"] = per_page
 
@@ -104,11 +109,15 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> PaginatedResponseArtifactSummary | None:
+) -> Any | ArtifactCursorPageArtifactSummary | None:
     if response.status_code == 200:
-        response_200 = PaginatedResponseArtifactSummary.from_dict(response.json())
+        response_200 = ArtifactCursorPageArtifactSummary.from_dict(response.json())
 
         return response_200
+
+    if response.status_code == 400:
+        response_400 = cast(Any, None)
+        return response_400
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -118,7 +127,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[PaginatedResponseArtifactSummary]:
+) -> Response[Any | ArtifactCursorPageArtifactSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -137,9 +146,9 @@ def sync_detailed(
     classification: ArtifactClassification | None | Unset = UNSET,
     execution: int | None | Unset = UNSET,
     name: None | str | Unset = UNSET,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
-) -> Response[PaginatedResponseArtifactSummary]:
+) -> Response[Any | ArtifactCursorPageArtifactSummary]:
     """List artifacts with pagination and optional filters
 
     Args:
@@ -150,7 +159,7 @@ def sync_detailed(
         classification (ArtifactClassification | None | Unset):
         execution (int | None | Unset):
         name (None | str | Unset):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
 
     Raises:
@@ -158,7 +167,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[PaginatedResponseArtifactSummary]
+        Response[Any | ArtifactCursorPageArtifactSummary]
     """
 
     kwargs = _get_kwargs(
@@ -169,7 +178,7 @@ def sync_detailed(
         classification=classification,
         execution=execution,
         name=name,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
     )
 
@@ -190,9 +199,9 @@ def sync(
     classification: ArtifactClassification | None | Unset = UNSET,
     execution: int | None | Unset = UNSET,
     name: None | str | Unset = UNSET,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
-) -> PaginatedResponseArtifactSummary | None:
+) -> Any | ArtifactCursorPageArtifactSummary | None:
     """List artifacts with pagination and optional filters
 
     Args:
@@ -203,7 +212,7 @@ def sync(
         classification (ArtifactClassification | None | Unset):
         execution (int | None | Unset):
         name (None | str | Unset):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
 
     Raises:
@@ -211,7 +220,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        PaginatedResponseArtifactSummary
+        Any | ArtifactCursorPageArtifactSummary
     """
 
     return sync_detailed(
@@ -223,7 +232,7 @@ def sync(
         classification=classification,
         execution=execution,
         name=name,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
     ).parsed
 
@@ -238,9 +247,9 @@ async def asyncio_detailed(
     classification: ArtifactClassification | None | Unset = UNSET,
     execution: int | None | Unset = UNSET,
     name: None | str | Unset = UNSET,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
-) -> Response[PaginatedResponseArtifactSummary]:
+) -> Response[Any | ArtifactCursorPageArtifactSummary]:
     """List artifacts with pagination and optional filters
 
     Args:
@@ -251,7 +260,7 @@ async def asyncio_detailed(
         classification (ArtifactClassification | None | Unset):
         execution (int | None | Unset):
         name (None | str | Unset):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
 
     Raises:
@@ -259,7 +268,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[PaginatedResponseArtifactSummary]
+        Response[Any | ArtifactCursorPageArtifactSummary]
     """
 
     kwargs = _get_kwargs(
@@ -270,7 +279,7 @@ async def asyncio_detailed(
         classification=classification,
         execution=execution,
         name=name,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
     )
 
@@ -289,9 +298,9 @@ async def asyncio(
     classification: ArtifactClassification | None | Unset = UNSET,
     execution: int | None | Unset = UNSET,
     name: None | str | Unset = UNSET,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
-) -> PaginatedResponseArtifactSummary | None:
+) -> Any | ArtifactCursorPageArtifactSummary | None:
     """List artifacts with pagination and optional filters
 
     Args:
@@ -302,7 +311,7 @@ async def asyncio(
         classification (ArtifactClassification | None | Unset):
         execution (int | None | Unset):
         name (None | str | Unset):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
 
     Raises:
@@ -310,7 +319,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        PaginatedResponseArtifactSummary
+        Any | ArtifactCursorPageArtifactSummary
     """
 
     return (
@@ -323,7 +332,7 @@ async def asyncio(
             classification=classification,
             execution=execution,
             name=name,
-            page=page,
+            cursor=cursor,
             per_page=per_page,
         )
     ).parsed

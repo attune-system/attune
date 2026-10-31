@@ -2,17 +2,12 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { ArtifactBodyState } from "./ArtifactBodyState";
-import type { PaginationMeta } from "./PaginationMeta";
 /**
- * Paginated response wrapper
+ * Count-free v1 artifact collection response. Pages are not historical snapshots.
  */
-export type PaginatedResponse_ArtifactVersionSummary = {
-  /**
-   * The page items
-   */
+export type ArtifactCursorPage_ArtifactVersionSummary = {
+  has_more: boolean;
   items: Array<{
-    body_state?: null | ArtifactBodyState;
     /**
      * MIME content type
      */
@@ -22,7 +17,7 @@ export type PaginatedResponse_ArtifactVersionSummary = {
      */
     created: string;
     /**
-     * Who created this version
+     * Reserved; arbitrary creator metadata is never exposed by summaries.
      */
     created_by?: string | null;
     /**
@@ -30,16 +25,9 @@ export type PaginatedResponse_ArtifactVersionSummary = {
      */
     execution?: number | null;
     /**
-     * Relative file path for disk-backed versions
-     */
-    file_path?: string | null;
-    /**
      * Version ID
      */
     id: number;
-    object_key?: string | null;
-    provider_version?: string | null;
-    sha256?: string | null;
     /**
      * Size of content in bytes
      */
@@ -49,8 +37,5 @@ export type PaginatedResponse_ArtifactVersionSummary = {
      */
     version: number;
   }>;
-  /**
-   * Pagination metadata
-   */
-  pagination: PaginationMeta;
+  next_cursor?: string | null;
 };

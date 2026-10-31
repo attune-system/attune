@@ -6,8 +6,8 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.paginated_response_artifact_version_summary import (
-    PaginatedResponseArtifactVersionSummary,
+from ...models.artifact_cursor_page_artifact_version_summary import (
+    ArtifactCursorPageArtifactVersionSummary,
 )
 from ...types import UNSET, Response, Unset
 
@@ -15,13 +15,18 @@ from ...types import UNSET, Response, Unset
 def _get_kwargs(
     id: int,
     *,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
 
-    params["page"] = page
+    json_cursor: None | str | Unset
+    if isinstance(cursor, Unset):
+        json_cursor = UNSET
+    else:
+        json_cursor = cursor
+    params["cursor"] = json_cursor
 
     params["per_page"] = per_page
 
@@ -40,9 +45,9 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | PaginatedResponseArtifactVersionSummary | None:
+) -> Any | ArtifactCursorPageArtifactVersionSummary | None:
     if response.status_code == 200:
-        response_200 = PaginatedResponseArtifactVersionSummary.from_dict(
+        response_200 = ArtifactCursorPageArtifactVersionSummary.from_dict(
             response.json()
         )
 
@@ -64,7 +69,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | PaginatedResponseArtifactVersionSummary]:
+) -> Response[Any | ArtifactCursorPageArtifactVersionSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -77,14 +82,14 @@ def sync_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
-) -> Response[Any | PaginatedResponseArtifactVersionSummary]:
+) -> Response[Any | ArtifactCursorPageArtifactVersionSummary]:
     """List a visibility-filtered page of versions without binary/JSON content.
 
     Args:
         id (int):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
 
     Raises:
@@ -92,12 +97,12 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | PaginatedResponseArtifactVersionSummary]
+        Response[Any | ArtifactCursorPageArtifactVersionSummary]
     """
 
     kwargs = _get_kwargs(
         id=id,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
     )
 
@@ -112,14 +117,14 @@ def sync(
     id: int,
     *,
     client: AuthenticatedClient,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
-) -> Any | PaginatedResponseArtifactVersionSummary | None:
+) -> Any | ArtifactCursorPageArtifactVersionSummary | None:
     """List a visibility-filtered page of versions without binary/JSON content.
 
     Args:
         id (int):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
 
     Raises:
@@ -127,13 +132,13 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | PaginatedResponseArtifactVersionSummary
+        Any | ArtifactCursorPageArtifactVersionSummary
     """
 
     return sync_detailed(
         id=id,
         client=client,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
     ).parsed
 
@@ -142,14 +147,14 @@ async def asyncio_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
-) -> Response[Any | PaginatedResponseArtifactVersionSummary]:
+) -> Response[Any | ArtifactCursorPageArtifactVersionSummary]:
     """List a visibility-filtered page of versions without binary/JSON content.
 
     Args:
         id (int):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
 
     Raises:
@@ -157,12 +162,12 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | PaginatedResponseArtifactVersionSummary]
+        Response[Any | ArtifactCursorPageArtifactVersionSummary]
     """
 
     kwargs = _get_kwargs(
         id=id,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
     )
 
@@ -175,14 +180,14 @@ async def asyncio(
     id: int,
     *,
     client: AuthenticatedClient,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
-) -> Any | PaginatedResponseArtifactVersionSummary | None:
+) -> Any | ArtifactCursorPageArtifactVersionSummary | None:
     """List a visibility-filtered page of versions without binary/JSON content.
 
     Args:
         id (int):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
 
     Raises:
@@ -190,14 +195,14 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | PaginatedResponseArtifactVersionSummary
+        Any | ArtifactCursorPageArtifactVersionSummary
     """
 
     return (
         await asyncio_detailed(
             id=id,
             client=client,
-            page=page,
+            cursor=cursor,
             per_page=per_page,
         )
     ).parsed

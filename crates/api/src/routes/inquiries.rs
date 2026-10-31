@@ -517,6 +517,14 @@ pub(crate) async fn inquiry_authorization_caller(
     db: &sqlx::PgPool,
     user: &AuthenticatedUser,
 ) -> ApiResult<AuthorizationContext> {
+    let mut connection = db.acquire().await?;
+    inquiry_authorization_caller_on(&mut connection, user).await
+}
+
+pub(crate) async fn inquiry_authorization_caller_on(
+    db: &mut sqlx::PgConnection,
+    user: &AuthenticatedUser,
+) -> ApiResult<AuthorizationContext> {
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution

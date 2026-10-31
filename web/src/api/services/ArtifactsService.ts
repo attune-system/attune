@@ -6,6 +6,8 @@ import type { AllocateFileVersionByRefRequest } from "../models/AllocateFileVers
 import type { AppendProgressRequest } from "../models/AppendProgressRequest";
 import type { ArtifactBodyState } from "../models/ArtifactBodyState";
 import type { ArtifactClassification } from "../models/ArtifactClassification";
+import type { ArtifactCursorPage_ArtifactSummary } from "../models/ArtifactCursorPage_ArtifactSummary";
+import type { ArtifactCursorPage_ArtifactVersionSummary } from "../models/ArtifactCursorPage_ArtifactVersionSummary";
 import type { ArtifactType } from "../models/ArtifactType";
 import type { ArtifactVersionByRefUploadForm } from "../models/ArtifactVersionByRefUploadForm";
 import type { ArtifactVersionUploadForm } from "../models/ArtifactVersionUploadForm";
@@ -14,8 +16,6 @@ import type { CreateArtifactRequest } from "../models/CreateArtifactRequest";
 import type { CreateFileVersionRequest } from "../models/CreateFileVersionRequest";
 import type { CreateVersionJsonRequest } from "../models/CreateVersionJsonRequest";
 import type { OwnerType } from "../models/OwnerType";
-import type { PaginatedResponse_ArtifactSummary } from "../models/PaginatedResponse_ArtifactSummary";
-import type { PaginatedResponse_ArtifactVersionSummary } from "../models/PaginatedResponse_ArtifactVersionSummary";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
 import type { SetDataRequest } from "../models/SetDataRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
@@ -27,7 +27,7 @@ import { request as __request } from "../core/request";
 export class ArtifactsService {
   /**
    * List artifacts with pagination and optional filters
-   * @returns PaginatedResponse_ArtifactSummary List of artifacts
+   * @returns ArtifactCursorPage_ArtifactSummary Metadata-visible cursor page
    * @throws ApiError
    */
   public static listArtifacts({
@@ -38,7 +38,7 @@ export class ArtifactsService {
     classification,
     execution,
     name,
-    page,
+    cursor,
     perPage,
   }: {
     /**
@@ -70,14 +70,14 @@ export class ArtifactsService {
      */
     name?: string | null;
     /**
-     * Page number (1-based)
+     * Opaque continuation bound to this endpoint and its filters.
      */
-    page?: number;
+    cursor?: string | null;
     /**
      * Items per page
      */
     perPage?: number;
-  }): CancelablePromise<PaginatedResponse_ArtifactSummary> {
+  }): CancelablePromise<ArtifactCursorPage_ArtifactSummary> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/artifacts",
@@ -89,8 +89,11 @@ export class ArtifactsService {
         classification: classification,
         execution: execution,
         name: name,
-        page: page,
+        cursor: cursor,
         per_page: perPage,
+      },
+      errors: {
+        400: `Invalid cursor or page size`,
       },
     });
   }
@@ -821,17 +824,26 @@ export class ArtifactsService {
    */
   public static downloadLatest({
     id,
+    versionId,
   }: {
     /**
      * Artifact ID
      */
     id: number;
+    /**
+     * Expected immutable version ID. A deleted/recreated version with the same
+     * version number must not be substituted. Omit for number/latest selection.
+     */
+    versionId?: number | null;
   }): CancelablePromise<any> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/artifacts/{id}/download",
       path: {
         id: id,
+      },
+      query: {
+        version_id: versionId,
       },
       errors: {
         404: `Artifact not found or no versions`,
@@ -963,17 +975,26 @@ export class ArtifactsService {
    */
   public static streamArtifact({
     id,
+    versionId,
   }: {
     /**
      * Artifact ID
      */
     id: number;
+    /**
+     * Expected immutable version ID. A deleted/recreated version with the same
+     * version number must not be substituted. Omit for number/latest selection.
+     */
+    versionId?: number | null;
   }): CancelablePromise<any> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/artifacts/{id}/stream",
       path: {
         id: id,
+      },
+      query: {
+        version_id: versionId,
       },
       errors: {
         401: `Unauthorized`,
@@ -983,21 +1004,21 @@ export class ArtifactsService {
   }
   /**
    * List a visibility-filtered page of versions without binary/JSON content.
-   * @returns PaginatedResponse_ArtifactVersionSummary Visible versions with exact totals
+   * @returns ArtifactCursorPage_ArtifactVersionSummary Visible version metadata cursor page
    * @throws ApiError
    */
   public static listVersions({
     id,
-    page,
+    cursor,
     perPage,
   }: {
     /**
      * Artifact ID
      */
     id: number;
-    page?: number;
+    cursor?: string | null;
     perPage?: number;
-  }): CancelablePromise<PaginatedResponse_ArtifactVersionSummary> {
+  }): CancelablePromise<ArtifactCursorPage_ArtifactVersionSummary> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/artifacts/{id}/versions",
@@ -1005,7 +1026,7 @@ export class ArtifactsService {
         id: id,
       },
       query: {
-        page: page,
+        cursor: cursor,
         per_page: perPage,
       },
       errors: {
@@ -1212,11 +1233,17 @@ export class ArtifactsService {
    */
   public static getLatestVersion({
     id,
+    versionId,
   }: {
     /**
      * Artifact ID
      */
     id: number;
+    /**
+     * Expected immutable version ID. A deleted/recreated version with the same
+     * version number must not be substituted. Omit for number/latest selection.
+     */
+    versionId?: number | null;
   }): CancelablePromise<{
     /**
      * Response DTO for an artifact version (without binary content)
@@ -1287,6 +1314,9 @@ export class ArtifactsService {
       url: "/api/v1/artifacts/{id}/versions/latest",
       path: {
         id: id,
+      },
+      query: {
+        version_id: versionId,
       },
       errors: {
         404: `Artifact not found or no versions`,
@@ -1399,6 +1429,7 @@ export class ArtifactsService {
   public static getVersion({
     id,
     version,
+    versionId,
   }: {
     /**
      * Artifact ID
@@ -1408,6 +1439,11 @@ export class ArtifactsService {
      * Version number
      */
     version: number;
+    /**
+     * Expected immutable version ID. A deleted/recreated version with the same
+     * version number must not be substituted. Omit for number/latest selection.
+     */
+    versionId?: number | null;
   }): CancelablePromise<{
     /**
      * Response DTO for an artifact version (without binary content)
@@ -1480,6 +1516,9 @@ export class ArtifactsService {
         id: id,
         version: version,
       },
+      query: {
+        version_id: versionId,
+      },
       errors: {
         404: `Artifact or version not found`,
       },
@@ -1525,6 +1564,7 @@ export class ArtifactsService {
   public static downloadVersion({
     id,
     version,
+    versionId,
   }: {
     /**
      * Artifact ID
@@ -1534,6 +1574,11 @@ export class ArtifactsService {
      * Version number
      */
     version: number;
+    /**
+     * Expected immutable version ID. A deleted/recreated version with the same
+     * version number must not be substituted. Omit for number/latest selection.
+     */
+    versionId?: number | null;
   }): CancelablePromise<any> {
     return __request(OpenAPI, {
       method: "GET",
@@ -1542,6 +1587,9 @@ export class ArtifactsService {
         id: id,
         version: version,
       },
+      query: {
+        version_id: versionId,
+      },
       errors: {
         404: `Artifact, version, or content not found`,
         416: `Requested range is not satisfiable`,
@@ -1549,13 +1597,13 @@ export class ArtifactsService {
     });
   }
   /**
-   * List a disclosure-eligible page of artifacts for a given execution.
-   * @returns PaginatedResponse_ArtifactSummary Eligible artifacts with exact totals
+   * List metadata and the highest exact-execution version for each artifact.
+   * @returns ArtifactCursorPage_ArtifactSummary Execution-selected metadata cursor page
    * @throws ApiError
    */
   public static listArtifactsByExecution({
     executionId,
-    page,
+    cursor,
     perPage,
     type,
   }: {
@@ -1563,13 +1611,13 @@ export class ArtifactsService {
      * Execution ID
      */
     executionId: number;
-    page?: number;
+    cursor?: string | null;
     perPage?: number;
     /**
      * Optional type filter, including bounded progress-artifact discovery.
      */
     type?: null | ArtifactType;
-  }): CancelablePromise<PaginatedResponse_ArtifactSummary> {
+  }): CancelablePromise<ArtifactCursorPage_ArtifactSummary> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/executions/{execution_id}/artifacts",
@@ -1577,7 +1625,7 @@ export class ArtifactsService {
         execution_id: executionId,
       },
       query: {
-        page: page,
+        cursor: cursor,
         per_page: perPage,
         type: type,
       },

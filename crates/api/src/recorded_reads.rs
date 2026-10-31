@@ -161,13 +161,16 @@ pub(crate) async fn artifact(
     Ok(artifact)
 }
 
-pub(crate) async fn history(
+pub(crate) async fn history_page(
     pool: &PgPool,
     user: &AuthenticatedUser,
     id: i64,
     encryption_key: Option<&str>,
-) -> ApiResult<Vec<attune_common::repositories::artifact::ArtifactVersionSummaryRow>> {
-    use attune_common::repositories::artifact::ArtifactVersionSummaryRow;
+    per_page: u32,
+    cursor: &crate::artifact_cursor::Cursor,
+) -> ApiResult<crate::dto::artifact::ArtifactCursorPage<crate::dto::artifact::ArtifactVersionSummary>>
+{
+    use crate::{artifact_cursor::Position, dto::artifact::ArtifactVersionSummary};
     let mut tx = pool.begin().await?;
     crate::recorded_consumers::authorize_target(
         &mut tx,
@@ -177,34 +180,45 @@ pub(crate) async fn history(
     )
     .await?;
     tx.commit().await?;
-    let candidates = ArtifactVersionRepository::bounded_summaries(pool, id).await?;
-    if candidates.len() > 256 {
+    if ArtifactVersionRepository::exceeds_recorded_history_bound(pool, id).await? {
         return Err(denied());
     }
+    let mut candidates = ArtifactVersionRepository::scan_summaries(
+        pool,
+        id,
+        None,
+        per_page + 1,
+        cursor.version_after(),
+    )
+    .await?;
+    let has_more = candidates.len() > per_page as usize;
+    candidates.truncate(per_page as usize);
+    let after = candidates.last().map(|row| Position::Version {
+        version: row.version,
+        id: row.id,
+    });
     let mut visible = Vec::new();
     let mut captured_reads = Vec::new();
     for candidate in candidates {
-        let (selected, captured) =
-            match version(pool, user, id, Some(candidate.version), encryption_key).await {
-                Ok((_, selected, captured)) => (selected, captured),
-                Err(ApiError::Forbidden(_) | ApiError::NotFound(_)) => continue,
-                Err(error) => return Err(error),
-            };
+        let (selected, captured) = match version_with_id(
+            pool,
+            user,
+            id,
+            Some(candidate.version),
+            Some(candidate.id),
+            encryption_key,
+        )
+        .await
+        {
+            Ok((_, selected, captured)) => (selected, captured),
+            Err(ApiError::Forbidden(_) | ApiError::NotFound(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        if selected.id != candidate.id {
+            return Err(denied());
+        }
         captured_reads.push(captured);
-        visible.push(ArtifactVersionSummaryRow {
-            id: selected.id,
-            version: selected.version,
-            execution: selected.execution,
-            content_type: selected.content_type,
-            size_bytes: selected.size_bytes,
-            file_path: selected.file_path,
-            body_state: selected.body_state,
-            object_key: selected.object_key,
-            provider_version: selected.provider_version,
-            sha256: selected.sha256,
-            created_by: selected.created_by,
-            created: selected.created,
-        });
+        visible.push(ArtifactVersionSummary::from(selected));
     }
     // Reauthorize the exact selected snapshots together. A prior per-version
     // decision is not a permit across the later collection/query waits.
@@ -258,14 +272,17 @@ pub(crate) async fn history(
     if chrono::Utc::now().timestamp() >= user.claims.exp {
         return Err(denied());
     }
-    Ok(visible)
+    cursor.scanned_page(visible, has_more, after)
 }
 
-pub(crate) async fn version(
+/// Reject an immutable-ID mismatch before projecting content, preparing sources,
+/// or committing a runtime-read acquisition. A version number is not identity.
+pub(crate) async fn version_with_id(
     pool: &PgPool,
     user: &AuthenticatedUser,
     artifact: i64,
     number: Option<i32>,
+    expected_version_id: Option<i64>,
     encryption_key: Option<&str>,
 ) -> ApiResult<(
     Artifact,
@@ -277,13 +294,21 @@ pub(crate) async fn version(
         .validate_recorded_runtime_authority(&mut tx)
         .await?
         .ok_or_else(denied)?;
-    let candidate = match number {
-        Some(number) => {
-            ArtifactVersionRepository::find_by_version(&mut *tx, artifact, number).await?
-        }
-        None => ArtifactVersionRepository::find_latest(&mut *tx, artifact).await?,
+    let candidate_id =
+        ArtifactVersionRepository::find_selection_identity(&mut *tx, artifact, number)
+            .await?
+            .ok_or_else(|| read_stage_denied(ReadAcquisitionStage::Candidate))?;
+    if expected_version_id.is_some_and(|expected| expected != candidate_id) {
+        return Err(ApiError::NotFound("Artifact version not found".into()));
     }
-    .ok_or_else(|| read_stage_denied(ReadAcquisitionStage::Candidate))?;
+    // Refetch by the selected immutable ID, never the reusable version number.
+    // Deletion/recreation during this wait can only deny, not acquire a sibling.
+    let candidate = ArtifactVersionRepository::find_by_id(&mut *tx, candidate_id)
+        .await?
+        .ok_or_else(|| read_stage_denied(ReadAcquisitionStage::Candidate))?;
+    if candidate.artifact != artifact || number.is_some_and(|number| candidate.version != number) {
+        return Err(read_stage_denied(ReadAcquisitionStage::SelectionChanged));
+    }
     let mut origins = Vec::new();
     let mut budget = crate::recorded_disclosure::OriginBudget::with_encryption_key(encryption_key);
     let file_origin = crate::file_origins::reference(&mut tx, candidate.id).await?;
@@ -356,9 +381,10 @@ pub(crate) async fn version(
     if artifact.scope == attune_common::models::OwnerType::Sensor {
         return Err(read_stage_denied(ReadAcquisitionStage::SensorSource));
     }
-    let selected = ArtifactVersionRepository::find_selected_for_share(&mut tx, artifact.id, number)
-        .await?
-        .ok_or_else(|| read_stage_denied(ReadAcquisitionStage::SelectedVersion))?;
+    let selected =
+        ArtifactVersionRepository::find_pinned_with_content_for_share(&mut tx, candidate.id)
+            .await?
+            .ok_or_else(|| read_stage_denied(ReadAcquisitionStage::SelectedVersion))?;
     if selected.id != candidate.id || selected.execution != candidate.execution {
         return Err(read_stage_denied(ReadAcquisitionStage::SelectionChanged));
     }

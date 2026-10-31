@@ -1,24 +1,33 @@
 import { QueryClient } from "@tanstack/react-query";
 
-interface HttpError extends Error {
-  response?: {
-    status: number;
-  };
+/** Generated requests expose status directly; Axios exposes response.status. */
+export function httpErrorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  if ("status" in error && typeof error.status === "number")
+    return error.status;
+  if (
+    "response" in error &&
+    error.response &&
+    typeof error.response === "object" &&
+    "status" in error.response &&
+    typeof error.response.status === "number"
+  ) {
+    return error.response.status;
+  }
+  return undefined;
 }
 
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      retry: (failureCount, error: HttpError) => {
-        // Don't retry on 401 (handled by interceptor) or 403 (permission denied)
-        if (
-          error?.response?.status === 401 ||
-          error?.response?.status === 403
-        ) {
-          return false;
-        }
-        // Retry once for other errors
-        return failureCount < 1;
+      retry: (failureCount, error) => {
+        const status = httpErrorStatus(error);
+        // No blind rate-limit retry: the user may retry deliberately. Only
+        // transport errors and selected transient server errors get one retry.
+        return (
+          failureCount < 1 &&
+          (status === undefined || [500, 502, 503, 504].includes(status))
+        );
       },
       refetchOnWindowFocus: false,
       staleTime: 30000, // 30 seconds

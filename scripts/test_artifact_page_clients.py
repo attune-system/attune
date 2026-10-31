@@ -10,21 +10,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 from generated_client import AuthenticatedClient
 from generated_client.api.artifacts import list_artifacts_by_execution, list_versions
 from generated_client.models.artifact_type import ArtifactType
-from generated_client.models.paginated_response_artifact_summary import (
-    PaginatedResponseArtifactSummary,
+from generated_client.models.artifact_cursor_page_artifact_summary import (
+    ArtifactCursorPageArtifactSummary,
 )
-from generated_client.models.paginated_response_artifact_version_summary import (
-    PaginatedResponseArtifactVersionSummary,
+from generated_client.models.artifact_cursor_page_artifact_version_summary import (
+    ArtifactCursorPageArtifactVersionSummary,
 )
 
 
 class ArtifactPageClientTests(unittest.TestCase):
-    def test_execution_page_and_progress_filter_use_the_typed_paginated_contract(self):
+    def test_execution_page_and_progress_filter_use_the_typed_cursor_contract(self):
         def respond(request):
             self.assertEqual(request.url.path, "/api/v1/executions/42/artifacts")
             self.assertEqual(
                 dict(request.url.params),
-                {"page": "1", "per_page": "1", "type": "progress"},
+                {"per_page": "1", "type": "progress"},
             )
             return httpx.Response(
                 200,
@@ -40,16 +40,14 @@ class ArtifactPageClientTests(unittest.TestCase):
                             "classification": "general",
                             "created": "2026-10-14T00:00:00Z",
                             "updated": "2026-10-14T00:00:00Z",
+                            "selected_version": {
+                                "id": 91, "version": 3, "execution": 42,
+                                "created": "2026-10-14T00:00:00Z",
+                            },
                         }
                     ],
-                    "pagination": {
-                        "page": 1,
-                        "page_size": 1,
-                        "total_items": 2,
-                        "total_pages": 2,
-                        "has_previous": False,
-                        "has_next": True,
-                    },
+                    "next_cursor": "opaque-next",
+                    "has_more": True,
                 },
             )
 
@@ -59,30 +57,28 @@ class ArtifactPageClientTests(unittest.TestCase):
             httpx_args={"transport": httpx.MockTransport(respond)},
         ) as client:
             result = list_artifacts_by_execution.sync(
-                42, client=client, page=1, per_page=1, type_=ArtifactType.PROGRESS
+                42, client=client, per_page=1, type_=ArtifactType.PROGRESS
             )
-        self.assertIsInstance(result, PaginatedResponseArtifactSummary)
+        self.assertIsInstance(result, ArtifactCursorPageArtifactSummary)
         self.assertEqual(result.items[0].id, 17)
-        self.assertEqual(result.pagination.total_items, 2)
+        self.assertEqual(result.items[0].selected_version.execution, 42)
+        self.assertEqual(result.items[0].selected_version.id, 91)
+        self.assertEqual(result.next_cursor, "opaque-next")
+        self.assertTrue(result.has_more)
+        self.assertNotIn("pagination", result.to_dict())
 
     def test_history_page_retains_navigation_metadata(self):
         def respond(request):
             self.assertEqual(request.url.path, "/api/v1/artifacts/17/versions")
-            self.assertEqual(dict(request.url.params), {"page": "2", "per_page": "100"})
+            self.assertEqual(dict(request.url.params), {"cursor": "opaque+/=", "per_page": "100"})
             return httpx.Response(
                 200,
                 json={
                     "items": [
                         {"id": 3, "version": 1, "created": "2026-10-14T00:00:00Z"}
                     ],
-                    "pagination": {
-                        "page": 2,
-                        "page_size": 100,
-                        "total_items": 101,
-                        "total_pages": 2,
-                        "has_previous": True,
-                        "has_next": False,
-                    },
+                    "next_cursor": None,
+                    "has_more": False,
                 },
             )
 
@@ -91,11 +87,11 @@ class ArtifactPageClientTests(unittest.TestCase):
             token="fixture-token",
             httpx_args={"transport": httpx.MockTransport(respond)},
         ) as client:
-            result = list_versions.sync(17, client=client, page=2, per_page=100)
-        self.assertIsInstance(result, PaginatedResponseArtifactVersionSummary)
+            result = list_versions.sync(17, client=client, cursor="opaque+/=", per_page=100)
+        self.assertIsInstance(result, ArtifactCursorPageArtifactVersionSummary)
         self.assertEqual(result.items[0].version, 1)
-        self.assertEqual(result.pagination.total_items, 101)
-        self.assertFalse(result.pagination.has_next)
+        self.assertIsNone(result.next_cursor)
+        self.assertFalse(result.has_more)
 
     def test_invalid_pages_do_not_parse_as_successful_empty_histories(self):
         with AuthenticatedClient(
@@ -105,14 +101,14 @@ class ArtifactPageClientTests(unittest.TestCase):
                 "transport": httpx.MockTransport(lambda _: httpx.Response(400))
             },
         ) as client:
-            response = list_versions.sync_detailed(17, client=client, page=0)
+            response = list_versions.sync_detailed(17, client=client, per_page=0)
         self.assertEqual(response.status_code, 400)
         self.assertIsNone(response.parsed)
 
     def test_unbounded_data_arrays_are_not_an_alternate_v1_reader(self):
         for model in [
-            PaginatedResponseArtifactSummary,
-            PaginatedResponseArtifactVersionSummary,
+            ArtifactCursorPageArtifactSummary,
+            ArtifactCursorPageArtifactVersionSummary,
         ]:
             with self.assertRaises(KeyError):
                 model.from_dict({"data": []})

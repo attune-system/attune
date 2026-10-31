@@ -5,6 +5,12 @@ Date: 2026-10-14
 Status: implementation in progress. See the linked implementation checkpoint;
 there are no live pre-prod measurements or full-plan performance certification.
 
+Follow-up: [Execution-scoped artifact reads](execution-scoped-artifact-reads.md)
+records the 2026-10-30 reproduction of the 257-execution detail failure and the
+user-approved metadata/content and cursor-pagination changes. The matrix below
+records the original baseline contract, not the replacement policy. See
+[Artifact reads](../api/artifact-reads.md) for the new canonical contract.
+
 For implementation, follow the file-level work units and PostgreSQL-specific gates
 in [Artifact reads on stock PostgreSQL](artifacts-postgresql-implementation.md).
 This document remains the source of truth for endpoint policy and acceptance.

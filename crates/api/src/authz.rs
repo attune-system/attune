@@ -428,6 +428,73 @@ impl AuthorizationService {
         }))
     }
 
+    /// Legacy execution credentials keep their token-named caps and standard
+    /// grants. Retain the same live delegation check on the caller's connection;
+    /// never substitute the sponsor's complete Access grants as the token's caps.
+    pub(crate) async fn retain_legacy_execution_snapshot_on(
+        connection: &mut sqlx::PgConnection,
+        user: &AuthenticatedUser,
+    ) -> Result<(AuthorizationSnapshot, Vec<Grant>), ApiError> {
+        if user.claims.token_type != TokenType::Execution
+            || user
+                .claims
+                .admitted_execution_credential()
+                .map_err(|_| {
+                    ApiError::Unauthorized("Invalid recorded execution credential".into())
+                })?
+                .is_some()
+        {
+            return Err(ApiError::Forbidden(
+                "Legacy execution authority required".into(),
+            ));
+        }
+        let identity_id = user.identity_id().map_err(|_| {
+            ApiError::Unauthorized("Invalid authentication subject in token".into())
+        })?;
+        let identity = IdentityRepository::find_by_id_for_share(connection, identity_id)
+            .await?
+            .ok_or_else(|| ApiError::Unauthorized("Identity not found".into()))?;
+        let refs = execution_permission_set_refs(user);
+        let sets = PermissionSetRepository::find_by_refs_for_share(connection, &refs).await?;
+        if sets.len() != refs.len() {
+            let found = sets
+                .iter()
+                .map(|set| set.r#ref.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let missing = refs
+                .iter()
+                .filter(|reference| !found.contains(reference.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(ApiError::Forbidden(format!(
+                "Execution token references unavailable permission sets: {}",
+                missing.join(", ")
+            )));
+        }
+        let mut grants = Self::grants_from_permission_sets(sets)?;
+        attune_common::delegation::DelegationAuthority::load_for_share(connection, identity_id)
+            .await?
+            .require_grants(&grants)?;
+        grants.extend(execution_standard_access_grants(user));
+        // Artifact metadata historically matches effective (canonical) grants;
+        // body/source checks match load_snapshot's narrowed ownership copies.
+        let visibility_grants = grants.clone();
+        let grants = attune_common::repositories::iam_ownership::IamOwnershipRepository::resolve_pack_owner_grants(
+            connection, identity_id, grants, false,
+        ).await?;
+        Ok((
+            AuthorizationSnapshot {
+                identity_id,
+                identity_attributes: match identity.attributes {
+                    serde_json::Value::Object(attributes) => attributes.into_iter().collect(),
+                    _ => Default::default(),
+                },
+                grants,
+            },
+            visibility_grants,
+        ))
+    }
+
     /// Evaluates `check` against a snapshot previously loaded via
     /// [`Self::load_snapshot`]. A `None` snapshot means the caller's token
     /// type is not subject to identity-based RBAC, so the check passes (same

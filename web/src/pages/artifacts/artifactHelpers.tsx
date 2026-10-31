@@ -34,7 +34,7 @@ export const SCOPE_OPTIONS: { value: OwnerType; label: string }[] = [
   { value: "pack", label: "Pack" },
   { value: "action", label: "Action" },
   { value: "sensor", label: "Sensor" },
-  { value: "rule", label: "Rule" },
+  { value: "identity", label: "Identity" },
 ];
 
 // ============================================================================
@@ -97,8 +97,8 @@ export function getScopeBadge(scope: OwnerType): {
       return { label: "Action", classes: "bg-yellow-100 text-yellow-800" };
     case "sensor":
       return { label: "Sensor", classes: "bg-indigo-100 text-indigo-800" };
-    case "rule":
-      return { label: "Rule", classes: "bg-blue-100 text-blue-800" };
+    case "identity":
+      return { label: "Identity", classes: "bg-blue-100 text-blue-800" };
     default:
       return { label: scope, classes: "bg-gray-100 text-gray-700" };
   }
@@ -118,7 +118,7 @@ export function getVisibilityBadge(visibility: string): {
 // Formatting helpers
 // ============================================================================
 
-export function formatBytes(bytes: number | null): string {
+export function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null || bytes === 0) return "\u2014";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -147,9 +147,13 @@ export function formatTime(timestamp: string) {
 export async function downloadArtifact(
   artifactId: number,
   artifactRef: string,
+  versionNumber?: number,
+  versionId?: number,
 ) {
+  if (versionNumber !== undefined && versionId === undefined)
+    throw new Error("Content unavailable or access denied");
   const token = localStorage.getItem("access_token");
-  const url = `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/download`;
+  const url = `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}${versionNumber === undefined ? "" : `/versions/${versionNumber}`}/download${versionNumber === undefined ? "" : `?version_id=${versionId}`}`;
 
   const response = await fetch(url, {
     headers: {
@@ -158,12 +162,14 @@ export async function downloadArtifact(
   });
 
   if (!response.ok) {
-    console.error(`Download failed: ${response.status} ${response.statusText}`);
-    return;
+    throw new Error("Content unavailable or access denied");
   }
 
   const disposition = response.headers.get("Content-Disposition");
-  let filename = artifactRef.replace(/\./g, "_") + ".bin";
+  let filename =
+    artifactRef.replace(/\./g, "_") +
+    (versionNumber === undefined ? "" : `_v${versionNumber}`) +
+    ".bin";
   if (disposition) {
     const match = disposition.match(/filename="?([^"]+)"?/);
     if (match) filename = match[1];

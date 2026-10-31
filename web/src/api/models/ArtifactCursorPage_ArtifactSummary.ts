@@ -4,16 +4,14 @@
 /* eslint-disable */
 import type { ArtifactClassification } from "./ArtifactClassification";
 import type { ArtifactType } from "./ArtifactType";
+import type { ArtifactVersionSummary } from "./ArtifactVersionSummary";
 import type { ArtifactVisibility } from "./ArtifactVisibility";
 import type { OwnerType } from "./OwnerType";
-import type { PaginationMeta } from "./PaginationMeta";
 /**
- * Paginated response wrapper
+ * Count-free v1 artifact collection response. Pages are not historical snapshots.
  */
-export type PaginatedResponse_ArtifactSummary = {
-  /**
-   * The page items
-   */
+export type ArtifactCursorPage_ArtifactSummary = {
+  has_more: boolean;
   items: Array<{
     /**
      * Classification used to distinguish runtime log artifacts from general artifacts.
@@ -47,8 +45,9 @@ export type PaginatedResponse_ArtifactSummary = {
      * Owner scope
      */
     scope: OwnerType;
+    selected_version?: null | ArtifactVersionSummary;
     /**
-     * Size of latest version in bytes
+     * Display size: execution-selected when scoped; omitted for global runtime logs.
      */
     size_bytes?: number | null;
     /**
@@ -64,8 +63,5 @@ export type PaginatedResponse_ArtifactSummary = {
      */
     visibility: ArtifactVisibility;
   }>;
-  /**
-   * Pagination metadata
-   */
-  pagination: PaginationMeta;
+  next_cursor?: string | null;
 };

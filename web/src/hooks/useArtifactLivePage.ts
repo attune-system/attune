@@ -3,16 +3,15 @@ import { hashKey, useQueryClient } from "@tanstack/react-query";
 
 function browsePage(queryKey: readonly unknown[]): number | undefined {
   const params = queryKey.at(-1);
-  return typeof params === "object" &&
-    params !== null &&
-    "page" in params &&
-    typeof params.page === "number"
-    ? params.page
+  return typeof params === "object" && params !== null && "cursor" in params
+    ? typeof params.cursor === "string"
+      ? 2
+      : 1
     : undefined;
 }
 
-/** Offset pages shift on insertion/retention. An affected live refresh starts a
- * new browse at page one; paused navigation does not reset or discard pages. */
+/** Insertion/retention starts a new cursor browse on relevant live refreshes.
+ * Paused navigation does not reset or discard pages. */
 export function useArtifactLivePage({
   scope,
   id,

@@ -3,6 +3,7 @@
 pub mod action;
 pub mod analytics;
 pub mod artifact;
+pub mod artifact_content;
 pub mod audit;
 pub mod auth;
 pub mod cache;

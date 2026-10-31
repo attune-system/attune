@@ -3509,9 +3509,9 @@ impl ExecutionVisibilityCache {
     pub(crate) fn managing_pack(&self, execution: i64) -> Option<i64> {
         self.managing_packs.get(&execution).copied().flatten()
     }
-    pub(crate) async fn load_ownership(
+    pub(crate) async fn load_ownership_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         ids: &[i64],
     ) -> Result<(), ApiError> {
         let mut missing = ids
@@ -3528,7 +3528,7 @@ impl ExecutionVisibilityCache {
         missing.sort_unstable();
         missing.dedup();
         for batch in missing.chunks(64) {
-            let owners = attune_common::repositories::iam_ownership::IamOwnershipRepository::execution_packs(db, batch).await?;
+            let owners = attune_common::repositories::iam_ownership::IamOwnershipRepository::execution_packs(&mut *db, batch).await?;
             for id in batch {
                 self.managing_packs.insert(*id, owners.get(id).copied());
             }
@@ -3536,9 +3536,9 @@ impl ExecutionVisibilityCache {
         Ok(())
     }
 
-    pub(crate) async fn load_public_actions(
+    pub(crate) async fn load_public_actions_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         refs: &[String],
     ) -> Result<(), ApiError> {
         let mut missing = refs
@@ -3549,7 +3549,7 @@ impl ExecutionVisibilityCache {
         missing.sort_unstable();
         missing.dedup();
         for batch in missing.chunks(64) {
-            let rows = ActionRepository::find_disclosure_visibility(db, batch).await?;
+            let rows = ActionRepository::find_disclosure_visibility(&mut *db, batch).await?;
             for reference in batch {
                 self.public_actions.insert(reference.clone(), false);
             }
@@ -3561,18 +3561,18 @@ impl ExecutionVisibilityCache {
         Ok(())
     }
 
-    async fn public_action(
+    async fn public_action_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         reference: &str,
     ) -> Result<bool, ApiError> {
-        self.load_public_actions(db, &[reference.to_string()])
+        self.load_public_actions_on(db, &[reference.to_string()])
             .await?;
         Ok(self.public_actions.get(reference).copied().unwrap_or(false))
     }
-    async fn ancestors(
+    async fn ancestors_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         execution: &attune_common::repositories::execution::ExecutionAuthorizationRow,
     ) -> Result<Vec<i64>, ApiError> {
         let Some(parent) = execution.parent else {
@@ -3589,7 +3589,11 @@ impl ExecutionVisibilityCache {
         Ok(ids)
     }
 
-    pub(crate) async fn load(&mut self, db: &sqlx::PgPool, ids: &[i64]) -> Result<(), ApiError> {
+    pub(crate) async fn load_on(
+        &mut self,
+        db: &mut sqlx::PgConnection,
+        ids: &[i64],
+    ) -> Result<(), ApiError> {
         let mut missing = ids
             .iter()
             .copied()
@@ -3598,7 +3602,7 @@ impl ExecutionVisibilityCache {
         missing.sort_unstable();
         missing.dedup();
         for batch in missing.chunks(64) {
-            let rows = ExecutionRepository::find_authorization_lineages(db, batch).await?;
+            let rows = ExecutionRepository::find_authorization_lineages(&mut *db, batch).await?;
             for id in batch {
                 self.lineages.insert(*id, None);
             }
@@ -3611,13 +3615,13 @@ impl ExecutionVisibilityCache {
             .filter_map(|id| self.lineages.get(id).and_then(Option::as_ref))
             .map(|row| row.anchor_action_ref.clone())
             .collect::<Vec<_>>();
-        self.load_public_actions(db, &refs).await?;
+        self.load_public_actions_on(db, &refs).await?;
         Ok(())
     }
 
-    async fn resolve(
+    async fn resolve_on(
         &mut self,
-        db: &sqlx::PgPool,
+        db: &mut sqlx::PgConnection,
         execution: &attune_common::repositories::execution::ExecutionAuthorizationRow,
     ) -> Result<attune_common::repositories::execution::ExecutionLineageRow, ApiError> {
         if execution.parent.is_none() {
@@ -3631,7 +3635,7 @@ impl ExecutionVisibilityCache {
                 },
             );
         }
-        self.load(db, &[execution.id]).await?;
+        self.load_on(db, &[execution.id]).await?;
         let row = self
             .lineages
             .get(&execution.id)
@@ -3715,9 +3719,111 @@ pub(crate) async fn authorize_execution_projection(
         None
     };
     let snapshot = snapshot.or(loaded_snapshot.as_ref());
+    let ctx = {
+        let mut connection = state.db.acquire().await?;
+        execution_projection_context_on(
+            &mut connection,
+            execution,
+            action,
+            snapshot,
+            visibility_cache,
+            identity_id,
+        )
+        .await?
+    };
+    let anchor_ref = ctx.target_ref.clone().unwrap_or_default();
+    let check = AuthorizationCheck {
+        resource: Resource::Executions,
+        action,
+        context: ctx,
+    };
+    let result = match snapshot {
+        Some(snapshot) => authz.authorize_with_snapshot(user, Some(snapshot), check),
+        None => authz.authorize(user, check).await,
+    };
+    if result.is_ok() {
+        return Ok(());
+    }
+    if action == Action::Read && user.claims.token_type == TokenType::Access {
+        let mut connection = state.db.acquire().await?;
+        if visibility_cache
+            .public_action_on(&mut connection, &anchor_ref)
+            .await?
+        {
+            return Ok(());
+        }
+    }
+    result
+}
+
+/// Transaction-aware projection check using the guard's retained Access IAM or
+/// separate legacy execution caps, never recorded authority or a cached allow.
+pub(crate) async fn authorize_execution_projection_on(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    execution: &attune_common::repositories::execution::ExecutionAuthorizationRow,
+    action: Action,
+    snapshot: &AuthorizationSnapshot,
+    visibility_cache: &mut ExecutionVisibilityCache,
+    connection: &mut sqlx::PgConnection,
+) -> Result<(), ApiError> {
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) || crate::recorded_consumers::is_recorded(user)?
+        || identity_id != snapshot.identity_id
+    {
+        return Err(ApiError::Forbidden(
+            "Current disclosure identity is required".into(),
+        ));
+    }
+    let ctx = execution_projection_context_on(
+        connection,
+        execution,
+        action,
+        Some(snapshot),
+        visibility_cache,
+        identity_id,
+    )
+    .await?;
+    let anchor_ref = ctx.target_ref.clone().unwrap_or_default();
+    let result = state.authorization_service().authorize_with_snapshot(
+        user,
+        Some(snapshot),
+        AuthorizationCheck {
+            resource: Resource::Executions,
+            action,
+            context: ctx,
+        },
+    );
+    if result.is_ok() {
+        return Ok(());
+    }
+    if action == Action::Read
+        && user.claims.token_type == TokenType::Access
+        && visibility_cache
+            .public_action_on(connection, &anchor_ref)
+            .await?
+    {
+        return Ok(());
+    }
+    result
+}
+
+async fn execution_projection_context_on(
+    connection: &mut sqlx::PgConnection,
+    execution: &attune_common::repositories::execution::ExecutionAuthorizationRow,
+    action: Action,
+    snapshot: Option<&AuthorizationSnapshot>,
+    visibility_cache: &mut ExecutionVisibilityCache,
+    identity_id: i64,
+) -> Result<AuthorizationContext, ApiError> {
     let mut ctx = AuthorizationContext::new(identity_id);
     let (anchor, ancestor_ids) = if matches!(action, Action::Read | Action::Decrypt) {
-        let lineage = visibility_cache.resolve(&state.db, execution).await?;
+        let lineage = visibility_cache.resolve_on(connection, execution).await?;
         (
             ExecutionVisibilityAnchorRow {
                 id: lineage.anchor_id,
@@ -3731,7 +3837,7 @@ pub(crate) async fn authorize_execution_projection(
                 id: execution.id,
                 action_ref: execution.action_ref.clone(),
             },
-            visibility_cache.ancestors(&state.db, execution).await?,
+            visibility_cache.ancestors_on(connection, execution).await?,
         )
     };
 
@@ -3747,7 +3853,7 @@ pub(crate) async fn authorize_execution_projection(
         })
     }) {
         visibility_cache
-            .load_ownership(&state.db, &[anchor.id])
+            .load_ownership_on(connection, &[anchor.id])
             .await?;
         ctx.managing_pack_id = visibility_cache
             .managing_packs
@@ -3774,30 +3880,7 @@ pub(crate) async fn authorize_execution_projection(
     ctx.execution_owner_identity_id = execution.executor;
     ctx.execution_ancestor_identity_ids = ancestor_ids;
 
-    let check = AuthorizationCheck {
-        resource: Resource::Executions,
-        action,
-        context: ctx,
-    };
-    let authz_result = match snapshot {
-        Some(snapshot) => authz.authorize_with_snapshot(user, Some(snapshot), check),
-        None => authz.authorize(user, check).await,
-    };
-
-    if authz_result.is_ok() {
-        return Ok(());
-    }
-
-    if matches!(action, Action::Read)
-        && user.claims.token_type == TokenType::Access
-        && visibility_cache
-            .public_action(&state.db, &anchor.action_ref)
-            .await?
-    {
-        return Ok(());
-    }
-
-    authz_result
+    Ok(ctx)
 }
 
 fn emit_execution_secret_disclosure_audit(
