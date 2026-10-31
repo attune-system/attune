@@ -192,7 +192,11 @@ async fn async_main(
         // We need a temporary DB connection for dynamic registration.
         // WorkerService::new() will create its own connection, so this is
         // a short-lived pool just for the registration step.
-        let db = attune_common::db::Database::new(&config.database).await?;
+        let db = attune_common::db::Database::new_named(
+            &config.database,
+            attune_common::db::ConnectionIdentity::for_process("agent", "runtime-registration"),
+        )
+        .await?;
         let pool = db.pool().clone();
 
         match auto_register_detected_runtimes(&pool, detected).await {

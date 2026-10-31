@@ -307,7 +307,11 @@ async fn main() -> Result<()> {
 
     if args.migrate || args.upgrade_pack_releases {
         info!("Connecting to database...");
-        let database = Database::new(&config.database).await?;
+        let database = Database::new_named(
+            &config.database,
+            attune_common::db::ConnectionIdentity::for_process("api", "maintenance"),
+        )
+        .await?;
 
         if args.migrate {
             database.migrate().await?;
@@ -382,7 +386,11 @@ async fn main() -> Result<()> {
 
     // Initialize database connection pool
     info!("Connecting to database...");
-    let database = Database::new(&config.database).await?;
+    let database = Database::new_named(
+        &config.database,
+        attune_common::db::ConnectionIdentity::for_process("api", "main"),
+    )
+    .await?;
     info!("Database connection established");
     PlatformCatalogRepository::reconcile(database.pool()).await?;
     info!("Platform catalog reconciled");

@@ -174,11 +174,12 @@ COPY migrations/ ./migrations/
 # Uses a dedicated cache ID (agent-target) so the musl target directory
 # doesn't collide with the glibc target cache used by other Dockerfiles.
 ARG ATTUNE_BUILD_GIT_SHA
+ARG CARGO_BUILD_JOBS=4
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,id=agent-target,target=/build/target,sharing=locked \
     TARGET="$(resolve-rust-target)" && \
-    cargo zigbuild --release --target "${TARGET}" --bin attune --bin attune-agent --bin attune-sensor-agent --bin attune-mcp && \
+    cargo zigbuild --release -j "${CARGO_BUILD_JOBS}" --target "${TARGET}" --bin attune --bin attune-agent --bin attune-sensor-agent --bin attune-mcp && \
     cp "/build/target/${TARGET}/release/attune" /build/attune && \
     cp "/build/target/${TARGET}/release/attune-agent" /build/attune-agent && \
     cp "/build/target/${TARGET}/release/attune-sensor-agent" /build/attune-sensor-agent && \

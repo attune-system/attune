@@ -74,6 +74,14 @@ pub fn spawn_threaded_writer(
                 .expect("failed to build audit writer runtime");
             runtime.block_on(async move {
                 let search_path = format!("SET search_path TO {schema}, public");
+                let identity = crate::db::ConnectionIdentity::for_process("api", "audit-writer");
+                let connect_options = match identity.connect_options(&database_url) {
+                    Ok(options) => options,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
                 let pool = match PgPoolOptions::new()
                     .max_connections(2)
                     .after_connect(move |connection, _| {
@@ -83,7 +91,7 @@ pub fn spawn_threaded_writer(
                             Ok(())
                         })
                     })
-                    .connect(&database_url)
+                    .connect_with(connect_options)
                     .await
                 {
                     Ok(pool) => pool,

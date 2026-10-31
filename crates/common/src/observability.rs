@@ -1,6 +1,10 @@
 use tracing::subscriber::set_global_default;
 use tracing_subscriber::EnvFilter;
 
+mod graph_transaction;
+pub(crate) use graph_transaction::shared_graph_admission_requested;
+pub use graph_transaction::SharedGraphTransactionTrace;
+
 use crate::{
     config::{Config, LogConfig},
     Error, Result,

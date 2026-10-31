@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{FromRow, PgConnection, PgPool, Postgres, Transaction};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
+use super::maintenance_admission::{self, MaintenanceBudget, MaintenanceResult};
 use crate::Result;
 
 #[derive(Debug, Clone, FromRow)]
@@ -183,27 +186,42 @@ impl StorageMaintenanceRepository {
         let mut tx = pool.begin().await?;
         super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx)
             .await?;
+        let claimed = Self::claim_pending_with_conn(&mut tx, id, cutoff, shared_file, None).await?;
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    async fn claim_pending_with_conn(
+        conn: &mut PgConnection,
+        id: i64,
+        cutoff: DateTime<Utc>,
+        shared_file: bool,
+        observed: Option<&str>,
+    ) -> Result<bool> {
         if super::file_evidence_retention::FileEvidenceRetentionRepository::request_cleanup(
-            &mut tx,
+            conn,
             &[id],
         )
         .await?
             != [id]
         {
-            tx.rollback().await?;
             return Ok(false);
         }
-        sqlx::query("SELECT id FROM artifact_version WHERE id = $1 FOR UPDATE")
+        let current: Option<i64> = sqlx::query_scalar("SELECT id FROM artifact_version WHERE id = $1 AND ($2::text IS NULL OR xmin::text=$2) FOR UPDATE")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .bind(observed)
+            .fetch_optional(&mut *conn)
             .await?;
+        if current.is_none() {
+            return Ok(false);
+        }
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext('log_stream'), hashtext($1::text))")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         sqlx::query("SELECT id FROM log_stream WHERE artifact_version = $1 FOR UPDATE")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
         let storage_predicate = if shared_file {
             "av.object_key IS NULL AND av.file_path IS NOT NULL AND EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id AND ls.backend = 'shared_file' AND NOT ls.sealed)"
@@ -223,7 +241,7 @@ impl StorageMaintenanceRepository {
         let claimed = sqlx::query(&query)
             .bind(id)
             .bind(cutoff)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?
             .rows_affected()
             == 1;
@@ -231,10 +249,34 @@ impl StorageMaintenanceRepository {
             "SELECT EXISTS(SELECT 1 FROM artifact_version WHERE id = $1 AND body_state = 'cleanup_claimed')",
         )
         .bind(id)
-        .fetch_one(&mut *tx)
+        .fetch_one(conn)
         .await?;
-        tx.commit().await?;
         Ok(claimed || already_claimed)
+    }
+
+    pub async fn claim_abandoned_pending_bounded(
+        pool: &PgPool,
+        id: i64,
+        cutoff: DateTime<Utc>,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<bool> {
+        maintenance_admission::run(pool, budget, deadline, cancel,
+            move |conn| Box::pin(async move {
+                Ok(sqlx::query_scalar::<_, String>("SELECT xmin::text FROM artifact_version WHERE id=$1 AND object_key IS NOT NULL AND (body_state='cleanup_claimed' OR (body_state='pending' AND body_updated<$2))")
+                    .bind(id).bind(cutoff).fetch_all(conn).await?)
+            }),
+            move |conn, candidates| Box::pin(async move {
+                // Preserve graph -> owner -> artifact -> stream lock order.
+                // A stale/ineligible candidate must not commit an owner claim.
+                use sqlx::Acquire;
+                let mut claim = conn.begin().await?;
+                let claimed = Self::claim_pending_with_conn(&mut claim,id,cutoff,false,Some(&candidates[0])).await?;
+                if claimed { claim.commit().await?; } else { claim.rollback().await?; }
+                Ok((claimed,u64::from(claimed)))
+            }),
+        ).await
     }
 
     pub async fn ready_objects(
@@ -355,17 +397,99 @@ impl StorageMaintenanceRepository {
     }
 
     pub async fn delete_cleanup_claimed(pool: &PgPool, id: i64) -> Result<bool> {
+        let mut conn = pool.acquire().await?;
+        Self::delete_cleanup_claimed_with_conn(&mut conn, id, None).await
+    }
+
+    async fn delete_cleanup_claimed_with_conn(
+        conn: &mut PgConnection,
+        id: i64,
+        observed: Option<&str>,
+    ) -> Result<bool> {
         let result = sqlx::query(
             "DELETE FROM artifact_version av \
-             WHERE av.id = $1 AND av.body_state = 'cleanup_claimed' \
+             WHERE av.id = $1 AND ($2::text IS NULL OR av.xmin::text=$2) AND av.body_state = 'cleanup_claimed' \
              AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
                              WHERE g.artifact_version = av.id AND g.state = 'issued' \
                                AND g.settle_until > clock_timestamp())",
         )
         .bind(id)
-        .execute(pool)
+        .bind(observed)
+        .execute(conn)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_cleanup_claimed_bounded(
+        pool: &PgPool,
+        id: i64,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<bool> {
+        maintenance_admission::run(pool, budget, deadline, cancel,
+            move |conn| Box::pin(async move {
+                Ok(sqlx::query_scalar::<_, String>("SELECT xmin::text FROM artifact_version WHERE id=$1 AND body_state='cleanup_claimed'")
+                    .bind(id).fetch_all(conn).await?)
+            }),
+            move |conn, candidates| Box::pin(async move {
+                // DELETE triggers recheck pins and preserve physical obligations
+                // in the same transaction, already holding exclusive admission.
+                let deleted = Self::delete_cleanup_claimed_with_conn(conn,id,Some(&candidates[0])).await?;
+                Ok((deleted,u64::from(deleted)))
+            }),
+        ).await
+    }
+
+    /// The version is the durable retry candidate for both operations. Commit
+    /// its deletion only together with parent metadata refresh/deletion.
+    pub async fn delete_cleanup_claimed_and_refresh_bounded(
+        pool: &PgPool,
+        id: i64,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<bool> {
+        maintenance_admission::run(pool,budget,deadline,cancel,
+            move |conn| Box::pin(async move {
+                Ok(sqlx::query_as::<_,(i64,String,String)>("SELECT av.artifact,av.xmin::text,a.xmin::text FROM artifact_version av JOIN artifact a ON a.id=av.artifact WHERE av.id=$1 AND av.body_state='cleanup_claimed'")
+                    .bind(id).fetch_all(conn).await?)
+            }),
+            move |conn,candidates| Box::pin(async move {
+                use sqlx::Acquire;
+                let (artifact,version_xmin,artifact_xmin) = &candidates[0];
+                let mut unit = conn.begin().await?;
+                let deleted = async {
+                    // Graph admission is already exclusive. Protect the whole
+                    // evidence cleanup group before targets; release triggers
+                    // may touch peer owners. Preserve the existing group/pins.
+                    sqlx::query_scalar::<_,i64>("SELECT version FROM file_evidence_owner WHERE version=$1 OR cleanup_group=(SELECT cleanup_group FROM file_evidence_owner WHERE version=$1) ORDER BY version FOR UPDATE")
+                        .bind(id).fetch_all(&mut *unit).await?;
+                    // Match version writers' advisory -> artifact-row order,
+                    // and acquire the artifact before locking its version.
+                    if super::artifact::ArtifactRepository::find_by_id_for_update(&mut unit,*artifact).await?.is_none() {
+                        return Ok::<_,crate::Error>(false);
+                    }
+                    let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM artifact WHERE id=$1 AND xmin::text=$2)")
+                        .bind(artifact).bind(artifact_xmin).fetch_one(&mut *unit).await?;
+                    if !current { return Ok(false); }
+                    let current: Option<i64> = sqlx::query_scalar("SELECT id FROM artifact_version av WHERE id=$1 AND artifact=$2 AND xmin::text=$3 AND body_state='cleanup_claimed' AND file_evidence_version_eligible(id) AND NOT EXISTS(SELECT 1 FROM artifact_upload_grant g WHERE g.artifact_version=av.id AND g.state='issued' AND g.settle_until>clock_timestamp()) FOR UPDATE")
+                        .bind(id).bind(artifact).bind(version_xmin).fetch_optional(&mut *unit).await?;
+                    if current.is_none() { return Ok(false); }
+                    if !Self::delete_cleanup_claimed_with_conn(&mut unit,id,Some(version_xmin)).await? {
+                        return Ok(false);
+                    }
+                    // This helper checks ALL remaining versions before deleting
+                    // the artifact, not merely the ready-version frontier.
+                    super::maintenance::MaintenanceRepository::refresh_or_delete_artifact_metadata_with_conn(&mut unit,*artifact).await?;
+                    Ok(true)
+                }.await?;
+                // BEFORE DELETE triggers may write even when a later trigger
+                // suppresses deletion. A no-op must publish none of that work.
+                if deleted { unit.commit().await?; } else { unit.rollback().await?; }
+                Ok((deleted,u64::from(deleted)))
+            }),
+        ).await
     }
 
     pub async fn delete_deleting(pool: &PgPool, id: i64) -> Result<bool> {

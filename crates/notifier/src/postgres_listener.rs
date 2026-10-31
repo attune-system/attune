@@ -1,7 +1,8 @@
 //! PostgreSQL LISTEN/NOTIFY integration for real-time notifications
 
 use anyhow::{Context, Result};
-use sqlx::postgres::PgListener;
+use attune_common::db::ConnectionIdentity;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{Acquire, Connection};
 use std::future::Future;
 use std::time::Duration;
@@ -119,6 +120,7 @@ where
 /// PostgreSQL listener that receives NOTIFY events and broadcasts them
 pub struct PostgresListener {
     database_url: String,
+    identity: ConnectionIdentity,
     notification_tx: broadcast::Sender<Notification>,
 }
 
@@ -128,8 +130,22 @@ impl PostgresListener {
         database_url: String,
         notification_tx: broadcast::Sender<Notification>,
     ) -> Result<Self> {
+        Self::new_named(
+            database_url,
+            notification_tx,
+            ConnectionIdentity::for_process("notifier", "listener"),
+        )
+        .await
+    }
+
+    pub async fn new_named(
+        database_url: String,
+        notification_tx: broadcast::Sender<Notification>,
+        identity: ConnectionIdentity,
+    ) -> Result<Self> {
         Ok(Self {
             database_url,
+            identity,
             notification_tx,
         })
     }
@@ -169,7 +185,14 @@ impl PostgresListener {
             crate::mask_connection_url(&self.database_url)
         );
 
-        let mut listener = PgListener::connect(&self.database_url)
+        // Match PgListener::connect's dedicated pool settings, with identity in
+        // the startup options so every reconnect is named before any SQL runs.
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .connect_lazy_with(self.identity.connect_options(&self.database_url)?);
+        let mut listener = PgListener::connect_with(&pool)
             .await
             .context("Failed to connect PostgreSQL listener")?;
 
@@ -177,6 +200,7 @@ impl PostgresListener {
         // dedicated socket directly on failure or cancellation, even during LISTEN.
         listener.abort_on_drop();
         listener.eager_reconnect(false);
+        listener.ignore_pool_close_event(true);
 
         info!("PostgreSQL LISTEN connection established — subscribing to channels");
 
@@ -511,6 +535,13 @@ mod tests {
         let (tx, mut receiver) = broadcast::channel(4);
         let listener = PostgresListener::new(db.database_url().to_string(), tx).await?;
         let mut pg = listener.create_listener().await?;
+        let name: String = sqlx::query_scalar("SHOW application_name")
+            .fetch_one(pg.acquire().await?)
+            .await?;
+        assert_eq!(name, listener.identity.application_name());
+        let search_path: String = sqlx::query_scalar("SHOW search_path")
+            .fetch_one(pg.acquire().await?)
+            .await?;
         // A healthy idle connection survives a cancelled receive and a real
         // protocol round-trip on the subscribed connection.
         assert!(tokio::time::timeout(Duration::from_millis(1), pg.recv())
@@ -550,6 +581,14 @@ mod tests {
         ));
 
         let mut pg = listener.create_listener().await?;
+        let name: String = sqlx::query_scalar("SHOW application_name")
+            .fetch_one(pg.acquire().await?)
+            .await?;
+        assert_eq!(name, listener.identity.application_name());
+        let recreated_search_path: String = sqlx::query_scalar("SHOW search_path")
+            .fetch_one(pg.acquire().await?)
+            .await?;
+        assert_eq!(recreated_search_path, search_path);
         let latest = ArtifactRepository::create(db.pool(), create("listener.latest")).await?;
         let notification = tokio::time::timeout(Duration::from_secs(10), pg.recv()).await??;
         listener.process_notification(notification.channel(), notification.payload())?;
@@ -606,6 +645,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(10);
         let listener = PostgresListener {
             database_url: "postgresql://test".to_string(),
+            identity: ConnectionIdentity::for_process("notifier", "listener"),
             notification_tx: tx,
         };
 
@@ -638,6 +678,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(10);
         let listener = PostgresListener {
             database_url: "postgresql://test".to_string(),
+            identity: ConnectionIdentity::for_process("notifier", "listener"),
             notification_tx: tx,
         };
 
@@ -665,6 +706,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(10);
         let listener = PostgresListener {
             database_url: "postgresql://test".to_string(),
+            identity: ConnectionIdentity::for_process("notifier", "listener"),
             notification_tx: tx,
         };
 
@@ -684,6 +726,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(10);
         let listener = PostgresListener {
             database_url: "postgresql://test".to_string(),
+            identity: ConnectionIdentity::for_process("notifier", "listener"),
             notification_tx: tx,
         };
 

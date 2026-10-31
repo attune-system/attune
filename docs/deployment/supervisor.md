@@ -78,7 +78,7 @@ separate summary-retention window or `continuous_aggregates` setting.
 
 ### Native partition and summary jobs
 
-The supervisor owns three durable schedule rows in `native_maintenance_schedule`.
+The supervisor owns four durable schedule rows in `native_maintenance_schedule`.
 They share the existing session advisory leader lock but have independent due
 times:
 
@@ -87,6 +87,7 @@ times:
 | `partition` | 3600 seconds | Reconcile daily future leaves, then attempt the oldest DEFAULT day per parent. |
 | `retention` | 3600 seconds | Runtime retention and cache cleanup, plus normal housekeeping. |
 | `summary` | 300 seconds | Refresh bounded completed-hour summaries. |
+| `object_retention` | 3600 seconds after a clean pass | Graph/object cleanup, with independent bounded continuation and retry deadlines. |
 
 The loop reloads persisted settings each cycle, with a polling delay of at most
 60 seconds between cycles. A summary tick does not rerun retention, cache expiry,
@@ -95,7 +96,65 @@ and run normal remediation. Summary
 and retention remain cadence-bound. Claiming an attempt records its retry due
 time before work starts. Successful bounded work uses its normal interval;
 failed work retries after the smaller of its interval and 60 seconds. Restarts
-preserve `next_due` and `last_success` rather than resetting another leader's work.
+preserve `next_due`, `last_success`, and unresolved `deferred_since` rather than
+resetting another leader's work.
+Completion uses the database clock to start the next interval, so a long-running
+attempt does not leave an already-overdue retry. Object-cleanup failures prevent
+the `object_retention` job from recording success, without shortening the
+independent row-retention cadence. Pending graph scans resume after their durable
+continuation deadline, normally one second, rather than waiting an hour.
+
+### Pack and authority graph cleanup
+
+Pack-release retention collects receipt leaves, accepted inputs, native snapshots,
+historical cache epochs, admission leaves, policy revisions, and releases in
+separate transactions. Each phase discovers a raw primary-key page without graph
+admission, then rechecks tuple identity, current pins, references, and retention
+eligibility after acquiring exclusive admission. Exact release counts and local
+pack-tree removal run after those graph transactions. Local tree removal retains
+its separate table-lock fence.
+
+Each metadata page probes at most 256 candidates and deletes at most
+the configured `pack_release_cleanup_batch_size`, capped at 256. Its internal
+defaults are 250 ms per statement, one second of page work, and ten seconds per
+collection, including reserved cleanup time. Phases take round-robin turns within
+that budget, ending each transaction before another page. A completed pass waits
+one hour before rescanning; an incomplete pass persists a short continuation.
+These budgets do not cover filesystem deletion or the entire supervisor cycle.
+
+Evidence audit/readmission, PUT-recovery metadata, and object-deletion claims use
+the same nonblocking-first admission policy with bounded statements and owned
+transaction cleanup. Their deferrals are reported, not returned as empty success.
+Each metadata unit gets a fresh bounded work window; graph scanning and provider
+HEAD/settlement/DELETE latency do not spend a later acknowledgement's allowance.
+Candidate batches are capped at 256. These per-unit bounds do not bound the wall
+time of provider I/O or the entire object-maintenance job. Abandoned-version
+deletion and artifact reconciliation commit as one unit, preserving the retry
+identity if either step cannot complete.
+After five minutes of recorded object-maintenance deferral, the scheduler permits
+a queued acquisition of at most 50 ms. Storage I/O remains outside these metadata
+transactions and keeps its existing settlement and retention protocol.
+
+Ordinary attempts use a nonblocking graph lock. Deferred phases retain their
+cursor and oldest deferral in `graph_reclamation_progress`, with a jittered retry
+around 30 seconds. After five minutes of deferral, a phase may queue for at most
+50 ms, then rolls back and defers again if admission is unavailable. Persistent
+deferral emits a cooldown-controlled maintenance alert when monitoring is enabled.
+Operators must arrange an approved maintenance opportunity if bounded attempts
+cannot make progress. Do not silently widen timeouts or disable retention.
+
+Wrapping cursors and fixed pass high-water marks revisit pinned and older rows
+even while new records arrive. After a confirmed DELETE-timeout rollback, the
+collector shrinks its next probe. A single over-budget leaf stays intact while
+the scan advances to later records, and is revisited on wrap. Its diagnostic age
+survives later cheap progress until a clean full pass. Discovery failures and
+unknown commits never authorize this advancement.
+
+A clean bounded pass is not a claim that the graph
+has been drained. Logs distinguish candidate/changed counts, lock/deadline
+deferrals, failures, and unknown commits. Deferred or failed graph phases prevent
+the object-maintenance job from recording success. Confirmed earlier commits remain
+valid if a later phase fails; unknown commits never authorize local tree removal.
 
 Each parent uses daily UTC half-open ranges and a DEFAULT partition. Normal
 reconciliation covers today plus `partition_lookahead_days`, seven by default.

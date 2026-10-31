@@ -132,7 +132,11 @@ struct SupervisorAlertRequest {
 
 impl SupervisorService {
     async fn new(config: Config) -> Result<Self> {
-        let db = Database::new(&config.database).await?;
+        let db = Database::new_named(
+            &config.database,
+            attune_common::db::ConnectionIdentity::for_process("supervisor", "main"),
+        )
+        .await?;
         RetentionRepository::seed_cache_config_if_empty(db.pool(), &config.cache_retention).await?;
         RetentionRepository::seed_native_config_if_empty(
             db.pool(),
@@ -418,9 +422,9 @@ impl SupervisorService {
             // Startup remediation still runs when a previous leader completed
             // retention recently. Summary catch-up gets a turn after housekeeping.
             if retention_due || !matches!(cycle_reason, SupervisorCycleReason::Scheduled) {
-                self.run_maintenance_cycle(&retention).await;
+                retention_success &= self.run_maintenance_cycle(&retention).await;
             }
-            if retention_due {
+            if retention_due || !retention_success {
                 ScheduleRepository::finish_attempt(
                     &self.inner.pool,
                     MaintenanceJob::Retention,
@@ -430,6 +434,10 @@ impl SupervisorService {
                 )
                 .await?;
             }
+            // Object/graph maintenance owns its cadence and success record. A
+            // pending raw scan must not rerun hourly runtime retention.
+            self.run_object_retention_job(&retention, cycle_reason, now)
+                .await?;
             // Invalid persisted native settings disable only native work for
             // this cycle, so they cannot prevent protected-row cleanup/remediation.
             if let Some(error) = native_validation_error {
@@ -462,7 +470,21 @@ impl SupervisorService {
             warn!(error = %error, "Failed to close supervisor leader session");
         }
 
-        cycle_result.map(|_| interval)
+        cycle_result?;
+        if self.inner.config.maintenance.enabled {
+            let statuses = ScheduleRepository::status(&self.inner.pool).await?;
+            if let Some(object) = statuses
+                .iter()
+                .find(|status| status.job == MaintenanceJob::ObjectRetention)
+            {
+                let delay = (object.next_due - now.max(Utc::now()))
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1))
+                    .max(Duration::from_secs(1));
+                return Ok(interval.min(delay));
+            }
+        }
+        Ok(interval)
     }
 
     async fn ensure_supervisor_run(
@@ -682,11 +704,13 @@ impl SupervisorService {
         }
     }
 
-    async fn run_maintenance_cycle(&self, retention: &RetentionConfig) {
+    /// Housekeeping keeps the row-retention cadence. Object/graph maintenance
+    /// has a distinct durable job so its continuation cannot rerun these steps.
+    async fn run_maintenance_cycle(&self, retention: &RetentionConfig) -> bool {
         let maintenance = &self.inner.config.maintenance;
         if !maintenance.enabled {
             info!("Supervisor maintenance jobs are disabled; skipping");
-            return;
+            return true;
         }
 
         if maintenance.artifact_cleanup_enabled {
@@ -721,26 +745,6 @@ impl SupervisorService {
             warn!(error = %err, "Artifact object metadata reconciliation failed");
         }
 
-        match object_retention::run_cycle(
-            &self.inner.pool,
-            &self.inner.blob_store,
-            std::path::Path::new(&self.inner.config.packs_base_dir),
-            maintenance,
-        )
-        .await
-        {
-            Ok(metrics) => info!(
-                retained_releases = metrics.retained_releases,
-                deleted_releases = metrics.deleted_releases,
-                pending_collection = metrics.pending_collection,
-                deleted_objects = metrics.deleted_objects,
-                deleted_bytes = metrics.deleted_bytes,
-                failures = metrics.failures,
-                "Object retention cycle completed"
-            ),
-            Err(err) => warn!(error = %err, "Object retention cycle failed"),
-        }
-
         if let Err(err) = self.delete_expired_legacy_snapshots(maintenance).await {
             warn!(error = %err, "Legacy snapshot cleanup failed");
         }
@@ -760,6 +764,124 @@ impl SupervisorService {
                 warn!(error = %err, "Supervisor corrective actions failed");
             }
         }
+        true
+    }
+
+    async fn run_object_retention_job(
+        &self,
+        retention: &RetentionConfig,
+        reason: SupervisorCycleReason,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let maintenance = &self.inner.config.maintenance;
+        if !maintenance.enabled {
+            return Ok(());
+        }
+        let previous = ScheduleRepository::status(&self.inner.pool)
+            .await?
+            .into_iter()
+            .find(|status| status.job == MaintenanceJob::ObjectRetention);
+        let budget = attune_common::repositories::maintenance_admission::MaintenanceBudget {
+            queued_admission: previous
+                .as_ref()
+                .and_then(|status| status.deferred_since)
+                .is_some_and(|since| since <= now.max(Utc::now()) - ChronoDuration::minutes(5)),
+            ..Default::default()
+        };
+        if !ScheduleRepository::begin_attempt(
+            &self.inner.pool,
+            MaintenanceJob::ObjectRetention,
+            now,
+            retention.check_interval_seconds,
+            !matches!(reason, SupervisorCycleReason::Scheduled),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let mut interval_seconds = retention.check_interval_seconds;
+        let complete = match object_retention::run_cycle_with_budget(
+            &self.inner.pool,
+            &self.inner.blob_store,
+            std::path::Path::new(&self.inner.config.packs_base_dir),
+            maintenance,
+            &budget,
+        )
+        .await
+        {
+            Ok(mut metrics) => {
+                if !metrics.metadata_complete {
+                    metrics.oldest_metadata_deferral_seconds = [
+                        metrics.oldest_metadata_deferral_seconds,
+                        previous
+                            .as_ref()
+                            .and_then(|status| status.deferred_since)
+                            .map(|since| (now.max(Utc::now()) - since).num_seconds().max(0)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                }
+                info!(
+                    retained_releases = metrics.retained_releases,
+                    deleted_releases = metrics.deleted_releases,
+                    pending_collection = metrics.pending_collection,
+                    deleted_objects = metrics.deleted_objects,
+                    deleted_bytes = metrics.deleted_bytes,
+                    failures = metrics.failures,
+                    graph_candidates = metrics.graph_candidates,
+                    graph_rows_changed = metrics.graph_rows_changed,
+                    graph_lock_deferrals = metrics.graph_lock_deferrals,
+                    graph_deadline_deferrals = metrics.graph_deadline_deferrals,
+                    graph_collection_complete = metrics.graph_collection_complete,
+                    graph_scan_pending = metrics.graph_scan_pending,
+                    metadata_complete = metrics.metadata_complete,
+                    metadata_scan_pending = metrics.metadata_scan_pending,
+                    metadata_lock_deferrals = metrics.metadata_lock_deferrals,
+                    metadata_deadline_deferrals = metrics.metadata_deadline_deferrals,
+                    metadata_rows_changed = metrics.metadata_rows_changed,
+                    oldest_metadata_deferral_seconds = metrics.oldest_metadata_deferral_seconds,
+                    oldest_graph_deferral_seconds = metrics.oldest_graph_deferral_seconds,
+                    "Object retention cycle completed"
+                );
+                if maintenance.monitoring_enabled {
+                    if let Err(error) = self
+                        .emit_graph_reclamation_deferral_alert(&metrics, maintenance)
+                        .await
+                    {
+                        warn!(%error, "Failed to report graph reclamation deferral");
+                    }
+                }
+                if let Some(next) = metrics.next_graph_attempt {
+                    let delay = (next - Utc::now()).num_seconds().max(1) as u64;
+                    interval_seconds = interval_seconds.min(delay);
+                }
+                if metrics.metadata_scan_pending
+                    && metrics.metadata_lock_deferrals == 0
+                    && (metrics.metadata_deadline_deferrals == 0
+                        || metrics.metadata_rows_changed > 0)
+                    && metrics.failures == 0
+                {
+                    interval_seconds = interval_seconds.min(1);
+                }
+                metrics.failures == 0
+                    && metrics.graph_collection_complete
+                    && metrics.metadata_complete
+            }
+            Err(err) => {
+                warn!(error = %err, "Object retention cycle failed");
+                false
+            }
+        };
+        ScheduleRepository::finish_attempt(
+            &self.inner.pool,
+            MaintenanceJob::ObjectRetention,
+            now,
+            interval_seconds,
+            complete,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn delete_expired_legacy_snapshots(
@@ -814,38 +936,8 @@ impl SupervisorService {
             maintenance.artifact_cleanup_batch_size,
         )
         .await?;
-        let pending_cutoff = Utc::now()
-            - ChronoDuration::seconds(
-                maintenance
-                    .object_upload_abandon_seconds
-                    .min(i64::MAX as u64) as i64,
-            );
-        for candidate in StorageMaintenanceRepository::abandoned_pending(
-            &self.inner.pool,
-            pending_cutoff,
-            maintenance.artifact_cleanup_batch_size,
-        )
-        .await?
-        {
-            if !StorageMaintenanceRepository::claim_abandoned_pending(
-                &self.inner.pool,
-                candidate.id,
-                pending_cutoff,
-            )
-            .await?
-            {
-                continue;
-            }
-            if StorageMaintenanceRepository::delete_cleanup_claimed(&self.inner.pool, candidate.id)
-                .await?
-            {
-                MaintenanceRepository::refresh_or_delete_artifact_metadata(
-                    &self.inner.pool,
-                    candidate.artifact,
-                )
-                .await?;
-            }
-        }
+        // Abandoned object uploads belong to the independently scheduled,
+        // bounded object-retention job, not this hourly reconciliation path.
 
         artifact_cleanup::cleanup_abandoned_shared_logs(
             &self.inner.pool,
@@ -987,6 +1079,52 @@ impl SupervisorService {
         }
 
         Ok(())
+    }
+
+    async fn emit_graph_reclamation_deferral_alert(
+        &self,
+        metrics: &object_retention::ObjectRetentionMetrics,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<()> {
+        let Some(age) = [
+            metrics.oldest_graph_deferral_seconds,
+            metrics.oldest_metadata_deferral_seconds,
+        ]
+        .into_iter()
+        .flatten()
+        .max() else {
+            return Ok(());
+        };
+        let max_deferral =
+            attune_common::repositories::pack_retention::GraphReclamationOptions::default()
+                .max_deferral
+                .as_secs();
+        if age < max_deferral as i64 || maintenance.alert_limit_per_cycle == 0 {
+            return Ok(());
+        }
+        let correlation_id = "supervisor:graph-reclamation:deferral".to_string();
+        if self
+            .alert_recently_emitted(&correlation_id, maintenance)
+            .await?
+        {
+            return Ok(());
+        }
+        self.emit_supervisor_alert(SupervisorAlertRequest {
+            severity: "warning",
+            category: "maintenance",
+            failure_type: "graph_reclamation_deferred",
+            component_type: "retention_target",
+            component_ref: Some("graph_reclamation".into()),
+            summary: "Graph reclamation remains deferred; review bounded maintenance opportunities"
+                .into(),
+            details: json!({
+                "oldest_deferral_seconds": age,
+                "lock_deferrals": metrics.graph_lock_deferrals,
+                "deadline_deferrals": metrics.graph_deadline_deferrals,
+            }),
+            correlation_id,
+        })
+        .await
     }
 
     async fn emit_retention_lag_alerts(
@@ -1745,7 +1883,11 @@ async fn main() -> Result<()> {
         rollback_snapshot_seconds,
     }) = args.command
     {
-        let db = Database::new(&config.database).await?;
+        let db = Database::new_named(
+            &config.database,
+            attune_common::db::ConnectionIdentity::for_process("supervisor", "maintenance"),
+        )
+        .await?;
         let period = rollback_snapshot_seconds
             .unwrap_or(config.maintenance.storage_rollback_snapshot_seconds);
         if period == 0 {
@@ -2024,6 +2166,291 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_cleanup_failure_retries_without_shortening_row_retention() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database).await.unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = false;
+        config.maintenance.pack_release_retention_enabled = false;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention.native_maintenance.enabled = false;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let now = DateTime::parse_from_rfc3339("2040-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=$1, last_success=NULL")
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        // Failure injection is confined to this test's physical database clone.
+        sqlx::query("ALTER TABLE object_maintenance_ledger RENAME TO unavailable_object_ledger")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                config,
+                artifact_transport: Arc::new(VolumeTransport::new(
+                    artifacts.path().to_str().unwrap(),
+                )),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, now)
+            .await
+            .unwrap();
+        let status = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.job == MaintenanceJob::ObjectRetention)
+            .unwrap();
+        assert_eq!(status.last_success, None);
+        assert_eq!(status.next_due, now + ChronoDuration::minutes(1));
+        let row_retention = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.job == MaintenanceJob::Retention)
+            .unwrap();
+        assert_eq!(row_retention.last_success, Some(now));
+        assert_eq!(row_retention.next_due, now + ChronoDuration::hours(1));
+        // Startup remediation can run before hourly retention is due. A failed
+        // forced attempt still needs a bounded retry, not an hour of deferral.
+        let previous_success = now - ChronoDuration::minutes(1);
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=$1,last_success=$2 WHERE job='object_retention'")
+            .bind(now + ChronoDuration::hours(1))
+            .bind(previous_success)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let startup = now + ChronoDuration::seconds(10);
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::StartupRecovery, startup)
+            .await
+            .unwrap();
+        let status = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.job == MaintenanceJob::ObjectRetention)
+            .unwrap();
+        assert_eq!(status.last_success, Some(previous_success));
+        assert_eq!(status.next_due, startup + ChronoDuration::minutes(1));
+        service.inner.pool.close().await;
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_continuations_cross_large_pinned_prefix_without_running_hourly_retention() {
+        use attune_common::{
+            models::enums::{
+                ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+                RetentionPolicyType,
+            },
+            repositories::{
+                artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
+                Create,
+            },
+        };
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database).await.unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = false;
+        config.maintenance.pack_release_retention_enabled = true;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention.native_maintenance.enabled = false;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=$1,last_success=$2 WHERE job='retention'")
+            .bind(now + ChronoDuration::hours(1)).bind(now)
+            .execute(database.pool()).await.unwrap();
+        let mut tx = database.pool().begin().await.unwrap();
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO runtime_cache_iteration_epoch(iteration,creation_transaction) SELECT id,'owned-supervisor-prefix' FROM generate_series(1,10241) id")
+            .execute(&mut *tx).await.unwrap();
+        // No physical bytes: the owner exercises the production evidence pins,
+        // while existing retention tests cover actual cleanup obligations.
+        sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,object_done,staging_done) VALUES(990001,990002,990003,true,true)")
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source) SELECT 990001,'runtime_cache_iteration_epoch',id FROM generate_series(1,10240) id")
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        let artifact = ArtifactRepository::create(
+            database.pool(),
+            CreateArtifactInput {
+                r#ref: "owned_supervisor_abandoned".into(),
+                scope: OwnerType::System,
+                owner: "supervisor-test".into(),
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::RuntimeLog,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 10,
+                name: None,
+                description: None,
+                content_type: None,
+                data: None,
+            },
+        )
+        .await
+        .unwrap();
+        let pending = ArtifactVersionRepository::create_object_pending(
+            database.pool(),
+            artifact.id,
+            None,
+            "application/octet-stream".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE artifact_version SET body_updated=clock_timestamp()-interval '2 days' WHERE id=$1")
+            .bind(pending.id).execute(database.pool()).await.unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                config,
+                artifact_transport: Arc::new(VolumeTransport::new(
+                    artifacts.path().to_str().unwrap(),
+                )),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        // Exercise the production housekeeping caller, not just object_retention.
+        // Its old duplicate abandoned-upload loop could queue an unbounded writer.
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=clock_timestamp() WHERE job='retention'")
+            .execute(database.pool()).await.unwrap();
+        let mut capture = database.pool().begin().await.unwrap();
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+            &mut capture,
+        )
+        .await
+        .unwrap();
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            service.run_retention_cycle_at(SupervisorCycleReason::Scheduled, Utc::now()),
+        )
+        .await;
+        capture.rollback().await.unwrap();
+        first
+            .expect("housekeeping queued an unbounded graph writer")
+            .unwrap();
+        assert!(
+            ArtifactVersionRepository::find_by_id(database.pool(), pending.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let baseline = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|status| status.job == MaintenanceJob::Retention)
+            .unwrap();
+        let mut reclaimed = false;
+        for _ in 0..8 {
+            // Advance only the owned maintenance deadlines, never hourly
+            // retention. This models persisted continuation after a restart.
+            sqlx::query("UPDATE native_maintenance_schedule SET next_due=clock_timestamp() WHERE job='object_retention'")
+                .execute(database.pool()).await.unwrap();
+            sqlx::query("UPDATE graph_reclamation_progress SET next_attempt=clock_timestamp() WHERE cursor_id<>0 OR high_water<>0 OR pass_deferred OR deferred_since IS NOT NULL")
+                .execute(database.pool()).await.unwrap();
+            let poll = service
+                .run_retention_cycle_at(SupervisorCycleReason::Scheduled, Utc::now())
+                .await
+                .unwrap();
+            let statuses = ScheduleRepository::status(database.pool()).await.unwrap();
+            let rows = statuses
+                .iter()
+                .find(|status| status.job == MaintenanceJob::Retention)
+                .unwrap();
+            assert_eq!(rows.last_success, baseline.last_success);
+            assert_eq!(rows.next_due, baseline.next_due);
+            reclaimed = !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM runtime_cache_iteration_epoch WHERE iteration=10241)",
+            )
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            if reclaimed {
+                break;
+            }
+            let object = statuses
+                .iter()
+                .find(|status| status.job == MaintenanceJob::ObjectRetention)
+                .unwrap();
+            assert!(
+                object.next_due <= Utc::now() + ChronoDuration::seconds(2),
+                "pending work earned an hourly cadence"
+            );
+            assert!(poll <= Duration::from_secs(2));
+        }
+        assert!(
+            reclaimed,
+            "production budgets did not cross the pinned prefix in bounded continuations"
+        );
+        let pins: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM runtime_cache_iteration_epoch WHERE iteration<=10240",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(pins, 10240);
+        service.inner.pool.close().await;
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_scheduler_keeps_hourly_retention_independent_and_resumes_bounded_jobs() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).unwrap();
@@ -2111,6 +2538,11 @@ mod tests {
         .await
         .unwrap();
         for row in &first {
+            if row.job == MaintenanceJob::ObjectRetention {
+                assert_eq!(row.last_success, None, "disabled object maintenance ran");
+                assert_eq!(row.next_due, now, "disabled object job was claimed");
+                continue;
+            }
             assert_eq!(
                 row.last_success,
                 Some(now),

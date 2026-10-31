@@ -27,7 +27,14 @@ async fn main() -> std::process::ExitCode {
             .map_err(|_| "Missing ATTUNE_ENCRYPTION_CONVERSION_SECRET. See --help.".to_string())?;
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
-            .connect(&url)
+            .connect_with(
+                attune_common::db::ConnectionIdentity::for_process(
+                    "encryption-convert",
+                    "maintenance",
+                )
+                .connect_options(&url)
+                .map_err(|_| "Invalid conversion database URL".to_string())?,
+            )
             .await
             .map_err(|_| {
                 "Cannot connect to the explicitly selected conversion database".to_string()

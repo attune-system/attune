@@ -34,6 +34,7 @@ use attune_common::models::{
     enums::{ArtifactBodyState, ArtifactUploadGrantState, LogStreamBackend},
     log_stream::{LogSegment, LogStream},
 };
+use attune_common::observability::SharedGraphTransactionTrace;
 use attune_common::repositories::artifact::ArtifactVersionRepository;
 use attune_common::repositories::artifact_upload_grant::{
     ArtifactUploadGrantRepository, CreateArtifactUploadGrantInput,
@@ -2044,6 +2045,7 @@ struct SealLogQuery {
     truncated: bool,
 }
 
+#[tracing::instrument(name = "log_stream_seal", level = "debug", skip_all)]
 async fn seal_log_stream(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -2058,325 +2060,382 @@ async fn seal_log_stream(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
     // Shared append uses source -> artifact advisory -> version -> stream ->
     // flock. Sealing must acquire the same locks before taking its file snapshot.
-    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
-    let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
-    let version =
-        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
-            .await
-            .map_err(map_repository_error)?
-            .ok_or_else(|| {
-                (
-                    StatusCode::FORBIDDEN,
-                    "Worker log version unavailable".into(),
-                )
-            })?;
-    let stream = LogStreamRepository::lock(&mut transaction, stream.id)
-        .await
-        .map_err(map_repository_error)?;
-    let proof =
-        encrypted_log_seal_proof(&mut transaction, &state, &user, &version, &stream, &headers)
-            .await?;
-    let mut verifier = proof.as_ref().map(|proof| {
-        attune_common::runtime_log_completion::FrameVerifier::new(
-            state
-                .config
-                .security
-                .encryption_key
-                .as_deref()
-                .expect("validated encryption key"),
-            proof.context.execution,
-            version.id,
-            proof
-                .permit
-                .max_plaintext_bytes
-                .expect("validated plaintext cap") as u64,
-            proof.permit.max_bytes as u64,
-        )
-    });
-    let shared_snapshot = if stream.backend == LogStreamBackend::SharedFile {
-        let file_path = version.file_path.as_deref().ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                "Shared log has no file path".to_string(),
-            )
-        })?;
-        let transport = VolumeTransport::new(&state.config.artifacts_dir);
-        let snapshot = if attune_common::worker_delivery::credential(&user.claims)
-            .map_err(map_transport_error)?
-            .is_some()
-        {
-            let permit = attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_version(&mut transaction,version.id)
-                .await.map_err(map_transport_error)?.ok_or_else(|| (StatusCode::FORBIDDEN,"Worker delivery permit unavailable".into()))?;
-            transport
-                .inspect_log_file(file_path, Some(permit.max_bytes as u64))
+    let trace = SharedGraphTransactionTrace::new("api.log_stream_seal");
+    let operation = async {
+        let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+        trace.begun();
+        trace.stage("version_authorization");
+        let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
+        trace.stage("version_and_stream_locks");
+        let version =
+            ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
                 .await
-        } else {
-            transport.inspect_log_file(file_path, None).await
-        };
-        Some(snapshot.map_err(map_transport_error)?)
-    } else {
-        None
-    };
-    if stream.sealed && proof.is_none() {
-        effect
-            .ensure_fresh_on(&mut transaction)
+                .map_err(map_repository_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "Worker log version unavailable".into(),
+                    )
+                })?;
+        let stream = LogStreamRepository::lock(&mut transaction, stream.id)
             .await
-            .map_err(map_api_error)?;
-        let unchanged = shared_snapshot.as_ref().is_none_or(|(_, size, digest)| {
-            version.size_bytes == i64::try_from(*size).ok()
-                && version.sha256.as_deref() == Some(hex_digest(digest).as_str())
-        });
-        return if unchanged
-            && log_stream_seal_is_complete(stream.truncated, query.truncated, version.body_state)
-        {
-            Ok(StatusCode::OK)
-        } else {
-            Err((
-                StatusCode::CONFLICT,
-                "Log stream was already sealed with different state".to_string(),
-            ))
-        };
-    }
-    if stream.backend == LogStreamBackend::ObjectSegments
-        && ArtifactUploadGrantRepository::active_log_segment_exists(
-            &mut *transaction,
-            artifact_version,
-        )
-        .await
-        .map_err(map_repository_error)?
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "A log segment upload is still settling".to_string(),
-        ));
-    }
-
-    let (size, digest) = match stream.backend {
-        LogStreamBackend::ObjectSegments => {
-            let segments = LogStreamRepository::segments_with_conn(&mut transaction, stream.id)
-                .await
-                .map_err(map_repository_error)?;
-            validate_log_snapshot(&stream, &segments)?;
-            let mut reader = stream_log_segments(&state, segments, None, false)
-                .map_err(map_log_stream_read_error)?;
-            let mut hasher = Sha256::new();
-            while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
-                let chunk = chunk.map_err(map_blob_error)?;
-                if let Some(verifier) = &mut verifier {
-                    verifier.update(&chunk).map_err(map_transport_error)?;
-                }
-                hasher.update(&chunk);
-            }
-            (stream.total_bytes, hex_digest(&hasher.finalize().into()))
-        }
-        LogStreamBackend::SharedFile => {
-            let (_, size, digest) = shared_snapshot.as_ref().expect("shared snapshot");
-            let size = i64::try_from(*size).map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Log size overflow".to_string(),
-                )
-            })?;
-            if let Some(verifier) = &mut verifier {
-                let path = version
-                    .file_path
+            .map_err(map_repository_error)?;
+        trace.stage("encrypted_seal_proof");
+        let proof =
+            encrypted_log_seal_proof(&mut transaction, &state, &user, &version, &stream, &headers)
+                .await?;
+        let mut verifier = proof.as_ref().map(|proof| {
+            attune_common::runtime_log_completion::FrameVerifier::new(
+                state
+                    .config
+                    .security
+                    .encryption_key
                     .as_deref()
-                    .ok_or_else(|| (StatusCode::CONFLICT, "Shared log path unavailable".into()))?;
-                let mut reader = VolumeTransport::new(&state.config.artifacts_dir)
-                    .open_reader(path, 0)
-                    .await
-                    .map_err(map_transport_error)?;
-                let mut buffer = vec![0_u8; 64 * 1024];
-                loop {
-                    let count = reader.read(&mut buffer).await.map_err(|_| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Shared log verification failed".into(),
-                        )
-                    })?;
-                    if count == 0 {
-                        break;
-                    }
-                    verifier
-                        .update(&buffer[..count])
-                        .map_err(map_transport_error)?;
-                }
-            }
-            (size, hex_digest(digest))
-        }
-    };
-    if let Some(proof) = &proof {
-        if proof.manifest.ciphertext_bytes != size as u64
-            || proof.manifest.ciphertext_sha256 != digest
-        {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Encrypted log final bytes do not match the authenticated manifest".into(),
-            ));
-        }
-        verifier
-            .take()
-            .expect("encrypted verifier")
-            .finish(&proof.manifest)
-            .map_err(map_transport_error)?;
-        effect
-            .ensure_fresh_on(&mut transaction)
-            .await
-            .map_err(map_api_error)?;
-        attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::record(
-            &mut transaction,&proof.context,&proof.permit,&proof.manifest,&proof.authenticated,query.truncated).await.map_err(map_transport_error)?;
-        ArtifactVersionRepository::set_encrypted_log_manifest(
-            &mut transaction,
-            version.id,
-            &proof.authenticated,
-        )
-        .await
-        .map_err(map_transport_error)?;
-    }
-
-    let current_version =
-        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
-            .await
-            .map_err(map_repository_error)?
-            .ok_or_else(|| {
+                    .expect("validated encryption key"),
+                proof.context.execution,
+                version.id,
+                proof
+                    .permit
+                    .max_plaintext_bytes
+                    .expect("validated plaintext cap") as u64,
+                proof.permit.max_bytes as u64,
+            )
+        });
+        trace.stage("shared_file_snapshot");
+        let shared_snapshot = if stream.backend == LogStreamBackend::SharedFile {
+            let file_path = version.file_path.as_deref().ok_or_else(|| {
                 (
                     StatusCode::CONFLICT,
-                    "Log artifact disappeared while sealing".to_string(),
+                    "Shared log has no file path".to_string(),
                 )
             })?;
-    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
-        .await
-        .map_err(map_repository_error)?;
-    check_delivery_bounds(
-        &mut transaction,
-        &user,
-        artifact_version,
-        Some(stream.id),
-        DeliveryOperation::Seal {
-            sequences: locked.next_sequence,
-            bytes: size,
-        },
-    )
-    .await?;
-    if locked.backend == LogStreamBackend::ObjectSegments
-        && ArtifactUploadGrantRepository::active_log_segment_exists(
-            &mut *transaction,
-            artifact_version,
-        )
-        .await
-        .map_err(map_repository_error)?
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "A log segment upload is still settling".to_string(),
-        ));
-    }
-    if locked.sealed {
-        if log_stream_seal_is_complete(
-            locked.truncated,
-            query.truncated,
-            current_version.body_state,
-        ) && proof.as_ref().is_none_or(|_| {
-            current_version.size_bytes == Some(size)
-                && current_version.sha256.as_deref() == Some(digest.as_str())
-        }) {
+            let transport = VolumeTransport::new(&state.config.artifacts_dir);
+            let snapshot = if attune_common::worker_delivery::credential(&user.claims)
+                .map_err(map_transport_error)?
+                .is_some()
+            {
+                let permit = attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_version(&mut transaction,version.id)
+                .await.map_err(map_transport_error)?.ok_or_else(|| (StatusCode::FORBIDDEN,"Worker delivery permit unavailable".into()))?;
+                transport
+                    .inspect_log_file(file_path, Some(permit.max_bytes as u64))
+                    .await
+            } else {
+                transport.inspect_log_file(file_path, None).await
+            };
+            Some(snapshot.map_err(map_transport_error)?)
+        } else {
+            None
+        };
+        trace.stage("seal_state_validation");
+        if stream.sealed && proof.is_none() {
             effect
                 .ensure_fresh_on(&mut transaction)
                 .await
                 .map_err(map_api_error)?;
-            effect.commit(transaction).await.map_err(map_api_error)?;
-            return Ok(StatusCode::OK);
+            let unchanged = shared_snapshot.as_ref().is_none_or(|(_, size, digest)| {
+                version.size_bytes == i64::try_from(*size).ok()
+                    && version.sha256.as_deref() == Some(hex_digest(digest).as_str())
+            });
+            let result = if unchanged
+                && log_stream_seal_is_complete(
+                    stream.truncated,
+                    query.truncated,
+                    version.body_state,
+                ) {
+                Ok(StatusCode::OK)
+            } else {
+                Err((
+                    StatusCode::CONFLICT,
+                    "Log stream was already sealed with different state".to_string(),
+                ))
+            };
+            // Validation only. Await rollback rather than claiming that Drop
+            // completed the transaction or publishing incidental authorization writes.
+            trace.stage("validation_rollback");
+            transaction.rollback().await.map_err(map_sqlx_error)?;
+            trace.rolled_back();
+            if result.is_ok() {
+                effect.ensure_fresh().map_err(map_api_error)?;
+            }
+            return result;
         }
-        return Err((
-            StatusCode::CONFLICT,
-            "Log stream was concurrently sealed with different state".to_string(),
-        ));
-    }
-    if locked.backend != stream.backend {
-        return Err((
-            StatusCode::CONFLICT,
-            "Log stream backend changed while sealing".to_string(),
-        ));
-    }
-    if locked.backend == LogStreamBackend::ObjectSegments
-        && (locked.next_sequence != stream.next_sequence
-            || locked.total_bytes != stream.total_bytes)
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "Log stream changed while sealing".to_string(),
-        ));
-    }
-    if current_version.body_state != Some(ArtifactBodyState::Pending) {
-        return Err((
-            StatusCode::CONFLICT,
-            "Log artifact is not pending".to_string(),
-        ));
-    }
-    effect
-        .ensure_fresh_on(&mut transaction)
-        .await
-        .map_err(map_api_error)?;
-    if let Some((snapshot, _, _)) = &shared_snapshot {
-        snapshot.freeze().map_err(map_transport_error)?;
-    }
-    match locked.backend {
-        LogStreamBackend::ObjectSegments => {
-            LogStreamRepository::seal(&mut transaction, stream.id, query.truncated)
-                .await
-                .map_err(map_repository_error)?;
-        }
-        LogStreamBackend::SharedFile => {
-            LogStreamRepository::seal_shared_file(
-                &mut transaction,
-                stream.id,
-                size,
-                query.truncated,
+        if stream.backend == LogStreamBackend::ObjectSegments
+            && ArtifactUploadGrantRepository::active_log_segment_exists(
+                &mut *transaction,
+                artifact_version,
             )
             .await
-            .map_err(map_repository_error)?;
+            .map_err(map_repository_error)?
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "A log segment upload is still settling".to_string(),
+            ));
         }
-    }
-    let ready = if locked.backend == LogStreamBackend::ObjectSegments {
-        ArtifactVersionRepository::mark_body_ready_in_transaction(
+
+        trace.stage("storage_verification");
+        let verification_started = std::time::Instant::now();
+        tracing::debug!(
+            stage = "storage_verification",
+            event = "started",
+            "Log seal stage"
+        );
+        let (size, digest) = match stream.backend {
+            LogStreamBackend::ObjectSegments => {
+                let segments = LogStreamRepository::segments_with_conn(&mut transaction, stream.id)
+                    .await
+                    .map_err(map_repository_error)?;
+                validate_log_snapshot(&stream, &segments)?;
+                let mut reader = stream_log_segments(&state, segments, None, false)
+                    .map_err(map_log_stream_read_error)?;
+                let mut hasher = Sha256::new();
+                while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
+                    let chunk = chunk.map_err(map_blob_error)?;
+                    if let Some(verifier) = &mut verifier {
+                        verifier.update(&chunk).map_err(map_transport_error)?;
+                    }
+                    hasher.update(&chunk);
+                }
+                (stream.total_bytes, hex_digest(&hasher.finalize().into()))
+            }
+            LogStreamBackend::SharedFile => {
+                let (_, size, digest) = shared_snapshot.as_ref().expect("shared snapshot");
+                let size = i64::try_from(*size).map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Log size overflow".to_string(),
+                    )
+                })?;
+                if let Some(verifier) = &mut verifier {
+                    let path = version.file_path.as_deref().ok_or_else(|| {
+                        (StatusCode::CONFLICT, "Shared log path unavailable".into())
+                    })?;
+                    let mut reader = VolumeTransport::new(&state.config.artifacts_dir)
+                        .open_reader(path, 0)
+                        .await
+                        .map_err(map_transport_error)?;
+                    let mut buffer = vec![0_u8; 64 * 1024];
+                    loop {
+                        let count = reader.read(&mut buffer).await.map_err(|_| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Shared log verification failed".into(),
+                            )
+                        })?;
+                        if count == 0 {
+                            break;
+                        }
+                        verifier
+                            .update(&buffer[..count])
+                            .map_err(map_transport_error)?;
+                    }
+                }
+                (size, hex_digest(digest))
+            }
+        };
+        tracing::debug!(
+            stage = "storage_verification",
+            event = "completed",
+            elapsed_us = verification_started.elapsed().as_micros() as u64,
+            "Log seal stage"
+        );
+        trace.stage("manifest_validation");
+        if let Some(proof) = &proof {
+            if proof.manifest.ciphertext_bytes != size as u64
+                || proof.manifest.ciphertext_sha256 != digest
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Encrypted log final bytes do not match the authenticated manifest".into(),
+                ));
+            }
+            verifier
+                .take()
+                .expect("encrypted verifier")
+                .finish(&proof.manifest)
+                .map_err(map_transport_error)?;
+            effect
+                .ensure_fresh_on(&mut transaction)
+                .await
+                .map_err(map_api_error)?;
+            attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::record(
+            &mut transaction,&proof.context,&proof.permit,&proof.manifest,&proof.authenticated,query.truncated).await.map_err(map_transport_error)?;
+            ArtifactVersionRepository::set_encrypted_log_manifest(
+                &mut transaction,
+                version.id,
+                &proof.authenticated,
+            )
+            .await
+            .map_err(map_transport_error)?;
+        }
+
+        trace.stage("publication_revalidation");
+        let current_version =
+            ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
+                .await
+                .map_err(map_repository_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::CONFLICT,
+                        "Log artifact disappeared while sealing".to_string(),
+                    )
+                })?;
+        let locked = LogStreamRepository::lock(&mut transaction, stream.id)
+            .await
+            .map_err(map_repository_error)?;
+        check_delivery_bounds(
             &mut transaction,
+            &user,
             artifact_version,
-            &format!("segments:{}", locked.next_sequence),
-            size,
-            &digest,
+            Some(stream.id),
+            DeliveryOperation::Seal {
+                sequences: locked.next_sequence,
+                bytes: size,
+            },
         )
-        .await
-    } else {
-        ArtifactVersionRepository::mark_log_body_ready_in_transaction(
-            &mut transaction,
+        .await?;
+        if locked.backend == LogStreamBackend::ObjectSegments
+            && ArtifactUploadGrantRepository::active_log_segment_exists(
+                &mut *transaction,
+                artifact_version,
+            )
+            .await
+            .map_err(map_repository_error)?
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "A log segment upload is still settling".to_string(),
+            ));
+        }
+        if locked.sealed {
+            if log_stream_seal_is_complete(
+                locked.truncated,
+                query.truncated,
+                current_version.body_state,
+            ) && proof.as_ref().is_none_or(|_| {
+                current_version.size_bytes == Some(size)
+                    && current_version.sha256.as_deref() == Some(digest.as_str())
+            }) {
+                effect
+                    .ensure_fresh_on(&mut transaction)
+                    .await
+                    .map_err(map_api_error)?;
+                trace.stage("commit");
+                transaction
+                    .commit()
+                    .await
+                    .map_err(crate::middleware::ApiError::from)
+                    .map_err(map_api_error)?;
+                trace.committed();
+                effect.ensure_fresh().map_err(map_api_error)?;
+                return Ok(StatusCode::OK);
+            }
+            return Err((
+                StatusCode::CONFLICT,
+                "Log stream was concurrently sealed with different state".to_string(),
+            ));
+        }
+        if locked.backend != stream.backend {
+            return Err((
+                StatusCode::CONFLICT,
+                "Log stream backend changed while sealing".to_string(),
+            ));
+        }
+        if locked.backend == LogStreamBackend::ObjectSegments
+            && (locked.next_sequence != stream.next_sequence
+                || locked.total_bytes != stream.total_bytes)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Log stream changed while sealing".to_string(),
+            ));
+        }
+        if current_version.body_state != Some(ArtifactBodyState::Pending) {
+            return Err((
+                StatusCode::CONFLICT,
+                "Log artifact is not pending".to_string(),
+            ));
+        }
+        trace.stage("final_freshness_and_publication");
+        effect
+            .ensure_fresh_on(&mut transaction)
+            .await
+            .map_err(map_api_error)?;
+        if let Some((snapshot, _, _)) = &shared_snapshot {
+            snapshot.freeze().map_err(map_transport_error)?;
+        }
+        match locked.backend {
+            LogStreamBackend::ObjectSegments => {
+                LogStreamRepository::seal(&mut transaction, stream.id, query.truncated)
+                    .await
+                    .map_err(map_repository_error)?;
+            }
+            LogStreamBackend::SharedFile => {
+                LogStreamRepository::seal_shared_file(
+                    &mut transaction,
+                    stream.id,
+                    size,
+                    query.truncated,
+                )
+                .await
+                .map_err(map_repository_error)?;
+            }
+        }
+        let ready = if locked.backend == LogStreamBackend::ObjectSegments {
+            ArtifactVersionRepository::mark_body_ready_in_transaction(
+                &mut transaction,
+                artifact_version,
+                &format!("segments:{}", locked.next_sequence),
+                size,
+                &digest,
+            )
+            .await
+        } else {
+            ArtifactVersionRepository::mark_log_body_ready_in_transaction(
+                &mut transaction,
+                artifact_version,
+                size,
+                &digest,
+            )
+            .await
+        }
+        .map_err(map_repository_error)?;
+        if ready.is_none() {
+            return Err((
+                StatusCode::CONFLICT,
+                "Log artifact could not be marked ready".to_string(),
+            ));
+        }
+        effect
+            .ensure_fresh_on(&mut transaction)
+            .await
+            .map_err(map_api_error)?;
+        trace.stage("commit");
+        transaction
+            .commit()
+            .await
+            .map_err(crate::middleware::ApiError::from)
+            .map_err(map_api_error)?;
+        trace.committed();
+        effect.ensure_fresh().map_err(map_api_error)?;
+        info!(
             artifact_version,
-            size,
-            &digest,
-        )
-        .await
-    }
-    .map_err(map_repository_error)?;
-    if ready.is_none() {
-        return Err((
-            StatusCode::CONFLICT,
-            "Log artifact could not be marked ready".to_string(),
-        ));
-    }
-    effect
-        .ensure_fresh_on(&mut transaction)
-        .await
-        .map_err(map_api_error)?;
-    effect.commit(transaction).await.map_err(map_api_error)?;
-    info!(
-        artifact_version,
-        stream_id = stream.id,
-        backend = ?locked.backend,
-        segments = locked.next_sequence,
-        bytes = size,
-        truncated = query.truncated,
-        "Sealed runtime log stream"
-    );
-    Ok(StatusCode::OK)
+            stream_id = stream.id,
+            backend = ?locked.backend,
+            segments = locked.next_sequence,
+            bytes = size,
+            truncated = query.truncated,
+            "Sealed runtime log stream"
+        );
+        Ok(StatusCode::OK)
+    };
+    let result = trace.observe(operation).await;
+    trace.operation_result(match &result {
+        Ok(_) => "success",
+        Err((status, _)) if status.is_client_error() => "rejected",
+        Err(_) => "error",
+    });
+    result
 }
 
 fn log_stream_seal_is_complete(

@@ -1,8 +1,11 @@
 //! Supervisor maintenance repository helpers.
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{FromRow, PgPool, Row};
+use sqlx::{FromRow, PgConnection, PgPool, Row};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
+use super::maintenance_admission::{self, MaintenanceBudget, MaintenanceResult};
 use crate::{
     models::{Id, JsonDict},
     Result,
@@ -248,6 +251,16 @@ impl MaintenanceRepository {
         pool: &PgPool,
         artifact_id: i64,
     ) -> Result<bool> {
+        let mut conn = pool.acquire().await?;
+        Self::refresh_or_delete_artifact_metadata_with_conn(&mut conn, artifact_id)
+            .await
+            .map(|(deleted, _)| deleted)
+    }
+
+    pub(super) async fn refresh_or_delete_artifact_metadata_with_conn(
+        conn: &mut PgConnection,
+        artifact_id: i64,
+    ) -> Result<(bool, u64)> {
         let refreshed = sqlx::query(
             "WITH latest AS (
                 SELECT size_bytes, content_type
@@ -265,11 +278,11 @@ impl MaintenanceRepository {
              WHERE a.id = $1",
         )
         .bind(artifact_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
         if refreshed.rows_affected() > 0 {
-            return Ok(false);
+            return Ok((false, refreshed.rows_affected()));
         }
 
         let deleted = sqlx::query(
@@ -286,10 +299,53 @@ impl MaintenanceRepository {
                )",
         )
         .bind(artifact_id)
-        .execute(pool)
+        .execute(conn)
         .await?;
 
-        Ok(deleted.rows_affected() > 0)
+        Ok((deleted.rows_affected() > 0, deleted.rows_affected()))
+    }
+
+    pub async fn refresh_or_delete_artifact_metadata_bounded(
+        pool: &PgPool,
+        artifact_id: i64,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<bool> {
+        maintenance_admission::run(
+            pool,
+            budget,
+            deadline,
+            cancel,
+            move |conn| {
+                Box::pin(async move {
+                    Ok(sqlx::query_scalar::<_, String>(
+                        "SELECT xmin::text FROM artifact WHERE id=$1",
+                    )
+                    .bind(artifact_id)
+                    .fetch_all(conn)
+                    .await?)
+                })
+            },
+            move |conn, candidates| {
+                Box::pin(async move {
+                    let current: Option<i64> = sqlx::query_scalar(
+                        "SELECT id FROM artifact WHERE id=$1 AND xmin::text=$2 FOR UPDATE",
+                    )
+                    .bind(artifact_id)
+                    .bind(&candidates[0])
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                    if current.is_none() {
+                        return Ok((false, 0));
+                    }
+                    // Refresh reads the current ready-version frontier. The DELETE
+                    // predicate and its triggers recheck emptiness, data and pins.
+                    Self::refresh_or_delete_artifact_metadata_with_conn(conn, artifact_id).await
+                })
+            },
+        )
+        .await
     }
 
     pub async fn stuck_runtime_snapshots(

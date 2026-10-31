@@ -1,6 +1,7 @@
 //! Physical-cleanup-owned retention of frozen file disclosure evidence.
 //! Pins preserve rows, never validity, grants or process-token liveness.
 use super::{
+    maintenance_admission::{self, MaintenanceBudget, MaintenanceOutcome, MaintenanceResult},
     runtime_read::{RuntimeReadOrigin, RuntimeReadRepository, RuntimeReadTarget},
     schema_type::SchemaTypeRepository,
 };
@@ -12,6 +13,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgConnection;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 pub struct FileEvidenceRetentionRepository;
 
@@ -313,11 +316,19 @@ mod purpose_retention_tests {
         ));
     }
 }
-#[derive(sqlx::FromRow)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct FilePutRecovery {
     version: i64,
     object_key: String,
     token: uuid::Uuid,
+}
+
+#[derive(Clone)]
+struct FileAuditVisit {
+    owner: Option<(i64, String)>,
+    progress_revision: i64,
+    high_water: i64,
+    next_cursor: i64,
 }
 impl FilePutRecovery {
     pub fn key(&self) -> Result<crate::blob_store::ObjectKey> {
@@ -994,16 +1005,25 @@ impl FileEvidenceRetentionRepository {
     pub async fn readmit(pool: &sqlx::PgPool, version: i64) -> Result<bool> {
         let mut tx = pool.begin().await?;
         Self::lock_reclamation(&mut tx).await?;
-        let candidate:Option<(i64,Value)>=sqlx::query_as("SELECT root_read,reservation FROM file_evidence_owner WHERE version=$1 AND evidence_state IN ('pending_audit','quarantined') AND NOT metadata_gone AND cleanup_group IS NULL FOR UPDATE")
-            .bind(version).fetch_optional(&mut *tx).await?;
+        let admitted = Self::readmit_with_conn(&mut tx, version, None).await?;
+        tx.commit().await?;
+        Ok(admitted.unwrap_or(false))
+    }
+
+    async fn readmit_with_conn(
+        conn: &mut PgConnection,
+        version: i64,
+        observed: Option<&str>,
+    ) -> Result<Option<bool>> {
+        let candidate:Option<(i64,Value)>=sqlx::query_as("SELECT root_read,reservation FROM file_evidence_owner WHERE version=$1 AND ($2::text IS NULL OR xmin::text=$2) AND evidence_state IN ('pending_audit','quarantined') AND NOT metadata_gone AND cleanup_group IS NULL FOR UPDATE")
+            .bind(version).bind(observed).fetch_optional(&mut *conn).await?;
         let Some((root, reservation)) = candidate else {
-            tx.rollback().await?;
-            return Ok(false);
+            return Ok(None);
         };
         // A savepoint rolls back partial graph pins without losing the durable
         // physical owner or aborting the transaction that records quarantine.
         use sqlx::Acquire;
-        let mut audit = (&mut *tx).begin().await?;
+        let mut audit = (&mut *conn).begin().await?;
         let result=async {
             let origin=RuntimeReadRepository::find(&mut *audit,root).await?;
             let (artifact,execution)=match &origin.target {
@@ -1020,11 +1040,15 @@ impl FileEvidenceRetentionRepository {
         match result {
             Ok(()) => {
                 audit.commit().await?;
-                tx.commit().await?;
-                Ok(true)
+                Ok(Some(true))
             }
             Err(error) => {
                 audit.rollback().await?;
+                // Timeouts and SQL failures are not invalid historical evidence.
+                // The outer owner must roll back rather than record quarantine.
+                if matches!(error, Error::Database(_)) {
+                    return Err(error);
+                }
                 // Only our located structural diagnostic is safe to persist.
                 // SQL/provider error text may carry connection or object data.
                 let location=match error {
@@ -1033,9 +1057,8 @@ impl FileEvidenceRetentionRepository {
                 };
                 sqlx::query("UPDATE file_evidence_owner SET evidence_state='quarantined',diagnostic=$2 WHERE version=$1")
                     .bind(version).bind(format!("version {version}: {location}; repair the identified retained proof and retry bounded readmission, or request physical cleanup"))
-                    .execute(&mut *tx).await?;
-                tx.commit().await?;
-                Ok(false)
+                    .execute(conn).await?;
+                Ok(Some(false))
             }
         }
     }
@@ -1048,6 +1071,211 @@ impl FileEvidenceRetentionRepository {
             admitted += u64::from(Self::readmit(pool, version).await?);
         }
         Ok(admitted)
+    }
+
+    /// Each owner keeps its own atomic readmission/quarantine commit. Confirmed
+    /// counts survive a later deferral, failure or unknown commit. A failed visit
+    /// advances only advisory progress after acknowledged owner rollback.
+    pub async fn audit_pending_bounded(
+        pool: &sqlx::PgPool,
+        limit: i64,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<u64> {
+        let mut report = MaintenanceResult::empty(MaintenanceOutcome::NoWork);
+        if [
+            budget.statement_timeout,
+            budget.page_timeout,
+            budget.queued_lock_timeout,
+        ]
+        .iter()
+        .any(|duration| duration.as_millis() == 0 || duration.as_millis() > i32::MAX as u128)
+        {
+            report.outcome = MaintenanceOutcome::Failed;
+            report.error = Some(Error::validation("Invalid metadata maintenance budget"));
+            return report;
+        }
+        let Some(page_end) = Instant::now().checked_add(budget.page_timeout) else {
+            report.outcome = MaintenanceOutcome::Failed;
+            report.error = Some(Error::validation("Invalid metadata maintenance budget"));
+            return report;
+        };
+        let end = deadline.min(page_end);
+        for _ in 0..limit.clamp(1, 256) {
+            if Instant::now() >= end || cancel.is_cancelled() {
+                report.fail(
+                    Error::invalid_state("File audit page deadline or cancellation reached"),
+                    end,
+                    cancel,
+                );
+                break;
+            }
+            let visit = maintenance_admission::probe(pool, budget, end, cancel, |conn| {
+                Box::pin(Self::audit_candidate(conn))
+            })
+            .await;
+            let visit = match visit {
+                Ok(Some(visit)) => visit,
+                Ok(None) => break,
+                Err(error) => {
+                    report.fail(error, end, cancel);
+                    break;
+                }
+            };
+            report.candidates += usize::from(visit.owner.is_some());
+            let step = Self::audit_visit(pool, visit.clone(), budget, end, cancel, false).await;
+            if matches!(
+                step.outcome,
+                MaintenanceOutcome::Progress | MaintenanceOutcome::NoWork
+            ) {
+                report.changed += step.changed;
+                report.value = Some(report.value.unwrap_or(0) + step.value.unwrap_or(0));
+                if report.error.is_none() {
+                    report.outcome = if report.changed > 0 {
+                        MaintenanceOutcome::Progress
+                    } else {
+                        MaintenanceOutcome::NoWork
+                    };
+                }
+                if visit.next_cursor == 0 {
+                    break;
+                }
+                continue;
+            }
+            report.outcome = step.outcome;
+            report.error = step.error;
+            if !step.rollback_acknowledged
+                || cancel.is_cancelled()
+                || !matches!(
+                    step.outcome,
+                    MaintenanceOutcome::DeadlineDeferred | MaintenanceOutcome::Failed
+                )
+            {
+                break;
+            }
+            // Rollback has already acknowledged the end of owner mutation. Its
+            // drain time must not consume the separately reserved progress-only
+            // window. No owner mutation is retried after the page deadline.
+            let completion_end = deadline.min(Instant::now() + budget.statement_timeout);
+            let deferred =
+                Self::audit_visit(pool, visit.clone(), budget, completion_end, cancel, true).await;
+            if !matches!(
+                deferred.outcome,
+                MaintenanceOutcome::Progress | MaintenanceOutcome::NoWork
+            ) {
+                report.outcome = deferred.outcome;
+                if deferred.error.is_some() {
+                    report.error = deferred.error;
+                }
+                break;
+            }
+            if visit.next_cursor == 0 || Instant::now() >= end {
+                break;
+            }
+        }
+        report
+    }
+
+    async fn audit_candidate(conn: &mut PgConnection) -> Result<Option<FileAuditVisit>> {
+        let (after,mut high_water,revision,deferred): (i64,i64,i64,bool) = sqlx::query_as("SELECT cursor_id,high_water,revision,deferred_since IS NOT NULL FROM graph_reclamation_progress WHERE phase='file_audits'")
+            .fetch_one(&mut *conn).await?;
+        let pass_pending = after > 0 || high_water > 0 || deferred;
+        if high_water == 0 {
+            high_water =
+                sqlx::query_scalar("SELECT COALESCE(max(version),0) FROM file_evidence_owner")
+                    .fetch_one(&mut *conn)
+                    .await?;
+        }
+        let owner: Option<(i64,String)> = sqlx::query_as("SELECT version,xmin::text FROM file_evidence_owner WHERE version>$1 AND version<=$2 AND evidence_state='pending_audit' AND NOT metadata_gone AND cleanup_group IS NULL ORDER BY version LIMIT 1")
+            .bind(after).bind(high_water).fetch_optional(conn).await?;
+        Ok(match owner {
+            Some((version, xmin)) => Some(FileAuditVisit {
+                owner: Some((version, xmin)),
+                progress_revision: revision,
+                high_water,
+                next_cursor: if version >= high_water { 0 } else { version },
+            }),
+            None if pass_pending => Some(FileAuditVisit {
+                owner: None,
+                progress_revision: revision,
+                high_water: 0,
+                next_cursor: 0,
+            }),
+            None => None,
+        })
+    }
+
+    async fn audit_visit(
+        pool: &sqlx::PgPool,
+        visit: FileAuditVisit,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+        failed: bool,
+    ) -> MaintenanceResult<u64> {
+        maintenance_admission::run(pool,budget,deadline,cancel,
+            move |_| Box::pin(async move { Ok(vec![visit]) }),
+            move |conn,visits| Box::pin(async move {
+                let visit = &visits[0];
+                let revision: i64 = sqlx::query_scalar("SELECT revision FROM graph_reclamation_progress WHERE phase='file_audits' FOR UPDATE")
+                    .fetch_one(&mut *conn).await?;
+                if revision!=visit.progress_revision { return Ok((0,0)); }
+                let admitted = if failed { None } else if let Some((version,xmin)) = &visit.owner {
+                    Self::readmit_with_conn(conn,*version,Some(xmin)).await?
+                } else { None };
+                let still_pending = if !failed && admitted.is_none() {
+                    if let Some((version,_)) = &visit.owner {
+                        sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM file_evidence_owner WHERE version=$1 AND evidence_state='pending_audit' AND NOT metadata_gone AND cleanup_group IS NULL)")
+                            .bind(version).fetch_one(&mut *conn).await?
+                    } else { false }
+                } else { false };
+                // A failed visit records only scheduling evidence. It never
+                // quarantines the owner or creates/releases disclosure pins.
+                // Keep the oldest failure until a complete later clean pass.
+                sqlx::query("UPDATE graph_reclamation_progress SET cursor_id=$1,high_water=$2,revision=revision+1,last_attempt=clock_timestamp(),next_attempt=clock_timestamp(),last_progress=CASE WHEN $3 THEN clock_timestamp() ELSE last_progress END,deferred_since=CASE WHEN $4 THEN COALESCE(deferred_since,clock_timestamp()) WHEN $1=0 AND NOT pass_deferred THEN NULL ELSE deferred_since END,pass_deferred=CASE WHEN $1=0 THEN false ELSE pass_deferred OR $4 END WHERE phase='file_audits' AND revision=$5")
+                    .bind(visit.next_cursor).bind(if visit.next_cursor==0 {0} else {visit.high_water})
+                    .bind(admitted.is_some()).bind(failed || still_pending).bind(revision).execute(conn).await?;
+                Ok((u64::from(admitted==Some(true)),u64::from(admitted.is_some())))
+            }),
+        ).await
+    }
+
+    /// Continue unfinished visits or unresolved failures on the object's durable
+    /// retry cadence. This is scheduling state, not an eligible-owner count.
+    pub async fn audit_scan_pending(pool: &sqlx::PgPool) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT cursor_id>0 OR high_water>0 OR deferred_since IS NOT NULL FROM graph_reclamation_progress WHERE phase='file_audits'")
+            .fetch_one(pool).await?)
+    }
+
+    /// Fold this oldest unresolved failure into supervisor status/operator alerts.
+    /// Cheap successes must not conceal a repeatedly over-budget owner.
+    pub async fn audit_deferred_since(pool: &sqlx::PgPool) -> Result<Option<DateTime<Utc>>> {
+        Ok(sqlx::query_scalar(
+            "SELECT deferred_since FROM graph_reclamation_progress WHERE phase='file_audits'",
+        )
+        .fetch_one(pool)
+        .await?)
+    }
+
+    pub async fn readmit_bounded(
+        pool: &sqlx::PgPool,
+        version: i64,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<bool> {
+        maintenance_admission::run(pool, budget, deadline, cancel,
+            move |conn| Box::pin(async move {
+                Ok(sqlx::query_as::<_, (i64, String)>("SELECT version,xmin::text FROM file_evidence_owner WHERE version=$1 AND evidence_state IN ('pending_audit','quarantined') AND NOT metadata_gone AND cleanup_group IS NULL")
+                    .bind(version).fetch_all(conn).await?)
+            }),
+            |conn, candidates| Box::pin(async move {
+                let (version, observed) = &candidates[0];
+                let admitted = Self::readmit_with_conn(conn, *version, Some(observed)).await?;
+                Ok((admitted.unwrap_or(false), u64::from(admitted.is_some())))
+            }),
+        ).await
     }
 
     pub async fn begin_put(conn: &mut PgConnection, version: i64) -> Result<Option<uuid::Uuid>> {
@@ -1120,20 +1348,58 @@ impl FileEvidenceRetentionRepository {
     ) -> Result<Vec<FilePutRecovery>> {
         let mut tx = pool.begin().await?;
         Self::lock_reclamation(&mut tx).await?;
-        let versions:Vec<i64>=sqlx::query_scalar("SELECT version FROM file_evidence_owner o WHERE metadata_gone AND NOT object_done AND object_key IS NOT NULL AND EXISTS(SELECT 1 FROM file_evidence_put p WHERE p.owner=o.version AND protocol='atomic_create_v1') AND NOT EXISTS(SELECT 1 FROM file_evidence_put p WHERE p.owner=o.version AND protocol='legacy_unknown') ORDER BY version LIMIT $1 FOR UPDATE")
-            .bind(limit.clamp(1,256)).fetch_all(&mut *tx).await?;
+        let plans = Self::recovery_candidates_with_conn(&mut tx, limit, None).await?;
+        tx.commit().await?;
+        Ok(plans)
+    }
+
+    async fn recovery_candidates_with_conn(
+        conn: &mut PgConnection,
+        limit: i64,
+        observed: Option<Vec<(i64, String)>>,
+    ) -> Result<Vec<FilePutRecovery>> {
+        let (ids, revisions): (Option<Vec<_>>, Option<Vec<_>>) = match observed {
+            Some(rows) => {
+                let (ids, revisions) = rows.into_iter().unzip();
+                (Some(ids), Some(revisions))
+            }
+            None => (None, None),
+        };
+        let versions:Vec<i64>=sqlx::query_scalar("SELECT version FROM file_evidence_owner o WHERE ($2::bigint[] IS NULL OR (version,xmin::text) IN (SELECT * FROM unnest($2::bigint[],$3::text[]))) AND metadata_gone AND NOT object_done AND object_key IS NOT NULL AND EXISTS(SELECT 1 FROM file_evidence_put p WHERE p.owner=o.version AND protocol='atomic_create_v1') AND NOT EXISTS(SELECT 1 FROM file_evidence_put p WHERE p.owner=o.version AND protocol='legacy_unknown') ORDER BY version LIMIT $1 FOR UPDATE")
+            .bind(limit.clamp(1,256)).bind(ids).bind(revisions).fetch_all(&mut *conn).await?;
         for version in &versions {
             // Do this before installing the fence row. It also protects a
             // rollback to old maintenance binaries that do not know the table.
             sqlx::query("UPDATE object_maintenance_ledger SET state='write_fencing',updated=NOW() WHERE object_key=(SELECT object_key FROM file_evidence_owner WHERE version=$1) AND NOT EXISTS(SELECT 1 FROM file_evidence_write_fence WHERE object_key=object_maintenance_ledger.object_key)")
-                .bind(version).execute(&mut *tx).await?;
+                .bind(version).execute(&mut *conn).await?;
             sqlx::query("INSERT INTO file_evidence_write_fence(object_key,token,version) SELECT object_key,gen_random_uuid(),version FROM file_evidence_owner WHERE version=$1 ON CONFLICT(object_key) DO NOTHING")
-                .bind(version).execute(&mut *tx).await?;
+                .bind(version).execute(&mut *conn).await?;
         }
         let plans=sqlx::query_as("SELECT version,object_key,token FROM file_evidence_write_fence WHERE version=ANY($1) AND NOT confirmed ORDER BY version")
-            .bind(&versions).fetch_all(&mut *tx).await?;
-        tx.commit().await?;
+            .bind(&versions).fetch_all(conn).await?;
         Ok(plans)
+    }
+
+    pub async fn recovery_candidates_bounded(
+        pool: &sqlx::PgPool,
+        limit: i64,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<Vec<FilePutRecovery>> {
+        maintenance_admission::run(pool, budget, deadline, cancel,
+            move |conn| Box::pin(async move {
+                // Advisory discovery only. Recheck PUT protocols and exact row
+                // identity after admission before installing any fence.
+                Ok(sqlx::query_as::<_, (i64, String)>("SELECT version,xmin::text FROM file_evidence_owner o WHERE metadata_gone AND NOT object_done AND object_key IS NOT NULL AND EXISTS(SELECT 1 FROM file_evidence_put p WHERE p.owner=o.version AND protocol='atomic_create_v1') AND NOT EXISTS(SELECT 1 FROM file_evidence_put p WHERE p.owner=o.version AND protocol='legacy_unknown') ORDER BY version LIMIT $1")
+                    .bind(limit.clamp(1,256)).fetch_all(conn).await?)
+            }),
+            move |conn, candidates| Box::pin(async move {
+                let plans = Self::recovery_candidates_with_conn(conn, limit, Some(candidates)).await?;
+                let changed = plans.len() as u64;
+                Ok((plans, changed))
+            }),
+        ).await
     }
 
     pub async fn complete_put_recovery(
@@ -1146,25 +1412,63 @@ impl FileEvidenceRetentionRepository {
         }
         let mut tx = pool.begin().await?;
         Self::lock_reclamation(&mut tx).await?;
+        Self::complete_put_recovery_with_conn(&mut tx, plan, settled.provider().as_stored())
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn complete_put_recovery_with_conn(
+        conn: &mut PgConnection,
+        plan: &FilePutRecovery,
+        provider: &str,
+    ) -> Result<()> {
         let changed=sqlx::query("UPDATE file_evidence_write_fence SET confirmed=true,provider_version=$4 WHERE object_key=$1 AND token=$2 AND version=$3 AND (provider_version IS NULL OR provider_version=$4)")
-            .bind(&plan.object_key).bind(plan.token).bind(plan.version).bind(settled.provider().as_stored()).execute(&mut *tx).await?.rows_affected();
+            .bind(&plan.object_key).bind(plan.token).bind(plan.version).bind(provider).execute(&mut *conn).await?.rows_affected();
         if changed != 1 {
             return Err(denied());
         }
         sqlx::query("UPDATE object_maintenance_ledger SET state='write_fenced',provider_version=$2,size_bytes=0,updated=NOW() WHERE object_key=$1")
-            .bind(&plan.object_key).bind(settled.provider().as_stored()).execute(&mut *tx).await?;
+            .bind(&plan.object_key).bind(provider).execute(&mut *conn).await?;
         sqlx::query("DELETE FROM file_evidence_put WHERE owner=$1 AND protocol='atomic_create_v1'")
             .bind(plan.version)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         sqlx::query("UPDATE file_evidence_owner SET object_done=true WHERE version=$1 AND metadata_gone AND NOT EXISTS(SELECT 1 FROM file_evidence_put WHERE owner=$1)")
-            .bind(plan.version).execute(&mut *tx).await?;
+            .bind(plan.version).execute(&mut *conn).await?;
         sqlx::query("SELECT file_evidence_release($1)")
             .bind(plan.version)
-            .execute(&mut *tx)
+            .execute(conn)
             .await?;
-        tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn complete_put_recovery_bounded(
+        pool: &sqlx::PgPool,
+        plan: &FilePutRecovery,
+        settled: &crate::blob_store::FilePutSettlement,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<bool> {
+        let valid = settled.key().as_str() == plan.object_key && settled.token() == plan.token;
+        let probe_plan = plan.clone();
+        let plan = plan.clone();
+        let provider = settled.provider().as_stored().to_owned();
+        maintenance_admission::run(pool, budget, deadline, cancel,
+            move |conn| Box::pin(async move {
+                if !valid { return Err(denied()); }
+                Ok(sqlx::query_scalar::<_, String>("SELECT xmin::text FROM file_evidence_write_fence WHERE version=$1 AND object_key=$2 AND token=$3")
+                    .bind(probe_plan.version).bind(probe_plan.object_key).bind(probe_plan.token).fetch_all(conn).await?)
+            }),
+            move |conn, candidates| Box::pin(async move {
+                let current: Option<i64> = sqlx::query_scalar("SELECT version FROM file_evidence_write_fence WHERE version=$1 AND object_key=$2 AND token=$3 AND xmin::text=$4 FOR UPDATE")
+                    .bind(plan.version).bind(&plan.object_key).bind(plan.token).bind(&candidates[0]).fetch_optional(&mut *conn).await?;
+                if current.is_none() { return Ok((false,0)); }
+                Self::complete_put_recovery_with_conn(conn, &plan, &provider).await?;
+                Ok((true,1))
+            }),
+        ).await
     }
     pub async fn lock_capture(conn: &mut PgConnection) -> Result<()> {
         SchemaTypeRepository::lock_selection(conn).await
@@ -1249,7 +1553,10 @@ impl FileEvidenceRetentionRepository {
             if closure.seen.len() + closure.proof_rows > MAX_NODES {
                 return Err(denied());
             }
-            Self::expand(conn, &node, depth, &mut closure).await.map_err(|_|Error::PermissionDenied(format!("File evidence unavailable at {}/{}; retained dependency is missing, invalid or exceeds its bound",node.kind,node.id)))?;
+            Self::expand(conn, &node, depth, &mut closure).await.map_err(|error| match error {
+                Error::Database(_) => error,
+                _ => Error::PermissionDenied(format!("File evidence unavailable at {}/{}; retained dependency is missing, invalid or exceeds its bound",node.kind,node.id)),
+            })?;
             sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source,source_created,source_generation) VALUES($1,$2,$3,COALESCE($4,'-infinity'::timestamptz),COALESCE($5::BIGINT,0::BIGINT)) ON CONFLICT DO NOTHING")
                 .bind(version).bind(&node.kind).bind(node.id).bind(node.created).bind(node.generation).execute(&mut *conn).await?;
         }
