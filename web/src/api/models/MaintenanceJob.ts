@@ -6,4 +6,5 @@ export enum MaintenanceJob {
   PARTITION = "partition",
   SUMMARY = "summary",
   RETENTION = "retention",
+  OBJECT_RETENTION = "object_retention",
 }

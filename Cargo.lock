@@ -680,6 +680,7 @@ name = "attune-supervisor"
 version = "0.10.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "attune-common",
  "bytes",
  "chrono",

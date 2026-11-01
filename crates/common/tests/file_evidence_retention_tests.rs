@@ -11,6 +11,9 @@ use attune_common::{
 };
 use chrono::{DateTime, Duration, Utc};
 
+#[path = "file_evidence_retention_tests/bounded_admission.rs"]
+mod bounded_admission;
+
 async fn database() -> TestDatabase {
     let config = Config::load_from_file(&format!(
         "{}/../../config.test.yaml",

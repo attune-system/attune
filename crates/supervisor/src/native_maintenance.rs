@@ -58,7 +58,7 @@ impl SupervisorService {
             let interval = match job {
                 MaintenanceJob::Partition => config.partition_interval_seconds,
                 MaintenanceJob::Summary => config.summary_interval_seconds,
-                MaintenanceJob::Retention => unreachable!(),
+                MaintenanceJob::Retention | MaintenanceJob::ObjectRetention => unreachable!(),
             };
             let force = job == MaintenanceJob::Partition
                 && !matches!(reason, SupervisorCycleReason::Scheduled);
@@ -152,7 +152,7 @@ impl SupervisorService {
                         ),
                     }
                 }
-                MaintenanceJob::Retention => unreachable!(),
+                MaintenanceJob::Retention | MaintenanceJob::ObjectRetention => unreachable!(),
             };
             let (success, details) = match outcome {
                 Ok(outcome) => outcome,
@@ -249,7 +249,7 @@ impl SupervisorService {
                     })
                     .collect::<Vec<_>>()
             }),
-            MaintenanceJob::Retention => return,
+            MaintenanceJob::Retention | MaintenanceJob::ObjectRetention => return,
         };
         match statuses {
             Ok(statuses) => {

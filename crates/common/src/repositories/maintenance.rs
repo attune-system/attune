@@ -1,8 +1,11 @@
 //! Supervisor maintenance repository helpers.
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{FromRow, PgPool, Row};
+use sqlx::{FromRow, PgConnection, PgPool, Row};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
+use super::maintenance_admission::{self, MaintenanceBudget, MaintenanceResult};
 use crate::{
     models::{Id, JsonDict},
     Result,
@@ -27,6 +30,7 @@ pub struct ExpiredArtifactVersion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactCleanupResult {
+    /// Versions considered in this page, not an exact count of the backlog.
     pub candidates: i64,
     pub deleted_versions: i64,
     pub deleted_files: i64,
@@ -213,6 +217,76 @@ impl MaintenanceRepository {
         .map_err(Into::into)
     }
 
+    pub async fn expired_artifact_candidates_bounded(
+        pool: &PgPool,
+        limit: i64,
+        budget: &MaintenanceBudget,
+    ) -> Result<Vec<ExpiredArtifactVersion>> {
+        maintenance_admission::probe(pool, budget, Instant::now() + budget.page_timeout, &CancellationToken::new(), move |conn| Box::pin(async move {
+            let predicate = expired_artifact_version_predicate();
+            let versions = sqlx::query_as(&format!("SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version FROM artifact_version av JOIN artifact a ON a.id=av.artifact WHERE {predicate} ORDER BY av.created,av.id LIMIT $1"))
+                .bind(limit.max(1)).fetch_all(conn).await?;
+            Ok(versions)
+        })).await
+    }
+
+    /// The caller retains physical admission until both deletion and parent
+    /// refresh commit. A suppressed deletion must roll back incidental triggers.
+    pub async fn delete_artifact_version_and_refresh_with_conn(
+        conn: &mut PgConnection,
+        id: i64,
+        artifact: i64,
+    ) -> Result<(bool, bool)> {
+        let deleted = sqlx::query("DELETE FROM artifact_version WHERE id=$1 AND artifact=$2")
+            .bind(id)
+            .bind(artifact)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected()
+            == 1;
+        if !deleted {
+            return Ok((false, false));
+        }
+        let (parent_deleted, _) =
+            Self::refresh_or_delete_artifact_metadata_with_conn(conn, artifact).await?;
+        Ok((true, parent_deleted))
+    }
+
+    pub async fn orphaned_staging_bounded(
+        pool: &PgPool,
+        limit: i64,
+        budget: &MaintenanceBudget,
+    ) -> Result<Vec<(String, i64)>> {
+        maintenance_admission::probe(pool,budget,Instant::now()+budget.page_timeout,&CancellationToken::new(),move |conn| Box::pin(async move {
+            Ok(sqlx::query_as("SELECT g.file_path,g.artifact_version FROM artifact_file_staging_guard g WHERE NOT EXISTS(SELECT 1 FROM artifact_version v WHERE v.id=g.artifact_version OR v.file_path=g.file_path) ORDER BY g.artifact_version,g.file_path LIMIT $1")
+                .bind(limit.max(1)).fetch_all(conn).await?)
+        })).await
+    }
+
+    pub async fn release_orphaned_staging_bounded(
+        pool: &PgPool,
+        path: String,
+        version: i64,
+        budget: &MaintenanceBudget,
+    ) -> MaintenanceResult<()> {
+        let probe_path = path.clone();
+        maintenance_admission::run(pool,budget,Instant::now()+budget.page_timeout,&CancellationToken::new(),
+            move |conn| Box::pin(async move {
+                Ok(sqlx::query_scalar::<_,String>("SELECT xmin::text FROM artifact_file_staging_guard WHERE file_path=$1 AND artifact_version=$2")
+                    .bind(probe_path).bind(version).fetch_all(conn).await?)
+            }),
+            move |conn,candidates| Box::pin(async move {
+                let current: Option<i64> = sqlx::query_scalar("SELECT artifact_version FROM artifact_file_staging_guard g WHERE file_path=$1 AND artifact_version=$2 AND xmin::text=$3 AND NOT EXISTS(SELECT 1 FROM artifact_version v WHERE v.id=g.artifact_version OR v.file_path=g.file_path) FOR UPDATE")
+                    .bind(&path).bind(version).bind(&candidates[0]).fetch_optional(&mut *conn).await?;
+                if current.is_none() { return Ok(((),0)); }
+                super::file_evidence_retention::FileEvidenceRetentionRepository::staging_removed(conn,&path,version).await?;
+                let changed = sqlx::query("DELETE FROM artifact_file_staging_guard WHERE file_path=$1 AND artifact_version=$2")
+                    .bind(path).bind(version).execute(conn).await?.rows_affected();
+                Ok(((),changed))
+            }),
+        ).await
+    }
+
     pub async fn delete_artifact_version(pool: &PgPool, id: i64) -> Result<bool> {
         let result = sqlx::query("DELETE FROM artifact_version WHERE id = $1")
             .bind(id)
@@ -236,18 +310,42 @@ impl MaintenanceRepository {
                 "Artifact reclamation must enter exclusive graph admission at transaction entry",
             ));
         }
+        let artifact: Option<i64> =
+            sqlx::query_scalar("SELECT artifact FROM artifact_version WHERE id=$1")
+                .bind(id)
+                .fetch_optional(&mut *connection)
+                .await?;
+        let Some(artifact) = artifact else {
+            return Ok(None);
+        };
+        if super::artifact::ArtifactRepository::find_by_id_for_update(connection, artifact)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
         Ok(sqlx::query_as(&format!(
             "SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version \
              FROM artifact_version av JOIN artifact a ON a.id=av.artifact \
-             WHERE av.id=$1 AND {} FOR UPDATE OF av,a",
+             WHERE av.id=$1 AND av.artifact=$2 AND {} FOR UPDATE OF av",
             expired_artifact_version_predicate()
-        )).bind(id).fetch_optional(connection).await?)
+        )).bind(id).bind(artifact).fetch_optional(connection).await?)
     }
 
     pub async fn refresh_or_delete_artifact_metadata(
         pool: &PgPool,
         artifact_id: i64,
     ) -> Result<bool> {
+        let mut conn = pool.acquire().await?;
+        Self::refresh_or_delete_artifact_metadata_with_conn(&mut conn, artifact_id)
+            .await
+            .map(|(deleted, _)| deleted)
+    }
+
+    pub(super) async fn refresh_or_delete_artifact_metadata_with_conn(
+        conn: &mut PgConnection,
+        artifact_id: i64,
+    ) -> Result<(bool, u64)> {
         let refreshed = sqlx::query(
             "WITH latest AS (
                 SELECT size_bytes, content_type
@@ -265,11 +363,11 @@ impl MaintenanceRepository {
              WHERE a.id = $1",
         )
         .bind(artifact_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
         if refreshed.rows_affected() > 0 {
-            return Ok(false);
+            return Ok((false, refreshed.rows_affected()));
         }
 
         let deleted = sqlx::query(
@@ -286,10 +384,53 @@ impl MaintenanceRepository {
                )",
         )
         .bind(artifact_id)
-        .execute(pool)
+        .execute(conn)
         .await?;
 
-        Ok(deleted.rows_affected() > 0)
+        Ok((deleted.rows_affected() > 0, deleted.rows_affected()))
+    }
+
+    pub async fn refresh_or_delete_artifact_metadata_bounded(
+        pool: &PgPool,
+        artifact_id: i64,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<bool> {
+        maintenance_admission::run(
+            pool,
+            budget,
+            deadline,
+            cancel,
+            move |conn| {
+                Box::pin(async move {
+                    Ok(sqlx::query_scalar::<_, String>(
+                        "SELECT xmin::text FROM artifact WHERE id=$1",
+                    )
+                    .bind(artifact_id)
+                    .fetch_all(conn)
+                    .await?)
+                })
+            },
+            move |conn, candidates| {
+                Box::pin(async move {
+                    let current: Option<i64> = sqlx::query_scalar(
+                        "SELECT id FROM artifact WHERE id=$1 AND xmin::text=$2 FOR UPDATE",
+                    )
+                    .bind(artifact_id)
+                    .bind(&candidates[0])
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                    if current.is_none() {
+                        return Ok((false, 0));
+                    }
+                    // Refresh reads the current ready-version frontier. The DELETE
+                    // predicate and its triggers recheck emptiness, data and pins.
+                    Self::refresh_or_delete_artifact_metadata_with_conn(conn, artifact_id).await
+                })
+            },
+        )
+        .await
     }
 
     pub async fn stuck_runtime_snapshots(

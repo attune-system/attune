@@ -19,6 +19,8 @@ use attune_common::{
 };
 use chrono::{Duration, Utc};
 
+#[path = "storage_maintenance_repository_tests/bounded_admission.rs"]
+mod bounded_admission;
 mod helpers;
 use helpers::{create_test_pool, unique_test_id};
 

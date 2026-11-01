@@ -216,7 +216,7 @@ Workflow details live in:
 - Owns retention, stale-state cleanup, corrective remediation, and related audit/alert emission.
 - Uses advisory locking so only one maintenance leader acts at a time.
 - Runtime retention config is persisted in DB and reloaded without restart.
-- Persisted retention, partition, and summary jobs have independent cadences under the same leader lock. Retention drops fully expired daily leaves and deletes boundary/DEFAULT rows in bounded batches, with separate row and partition counts.
+- Persisted retention, object-retention, partition, and summary jobs have independent cadences under the same leader lock. Graph/object continuations do not rerun hourly row retention; read `docs/deployment/supervisor.md` before changing their scheduling or admission budgets. Retention drops fully expired daily leaves and deletes boundary/DEFAULT rows in bounded batches, with separate row and partition counts.
 - Analytics use clean per-hour summary coverage plus raw fallback for gaps, dirty hours, and partial hours. Summaries do not outlive raw retention. For freshness metadata and dashboard authorization, read `docs/dashboards.md`.
 
 Use docs for specifics instead of expanding this file:

@@ -3,14 +3,112 @@
 //! This module provides database connection pooling and utilities for
 //! interacting with the PostgreSQL database.
 
+use sha2::{Digest, Sha256};
 use sqlx::migrate::Migrate;
-use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::Acquire;
+use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::config::DatabaseConfig;
 use crate::error::Result;
+
+/// Attribution for one service instance and connection purpose. Do not use secrets
+/// or request/user identifiers here; PostgreSQL exposes this in pg_stat_activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionIdentity {
+    service: String,
+    instance: String,
+    purpose: String,
+}
+
+impl ConnectionIdentity {
+    pub fn new(
+        service: impl Into<String>,
+        instance: impl Into<String>,
+        purpose: impl Into<String>,
+    ) -> Self {
+        Self {
+            service: service.into(),
+            instance: instance.into(),
+            purpose: purpose.into(),
+        }
+    }
+
+    /// Use one random instance ID for this process, shared by all of its pools.
+    pub fn for_process(service: &str, purpose: &str) -> Self {
+        static INSTANCE: OnceLock<String> = OnceLock::new();
+        Self::new(
+            service,
+            INSTANCE.get_or_init(|| uuid::Uuid::new_v4().simple().to_string()),
+            purpose,
+        )
+    }
+
+    /// PostgreSQL escapes non-ASCII application_name bytes and limits the result
+    /// to 63 bytes. Render an ASCII prefix ourselves so the server keeps the exact
+    /// name. Sanitation, truncation, or ambiguous component separators add a
+    /// SHA-256 suffix of the full original identity, with length-framed fields.
+    pub fn application_name(&self) -> String {
+        let mut digest = Sha256::new();
+        for part in [&self.service, &self.purpose, &self.instance] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        let original = format!("attune:{}:{}:{}", self.service, self.purpose, self.instance);
+        let readable: String = original
+            .chars()
+            .map(|c| {
+                if !c.is_ascii() || c.is_ascii_control() {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if readable.len() <= 63
+            && readable == original
+            && ![&self.service, &self.purpose, &self.instance]
+                .iter()
+                .any(|part| part.contains(':'))
+        {
+            return readable;
+        }
+        let suffix: String = digest.finalize()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let end = readable.len().min(46);
+        format!("{}~{suffix}", &readable[..end])
+    }
+
+    /// Preserve URL credentials, TLS, and startup options, replacing only the name.
+    pub fn connect_options(&self, url: &str) -> std::result::Result<PgConnectOptions, sqlx::Error> {
+        Ok(PgConnectOptions::from_str(url)?.application_name(&self.application_name()))
+    }
+}
+
+fn configure_pool(
+    options: PgPoolOptions,
+    schema: String,
+    application_name: String,
+) -> PgPoolOptions {
+    options.after_connect(move |conn, _meta| {
+        let schema = schema.clone();
+        let application_name = application_name.clone();
+        Box::pin(async move {
+            // Extension functions live in public; application tables resolve first.
+            sqlx::query("SELECT set_config('search_path', $1, false), set_config('application_name', $2, false)")
+                .bind(format!("{schema}, public"))
+                .bind(application_name)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        })
+    })
+}
 
 async fn pin_sqlx_history_search_path(connection: &mut PgConnection) -> Result<()> {
     let (has_attune_history, has_public_history): (bool, bool) = sqlx::query_as(
@@ -83,8 +181,18 @@ pub struct Database {
 }
 
 impl Database {
-    /// Create a new database connection from configuration
+    /// Convenience constructor for tests and local callers. Services must use
+    /// `new_named` so their connections can be attributed independently.
     pub async fn new(config: &DatabaseConfig) -> Result<Self> {
+        Self::new_named(
+            config,
+            ConnectionIdentity::for_process("unattributed", "main"),
+        )
+        .await
+    }
+
+    /// Create a service pool with explicit attribution on every new connection.
+    pub async fn new_named(config: &DatabaseConfig, identity: ConnectionIdentity) -> Result<Self> {
         // Default to "attune" schema for production safety
         let schema = config
             .schema
@@ -96,33 +204,20 @@ impl Database {
 
         // Log schema configuration prominently
         info!(
-            "Connecting to database with max_connections={}, schema={}",
-            config.max_connections, schema
+            max_connections = config.max_connections,
+            schema,
+            application_name = identity.application_name(),
+            "Connecting to database"
         );
 
-        // Clone schema for use in closure
-        let schema_for_hook = schema.clone();
-
-        let pool = PgPoolOptions::new()
+        let options = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.connect_timeout))
             .acquire_time_level(log::LevelFilter::Debug)
-            .idle_timeout(Duration::from_secs(config.idle_timeout))
-            .after_connect(move |conn, _meta| {
-                let schema = schema_for_hook.clone();
-                Box::pin(async move {
-                    // Extension functions are installed in public, while unqualified
-                    // application tables continue to resolve in the configured schema.
-                    sqlx::query("SELECT set_config('search_path', $1, false), set_config('application_name', $2, false)")
-                        .bind(format!("{schema}, public"))
-                        .bind(format!("attune:{schema}"))
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect(&config.url)
+            .idle_timeout(Duration::from_secs(config.idle_timeout));
+        let pool = configure_pool(options, schema.clone(), identity.application_name())
+            .connect_with(identity.connect_options(&config.url)?)
             .await?;
 
         // Run a test query to verify connection
@@ -275,6 +370,109 @@ pub struct PoolStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_identity_short_names_are_readable() {
+        assert_eq!(
+            ConnectionIdentity::new("api", "instance-1", "listener").application_name(),
+            "attune:api:listener:instance-1"
+        );
+    }
+
+    #[test]
+    fn connection_identity_truncation_is_byte_safe_and_stable() {
+        for instance in [
+            "a".repeat(47),
+            "a".repeat(48),
+            "a".repeat(49),
+            "界".repeat(80),
+            "🦀".repeat(80),
+        ] {
+            let identity = ConnectionIdentity::new("api", instance, "main");
+            let name = identity.application_name();
+            assert!(name.is_ascii(), "{name}");
+            assert!(name.len() <= 63, "{name}");
+            assert_eq!(name, identity.application_name());
+            assert!(name.starts_with("attune:api:main:"));
+        }
+        let prefix = "x".repeat(100);
+        assert_eq!(
+            ConnectionIdentity::new("api", format!("{prefix}a"), "main").application_name(),
+            "attune:api:main:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx~018586a35e64ed47"
+        );
+        assert_ne!(
+            ConnectionIdentity::new("api", format!("{prefix}a"), "main").application_name(),
+            ConnectionIdentity::new("api", format!("{prefix}b"), "main").application_name()
+        );
+        // A suffix hashes all fields, including fields beyond the readable prefix.
+        assert_ne!(
+            ConnectionIdentity::new(prefix.clone(), "one", "main").application_name(),
+            ConnectionIdentity::new(prefix, "one", "listener").application_name()
+        );
+    }
+
+    #[test]
+    fn connection_identity_short_unicode_is_sanitized_and_keeps_original_digest() {
+        let name = ConnectionIdentity::new("api", "界", "main").application_name();
+        assert!(name.is_ascii());
+        assert!(name.len() <= 63);
+        assert_eq!(name, "attune:api:main:_~c751e46d3c7296fa");
+        assert_ne!(
+            name,
+            ConnectionIdentity::new("api", "_", "main").application_name()
+        );
+        assert_ne!(
+            name,
+            ConnectionIdentity::new("api", "海", "main").application_name()
+        );
+        let all_fields = ConnectionIdentity::new("apï", "界", "maïn").application_name();
+        assert!(all_fields.is_ascii());
+        assert!(all_fields.len() <= 63);
+        assert!(all_fields.starts_with("attune:ap_:ma_n:_~"));
+    }
+
+    #[test]
+    fn connection_identity_controls_and_component_boundaries_do_not_alias() {
+        let name = ConnectionIdentity::new("api", "one\0\n", "main").application_name();
+        assert!(name.is_ascii());
+        assert!(name.len() <= 63);
+        assert!(!name.chars().any(char::is_control));
+        assert_ne!(
+            name,
+            ConnectionIdentity::new("api", "one__", "main").application_name()
+        );
+        assert_ne!(
+            ConnectionIdentity::new("a:b", "d", "c").application_name(),
+            ConnectionIdentity::new("a", "d", "b:c").application_name()
+        );
+    }
+
+    #[test]
+    fn connection_identity_preserves_connect_options() {
+        let identity = ConnectionIdentity::new("api", "one", "listener");
+        let options = identity.connect_options("postgresql://user:secret@db.example:5433/production?sslmode=verify-full&application_name=old&options=-c%20search_path%3Dprivate").unwrap();
+        assert_eq!(options.get_host(), "db.example");
+        assert_eq!(options.get_port(), 5433);
+        assert_eq!(options.get_username(), "user");
+        assert_eq!(options.get_database(), Some("production"));
+        assert!(matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::VerifyFull
+        ));
+        assert_eq!(options.get_options(), Some("-c search_path=private"));
+        assert_eq!(
+            options.get_application_name(),
+            Some(identity.application_name().as_str())
+        );
+    }
+
+    #[test]
+    fn process_pools_share_an_instance_but_not_a_purpose() {
+        let working = ConnectionIdentity::for_process("notifier", "working");
+        let listener = ConnectionIdentity::for_process("notifier", "listener");
+        assert_eq!(working.instance, listener.instance);
+        assert_ne!(working.application_name(), listener.application_name());
+    }
 
     #[test]
     fn test_pool_stats() {

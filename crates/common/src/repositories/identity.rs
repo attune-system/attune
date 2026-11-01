@@ -193,10 +193,13 @@ impl IdentityRepository {
     }
 
     /// One statement provides a consistent current identity/assignment snapshot.
-    pub async fn authorization_state(
-        pool: &PgPool,
+    pub async fn authorization_state<'e, E>(
+        executor: E,
         identity_id: Id,
-    ) -> Result<Option<IdentityAuthorizationRow>> {
+    ) -> Result<Option<IdentityAuthorizationRow>>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
         sqlx::query_as(
             "SELECT i.id AS identity_id, i.attributes, i.frozen,
                 COALESCE((SELECT jsonb_agg(g.value)
@@ -208,7 +211,7 @@ impl IdentityRepository {
                             WHERE ira.identity = i.id AND ra.permset = ps.id)
                     )), '[]'::JSONB) AS grants
              FROM identity i WHERE i.id = $1",
-        ).bind(identity_id).fetch_optional(pool).await.map_err(Into::into)
+        ).bind(identity_id).fetch_optional(executor).await.map_err(Into::into)
     }
 
     pub async fn list_admin(

@@ -76,6 +76,7 @@ pub mod key;
 pub mod key_schema;
 pub mod log_stream;
 pub mod maintenance;
+pub mod maintenance_admission;
 pub mod managed_component_readmission;
 pub mod managed_executable;
 pub mod managed_sensor_metadata;

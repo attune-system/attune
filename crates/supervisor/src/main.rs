@@ -40,6 +40,7 @@ use attune_common::{
             MaintenanceRepository, QueueRemediationResult, StaleExecutionCandidate,
             WorkflowRemediationResult,
         },
+        maintenance_admission::{MaintenanceBudget, PhysicalCleanup},
         native_maintenance::schedule::{MaintenanceJob, ScheduleRepository},
         retention::{RetentionRepository, RetentionTargetFailure, RetentionTargetResult},
         storage_maintenance::StorageMaintenanceRepository,
@@ -132,7 +133,11 @@ struct SupervisorAlertRequest {
 
 impl SupervisorService {
     async fn new(config: Config) -> Result<Self> {
-        let db = Database::new(&config.database).await?;
+        let db = Database::new_named(
+            &config.database,
+            attune_common::db::ConnectionIdentity::for_process("supervisor", "main"),
+        )
+        .await?;
         RetentionRepository::seed_cache_config_if_empty(db.pool(), &config.cache_retention).await?;
         RetentionRepository::seed_native_config_if_empty(
             db.pool(),
@@ -418,9 +423,9 @@ impl SupervisorService {
             // Startup remediation still runs when a previous leader completed
             // retention recently. Summary catch-up gets a turn after housekeeping.
             if retention_due || !matches!(cycle_reason, SupervisorCycleReason::Scheduled) {
-                self.run_maintenance_cycle(&retention).await;
+                retention_success &= self.run_maintenance_cycle(&retention).await;
             }
-            if retention_due {
+            if retention_due || !retention_success {
                 ScheduleRepository::finish_attempt(
                     &self.inner.pool,
                     MaintenanceJob::Retention,
@@ -430,6 +435,10 @@ impl SupervisorService {
                 )
                 .await?;
             }
+            // Object/graph maintenance owns its cadence and success record. A
+            // pending raw scan must not rerun hourly runtime retention.
+            self.run_object_retention_job(&retention, cycle_reason, now)
+                .await?;
             // Invalid persisted native settings disable only native work for
             // this cycle, so they cannot prevent protected-row cleanup/remediation.
             if let Some(error) = native_validation_error {
@@ -462,7 +471,21 @@ impl SupervisorService {
             warn!(error = %error, "Failed to close supervisor leader session");
         }
 
-        cycle_result.map(|_| interval)
+        cycle_result?;
+        if self.inner.config.maintenance.enabled {
+            let statuses = ScheduleRepository::status(&self.inner.pool).await?;
+            if let Some(object) = statuses
+                .iter()
+                .find(|status| status.job == MaintenanceJob::ObjectRetention)
+            {
+                let delay = (object.next_due - now.max(Utc::now()))
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1))
+                    .max(Duration::from_secs(1));
+                return Ok(interval.min(delay));
+            }
+        }
+        Ok(interval)
     }
 
     async fn ensure_supervisor_run(
@@ -682,25 +705,52 @@ impl SupervisorService {
         }
     }
 
-    async fn run_maintenance_cycle(&self, retention: &RetentionConfig) {
+    /// Housekeeping keeps the row-retention cadence. Object/graph maintenance
+    /// has a distinct durable job so its continuation cannot rerun these steps.
+    async fn run_maintenance_cycle(&self, retention: &RetentionConfig) -> bool {
+        // Filesystem removal can outlive a dropped future in Tokio's blocking
+        // pool. Own the whole protected operation, not just its waiting caller,
+        // so cancellation cannot release graph/row fences before unlink ends.
+        let service = self.clone();
+        let retention = retention.clone();
+        tokio::spawn(async move { service.run_maintenance_cycle_owned(&retention).await })
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn run_maintenance_cycle_owned(&self, retention: &RetentionConfig) -> bool {
         let maintenance = &self.inner.config.maintenance;
         if !maintenance.enabled {
             info!("Supervisor maintenance jobs are disabled; skipping");
-            return;
+            return true;
         }
 
+        let budget = match ScheduleRepository::status(&self.inner.pool).await {
+            Ok(statuses) => MaintenanceBudget {
+                queued_admission: statuses
+                    .iter()
+                    .find(|s| s.job == MaintenanceJob::Retention)
+                    .and_then(|s| s.deferred_since)
+                    .is_some_and(|since| since <= Utc::now() - ChronoDuration::minutes(5)),
+                ..Default::default()
+            },
+            Err(_) => return false,
+        };
+        let mut complete = true;
+
         if maintenance.artifact_cleanup_enabled {
-            match artifact_cleanup::cleanup_expired_artifacts(
+            match artifact_cleanup::cleanup_expired_artifacts_with_budget(
                 &self.inner.pool,
                 self.inner.artifact_transport.as_ref(),
                 maintenance,
+                &budget,
             )
             .await
             {
                 Ok(result) => {
                     if result.candidates > 0 || result.deleted_versions > 0 {
                         info!(
-                            candidates = result.candidates,
+                            page_candidates = result.candidates,
                             deleted_versions = result.deleted_versions,
                             deleted_files = result.deleted_files,
                             deleted_artifacts = result.deleted_artifacts,
@@ -711,38 +761,29 @@ impl SupervisorService {
                         }
                     }
                 }
-                Err(err) => {
-                    warn!(error = %err, "Artifact cleanup failed");
+                Err(_) => {
+                    complete = false;
+                    warn!("Artifact cleanup deferred or failed; retry required");
                 }
             }
         }
 
-        if let Err(err) = self.reconcile_artifact_object_metadata(maintenance).await {
-            warn!(error = %err, "Artifact object metadata reconciliation failed");
-        }
-
-        match object_retention::run_cycle(
-            &self.inner.pool,
-            &self.inner.blob_store,
-            std::path::Path::new(&self.inner.config.packs_base_dir),
-            maintenance,
-        )
-        .await
+        if self
+            .reconcile_artifact_object_metadata(maintenance, &budget)
+            .await
+            .is_err()
         {
-            Ok(metrics) => info!(
-                retained_releases = metrics.retained_releases,
-                deleted_releases = metrics.deleted_releases,
-                pending_collection = metrics.pending_collection,
-                deleted_objects = metrics.deleted_objects,
-                deleted_bytes = metrics.deleted_bytes,
-                failures = metrics.failures,
-                "Object retention cycle completed"
-            ),
-            Err(err) => warn!(error = %err, "Object retention cycle failed"),
+            complete = false;
+            warn!("Artifact object metadata reconciliation deferred or failed; retry required");
         }
 
-        if let Err(err) = self.delete_expired_legacy_snapshots(maintenance).await {
-            warn!(error = %err, "Legacy snapshot cleanup failed");
+        if self
+            .delete_expired_legacy_snapshots(maintenance, &budget)
+            .await
+            .is_err()
+        {
+            complete = false;
+            warn!("Legacy snapshot cleanup deferred or failed; retry required");
         }
 
         if maintenance.monitoring_enabled {
@@ -760,41 +801,186 @@ impl SupervisorService {
                 warn!(error = %err, "Supervisor corrective actions failed");
             }
         }
+        complete
+    }
+
+    async fn run_object_retention_job(
+        &self,
+        retention: &RetentionConfig,
+        reason: SupervisorCycleReason,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let maintenance = &self.inner.config.maintenance;
+        if !maintenance.enabled {
+            return Ok(());
+        }
+        let previous = ScheduleRepository::status(&self.inner.pool)
+            .await?
+            .into_iter()
+            .find(|status| status.job == MaintenanceJob::ObjectRetention);
+        let budget = attune_common::repositories::maintenance_admission::MaintenanceBudget {
+            queued_admission: previous
+                .as_ref()
+                .and_then(|status| status.deferred_since)
+                .is_some_and(|since| since <= now.max(Utc::now()) - ChronoDuration::minutes(5)),
+            ..Default::default()
+        };
+        if !ScheduleRepository::begin_attempt(
+            &self.inner.pool,
+            MaintenanceJob::ObjectRetention,
+            now,
+            retention.check_interval_seconds,
+            !matches!(reason, SupervisorCycleReason::Scheduled),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let mut interval_seconds = retention.check_interval_seconds;
+        let complete = match object_retention::run_cycle_with_budget(
+            &self.inner.pool,
+            &self.inner.blob_store,
+            std::path::Path::new(&self.inner.config.packs_base_dir),
+            maintenance,
+            &budget,
+        )
+        .await
+        {
+            Ok(mut metrics) => {
+                if !metrics.metadata_complete {
+                    metrics.oldest_metadata_deferral_seconds = [
+                        metrics.oldest_metadata_deferral_seconds,
+                        previous
+                            .as_ref()
+                            .and_then(|status| status.deferred_since)
+                            .map(|since| (now.max(Utc::now()) - since).num_seconds().max(0)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                }
+                info!(
+                    retained_releases = metrics.retained_releases,
+                    deleted_releases = metrics.deleted_releases,
+                    pending_collection = metrics.pending_collection,
+                    deleted_objects = metrics.deleted_objects,
+                    deleted_bytes = metrics.deleted_bytes,
+                    failures = metrics.failures,
+                    graph_candidates = metrics.graph_candidates,
+                    graph_rows_changed = metrics.graph_rows_changed,
+                    graph_lock_deferrals = metrics.graph_lock_deferrals,
+                    graph_deadline_deferrals = metrics.graph_deadline_deferrals,
+                    graph_collection_complete = metrics.graph_collection_complete,
+                    graph_scan_pending = metrics.graph_scan_pending,
+                    metadata_complete = metrics.metadata_complete,
+                    metadata_scan_pending = metrics.metadata_scan_pending,
+                    metadata_lock_deferrals = metrics.metadata_lock_deferrals,
+                    metadata_deadline_deferrals = metrics.metadata_deadline_deferrals,
+                    metadata_rows_changed = metrics.metadata_rows_changed,
+                    oldest_metadata_deferral_seconds = metrics.oldest_metadata_deferral_seconds,
+                    oldest_graph_deferral_seconds = metrics.oldest_graph_deferral_seconds,
+                    "Object retention cycle completed"
+                );
+                if maintenance.monitoring_enabled {
+                    if let Err(error) = self
+                        .emit_graph_reclamation_deferral_alert(&metrics, maintenance)
+                        .await
+                    {
+                        warn!(%error, "Failed to report graph reclamation deferral");
+                    }
+                }
+                if let Some(next) = metrics.next_graph_attempt {
+                    let delay = (next - Utc::now()).num_seconds().max(1) as u64;
+                    interval_seconds = interval_seconds.min(delay);
+                }
+                if metrics.metadata_scan_pending
+                    && metrics.metadata_lock_deferrals == 0
+                    && (metrics.metadata_deadline_deferrals == 0
+                        || metrics.metadata_rows_changed > 0)
+                    && metrics.failures == 0
+                {
+                    interval_seconds = interval_seconds.min(1);
+                }
+                metrics.failures == 0
+                    && metrics.graph_collection_complete
+                    && metrics.metadata_complete
+            }
+            Err(err) => {
+                warn!(error = %err, "Object retention cycle failed");
+                false
+            }
+        };
+        ScheduleRepository::finish_attempt(
+            &self.inner.pool,
+            MaintenanceJob::ObjectRetention,
+            now,
+            interval_seconds,
+            complete,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn delete_expired_legacy_snapshots(
         &self,
         maintenance: &SupervisorMaintenanceConfig,
+        budget: &MaintenanceBudget,
     ) -> Result<()> {
-        for (id, path) in StorageMaintenanceRepository::expired_pack_snapshots(
-            &self.inner.pool,
-            maintenance.artifact_cleanup_batch_size,
-        )
-        .await?
-        {
-            let mut evidence_tx = self.inner.pool.begin().await?;
-            attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut evidence_tx).await?;
-            if !attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::eligible(&mut evidence_tx,"pack_release",id).await? {evidence_tx.rollback().await?;continue;}
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+        for pack in [true, false] {
+            for candidate in StorageMaintenanceRepository::expired_snapshots_bounded(
+                &self.inner.pool,
+                pack,
+                maintenance.artifact_cleanup_batch_size,
+                budget,
+            )
+            .await?
+            {
+                let path = candidate.path.clone();
+                let mut cleanup = PhysicalCleanup::begin(&self.inner.pool, budget).await?;
+                let cleared = cleanup
+                    .metadata(move |conn| {
+                        Box::pin(async move {
+                            StorageMaintenanceRepository::clear_expired_snapshot_with_conn(
+                                conn, candidate, pack,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                match cleared {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        cleanup.rollback().await?;
+                        anyhow::bail!(
+                            "Legacy snapshot identity or eligibility changed; retry required"
+                        );
+                    }
+                    Err(error) => {
+                        cleanup.rollback().await?;
+                        return Err(error.into());
+                    }
+                }
+                // No timeout here: retain the existing evidence/row fence until
+                // physical completion. Snapshot cleanup has no durable FS claim.
+                let removed = if pack {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(anyhow::Error::from(error)),
+                    }
+                } else {
+                    self.inner
+                        .artifact_transport
+                        .delete_file(&path)
+                        .await
+                        .map_err(anyhow::Error::from)
+                };
+                if let Err(error) = removed {
+                    cleanup.rollback().await?;
+                    return Err(error);
+                }
+                cleanup.commit().await?;
             }
-            StorageMaintenanceRepository::clear_pack_snapshot(&mut *evidence_tx, id).await?;
-            evidence_tx.commit().await?;
-        }
-        for (id, path) in StorageMaintenanceRepository::expired_artifact_snapshots(
-            &self.inner.pool,
-            maintenance.artifact_cleanup_batch_size,
-        )
-        .await?
-        {
-            let mut evidence_tx = self.inner.pool.begin().await?;
-            attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut evidence_tx).await?;
-            if !attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::eligible(&mut evidence_tx,"artifact_version",id).await? {evidence_tx.rollback().await?;continue;}
-            self.inner.artifact_transport.delete_file(&path).await?;
-            StorageMaintenanceRepository::clear_artifact_snapshot(&mut *evidence_tx, id).await?;
-            evidence_tx.commit().await?;
         }
         Ok(())
     }
@@ -802,6 +988,7 @@ impl SupervisorService {
     async fn reconcile_artifact_object_metadata(
         &self,
         maintenance: &SupervisorMaintenanceConfig,
+        budget: &MaintenanceBudget,
     ) -> Result<()> {
         ArtifactUploadGrantRepository::mark_expired(
             &self.inner.pool,
@@ -814,108 +1001,117 @@ impl SupervisorService {
             maintenance.artifact_cleanup_batch_size,
         )
         .await?;
-        let pending_cutoff = Utc::now()
-            - ChronoDuration::seconds(
-                maintenance
-                    .object_upload_abandon_seconds
-                    .min(i64::MAX as u64) as i64,
-            );
-        for candidate in StorageMaintenanceRepository::abandoned_pending(
-            &self.inner.pool,
-            pending_cutoff,
-            maintenance.artifact_cleanup_batch_size,
-        )
-        .await?
-        {
-            if !StorageMaintenanceRepository::claim_abandoned_pending(
-                &self.inner.pool,
-                candidate.id,
-                pending_cutoff,
-            )
-            .await?
-            {
-                continue;
-            }
-            if StorageMaintenanceRepository::delete_cleanup_claimed(&self.inner.pool, candidate.id)
-                .await?
-            {
-                MaintenanceRepository::refresh_or_delete_artifact_metadata(
-                    &self.inner.pool,
-                    candidate.artifact,
-                )
-                .await?;
-            }
-        }
+        // Abandoned object uploads belong to the independently scheduled,
+        // bounded object-retention job, not this hourly reconciliation path.
 
-        artifact_cleanup::cleanup_abandoned_shared_logs(
+        let shared_result = artifact_cleanup::cleanup_abandoned_shared_logs_with_budget(
             &self.inner.pool,
             self.inner.artifact_transport.as_ref(),
             maintenance,
+            budget,
         )
-        .await?;
+        .await;
 
         let after_id = self
             .inner
             .artifact_reconciliation_cursor
             .load(Ordering::Relaxed);
-        let candidates = StorageMaintenanceRepository::ready_objects(
+        let mut candidates = StorageMaintenanceRepository::ready_objects_bounded(
             &self.inner.pool,
             after_id,
             maintenance.artifact_cleanup_batch_size,
+            budget,
         )
         .await?;
         if candidates.is_empty() {
             self.inner
                 .artifact_reconciliation_cursor
                 .store(0, Ordering::Relaxed);
+            if after_id > 0 {
+                // A deferred visit must get a real retry, not an empty pass
+                // that reports success and postpones the head for another hour.
+                // Only the tail was empty, so this still visits at most one
+                // bounded nonempty page in this invocation.
+                candidates = StorageMaintenanceRepository::ready_objects_bounded(
+                    &self.inner.pool,
+                    0,
+                    maintenance.artifact_cleanup_batch_size,
+                    budget,
+                )
+                .await?;
+            }
         }
+        let mut deferred = shared_result.err();
         for candidate in candidates {
-            self.inner
-                .artifact_reconciliation_cursor
-                .store(candidate.id, Ordering::Relaxed);
-            let matches = if let Some(stream) =
-                LogStreamRepository::find_by_artifact_version(&self.inner.pool, candidate.id)
-                    .await?
-            {
-                let mut matches = stream.sealed;
-                for segment in LogStreamRepository::segments(&self.inner.pool, stream.id).await? {
-                    let key = ObjectKey::new(segment.object_key)?;
-                    matches &= self
-                        .inner
+            let id = candidate.id;
+            let visited: Result<()> = async {
+                let matches = if let Some(stream) =
+                    LogStreamRepository::find_by_artifact_version(&self.inner.pool, candidate.id)
+                        .await?
+                {
+                    let mut matches = stream.sealed;
+                    for segment in
+                        LogStreamRepository::segments(&self.inner.pool, stream.id).await?
+                    {
+                        let key = ObjectKey::new(segment.object_key)?;
+                        matches &= self
+                            .inner
+                            .blob_store
+                            .head(&key)
+                            .await?
+                            .is_some_and(|object| {
+                                object.provider_version.as_stored() == segment.provider_version
+                                    && object.size == segment.size_bytes as u64
+                                    && hex_digest(&object.sha256) == segment.sha256
+                            });
+                    }
+                    matches
+                } else {
+                    let key = ObjectKey::new(candidate.object_key.clone())?;
+                    self.inner
                         .blob_store
                         .head(&key)
                         .await?
                         .is_some_and(|object| {
-                            object.provider_version.as_stored() == segment.provider_version
-                                && object.size == segment.size_bytes as u64
-                                && hex_digest(&object.sha256) == segment.sha256
-                        });
+                            candidate.provider_version.as_deref()
+                                == Some(object.provider_version.as_stored())
+                                && candidate.size_bytes == Some(object.size as i64)
+                                && candidate.sha256.as_deref()
+                                    == Some(hex_digest(&object.sha256).as_str())
+                        })
+                };
+                if !matches {
+                    StorageMaintenanceRepository::delete_mismatched_ready_and_refresh_bounded(
+                        &self.inner.pool,
+                        candidate,
+                        budget,
+                        tokio::time::Instant::now() + budget.page_timeout,
+                        &Default::default(),
+                    )
+                    .await
+                    .into_result()?;
+                    // Confirmed NoWork is a completed visit, not a failure. Pins or
+                    // fresh ineligibility can legitimately suppress this deletion.
                 }
-                matches
-            } else {
-                let key = ObjectKey::new(candidate.object_key.clone())?;
-                self.inner
-                    .blob_store
-                    .head(&key)
-                    .await?
-                    .is_some_and(|object| {
-                        candidate.provider_version.as_deref()
-                            == Some(object.provider_version.as_stored())
-                            && candidate.size_bytes == Some(object.size as i64)
-                            && candidate.sha256.as_deref()
-                                == Some(hex_digest(&object.sha256).as_str())
-                    })
-            };
-            if !matches
-                && MaintenanceRepository::delete_artifact_version(&self.inner.pool, candidate.id)
-                    .await?
-            {
-                MaintenanceRepository::refresh_or_delete_artifact_metadata(
-                    &self.inner.pool,
-                    candidate.artifact,
-                )
-                .await?;
+                Ok(())
             }
+            .await;
+            // This cursor is advisory discovery state, never deletion authority.
+            // Visit independent rows even after failure; wrapping revisits this
+            // head without authorizing work from an unknown transaction outcome.
+            self.inner
+                .artifact_reconciliation_cursor
+                .store(id, Ordering::Relaxed);
+            if let Err(error) = visited {
+                if deferred.is_none() {
+                    deferred = Some(error);
+                }
+            }
+        }
+        // A flocked abandoned log must keep the failed retry cadence without
+        // preventing unrelated ready objects from being reconciled first.
+        if let Some(error) = deferred {
+            return Err(error);
         }
         Ok(())
     }
@@ -925,7 +1121,8 @@ impl SupervisorService {
         &self,
         maintenance: &SupervisorMaintenanceConfig,
     ) -> Result<()> {
-        self.reconcile_artifact_object_metadata(maintenance).await?;
+        self.reconcile_artifact_object_metadata(maintenance, &MaintenanceBudget::default())
+            .await?;
         object_retention::run_cycle(
             &self.inner.pool,
             &self.inner.blob_store,
@@ -933,7 +1130,8 @@ impl SupervisorService {
             maintenance,
         )
         .await?;
-        self.delete_expired_legacy_snapshots(maintenance).await
+        self.delete_expired_legacy_snapshots(maintenance, &MaintenanceBudget::default())
+            .await
     }
 
     async fn emit_stuck_runtime_alerts(
@@ -987,6 +1185,52 @@ impl SupervisorService {
         }
 
         Ok(())
+    }
+
+    async fn emit_graph_reclamation_deferral_alert(
+        &self,
+        metrics: &object_retention::ObjectRetentionMetrics,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<()> {
+        let Some(age) = [
+            metrics.oldest_graph_deferral_seconds,
+            metrics.oldest_metadata_deferral_seconds,
+        ]
+        .into_iter()
+        .flatten()
+        .max() else {
+            return Ok(());
+        };
+        let max_deferral =
+            attune_common::repositories::pack_retention::GraphReclamationOptions::default()
+                .max_deferral
+                .as_secs();
+        if age < max_deferral as i64 || maintenance.alert_limit_per_cycle == 0 {
+            return Ok(());
+        }
+        let correlation_id = "supervisor:graph-reclamation:deferral".to_string();
+        if self
+            .alert_recently_emitted(&correlation_id, maintenance)
+            .await?
+        {
+            return Ok(());
+        }
+        self.emit_supervisor_alert(SupervisorAlertRequest {
+            severity: "warning",
+            category: "maintenance",
+            failure_type: "graph_reclamation_deferred",
+            component_type: "retention_target",
+            component_ref: Some("graph_reclamation".into()),
+            summary: "Graph reclamation remains deferred; review bounded maintenance opportunities"
+                .into(),
+            details: json!({
+                "oldest_deferral_seconds": age,
+                "lock_deferrals": metrics.graph_lock_deferrals,
+                "deadline_deferrals": metrics.graph_deadline_deferrals,
+            }),
+            correlation_id,
+        })
+        .await
     }
 
     async fn emit_retention_lag_alerts(
@@ -1647,6 +1891,7 @@ impl SupervisorService {
     async fn audit_artifact_cleanup_completed(&self, result: &ArtifactCleanupResult) -> Result<()> {
         let details = json!({
             "candidates": result.candidates,
+            "candidate_count_scope": "page",
             "deleted_versions": result.deleted_versions,
             "deleted_files": result.deleted_files,
             "deleted_artifacts": result.deleted_artifacts,
@@ -1745,7 +1990,11 @@ async fn main() -> Result<()> {
         rollback_snapshot_seconds,
     }) = args.command
     {
-        let db = Database::new(&config.database).await?;
+        let db = Database::new_named(
+            &config.database,
+            attune_common::db::ConnectionIdentity::for_process("supervisor", "maintenance"),
+        )
+        .await?;
         let period = rollback_snapshot_seconds
             .unwrap_or(config.maintenance.storage_rollback_snapshot_seconds);
         if period == 0 {
@@ -2024,6 +2273,1044 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn housekeeping_defers_with_artifact_cleanup_enabled_and_retries_retention_rows() {
+        use attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository as Evidence;
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = true;
+        config.maintenance.pack_release_retention_enabled = false;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention.native_maintenance.enabled = false;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for suffix in ["expired", "shared", "snapshot", "mismatch"] {
+            let artifact = ArtifactRepository::create(
+                database.pool(),
+                CreateArtifactInput {
+                    r#ref: format!("owned_housekeeping_{suffix}"),
+                    scope: OwnerType::System,
+                    owner: "supervisor-test".into(),
+                    r#type: ArtifactType::FileBinary,
+                    visibility: ArtifactVisibility::Private,
+                    classification: ArtifactClassification::General,
+                    retention_policy: RetentionPolicyType::Versions,
+                    retention_limit: 10,
+                    name: None,
+                    description: None,
+                    content_type: None,
+                    data: None,
+                },
+            )
+            .await
+            .unwrap();
+            let version: i64 = sqlx::query_scalar("INSERT INTO artifact_version(artifact,version,file_path,created) VALUES($1,1,$2,NOW()-interval '2 days') RETURNING id")
+                .bind(artifact.id).bind(format!("{suffix}.txt")).fetch_one(database.pool()).await.unwrap();
+            tokio::fs::write(
+                artifacts.path().join(format!("{suffix}.txt")),
+                b"owned cleanup bytes",
+            )
+            .await
+            .unwrap();
+            ids.push((artifact.id, version));
+        }
+        sqlx::query("UPDATE artifact SET retention_policy='days',retention_limit=1 WHERE id=$1")
+            .bind(ids[0].0)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifact_version SET body_state='ready',size_bytes=19,sha256=repeat('a',64) WHERE id=$1")
+            .bind(ids[0].1).execute(database.pool()).await.unwrap();
+        let execution: i64 = sqlx::query_scalar("INSERT INTO execution(action_ref,status) VALUES('core.owned_housekeeping','failed') RETURNING id")
+            .fetch_one(database.pool()).await.unwrap();
+        sqlx::query("UPDATE artifact_version SET body_state='pending',body_updated=NOW()-interval '2 days',execution=$2 WHERE id=$1")
+            .bind(ids[1].1).bind(execution).execute(database.pool()).await.unwrap();
+        LogStreamRepository::create_with_backend(
+            database.pool(),
+            ids[1].1,
+            LogStreamBackend::SharedFile,
+            1024,
+            1000,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE artifact_version SET body_updated=NOW()-interval '2 days' WHERE id=$1")
+            .bind(ids[1].1)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifact_version SET legacy_snapshot_expires_at=NOW()-interval '1 day' WHERE id=$1")
+            .bind(ids[2].1).execute(database.pool()).await.unwrap();
+        sqlx::query("UPDATE artifact_version SET body_state='ready',object_key='owned/housekeeping/missing',provider_version='e:missing',size_bytes=19,sha256=repeat('a',64) WHERE id=$1")
+            .bind(ids[3].1).execute(database.pool()).await.unwrap();
+        let pack: i64 = sqlx::query_scalar("INSERT INTO pack(ref,label,version) VALUES('owned_housekeeping_snapshot','owned_housekeeping_snapshot','1.0.0') RETURNING id")
+            .fetch_one(database.pool()).await.unwrap();
+        let pack_path = artifacts.path().join("pack-snapshot.tar");
+        tokio::fs::write(&pack_path, b"owned pack snapshot")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO pack_release(pack,pack_ref,version,digest,archive_path,content_path,archive_size,manifest,legacy_snapshot_expires_at) VALUES($1,'owned_housekeeping_snapshot','1.0.0',repeat('a',64),$2,'owned-content',19,'{}',NOW()-interval '1 day')")
+            .bind(pack).bind(pack_path.to_str().unwrap()).execute(database.pool()).await.unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                config,
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        let now = Utc::now();
+        let mut blocker = database.pool().begin().await.unwrap();
+        Evidence::lock_capture(&mut blocker).await.unwrap();
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.run_retention_cycle_at(SupervisorCycleReason::Scheduled, now),
+        )
+        .await;
+        let first_completed = Utc::now();
+        // Keep the blocker held through BOTH return and a fresh foreground reader.
+        // Releasing it before assertions would hide an exclusive waiter convoy.
+        let mut reader = database.pool().begin().await.unwrap();
+        let readable =
+            tokio::time::timeout(Duration::from_secs(1), Evidence::lock_capture(&mut reader)).await;
+        blocker.rollback().await.unwrap();
+        reader.rollback().await.unwrap();
+        first
+            .expect("enabled artifact housekeeping queued an unbounded graph writer")
+            .unwrap();
+        readable
+            .expect("housekeeping left an exclusive waiter blocking new readers")
+            .unwrap();
+        let status = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.job == MaintenanceJob::Retention)
+            .unwrap();
+        assert_eq!(
+            status.last_success, None,
+            "deferred housekeeping must not report hourly success"
+        );
+        assert!(
+            status.next_due.timestamp_micros()
+                >= (now + ChronoDuration::minutes(1)).timestamp_micros()
+                && status.next_due.timestamp_micros()
+                    <= (now.max(first_completed) + ChronoDuration::minutes(1)).timestamp_micros(),
+            "retry must be anchored between the requested clock and observed completion"
+        );
+        for (_, version) in &ids {
+            assert!(
+                ArtifactVersionRepository::find_by_id(database.pool(), *version)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let retry_now = status.next_due;
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, retry_now)
+            .await
+            .unwrap();
+        let retry_completed = Utc::now();
+        let succeeded = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.job == MaintenanceJob::Retention)
+            .unwrap();
+        let last_success = succeeded.last_success.expect("cleanup retry must succeed");
+        assert!(
+            last_success.timestamp_micros() >= retry_now.timestamp_micros()
+                && last_success.timestamp_micros()
+                    <= retry_now.max(retry_completed).timestamp_micros(),
+            "successful completion must honor the persisted future retry clock"
+        );
+        for index in [0, 1, 3] {
+            assert!(
+                ArtifactVersionRepository::find_by_id(database.pool(), ids[index].1)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "retention-only candidate {index} was not retried"
+            );
+        }
+        let snapshot: Option<String> =
+            sqlx::query_scalar("SELECT file_path FROM artifact_version WHERE id=$1")
+                .bind(ids[2].1)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert!(snapshot.is_none());
+        assert!(!artifacts.path().join("snapshot.txt").exists());
+        assert!(!pack_path.exists());
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    fn housekeeping_artifact_input(suffix: &str) -> CreateArtifactInput {
+        CreateArtifactInput {
+            r#ref: format!("owned_housekeeping_followup_{suffix}"),
+            scope: OwnerType::System,
+            owner: "supervisor-test".into(),
+            r#type: ArtifactType::FileBinary,
+            visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Versions,
+            retention_limit: 10,
+            name: None,
+            description: None,
+            content_type: None,
+            data: None,
+        }
+    }
+
+    async fn missing_housekeeping_version(pool: &PgPool, suffix: &str) -> Result<(i64, i64)> {
+        let artifact =
+            ArtifactRepository::create(pool, housekeeping_artifact_input(suffix)).await?;
+        let version = ArtifactVersionRepository::create_object_pending(
+            pool,
+            artifact.id,
+            None,
+            "application/octet-stream".into(),
+            None,
+            None,
+        )
+        .await?;
+        let ready = ArtifactVersionRepository::mark_body_ready(
+            pool,
+            version.id,
+            "e:owned-missing",
+            5,
+            &"a".repeat(64),
+        )
+        .await?;
+        anyhow::ensure!(
+            ready.is_some(),
+            "owned missing-body fixture must become ready"
+        );
+        Ok((artifact.id, version.id))
+    }
+
+    fn housekeeping_test_service(
+        config: Config,
+        pool: PgPool,
+        objects: &std::path::Path,
+    ) -> SupervisorService {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool,
+                artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects).unwrap()),
+                config,
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn flocked_shared_log_does_not_starve_other_shared_logs_or_ready_reconciliation() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = true;
+        config.maintenance.pack_release_retention_enabled = false;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention.native_maintenance.enabled = false;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let execution: i64 = sqlx::query_scalar("INSERT INTO execution(action_ref,status) VALUES('core.owned_flocked_cleanup','failed') RETURNING id")
+            .fetch_one(database.pool()).await.unwrap();
+        let volume = VolumeTransport::new(&config.artifacts_dir);
+        let mut shared = Vec::new();
+        for (index, suffix) in ["locked", "free"].into_iter().enumerate() {
+            let artifact =
+                ArtifactRepository::create(database.pool(), housekeeping_artifact_input(suffix))
+                    .await
+                    .unwrap();
+            let version = ArtifactVersionRepository::create_log_pending(
+                database.pool(),
+                artifact.id,
+                &artifact.r#ref,
+                LogStreamBackend::SharedFile,
+                "text/plain".into(),
+                Some(execution),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            LogStreamRepository::create_with_backend(
+                database.pool(),
+                version.id,
+                LogStreamBackend::SharedFile,
+                1024,
+                1000,
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE artifact_version SET body_updated=NOW()-interval '2 days'+$2::integer*interval '1 second' WHERE id=$1")
+                .bind(version.id).bind(index as i32).execute(database.pool()).await.unwrap();
+            volume
+                .write_file(
+                    version.file_path.as_deref().unwrap(),
+                    b"owned shared bytes",
+                    None,
+                )
+                .await
+                .unwrap();
+            shared.push(version);
+        }
+        let locked_path = artifacts
+            .path()
+            .join(shared[0].file_path.as_deref().unwrap());
+        let free_path = artifacts
+            .path()
+            .join(shared[1].file_path.as_deref().unwrap());
+        let mut writer = tokio::process::Command::new("python3")
+            .args(["-u","-c","import fcntl,sys\nwith open(sys.argv[1],'a+b') as f:\n fcntl.flock(f,fcntl.LOCK_EX)\n print('locked',flush=True)\n sys.stdin.buffer.read(1)"])
+            .arg(&locked_path)
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        let mut output = tokio::io::BufReader::new(writer.stdout.take().unwrap()).lines();
+        let ready = tokio::time::timeout(Duration::from_secs(5), output.next_line()).await;
+        if !matches!(&ready,Ok(Ok(Some(line))) if line == "locked") {
+            writer.kill().await.unwrap();
+            writer.wait().await.unwrap();
+            panic!("owned child did not acknowledge its cross-process flock: {ready:?}");
+        }
+        let service = housekeeping_test_service(config, database.pool().clone(), objects.path());
+        // All assertions that can fail while the child holds the flock return an
+        // error first, so teardown always releases and joins the actual writer.
+        let checked: Result<()> = async {
+            let mut now = Utc::now();
+            for cycle in 0..2 {
+                let (_, missing) =
+                    missing_housekeeping_version(database.pool(), &format!("missing_{cycle}"))
+                        .await?;
+                service
+                    .run_retention_cycle_at(SupervisorCycleReason::Scheduled, now)
+                    .await?;
+                let completed = Utc::now();
+                anyhow::ensure!(
+                    ArtifactVersionRepository::find_by_id(database.pool(), missing)
+                        .await?
+                        .is_none(),
+                    "flocked shared log starved unrelated ready-body reconciliation"
+                );
+                anyhow::ensure!(
+                    ArtifactVersionRepository::find_by_id(database.pool(), shared[1].id)
+                        .await?
+                        .is_none(),
+                    "flocked head starved the independent shared-log follower"
+                );
+                let locked =
+                    ArtifactVersionRepository::find_by_id(database.pool(), shared[0].id).await?;
+                anyhow::ensure!(
+                    locked.is_some() && locked_path.exists(),
+                    "active writer file or version was deleted"
+                );
+                anyhow::ensure!(
+                    !free_path.exists(),
+                    "independent shared-log bytes were not removed"
+                );
+                let status = ScheduleRepository::status(database.pool())
+                    .await?
+                    .into_iter()
+                    .find(|s| s.job == MaintenanceJob::Retention)
+                    .unwrap();
+                anyhow::ensure!(
+                    status.last_success.is_none(),
+                    "partial cleanup reported hourly success"
+                );
+                anyhow::ensure!(
+                    status.next_due.timestamp_micros()
+                        >= (now + ChronoDuration::minutes(1)).timestamp_micros()
+                        && status.next_due.timestamp_micros()
+                            <= (now.max(completed) + ChronoDuration::minutes(1)).timestamp_micros(),
+                    "flock deferral lost its one-minute retry"
+                );
+                now = status.next_due;
+            }
+            Ok(())
+        }
+        .await;
+        writer.stdin.take().unwrap().write_all(b"x").await.unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), writer.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stopped.success());
+        checked.unwrap();
+        let cleaned = artifact_cleanup::cleanup_abandoned_shared_logs(
+            database.pool(),
+            &volume,
+            &service.inner.config.maintenance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cleaned, 1,
+            "the durable claim must remain retryable after the writer exits"
+        );
+        assert!(!locked_path.exists());
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_ready_mismatch_is_a_visit_not_a_prefix_that_hides_later_rows() {
+        use attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository as Evidence;
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = true;
+        config.maintenance.pack_release_retention_enabled = false;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention.native_maintenance.enabled = false;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let (_, head) = missing_housekeeping_version(database.pool(), "pinned_head")
+            .await
+            .unwrap();
+        let (_, follower) = missing_housekeeping_version(database.pool(), "unpinned_follower")
+            .await
+            .unwrap();
+        let mut pin = database.pool().begin().await.unwrap();
+        Evidence::lock_capture(&mut pin).await.unwrap();
+        // Retention-only fixture, not disclosure authority. Incomplete physical
+        // flags retain this owner's pin until the test explicitly completes it.
+        sqlx::query(
+            "INSERT INTO file_evidence_owner(version,artifact,root_read) VALUES(99801,99802,99803)",
+        )
+        .execute(&mut *pin)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO file_evidence_pin(owner,kind,source) VALUES(99801,'artifact_version',$1)",
+        )
+        .bind(head)
+        .execute(&mut *pin)
+        .await
+        .unwrap();
+        pin.commit().await.unwrap();
+        let service = housekeeping_test_service(config, database.pool().clone(), objects.path());
+        let start = Utc::now();
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, start)
+            .await
+            .unwrap();
+        assert!(ArtifactVersionRepository::find_by_id(database.pool(), head)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            ArtifactVersionRepository::find_by_id(database.pool(), follower)
+                .await
+                .unwrap()
+                .is_none(),
+            "confirmed pinned NoWork hid the unpinned follower"
+        );
+        assert_eq!(
+            service
+                .inner
+                .artifact_reconciliation_cursor
+                .load(Ordering::Relaxed),
+            follower
+        );
+        let next_due = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.job == MaintenanceJob::Retention)
+            .unwrap()
+            .next_due;
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, next_due)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .inner
+                .artifact_reconciliation_cursor
+                .load(Ordering::Relaxed),
+            head,
+            "tail exhaustion must wrap and revisit the pinned head immediately"
+        );
+        let next_due = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.job == MaintenanceJob::Retention)
+            .unwrap()
+            .next_due;
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, next_due)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .inner
+                .artifact_reconciliation_cursor
+                .load(Ordering::Relaxed),
+            head,
+            "wrapped discovery must revisit the pinned head"
+        );
+        let pins: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM file_evidence_pin WHERE owner=99801 AND source=$1",
+        )
+        .bind(head)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(pins, 1, "NoWork visits must preserve the proof pin");
+        let mut complete = database.pool().begin().await.unwrap();
+        Evidence::lock_reclamation(&mut complete).await.unwrap();
+        Evidence::request_cleanup(&mut complete, &[99801])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE file_evidence_owner SET metadata_gone=true,object_done=true,staging_done=true WHERE version=99801").execute(&mut *complete).await.unwrap();
+        sqlx::query("SELECT file_evidence_release(99801)")
+            .execute(&mut *complete)
+            .await
+            .unwrap();
+        complete.commit().await.unwrap();
+        for _ in 0..2 {
+            let next_due = ScheduleRepository::status(database.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.job == MaintenanceJob::Retention)
+                .unwrap()
+                .next_due;
+            service
+                .run_retention_cycle_at(SupervisorCycleReason::Scheduled, next_due)
+                .await
+                .unwrap();
+        }
+        assert!(
+            ArtifactVersionRepository::find_by_id(database.pool(), head)
+                .await
+                .unwrap()
+                .is_none(),
+            "wrapped head was not reclaimed after its physical obligation completed"
+        );
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[derive(Debug)]
+    struct PausedPhysicalDelete {
+        volume: VolumeTransport,
+        entered: Arc<tokio::sync::Notify>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArtifactFileTransport for PausedPhysicalDelete {
+        async fn write_file(
+            &self,
+            path: &str,
+            bytes: &[u8],
+            content_type: Option<&str>,
+        ) -> attune_common::Result<()> {
+            self.volume.write_file(path, bytes, content_type).await
+        }
+        async fn file_exists(&self, path: &str) -> attune_common::Result<bool> {
+            self.volume.file_exists(path).await
+        }
+        async fn file_size(&self, path: &str) -> attune_common::Result<Option<u64>> {
+            self.volume.file_size(path).await
+        }
+        async fn open_reader(
+            &self,
+            path: &str,
+            offset: u64,
+        ) -> attune_common::Result<attune_common::artifact_transport::BoxAsyncReader> {
+            self.volume.open_reader(path, offset).await
+        }
+        fn transport_mode(&self) -> &'static str {
+            "owned-physical-cleanup-test"
+        }
+        fn base_dir(&self) -> &str {
+            self.volume.base_dir()
+        }
+        async fn delete_file(&self, path: &str) -> attune_common::Result<()> {
+            let release = self
+                .release
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one owned deletion");
+            let entered = self.entered.clone();
+            let path = std::path::Path::new(self.volume.base_dir()).join(path);
+            tokio::task::spawn_blocking(move || {
+                entered.notify_one();
+                release
+                    .recv()
+                    .expect("test must release and join the physical worker");
+                std::fs::remove_file(path)
+                    .map_err(|_| attune_common::Error::Io("owned physical deletion failed".into()))
+            })
+            .await
+            .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_cleanup_keeps_its_fence_past_metadata_budget_and_waiter_cancellation() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = true;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let artifact = ArtifactRepository::create(
+            database.pool(),
+            CreateArtifactInput {
+                r#ref: "owned_physical_exception".into(),
+                scope: OwnerType::System,
+                owner: "supervisor-test".into(),
+                r#type: ArtifactType::FileBinary,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::General,
+                retention_policy: RetentionPolicyType::Days,
+                retention_limit: 1,
+                name: None,
+                description: None,
+                content_type: None,
+                data: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let version: i64 = sqlx::query_scalar("INSERT INTO artifact_version(artifact,version,file_path,created) VALUES($1,1,'owned-paused.txt',NOW()-interval '2 days') RETURNING id")
+            .bind(artifact).fetch_one(database.pool()).await.unwrap();
+        tokio::fs::write(artifacts.path().join("owned-paused.txt"), b"owned bytes")
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                artifact_transport: Arc::new(PausedPhysicalDelete {
+                    volume: VolumeTransport::new(&config.artifacts_dir),
+                    entered: entered.clone(),
+                    release: std::sync::Mutex::new(Some(release_rx)),
+                }),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                config,
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        let runner = service.clone();
+        let caller = tokio::spawn(async move {
+            runner
+                .run_maintenance_cycle(&RetentionConfig::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        // This is an elapsed-time contract, not a readiness sleep: physical I/O
+        // must outlive the default one-second metadata page without losing its
+        // fence, even after its original waiter was cancelled.
+        tokio::time::sleep(MaintenanceBudget::default().page_timeout + Duration::from_millis(100))
+            .await;
+        let mut reader = database.pool().begin().await.unwrap();
+        let admitted: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock_shared(hashtextextended(current_schema() || ':named-type-graph',0))")
+            .fetch_one(&mut *reader).await.unwrap();
+        reader.rollback().await.unwrap();
+        // Always release the blocking worker before asserting or tearing down.
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&service.inner) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned housekeeping task must finish before database teardown");
+        assert!(
+            !admitted,
+            "physical cleanup lost its fence while unlink was still pending"
+        );
+        assert!(!artifacts.path().join("owned-paused.txt").exists());
+        assert!(
+            ArtifactVersionRepository::find_by_id(database.pool(), version)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_cleanup_failure_retries_without_shortening_row_retention() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database).await.unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = false;
+        config.maintenance.pack_release_retention_enabled = false;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention.native_maintenance.enabled = false;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let now = DateTime::parse_from_rfc3339("2040-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=$1, last_success=NULL")
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        // Failure injection is confined to this test's physical database clone.
+        sqlx::query("ALTER TABLE object_maintenance_ledger RENAME TO unavailable_object_ledger")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                config,
+                artifact_transport: Arc::new(VolumeTransport::new(
+                    artifacts.path().to_str().unwrap(),
+                )),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, now)
+            .await
+            .unwrap();
+        let status = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.job == MaintenanceJob::ObjectRetention)
+            .unwrap();
+        assert_eq!(status.last_success, None);
+        assert_eq!(status.next_due, now + ChronoDuration::minutes(1));
+        let row_retention = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.job == MaintenanceJob::Retention)
+            .unwrap();
+        assert_eq!(row_retention.last_success, Some(now));
+        assert_eq!(row_retention.next_due, now + ChronoDuration::hours(1));
+        // Startup remediation can run before hourly retention is due. A failed
+        // forced attempt still needs a bounded retry, not an hour of deferral.
+        let previous_success = now - ChronoDuration::minutes(1);
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=$1,last_success=$2 WHERE job='object_retention'")
+            .bind(now + ChronoDuration::hours(1))
+            .bind(previous_success)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let startup = now + ChronoDuration::seconds(10);
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::StartupRecovery, startup)
+            .await
+            .unwrap();
+        let status = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.job == MaintenanceJob::ObjectRetention)
+            .unwrap();
+        assert_eq!(status.last_success, Some(previous_success));
+        assert_eq!(status.next_due, startup + ChronoDuration::minutes(1));
+        service.inner.pool.close().await;
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_continuations_cross_large_pinned_prefix_without_running_hourly_retention() {
+        use attune_common::{
+            models::enums::{
+                ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+                RetentionPolicyType,
+            },
+            repositories::{
+                artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
+                Create,
+            },
+        };
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database).await.unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = false;
+        config.maintenance.pack_release_retention_enabled = true;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention.native_maintenance.enabled = false;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=$1,last_success=$2 WHERE job='retention'")
+            .bind(now + ChronoDuration::hours(1)).bind(now)
+            .execute(database.pool()).await.unwrap();
+        let mut tx = database.pool().begin().await.unwrap();
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO runtime_cache_iteration_epoch(iteration,creation_transaction) SELECT id,'owned-supervisor-prefix' FROM generate_series(1,10241) id")
+            .execute(&mut *tx).await.unwrap();
+        // No physical bytes: the owner exercises the production evidence pins,
+        // while existing retention tests cover actual cleanup obligations.
+        sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,object_done,staging_done) VALUES(990001,990002,990003,true,true)")
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source) SELECT 990001,'runtime_cache_iteration_epoch',id FROM generate_series(1,10240) id")
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        let artifact = ArtifactRepository::create(
+            database.pool(),
+            CreateArtifactInput {
+                r#ref: "owned_supervisor_abandoned".into(),
+                scope: OwnerType::System,
+                owner: "supervisor-test".into(),
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::RuntimeLog,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 10,
+                name: None,
+                description: None,
+                content_type: None,
+                data: None,
+            },
+        )
+        .await
+        .unwrap();
+        let pending = ArtifactVersionRepository::create_object_pending(
+            database.pool(),
+            artifact.id,
+            None,
+            "application/octet-stream".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE artifact_version SET body_updated=clock_timestamp()-interval '2 days' WHERE id=$1")
+            .bind(pending.id).execute(database.pool()).await.unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                config,
+                artifact_transport: Arc::new(VolumeTransport::new(
+                    artifacts.path().to_str().unwrap(),
+                )),
+                blob_store: Arc::new(FilesystemBlobStore::new(objects.path()).unwrap()),
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_tx,
+            }),
+        };
+        // Exercise the production housekeeping caller, not just object_retention.
+        // Its old duplicate abandoned-upload loop could queue an unbounded writer.
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=clock_timestamp() WHERE job='retention'")
+            .execute(database.pool()).await.unwrap();
+        let mut capture = database.pool().begin().await.unwrap();
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+            &mut capture,
+        )
+        .await
+        .unwrap();
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            service.run_retention_cycle_at(SupervisorCycleReason::Scheduled, Utc::now()),
+        )
+        .await;
+        capture.rollback().await.unwrap();
+        first
+            .expect("housekeeping queued an unbounded graph writer")
+            .unwrap();
+        assert!(
+            ArtifactVersionRepository::find_by_id(database.pool(), pending.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let baseline = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|status| status.job == MaintenanceJob::Retention)
+            .unwrap();
+        let mut reclaimed = false;
+        for _ in 0..8 {
+            // Advance only the owned maintenance deadlines, never hourly
+            // retention. This models persisted continuation after a restart.
+            sqlx::query("UPDATE native_maintenance_schedule SET next_due=clock_timestamp() WHERE job='object_retention'")
+                .execute(database.pool()).await.unwrap();
+            sqlx::query("UPDATE graph_reclamation_progress SET next_attempt=clock_timestamp() WHERE cursor_id<>0 OR high_water<>0 OR pass_deferred OR deferred_since IS NOT NULL")
+                .execute(database.pool()).await.unwrap();
+            let poll = service
+                .run_retention_cycle_at(SupervisorCycleReason::Scheduled, Utc::now())
+                .await
+                .unwrap();
+            let statuses = ScheduleRepository::status(database.pool()).await.unwrap();
+            let rows = statuses
+                .iter()
+                .find(|status| status.job == MaintenanceJob::Retention)
+                .unwrap();
+            assert_eq!(rows.last_success, baseline.last_success);
+            assert_eq!(rows.next_due, baseline.next_due);
+            reclaimed = !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM runtime_cache_iteration_epoch WHERE iteration=10241)",
+            )
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            if reclaimed {
+                break;
+            }
+            let object = statuses
+                .iter()
+                .find(|status| status.job == MaintenanceJob::ObjectRetention)
+                .unwrap();
+            assert!(
+                object.next_due <= Utc::now() + ChronoDuration::seconds(2),
+                "pending work earned an hourly cadence"
+            );
+            assert!(poll <= Duration::from_secs(2));
+        }
+        assert!(
+            reclaimed,
+            "production budgets did not cross the pinned prefix in bounded continuations"
+        );
+        let pins: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM runtime_cache_iteration_epoch WHERE iteration<=10240",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(pins, 10240);
+        service.inner.pool.close().await;
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_scheduler_keeps_hourly_retention_independent_and_resumes_bounded_jobs() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).unwrap();
@@ -2111,6 +3398,11 @@ mod tests {
         .await
         .unwrap();
         for row in &first {
+            if row.job == MaintenanceJob::ObjectRetention {
+                assert_eq!(row.last_success, None, "disabled object maintenance ran");
+                assert_eq!(row.next_due, now, "disabled object job was claimed");
+                continue;
+            }
             assert_eq!(
                 row.last_success,
                 Some(now),

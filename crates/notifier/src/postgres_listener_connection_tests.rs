@@ -31,6 +31,18 @@ async fn wire_peer(
         let length = stream.read_u32().await?;
         let mut startup = vec![0; length as usize - 4];
         stream.read_exact(&mut startup).await?;
+        let fields: Vec<&[u8]> = startup[4..].split(|byte| *byte == 0).collect();
+        let application_name = fields
+            .chunks(2)
+            .find(|pair| pair[0] == b"application_name")
+            .and_then(|pair| pair.get(1))
+            .context("missing startup application_name")?;
+        assert_eq!(
+            *application_name,
+            ConnectionIdentity::for_process("notifier", "listener")
+                .application_name()
+                .as_bytes()
+        );
         stream.write_all(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I").await?;
         let mut subscribed = false;
         loop {

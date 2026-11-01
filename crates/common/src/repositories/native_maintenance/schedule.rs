@@ -26,16 +26,23 @@ pub enum MaintenanceJob {
     Partition,
     Summary,
     Retention,
+    ObjectRetention,
 }
 
 impl MaintenanceJob {
-    pub const ALL: [Self; 3] = [Self::Partition, Self::Summary, Self::Retention];
+    pub const ALL: [Self; 4] = [
+        Self::Partition,
+        Self::Summary,
+        Self::Retention,
+        Self::ObjectRetention,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Partition => "partition",
             Self::Summary => "summary",
             Self::Retention => "retention",
+            Self::ObjectRetention => "object_retention",
         }
     }
 }
@@ -48,6 +55,7 @@ impl TryFrom<String> for MaintenanceJob {
             "partition" => Ok(Self::Partition),
             "summary" => Ok(Self::Summary),
             "retention" => Ok(Self::Retention),
+            "object_retention" => Ok(Self::ObjectRetention),
             _ => Err(Error::Validation("unknown native maintenance job".into())),
         }
     }
@@ -59,6 +67,7 @@ pub struct MaintenanceScheduleStatus {
     pub job: MaintenanceJob,
     pub next_due: DateTime<Utc>,
     pub last_success: Option<DateTime<Utc>>,
+    pub deferred_since: Option<DateTime<Utc>>,
 }
 
 impl MaintenanceScheduleStatus {
@@ -122,7 +131,7 @@ impl ScheduleRepository {
     pub async fn ensure(pool: &PgPool, now: DateTime<Utc>) -> Result<()> {
         sqlx::query(
             "INSERT INTO native_maintenance_schedule (job, next_due)
-             SELECT unnest(ARRAY['partition', 'summary', 'retention']::text[]), $1
+             SELECT unnest(ARRAY['partition', 'summary', 'retention', 'object_retention']::text[]), $1
              ON CONFLICT (job) DO NOTHING",
         )
         .bind(now)
@@ -131,10 +140,10 @@ impl ScheduleRepository {
         Ok(())
     }
 
-    /// Three fixed job rows, suitable for the protected operator status API.
+    /// Fixed job rows, suitable for the protected operator status API.
     pub async fn status(pool: &PgPool) -> Result<Vec<MaintenanceScheduleStatus>> {
         Ok(sqlx::query_as(
-            "SELECT job, next_due, last_success FROM native_maintenance_schedule ORDER BY job",
+            "SELECT job, next_due, last_success, deferred_since FROM native_maintenance_schedule ORDER BY job",
         )
         .fetch_all(pool)
         .await?)
@@ -166,6 +175,8 @@ impl ScheduleRepository {
 
     /// Successful bounded work earns the normal cadence, even when backfill is
     /// still pending. Failed/cancelled work keeps last_success and retries later.
+    /// Anchor the deadline after completion, not at the caller's cycle start.
+    /// A future supplied clock remains useful to deterministic scheduler tests.
     pub async fn finish_attempt(
         pool: &PgPool,
         job: MaintenanceJob,
@@ -175,9 +186,15 @@ impl ScheduleRepository {
     ) -> Result<()> {
         let next_due = next_deadline(now, interval_seconds, success)?;
         sqlx::query(
-            "UPDATE native_maintenance_schedule
-             SET next_due = $2, last_success = CASE WHEN $3 THEN $4 ELSE last_success END
-             WHERE job = $1",
+            "WITH completion AS MATERIALIZED (
+                 SELECT GREATEST($4::timestamptz, clock_timestamp()) AS at
+             )
+             UPDATE native_maintenance_schedule
+             SET next_due = completion.at + ($2::timestamptz - $4::timestamptz),
+                 last_success = CASE WHEN $3 THEN completion.at ELSE last_success END,
+                 deferred_since = CASE WHEN $3 THEN NULL ELSE COALESCE(deferred_since, completion.at) END
+             FROM completion
+              WHERE job = $1",
         )
         .bind(job.name())
         .bind(next_due)
@@ -244,6 +261,49 @@ mod tests {
             );
         }
         assert!(MaintenanceJob::try_from("event; DROP TABLE event".to_owned()).is_err());
+    }
+
+    #[tokio::test]
+    async fn long_attempt_schedules_retry_from_completion_not_cycle_start() {
+        use crate::{config::Config, test_database::TestDatabase};
+        let config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let database = TestDatabase::create(&config.database).await.unwrap();
+        let pool = database.pool();
+        let completion_floor: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let stale_start = completion_floor - Duration::hours(2);
+        ScheduleRepository::ensure(pool, stale_start).await.unwrap();
+        for success in [true, false] {
+            ScheduleRepository::finish_attempt(
+                pool,
+                MaintenanceJob::Retention,
+                stale_start,
+                3600,
+                success,
+            )
+            .await
+            .unwrap();
+            let status = ScheduleRepository::status(pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.job == MaintenanceJob::Retention)
+                .unwrap();
+            let cadence = if success {
+                Duration::hours(1)
+            } else {
+                Duration::minutes(1)
+            };
+            assert!(status.next_due >= completion_floor + cadence);
+            assert!(status.last_success.unwrap() >= completion_floor);
+        }
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]

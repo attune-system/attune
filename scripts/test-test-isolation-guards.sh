@@ -85,6 +85,11 @@ for service in api executor executor-2 supervisor worker-shell worker-python wor
 done
 grep -Fq 'cargo test --workspace --all-features --no-run' "$ROOT/docker/Dockerfile.rust-tests"
 
+# The E2E runner passes a compile budget to every image. Agent cross-compilation
+# must consume it too, rather than silently using every CPU on the builder.
+grep -Fq 'ARG CARGO_BUILD_JOBS=4' "$ROOT/docker/Dockerfile.agent"
+grep -Fq 'cargo zigbuild --release -j "${CARGO_BUILD_JOBS}"' "$ROOT/docker/Dockerfile.agent"
+
 # Infrastructure-only changes must exercise the Rust runner and full-stack lane.
 for path in Makefile scripts/run-ci-rust-tests.sh scripts/runtime-log-s3.sh \
   config.test.yaml docker-compose.yaml docker-compose.e2e.yaml \

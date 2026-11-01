@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Executor, PgConnection, PgPool, Postgres};
 
 use crate::{
     auth::jwt::STANDARD_EXECUTION_ACCESS_REF,
@@ -34,8 +34,11 @@ impl DelegationAuthority {
         }
     }
 
-    pub async fn load(pool: &PgPool, identity_id: Id) -> Result<Self> {
-        let row = IdentityRepository::authorization_state(pool, identity_id)
+    pub async fn load<'e, E>(executor: E, identity_id: Id) -> Result<Self>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
+        let row = IdentityRepository::authorization_state(executor, identity_id)
             .await?
             .filter(|row| !row.frozen)
             .ok_or_else(|| {

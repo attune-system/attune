@@ -109,7 +109,11 @@ impl SensorService {
 
         // Connect to database
         info!("Connecting to database...");
-        let database = Database::new(&config.database).await?;
+        let database = Database::new_named(
+            &config.database,
+            attune_common::db::ConnectionIdentity::for_process("sensor", "main"),
+        )
+        .await?;
         let db = database.pool().clone();
         info!("Database connection established");
 

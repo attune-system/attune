@@ -30,6 +30,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 mod helpers;
+#[path = "execution_token_permissions_e2e/transactional_delegation.rs"]
+mod transactional_delegation;
 use helpers::{activate_test_pack_release_with_projections, TestContext};
 
 type TResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;

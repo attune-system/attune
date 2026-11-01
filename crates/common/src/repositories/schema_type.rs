@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use sqlx::{Executor, PgConnection, Postgres, Transaction};
+use sqlx::{Executor, PgConnection, Postgres, Row, Transaction};
 
 use crate::models::schema_type::{SchemaType, SchemaTypeRevision};
 use crate::platform_catalog::ManagedComponentKind;
@@ -75,16 +75,36 @@ impl SchemaTypeRepository {
     /// locks. Mutation entry points must take exclusive graph admission before
     /// any pack or component write lock, never upgrade behind those locks.
     pub async fn lock_selection(connection: &mut PgConnection) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':named-type-graph', 0))")
-            .execute(connection).await?;
+        let owner_request = crate::observability::shared_graph_admission_requested();
+        let started = std::time::Instant::now();
+        tracing::debug!(mode = "shared", event = "requested", "Graph admission");
+        let result = sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':named-type-graph', 0)), pg_backend_pid() AS backend")
+            .fetch_one(connection).await;
+        owner_request.finished(result.as_ref().ok().map(|row| row.get("backend")));
+        tracing::debug!(
+            mode = "shared",
+            event = if result.is_ok() { "acquired" } else { "failed" },
+            wait_us = started.elapsed().as_micros() as u64,
+            "Graph admission"
+        );
+        result?;
         Ok(())
     }
     /// Exclusive graph admission for mutation/reclamation, acquired before
     /// cache admission and pack/component locks. New bindings become visible
     /// before eligible releases are deleted.
     pub async fn lock_reclamation(connection: &mut PgConnection) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':named-type-graph', 0))")
-            .execute(connection).await?;
+        let started = std::time::Instant::now();
+        tracing::debug!(mode = "exclusive", event = "requested", "Graph admission");
+        let result = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':named-type-graph', 0))")
+            .execute(connection).await;
+        tracing::debug!(
+            mode = "exclusive",
+            event = if result.is_ok() { "acquired" } else { "failed" },
+            wait_us = started.elapsed().as_micros() as u64,
+            "Graph admission"
+        );
+        result?;
         Ok(())
     }
     pub async fn refresh_type_references(connection: &mut PgConnection, pack: i64) -> Result<()> {
