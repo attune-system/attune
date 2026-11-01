@@ -3,7 +3,9 @@ use sqlx::{Executor, FromRow, PgConnection, PgPool, Postgres};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::maintenance_admission::{self, MaintenanceBudget, MaintenanceResult};
+use super::maintenance_admission::{
+    self, MaintenanceBudget, MaintenanceOutcome, MaintenanceResult,
+};
 use super::pack_install::{PACK_INSTALL_ACTIVATION_TTL_SECS, PACK_INSTALL_ACTIVE_TTL_SECS};
 use crate::{Error, Result};
 
@@ -27,6 +29,16 @@ struct DeletionCandidate {
     progress_revision: i64,
     high_water: i64,
     next_cursor: i64,
+    after: i64,
+}
+
+#[derive(Clone, Copy)]
+struct DeletionRetry {
+    revision: i64,
+    after: i64,
+    high_water: i64,
+    next_cursor: i64,
+    count: usize,
 }
 
 enum DeletionVisit {
@@ -229,7 +241,11 @@ impl ObjectMaintenanceRepository {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> MaintenanceResult<Vec<ObjectLedgerEntry>> {
-        let report = maintenance_admission::run(pool, budget, deadline, cancel,
+        // Set only after admission and the progress revision check, immediately
+        // before claiming. A discovery/admission failure is not a failed visit.
+        let attempted = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let attempted_ref = attempted.clone();
+        let mut report = maintenance_admission::run(pool, budget, deadline, cancel,
             move |conn| Box::pin(Self::deletion_candidates(conn,retry_cutoff,limit.clamp(1,256))),
             move |conn, candidates| Box::pin(async move {
                 let raw_count = candidates.iter().filter(|visit| matches!(visit,DeletionVisit::Row(_))).count();
@@ -240,21 +256,59 @@ impl ObjectMaintenanceRepository {
                 let revision: i64 = sqlx::query_scalar("SELECT revision FROM graph_reclamation_progress WHERE phase='object_deletions' FOR UPDATE")
                     .fetch_one(&mut *conn).await?;
                 if revision != progress_revision { return Ok(((Vec::new(),raw_count),0)); }
-                let observed = candidates.into_iter().filter_map(|visit| match visit {
+                if let DeletionVisit::Row(first) = &candidates[0] {
+                    *attempted_ref.lock().unwrap() = Some(DeletionRetry {
+                        revision, after:first.after, high_water, next_cursor, count:raw_count,
+                    });
+                }
+                let observed: Vec<_> = candidates.into_iter().filter_map(|visit| match visit {
                     DeletionVisit::Row(candidate) => Some((candidate.id,candidate.xmin)),
                     DeletionVisit::EmptyPass { .. } => None,
                 }).collect();
                 // Every eligibility/pin check and exact xmin check runs after
                 // admission. Ineligible visits advance only on this same commit.
                 let rows = if raw_count==0 { Vec::new() } else {
-                    Self::claim_deletions_with_conn(conn, retry_cutoff, limit.clamp(1,256), Some(observed)).await?
+                    Self::claim_deletions_with_conn(conn, retry_cutoff, limit.clamp(1,256), Some(observed.clone())).await?
                 };
+                // An xmin race is not proof that a previously failed row became
+                // ineligible. Keep its retry age until a later clean visit.
+                let changed_identity = if rows.len()<raw_count {
+                    let (ids,revisions): (Vec<_>,Vec<_>) = observed.into_iter().unzip();
+                    sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM object_maintenance_ledger l JOIN unnest($1::bigint[],$2::text[]) seen(id,revision) ON l.id=seen.id WHERE l.xmin::text<>seen.revision AND ((l.state='deleting' AND l.updated<$3) OR (l.state='deletion_pending' AND l.eligible_at<$3)))")
+                        .bind(ids).bind(revisions).bind(retry_cutoff).fetch_one(&mut *conn).await?
+                } else { false };
                 let changed = rows.len() as u64;
-                sqlx::query("UPDATE graph_reclamation_progress SET cursor_id=$1,high_water=$2,revision=revision+1,last_attempt=clock_timestamp(),next_attempt=clock_timestamp(),last_progress=CASE WHEN $3 THEN clock_timestamp() ELSE last_progress END WHERE phase='object_deletions' AND revision=$4")
-                    .bind(next_cursor).bind(if next_cursor==0 {0} else {high_water}).bind(changed>0).bind(revision).execute(conn).await?;
+                sqlx::query("UPDATE graph_reclamation_progress SET cursor_id=$1,high_water=$2,revision=revision+1,last_attempt=clock_timestamp(),next_attempt=clock_timestamp(),last_progress=CASE WHEN $3 THEN clock_timestamp() ELSE last_progress END,probe_limit=CASE WHEN $1=0 AND NOT pass_deferred AND NOT $5 THEN 256 ELSE probe_limit END,deferred_since=CASE WHEN $5 THEN COALESCE(deferred_since,clock_timestamp()) WHEN $1=0 AND NOT pass_deferred THEN NULL ELSE deferred_since END,oversized_since=CASE WHEN $1=0 AND NOT pass_deferred AND NOT $5 THEN NULL ELSE oversized_since END,pass_deferred=CASE WHEN $1=0 THEN false ELSE pass_deferred OR $5 END WHERE phase='object_deletions' AND revision=$4")
+                    .bind(next_cursor).bind(if next_cursor==0 {0} else {high_water}).bind(changed>0).bind(revision).bind(changed_identity).execute(conn).await?;
                 Ok(((rows,raw_count),changed))
             }),
         ).await;
+        let attempted = *attempted.lock().unwrap();
+        if let Some(visit) = attempted.filter(|_| {
+            report.rollback_acknowledged
+                && !cancel.is_cancelled()
+                && matches!(
+                    report.outcome,
+                    MaintenanceOutcome::DeadlineDeferred | MaintenanceOutcome::Failed
+                )
+        }) {
+            // The claim rollback is acknowledged before this separately bounded
+            // progress-only transaction. It cannot return claims or change the
+            // ledger. Shrink a failed page without skipping its rows; only a
+            // failed singleton advances, and the next frozen pass revisits it.
+            let completion_end = deadline.min(Instant::now() + budget.statement_timeout);
+            let completion =
+                Self::deletion_failed_visit(pool, visit, budget, completion_end, cancel).await;
+            if !matches!(
+                completion.outcome,
+                MaintenanceOutcome::Progress | MaintenanceOutcome::NoWork
+            ) {
+                report.outcome = completion.outcome;
+                if completion.error.is_some() {
+                    report.error = completion.error;
+                }
+            }
+        }
         // The internal empty-pass sentinel is not an object candidate. Only
         // acknowledged commits can expose the corrected count or returned rows.
         let candidates = report
@@ -271,10 +325,39 @@ impl ObjectMaintenanceRepository {
         }
     }
 
+    async fn deletion_failed_visit(
+        pool: &PgPool,
+        visit: DeletionRetry,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<()> {
+        maintenance_admission::run(pool,budget,deadline,cancel,
+            move |_| Box::pin(async move { Ok(vec![visit]) }),
+            move |conn,visits| Box::pin(async move {
+                let visit = visits[0];
+                let singleton = visit.count==1;
+                let cursor = if singleton { visit.next_cursor } else { visit.after };
+                sqlx::query("UPDATE graph_reclamation_progress SET cursor_id=$1,high_water=$2,probe_limit=$3,revision=revision+1,last_attempt=clock_timestamp(),next_attempt=clock_timestamp(),oversized_since=CASE WHEN $4 THEN oversized_since ELSE COALESCE(oversized_since,clock_timestamp()) END,deferred_since=CASE WHEN $4 THEN COALESCE(deferred_since,clock_timestamp()) ELSE deferred_since END,pass_deferred=$1<>0 OR NOT $4 WHERE phase='object_deletions' AND revision=$5")
+                    .bind(cursor).bind(if singleton && cursor==0 {0} else {visit.high_water})
+                    .bind(if singleton {1} else {(visit.count as i64 / 2).max(1)})
+                    .bind(singleton).bind(visit.revision).execute(conn).await?;
+                Ok(((),0))
+            }),
+        ).await
+    }
+
     /// Advisory scheduling state, not an eligible-object count. Continue a
     /// bounded raw pass promptly rather than waiting for the normal cadence.
     pub async fn deletion_scan_pending(pool: &PgPool) -> Result<bool> {
-        Ok(sqlx::query_scalar("SELECT cursor_id>0 OR high_water>0 FROM graph_reclamation_progress WHERE phase='object_deletions'")
+        Ok(sqlx::query_scalar("SELECT cursor_id>0 OR high_water>0 OR pass_deferred OR deferred_since IS NOT NULL OR oversized_since IS NOT NULL FROM graph_reclamation_progress WHERE phase='object_deletions'")
+            .fetch_one(pool).await?)
+    }
+
+    /// Oldest unresolved failed claim, including over-budget multi-row probes.
+    /// Cheap followers cannot clear this age before a complete clean pass.
+    pub async fn deletion_deferred_since(pool: &PgPool) -> Result<Option<DateTime<Utc>>> {
+        Ok(sqlx::query_scalar("SELECT LEAST(deferred_since,oversized_since) FROM graph_reclamation_progress WHERE phase='object_deletions'")
             .fetch_one(pool).await?)
     }
 
@@ -283,45 +366,40 @@ impl ObjectMaintenanceRepository {
         retry_cutoff: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<DeletionVisit>> {
-        let (mut after,mut high_water,revision): (i64,i64,i64) = sqlx::query_as("SELECT cursor_id,high_water,revision FROM graph_reclamation_progress WHERE phase='object_deletions'")
+        let (after,mut high_water,revision,probe_limit,deferred): (i64,i64,i64,i64,bool) = sqlx::query_as("SELECT cursor_id,high_water,revision,probe_limit,pass_deferred OR deferred_since IS NOT NULL OR oversized_since IS NOT NULL FROM graph_reclamation_progress WHERE phase='object_deletions'")
             .fetch_one(&mut *conn).await?;
-        let pass_pending = after > 0 || high_water > 0;
-        // At most one tail probe and one wrapped head probe. A frozen pass end
-        // prevents continuous insertion from hiding newly eligible older rows.
-        for _ in 0..2 {
-            if high_water == 0 {
-                high_water =
-                    sqlx::query_scalar("SELECT COALESCE(max(id),0) FROM object_maintenance_ledger")
-                        .fetch_one(&mut *conn)
-                        .await?;
-            }
-            let rows: Vec<(i64,String)> = sqlx::query_as("SELECT id,xmin::text FROM object_maintenance_ledger WHERE id>$1 AND id<=$2 AND ((state='deleting' AND updated<$3) OR (state='deletion_pending' AND eligible_at<$3)) ORDER BY id LIMIT $4")
+        let pass_pending = after > 0 || high_water > 0 || deferred;
+        let limit = limit.min(probe_limit);
+        // Finish the frozen pass before wrapping, so a dirty pass cannot clear
+        // failure age. Continuous insertion cannot hide failed older rows.
+        if high_water == 0 {
+            high_water =
+                sqlx::query_scalar("SELECT COALESCE(max(id),0) FROM object_maintenance_ledger")
+                    .fetch_one(&mut *conn)
+                    .await?;
+        }
+        let rows: Vec<(i64,String)> = sqlx::query_as("SELECT id,xmin::text FROM object_maintenance_ledger WHERE id>$1 AND id<=$2 AND ((state='deleting' AND updated<$3) OR (state='deletion_pending' AND eligible_at<$3)) ORDER BY id LIMIT $4")
                 .bind(after).bind(high_water).bind(retry_cutoff).bind(limit).fetch_all(&mut *conn).await?;
-            if !rows.is_empty() {
-                let last = rows.last().unwrap().0;
-                let next_cursor = if rows.len() < limit as usize || last >= high_water {
-                    0
-                } else {
-                    last
-                };
-                return Ok(rows
-                    .into_iter()
-                    .map(|(id, xmin)| {
-                        DeletionVisit::Row(DeletionCandidate {
-                            id,
-                            xmin,
-                            progress_revision: revision,
-                            high_water,
-                            next_cursor,
-                        })
+        if !rows.is_empty() {
+            let last = rows.last().unwrap().0;
+            let next_cursor = if rows.len() < limit as usize || last >= high_water {
+                0
+            } else {
+                last
+            };
+            return Ok(rows
+                .into_iter()
+                .map(|(id, xmin)| {
+                    DeletionVisit::Row(DeletionCandidate {
+                        id,
+                        xmin,
+                        progress_revision: revision,
+                        high_water,
+                        next_cursor,
+                        after,
                     })
-                    .collect());
-            }
-            if after == 0 {
-                break;
-            }
-            after = 0;
-            high_water = 0;
+                })
+                .collect());
         }
         // Discovery itself never updates the cursor. The outer owner first
         // acknowledges discovery rollback, then commits this revision-checked

@@ -636,3 +636,478 @@ async fn over_budget_first_audit_owner_does_not_hide_cheap_owners_or_clear_failu
     assert!(!Evidence::audit_scan_pending(db.pool()).await.unwrap());
     db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn over_budget_first_deletion_does_not_hide_the_257th_candidate() {
+    let db = database().await;
+    sqlx::query("INSERT INTO object_maintenance_ledger(object_key,object_kind,provider_version,state,eligible_at) SELECT 'bounded/fair/'||n,'artifact','v:bounded','deletion_pending',NOW()-INTERVAL '1 hour' FROM generate_series(1,257) n ORDER BY n")
+        .execute(db.pool()).await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION owned_claim_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF OLD.object_key='bounded/fair/1' THEN PERFORM pg_sleep(0.3); END IF; RETURN NEW; END; $$; CREATE TRIGGER owned_claim_delay BEFORE UPDATE OF state ON object_maintenance_ledger FOR EACH ROW WHEN (NEW.state='deleting') EXECUTE FUNCTION owned_claim_delay()")
+        .execute(db.pool()).await.unwrap();
+    let budget = MaintenanceBudget {
+        statement_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let cutoff = Utc::now();
+    let mut claimed = std::collections::HashSet::new();
+    let mut oldest = None;
+    for _ in 0..270 {
+        let report =
+            Objects::claim_deletions_bounded(db.pool(), cutoff, 256, &budget, deadline(), &cancel)
+                .await;
+        assert!(
+            matches!(
+                report.outcome,
+                MaintenanceOutcome::Progress
+                    | MaintenanceOutcome::NoWork
+                    | MaintenanceOutcome::DeadlineDeferred
+            ),
+            "{report:?}"
+        );
+        let rows = report.value.unwrap_or_default();
+        assert_eq!(report.changed, rows.len() as u64);
+        for row in rows {
+            assert_ne!(row.object_key, "bounded/fair/1");
+            assert_eq!(row.attempts, 1);
+            assert!(
+                claimed.insert(row.object_key),
+                "a confirmed claim was returned twice"
+            );
+        }
+        let age: Option<chrono::DateTime<Utc>> = sqlx::query_scalar("SELECT LEAST(deferred_since,oversized_since) FROM graph_reclamation_progress WHERE phase='object_deletions'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert!(
+            age.is_some(),
+            "an acknowledged over-budget visit must persist retry progress"
+        );
+        if let Some(oldest) = oldest {
+            assert_eq!(age, Some(oldest), "cheap claims must not erase failure age");
+        } else {
+            oldest = age;
+        }
+        if claimed.contains("bounded/fair/257") {
+            break;
+        }
+    }
+    assert_eq!(
+        claimed.len(),
+        256,
+        "a slow first claim cannot hide the cheap tail"
+    );
+    assert!(oldest.is_some());
+    assert!(Objects::deletion_scan_pending(db.pool()).await.unwrap());
+    let slow: (String, i32) = sqlx::query_as(
+        "SELECT state,attempts FROM object_maintenance_ledger WHERE object_key='bounded/fair/1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(slow, ("deletion_pending".into(), 0));
+    let repeated =
+        Objects::claim_deletions_bounded(db.pool(), cutoff, 256, &budget, deadline(), &cancel)
+            .await;
+    assert_eq!(
+        repeated.outcome,
+        MaintenanceOutcome::DeadlineDeferred,
+        "{repeated:?}"
+    );
+    assert_eq!(repeated.changed, 0);
+    assert!(repeated.value.is_none());
+    let age: Option<chrono::DateTime<Utc>> = sqlx::query_scalar("SELECT LEAST(deferred_since,oversized_since) FROM graph_reclamation_progress WHERE phase='object_deletions'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(age, oldest);
+    sqlx::raw_sql("DROP TRIGGER owned_claim_delay ON object_maintenance_ledger; DROP FUNCTION owned_claim_delay()")
+        .execute(db.pool()).await.unwrap();
+    let mut repaired = 0;
+    for _ in 0..3 {
+        let report = Objects::claim_deletions_bounded(
+            db.pool(),
+            cutoff,
+            256,
+            &MaintenanceBudget::default(),
+            deadline(),
+            &cancel,
+        )
+        .await;
+        assert!(
+            matches!(
+                report.outcome,
+                MaintenanceOutcome::Progress | MaintenanceOutcome::NoWork
+            ),
+            "{report:?}"
+        );
+        repaired += report.changed;
+        if !Objects::deletion_scan_pending(db.pool()).await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(repaired, 1);
+    let progress: (i64,Option<chrono::DateTime<Utc>>) = sqlx::query_as("SELECT probe_limit,LEAST(deferred_since,oversized_since) FROM graph_reclamation_progress WHERE phase='object_deletions'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        progress,
+        (256, None),
+        "only a complete clean pass resets failure state"
+    );
+    assert!(!Objects::deletion_scan_pending(db.pool()).await.unwrap());
+    assert_reader_admitted(db.pool()).await;
+    db.cleanup().await.unwrap();
+}
+
+async fn seed_claim_cancellation(pool: &sqlx::PgPool, deferred: bool) {
+    sqlx::query("INSERT INTO object_maintenance_ledger(object_key,object_kind,provider_version,state,eligible_at) SELECT 'bounded/cancel/'||n,'artifact','v:bounded','deletion_pending',NOW()-INTERVAL '1 hour' FROM generate_series(1,2) n")
+        .execute(pool).await.unwrap();
+    // PgSleep is the readiness barrier. The delay also keeps the statement in
+    // flight until cancellation or socket disposal, not a scheduler sleep.
+    sqlx::raw_sql("CREATE FUNCTION owned_claim_cancel() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END; $$")
+        .execute(pool).await.unwrap();
+    let trigger = if deferred {
+        "CREATE CONSTRAINT TRIGGER owned_claim_cancel AFTER UPDATE ON object_maintenance_ledger DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.state='deleting') EXECUTE FUNCTION owned_claim_cancel()"
+    } else {
+        "CREATE TRIGGER owned_claim_cancel BEFORE UPDATE OF state ON object_maintenance_ledger FOR EACH ROW WHEN (NEW.state='deleting') EXECUTE FUNCTION owned_claim_cancel()"
+    };
+    sqlx::raw_sql(trigger).execute(pool).await.unwrap();
+}
+
+async fn await_claim_sleep(pool: &sqlx::PgPool, commit: bool) -> i32 {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND state='active' AND wait_event='PgSleep' AND CASE WHEN $1 THEN query='COMMIT' ELSE query LIKE 'WITH candidates AS (%' END")
+                .bind(commit).fetch_optional(pool).await.unwrap();
+            if let Some(pid) = pid { break pid; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap()
+}
+
+async fn assert_claim_progress_untouched(pool: &sqlx::PgPool) {
+    #[derive(Debug, PartialEq, sqlx::FromRow)]
+    struct ClaimProgress {
+        cursor_id: i64,
+        high_water: i64,
+        revision: i64,
+        probe_limit: i64,
+        pass_deferred: bool,
+        deferred_since: Option<chrono::DateTime<Utc>>,
+        oversized_since: Option<chrono::DateTime<Utc>>,
+    }
+
+    let progress: ClaimProgress = sqlx::query_as("SELECT cursor_id,high_water,revision,probe_limit,pass_deferred,deferred_since,oversized_since FROM graph_reclamation_progress WHERE phase='object_deletions'")
+        .fetch_one(pool).await.unwrap();
+    assert_eq!(
+        progress,
+        ClaimProgress {
+            cursor_id: 0,
+            high_water: 0,
+            revision: 0,
+            probe_limit: 256,
+            pass_deferred: false,
+            deferred_since: None,
+            oversized_since: None,
+        }
+    );
+    let unchanged: i64 = sqlx::query_scalar("SELECT count(*) FROM object_maintenance_ledger WHERE state='deletion_pending' AND attempts=0")
+        .fetch_one(pool).await.unwrap();
+    assert_eq!(unchanged, 2);
+    assert_eq!(Objects::deletion_deferred_since(pool).await.unwrap(), None);
+    assert!(!Objects::deletion_scan_pending(pool).await.unwrap());
+}
+
+#[tokio::test]
+async fn whole_page_deletion_timeout_needs_caller_reserve_for_failed_visit_bookkeeping() {
+    let db = database().await;
+    seed_claim_cancellation(db.pool(), false).await;
+    let budget = MaintenanceBudget {
+        statement_timeout: Duration::from_secs(1),
+        page_timeout: Duration::from_millis(250),
+        ..Default::default()
+    };
+    let cutoff = Utc::now();
+    let cancel = CancellationToken::new();
+
+    // Poll until the claim owns admission and is in its trigger. Then leave the
+    // owner unpolled until its caller deadline expires. This deliberate client
+    // gap tests the wall-clock budget, not sleep-based ordering of a race.
+    let exhausted_end = Instant::now() + budget.page_timeout;
+    let mut exhausted = Box::pin(Objects::claim_deletions_bounded(
+        db.pool(),
+        cutoff,
+        256,
+        &budget,
+        exhausted_end,
+        &cancel,
+    ));
+    let pid = tokio::select! {
+        pid = await_claim_sleep(db.pool(),false) => pid,
+        report = &mut exhausted => panic!("claim ended before whole-page deadline barrier: {report:?}"),
+    };
+    tokio::time::sleep_until(exhausted_end).await;
+    let exhausted = exhausted.await;
+    assert_eq!(
+        exhausted.outcome,
+        MaintenanceOutcome::DeadlineDeferred,
+        "{exhausted:?}"
+    );
+    assert!(exhausted.rollback_acknowledged, "{exhausted:?}");
+    assert_eq!(exhausted.candidates, 2);
+    assert_eq!(exhausted.changed, 0);
+    assert!(exhausted.value.is_none());
+    await_backend_exit(db.pool(), pid).await;
+    assert_claim_progress_untouched(db.pool()).await;
+    assert_reader_admitted(db.pool()).await;
+
+    // The statement cap exceeds the whole page, so this cannot be an early
+    // statement-budget failure. Only progress-only bookkeeping may consume the
+    // caller's reserve after run() ends and acknowledges the claim rollback.
+    let reserved_end = Instant::now() + budget.page_timeout + 3 * budget.statement_timeout;
+    let reserved =
+        Objects::claim_deletions_bounded(db.pool(), cutoff, 256, &budget, reserved_end, &cancel)
+            .await;
+    assert_eq!(
+        reserved.outcome,
+        MaintenanceOutcome::DeadlineDeferred,
+        "{reserved:?}"
+    );
+    assert!(reserved.rollback_acknowledged, "{reserved:?}");
+    assert_eq!(reserved.candidates, 2);
+    assert_eq!(reserved.changed, 0);
+    assert!(reserved.value.is_none());
+    let progress: (i64,i64,i64,i64,bool) = sqlx::query_as("SELECT cursor_id,high_water,revision,probe_limit,pass_deferred FROM graph_reclamation_progress WHERE phase='object_deletions'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        progress.0, 0,
+        "a failed multi-row probe must not skip either row"
+    );
+    assert!(progress.1 > 0);
+    assert_eq!((progress.2, progress.3, progress.4), (1, 1, true));
+    let untouched: i64 = sqlx::query_scalar("SELECT count(*) FROM object_maintenance_ledger WHERE state='deletion_pending' AND attempts=0")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        untouched, 2,
+        "progress-only bookkeeping cannot claim ledger rows"
+    );
+    assert!(Objects::deletion_scan_pending(db.pool()).await.unwrap());
+    assert!(Objects::deletion_deferred_since(db.pool())
+        .await
+        .unwrap()
+        .is_some());
+    assert_reader_admitted(db.pool()).await;
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_singleton_deletion_stays_pending_after_cursor_wraps_to_zero() {
+    let db = database().await;
+    seed_claim_cancellation(db.pool(), false).await;
+    sqlx::query("DELETE FROM object_maintenance_ledger WHERE object_key='bounded/cancel/2'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let budget = MaintenanceBudget {
+        statement_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let cutoff = Utc::now();
+    let cancel = CancellationToken::new();
+    let mut oldest = None;
+    for _ in 0..2 {
+        let report =
+            Objects::claim_deletions_bounded(db.pool(), cutoff, 256, &budget, deadline(), &cancel)
+                .await;
+        assert_eq!(
+            report.outcome,
+            MaintenanceOutcome::DeadlineDeferred,
+            "{report:?}"
+        );
+        assert!(report.rollback_acknowledged);
+        assert!(report.value.is_none());
+        assert_eq!(report.changed, 0);
+        let cursor: (i64,i64) = sqlx::query_as("SELECT cursor_id,high_water FROM graph_reclamation_progress WHERE phase='object_deletions'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(cursor, (0, 0));
+        assert!(Objects::deletion_scan_pending(db.pool()).await.unwrap());
+        let age = Objects::deletion_deferred_since(db.pool()).await.unwrap();
+        assert!(age.is_some());
+        if oldest.is_some() {
+            assert_eq!(age, oldest);
+        }
+        oldest = age;
+    }
+    sqlx::raw_sql("DROP TRIGGER owned_claim_cancel ON object_maintenance_ledger; DROP FUNCTION owned_claim_cancel()")
+        .execute(db.pool()).await.unwrap();
+    let repaired = Objects::claim_deletions_bounded(
+        db.pool(),
+        cutoff,
+        256,
+        &MaintenanceBudget::default(),
+        deadline(),
+        &cancel,
+    )
+    .await;
+    assert_eq!(
+        repaired.outcome,
+        MaintenanceOutcome::Progress,
+        "{repaired:?}"
+    );
+    assert_eq!(repaired.changed, 1);
+    assert_eq!(repaired.value.unwrap().len(), 1);
+    assert!(!Objects::deletion_scan_pending(db.pool()).await.unwrap());
+    assert_eq!(
+        Objects::deletion_deferred_since(db.pool()).await.unwrap(),
+        None
+    );
+    assert_reader_admitted(db.pool()).await;
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn deletion_admission_deferral_and_cancelled_claim_do_not_record_failed_visits() {
+    let db = database().await;
+    seed_claim_cancellation(db.pool(), false).await;
+    let budget = MaintenanceBudget {
+        statement_timeout: Duration::from_millis(300),
+        page_timeout: Duration::from_secs(3),
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let mut blocker = db.pool().begin().await.unwrap();
+    Evidence::lock_capture(&mut blocker).await.unwrap();
+    let denied =
+        Objects::claim_deletions_bounded(db.pool(), Utc::now(), 256, &budget, deadline(), &cancel)
+            .await;
+    deferred(&denied);
+    assert_claim_progress_untouched(db.pool()).await;
+    blocker.rollback().await.unwrap();
+
+    let cancellation = async {
+        let pid = await_claim_sleep(db.pool(), false).await;
+        cancel.cancel();
+        pid
+    };
+    let (report, pid) = tokio::join!(
+        Objects::claim_deletions_bounded(db.pool(), Utc::now(), 256, &budget, deadline(), &cancel),
+        cancellation,
+    );
+    assert_eq!(
+        report.outcome,
+        MaintenanceOutcome::DeadlineDeferred,
+        "{report:?}"
+    );
+    assert!(report.rollback_acknowledged, "{report:?}");
+    assert_eq!(report.changed, 0);
+    assert!(report.value.is_none());
+    await_backend_exit(db.pool(), pid).await;
+    assert_claim_progress_untouched(db.pool()).await;
+    assert_reader_admitted(db.pool()).await;
+
+    let cancel = CancellationToken::new();
+    let mut work = Box::pin(Objects::claim_deletions_bounded(
+        db.pool(),
+        Utc::now(),
+        256,
+        &budget,
+        deadline(),
+        &cancel,
+    ));
+    let pid = tokio::select! {
+        pid = await_claim_sleep(db.pool(),false) => pid,
+        report = &mut work => panic!("claim ended before owner-drop barrier: {report:?}"),
+    };
+    drop(work);
+    await_backend_exit(db.pool(), pid).await;
+    assert_claim_progress_untouched(db.pool()).await;
+    assert_reader_admitted(db.pool()).await;
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn deletion_unknown_commit_never_records_a_failed_visit_or_returns_claims() {
+    let db = database().await;
+    sqlx::query("INSERT INTO object_maintenance_ledger(object_key,object_kind,provider_version,state,eligible_at) SELECT 'bounded/unknown/'||n,'artifact','v:bounded','deletion_pending',NOW()-INTERVAL '1 hour' FROM generate_series(1,2) n")
+        .execute(db.pool()).await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION owned_claim_commit_gate() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || ':owned-unknown-commit',0)); RETURN NEW; END; $$; CREATE CONSTRAINT TRIGGER owned_claim_commit_gate AFTER UPDATE ON object_maintenance_ledger DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.state='deleting') EXECUTE FUNCTION owned_claim_commit_gate()")
+        .execute(db.pool()).await.unwrap();
+    let mut blocker = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || ':owned-unknown-commit',0))")
+        .execute(&mut *blocker).await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let budget = MaintenanceBudget {
+        statement_timeout: Duration::from_millis(300),
+        page_timeout: Duration::from_secs(3),
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let lose_ack = async {
+        let observed = timeout(Duration::from_secs(2), async {
+            loop {
+                let pid: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND state='active' AND query='COMMIT' AND $1=ANY(pg_blocking_pids(pid))")
+                    .bind(blocker_pid).fetch_optional(db.pool()).await.map_err(|error|error.to_string())?;
+                if let Some(pid) = pid { return Ok::<_,String>(pid); }
+                tokio::task::yield_now().await;
+            }
+        }).await.map_err(|_|"COMMIT did not reach the owned advisory gate within two seconds".to_owned()).and_then(|result|result);
+        cancel.cancel();
+        observed
+    };
+    let (report, observed) = tokio::join!(
+        Objects::claim_deletions_bounded(db.pool(), Utc::now(), 256, &budget, deadline(), &cancel),
+        lose_ack,
+    );
+    // Check the contract while COMMIT is still behind our gate, but defer any
+    // panic until the gate and database fixture have been explicitly released.
+    let checked = if report.outcome == MaintenanceOutcome::CommitUnknown
+        && !report.rollback_acknowledged
+        && report.value.is_none()
+        && report.changed == 0
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "uncertain COMMIT exposed claims or acknowledged rollback: {report:?}"
+        ))
+    };
+    let released = blocker.rollback().await;
+    let result = async {
+        released.map_err(|error|error.to_string())?;
+        let pid = observed?;
+        // Socket disposal need not interrupt a running COMMIT. Once our gate is
+        // released, the uncertain transaction can finish or fail without delay.
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)")
+                    .bind(pid).fetch_one(db.pool()).await.map_err(|error|error.to_string())?;
+                if !exists { return Ok::<_,String>(()); }
+                tokio::task::yield_now().await;
+            }
+        }).await.map_err(|_|format!("backend {pid} did not exit within three seconds after releasing owned COMMIT gate"))??;
+        checked?;
+        // Either original COMMIT outcome is valid. Neither authorizes another
+        // progress-only failed visit or a physical cleanup descriptor.
+        let progress: (i64,i64,bool,Option<chrono::DateTime<Utc>>,Option<chrono::DateTime<Utc>>) = sqlx::query_as("SELECT revision,probe_limit,pass_deferred,deferred_since,oversized_since FROM graph_reclamation_progress WHERE phase='object_deletions'")
+            .fetch_one(db.pool()).await.map_err(|error|error.to_string())?;
+        if !(progress.0==0 || progress.0==1)
+            || (progress.1,progress.2,progress.3,progress.4)!=(256,false,None,None) {
+            return Err(format!("unknown COMMIT recorded a failed visit: {progress:?}"));
+        }
+        let excess: i64 = sqlx::query_scalar("SELECT count(*) FROM object_maintenance_ledger WHERE attempts>1")
+            .fetch_one(db.pool()).await.map_err(|error|error.to_string())?;
+        if excess!=0 || Objects::deletion_deferred_since(db.pool()).await.map_err(|error|error.to_string())?.is_some() {
+            return Err("unknown COMMIT retried claims or recorded failure age".to_owned());
+        }
+        let mut reader = db.pool().begin().await.map_err(|error|error.to_string())?;
+        let admitted = timeout(Duration::from_secs(2), Evidence::lock_capture(&mut reader)).await;
+        let ended = reader.rollback().await;
+        admitted.map_err(|_|"reader admission timed out after releasing COMMIT gate".to_owned())?.map_err(|error|error.to_string())?;
+        ended.map_err(|error|error.to_string())?;
+        Ok::<_,String>(())
+    }.await;
+    let cleanup = db.cleanup().await;
+    assert!(
+        result.is_ok() && cleanup.is_ok(),
+        "case={result:?}; cleanup={cleanup:?}"
+    );
+}

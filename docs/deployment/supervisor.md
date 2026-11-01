@@ -114,13 +114,25 @@ eligibility after acquiring exclusive admission. Exact release counts and local
 pack-tree removal run after those graph transactions. Local tree removal retains
 its separate table-lock fence.
 
-Each metadata page probes at most 256 candidates and deletes at most
-the configured `pack_release_cleanup_batch_size`, capped at 256. Its internal
+Each metadata page probes at most 256 candidates. The configured
+`pack_release_cleanup_batch_size`, capped at 256, limits release deletions across
+the entire collection cycle, not each resumed page. Other metadata phases retain
+their per-page deletion budget. Empty or pinned pages do not spend the release
+allowance, so raw scans can still reach later eligible releases. The internal
 defaults are 250 ms per statement, one second of page work, and ten seconds per
 collection, including reserved cleanup time. Phases take round-robin turns within
 that budget, ending each transaction before another page. A completed pass waits
 one hour before rescanning; an incomplete pass persists a short continuation.
 These budgets do not cover filesystem deletion or the entire supervisor cycle.
+
+Hourly artifact housekeeping also uses bounded graph admission. Expired-artifact
+cleanup reports candidates selected for its page, not an exact backlog count;
+reporting cannot prevent that page from making progress. Deferred shared-log
+writers and pinned ready versions remain retryable without hiding independent
+reconciliation candidates. Legacy filesystem deletion retains its existing graph
+and file fences until the physical operation finishes. Cancelling its waiter does
+not cancel the owning housekeeping task or release those fences early. This is
+not a filesystem-I/O wall-clock bound or a new durable crash-recovery protocol.
 
 Evidence audit/readmission, PUT-recovery metadata, and object-deletion claims use
 the same nonblocking-first admission policy with bounded statements and owned
@@ -149,6 +161,9 @@ collector shrinks its next probe. A single over-budget leaf stays intact while
 the scan advances to later records, and is revisited on wrap. Its diagnostic age
 survives later cheap progress until a clean full pass. Discovery failures and
 unknown commits never authorize this advancement.
+Object-deletion claims use the same failed-page reduction and acknowledged
+singleton-visit policy. Their caller reserves bounded retry-bookkeeping time
+separately from the claim page; a whole-page timeout cannot consume that reserve.
 
 A clean bounded pass is not a claim that the graph
 has been drained. Logs distinguish candidate/changed counts, lock/deadline

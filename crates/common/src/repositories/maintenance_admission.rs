@@ -1,4 +1,5 @@
-//! Bounded metadata maintenance. Storage I/O must stay outside these transactions.
+//! Bounded metadata maintenance. `PhysicalCleanup` is the explicit exception for
+//! legacy filesystem cleanup which has no durable physical-work claim.
 use crate::{Error, Result};
 use futures::future::BoxFuture;
 use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
@@ -52,6 +53,17 @@ pub struct MaintenanceResult<T> {
 }
 
 impl<T> MaintenanceResult<T> {
+    /// Housekeeping callers must not turn a deferred or unknown transaction into
+    /// an empty success. In particular, no physical work follows CommitUnknown.
+    pub fn into_result(self) -> Result<Option<T>> {
+        match self.outcome {
+            MaintenanceOutcome::Progress | MaintenanceOutcome::NoWork => Ok(self.value),
+            outcome => Err(self.error.unwrap_or_else(|| {
+                Error::invalid_state(format!("Metadata maintenance deferred: {outcome:?}"))
+            })),
+        }
+    }
+
     pub(crate) fn empty(outcome: MaintenanceOutcome) -> Self {
         Self {
             outcome,
@@ -136,6 +148,98 @@ async fn rollback(mut tx: Transaction<'_, Postgres>, cap: Duration) -> Result<()
         Error::invalid_state("Metadata maintenance rollback unconfirmed; owned socket disposed")
     })??;
     Ok(())
+}
+
+/// Admission and each metadata phase are bounded. Physical I/O deliberately is
+/// not: cancelling an unlink future can leave a blocking thread still unlinking.
+/// The caller must await physical work without a timeout and keep this owner
+/// alive through completion. Production housekeeping runs in an owned task so
+/// cancellation of its waiter cannot drop this fence during filesystem work.
+pub struct PhysicalCleanup {
+    tx: Transaction<'static, Postgres>,
+    budget: MaintenanceBudget,
+}
+
+impl PhysicalCleanup {
+    pub async fn begin(pool: &PgPool, budget: &MaintenanceBudget) -> Result<Self> {
+        if [
+            budget.statement_timeout,
+            budget.page_timeout,
+            budget.queued_lock_timeout,
+        ]
+        .iter()
+        .any(|duration| duration.as_millis() == 0 || duration.as_millis() > i32::MAX as u128)
+        {
+            return Err(Error::validation("Invalid metadata maintenance budget"));
+        }
+        let cancel = CancellationToken::new();
+        let end = Instant::now() + budget.page_timeout;
+        let mut conn = limited(end, &cancel, async { Ok(pool.acquire().await?) }).await?;
+        // Never return a cancelled/in-flight transaction to the pool.
+        conn.close_on_drop();
+        let mut tx = limited(end, &cancel, async {
+            Ok(Transaction::begin(conn, None).await?)
+        })
+        .await?;
+        let admitted = limited(end, &cancel, async {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *tx).await?;
+            configure(&mut tx, end, budget).await?;
+            if budget.queued_admission {
+                let previous: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')").fetch_one(&mut *tx).await?;
+                sqlx::query("SELECT set_config('lock_timeout',$1,true)")
+                    .bind(milliseconds(budget.queued_lock_timeout)).execute(&mut *tx).await?;
+                super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await?;
+                sqlx::query("SELECT set_config('lock_timeout',$1,true)").bind(previous).execute(&mut *tx).await?;
+                Ok(true)
+            } else {
+                Ok(sqlx::query_scalar::<_,bool>("SELECT pg_try_advisory_xact_lock(hashtextextended(current_schema() || ':named-type-graph',0))")
+                    .fetch_one(&mut *tx).await?)
+            }
+        }).await;
+        match admitted {
+            Ok(true) => Ok(Self {
+                tx,
+                budget: budget.clone(),
+            }),
+            other => {
+                rollback(tx, budget.statement_timeout).await?;
+                match other {
+                    Ok(false) => Err(Error::invalid_state("Physical cleanup admission deferred")),
+                    Err(error) => Err(error),
+                    Ok(true) => unreachable!(),
+                }
+            }
+        }
+    }
+
+    /// Start a fresh metadata deadline after physical I/O. Never wrap physical
+    /// work in this method; its timeout would release a still-needed fence.
+    pub async fn metadata<T>(
+        &mut self,
+        work: impl for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T>>,
+    ) -> Result<T> {
+        let end = Instant::now() + self.budget.page_timeout;
+        limited(end, &CancellationToken::new(), async {
+            configure(&mut self.tx, end, &self.budget).await?;
+            work(&mut self.tx).await
+        })
+        .await
+    }
+
+    pub async fn rollback(self) -> Result<()> {
+        rollback(self.tx, self.budget.statement_timeout).await
+    }
+
+    pub async fn commit(mut self) -> Result<()> {
+        let end = Instant::now() + self.budget.page_timeout;
+        limited(end, &CancellationToken::new(), async {
+            configure(&mut self.tx, end, &self.budget).await?;
+            self.tx.commit().await.map_err(|_| {
+                Error::invalid_state("Physical cleanup commit unconfirmed; retry required")
+            })
+        })
+        .await
+    }
 }
 
 /// Read-only candidate discovery with no graph admission. A result is exposed

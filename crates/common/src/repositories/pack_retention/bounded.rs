@@ -12,6 +12,7 @@ use tracing::Instrument;
 #[derive(Debug, Clone)]
 pub struct GraphReclamationOptions {
     pub candidate_limit: i64,
+    /// Per-page delete cap for graph leaves, and per-invocation cap for releases.
     pub delete_limit: i64,
     pub statement_timeout: Duration,
     /// Page work deadline. Cleanup/retry bookkeeping can use three further
@@ -438,14 +439,9 @@ pub(super) async fn collect(
     // Stable sorting preserves the original dependency order on the first pass.
     phases.sort_by_key(|(_, state)| state.last_attempt);
     let mut result = GraphReclamationResult::default();
-    let policy = PagePolicy {
-        cutoff,
-        newest,
-        options,
-        compatibility_wait: matches!(mode, CollectionMode::Compatibility),
-        #[cfg(test)]
-        lose_commit_ack: false,
-    };
+    // Release cleanup is capped across the entire invocation. Raw pinned pages
+    // spend no allowance; other leaf phases retain their independent page caps.
+    let mut release_options = options.clone();
     let mut queue: VecDeque<_> = phases.into();
     while let Some((phase, mut state)) = queue.pop_front() {
         let phase_span = tracing::debug_span!("graph_reclamation_phase", phase = phase.name());
@@ -466,6 +462,18 @@ pub(super) async fn collect(
             report.pending = true;
             let end = cycle_end.min(started + options.page_timeout);
             let mut retry = None;
+            let policy = PagePolicy {
+                cutoff,
+                newest,
+                options: if phase == GraphReclamationPhase::Releases {
+                    &release_options
+                } else {
+                    options
+                },
+                compatibility_wait: matches!(mode, CollectionMode::Compatibility),
+                #[cfg(test)]
+                lose_commit_ack: false,
+            };
             match page(
                 pool,
                 phase,
@@ -478,7 +486,14 @@ pub(super) async fn collect(
             .instrument(phase_span.clone())
             .await
             {
-                Ok(content) => result.deleted_content.extend(content),
+                Ok(content) => {
+                    if phase == GraphReclamationPhase::Releases {
+                        // page reports changes and content only after COMMIT is
+                        // acknowledged. An unknown commit stops the collection.
+                        release_options.delete_limit -= report.changed as i64;
+                    }
+                    result.deleted_content.extend(content);
+                }
                 Err(error) => {
                     report.outcome = match &error {
                         _ if report.outcome == GraphReclamationOutcome::Failed => {
@@ -540,6 +555,7 @@ pub(super) async fn collect(
         // Deferrals leave the queue until their durable retry deadline, even if
         // another phase or a queued acquisition has consumed very little time.
         let continue_pass = !mode.single_page()
+            && (phase != GraphReclamationPhase::Releases || release_options.delete_limit > 0)
             && report.cursor != 0
             && matches!(
                 report.outcome,

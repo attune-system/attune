@@ -273,7 +273,9 @@ pub async fn run_cycle_with_budget(
             delete_cutoff,
             limit,
             budget,
-            metadata_deadline(),
+            // The claim itself remains page-bounded. After acknowledged
+            // rollback, leave a separate bounded reserve for retry progress.
+            Instant::now() + budget.page_timeout + budget.statement_timeout * 3,
             &cancellation,
         )
         .await,
@@ -328,9 +330,14 @@ pub async fn run_cycle_with_budget(
     metrics.metadata_scan_pending = ObjectMaintenanceRepository::deletion_scan_pending(pool)
         .await?
         || Evidence::audit_scan_pending(pool).await?;
-    metrics.oldest_metadata_deferral_seconds = Evidence::audit_deferred_since(pool)
-        .await?
-        .map(|since| (Utc::now() - since).num_seconds().max(0));
+    metrics.oldest_metadata_deferral_seconds = [
+        Evidence::audit_deferred_since(pool).await?,
+        ObjectMaintenanceRepository::deletion_deferred_since(pool).await?,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .map(|since| (Utc::now() - since).num_seconds().max(0));
     metrics.metadata_complete &= !metrics.metadata_scan_pending;
     Ok(metrics)
 }
@@ -526,6 +533,105 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_claim_page_deadline_keeps_retry_progress_and_visits_cheap_followers() {
+        let config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let directory = tempfile::tempdir().unwrap();
+        let inner = Arc::new(FilesystemBlobStore::new(directory.path()).unwrap());
+        for path in ["claim-budget/slow", "claim-budget/cheap"] {
+            let key = ObjectKey::new(path).unwrap();
+            let bytes = Bytes::from_static(b"owned claim-page regression");
+            ObjectMaintenanceRepository::reserve_upload(database.pool(), path, "artifact")
+                .await
+                .unwrap();
+            let stored = inner
+                .put(&key, body_from_bytes(bytes.clone()), sha256(&bytes))
+                .await
+                .unwrap();
+            ObjectMaintenanceRepository::record_uploaded(
+                database.pool(),
+                path,
+                stored.provider_version.as_stored(),
+                stored.size as i64,
+            )
+            .await
+            .unwrap();
+        }
+        ObjectMaintenanceRepository::schedule_unreferenced(
+            database.pool(),
+            Utc::now() + Duration::hours(1),
+            Utc::now() - Duration::hours(1),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE graph_reclamation_progress SET probe_limit=1 WHERE phase='object_deletions'",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        // Elapsed claim time is the contract: individual owner work reaches its
+        // whole-page deadline, leaving only the separate bookkeeping reserve.
+        sqlx::raw_sql("CREATE FUNCTION owned_slow_object_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$; CREATE TRIGGER owned_slow_object_claim BEFORE UPDATE ON object_maintenance_ledger FOR EACH ROW WHEN (OLD.object_key='claim-budget/slow' AND NEW.state='deleting') EXECUTE FUNCTION owned_slow_object_claim()")
+            .execute(database.pool()).await.unwrap();
+        let mut maintenance = config.maintenance;
+        maintenance.pack_release_retention_enabled = false;
+        maintenance.artifact_cleanup_batch_size = 2;
+        maintenance.object_delete_grace_seconds = 1;
+        let budget = MaintenanceBudget {
+            page_timeout: std::time::Duration::from_millis(500),
+            statement_timeout: std::time::Duration::from_secs(2),
+            ..Default::default()
+        };
+        let store: Arc<dyn BlobStore> = inner.clone();
+        let first = run_cycle_with_budget(
+            database.pool(),
+            &store,
+            directory.path(),
+            &maintenance,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert!(first.metadata_deadline_deferrals > 0, "{first:?}");
+        let second = run_cycle_with_budget(
+            database.pool(),
+            &store,
+            directory.path(),
+            &maintenance,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.deleted_objects, 1,
+            "the failed singleton must not hide the cheap follower: {second:?}"
+        );
+        assert!(inner
+            .head(&ObjectKey::new("claim-budget/cheap").unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(inner
+            .head(&ObjectKey::new("claim-budget/slow").unwrap())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            second.oldest_metadata_deferral_seconds.is_some(),
+            "a cheap claim cannot clear the failed visit's age: {second:?}"
+        );
         database.cleanup().await.unwrap();
     }
 

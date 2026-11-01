@@ -679,3 +679,501 @@ async fn combined_noop_delete_does_not_commit_incidental_trigger_writes() {
     assert_physical_obligations(db.pool(), version, false).await;
     db.cleanup().await.unwrap();
 }
+
+async fn shared_pending(
+    pool: &sqlx::PgPool,
+    suffix: &str,
+) -> attune_common::repositories::storage_maintenance::SharedLogBodyCandidate {
+    let artifact = ArtifactRepository::create(pool, artifact_input(suffix))
+        .await
+        .unwrap();
+    let execution: i64 = sqlx::query_scalar("INSERT INTO execution(action_ref,status) VALUES('core.owned_shared_cleanup','failed') RETURNING id")
+        .fetch_one(pool).await.unwrap();
+    let version = ArtifactVersionRepository::create_log_pending(
+        pool,
+        artifact.id,
+        &artifact.r#ref,
+        super::LogStreamBackend::SharedFile,
+        "text/plain".into(),
+        Some(execution),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    super::LogStreamRepository::create_with_backend(
+        pool,
+        version.id,
+        super::LogStreamBackend::SharedFile,
+        1024,
+        1000,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE artifact_version SET body_updated=NOW()-interval '2 hours' WHERE id=$1")
+        .bind(version.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut seed = pool.begin().await.unwrap();
+    Evidence::lock_reclamation(&mut seed).await.unwrap();
+    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,staging_path,object_done) VALUES($1,$2,99601,$3,true)")
+        .bind(version.id).bind(artifact.id).bind(&version.file_path).execute(&mut *seed).await.unwrap();
+    seed.commit().await.unwrap();
+    attune_common::repositories::storage_maintenance::SharedLogBodyCandidate {
+        id: version.id,
+        artifact: artifact.id,
+        file_path: version.file_path.unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn shared_cleanup_claim_defers_then_commits_the_fresh_path_and_atomic_completion() {
+    let db = create_test_pool().await.unwrap();
+    let candidate = shared_pending(db.pool(), "bounded_shared").await;
+    let budget = MaintenanceBudget::default();
+    let cancel = CancellationToken::new();
+    let mut capture = db.pool().begin().await.unwrap();
+    Evidence::lock_capture(&mut capture).await.unwrap();
+    let report = timeout(
+        Duration::from_secs(2),
+        StorageMaintenanceRepository::claim_abandoned_shared_log_pending_bounded(
+            db.pool(),
+            candidate.clone(),
+            Utc::now(),
+            &budget,
+            deadline(),
+            &cancel,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.outcome,
+        MaintenanceOutcome::LockDeferred,
+        "{report:?}"
+    );
+    assert!(
+        report.into_result().is_err(),
+        "deferral cannot become empty success"
+    );
+    let mut reader = db.pool().begin().await.unwrap();
+    timeout(Duration::from_secs(1), Evidence::lock_capture(&mut reader))
+        .await
+        .unwrap()
+        .unwrap();
+    reader.rollback().await.unwrap();
+    capture.rollback().await.unwrap();
+    let report = StorageMaintenanceRepository::claim_abandoned_shared_log_pending_bounded(
+        db.pool(),
+        candidate.clone(),
+        Utc::now(),
+        &budget,
+        deadline(),
+        &cancel,
+    )
+    .await;
+    assert_eq!(report.outcome, MaintenanceOutcome::Progress, "{report:?}");
+    assert_eq!(
+        report.value.unwrap().unwrap().file_path,
+        candidate.file_path
+    );
+    let completed = StorageMaintenanceRepository::delete_cleanup_claimed_and_refresh_bounded(
+        db.pool(),
+        candidate.id,
+        &budget,
+        deadline(),
+        &cancel,
+    )
+    .await;
+    assert_eq!(completed.value, Some(true), "{completed:?}");
+    let remaining: (bool,bool) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM artifact_version WHERE id=$1),EXISTS(SELECT 1 FROM artifact WHERE id=$2)")
+        .bind(candidate.id).bind(candidate.artifact).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(remaining, (false, false));
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_cleanup_stale_identity_rolls_back_the_evidence_group() {
+    let db = create_test_pool().await.unwrap();
+    let candidate = shared_pending(db.pool(), "bounded_shared_stale").await;
+    let id = candidate.id;
+    let mut capture = db.pool().begin().await.unwrap();
+    Evidence::lock_capture(&mut capture).await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *capture)
+        .await
+        .unwrap();
+    let update = async {
+        await_graph_waiter(db.pool(), pid).await;
+        sqlx::query("UPDATE artifact_version SET file_path='logs/owned-new-path.txt' WHERE id=$1")
+            .bind(id)
+            .execute(&mut *capture)
+            .await
+            .unwrap();
+        capture.commit().await.unwrap();
+    };
+    let budget = queued_budget();
+    let cancel = CancellationToken::new();
+    let (report, ()) = tokio::join!(
+        StorageMaintenanceRepository::claim_abandoned_shared_log_pending_bounded(
+            db.pool(),
+            candidate,
+            Utc::now(),
+            &budget,
+            deadline(),
+            &cancel
+        ),
+        update
+    );
+    assert_eq!(report.outcome, MaintenanceOutcome::NoWork, "{report:?}");
+    assert!(report.value.unwrap().is_none());
+    let state: (String,Option<i64>) = sqlx::query_as("SELECT av.body_state::text,o.cleanup_group FROM artifact_version av JOIN file_evidence_owner o ON o.version=av.id WHERE av.id=$1")
+        .bind(id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(state, ("pending".into(), None));
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_cleanup_unknown_commit_never_returns_physical_deletion_authority() {
+    let db = create_test_pool().await.unwrap();
+    let candidate = shared_pending(db.pool(), "bounded_shared_unknown").await;
+    let id = candidate.id;
+    sqlx::raw_sql("CREATE FUNCTION owned_deferred_shared_commit() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(2); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER owned_deferred_shared_commit AFTER UPDATE ON artifact_version DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.body_state='cleanup_claimed' AND OLD.body_state IS DISTINCT FROM NEW.body_state) EXECUTE FUNCTION owned_deferred_shared_commit()")
+        .execute(db.pool()).await.unwrap();
+    let budget = MaintenanceBudget {
+        statement_timeout: Duration::from_millis(150),
+        page_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let report = StorageMaintenanceRepository::claim_abandoned_shared_log_pending_bounded(
+        db.pool(),
+        candidate,
+        Utc::now(),
+        &budget,
+        deadline(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        report.outcome,
+        MaintenanceOutcome::CommitUnknown,
+        "{report:?}"
+    );
+    assert!(report.value.is_none());
+    assert!(!report.rollback_acknowledged);
+    assert!(report.into_result().is_err());
+    let state: (String,Option<i64>) = sqlx::query_as("SELECT av.body_state::text,o.cleanup_group FROM artifact_version av JOIN file_evidence_owner o ON o.version=av.id WHERE av.id=$1")
+        .bind(id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(state, ("pending".into(), None));
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn ready_mismatch_cleanup_defers_and_rechecks_the_identity_observed_before_head() {
+    let db = create_test_pool().await.unwrap();
+    let (artifact, version) = pending(db.pool(), "bounded_ready_mismatch").await;
+    ArtifactVersionRepository::mark_body_ready(db.pool(), version, "e:owned", 9, &"a".repeat(64))
+        .await
+        .unwrap()
+        .unwrap();
+    let candidate = StorageMaintenanceRepository::ready_objects(db.pool(), 0, 10)
+        .await
+        .unwrap()
+        .remove(0);
+    let budget = MaintenanceBudget::default();
+    let cancel = CancellationToken::new();
+    let mut capture = db.pool().begin().await.unwrap();
+    Evidence::lock_capture(&mut capture).await.unwrap();
+    let deferred = timeout(
+        Duration::from_secs(2),
+        StorageMaintenanceRepository::delete_mismatched_ready_and_refresh_bounded(
+            db.pool(),
+            candidate.clone(),
+            &budget,
+            deadline(),
+            &cancel,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        deferred.outcome,
+        MaintenanceOutcome::LockDeferred,
+        "{deferred:?}"
+    );
+    let mut reader = db.pool().begin().await.unwrap();
+    timeout(Duration::from_secs(1), Evidence::lock_capture(&mut reader))
+        .await
+        .unwrap()
+        .unwrap();
+    reader.rollback().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *capture)
+        .await
+        .unwrap();
+    let update = async {
+        await_graph_waiter(db.pool(), pid).await;
+        sqlx::query("UPDATE artifact_version SET meta='{}' WHERE id=$1")
+            .bind(version)
+            .execute(&mut *capture)
+            .await
+            .unwrap();
+        capture.commit().await.unwrap();
+    };
+    let queued = queued_budget();
+    let (stale, ()) = tokio::join!(
+        StorageMaintenanceRepository::delete_mismatched_ready_and_refresh_bounded(
+            db.pool(),
+            candidate,
+            &queued,
+            deadline(),
+            &cancel
+        ),
+        update
+    );
+    assert_eq!(stale.value, Some(false), "{stale:?}");
+    let group: Option<i64> =
+        sqlx::query_scalar("SELECT cleanup_group FROM file_evidence_owner WHERE version=$1")
+            .bind(version)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(group.is_none());
+    let fresh = StorageMaintenanceRepository::ready_objects(db.pool(), 0, 10)
+        .await
+        .unwrap()
+        .remove(0);
+    let deleted = StorageMaintenanceRepository::delete_mismatched_ready_and_refresh_bounded(
+        db.pool(),
+        fresh,
+        &budget,
+        deadline(),
+        &cancel,
+    )
+    .await;
+    assert_eq!(deleted.value, Some(true), "{deleted:?}");
+    let remaining: (bool,bool) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM artifact_version WHERE id=$1),EXISTS(SELECT 1 FROM artifact WHERE id=$2)")
+        .bind(version).bind(artifact).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(remaining, (false, false));
+    assert_physical_obligations(db.pool(), version, true).await;
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_snapshot_admission_is_bounded_and_rechecks_path_expiry_and_pins() {
+    use attune_common::repositories::maintenance_admission::PhysicalCleanup;
+    let db = create_test_pool().await.unwrap();
+    let artifact = ArtifactRepository::create(db.pool(), artifact_input("bounded_snapshot"))
+        .await
+        .unwrap();
+    let version: i64 = sqlx::query_scalar("INSERT INTO artifact_version(artifact,version,file_path,legacy_snapshot_expires_at) VALUES($1,1,'owned-snapshot.txt',NOW()-interval '1 day') RETURNING id")
+        .bind(artifact.id).fetch_one(db.pool()).await.unwrap();
+    let pack: i64 = sqlx::query_scalar("INSERT INTO pack(ref,label,version) VALUES('owned_snapshot','owned_snapshot','1.0.0') RETURNING id").fetch_one(db.pool()).await.unwrap();
+    let release: i64 = sqlx::query_scalar("INSERT INTO pack_release(pack,pack_ref,version,digest,archive_path,content_path,archive_size,manifest,legacy_snapshot_expires_at) VALUES($1,'owned_snapshot','1.0.0',repeat('a',64),'owned-snapshot.tar','owned-content',0,'{}',NOW()-interval '1 day') RETURNING id")
+        .bind(pack).fetch_one(db.pool()).await.unwrap();
+    let budget = MaintenanceBudget::default();
+    let artifact_candidate =
+        StorageMaintenanceRepository::expired_snapshots_bounded(db.pool(), false, 10, &budget)
+            .await
+            .unwrap()
+            .remove(0);
+    let pack_candidate =
+        StorageMaintenanceRepository::expired_snapshots_bounded(db.pool(), true, 10, &budget)
+            .await
+            .unwrap()
+            .remove(0);
+    let mut capture = db.pool().begin().await.unwrap();
+    Evidence::lock_capture(&mut capture).await.unwrap();
+    assert!(timeout(
+        Duration::from_secs(2),
+        PhysicalCleanup::begin(db.pool(), &budget)
+    )
+    .await
+    .unwrap()
+    .is_err());
+    let mut reader = db.pool().begin().await.unwrap();
+    timeout(Duration::from_secs(1), Evidence::lock_capture(&mut reader))
+        .await
+        .unwrap()
+        .unwrap();
+    reader.rollback().await.unwrap();
+    sqlx::query("UPDATE artifact_version SET file_path='owned-replaced-snapshot.txt' WHERE id=$1")
+        .bind(version)
+        .execute(&mut *capture)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE pack_release SET legacy_snapshot_expires_at=NOW()+interval '1 day' WHERE id=$1",
+    )
+    .bind(release)
+    .execute(&mut *capture)
+    .await
+    .unwrap();
+    capture.commit().await.unwrap();
+    for (candidate, pack) in [(artifact_candidate, false), (pack_candidate, true)] {
+        let mut cleanup = PhysicalCleanup::begin(db.pool(), &budget).await.unwrap();
+        let current = cleanup
+            .metadata(move |conn| {
+                Box::pin(async move {
+                    StorageMaintenanceRepository::clear_expired_snapshot_with_conn(
+                        conn, candidate, pack,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(!current, "stale path/expiry must never authorize unlink");
+        cleanup.rollback().await.unwrap();
+    }
+    let candidate =
+        StorageMaintenanceRepository::expired_snapshots_bounded(db.pool(), false, 10, &budget)
+            .await
+            .unwrap()
+            .remove(0);
+    let mut pin = db.pool().begin().await.unwrap();
+    Evidence::lock_capture(&mut pin).await.unwrap();
+    sqlx::query(
+        "INSERT INTO file_evidence_owner(version,artifact,root_read) VALUES(99701,99702,99703)",
+    )
+    .execute(&mut *pin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO file_evidence_pin(owner,kind,source) VALUES(99701,'artifact_version',$1)",
+    )
+    .bind(version)
+    .execute(&mut *pin)
+    .await
+    .unwrap();
+    pin.commit().await.unwrap();
+    let mut cleanup = PhysicalCleanup::begin(db.pool(), &budget).await.unwrap();
+    assert!(!cleanup
+        .metadata(move |conn| Box::pin(async move {
+            StorageMaintenanceRepository::clear_expired_snapshot_with_conn(conn, candidate, false)
+                .await
+        }))
+        .await
+        .unwrap());
+    cleanup.rollback().await.unwrap();
+    let path: Option<String> =
+        sqlx::query_scalar("SELECT file_path FROM artifact_version WHERE id=$1")
+            .bind(version)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(path.as_deref(), Some("owned-replaced-snapshot.txt"));
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn physical_cleanup_metadata_deadline_rolls_back_and_releases_admission() {
+    use attune_common::repositories::maintenance_admission::PhysicalCleanup;
+    let db = create_test_pool().await.unwrap();
+    let budget = MaintenanceBudget {
+        statement_timeout: Duration::from_millis(100),
+        page_timeout: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let mut cleanup = PhysicalCleanup::begin(db.pool(), &budget).await.unwrap();
+    let result = cleanup
+        .metadata(|conn| {
+            Box::pin(async move {
+                sqlx::query("SELECT pg_sleep(2)").execute(conn).await?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(result.is_err());
+    cleanup
+        .rollback()
+        .await
+        .expect("rollback must be acknowledged after statement cancellation");
+    let mut reader = db.pool().begin().await.unwrap();
+    timeout(Duration::from_secs(1), Evidence::lock_capture(&mut reader))
+        .await
+        .unwrap()
+        .unwrap();
+    reader.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn physical_cleanup_queued_admission_restores_the_inherited_lock_timeout() {
+    use attune_common::repositories::maintenance_admission::PhysicalCleanup;
+    let db = create_test_pool().await.unwrap();
+    let artifact =
+        ArtifactRepository::create(db.pool(), artifact_input("physical_inherited_timeout"))
+            .await
+            .unwrap();
+    let schema = format!("\"{}\"", db.schema().replace('"', "\"\""));
+    let isolated = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('search_path',$1,false),set_config('lock_timeout','10ms',false)")
+                    .bind(schema).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with(db.pool().connect_options().as_ref().clone())
+        .await.unwrap();
+    let mut blocker = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM artifact WHERE id=$1 FOR UPDATE")
+        .bind(artifact.id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let budget = MaintenanceBudget {
+        queued_admission: true,
+        queued_lock_timeout: Duration::from_millis(50),
+        statement_timeout: Duration::from_secs(1),
+        page_timeout: Duration::from_secs(2),
+    };
+    let mut cleanup = PhysicalCleanup::begin(&isolated, &budget).await.unwrap();
+    let restored = cleanup
+        .metadata(|conn| {
+            Box::pin(async move {
+                Ok(
+                    sqlx::query_scalar::<_, String>("SELECT current_setting('lock_timeout')")
+                        .fetch_one(conn)
+                        .await?,
+                )
+            })
+        })
+        .await
+        .unwrap();
+    let id = artifact.id;
+    let blocked = cleanup
+        .metadata(move |conn| {
+            Box::pin(async move {
+                Ok(
+                    sqlx::query_scalar::<_, i64>("SELECT id FROM artifact WHERE id=$1 FOR UPDATE")
+                        .bind(id)
+                        .fetch_one(conn)
+                        .await?,
+                )
+            })
+        })
+        .await;
+    cleanup.rollback().await.unwrap();
+    blocker.rollback().await.unwrap();
+    isolated.close().await;
+    db.cleanup().await.unwrap();
+    assert_eq!(
+        restored, "10ms",
+        "queued admission must restore the inherited setting"
+    );
+    match blocked {
+        Err(attune_common::Error::Database(sqlx::Error::Database(error))) => {
+            assert_eq!(
+                error.code().as_deref(),
+                Some("55P03"),
+                "row contention must use the restored lock timeout, not the statement deadline"
+            );
+        }
+        other => panic!("expected a lock timeout from the held artifact row: {other:?}"),
+    }
+}

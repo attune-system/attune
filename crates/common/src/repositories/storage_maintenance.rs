@@ -33,6 +33,8 @@ pub struct ObjectBodyCandidate {
     pub sha256: Option<String>,
     pub file_path: Option<String>,
     pub legacy_snapshot_expires_at: Option<DateTime<Utc>>,
+    pub identity: String,
+    pub stream_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -40,6 +42,13 @@ pub struct SharedLogBodyCandidate {
     pub id: i64,
     pub artifact: i64,
     pub file_path: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct LegacySnapshotCandidate {
+    pub id: i64,
+    pub path: String,
+    pub identity: String,
 }
 
 pub struct StorageMaintenanceRepository;
@@ -279,6 +288,86 @@ impl StorageMaintenanceRepository {
         ).await
     }
 
+    /// A committed cleanup_claimed state is the existing durable shared-log
+    /// writer fence. Return the freshly checked path only on acknowledged commit.
+    pub async fn claim_abandoned_shared_log_pending_bounded(
+        pool: &PgPool,
+        candidate: SharedLogBodyCandidate,
+        cutoff: DateTime<Utc>,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<Option<SharedLogBodyCandidate>> {
+        let id = candidate.id;
+        let path = candidate.file_path;
+        let probe_path = path.clone();
+        maintenance_admission::run(pool,budget,deadline,cancel,
+            move |conn| Box::pin(async move {
+                Ok(sqlx::query_scalar::<_,String>("SELECT xmin::text FROM artifact_version WHERE id=$1 AND file_path=$2 AND object_key IS NULL AND (body_state='cleanup_claimed' OR (body_state='pending' AND body_updated<$3))")
+                    .bind(id).bind(probe_path).bind(cutoff).fetch_all(conn).await?)
+            }),
+            move |conn,candidates| Box::pin(async move {
+                use sqlx::Acquire;
+                let mut claim = conn.begin().await?;
+                let claimed = Self::claim_pending_with_conn(&mut claim,id,cutoff,true,Some(&candidates[0])).await?;
+                let current = if claimed {
+                    sqlx::query_as::<_,SharedLogBodyCandidate>("SELECT id,artifact,file_path FROM artifact_version WHERE id=$1 AND object_key IS NULL AND file_path=$2 AND body_state='cleanup_claimed'")
+                        .bind(id).bind(path).fetch_optional(&mut *claim).await?
+                } else { None };
+                let changed = u64::from(current.is_some());
+                if current.is_some() { claim.commit().await?; } else { claim.rollback().await?; }
+                Ok((current,changed))
+            }),
+        ).await
+    }
+
+    pub async fn abandoned_shared_log_pending_bounded(
+        pool: &PgPool,
+        cutoff: DateTime<Utc>,
+        limit: i64,
+        budget: &MaintenanceBudget,
+    ) -> Result<Vec<SharedLogBodyCandidate>> {
+        maintenance_admission::probe(pool,budget,Instant::now()+budget.page_timeout,&CancellationToken::new(),move |conn| Box::pin(async move {
+            Ok(sqlx::query_as("SELECT av.id,av.artifact,av.file_path FROM artifact_version av WHERE av.object_key IS NULL AND av.file_path IS NOT NULL AND (av.body_state='cleanup_claimed' OR (av.body_state='pending' AND av.body_updated<$1 AND EXISTS(SELECT 1 FROM log_stream ls WHERE ls.artifact_version=av.id AND ls.backend='shared_file' AND NOT ls.sealed) AND EXISTS(SELECT 1 FROM execution e WHERE e.id=av.execution AND e.status IN ('completed','failed','cancelled','timeout','abandoned')))) ORDER BY av.body_updated,av.id LIMIT $2")
+                .bind(cutoff).bind(limit.max(1)).fetch_all(conn).await?)
+        })).await
+    }
+
+    /// HEAD was performed outside admission. Its candidate identity, including
+    /// the stream revision, is authority only for this exact still-ready row.
+    pub async fn delete_mismatched_ready_and_refresh_bounded(
+        pool: &PgPool,
+        candidate: ObjectBodyCandidate,
+        budget: &MaintenanceBudget,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MaintenanceResult<bool> {
+        let id = candidate.id;
+        let identity = candidate.identity.clone();
+        maintenance_admission::run(pool,budget,deadline,cancel,
+            move |conn| Box::pin(async move {
+                Ok(sqlx::query_scalar::<_,i64>("SELECT id FROM artifact_version WHERE id=$1 AND xmin::text=$2 AND body_state='ready'")
+                    .bind(id).bind(identity).fetch_all(conn).await?)
+            }),
+            move |conn,_| Box::pin(async move {
+                use sqlx::Acquire;
+                let mut unit = conn.begin().await?;
+                let deleted = async {
+                    if super::file_evidence_retention::FileEvidenceRetentionRepository::request_cleanup(&mut unit,&[id]).await? != [id] { return Ok::<_,crate::Error>(false); }
+                    if super::artifact::ArtifactRepository::find_by_id_for_update(&mut unit,candidate.artifact).await?.is_none() { return Ok(false); }
+                    let current: Option<i64> = sqlx::query_scalar("SELECT av.id FROM artifact_version av WHERE av.id=$1 AND av.artifact=$2 AND av.xmin::text=$3 AND av.body_state='ready' AND av.object_key=$4 AND av.provider_version IS NOT DISTINCT FROM $5 AND av.size_bytes IS NOT DISTINCT FROM $6 AND av.sha256 IS NOT DISTINCT FROM $7 AND file_evidence_version_eligible(av.id) AND (SELECT xmin::text FROM log_stream WHERE artifact_version=av.id) IS NOT DISTINCT FROM $8 FOR UPDATE")
+                        .bind(id).bind(candidate.artifact).bind(candidate.identity).bind(candidate.object_key)
+                        .bind(candidate.provider_version).bind(candidate.size_bytes).bind(candidate.sha256).bind(candidate.stream_identity)
+                        .fetch_optional(&mut *unit).await?;
+                    if current.is_none() { return Ok(false); }
+                    Ok(super::maintenance::MaintenanceRepository::delete_artifact_version_and_refresh_with_conn(&mut unit,id,candidate.artifact).await?.0)
+                }.await?;
+                if deleted { unit.commit().await?; } else { unit.rollback().await?; }
+                Ok((deleted,u64::from(deleted)))
+            }),
+        ).await
+    }
+
     pub async fn ready_objects(
         pool: &PgPool,
         after_id: i64,
@@ -286,7 +375,8 @@ impl StorageMaintenanceRepository {
     ) -> Result<Vec<ObjectBodyCandidate>> {
         sqlx::query_as(
             "SELECT av.id, av.artifact, av.object_key, av.provider_version, av.size_bytes, \
-                     av.sha256, av.file_path, av.legacy_snapshot_expires_at \
+                     av.sha256, av.file_path, av.legacy_snapshot_expires_at, av.xmin::text AS identity, \
+                     (SELECT xmin::text FROM log_stream WHERE artifact_version=av.id) AS stream_identity \
              FROM artifact_version av WHERE av.body_state = 'ready' AND av.object_key IS NOT NULL AND av.id > $1 \
              ORDER BY av.id LIMIT $2",
         )
@@ -295,6 +385,56 @@ impl StorageMaintenanceRepository {
         .fetch_all(pool)
         .await
         .map_err(Into::into)
+    }
+
+    pub async fn ready_objects_bounded(
+        pool: &PgPool,
+        after_id: i64,
+        limit: i64,
+        budget: &MaintenanceBudget,
+    ) -> Result<Vec<ObjectBodyCandidate>> {
+        maintenance_admission::probe(pool,budget,Instant::now()+budget.page_timeout,&CancellationToken::new(),move |conn| Box::pin(async move {
+            Ok(sqlx::query_as("SELECT av.id,av.artifact,av.object_key,av.provider_version,av.size_bytes,av.sha256,av.file_path,av.legacy_snapshot_expires_at,av.xmin::text AS identity,(SELECT xmin::text FROM log_stream WHERE artifact_version=av.id) AS stream_identity FROM artifact_version av WHERE av.body_state='ready' AND av.object_key IS NOT NULL AND av.id>$1 ORDER BY av.id LIMIT $2")
+                .bind(after_id.max(0)).bind(limit.max(1)).fetch_all(conn).await?)
+        })).await
+    }
+
+    pub async fn expired_snapshots_bounded(
+        pool: &PgPool,
+        pack: bool,
+        limit: i64,
+        budget: &MaintenanceBudget,
+    ) -> Result<Vec<LegacySnapshotCandidate>> {
+        maintenance_admission::probe(pool,budget,Instant::now()+budget.page_timeout,&CancellationToken::new(),move |conn| Box::pin(async move {
+            let (table,path,kind) = if pack { ("pack_release","archive_path","pack_release") } else { ("artifact_version","file_path","artifact_version") };
+            Ok(sqlx::query_as(&format!("SELECT id,{path} AS path,xmin::text AS identity FROM {table} WHERE {path} IS NOT NULL AND legacy_snapshot_expires_at<=NOW() AND NOT file_evidence_pinned('{kind}',id) ORDER BY id LIMIT $1"))
+                .bind(limit.max(1)).fetch_all(conn).await?)
+        })).await
+    }
+
+    /// Clear metadata before unlinking, but retain this transaction's graph/row
+    /// fences through the physical operation and commit. Fresh identity, path,
+    /// expiry and pins are checked after admission, never from discovery alone.
+    pub async fn clear_expired_snapshot_with_conn(
+        conn: &mut PgConnection,
+        candidate: LegacySnapshotCandidate,
+        pack: bool,
+    ) -> Result<bool> {
+        let (table, path, kind) = if pack {
+            ("pack_release", "archive_path", "pack_release")
+        } else {
+            ("artifact_version", "file_path", "artifact_version")
+        };
+        let current: Option<i64> = sqlx::query_scalar(&format!("SELECT id FROM {table} WHERE id=$1 AND xmin::text=$2 AND {path}=$3 AND legacy_snapshot_expires_at<=NOW() AND NOT file_evidence_pinned('{kind}',id) FOR UPDATE"))
+            .bind(candidate.id).bind(candidate.identity).bind(candidate.path).fetch_optional(&mut *conn).await?;
+        if current.is_none() {
+            return Ok(false);
+        }
+        if pack {
+            Self::clear_pack_snapshot(conn, candidate.id).await
+        } else {
+            Self::clear_artifact_snapshot(conn, candidate.id).await
+        }
     }
 
     pub async fn deleting_objects(
@@ -319,7 +459,8 @@ impl StorageMaintenanceRepository {
     ) -> Result<Vec<ObjectBodyCandidate>> {
         let query = format!(
             "SELECT av.id, av.artifact, av.object_key, av.provider_version, av.size_bytes, \
-                    av.sha256, av.file_path, av.legacy_snapshot_expires_at \
+                    av.sha256, av.file_path, av.legacy_snapshot_expires_at, av.xmin::text AS identity, \
+                    (SELECT xmin::text FROM log_stream WHERE artifact_version=av.id) AS stream_identity \
              FROM artifact_version av WHERE {predicate} AND file_evidence_version_eligible(av.id) ORDER BY av.body_updated, av.id LIMIT $2"
         );
         sqlx::query_as(&query)

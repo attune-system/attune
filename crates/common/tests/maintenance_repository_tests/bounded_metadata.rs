@@ -185,3 +185,124 @@ async fn bounded_metadata_refresh_keeps_latest_ready_version_and_pinned_empty_ar
         .is_some());
     db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn expired_version_and_parent_metadata_are_one_rollback_unit() {
+    use attune_common::repositories::maintenance_admission::PhysicalCleanup;
+    let db = setup_db().await;
+    let id = artifact(db.pool()).await;
+    let version = ArtifactVersionRepository::create(
+        db.pool(),
+        CreateArtifactVersionInput {
+            artifact: id,
+            file_path: None,
+            content: Some(vec![0; 9]),
+            content_json: None,
+            content_type: None,
+            execution: None,
+            meta: None,
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION owned_expired_parent_failure() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owned expired parent failure'; END $$; CREATE TRIGGER owned_expired_parent_failure BEFORE DELETE ON artifact FOR EACH ROW EXECUTE FUNCTION owned_expired_parent_failure()")
+        .execute(db.pool()).await.unwrap();
+    let version_id = version.id;
+    let mut cleanup = PhysicalCleanup::begin(db.pool(), &MaintenanceBudget::default())
+        .await
+        .unwrap();
+    let failed = cleanup
+        .metadata(move |conn| {
+            Box::pin(async move {
+                MaintenanceRepository::delete_artifact_version_and_refresh_with_conn(
+                    conn, version_id, id,
+                )
+                .await
+            })
+        })
+        .await;
+    assert!(failed.is_err());
+    cleanup.rollback().await.unwrap();
+    assert!(ArtifactVersionRepository::find_by_id(db.pool(), version_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(ArtifactRepository::find_by_id(db.pool(), id)
+        .await
+        .unwrap()
+        .is_some());
+    sqlx::raw_sql("DROP TRIGGER owned_expired_parent_failure ON artifact; DROP FUNCTION owned_expired_parent_failure()")
+        .execute(db.pool()).await.unwrap();
+    let mut retry = PhysicalCleanup::begin(db.pool(), &MaintenanceBudget::default())
+        .await
+        .unwrap();
+    let deleted = retry
+        .metadata(move |conn| {
+            Box::pin(async move {
+                MaintenanceRepository::delete_artifact_version_and_refresh_with_conn(
+                    conn, version_id, id,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted, (true, true));
+    retry.commit().await.unwrap();
+    assert!(ArtifactVersionRepository::find_by_id(db.pool(), version_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ArtifactRepository::find_by_id(db.pool(), id)
+        .await
+        .unwrap()
+        .is_none());
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_artifact_page_does_not_depend_on_the_global_reporting_count() {
+    let db = setup_db().await;
+    let id = artifact(db.pool()).await;
+    sqlx::query("UPDATE artifact SET retention_policy='days',retention_limit=1 WHERE id=$1")
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO artifact_version(artifact,version,created) SELECT $1,n,NOW()-interval '2 days'+n*interval '1 second' FROM generate_series(1,7) n")
+        .bind(id).execute(db.pool()).await.unwrap();
+    // A query-shape guard, not a timing/performance simulation. Keep the real
+    // eligibility implementation and reject only the top-level reporting COUNT
+    // in this owned database. A bounded page must not execute that query at all.
+    sqlx::raw_sql("ALTER FUNCTION file_evidence_version_eligible(BIGINT) RENAME TO owned_real_version_eligibility;
+        CREATE FUNCTION file_evidence_version_eligible(v BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql STABLE AS $$
+        BEGIN
+          IF current_query() LIKE '%SELECT COUNT(*)::BIGINT FROM artifact_version av%' THEN
+            RAISE EXCEPTION 'owned global reporting count must not gate page discovery';
+          END IF;
+          RETURN owned_real_version_eligibility(v);
+        END $$;")
+        .execute(db.pool()).await.unwrap();
+    let count = MaintenanceRepository::expired_artifact_version_count(db.pool()).await;
+    let page = MaintenanceRepository::expired_artifact_candidates_bounded(
+        db.pool(),
+        2,
+        &MaintenanceBudget::default(),
+    )
+    .await;
+    sqlx::raw_sql("DROP FUNCTION file_evidence_version_eligible(BIGINT); ALTER FUNCTION owned_real_version_eligibility(BIGINT) RENAME TO file_evidence_version_eligible")
+        .execute(db.pool()).await.unwrap();
+    db.cleanup().await.unwrap();
+    assert!(
+        count.is_err(),
+        "the fixture must reject the actual global count query"
+    );
+    let page = page.expect("a reporting-count failure must not prevent bounded page discovery");
+    assert_eq!(
+        page.len(),
+        2,
+        "report only the selected page, not the seven-row backlog"
+    );
+    assert!(page.iter().all(|version| version.artifact == id));
+}

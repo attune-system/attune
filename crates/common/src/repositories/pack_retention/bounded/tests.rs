@@ -1439,6 +1439,191 @@ async fn release_test_pack(pool: &PgPool) -> crate::models::Pack {
     .unwrap()
 }
 
+async fn seed_inactive_releases(pool: &PgPool, count: i64) -> Vec<i64> {
+    let pack = release_test_pack(pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    let mut ids: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO pack_release(pack,pack_ref,version,digest,object_key,provider_version,content_path,archive_size,manifest,inactive_since)
+         SELECT $1,$2,'1.0.'||n,lpad(to_hex(n),64,'0'),'collector/'||n,'e:owned-fixture',
+             '/packs/.releases/collector-'||n,1,'{}',clock_timestamp()-interval '1 day'
+         FROM generate_series(1,$3::bigint) n ORDER BY n RETURNING id",
+    )
+    .bind(pack.id)
+    .bind(&pack.r#ref)
+    .bind(count)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn graph_release_cycle_cap() {
+    use super::super::PackRetentionRepository;
+
+    let db = database().await;
+    let releases = seed_inactive_releases(db.pool(), 257).await;
+    seed(db.pool(), &(1..=257).collect::<Vec<_>>()).await;
+    let budgets = GraphReclamationOptions {
+        delete_limit: 1,
+        ..options()
+    };
+    let first = PackRetentionRepository::collect_bounded(db.pool(), Utc::now(), 0, &budgets)
+        .await
+        .unwrap();
+    let release = first
+        .phases
+        .iter()
+        .find(|phase| phase.phase == GraphReclamationPhase::Releases)
+        .unwrap();
+    assert_eq!(
+        (release.changed, first.deleted_content.len()),
+        (1, 1),
+        "257 eligible releases must not receive a fresh DELETE allowance on the second page"
+    );
+    assert_eq!((release.pages, release.cursor), (1, releases[255]));
+    assert!(release.pending && first.backlog_pending() && !first.complete());
+    assert_eq!(
+        PackRetentionRepository::retained_count(db.pool())
+            .await
+            .unwrap(),
+        256
+    );
+    assert_eq!(
+        epoch(&first).changed,
+        2,
+        "the release cap is not a global graph deletion cap"
+    );
+    let progress = PackRetentionRepository::reclamation_progress(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|phase| phase.phase == "releases")
+        .unwrap();
+    assert_eq!(
+        (progress.cursor, progress.high_water),
+        (releases[255], releases[256])
+    );
+    assert!(progress.pending && progress.pass_deferred);
+    let delay = progress.next_attempt.unwrap() - progress.last_attempt.unwrap();
+    assert_eq!(delay, chrono::Duration::seconds(1));
+
+    sqlx::query("UPDATE graph_reclamation_progress SET next_attempt=clock_timestamp() WHERE phase='releases'")
+        .execute(db.pool()).await.unwrap();
+    let resumed = PackRetentionRepository::collect_bounded(db.pool(), Utc::now(), 0, &budgets)
+        .await
+        .unwrap();
+    let release = resumed
+        .phases
+        .iter()
+        .find(|phase| phase.phase == GraphReclamationPhase::Releases)
+        .unwrap();
+    assert_eq!((release.changed, release.pages, release.cursor), (1, 1, 0));
+    assert_eq!(
+        resumed.deleted_content.len(),
+        1,
+        "a fresh invocation resets the allowance"
+    );
+    assert_eq!(
+        PackRetentionRepository::retained_count(db.pool())
+            .await
+            .unwrap(),
+        255
+    );
+    assert!(release.pending && resumed.backlog_pending() && !resumed.complete());
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn graph_release_cycle_cap_remaining_allowance() {
+    use super::super::PackRetentionRepository;
+
+    let db = database().await;
+    let releases = seed_inactive_releases(db.pool(), 5).await;
+    let budgets = GraphReclamationOptions {
+        candidate_limit: 2,
+        delete_limit: 3,
+        ..options()
+    };
+    let result = PackRetentionRepository::collect_bounded(db.pool(), Utc::now(), 0, &budgets)
+        .await
+        .unwrap();
+    let release = result
+        .phases
+        .iter()
+        .find(|phase| phase.phase == GraphReclamationPhase::Releases)
+        .unwrap();
+    assert_eq!(
+        (release.changed, release.pages, release.candidates),
+        (3, 2, 4)
+    );
+    assert_eq!(result.deleted_content.len(), 3);
+    assert_eq!(release.cursor, releases[3]);
+    let progress = PackRetentionRepository::reclamation_progress(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|phase| phase.phase == "releases")
+        .unwrap();
+    assert!(progress.pending && progress.pass_deferred && progress.oversized_since.is_some());
+    assert_eq!(progress.high_water, releases[4]);
+    assert_eq!(
+        PackRetentionRepository::retained_count(db.pool())
+            .await
+            .unwrap(),
+        2
+    );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn graph_release_cycle_cap_crosses_ten_thousand_pins() {
+    use super::super::PackRetentionRepository;
+
+    let db = database().await;
+    let releases = seed_inactive_releases(db.pool(), 10_241).await;
+    let mut tx = db.pool().begin().await.unwrap();
+    SchemaTypeRepository::lock_selection(&mut tx).await.unwrap();
+    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,object_done,staging_done) VALUES(990001,990002,990003,true,true)")
+        .execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source) SELECT 990001,'pack_release',id FROM unnest($1::bigint[]) id")
+        .bind(&releases[..10_240]).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let budgets = GraphReclamationOptions {
+        delete_limit: 1,
+        ..options()
+    };
+    let result = PackRetentionRepository::collect_bounded(db.pool(), Utc::now(), 0, &budgets)
+        .await
+        .unwrap();
+    let release = result
+        .phases
+        .iter()
+        .find(|phase| phase.phase == GraphReclamationPhase::Releases)
+        .unwrap();
+    assert_eq!(
+        (release.changed, release.candidates, release.pages),
+        (1, 10_241, 41)
+    );
+    assert_eq!(result.deleted_content.len(), 1);
+    assert_eq!(
+        PackRetentionRepository::retained_count(db.pool())
+            .await
+            .unwrap(),
+        10_240
+    );
+    assert!(
+        result.complete(),
+        "pinned-only pages must not spend the release allowance: {result:?}"
+    );
+    db.cleanup().await.unwrap();
+}
+
 #[tokio::test]
 async fn release_retention_preserves_strict_cutoff_and_newest_inactive_id_ties() {
     use crate::repositories::pack_release::{CreatePackReleaseInput, PackReleaseRepository};

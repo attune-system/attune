@@ -1580,14 +1580,15 @@ async fn shared_volume_cross_process_locking_writer_loss_and_retention() -> Resu
     let mut maintenance = harness.replicas[0].state.config.maintenance.clone();
     maintenance.object_upload_abandon_seconds = 3600;
     maintenance.artifact_cleanup_batch_size = 10;
-    assert_eq!(
+    assert!(
         attune_supervisor::artifact_cleanup::cleanup_abandoned_shared_logs(
             harness.database.pool(),
             other_pod.as_ref(),
             &maintenance,
         )
-        .await?,
-        0
+        .await
+        .is_err(),
+        "an active flock must report deferred cleanup, not an empty success"
     );
     let claimed_state: String =
         sqlx::query_scalar("SELECT body_state::text FROM artifact_version WHERE id = $1")
