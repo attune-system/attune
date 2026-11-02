@@ -3,9 +3,11 @@
 <!-- 2026-06-30: Leaned AGENTS.md, removed duplicated deep detail, and kept only task-critical invariants. -->
 
 ## Project Overview
+
 Attune is a pre-production, event-driven automation/orchestration platform built primarily in Rust. It is StackStorm-like: sensors create events, rules create enforcements, and the executor schedules actions and workflows.
 
 ### Status / Change Policy
+
 - **Pre-production**: no stable release or backward-compatibility promise yet.
 - **Database baseline before 1.0.0**: target fresh installations; canonical migrations may be revised with an explicit development-database reset. Starting with 1.0.0, preserve applied migration bytes and use forward, data-preserving migrations. Never reset databases or rewrite recorded checksums automatically.
 - **Initial formats stay v1**: revise the canonical pre-production contract in place; do not invent v2 formats, dual readers, or legacy compatibility adapters without explicit approval. Safe data conversion/reset is separate from runtime backward compatibility.
@@ -13,28 +15,28 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 - **Internal contracts still matter**: keep API ↔ web UI and service ↔ service expectations coherent.
 
 ## Critical Guardrails (Read First)
-1. **ALWAYS** validate the exact repository state being committed with the standard CI validations defined in `.github/workflows/`. Agents may commit only after all applicable required checks pass; failed, skipped, blocked, or stale checks do not satisfy this requirement. Committing and pushing still require explicit user authorization. See `docs/testing/running-tests.md` for local validation procedures.
-2. **ALWAYS** use the repository layer for DB access. Do **not** bypass it with ad hoc service queries.
-3. **NEVER** hardcode schema prefixes in SQL. Rely on PostgreSQL `search_path`.
-4. **ALWAYS** apply `RequireAuth` to protected Axum routes.
-5. **REMEMBER** all primary IDs are `i64` / `BIGINT`.
-6. **NEVER** use `SELECT *` for SQLx `FromRow` models on evolving tables. Use repository `SELECT_COLUMNS` constants (for example in `execution.rs`, `pack.rs`, `runtime_version.rs`).
-7. **REMEMBER** selected runtime references to `event`, `enforcement`, and `execution` intentionally use plain `BIGINT` values without foreign keys so retention can remove rows independently. Preserve dangling-ID semantics. Native partitioning does not make `id` globally unique or justify adding reference FKs.
-8. **ALWAYS** keep schema definitions flat: `param_schema`, `out_schema`, and `conf_schema` use Attune's flat per-field format, not raw JSON Schema.
+
+1. Distinguish saving progress from declaring work **ready to merge**. Authorized non-`main` commits and pushes may contain disclosed incomplete or failing work; the complete suite is not required locally for every commit or push. Before declaring work ready to merge, run validation proportionate to scope and risk, cover affected contracts, and resolve regressions introduced by the changes. Required CI must pass before changes enter `main`. Follow [task authorization](#task-authorization) and the [testing guide](docs/testing/running-tests.md) for readiness, result reuse, baseline failures, and reporting.
+2. Use the repository layer for DB access. Do not bypass it with ad hoc service queries.
+3. Do not hardcode schema prefixes in SQL. Rely on PostgreSQL `search_path`.
+4. Apply `RequireAuth` to protected Axum routes.
+5. Use `i64` / `BIGINT` for all primary IDs.
+6. Do not use `SELECT *` for SQLx `FromRow` models on evolving tables. Use repository `SELECT_COLUMNS` constants (for example in `execution.rs`, `pack.rs`, `runtime_version.rs`).
+7. Preserve independent retention for runtime references to `event`, `enforcement`, and `execution`: selected references intentionally use plain `BIGINT` values without foreign keys. Preserve dangling-ID semantics. Native partitioning does not make `id` globally unique or justify adding reference FKs.
+8. Keep schema definitions flat: `param_schema`, `out_schema`, and `conf_schema` use Attune's flat per-field format, not raw JSON Schema.
    For value-schema validation, defaults, secret traversal, or template handling, use `crates/common/src/value_schema/` and read `docs/plans/named-type-schema-compiler.md`. Authoring previews are not runtime release bindings.
-9. **ALWAYS** keep `execution.config` flat: the object itself is the parameters map. Never wrap parameters under `{"parameters": ...}`.
-10. **ALWAYS** deliver action parameters via **stdin JSON**, not environment variables.
-11. **REMEMBER** execution API access is opt-in via `permission_set_refs`. The reserved ref `standard` grants only scoped key/artifact access for the executing action/pack (and containing workflow action/pack for workflow child executions).
-12. **REMEMBER** workflow actions are stored as **two files**: action metadata YAML in `actions/` plus graph YAML in `actions/workflows/`, linked by `workflow_file`.
-13. **ALWAYS** compare runtime names case-insensitively via `normalize_runtime_name()` (for example, `node`, `nodejs`, and `Node.js` should resolve equivalently).
-14. **NEVER** use `PgListener::listen()` in a loop in the notifier. Use **`PgListener::listen_all()`** once, or the listener can stop receiving notifications.
-15. **ALWAYS** maintain a zero-warning workspace. Run `cargo check --all-targets --workspace` and fix warnings you introduce.
-16. **REMEMBER** schema changes require `cargo sqlx prepare`.
-17. **REMEMBER** when adding mutable `execution` or `worker` columns, update the history trigger with `IS DISTINCT FROM` checks; for large JSONB values, store digest summaries with `_jsonb_digest_summary()` instead of raw payloads.
-18. **ALWAYS** clear inherited environments for pack-controlled processes, including setup and verification commands, using `ChildProcessEnvironment` before explicit context. For allowlists and precedence, read `docs/deployment/child-process-environments.md`.
-19. **ALWAYS** bind delegated execution grants to an explicit active owner and secret disclosure to recorded origins. For registration, token consumers, key delivery, or signing changes, read `docs/permissions/delegation-and-secret-disclosure.md`.
+9. Keep `execution.config` flat: the object itself is the parameters map. Do not wrap parameters under `{"parameters": ...}`.
+10. Deliver action parameters via **stdin JSON**, not environment variables.
+11. Keep execution API access opt-in via `permission_set_refs`. The reserved ref `standard` grants only scoped key/artifact access for the executing action/pack (and containing workflow action/pack for workflow child executions).
+12. Store workflow actions using the [two-file representation](#storage-and-authoring).
+13. Compare runtime names case-insensitively via `normalize_runtime_name()` (for example, `node`, `nodejs`, and `Node.js` should resolve equivalently).
+14. Use `PgListener::listen_all()` once in the notifier. Do not use `PgListener::listen()` in a loop, or the listener can stop receiving notifications.
+15. When adding mutable `execution` or `worker` columns, update the history trigger with `IS DISTINCT FROM` checks; for large JSONB values, store digest summaries with `_jsonb_digest_summary()` instead of raw payloads.
+16. Clear inherited environments for pack-controlled processes, including setup and verification commands, using `ChildProcessEnvironment` before explicit context. For allowlists and precedence, read `docs/deployment/child-process-environments.md`.
+17. Bind delegated execution grants to an explicit active owner and secret disclosure to recorded origins. For registration, token consumers, key delivery, or signing changes, read `docs/permissions/delegation-and-secret-disclosure.md`.
 
 ## Core Stack
+
 - **Rust** 2021
 - **Database**: stock PostgreSQL **16+**, PostgreSQL 18 by default in Compose and CI. No TimescaleDB extension is required.
 - **Queue**: RabbitMQ 3.12+
@@ -43,6 +45,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 - **Async**: Tokio
 
 ## Repo Orientation
+
 ```text
 attune/
 ├── Cargo.toml
@@ -66,7 +69,9 @@ attune/
 ```
 
 ## Architecture Map
+
 ### Services
+
 - **api**: JWT auth, REST endpoints, pack registration/upload, artifacts, dashboard APIs.
 - **executor**: creates/schedules executions, orchestrates workflows, dispatches work queues.
 - **worker**: runs actions in configured runtimes; manages pack runtime environments.
@@ -77,6 +82,7 @@ attune/
 - **cli / attune-mcp**: CLI plus MCP transport over stdio/HTTP.
 
 ### High-level Event Flow
+
 - **Sensor → Event → Rule → Enforcement → Execution**
 - Workflow actions are orchestrated by the **executor**; workflow tasks become normal child executions.
 - Work queues create normal executions through executor dispatch.
@@ -88,6 +94,7 @@ attune/
   in-tree Rust cache SDK.
 
 ### Deep-Dive Docs
+
 - Service architecture: `docs/architecture/*.md`
 - Notifier: `docs/architecture/notifier-service.md`
 - Sensor lifecycle: `docs/sensors/sensor-lifecycle-management.md`
@@ -95,6 +102,7 @@ attune/
 - Workflow engine: `docs/workflows/workflow-orchestration.md`, `docs/workflows/workflow-execution-engine.md`
 
 ## Docker / Deployment Reality
+
 - Attune runs primarily via **Docker Compose** (`docker-compose.yaml`).
 - Main named volumes:
   - `packs_data` for packs
@@ -110,6 +118,7 @@ attune/
 - For fresh installation, migration-policy, or development-database reset decisions, read `docs/deployment/postgresql-only.md` before changing database volumes or migration histories.
 
 ### Musl / Cross-Compilation Guidance
+
 Use the shared pattern for both agent binaries and pack binaries:
 - Dockerfiles: `docker/Dockerfile.agent`, `docker/Dockerfile.pack-binaries`
 - Build style: **musl + cargo-zigbuild** for statically linked multi-arch binaries
@@ -130,32 +139,35 @@ For more detail, use:
 - `docs/QUICKREF-unified-runtime-detection.md`
 
 ## Canonical Data / DB Rules
+
 ### Database Access
-- Repository layer is the source of truth for queries and persistence.
-- All SQL uses unqualified table names and depends on `search_path`.
+
+- Follow the repository-access and SQL qualification requirements in [Critical Guardrails](#critical-guardrails-read-first).
 - Use transactions for multi-table work.
 - Use PostgreSQL enum mappings in Rust for custom enums.
 
 ### Tables and history
+
 - `event`, `execution_history`, and `audit_event` are native daily UTC RANGE parents with DEFAULT partitions. Their keys are `created`, `time`, and `created`. `event` and `audit_event` have composite primary keys `(id, created)`.
 - Other runtime tables, `worker_history`, and `sensor_process_history` remain ordinary PostgreSQL tables. History records have no public history-ID contract.
-- References such as `execution.parent`, `execution.enforcement`, `workflow_execution.execution`, and `inquiry.created_by_execution` retain the independent-retention semantics in guardrail 7.
+- References such as `execution.parent`, `execution.enforcement`, `workflow_execution.execution`, and `inquiry.created_by_execution` retain the independent-retention semantics described in [Critical Guardrails](#critical-guardrails-read-first).
 - `event` is immutable after insert.
 - `cache_entry` is LIST-partitioned by generation, with composite key `(generation, id)` and no DEFAULT. Reclamation atomically drops one partition and releases exact usage. Cache/workflow mutations acquire admission before parent protection and metadata/pin rows; use `PinMutation` at outer transaction entry for pin creation or cascades. Ordinary `Read` stays concurrent. For DDL, quotas, and lock ordering, read `docs/plans/cache-generation-partitioning.md`.
   Namespace mode is immutable: `snapshot` publishes immutable generations; `live` reuses one durable mutable backing partition and supports revision-guarded ID mutations/lookups, not scans or `iterate_cache`. For clone baselines, live batches, accounting, and retry contracts, read `docs/KEY_CACHE.md`.
 - `enforcement` has a narrow lifecycle and no separate history table.
 - `execution` is mutable and has an `execution_history` table; `worker` and `sensor_process` also have history tracking.
-- History is trigger-driven. If you add mutable `execution`/`worker` columns, keep trigger diffs in sync with `IS DISTINCT FROM` checks.
-- For large JSONB fields in history, store `_jsonb_digest_summary()` output instead of raw content.
+- History is trigger-driven; follow the history-trigger requirements in [Critical Guardrails](#critical-guardrails-read-first).
 - `migrations/` is the source of truth for current schema shape.
 - For partition DDL roles, summary coverage, or retention changes, read `docs/deployment/postgresql-only.md` and `docs/deployment/supervisor.md`. Partition-parent row cleanup uses statement-local `(tableoid, ctid)` pairs. Summary producers append invalidations without an FK to builder state; builders acknowledge exact snapshot-visible IDs, never an ID watermark.
 
 ### Artifact / File Storage Essentials
+
 - File artifacts live on the shared artifact storage volume; metadata stays in PostgreSQL.
 - Artifact transport supports shared-volume and API-backed modes.
 - Runtime logs are classified as private `runtime_log` artifacts.
 
 ## Core Domain Notes
+
 - **Pack**: bundle of actions, triggers, rules, sensors, runtimes, workflows, queues, etc.
 - **Action**: executable unit; may declare default `permission_set_refs`, timeouts, runtime requirements, and worker placement constraints.
 - **Trigger / Event / Rule / Enforcement**: event-ingress pipeline.
@@ -165,7 +177,9 @@ For more detail, use:
 - **Artifact**: execution/sensor outputs, files, logs, and progress state.
 
 ## Workflows: Model-Level Rules Only
+
 ### Storage and Authoring
+
 - Workflow actions use **two files**:
   1. `actions/<name>.yaml` for action metadata
   2. `actions/workflows/<name>.workflow.yaml` for graph definition
@@ -173,6 +187,7 @@ For more detail, use:
 - Do **not** embed the workflow graph directly in the action YAML.
 
 ### Graph Model
+
 - Canonical task transition model is `next: []`.
 - Conditions belong on **transitions**, not tasks.
 - The UI does not rely on task `type`; tasks are action invocations.
@@ -181,6 +196,7 @@ For more detail, use:
   item/batch child executions; `require_fresh` defaults to `false`.
 
 ### Template / Context Rules
+
 - Use canonical namespaces in workflow expressions: `parameters`, `workflow`, `task`, `config`, `keystore`, `item`, `index`, `system`.
 - Pure `{{ ... }}` expressions are type-preserving.
 - Prefer `event.payload.*` in rule/action-param templates; the old `trigger.payload.*` form is legacy.
@@ -191,6 +207,7 @@ Workflow details live in:
 - `docs/examples/*.yaml`
 
 ## Runtime / Execution Rules
+
 - Worker runtimes come from DB-backed runtime definitions; native runtimes are represented by empty interpreter config.
 - Candidate pack tests always download version-pinned archives from the API's configured object backend, including shared-volume workers. See `docs/deployment/pack-candidate-distribution.md`.
 - Pack publication keeps releases immutable. For the off/on/suffix republishing policy and preserved release pins, read `docs/packs/pack-release-artifacts-spec.md#republishing-policy`.
@@ -200,19 +217,23 @@ Workflow details live in:
 - Important execution env vars include `ATTUNE_ACTION`, `ATTUNE_PACK_REF`, `ATTUNE_EXEC_ID`, `ATTUNE_API_URL`, `ATTUNE_ARTIFACTS_DIR`, and `ATTUNE_RUNTIME_ENVS_DIR`.
 
 ## Notifier / Sensor / Supervisor Contracts
+
 ### Notifier
+
 - Authenticated WebSocket service on port 8081.
 - Subscribe with filters like `all`, `entity_type:<type>`, `entity:<type>:<id>`, `user:<id>`, `notification_type:<type>`.
 - JWT is required at connect time; do **not** use query-string tokens.
-- **Critical invariant**: use `PgListener::listen_all()` once.
+- Follow the listener-registration requirement in [Critical Guardrails](#critical-guardrails-read-first).
 - Outbound notifications must stay wrapped in the tagged client-message enum so serialized messages retain their `type` field.
 
 ### Sensor
+
 - Managed sensors run as processes selected by worker capabilities / placement constraints.
 - Sensor stdout/stderr are exposed via sensor log APIs and retained as artifact-backed runtime logs.
 - Repeated managed sensor failures escalate via `core.alert`.
 
 ### Supervisor
+
 - Owns retention, stale-state cleanup, corrective remediation, and related audit/alert emission.
 - Uses advisory locking so only one maintenance leader acts at a time.
 - Runtime retention config is persisted in DB and reloaded without restart.
@@ -225,13 +246,15 @@ Use docs for specifics instead of expanding this file:
 - `docs/deployment/supervisor.md`
 
 ## Authentication / Security Essentials
+
 - Access auth is JWT-based; integration tokens, OIDC, and LDAP are supported.
-- Protected Axum routes use `RequireAuth`.
+- Follow the protected-route authentication requirement in [Critical Guardrails](#critical-guardrails-read-first).
 - Secrets encryption/decryption goes through shared `attune_common::crypto` helpers.
 - Never put raw secrets, token values, decrypted key material, or artifact content into audit-event details.
 
 ## Web UI Essentials
-- Generated API client lives under `web/src/api/`. After API contract changes or platform/API version bumps, run `npm run generate:api` and `npm run check:api` from `web/`, then commit the generated client changes. Verify that exported `web/openapi.json` `info.version` and `web/src/api/core/OpenAPI.ts` `VERSION` match `[workspace.package].version`; the JSON spec is ignored build output.
+
+- Generated API client lives under `web/src/api/`. Follow [generated API client validation](#generated-api-client-validation) for contract changes and version bumps.
 - Dashboard runtime + authoring exist; use the dashboard types/contracts codepaths already in the repo.
 - Workflow builder edits the two-file workflow/action representation.
 - Execution detail pages include workflow timeline visualization driven by workflow definition + child executions.
@@ -241,7 +264,15 @@ For UI implementation details, read:
 - `docs/architecture/web-ui-architecture.md`
 
 ## Development Workflow
+
+### Task Authorization
+
+- An explicit request to deliver a PR authorizes task-scoped branch creation, commits, pushes, and opening/updating that PR throughout the task without repeated permission requests, unless the user limits that scope.
+- A request to edit files alone does not authorize publishing them; other commits and pushes require explicit authorization.
+- Merging, releasing, and deploying require separate authorization.
+
 ### Common Commands
+
 ```bash
 make build
 make test
@@ -257,7 +288,8 @@ make db-migrate
 ```
 
 ### Testing / Validation
-- Read `docs/testing/running-tests.md` before choosing a test runner or provisioning dependencies.
+
+- Read [Running Tests](docs/testing/running-tests.md) before choosing a test runner or provisioning dependencies. It defines **work in progress** and **ready to merge**, test selection, result reuse, baseline failure evidence, the required CI gate, and the validation handoff format.
 - Database-only Rust tests run in normal Cargo suites and require stock PostgreSQL 16 or newer. Reserve `--ignored` for tests with explicit external-service or stress-test prerequisites.
   Scope exception: the six named deferred deployment cases in `self_contained_deployment_tests` remain compiled and explicitly ignored. Five require disabled registrar exemptions; the historical recursion-negative case conflicts with the supported recursive-call policy. Before changing their status or reporting deployment coverage, read `docs/testing/supported-deployment-scope.md`. They are deferred coverage, never passing release evidence.
 - Prefer `scripts/run-rust-integration-tests.sh` for Docker-owned Rust tests and `scripts/run-integration-tests.sh` for full-stack E2E. These runners own setup and teardown and avoid fixed host ports.
@@ -270,10 +302,18 @@ make db-migrate
   to 2 hours for `make test-integration`, and up to 2 hours for `make e2e-test`.
   Set the command timeout before starting so a passing run is not terminated
   and repeated only because the agent timeout was too short.
-- After schema changes, run `cargo sqlx prepare`.
-- Before finishing code work, run targeted validation plus `cargo check --all-targets --workspace`.
+
+### Schema Validation
+
+- For schema changes, run `cargo sqlx prepare` before declaring work ready to merge. Incomplete schema work may be checkpointed on non-`main` branches under the validation rule in [Critical Guardrails](#critical-guardrails-read-first).
+
+### Generated API Client Validation
+
+- For API contract changes or platform/API version bumps, run `npm run generate:api` and `npm run check:api` from `web/` and include generated client changes before declaring work ready to merge. Intermediate non-`main` checkpoints may defer this under the validation rule in [Critical Guardrails](#critical-guardrails-read-first).
+- Verify that exported `web/openapi.json` `info.version` and `web/src/api/core/OpenAPI.ts` `VERSION` match `[workspace.package].version`; the JSON spec is ignored build output.
 
 ### Test Authoring / Isolation
+
 - Prefer deterministic pure tests for logic; retain real repository/API/service tests for boundary contracts. `cargo test --lib` is not necessarily infrastructure-free.
 - Reuse owning fixtures and minimal repository/API seed builders. Give mutable DB, MQ, filesystem, account, and service resources explicit run/test ownership; never clean up unowned resources or rows by age alone.
 - Await teardown: stop and join background writers/processes before closing pools and removing resources. Surface cleanup failures; `Drop` and janitors are fallback recovery, not proof of successful cleanup.
@@ -284,11 +324,13 @@ make db-migrate
 - Compare identical test coverage and cold/warm timings; do not claim speedups from omitted tests, hidden retries, or skipped setup. See `docs/plans/test-isolation-and-speed.md` for the transformation sequence and acceptance gates.
 
 ### Zero-Warnings Policy
-- New warnings are regressions.
+
+- Maintain a zero-warning workspace. New warnings are regressions; fix warnings introduced by the changes before declaring work ready to merge.
 - Prefer fixing dead code / unused imports / unused variables over suppressing warnings.
 - If `#[allow(dead_code)]` is necessary, keep it narrow and explain why.
 
 ### CLI: Representative Commands
+
 For full CLI coverage, see `docs/cli/cli.md` and `docs/cli/cli-profiles.md`.
 
 ```bash
@@ -306,18 +348,20 @@ attune artifact list --execution 42
 attune-mcp
 ```
 
-CLI rules worth remembering:
+CLI usage rules:
 - Prefer `pack upload` for local-to-Docker installs; `pack register` only works for API-visible paths.
 - `workflow upload` expects an action YAML with `workflow_file` pointing at the companion graph file.
 - `attune-mcp` reuses CLI auth/profile state.
 
 ## File Placement Conventions
+
 - **New API endpoint**: `crates/api/src/routes/<domain>.rs` + DTO in `crates/api/src/dto/<domain>.rs`
 - **New model / table**: model in `crates/common/src/models.rs`, repo in `crates/common/src/repositories/`, migration in `migrations/`
 - **New config**: add to `crates/common/src/config.rs`
 - **New docs**: put usage/system docs in `docs/`; put work summaries in `work-summary/`
 
 ## Important Files / Directories
+
 - `crates/common/src/models.rs`
 - `crates/common/src/repositories/`
 - `crates/common/src/config.rs`
@@ -333,6 +377,7 @@ CLI rules worth remembering:
 - `docs/`
 
 ## Documentation Pointers
+
 Use retrieval, not memory. Start here instead of expanding AGENTS again:
 - Architecture: `docs/architecture/*.md`
 - API: `docs/api/*.md`
@@ -345,13 +390,15 @@ Use retrieval, not memory. Start here instead of expanding AGENTS again:
 - To regenerate the doc index: `make generate-agents-index`
 
 ## Reporting / Work Summary Rules
+
 - Report progress briefly while working.
-- Summarize changes **once** at the end.
+- Summarize changes **once** at the end, using the [validation handoff format](docs/testing/running-tests.md#validation-handoff) for status, checks, and remaining gaps.
 - Do not create ad hoc docs in the repo root.
 - Put enduring system docs in `docs/`.
 - Put work summaries in `work-summary/` only when that output is actually desired.
 
 ## Keeping This File Updated
+
 Update `AGENTS.md` when any of these change materially:
 - repo structure
 - major architecture / service boundaries
@@ -363,7 +410,7 @@ Update `AGENTS.md` when any of these change materially:
 When updating:
 - keep it concise and scannable
 - prefer pointers to docs over deep implementation detail
-- preserve the guardrails in the **Critical Guardrails** section
+- keep safety and architecture invariants in **Critical Guardrails**, development procedures in **Development Workflow**, and detailed validation guidance in the testing guide
 - avoid duplicating the same invariant in multiple sections
 
 ## Agent skills

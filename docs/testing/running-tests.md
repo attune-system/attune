@@ -2,6 +2,85 @@
 
 Attune has pure unit tests, template-cloned PostgreSQL tests, broker/service tests, and full Docker E2E tests. Do not infer infrastructure independence from a Rust target's location or from `--lib`.
 
+## Choosing validation scope
+
+Follow the [validation rule](../../AGENTS.md#critical-guardrails-read-first):
+non-`main` checkpoints and draft PRs may contain disclosed incomplete or failing
+work. Use scoped validation during development; complete applicable checks and
+artifacts before declaring work ready to merge. Early review does not require
+merge readiness.
+
+**Work in progress** means changes are saved or available for review while
+implementation, applicable completion requirements, or required checks remain
+outstanding. **Ready to merge** means those requirements are complete, regressions
+introduced by the changes are resolved, and applicable required CI has passed.
+
+Before merging to or committing directly on `main`, all applicable required CI
+checks in `.github/workflows/` must pass for the PR head or merge candidate
+required by branch protection and merge-queue rules, or the exact state of a
+direct commit. Local result reuse does not waive this gate.
+
+Choose tests from the diff and affected consumers, not just the files edited.
+The following are starting points; combine rows when a change spans areas and
+broaden coverage when risk or failures warrant it.
+
+| Change | Relevant validation before merge readiness |
+| --- | --- |
+| Documentation only | `git diff --check`; review links, examples, and instruction consistency. Application tests are unnecessary unless executable content or behavior also changes. |
+| Isolated Rust crate | Rust formatting, `cargo check -p <package> --all-targets`, relevant Clippy checks, and focused tests. Include repository/API tests when behavior crosses those boundaries. |
+| Shared Rust code, workspace configuration, or dependencies | `cargo check --all-targets --workspace`, relevant formatting/Clippy checks, and tests for affected consumers. |
+| Web UI | From `web/`, run focused tests with `npm test -- <test-file>`, plus `npm run format:check`, `npm run lint`, and `npm run typecheck`; add contract checks or a build when affected. |
+| API contracts or platform/API versions | Relevant API and consumer tests; complete [generated API client validation](../../AGENTS.md#generated-api-client-validation). |
+| Schema or repository queries | Migration and relevant repository/integration tests on owned disposable PostgreSQL; complete [schema validation](../../AGENTS.md#schema-validation) and include resulting metadata changes when applicable. |
+| Authentication, permissions, or cross-service behavior | Relevant security/authorization and integration/E2E cases across affected boundaries, including rejection paths; isolated unit tests alone are insufficient. |
+| Executable scripts or deployment/test configuration | Applicable syntax, unit, and smoke/integration checks for the changed execution path; these are not documentation-only changes. |
+
+Cargo tests may need external services even with `--lib`. Follow the run identity,
+concurrency, and owned-infrastructure procedures below. For scoped Docker runs,
+use the existing runner's `--crate`, `--test`, or `--filter` controls.
+
+### Reusing results and handling failures
+
+Reuse a check only when subsequent changes cannot affect its result. Record the
+tested commit SHA, any uncommitted changes present during the run (for example,
+a saved diff), the command and result, and why reuse remains valid. A prose-only
+edit can preserve code-test evidence; shared library, dependency, configuration,
+fixture, or relevant environment changes require rerunning affected checks and
+consumer coverage. When the impact is uncertain, rerun. Reused local evidence
+does not replace required CI on the PR head or merge candidate.
+
+Fix regressions introduced by the task before declaring merge readiness. If a
+failure appears unrelated, record evidence such as an existing CI failure or a
+reproduction on the base revision with equivalent prerequisites. Without that
+evidence, report the cause as unresolved. Do not silently expand the task to fix
+unrelated failures or label them passed. Required CI failures still block merge,
+even when they predate the task.
+
+Unavailable local infrastructure may be disclosed and validation obtained in CI
+through an authorized non-`main` push. Pending or blocked checks remain gaps until
+results arrive. Follow the completion requirements for
+[schema validation](../../AGENTS.md#schema-validation),
+[generated API clients](../../AGENTS.md#generated-api-client-validation), and
+[warning cleanup](../../AGENTS.md#zero-warnings-policy). Other safety and
+resource-ownership rules still apply during work in progress.
+
+### Validation handoff
+
+Use this compact format in the handoff or PR description; no separate report file
+is required:
+
+```text
+Status: work in progress / ready to merge
+Validation: commands and results, tested revision and any uncommitted changes;
+            why the selected scope is appropriate; rationale for reused results
+Gaps: known failures (with baseline evidence if unrelated), blocked/unrun checks,
+      pending CI, and remaining work; or none
+```
+
+Use “work in progress” while applicable completion requirements or required checks
+remain outstanding. Update the report as results arrive so a reviewer or another
+agent can distinguish saved progress from merge readiness.
+
 ## Fast local checks
 
 ```bash
