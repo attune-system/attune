@@ -385,6 +385,16 @@ async fn same_ctid_in_two_leaves_deletes_only_the_selected_tableoid_pair() {
 #[tokio::test]
 async fn native_retention_uses_metadata_for_full_days_and_bounded_candidates_for_default() {
     let db = database().await;
+    // Reproduce a template created before UTC midnight and cloned after it.
+    // Its now-expired empty leaf must not change this fixture's accounting.
+    PartitionRepository::ensure_day(
+        db.pool(),
+        ManagedTable::Event,
+        utc_day(Utc::now()) - Duration::days(1),
+        &config(),
+    )
+    .await
+    .unwrap();
     let start = day("2020-08-02T00:00:00Z");
     PartitionRepository::ensure_day(db.pool(), ManagedTable::Event, start, &config())
         .await
@@ -398,10 +408,17 @@ async fn native_retention_uses_metadata_for_full_days_and_bounded_candidates_for
         native_maintenance: config(),
         ..Default::default()
     };
+    // Keep expiry inside the historical fixture window. A template's empty
+    // bootstrap partitions can become eligible across UTC midnight, but are
+    // unrelated to the one historical leaf whose accounting we assert here.
+    let max_age_seconds = (Utc::now() - (start + Duration::days(4)))
+        .num_seconds()
+        .try_into()
+        .unwrap();
     let result = RetentionRepository::run_target_bounded(
         db.pool(),
         RetentionTarget::Events,
-        60,
+        max_age_seconds,
         &retention,
         || false,
     )

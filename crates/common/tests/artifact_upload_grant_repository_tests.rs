@@ -8,6 +8,7 @@ use attune_common::{
     repositories::{
         artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
         artifact_upload_grant::{ArtifactUploadGrantRepository, CreateArtifactUploadGrantInput},
+        log_stream::LogStreamRepository,
         object_maintenance::ObjectMaintenanceRepository,
         storage_maintenance::StorageMaintenanceRepository,
         Create,
@@ -419,4 +420,189 @@ async fn expired_url_cannot_be_renewed_during_its_settlement_window() {
     .await
     .unwrap());
     tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn grant_artifact_version_index_covers_all_rows_without_changing_uniqueness() {
+    let database = create_test_pool().await.expect("test database");
+    let definition: (bool, bool, bool, bool, bool, i16, i16, String, String) = sqlx::query_as(
+        "SELECT i.indisvalid, i.indisready, i.indisunique, i.indpred IS NULL, \
+                i.indexprs IS NULL, i.indnkeyatts, i.indnatts, am.amname::text, \
+                pg_get_indexdef(i.indexrelid, 1, true) \
+         FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+         JOIN pg_am am ON am.oid = c.relam \
+         WHERE i.indrelid = 'artifact_upload_grant'::regclass \
+           AND c.relname = 'idx_artifact_upload_grant_artifact_version'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        definition,
+        (
+            true,
+            true,
+            false,
+            true,
+            true,
+            1,
+            1,
+            "btree".into(),
+            "artifact_version".into()
+        )
+    );
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+         WHERE i.indrelid = 'artifact_upload_grant'::regclass AND i.indisvalid \
+           AND ((c.relname IN ('uq_artifact_upload_grant_artifact_body', \
+                              'uq_artifact_upload_grant_log_segment') AND i.indisunique) \
+                OR c.relname = 'idx_artifact_upload_grant_issued_expiry')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained, 3);
+    database.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_rechecks_body_and_segment_grants_across_settlement_and_terminal_states() {
+    let database = create_test_pool().await.expect("test database");
+    let pool = database.pool();
+    let now = Utc::now();
+    let cutoff = now - Duration::hours(1);
+    for segment_sequence in [None, Some(0)] {
+        // URL expiry alone must not end the settlement protection. Conversely,
+        // terminal grants must not block cleanup even with a future settle_until.
+        for (state, expired_url, settled, protected) in [
+            ("issued", false, false, true),
+            ("issued", true, false, true),
+            ("issued", true, true, false),
+            ("completed", false, false, false),
+            ("expired", false, false, false),
+        ] {
+            for path in [
+                "claim",
+                "mark_deleting",
+                "delete_claimed",
+                "delete_deleting",
+            ] {
+                let version = pending_version(pool).await;
+                if segment_sequence.is_some() {
+                    let execution: i64 = sqlx::query_scalar(
+                        "INSERT INTO execution (action_ref, status) VALUES ('grant.test', 'failed') RETURNING id",
+                    )
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+                    sqlx::query("UPDATE artifact_version SET execution = $2 WHERE id = $1")
+                        .bind(version.id)
+                        .bind(execution)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                    LogStreamRepository::create(pool, version.id, 1024, 500)
+                        .await
+                        .unwrap();
+                }
+                sqlx::query("UPDATE artifact_version SET body_updated = $2 WHERE id = $1")
+                    .bind(version.id)
+                    .bind(now - Duration::hours(2))
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                let grant = ArtifactUploadGrantRepository::create(
+                    pool,
+                    CreateArtifactUploadGrantInput {
+                        token: Uuid::new_v4(),
+                        artifact_version: version.id,
+                        segment_sequence,
+                        object_key: version.object_key.unwrap(),
+                        expected_size: 12,
+                        expected_sha256: "a".repeat(64),
+                        content_type: "application/octet-stream".into(),
+                        expires_at: if expired_url {
+                            now - Duration::days(2)
+                        } else {
+                            now + Duration::days(1)
+                        },
+                        settle_until: if settled {
+                            now - Duration::days(1)
+                        } else {
+                            now + Duration::days(2)
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+                if state == "completed" {
+                    let mut tx = pool.begin().await.unwrap();
+                    assert!(ArtifactUploadGrantRepository::mark_completed(
+                        &mut tx,
+                        grant.id,
+                        "provider-1"
+                    )
+                    .await
+                    .unwrap());
+                    tx.commit().await.unwrap();
+                } else if state == "expired" {
+                    sqlx::query("UPDATE artifact_upload_grant SET state = 'expired' WHERE id = $1")
+                        .bind(grant.id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+                let selected = StorageMaintenanceRepository::abandoned_pending(pool, cutoff, 100)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.id == version.id);
+                assert_eq!(selected, !protected, "{segment_sequence:?} {state} {path}");
+                let changed = match path {
+                    "claim" => StorageMaintenanceRepository::claim_abandoned_pending(
+                        pool, version.id, cutoff,
+                    )
+                    .await
+                    .unwrap(),
+                    "mark_deleting" => StorageMaintenanceRepository::mark_deleting_from_pending(
+                        pool,
+                        version.id,
+                        "provider-1",
+                        12,
+                        &"a".repeat(64),
+                    )
+                    .await
+                    .unwrap(),
+                    "delete_claimed" => {
+                        sqlx::query("UPDATE artifact_version SET body_state = 'cleanup_claimed' WHERE id = $1")
+                            .bind(version.id).execute(pool).await.unwrap();
+                        StorageMaintenanceRepository::delete_cleanup_claimed(pool, version.id)
+                            .await
+                            .unwrap()
+                    }
+                    "delete_deleting" => {
+                        sqlx::query("UPDATE artifact_version SET body_state = 'deleting', provider_version = 'provider-1', size_bytes = 12, sha256 = repeat('a', 64) WHERE id = $1")
+                            .bind(version.id).execute(pool).await.unwrap();
+                        StorageMaintenanceRepository::delete_deleting(pool, version.id)
+                            .await
+                            .unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(changed, !protected, "{segment_sequence:?} {state} {path}");
+                let remaining: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM artifact_upload_grant WHERE artifact_version = $1",
+                )
+                .bind(version.id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                assert_eq!(
+                    remaining,
+                    i64::from(protected || !path.starts_with("delete_"))
+                );
+            }
+        }
+    }
+    database.cleanup().await.unwrap();
 }

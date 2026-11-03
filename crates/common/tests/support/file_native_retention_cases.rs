@@ -43,6 +43,9 @@ use attune_common::{
 };
 use bytes::Bytes;
 
+#[path = "encryption_compatibility.rs"]
+mod encryption_compatibility;
+
 const KEY: &str = "F-native-file-repository-test-owned-encryption-key";
 
 #[path = "file_native_prospective_cases.rs"]
@@ -425,10 +428,63 @@ async fn create_generation(
 #[tokio::test]
 async fn cache_and_wait_archives_pin_files_across_raw_source_gc_then_release_exact_physical_children(
 ) {
-    native_storage_custody_case(false).await;
+    native_storage_custody_case(false, false).await;
 }
 
-async fn native_storage_custody_case(prospective: bool) {
+#[tokio::test]
+async fn encryption_upgrade_preserves_accepted_wait_cache_receipts_and_real_file_bytes() {
+    native_storage_custody_case(false, true).await;
+}
+
+async fn read_file_payload(
+    pool: &sqlx::PgPool,
+    held: &Held,
+    store: &FilesystemBlobStore,
+    key: &str,
+) -> Vec<u8> {
+    use futures::TryStreamExt;
+    let body = FileOriginRepository::body(pool, held.version)
+        .await
+        .unwrap()
+        .unwrap();
+    let reader = store
+        .get_pinned(
+            &held.object.key,
+            &held.object.provider_version,
+            held.object.size,
+            held.object.sha256,
+            None,
+        )
+        .await
+        .unwrap();
+    let bytes = reader
+        .try_fold(Vec::new(), |mut bytes, chunk| async move {
+            bytes.extend_from_slice(&chunk);
+            Ok(bytes)
+        })
+        .await
+        .unwrap();
+    attune_common::runtime_file_body::open(
+        &bytes,
+        &body.manifest(),
+        &body.authenticated_manifest,
+        key,
+    )
+    .unwrap()
+}
+
+pub(super) async fn upgrade_held_file(
+    pool: &sqlx::PgPool,
+    held: &Held,
+    store: &FilesystemBlobStore,
+    key: &str,
+) {
+    let before = read_file_payload(pool, held, store, key).await;
+    encryption_compatibility::legacy_upgrade_roundtrip(pool, key).await;
+    assert_eq!(read_file_payload(pool, held, store, key).await, before);
+}
+
+async fn native_storage_custody_case(prospective: bool, compatibility: bool) {
     let (db, fixture) = native_file_producer_fixture().await;
     let owner = &fixture.policy.policy.owner;
     let original_key = helpers::KeyFixture::new_pack(
@@ -1029,6 +1085,16 @@ async fn native_storage_custody_case(prospective: bool) {
     let mut files = Vec::new();
     for receipt in &receipts {
         files.push(hold(&db, &fixture, receipt, directory.path(), &store).await);
+    }
+    if compatibility {
+        let mut before = Vec::new();
+        for file in &files {
+            before.push(read_file_payload(&db, file, &store, KEY).await);
+        }
+        encryption_compatibility::legacy_upgrade_roundtrip(&db, KEY).await;
+        for (file, expected) in files.iter().zip(before) {
+            assert_eq!(read_file_payload(&db, file, &store, KEY).await, expected);
+        }
     }
     let iteration = iteration.unwrap();
     if prospective {

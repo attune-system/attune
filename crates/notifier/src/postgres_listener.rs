@@ -1,7 +1,10 @@
 //! PostgreSQL LISTEN/NOTIFY integration for real-time notifications
 
 use anyhow::{Context, Result};
-use sqlx::postgres::PgListener;
+use attune_common::db::ConnectionIdentity;
+use sqlx::postgres::{PgListener, PgPoolOptions};
+use sqlx::{Acquire, Connection};
+use std::future::Future;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, trace, warn};
@@ -29,9 +32,95 @@ const NOTIFICATION_CHANNELS: &[&str] = &[
     "rule_lifecycle_changed",
 ];
 
+const IDLE_INTERVAL: Duration = Duration::from_secs(60);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Keep the receive/recovery loop testable without a database or real-time waits.
+#[async_trait::async_trait]
+trait ListenConnection: Send {
+    type Notification;
+
+    async fn recv(&mut self) -> Result<Self::Notification>;
+    async fn ping(&mut self) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl ListenConnection for PgListener {
+    type Notification = sqlx::postgres::PgNotification;
+
+    async fn recv(&mut self) -> Result<Self::Notification> {
+        // Return control to our bounded reconnect loop on detected I/O failure.
+        self.try_recv()
+            .await?
+            .context("PostgreSQL LISTEN connection lost")
+    }
+
+    async fn ping(&mut self) -> Result<()> {
+        Ok(self.acquire().await?.ping().await?)
+    }
+}
+
+async fn run_listener<C, F, Fut>(
+    mut connect: F,
+    mut on_notification: impl FnMut(C::Notification),
+) -> Result<()>
+where
+    C: ListenConnection,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<C>>,
+{
+    let mut listener = tokio::time::timeout(CONNECT_TIMEOUT, connect())
+        .await
+        .context("PostgreSQL listener connection/subscription timed out")??;
+
+    loop {
+        trace!("Calling listener.recv() — waiting for next notification");
+        let received = match tokio::time::timeout(IDLE_INTERVAL, listener.recv()).await {
+            Ok(result) => result.map(Some),
+            // A pending receive cannot detect a silently broken socket. Probe the
+            // dedicated LISTEN connection, not the service's role lookup pool.
+            Err(_) => tokio::time::timeout(PROBE_TIMEOUT, listener.ping())
+                .await
+                .context("PostgreSQL LISTEN connection probe timed out")
+                .and_then(|result| result)
+                .map(|()| None),
+        };
+        match received {
+            Ok(Some(notification)) => on_notification(notification),
+            Ok(None) => info!("PostgreSQL listener heartbeat: LISTEN connection probe succeeded"),
+            Err(e) => {
+                warn!("PostgreSQL listener connection failed: {:#}", e);
+                // Never return to recv on this connection, even if reconnect fails.
+                drop(listener);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                loop {
+                    warn!("Attempting to reconnect PostgreSQL listener...");
+                    let reconnected = tokio::time::timeout(CONNECT_TIMEOUT, connect())
+                        .await
+                        .context("PostgreSQL listener connection/subscription timed out")
+                        .and_then(|result| result);
+                    match reconnected {
+                        Ok(new_listener) => {
+                            listener = new_listener;
+                            info!("PostgreSQL listener reconnected successfully");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Failed to reconnect PostgreSQL listener: {:#}", e);
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// PostgreSQL listener that receives NOTIFY events and broadcasts them
 pub struct PostgresListener {
     database_url: String,
+    identity: ConnectionIdentity,
     notification_tx: broadcast::Sender<Notification>,
 }
 
@@ -41,8 +130,22 @@ impl PostgresListener {
         database_url: String,
         notification_tx: broadcast::Sender<Notification>,
     ) -> Result<Self> {
+        Self::new_named(
+            database_url,
+            notification_tx,
+            ConnectionIdentity::for_process("notifier", "listener"),
+        )
+        .await
+    }
+
+    pub async fn new_named(
+        database_url: String,
+        notification_tx: broadcast::Sender<Notification>,
+        identity: ConnectionIdentity,
+    ) -> Result<Self> {
         Ok(Self {
             database_url,
+            identity,
             notification_tx,
         })
     }
@@ -54,74 +157,25 @@ impl PostgresListener {
             NOTIFICATION_CHANNELS
         );
 
-        // Create a dedicated listener connection
-        let mut listener = self.create_listener().await?;
-
-        info!("PostgreSQL listener ready — entering recv loop");
-
-        // Periodic heartbeat so we can confirm the task is alive even when idle.
-        let heartbeat_interval = Duration::from_secs(60);
-        let mut next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
-
-        // Process notifications in a loop
-        loop {
-            // Log a heartbeat if no notification has arrived for a while.
-            let now = tokio::time::Instant::now();
-            if now >= next_heartbeat {
-                info!("PostgreSQL listener heartbeat — still waiting for notifications");
-                next_heartbeat = now + heartbeat_interval;
-            }
-
-            trace!("Calling listener.recv() — waiting for next notification");
-
-            // Use a timeout so the heartbeat fires even during long idle periods.
-            match tokio::time::timeout(heartbeat_interval, listener.recv()).await {
-                // Timed out waiting — loop back and log the heartbeat above.
-                Err(_timeout) => {
-                    trace!("listener.recv() timed out — re-entering loop");
-                    continue;
+        run_listener(
+            || self.create_listener(),
+            |notification| {
+                let channel = notification.channel();
+                let payload = notification.payload();
+                debug!(
+                    "Received PostgreSQL notification: channel={}, payload_len={}",
+                    channel,
+                    payload.len()
+                );
+                if let Err(e) = self.process_notification(channel, payload) {
+                    error!(
+                        "Failed to process notification from channel '{}': {}",
+                        channel, e
+                    );
                 }
-                Ok(recv_result) => match recv_result {
-                    Ok(pg_notification) => {
-                        let channel = pg_notification.channel();
-                        let payload = pg_notification.payload();
-                        debug!(
-                            "Received PostgreSQL notification: channel={}, payload_len={}",
-                            channel,
-                            payload.len()
-                        );
-
-                        // Parse and broadcast notification
-                        if let Err(e) = self.process_notification(channel, payload) {
-                            error!(
-                                "Failed to process notification from channel '{}': {}",
-                                channel, e
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error receiving PostgreSQL notification: {}", e);
-
-                        // Sleep briefly before retrying to avoid tight loop on persistent errors
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-
-                        // Try to reconnect
-                        warn!("Attempting to reconnect PostgreSQL listener...");
-                        match self.create_listener().await {
-                            Ok(new_listener) => {
-                                listener = new_listener;
-                                next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
-                                info!("PostgreSQL listener reconnected successfully");
-                            }
-                            Err(e) => {
-                                error!("Failed to reconnect PostgreSQL listener: {}", e);
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                            }
-                        }
-                    }
-                }, // end Ok(recv_result)
-            } // end timeout match
-        }
+            },
+        )
+        .await
     }
 
     /// Create a fresh [`PgListener`] subscribed to all notification channels.
@@ -131,9 +185,22 @@ impl PostgresListener {
             crate::mask_connection_url(&self.database_url)
         );
 
-        let mut listener = PgListener::connect(&self.database_url)
+        // Match PgListener::connect's dedicated pool settings, with identity in
+        // the startup options so every reconnect is named before any SQL runs.
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .connect_lazy_with(self.identity.connect_options(&self.database_url)?);
+        let mut listener = PgListener::connect_with(&pool)
             .await
             .context("Failed to connect PostgreSQL listener")?;
+
+        // SQLx normally spawns an unbounded UNLISTEN during Drop. Close this
+        // dedicated socket directly on failure or cancellation, even during LISTEN.
+        listener.abort_on_drop();
+        listener.eager_reconnect(false);
+        listener.ignore_pool_close_event(true);
 
         info!("PostgreSQL LISTEN connection established — subscribing to channels");
 
@@ -201,8 +268,246 @@ impl PostgresListener {
 }
 
 #[cfg(test)]
+#[path = "postgres_listener_connection_tests.rs"]
+mod connection_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    mod liveness {
+        use super::*;
+        use std::{
+            collections::BTreeMap,
+            sync::{Arc, Mutex},
+        };
+
+        #[derive(Clone, Copy)]
+        enum Outcome {
+            Healthy,
+            Failed,
+            Stalled,
+        }
+
+        #[derive(Default, Debug)]
+        struct Calls {
+            connects: usize,
+            connect_times: Vec<Duration>,
+            receives: BTreeMap<usize, usize>,
+            probes: BTreeMap<usize, usize>,
+            dropped: Vec<usize>,
+        }
+
+        struct FakeConnection {
+            id: usize,
+            calls: Arc<Mutex<Calls>>,
+            probe: Outcome,
+            receive_error: bool,
+            notification: Option<i64>,
+        }
+
+        impl Drop for FakeConnection {
+            fn drop(&mut self) {
+                self.calls.lock().unwrap().dropped.push(self.id);
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ListenConnection for FakeConnection {
+            type Notification = i64;
+
+            async fn recv(&mut self) -> Result<i64> {
+                *self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .receives
+                    .entry(self.id)
+                    .or_default() += 1;
+                if self.receive_error {
+                    anyhow::bail!("explicit receive failure");
+                }
+                if let Some(notification) = self.notification.take() {
+                    return Ok(notification);
+                }
+                std::future::pending().await
+            }
+
+            async fn ping(&mut self) -> Result<()> {
+                *self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .probes
+                    .entry(self.id)
+                    .or_default() += 1;
+                match self.probe {
+                    Outcome::Healthy => Ok(()),
+                    Outcome::Failed => anyhow::bail!("broken LISTEN connection"),
+                    Outcome::Stalled => std::future::pending().await,
+                }
+            }
+        }
+
+        // Exercise the production timeout and reconnect loop, including parsing and
+        // delivery to the same broadcast receiver after recovery. Only I/O is fake.
+        async fn scenario(
+            probe: Outcome,
+            receive_error: bool,
+            connect_outcomes: &[Outcome],
+        ) -> (Calls, Vec<i64>) {
+            let calls = Arc::new(Mutex::new(Calls::default()));
+            let (tx, mut rx) = broadcast::channel(4);
+            let notifier = PostgresListener::new("unused".into(), tx).await.unwrap();
+            let start = tokio::time::Instant::now();
+            let mut outcomes = connect_outcomes.iter().copied();
+            let connect = || {
+                let outcome = outcomes.next().expect("unexpected connection attempt");
+                let calls = calls.clone();
+                let id = {
+                    let mut calls = calls.lock().unwrap();
+                    calls.connects += 1;
+                    calls.connect_times.push(start.elapsed());
+                    assert!(
+                        calls.connects == 1 || calls.dropped.contains(&1),
+                        "discard the failed connection before attempting reconnect"
+                    );
+                    calls.connects
+                };
+                async move {
+                    match outcome {
+                        Outcome::Failed => anyhow::bail!("reconnect failed"),
+                        Outcome::Stalled => std::future::pending().await,
+                        Outcome::Healthy => Ok(FakeConnection {
+                            id,
+                            calls,
+                            probe: if id == 1 { probe } else { Outcome::Healthy },
+                            receive_error: id == 1 && receive_error,
+                            notification: (id > 1).then_some(123),
+                        }),
+                    }
+                }
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(181),
+                run_listener(connect, |id| {
+                    notifier
+                        .process_notification(
+                            "execution_status_changed",
+                            &format!(r#"{{"entity_type":"execution","entity_id":{id}}}"#),
+                        )
+                        .unwrap();
+                }),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "listener loop must keep running: {result:?}"
+            );
+            let mut delivered = Vec::new();
+            while let Ok(notification) = rx.try_recv() {
+                delivered.push(notification.entity_id);
+            }
+            let calls = Arc::try_unwrap(calls).unwrap().into_inner().unwrap();
+            (calls, delivered)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn healthy_idle_connection_is_probed_without_reconnecting() {
+            let (calls, delivered) = scenario(Outcome::Healthy, false, &[Outcome::Healthy]).await;
+            assert_eq!(
+                calls.probes.get(&1),
+                Some(&3),
+                "idle timeouts must probe the LISTEN connection"
+            );
+            assert_eq!(calls.connects, 1);
+            assert!(delivered.is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failed_idle_probe_reconnects_and_resumes_delivery() {
+            let (calls, delivered) = scenario(
+                Outcome::Failed,
+                false,
+                &[Outcome::Healthy, Outcome::Healthy],
+            )
+            .await;
+            assert_eq!(calls.connects, 2, "a failed idle probe must reconnect");
+            assert_eq!(calls.connect_times[1], Duration::from_secs(61));
+            assert_eq!(calls.receives.get(&1), Some(&1));
+            assert_eq!(calls.dropped, vec![1, 2]);
+            assert_eq!(delivered, vec![123]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stalled_idle_probe_reconnects_and_resumes_delivery() {
+            let (calls, delivered) = scenario(
+                Outcome::Stalled,
+                false,
+                &[Outcome::Healthy, Outcome::Healthy],
+            )
+            .await;
+            assert_eq!(
+                calls.connects, 2,
+                "a stalled idle probe must have a deadline"
+            );
+            assert_eq!(calls.connect_times[1], Duration::from_secs(71));
+            assert_eq!(calls.receives.get(&1), Some(&1));
+            assert_eq!(delivered, vec![123]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reconnect_retries_errors_and_timeouts_without_reusing_dead_connection() {
+            let (calls, delivered) = scenario(
+                Outcome::Failed,
+                false,
+                &[
+                    Outcome::Healthy,
+                    Outcome::Failed,
+                    Outcome::Stalled,
+                    Outcome::Healthy,
+                ],
+            )
+            .await;
+            assert_eq!(
+                calls.connects, 4,
+                "retry failed and stalled reconnects independently of recv"
+            );
+            assert_eq!(
+                calls.connect_times,
+                [0, 61, 66, 81].map(Duration::from_secs)
+            );
+            assert_eq!(calls.receives.get(&1), Some(&1));
+            assert_eq!(calls.dropped, vec![1, 4]);
+            assert_eq!(delivered, vec![123]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn explicit_receive_error_still_reconnects() {
+            let (calls, delivered) = scenario(
+                Outcome::Healthy,
+                true,
+                &[Outcome::Healthy, Outcome::Healthy],
+            )
+            .await;
+            assert_eq!(calls.connects, 2);
+            assert_eq!(calls.receives.get(&1), Some(&1));
+            assert_eq!(delivered, vec![123]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn initial_connection_has_a_deadline() {
+            let result = tokio::time::timeout(
+                Duration::from_secs(11),
+                run_listener(std::future::pending::<Result<FakeConnection>>, |_| {}),
+            )
+            .await;
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "initial connection must fail within its deadline: {result:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn listener_recreation_keeps_receivers_open_but_cannot_replay_artifact_changes(
@@ -230,6 +535,19 @@ mod tests {
         let (tx, mut receiver) = broadcast::channel(4);
         let listener = PostgresListener::new(db.database_url().to_string(), tx).await?;
         let mut pg = listener.create_listener().await?;
+        let name: String = sqlx::query_scalar("SHOW application_name")
+            .fetch_one(pg.acquire().await?)
+            .await?;
+        assert_eq!(name, listener.identity.application_name());
+        let search_path: String = sqlx::query_scalar("SHOW search_path")
+            .fetch_one(pg.acquire().await?)
+            .await?;
+        // A healthy idle connection survives a cancelled receive and a real
+        // protocol round-trip on the subscribed connection.
+        assert!(tokio::time::timeout(Duration::from_millis(1), pg.recv())
+            .await
+            .is_err());
+        tokio::time::timeout(PROBE_TIMEOUT, ListenConnection::ping(&mut pg)).await??;
         let create = |reference: &str| CreateArtifactInput {
             r#ref: reference.into(),
             scope: OwnerType::Action,
@@ -245,6 +563,8 @@ mod tests {
             data: Some(serde_json::json!({})),
         };
         let first = ArtifactRepository::create(db.pool(), create("listener.first")).await?;
+        // Notifications encountered by the ping must remain buffered for recv.
+        tokio::time::timeout(PROBE_TIMEOUT, ListenConnection::ping(&mut pg)).await??;
         let notification = tokio::time::timeout(Duration::from_secs(10), pg.recv()).await??;
         listener.process_notification(notification.channel(), notification.payload())?;
         assert_eq!(receiver.recv().await?.entity_id, first.id);
@@ -261,6 +581,14 @@ mod tests {
         ));
 
         let mut pg = listener.create_listener().await?;
+        let name: String = sqlx::query_scalar("SHOW application_name")
+            .fetch_one(pg.acquire().await?)
+            .await?;
+        assert_eq!(name, listener.identity.application_name());
+        let recreated_search_path: String = sqlx::query_scalar("SHOW search_path")
+            .fetch_one(pg.acquire().await?)
+            .await?;
+        assert_eq!(recreated_search_path, search_path);
         let latest = ArtifactRepository::create(db.pool(), create("listener.latest")).await?;
         let notification = tokio::time::timeout(Duration::from_secs(10), pg.recv()).await??;
         listener.process_notification(notification.channel(), notification.payload())?;
@@ -279,8 +607,7 @@ mod tests {
         drop(pg);
         drop(listener);
         drop(receiver);
-        // PgListener returns its connection asynchronously. Observe completed
-        // closure before asking the fixture to remove its database.
+        // Observe server-side closure before asking the fixture to remove its database.
         tokio::time::timeout(Duration::from_secs(10), async {
             let mut retry = tokio::time::interval(Duration::from_millis(10));
             loop {
@@ -318,6 +645,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(10);
         let listener = PostgresListener {
             database_url: "postgresql://test".to_string(),
+            identity: ConnectionIdentity::for_process("notifier", "listener"),
             notification_tx: tx,
         };
 
@@ -350,6 +678,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(10);
         let listener = PostgresListener {
             database_url: "postgresql://test".to_string(),
+            identity: ConnectionIdentity::for_process("notifier", "listener"),
             notification_tx: tx,
         };
 
@@ -377,6 +706,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(10);
         let listener = PostgresListener {
             database_url: "postgresql://test".to_string(),
+            identity: ConnectionIdentity::for_process("notifier", "listener"),
             notification_tx: tx,
         };
 
@@ -396,6 +726,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(10);
         let listener = PostgresListener {
             database_url: "postgresql://test".to_string(),
+            identity: ConnectionIdentity::for_process("notifier", "listener"),
             notification_tx: tx,
         };
 

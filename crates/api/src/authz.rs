@@ -428,6 +428,73 @@ impl AuthorizationService {
         }))
     }
 
+    /// Legacy execution credentials keep their token-named caps and standard
+    /// grants. Retain the same live delegation check on the caller's connection;
+    /// never substitute the sponsor's complete Access grants as the token's caps.
+    pub(crate) async fn retain_legacy_execution_snapshot_on(
+        connection: &mut sqlx::PgConnection,
+        user: &AuthenticatedUser,
+    ) -> Result<(AuthorizationSnapshot, Vec<Grant>), ApiError> {
+        if user.claims.token_type != TokenType::Execution
+            || user
+                .claims
+                .admitted_execution_credential()
+                .map_err(|_| {
+                    ApiError::Unauthorized("Invalid recorded execution credential".into())
+                })?
+                .is_some()
+        {
+            return Err(ApiError::Forbidden(
+                "Legacy execution authority required".into(),
+            ));
+        }
+        let identity_id = user.identity_id().map_err(|_| {
+            ApiError::Unauthorized("Invalid authentication subject in token".into())
+        })?;
+        let identity = IdentityRepository::find_by_id_for_share(connection, identity_id)
+            .await?
+            .ok_or_else(|| ApiError::Unauthorized("Identity not found".into()))?;
+        let refs = execution_permission_set_refs(user);
+        let sets = PermissionSetRepository::find_by_refs_for_share(connection, &refs).await?;
+        if sets.len() != refs.len() {
+            let found = sets
+                .iter()
+                .map(|set| set.r#ref.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let missing = refs
+                .iter()
+                .filter(|reference| !found.contains(reference.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(ApiError::Forbidden(format!(
+                "Execution token references unavailable permission sets: {}",
+                missing.join(", ")
+            )));
+        }
+        let mut grants = Self::grants_from_permission_sets(sets)?;
+        attune_common::delegation::DelegationAuthority::load_for_share(connection, identity_id)
+            .await?
+            .require_grants(&grants)?;
+        grants.extend(execution_standard_access_grants(user));
+        // Artifact metadata historically matches effective (canonical) grants;
+        // body/source checks match load_snapshot's narrowed ownership copies.
+        let visibility_grants = grants.clone();
+        let grants = attune_common::repositories::iam_ownership::IamOwnershipRepository::resolve_pack_owner_grants(
+            connection, identity_id, grants, false,
+        ).await?;
+        Ok((
+            AuthorizationSnapshot {
+                identity_id,
+                identity_attributes: match identity.attributes {
+                    serde_json::Value::Object(attributes) => attributes.into_iter().collect(),
+                    _ => Default::default(),
+                },
+                grants,
+            },
+            visibility_grants,
+        ))
+    }
+
     /// Evaluates `check` against a snapshot previously loaded via
     /// [`Self::load_snapshot`]. A `None` snapshot means the caller's token
     /// type is not subject to identity-based RBAC, so the check passes (same
@@ -547,6 +614,87 @@ impl AuthorizationService {
             &current_grants,
             &requested_grants,
             &ctx,
+        ))
+    }
+
+    /// Live, nonlocking delegation reads on the caller's connection. Never use
+    /// the pool or authorization caches while the caller holds graph admission.
+    /// This preserves the existing revocation race semantics and adds no late
+    /// identity locks after execution/target protection.
+    pub async fn can_delegate_permission_sets_on(
+        &self,
+        conn: &mut PgConnection,
+        user: &AuthenticatedUser,
+        permission_set_refs: &[String],
+    ) -> Result<bool, ApiError> {
+        let permission_set_refs = named_execution_permission_set_refs(permission_set_refs);
+        if permission_set_refs.is_empty() {
+            return Ok(true);
+        }
+        if user
+            .claims
+            .admitted_execution_credential()
+            .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
+            .is_some()
+        {
+            return Err(ApiError::Forbidden(
+                "Recorded runtime authority requires target-aware matching".into(),
+            ));
+        }
+        let identity_id = user.identity_id().map_err(|_| {
+            ApiError::Unauthorized("Invalid authentication subject in token".into())
+        })?;
+        let identity = IdentityRepository::find_by_id(&mut *conn, identity_id)
+            .await?
+            .ok_or_else(|| ApiError::Unauthorized("Identity not found".into()))?;
+        if user.claims.token_type == TokenType::Access && identity.frozen {
+            return Err(ApiError::Forbidden(
+                "Identity is frozen and cannot authorize requests".into(),
+            ));
+        }
+        let current_grants = match user.claims.token_type {
+            TokenType::Access => {
+                // Delegation needs canonical relative grants, not effective or
+                // structurally resolved target-matching copies.
+                let mut sets =
+                    PermissionSetRepository::find_by_identity(&mut *conn, identity_id).await?;
+                let roles = IdentityRoleAssignmentRepository::find_role_names_by_identity(
+                    &mut *conn,
+                    identity_id,
+                )
+                .await?;
+                sets.extend(PermissionSetRepository::find_by_roles(&mut *conn, &roles).await?);
+                let mut seen = std::collections::HashSet::new();
+                sets.retain(|set| seen.insert(set.id));
+                Self::grants_from_permission_sets(sets)?
+            }
+            TokenType::Execution => {
+                let refs = execution_permission_set_refs(user);
+                let sets = PermissionSetRepository::find_by_refs(&mut *conn, &refs).await?;
+                let mut grants = Self::execution_grants_from_permission_sets(&refs, sets)?;
+                attune_common::delegation::DelegationAuthority::load(&mut *conn, identity_id)
+                    .await?
+                    .require_grants(&grants)?;
+                grants.extend(execution_standard_access_grants(user));
+                grants
+            }
+            _ => Vec::new(),
+        };
+        let requested_sets =
+            PermissionSetRepository::find_by_refs(&mut *conn, &permission_set_refs).await?;
+        if requested_sets.len() != permission_set_refs.len() {
+            return Ok(false);
+        }
+        let requested_grants = Self::grants_from_permission_sets(requested_sets)?;
+        let mut context = AuthorizationContext::new(identity_id);
+        context.identity_attributes = match identity.attributes {
+            serde_json::Value::Object(attributes) => attributes.into_iter().collect(),
+            _ => HashMap::new(),
+        };
+        Ok(attune_common::rbac::can_delegate_grants(
+            &current_grants,
+            &requested_grants,
+            &context,
         ))
     }
 
@@ -717,22 +865,8 @@ impl AuthorizationService {
                 let refs = execution_permission_set_refs(user);
                 let permission_sets =
                     PermissionSetRepository::find_by_refs(&self.db, &refs).await?;
-                if permission_sets.len() != refs.len() {
-                    let found: std::collections::HashSet<_> = permission_sets
-                        .iter()
-                        .map(|set| set.r#ref.as_str())
-                        .collect();
-                    let missing: Vec<_> = refs
-                        .iter()
-                        .filter(|r| !found.contains(r.as_str()))
-                        .cloned()
-                        .collect();
-                    return Err(ApiError::Forbidden(format!(
-                        "Execution token references unavailable permission sets: {}",
-                        missing.join(", ")
-                    )));
-                }
-                let mut grants = Self::grants_from_permission_sets(permission_sets)?;
+                let mut grants =
+                    Self::execution_grants_from_permission_sets(&refs, permission_sets)?;
                 attune_common::delegation::DelegationAuthority::load(&self.db, identity_id)
                     .await?
                     .require_grants(&grants)?;
@@ -849,6 +983,28 @@ impl AuthorizationService {
             );
         }
         Ok(permission_sets)
+    }
+
+    fn execution_grants_from_permission_sets(
+        refs: &[String],
+        permission_sets: Vec<PermissionSet>,
+    ) -> Result<Vec<Grant>, ApiError> {
+        if permission_sets.len() != refs.len() {
+            let found: std::collections::HashSet<_> = permission_sets
+                .iter()
+                .map(|set| set.r#ref.as_str())
+                .collect();
+            let missing: Vec<_> = refs
+                .iter()
+                .filter(|r| !found.contains(r.as_str()))
+                .cloned()
+                .collect();
+            return Err(ApiError::Forbidden(format!(
+                "Execution token references unavailable permission sets: {}",
+                missing.join(", ")
+            )));
+        }
+        Self::grants_from_permission_sets(permission_sets)
     }
 
     fn grants_from_permission_sets(

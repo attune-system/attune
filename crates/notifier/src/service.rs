@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use attune_common::config::Config;
+use attune_common::db::ConnectionIdentity;
 
 use crate::postgres_listener::PostgresListener;
 use crate::subscriber_manager::SubscriberManager;
@@ -62,7 +63,12 @@ impl NotifierService {
 
         // Create PostgreSQL listener
         let postgres_listener = Arc::new(
-            PostgresListener::new(config.database.url.clone(), notification_tx.clone()).await?,
+            PostgresListener::new_named(
+                config.database.url.clone(),
+                notification_tx.clone(),
+                ConnectionIdentity::for_process("notifier", "listener"),
+            )
+            .await?,
         );
 
         // Create a small connection pool for ad-hoc queries (role lookups on
@@ -75,7 +81,10 @@ impl NotifierService {
             .min_connections(0)
             .acquire_timeout(Duration::from_secs(5))
             .idle_timeout(Duration::from_secs(60))
-            .connect(&config.database.url)
+            .connect_with(
+                ConnectionIdentity::for_process("notifier", "working")
+                    .connect_options(&config.database.url)?,
+            )
             .await
             .context("Failed to create notifier database pool")?;
 
@@ -196,6 +205,7 @@ impl NotifierService {
         self.shutdown.cancel();
         self.subscriber_manager.disconnect_all().await;
         abort_and_join_tasks(&mut tasks).await;
+        drain_working_pool(&self.db_pool).await?;
 
         component_result
     }
@@ -209,10 +219,23 @@ impl NotifierService {
         // Disconnect all WebSocket clients
         self.subscriber_manager.disconnect_all().await;
 
+        // Closing rejects new acquisitions and waits for checked-out validation
+        // owners. Their query/cleanup deadlines bound graceful shutdown too.
+        drain_working_pool(&self.db_pool).await?;
+
         info!("Notifier Service shutdown complete");
 
         Ok(())
     }
+}
+
+pub(crate) async fn drain_working_pool(pool: &sqlx::PgPool) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(25), pool.close())
+        .await
+        .context("Notifier working pool did not drain before shutdown deadline")?;
+    // Pool drain is not backend-gone acknowledgement. Tests observe the owned
+    // backend through a separate connection before claiming server cleanup.
+    Ok(())
 }
 
 async fn abort_and_join_tasks<T: 'static>(tasks: &mut JoinSet<T>) {
@@ -230,6 +253,45 @@ async fn abort_and_join_tasks<T: 'static>(tasks: &mut JoinSet<T>) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn working_pool_is_named_without_changing_url_session_options() -> Result<()> {
+        let mut config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))?;
+        let fixture = attune_common::test_database::TestDatabase::create(&config.database)
+            .await?
+            .with_cleanup_on_drop();
+        // The separate notifier pool historically inherits session settings from
+        // its URL rather than the common Database search_path hook.
+        let separator = if fixture.database_url().contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        config.database.url = format!(
+            "{}{separator}options=-c%20search_path%3Dpg_catalog",
+            fixture.database_url()
+        );
+        let service = NotifierService::new(config).await?;
+        assert_eq!(service.db_pool.options().get_max_connections(), 4);
+        let name: String = sqlx::query_scalar("SHOW application_name")
+            .fetch_one(&service.db_pool)
+            .await?;
+        assert_eq!(
+            name,
+            ConnectionIdentity::for_process("notifier", "working").application_name()
+        );
+        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&service.db_pool)
+            .await?;
+        assert_eq!(schema, "pg_catalog");
+        service.db_pool.close().await;
+        drop(service);
+        fixture.cleanup().await?;
+        Ok(())
+    }
 
     #[test]
     fn test_notification_serialization() {

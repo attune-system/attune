@@ -9,6 +9,7 @@ import os
 import tarfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -37,8 +38,18 @@ def require_contract(ready):
         raise RuntimeError("API publication contract is unavailable; deploy compatible API/bootstrap versions before publishing core")
 
 
+class NoApiRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Publication credentials must never follow a server-selected destination.
+        raise urllib.error.HTTPError(req.full_url, code, "API redirects are not allowed", headers, fp)
+
+
 def request(url, *, data=None, headers=None, method=None):
-    return urllib.request.urlopen(
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("API URL must use HTTP or HTTPS without embedded credentials")
+    opener = urllib.request.build_opener(NoApiRedirects())
+    return opener.open(
         urllib.request.Request(url, data=data, headers=headers or {}, method=method),
         timeout=10,
     )

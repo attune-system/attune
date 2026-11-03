@@ -92,6 +92,79 @@ async fn setup_db() -> attune_common::test_database::TestDatabase {
 }
 
 #[tokio::test]
+async fn log_pending_paths_are_version_scoped_when_artifact_refs_overlap() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("overlapping_log_paths");
+    for backend in [
+        LogStreamBackend::SharedFile,
+        LogStreamBackend::ObjectSegments,
+    ] {
+        let mut first_input = fixture.create_input("overlapping_log");
+        first_input.classification = ArtifactClassification::RuntimeLog;
+        let mut second_input = first_input.clone();
+        second_input.owner = fixture.unique_owner("other_owner");
+        let first = ArtifactRepository::create(&pool, first_input)
+            .await
+            .unwrap();
+        let second = ArtifactRepository::create(&pool, second_input)
+            .await
+            .unwrap();
+        for transactional in [false, true] {
+            let mut versions = Vec::new();
+            for artifact in [&first, &second] {
+                let version = if transactional {
+                    let mut tx = pool.begin().await.unwrap();
+                    let version = ArtifactVersionRepository::create_log_pending_with_conn(
+                        &mut tx,
+                        artifact.id,
+                        &artifact.r#ref,
+                        backend,
+                        42,
+                        serde_json::json!({"stream": "stderr"}),
+                    )
+                    .await
+                    .unwrap();
+                    tx.commit().await.unwrap();
+                    version
+                } else {
+                    ArtifactVersionRepository::create_log_pending(
+                        &pool,
+                        artifact.id,
+                        &artifact.r#ref,
+                        backend,
+                        "text/plain".to_string(),
+                        Some(42),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                };
+                versions.push(version);
+            }
+            assert_eq!(versions[0].version, versions[1].version);
+            assert_ne!(
+                versions[0].file_path, versions[1].file_path,
+                "Different versions must never share a runtime log authorization path"
+            );
+            for version in versions {
+                let path = version.file_path.as_deref().unwrap();
+                assert!(path.starts_with(&format!("files/versions/{}/", version.id)));
+                assert_eq!(
+                    ArtifactVersionRepository::find_unique_by_file_path(&pool, path)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .id,
+                    version.id
+                );
+            }
+        }
+    }
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_file_path_scope_queries_are_exact() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("file_path_scope_queries");

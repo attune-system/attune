@@ -16,6 +16,57 @@ use attune_common::{
 use helpers::*;
 
 #[tokio::test]
+async fn persisted_fingerprint_is_not_a_decryption_key() {
+    use aes_gcm::{
+        aead::{Aead, KeyInit, Payload},
+        Aes256Gcm, Nonce,
+    };
+    use attune_common::crypto;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    const SERVER_SECRET: &str = "synthetic-key-repository-encryption-secret";
+    let db = create_test_pool().await.unwrap();
+    let plaintext = serde_json::json!({"credential": "synthetic-only"});
+    let mut fixture = KeyFixture::new_system_unique("fingerprint", "unused");
+    fixture.value = plaintext.clone();
+    let created = fixture.create_encrypted(&db, SERVER_SECRET).await.unwrap();
+    let stored = KeyRepository::find_by_id(&db, created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let fingerprint = stored.encryption_key_hash.as_deref().unwrap();
+    let bytes: Vec<u8> = (0..fingerprint.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&fingerprint[i..i + 2], 16).unwrap())
+        .collect();
+    let encoded = STANDARD.decode(stored.value.as_str().unwrap()).unwrap();
+    let nonce: [u8; 12] = encoded[..12].try_into().unwrap();
+    let aad = [
+        b"attune:keystore:value\0".as_slice(),
+        &stored.id.to_be_bytes(),
+    ]
+    .concat();
+    assert!(
+        Aes256Gcm::new_from_slice(&bytes)
+            .unwrap()
+            .decrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: &encoded[12..],
+                    aad: &aad
+                }
+            )
+            .is_err(),
+        "Database fingerprint must not decrypt the stored value"
+    );
+    assert_eq!(
+        crypto::keystore::decrypt_json(&stored.value, SERVER_SECRET, stored.id).unwrap(),
+        plaintext
+    );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn key_schema_assignment_is_verified_transactional_and_removed_with_owner() {
     use attune_common::{
         repositories::{
@@ -73,6 +124,57 @@ async fn key_schema_assignment_is_verified_transactional_and_removed_with_owner(
         .await
         .unwrap()
         .is_none());
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn reserved_identity_and_encrypted_insert_roll_back_without_publishing_plaintext() {
+    let db = create_test_pool().await.unwrap();
+    let input = CreateKeyInput {
+        local_ref: "reserved_id".into(),
+        owner_type: OwnerType::System,
+        owner_identity: None,
+        owner_pack: None,
+        owner_pack_ref: None,
+        owner_action: None,
+        owner_action_ref: None,
+        owner_sensor: None,
+        owner_sensor_ref: None,
+        name: "Reserved identity".into(),
+        encrypted: true,
+        encryption_key_hash: None,
+        value: serde_json::json!({"credential":"synthetic-reservation-only"}),
+    };
+    let mut tx = db.begin().await.unwrap();
+    let stored = KeyRepository::create_encrypted(
+        &mut tx,
+        input.clone(),
+        "synthetic-id-reservation-master-32-bytes",
+    )
+    .await
+    .unwrap();
+    assert!(stored.value.is_string());
+    assert!(!stored
+        .value
+        .to_string()
+        .contains("synthetic-reservation-only"));
+    assert!(KeyRepository::find_by_id(&db, stored.id)
+        .await
+        .unwrap()
+        .is_none());
+    tx.rollback().await.unwrap();
+    assert!(KeyRepository::find_by_id(&db, stored.id)
+        .await
+        .unwrap()
+        .is_none());
+    let next = KeyRepository::create_encrypted_in_pool(
+        &db,
+        input,
+        "synthetic-id-reservation-master-32-bytes",
+    )
+    .await
+    .unwrap();
+    assert!(next.id > stored.id);
     db.cleanup().await.unwrap();
 }
 

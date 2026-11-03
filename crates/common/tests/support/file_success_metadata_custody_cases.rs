@@ -19,15 +19,35 @@ use attune_common::{
 
 #[tokio::test]
 async fn success_metadata_generated_default_file_custody_survives_raw_child_gc_and_exact_cleanup() {
-    run(source::NativeResultCase::DefaultGeneratedSuccess, false).await;
+    run(
+        source::NativeResultCase::DefaultGeneratedSuccess,
+        false,
+        false,
+    )
+    .await;
 }
 #[tokio::test]
 async fn success_metadata_canonical_warning_file_custody_retains_real_leaf_receipt_until_exact_cleanup(
 ) {
-    run(source::NativeResultCase::GeneratedWarningCandidate, true).await;
+    run(
+        source::NativeResultCase::GeneratedWarningCandidate,
+        true,
+        false,
+    )
+    .await;
 }
 
-async fn run(case: source::NativeResultCase, warning: bool) {
+#[tokio::test]
+async fn encryption_upgrade_preserves_nested_success_observations_and_file_custody() {
+    run(
+        source::NativeResultCase::GeneratedWarningCandidate,
+        true,
+        true,
+    )
+    .await;
+}
+
+async fn run(case: source::NativeResultCase, warning: bool, compatibility: bool) {
     let (db, files, parent, workflow, child) = source::original_success_file_source(case).await;
     let mut tx = db.begin().await.unwrap();
     CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
@@ -187,6 +207,14 @@ async fn run(case: source::NativeResultCase, warning: bool) {
         &store,
     )
     .await;
+    if compatibility {
+        let before = read_file_payload(&db, &held, &store, source::KEY).await;
+        encryption_compatibility::legacy_upgrade_roundtrip(&db, source::KEY).await;
+        assert_eq!(
+            read_file_payload(&db, &held, &store, source::KEY).await,
+            before
+        );
+    }
     let mut tx = db.begin().await.unwrap();
     Evidence::lock_reclamation(&mut tx).await.unwrap();
     ExecutionRepository::update(

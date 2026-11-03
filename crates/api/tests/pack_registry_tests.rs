@@ -9,6 +9,13 @@
 
 mod helpers;
 
+#[path = "pack_registry_tests/source_header_races.rs"]
+mod source_header_races;
+
+#[cfg(unix)]
+#[path = "pack_registry_tests/source_auth.rs"]
+mod source_auth;
+
 use attune_common::{
     auth::{
         hash_integration_token,
@@ -2661,6 +2668,7 @@ async fn selected_index_fetch_failures_are_visible_and_disabled_preview_requires
             position: None,
             enabled: false,
             headers: json!({}),
+            source_headers: json!({}),
         },
     )
     .await?;
@@ -2704,13 +2712,17 @@ async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let create_secret = "create-registry-secret";
     let update_secret = "update-registry-secret";
+    let source_secret = "source-registry-secret";
     let response = ctx
         .post(
             "/api/v1/pack-indices",
             json!({
                 "name": "Audit registry",
                 "url": "https://raw.githubusercontent.com/attune-system/index/audit-test/index.json",
-                "headers": {"Authorization": create_secret}
+                "headers": {"Authorization": create_secret},
+                "source_headers": {
+                    "https://artifacts.example.com": {"Authorization": source_secret}
+                }
             }),
             None,
         )
@@ -2718,6 +2730,15 @@ async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
     assert_eq!(response.status(), axum::http::StatusCode::CREATED);
     let body: serde_json::Value = response.json().await?;
     let id = body["data"]["id"].as_i64().expect("created registry id");
+    assert_eq!(
+        body["data"]["source_headers"]["https://artifacts.example.com"]["Authorization"],
+        "[REDACTED]"
+    );
+    let stored = PackRegistryIndexRepository::find_by_id(&ctx.pool, id)
+        .await?
+        .unwrap();
+    assert!(stored.source_headers["https://artifacts.example.com"].is_string());
+    assert!(!stored.source_headers.to_string().contains(source_secret));
     assert!(
         body["data"]["headers"]["Authorization"] == "[REDACTED]",
         "registry authorization header was not redacted"
@@ -2735,12 +2756,27 @@ async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
                 "headers": {
                     "Authorization": "[REDACTED]",
                     "X-Api-Key": update_secret
+                },
+                "source_headers": {
+                    "https://artifacts.example.com": {
+                        "Authorization": "[REDACTED]",
+                        "X-Api-Key": update_secret
+                    }
                 }
             }),
             None,
         )
         .await?;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["data"]["source_headers"]["https://artifacts.example.com"]["Authorization"],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        body["data"]["source_headers"]["https://artifacts.example.com"]["X-Api-Key"],
+        "[REDACTED]"
+    );
     let response = ctx
         .delete(&format!("/api/v1/pack-indices/{id}"), None)
         .await?;
@@ -2773,11 +2809,14 @@ async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
         let serialized = details.to_string();
         assert!(!serialized.contains(create_secret));
         assert!(!serialized.contains(update_secret));
+        assert!(!serialized.contains(source_secret));
+        assert!(details.get("source_headers").is_none());
         assert!(details.get("headers").is_none());
         assert_eq!(details["headers_configured"], true);
         assert_eq!(details["url"], "https://raw.githubusercontent.com");
     }
 
+    ctx.cleanup().await?;
     Ok(())
 }
 

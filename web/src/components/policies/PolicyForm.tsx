@@ -18,6 +18,7 @@ import {
   type PolicyResponse,
   type QuotaPolicyRequest,
   type RateLimitPolicyRequest,
+  type ResourceConcurrency,
   type UpdatePolicyRequest,
 } from "@/api/policies";
 
@@ -159,6 +160,7 @@ function PolicyPrecedencePreview({
   });
   const matchingPolicies = data?.items ?? [];
   const sameScope = matchingPolicies
+    .filter((policy) => !policy.resource_concurrency)
     .filter((policy) => policy.scope.type === scopeType)
     .filter((policy) =>
       scopeType === PolicyScopeType.ACTION
@@ -219,6 +221,25 @@ export default function PolicyForm({
     () => initialData?.description ?? "",
   );
   const [enabled, setEnabled] = useState(() => initialData?.enabled ?? true);
+  const [sharedEnabled, setSharedEnabled] = useState(
+    !!initialData?.resource_concurrency,
+  );
+  const [resourceNamespace, setResourceNamespace] = useState(
+    initialData?.resource_concurrency?.namespace ?? "",
+  );
+  const [resourceLimit, setResourceLimit] = useState(
+    initialData?.resource_concurrency?.limit ?? 1,
+  );
+  const [resourceMethod, setResourceMethod] = useState(
+    initialData?.resource_concurrency?.method ?? PolicyMethod.ENQUEUE,
+  );
+  const [participants, setParticipants] = useState<
+    ResourceConcurrency["participants"]
+  >(
+    initialData?.resource_concurrency?.participants ?? [
+      { action: "", resource_parameter: "" },
+    ],
+  );
   const [priority, setPriority] = useState(() => initialData?.priority ?? 0);
   const [scopeType, setScopeType] = useState<PolicyScopeType>(
     () => initialScope?.type ?? PolicyScopeType.ACTION,
@@ -360,11 +381,48 @@ export default function PolicyForm({
       if (!name.trim()) {
         throw new Error("Policy name is required");
       }
-      if (!concurrencyEnabled && !rateLimitEnabled && quotas.length === 0) {
+      if (
+        !sharedEnabled &&
+        !concurrencyEnabled &&
+        !rateLimitEnabled &&
+        quotas.length === 0
+      ) {
         throw new Error("Enable at least one policy feature");
+      }
+      if (
+        sharedEnabled &&
+        (concurrencyEnabled ||
+          rateLimitEnabled ||
+          quotas.length > 0 ||
+          scopeType === PolicyScopeType.ACTION)
+      ) {
+        throw new Error(
+          "Shared resource policies require global or pack scope without standard controls",
+        );
+      }
+      if (
+        sharedEnabled &&
+        (!resourceNamespace.trim() ||
+          participants.length === 0 ||
+          participants.some(
+            (participant) =>
+              !participant.action || !participant.resource_parameter.trim(),
+          ))
+      ) {
+        throw new Error(
+          "Enter a namespace and a resource parameter path for each participating action",
+        );
       }
 
       const common = {
+        resource_concurrency: sharedEnabled
+          ? {
+              namespace: resourceNamespace.trim(),
+              limit: positiveInteger("Shared concurrency limit", resourceLimit),
+              method: resourceMethod,
+              participants,
+            }
+          : null,
         name: name.trim(),
         description: description.trim() || null,
         enabled,
@@ -502,7 +560,9 @@ export default function PolicyForm({
             <button
               key={type}
               type="button"
-              disabled={isEditing}
+              disabled={
+                isEditing || (sharedEnabled && type === PolicyScopeType.ACTION)
+              }
               onClick={() => {
                 setScopeType(type);
                 if (type === PolicyScopeType.GLOBAL) {
@@ -582,13 +642,154 @@ export default function PolicyForm({
           </div>
         )}
         <div className="mt-4">
-          <PolicyPrecedencePreview
-            scopeType={scopeType}
-            priority={Number(priority) || 0}
-            packRef={packRef}
-            actionRef={actionRef}
-          />
+          {!sharedEnabled && (
+            <PolicyPrecedencePreview
+              scopeType={scopeType}
+              priority={Number(priority) || 0}
+              packRef={packRef}
+              actionRef={actionRef}
+            />
+          )}
         </div>
+      </Section>
+
+      <Section
+        title="Shared resource concurrency"
+        description="Apply an additional limit across participating actions, keyed by a scalar parameter value. Pack scope indicates ownership, not a restriction on participants."
+      >
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={sharedEnabled}
+            disabled={isEditing}
+            onChange={(event) => {
+              setSharedEnabled(event.target.checked);
+              if (event.target.checked) {
+                setScopeType(PolicyScopeType.GLOBAL);
+                setPackRef("");
+                setConcurrencyEnabled(false);
+                setRateLimitEnabled(false);
+                setQuotas([]);
+              }
+            }}
+          />
+          Enable shared resource policy
+        </label>
+        {sharedEnabled && (
+          <div className="mt-4 space-y-4">
+            <label className="block text-sm">
+              Resource namespace
+              <input
+                aria-label="Resource namespace"
+                value={resourceNamespace}
+                onChange={(event) => setResourceNamespace(event.target.value)}
+                className="mt-1 block w-full rounded border p-2"
+              />
+            </label>
+            <label className="block text-sm">
+              Shared concurrency limit
+              <input
+                aria-label="Shared concurrency limit"
+                type="number"
+                min={1}
+                value={resourceLimit}
+                onChange={(event) =>
+                  setResourceLimit(Number(event.target.value))
+                }
+                className="mt-1 block rounded border p-2"
+              />
+            </label>
+            <label className="block text-sm">
+              When exhausted
+              <select
+                aria-label="Shared exhaustion behavior"
+                value={resourceMethod}
+                onChange={(event) =>
+                  setResourceMethod(
+                    event.target.value === PolicyMethod.CANCEL
+                      ? PolicyMethod.CANCEL
+                      : PolicyMethod.ENQUEUE,
+                  )
+                }
+                className="ml-2 rounded border p-2"
+              >
+                <option value={PolicyMethod.ENQUEUE}>Enqueue</option>
+                <option value={PolicyMethod.CANCEL}>Cancel</option>
+              </select>
+            </label>
+            {participants.map((participant, index) => (
+              <div key={index} className="grid items-end gap-3 md:grid-cols-3">
+                <SearchableSelect
+                  options={actions.map((action) => ({
+                    value: action.ref,
+                    label: action.ref,
+                  }))}
+                  value={participant.action}
+                  placeholder="Select participating action"
+                  onChange={(value) =>
+                    setParticipants((current) =>
+                      current.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? { ...item, action: String(value) }
+                          : item,
+                      ),
+                    )
+                  }
+                />
+                <label className="text-sm">
+                  Resource parameter path
+                  <input
+                    aria-label={`Resource parameter path ${index + 1}`}
+                    value={participant.resource_parameter}
+                    onChange={(event) =>
+                      setParticipants((current) =>
+                        current.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? {
+                                ...item,
+                                resource_parameter: event.target.value,
+                              }
+                            : item,
+                        ),
+                      )
+                    }
+                    className="mt-1 block w-full rounded border p-2"
+                    placeholder="target.org_id"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setParticipants((current) =>
+                      current.filter((_, itemIndex) => itemIndex !== index),
+                    )
+                  }
+                  className="rounded border p-2"
+                >
+                  Remove participant
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              onClick={() =>
+                setParticipants((current) => [
+                  ...current,
+                  { action: "", resource_parameter: "" },
+                ])
+              }
+              className="rounded border p-2"
+            >
+              Add participant
+            </button>
+            <p className="text-sm text-gray-600">
+              Resource settings cannot change while executions are active or
+              waiting. Disabling the policy stops new admissions from being
+              restricted; admitted executions retain their reservations until
+              terminal.
+            </p>
+          </div>
+        )}
       </Section>
 
       <Section
@@ -599,6 +800,7 @@ export default function PolicyForm({
           <input
             type="checkbox"
             checked={concurrencyEnabled}
+            disabled={sharedEnabled}
             onChange={(event) => setConcurrencyEnabled(event.target.checked)}
             className="rounded border-gray-300"
           />
@@ -743,6 +945,7 @@ export default function PolicyForm({
           <input
             type="checkbox"
             checked={rateLimitEnabled}
+            disabled={sharedEnabled}
             onChange={(event) => setRateLimitEnabled(event.target.checked)}
             className="rounded border-gray-300"
           />
@@ -892,6 +1095,7 @@ export default function PolicyForm({
               { quota_type: "running_executions", limit: 1 },
             ])
           }
+          disabled={sharedEnabled}
           className="mt-4 inline-flex items-center gap-2 rounded-lg border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
         >
           <Plus className="h-4 w-4" />
@@ -899,12 +1103,15 @@ export default function PolicyForm({
         </button>
       </Section>
 
-      {!concurrencyEnabled && !rateLimitEnabled && quotas.length === 0 && (
-        <div className="flex gap-2 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
-          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
-          Enable at least one policy feature before saving.
-        </div>
-      )}
+      {!sharedEnabled &&
+        !concurrencyEnabled &&
+        !rateLimitEnabled &&
+        quotas.length === 0 && (
+          <div className="flex gap-2 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+            <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+            Enable at least one policy feature before saving.
+          </div>
+        )}
 
       <div className="flex justify-end gap-3">
         <button

@@ -97,7 +97,10 @@ async fn recorded_shared_volume_completion_is_bounded_and_revalidates_terminal_s
     .await
     .unwrap();
     let pinned_root = attune_common::worker_delivery::log_reference(&execution, "stdout").unwrap();
-    assert!(path.starts_with(&pinned_root.replace('.', "/")));
+    assert!(path.starts_with(&format!(
+        "files/versions/{version}/{}/",
+        pinned_root.replace('.', "/")
+    )));
     let root = tempfile::tempdir().unwrap();
     let base: Arc<dyn ArtifactFileTransport> =
         Arc::new(VolumeTransport::new(root.path().to_str().unwrap()));

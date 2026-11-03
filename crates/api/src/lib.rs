@@ -4,6 +4,7 @@
 //! including the server, routing, authentication, and state management.
 //! It is primarily used by the binary target and integration tests.
 
+mod artifact_cursor;
 mod artifact_reads;
 pub mod auth;
 pub mod authz;

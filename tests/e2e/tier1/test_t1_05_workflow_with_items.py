@@ -260,7 +260,8 @@ class TestWorkflowWithItems:
         client.fire_webhook(trigger_ref=trigger["ref"], payload={"items": test_items})
 
         # Wait for all executions
-        start = time.time()
+        start = time.monotonic()
+        deadline = start + 45
         executions = wait_for_execution_count(
             client=client,
             expected_count=num_items,
@@ -268,36 +269,28 @@ class TestWorkflowWithItems:
             timeout=45,
             poll_interval=1.0,
         )
-        elapsed = time.time() - start
+        elapsed = time.monotonic() - start
 
         print(f"✓ {len(executions)} executions created in {elapsed:.1f}s")
 
         # Check statuses
         print(f"\nChecking execution statuses...")
+        assert len(executions) == num_items
         succeeded = 0
-        for execution in executions[:num_items]:
-            if execution["status"] == "completed":
-                succeeded += 1
-            elif execution["status"] not in ["completed", "failed", "cancelled"]:
-                # Still running, wait briefly
-                try:
-                    final = wait_for_execution_status(
-                        client=client,
-                        execution_id=execution["id"],
-                        expected_status="completed",
-                        timeout=10,
-                    )
-                    if final["status"] == "completed":
-                        succeeded += 1
-                except:
-                    pass
+        for execution in executions:
+            # Report terminal failures with the helper's execution/result details.
+            # All waits share one deadline rather than swallowing per-item errors.
+            wait_for_execution_status(
+                client=client,
+                execution_id=execution["id"],
+                expected_status="completed",
+                timeout=max(0.1, deadline - time.monotonic()),
+            )
+            succeeded += 1
 
         print(f"✓ {succeeded}/{num_items} executions succeeded")
 
-        # Should have most/all succeed (allow some infrastructure failures)
-        assert succeeded >= num_items * 0.6, (
-            f"Too many failures: {succeeded}/{num_items}"
-        )
+        assert succeeded == num_items
 
         print(f"\n=== Test Summary ===")
         print(f"✓ {num_items} items processed")

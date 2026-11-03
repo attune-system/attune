@@ -66,3 +66,56 @@ if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$
     echo 'Orphaned Arch package signature was accepted' >&2
     exit 1
 fi
+rm "$test_root/orphan-${version}-x86_64.pkg.tar.zst.sig"
+
+# CLI archives may be absent, never half present.
+for archive in \
+    "attune_${version}_linux_amd64.tar.gz" \
+    "attune_${version}_linux_arm64.tar.gz" \
+    "attune_${version}_darwin_amd64.tar.gz" \
+    "attune_${version}_darwin_arm64.tar.gz" \
+    "attune_${version}_windows_amd64.zip"; do
+    rm "$test_root/$archive" "$test_root/$archive.sha256"
+done
+if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag"; then
+    echo 'Default validation no longer requires CLI archives' >&2
+    exit 1
+fi
+bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag" --allow-missing-cli
+for archive in \
+    "attune_${version}_linux_amd64.tar.gz" \
+    "attune_${version}_darwin_arm64.tar.gz" \
+    "attune_${version}_windows_amd64.zip"; do
+    for suffix in '' .sha256; do
+        touch "$test_root/$archive$suffix"
+        if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag" --allow-missing-cli; then
+            echo 'Partial optional CLI archive/checksum pair was accepted' >&2
+            exit 1
+        fi
+        rm "$test_root/$archive$suffix"
+    done
+done
+
+# Package publication is all-or-nothing; present packages still need full validation.
+rm "$test_root/attune-api_${version}_arm64.deb"
+if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag" \
+    --allow-missing-cli --allow-missing-linux-packages; then
+    echo 'Partial optional Linux package set was accepted' >&2
+    exit 1
+fi
+rm "$test_root"/*.deb "$test_root"/*.rpm "$test_root"/*.pkg.tar.zst "$test_root"/*.pkg.tar.zst.sig
+bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag" \
+    --allow-missing-cli --allow-missing-linux-packages
+for required in attune-binaries-amd64.tar.gz "attune-docker-dist-${tag}.tar.gz" attune-openapi.json; do
+    rm "$test_root/$required"
+    if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag" \
+        --allow-missing-cli --allow-missing-linux-packages; then
+        echo 'Missing required server asset was accepted' >&2
+        exit 1
+    fi
+    touch "$test_root/$required"
+done
+if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag" --allow-missing-everything; then
+    echo 'Unknown validation option was accepted' >&2
+    exit 1
+fi

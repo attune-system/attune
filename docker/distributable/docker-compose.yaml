@@ -115,12 +115,12 @@ services:
     restart: "no"
 
   init-packs:
-    image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/init-packs:${ATTUNE_INIT_PACKS_IMAGE_TAG:-core-1.0.4}
+    image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/init-packs:${ATTUNE_INIT_PACKS_IMAGE_TAG:-core-1.0.5}
     container_name: attune-init-packs
     environment:
       ATTUNE_BOOTSTRAP_MODE: api
       ATTUNE_BOOTSTRAP_TOKEN: ${ATTUNE_BOOTSTRAP_TOKEN:-}
-      ATTUNE_CORE_PACK_VERSION: ${ATTUNE_CORE_PACK_VERSION:-1.0.4}
+      ATTUNE_CORE_PACK_VERSION: ${ATTUNE_CORE_PACK_VERSION:-1.0.5}
       ATTUNE_CORE_PACK_DIGEST: ${ATTUNE_CORE_PACK_DIGEST:-}
       SOURCE_PACKS_DIR: /source/packs
       ATTUNE_API_URL: http://api:8080

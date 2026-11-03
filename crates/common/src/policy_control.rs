@@ -3,6 +3,7 @@ use serde_yaml_ng::Value as YamlValue;
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct PolicyControls {
+    pub resource_concurrency: Option<serde_json::Value>,
     pub threshold: Option<i32>,
     pub method: Option<PolicyMethod>,
     pub parameters: Vec<String>,
@@ -69,14 +70,32 @@ pub(crate) fn parse_policy_controls(data: &YamlValue) -> Result<PolicyControls, 
     }
 
     let quotas = parse_quotas(data.get("quotas"))?;
+    let resource_concurrency = data
+        .get("resource_concurrency")
+        .map(|value| {
+            let resource: crate::resource_concurrency::ResourceConcurrency =
+                serde_yaml_ng::from_value(value.clone()).map_err(|error| error.to_string())?;
+            resource.validate().map_err(|error| error.to_string())?;
+            serde_json::to_value(resource).map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    if resource_concurrency.is_some()
+        && (threshold.is_some()
+            || rate_limit_max_executions.is_some()
+            || quotas.as_array().is_some_and(|items| !items.is_empty()))
+    {
+        return Err("Shared resource policies must not also configure standard controls".into());
+    }
     if threshold.is_none()
         && rate_limit_max_executions.is_none()
         && quotas.as_array().is_none_or(Vec::is_empty)
+        && resource_concurrency.is_none()
     {
         return Err("Policy must configure concurrency, rate_limit, or quotas".to_string());
     }
 
     Ok(PolicyControls {
+        resource_concurrency,
         threshold,
         method,
         parameters,
@@ -162,5 +181,17 @@ mod tests {
         assert!(parse("rate_limit: { max_executions: 2, window_seconds: -1 }\n").is_err());
         assert!(parse("quotas: [{ quota_type: daily, limit: 0 }]\n").is_err());
         assert!(parse("enabled: true\n").is_err());
+    }
+
+    #[test]
+    fn shared_policy_requires_scalar_paths_and_exclusive_controls() {
+        let shared = "resource_concurrency:\n  namespace: salesforce_org\n  limit: 1\n  method: enqueue\n  participants:\n    - action: salesforce.deploy\n      resource_parameter: target.org_id\n";
+        assert!(parse(shared).unwrap().resource_concurrency.is_some());
+        assert!(parse(&format!(
+            "{shared}concurrency: {{limit: 2, method: enqueue}}\n"
+        ))
+        .is_err());
+        assert!(parse(&shared.replace("target.org_id", "target..org_id")).is_err());
+        assert!(parse(&shared.replace("limit: 1", "limit: 0")).is_err());
     }
 }

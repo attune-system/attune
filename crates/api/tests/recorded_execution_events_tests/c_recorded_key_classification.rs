@@ -239,7 +239,11 @@ async fn classification_case(
     let changed = if original_encrypted {
         json!("wrong-current-plain-value")
     } else {
-        attune_common::crypto::encrypt_json(&json!("wrong-current-encrypted-value"), encryption)?
+        attune_common::crypto::keystore::encrypt_json(
+            &json!("wrong-current-encrypted-value"),
+            encryption,
+            origin.key_id,
+        )?
     };
     KeyRepository::update(
         &fixture.ctx.pool,
@@ -247,7 +251,10 @@ async fn classification_case(
         UpdateKeyInput {
             encrypted: Some(!original_encrypted),
             value: Some(changed),
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption)),
+            encryption_key_hash: Some(attune_common::crypto::keystore::fingerprint(
+                encryption,
+                origin.key_id,
+            )?),
             ..Default::default()
         },
     )

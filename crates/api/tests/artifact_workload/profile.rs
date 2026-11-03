@@ -71,7 +71,10 @@ async fn artifact_cardinality_and_history_workload_profile() -> Result<()> {
         for _ in 0..21 {
             let (sample, body) = measure(&ctx, &path).await?;
             assert_eq!(sample.status, 200, "{body}");
-            assert_eq!(body["pagination"]["total_items"], 2);
+            assert_eq!(body["items"].as_array().ok_or("items missing")?.len(), 2);
+            assert_eq!(body["has_more"], false);
+            assert_eq!(sample.queries.artifact_count_reads, 0);
+            assert_eq!(sample.queries.artifact_linked_history_reads, 0);
             assert_eq!(sample.queries.ciphertext_reads, 0);
             assert!(sample.response_bytes < 128 * 1024);
             samples.push(sample);
@@ -84,7 +87,8 @@ async fn artifact_cardinality_and_history_workload_profile() -> Result<()> {
             for result in wave {
                 let (sample, body) = result?;
                 assert_eq!(sample.status, 200, "{body}");
-                assert_eq!(body["pagination"]["total_items"], 2);
+                assert_eq!(body["items"].as_array().ok_or("items missing")?.len(), 2);
+                assert_eq!(body["has_more"], false);
                 concurrent.push(sample);
             }
         }
@@ -117,7 +121,10 @@ async fn artifact_cardinality_and_history_workload_profile() -> Result<()> {
             )
             .await?;
             assert_eq!(sample.status, 200, "{body}");
-            assert_eq!(body["pagination"]["total_items"], count);
+            assert_eq!(body["has_more"], count > 20);
+            assert_eq!(body["next_cursor"].is_string(), count > 20);
+            assert!(body.get("pagination").is_none());
+            assert_eq!(sample.queries.artifact_count_reads, 0);
             assert_eq!(
                 body["items"].as_array().ok_or("items missing")?.len(),
                 count.min(20)
@@ -136,7 +143,7 @@ async fn artifact_cardinality_and_history_workload_profile() -> Result<()> {
     save_report(
         "artifact-cardinality-profile",
         &json!({"history_cases":histories,"cardinality_cases":cardinalities,
-        "limitations":["first after auth-cache invalidation is not cold PostgreSQL","exact totals still authorize full eligible history",
+        "limitations":["first after auth-cache invalidation is not cold PostgreSQL","metadata samples are not content-disclosure latency measurements",
             "four concurrent in-process Axum clients, not browser/network TTFB","no matched legacy p95 baseline"]}),
     )?;
     ctx.cleanup().await?;
@@ -192,7 +199,8 @@ async fn artifact_partition_and_maintenance_workload_profile() -> Result<()> {
             .collect(),
     )
     .await?;
-    let path = format!("/api/v1/executions/{latest}/artifacts");
+    // Keep measuring actual source authorization, not the now-safe metadata path.
+    let path = format!("/api/v1/artifacts/{stdout}/versions/100");
     let native = fixture_maintenance_config();
     let mut prepared_days = 0;
     let mut profiles = Vec::new();
@@ -217,8 +225,7 @@ async fn artifact_partition_and_maintenance_workload_profile() -> Result<()> {
         for _ in 0..21 {
             let (sample, body) = measure(&ctx, &path).await?;
             assert_eq!(sample.status, 200, "{body}");
-            assert_eq!(body["pagination"]["total_items"], 2);
-            assert_eq!(body["items"].as_array().ok_or("items missing")?.len(), 2);
+            assert_eq!(body["data"]["version"], 100);
             assert_eq!(sample.queries.ciphertext_reads, 0);
             assert!(
                 sample.queries.pool_acquisitions > 0,
@@ -288,7 +295,7 @@ async fn artifact_partition_and_maintenance_workload_profile() -> Result<()> {
                 "pool_size":ctx.pool.size(),"pool_idle":ctx.pool.num_idle()}));
             let (sample, body) = measure(&ctx, &path).await?;
             assert_eq!(sample.status, 200, "{body}");
-            assert_eq!(body["pagination"]["total_items"], 2);
+            assert_eq!(body["data"]["version"], 100);
             samples.push(sample);
         }
         Ok::<_, Box<dyn std::error::Error>>((samples, wait_samples))
@@ -408,7 +415,7 @@ async fn artifact_partition_and_maintenance_workload_profile() -> Result<()> {
         for _ in 0..20 {
             let (sample, body) = measure(&ctx, &path).await?;
             assert_eq!(sample.status, 200, "{body}");
-            assert_eq!(body["pagination"]["total_items"], 2);
+            assert_eq!(body["data"]["version"], 100);
             assert_eq!(sample.queries.ciphertext_reads, 0);
             samples.push(sample);
         }
@@ -426,7 +433,8 @@ async fn artifact_partition_and_maintenance_workload_profile() -> Result<()> {
     save_report(
         "artifact-workload-profile",
         &json!({
-            "fixture":"two-logs-100-executions-64-event-origins", "permissions":"fixture.artifact_reader-and-profile_events",
+            "fixture":"two-logs-100-executions-64-event-origins", "selected_content_endpoint":path,
+            "permissions":"fixture.artifact_reader-and-profile_events",
             "maintenance_test_operation_timeout_milliseconds":native.operation_timeout_milliseconds,
             "cache_state":"first-after-ddl-and-warm-reported-separately", "concurrency":{"readers":1,"maintenance_tasks":1},
             "partition_profiles":profiles, "batch_profiles":batch_profiles,

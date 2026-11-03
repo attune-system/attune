@@ -3,8 +3,10 @@
 mod helpers;
 
 use attune_common::repositories::{
-    pack_registry_index::{CreatePackRegistryIndexInput, PackRegistryIndexRepository},
-    Delete, List,
+    pack_registry_index::{
+        CreatePackRegistryIndexInput, PackRegistryIndexRepository, UpdatePackRegistryIndexInput,
+    },
+    Delete, FindById, List,
 };
 use helpers::create_test_pool;
 
@@ -26,6 +28,7 @@ async fn standard_index_is_managed_and_custom_indices_append() {
             position: None,
             enabled: true,
             headers: serde_json::json!("encrypted-empty-headers"),
+            source_headers: serde_json::json!({}),
         },
     )
     .await
@@ -68,6 +71,7 @@ async fn appending_at_max_position_saturates_and_preserves_id_order() {
             position: None,
             enabled: true,
             headers: serde_json::json!({}),
+            source_headers: serde_json::json!({}),
         },
     )
     .await
@@ -89,6 +93,7 @@ async fn header_compare_and_set_does_not_overwrite_concurrent_rotation() {
             position: None,
             enabled: true,
             headers: serde_json::json!("legacy-ciphertext"),
+            source_headers: serde_json::json!({}),
         },
     )
     .await
@@ -123,4 +128,52 @@ async fn header_compare_and_set_does_not_overwrite_concurrent_rotation() {
             .await
             .unwrap();
     assert_eq!(persisted, rotated);
+}
+
+#[tokio::test]
+async fn source_headers_are_normalized_preserved_and_explicitly_cleared() {
+    let pool = create_test_pool().await.unwrap();
+    let index = PackRegistryIndexRepository::create(
+        &pool,
+        CreatePackRegistryIndexInput {
+            name: None,
+            url: "https://registry.example.com/index.json".to_string(),
+            position: None,
+            enabled: true,
+            headers: serde_json::json!({}),
+            source_headers: serde_json::json!({"HTTPS://ARTIFACTS.EXAMPLE.COM.:443/": "encrypted-source-headers"}),
+        },
+    ).await.unwrap();
+    assert_eq!(
+        index.source_headers,
+        serde_json::json!({"https://artifacts.example.com": "encrypted-source-headers"})
+    );
+    let unchanged = PackRegistryIndexRepository::update(
+        &pool,
+        index.id,
+        UpdatePackRegistryIndexInput {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(unchanged.source_headers, index.source_headers);
+    let cleared = PackRegistryIndexRepository::update(
+        &pool,
+        index.id,
+        UpdatePackRegistryIndexInput {
+            source_headers: Some(serde_json::json!({})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleared.source_headers, serde_json::json!({}));
+    let persisted = PackRegistryIndexRepository::find_by_id(&pool, index.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.source_headers, serde_json::json!({}));
+    pool.cleanup().await.unwrap();
 }

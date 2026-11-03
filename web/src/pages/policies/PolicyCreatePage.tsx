@@ -28,7 +28,8 @@ export default function PolicyCreatePage() {
             <p className="mt-1 text-blue-800">
               Attune applies one effective policy. Action policies override pack
               policies, pack policies override global policies, and higher
-              priority wins within the same scope.
+              priority wins within the same scope. Shared resource policies
+              apply separately, in addition to the effective standard policy.
             </p>
           </div>
         </div>

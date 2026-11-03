@@ -20,6 +20,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
+pub mod keystore;
+
 /// Size of the nonce in bytes (96 bits for AES-GCM)
 const NONCE_SIZE: usize = 12;
 
@@ -154,13 +156,20 @@ fn generate_nonce() -> [u8; NONCE_SIZE] {
     nonce
 }
 
-/// Hash an encryption key to store as a reference
+/// Compute a one-way, domain-separated verifier for the configured encryption key.
 ///
 /// This is used to verify that the correct encryption key is being used
-/// without storing the key itself.
+/// without storing usable AES key material. Never persist `derive_key` directly:
+/// those bytes decrypt every value encrypted with the same configured secret.
+/// The configured secret must have at least 256 bits of random entropy; this
+/// fast verifier is not a password-hardening function.
+///
+/// Older persisted verifiers require explicit data conversion. Do not accept
+/// the old AES-key-as-verifier representation as a runtime fallback.
 pub fn hash_encryption_key(encryption_key: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(encryption_key.as_bytes());
+    hasher.update(b"attune:encryption-key-fingerprint\0");
+    hasher.update(derive_key(encryption_key));
     let result = hasher.finalize();
     result.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -170,6 +179,74 @@ mod tests {
     use super::*;
 
     const TEST_KEY: &str = "this_is_a_test_key_that_is_32_chars_long!!!!";
+
+    #[test]
+    fn stored_fingerprint_cannot_decrypt_json() {
+        let value = serde_json::json!({"credential": "synthetic-only"});
+        let stored = encrypt_json(&value, TEST_KEY).unwrap();
+        let fingerprint = hash_encryption_key(TEST_KEY);
+        let bytes: Vec<u8> = (0..fingerprint.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&fingerprint[i..i + 2], 16).unwrap())
+            .collect();
+        let encoded = BASE64.decode(stored.as_str().unwrap()).unwrap();
+        let nonce: [u8; NONCE_SIZE] = encoded[..NONCE_SIZE].try_into().unwrap();
+        let recovered = Aes256Gcm::new_from_slice(&bytes)
+            .unwrap()
+            .decrypt(&Nonce::from(nonce), &encoded[NONCE_SIZE..]);
+        assert!(
+            recovered.is_err(),
+            "Persisted fingerprint permits raw AES-GCM decryption"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_domain_separated_from_aes_key() {
+        let aes_key = Sha256::digest(TEST_KEY.as_bytes());
+        let mut expected = Sha256::new();
+        expected.update(b"attune:encryption-key-fingerprint\0");
+        expected.update(aes_key);
+        let fingerprint = hash_encryption_key(TEST_KEY);
+        let expected_hex: String = expected
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let aes_hex: String = aes_key.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(fingerprint, expected_hex);
+        assert!(
+            fingerprint != aes_hex,
+            "Fingerprint must not be AES key material"
+        );
+    }
+
+    #[test]
+    fn ciphertext_tampering_is_rejected() {
+        let ciphertext = encrypt("synthetic-only", TEST_KEY).unwrap();
+        let encoded = BASE64.decode(ciphertext).unwrap();
+        for position in [0, NONCE_SIZE, encoded.len() - 1] {
+            let mut tampered = encoded.clone();
+            tampered[position] ^= 1;
+            assert!(decrypt(&BASE64.encode(tampered), TEST_KEY).is_err());
+        }
+    }
+
+    #[test]
+    fn existing_ciphertext_key_derivation_and_encoding_are_preserved() {
+        // Fixed synthetic nonce, only for a deterministic historical-format fixture.
+        let nonce = [7u8; NONCE_SIZE];
+        let aes_key = Sha256::digest(TEST_KEY.as_bytes());
+        let value = serde_json::json!({"historical": "synthetic-only"});
+        let ciphertext = Aes256Gcm::new_from_slice(&aes_key)
+            .unwrap()
+            .encrypt(&Nonce::from(nonce), value.to_string().as_bytes())
+            .unwrap();
+        let fixture = BASE64.encode([nonce.as_slice(), ciphertext.as_slice()].concat());
+        assert_eq!(
+            decrypt_json(&JsonValue::String(fixture), TEST_KEY).unwrap(),
+            value
+        );
+    }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {

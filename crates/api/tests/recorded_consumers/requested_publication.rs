@@ -60,8 +60,8 @@ async fn target(fixture: &Fixture, sealed: bool) -> Result<Target> {
         .encryption_key
         .as_deref()
         .unwrap();
-    let original = KeyRepository::create(
-        &mut *tx,
+    let original = KeyRepository::create_encrypted(
+        &mut tx,
         CreateKeyInput {
             local_ref: "requested_original".into(),
             owner_type: OwnerType::Pack,
@@ -74,12 +74,10 @@ async fn target(fixture: &Fixture, sealed: bool) -> Result<Target> {
             owner_sensor_ref: None,
             name: "Original Requested input".into(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(encryption)),
-            value: attune_common::crypto::encrypt_json(
-                &json!("original private input"),
-                encryption,
-            )?,
+            encryption_key_hash: None,
+            value: json!("original private input"),
         },
+        encryption,
     )
     .await?;
     let input_set = PermissionSetRepository::create(&mut *tx, CreatePermissionSetInput {
@@ -214,9 +212,10 @@ async fn actual_human_and_recorded_reschedule_keep_targets_original_key_and_atte
             &fixture.ctx.pool,
             target.key,
             UpdateKeyInput {
-                value: Some(attune_common::crypto::encrypt_json(
+                value: Some(attune_common::crypto::keystore::encrypt_json(
                     &json!("changed current key"),
                     encryption,
+                    target.key,
                 )?),
                 ..Default::default()
             },

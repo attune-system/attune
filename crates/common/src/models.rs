@@ -790,6 +790,7 @@ pub mod pack_registry_index {
         pub enabled: bool,
         pub is_standard: bool,
         pub headers: JsonDict,
+        pub source_headers: JsonDict,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1640,6 +1641,8 @@ pub mod action {
         pub rate_limit_max_executions: Option<i32>,
         pub rate_limit_window_seconds: Option<i32>,
         pub quotas: JsonValue,
+        pub resource_concurrency:
+            Option<sqlx::types::Json<crate::resource_concurrency::ResourceConcurrency>>,
         pub name: String,
         pub description: Option<String>,
         pub tags: Vec<String>,

@@ -1587,8 +1587,8 @@ async fn sensor_input_templates_use_deployed_read_decrypt_grants_and_record_key_
         &mut tx,&author,author.config.as_ref(),Some(key)).await.unwrap();
     assert!(!revision.config.to_string().contains("keystore"));
     tx.commit().await.unwrap();
-    let stored_key = KeyRepository::create(
-        &*pool,
+    let stored_key = KeyRepository::create_encrypted_in_pool(
+        &pool,
         CreateKeyInput {
             local_ref: "sensor_input".into(),
             owner_type: attune_common::models::OwnerType::System,
@@ -1601,9 +1601,10 @@ async fn sensor_input_templates_use_deployed_read_decrypt_grants_and_record_key_
             owner_sensor_ref: None,
             name: "Sensor input".into(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(key)),
-            value: attune_common::crypto::encrypt_json(&json!("private-key-input"), key).unwrap(),
+            encryption_key_hash: None,
+            value: json!("private-key-input"),
         },
+        key,
     )
     .await
     .unwrap();
@@ -1756,8 +1757,8 @@ async fn sensor_initial_rule_values_are_encrypted_and_pinned_before_launch() {
     .await;
     let key = "0123456789abcdef0123456789abcdef";
     use attune_common::repositories::key::{CreateKeyInput, KeyRepository};
-    let input_key = KeyRepository::create(
-        &*pool,
+    let input_key = KeyRepository::create_encrypted_in_pool(
+        &pool,
         CreateKeyInput {
             local_ref: "sensor_input".into(),
             owner_type: attune_common::models::OwnerType::System,
@@ -1770,10 +1771,10 @@ async fn sensor_initial_rule_values_are_encrypted_and_pinned_before_launch() {
             owner_sensor_ref: None,
             name: "Sensor input".into(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(key)),
-            value: attune_common::crypto::encrypt_json(&json!("private-rule-fixture"), key)
-                .unwrap(),
+            encryption_key_hash: None,
+            value: json!("private-rule-fixture"),
         },
+        key,
     )
     .await
     .unwrap();
@@ -1895,7 +1896,14 @@ async fn sensor_initial_rule_values_are_encrypted_and_pinned_before_launch() {
     assert!(!error.to_string().contains("updated-rule-fixture"));
     rejected.rollback().await.unwrap();
     sqlx::query("UPDATE key SET value = $1 WHERE id = $2")
-        .bind(attune_common::crypto::encrypt_json(&json!("updated-rule-fixture"), key).unwrap())
+        .bind(
+            attune_common::crypto::keystore::encrypt_json(
+                &json!("updated-rule-fixture"),
+                key,
+                input_key.id,
+            )
+            .unwrap(),
+        )
         .bind(input_key.id)
         .execute(&*pool)
         .await
@@ -1994,7 +2002,14 @@ async fn sensor_initial_rule_values_are_encrypted_and_pinned_before_launch() {
         vec![stored[0].0]
     );
     sqlx::query("UPDATE key SET value = $1 WHERE id = $2")
-        .bind(attune_common::crypto::encrypt_json(&json!("another-rule-fixture"), key).unwrap())
+        .bind(
+            attune_common::crypto::keystore::encrypt_json(
+                &json!("another-rule-fixture"),
+                key,
+                input_key.id,
+            )
+            .unwrap(),
+        )
         .bind(input_key.id)
         .execute(&*pool)
         .await
@@ -2024,8 +2039,8 @@ async fn sensor_initial_rule_values_are_encrypted_and_pinned_before_launch() {
             .map(|(delivery, _)| *delivery)
             .collect::<Vec<_>>()
     );
-    let alternate_key = KeyRepository::create(
-        &*pool,
+    let alternate_key = KeyRepository::create_encrypted_in_pool(
+        &pool,
         CreateKeyInput {
             local_ref: "sensor_input_alt".into(),
             owner_type: attune_common::models::OwnerType::System,
@@ -2038,10 +2053,10 @@ async fn sensor_initial_rule_values_are_encrypted_and_pinned_before_launch() {
             owner_sensor_ref: None,
             name: "Alternate sensor input".into(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(key)),
-            value: attune_common::crypto::encrypt_json(&json!("another-rule-fixture"), key)
-                .unwrap(),
+            encryption_key_hash: None,
+            value: json!("another-rule-fixture"),
         },
+        key,
     )
     .await
     .unwrap();

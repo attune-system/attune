@@ -2,6 +2,85 @@
 
 Attune has pure unit tests, template-cloned PostgreSQL tests, broker/service tests, and full Docker E2E tests. Do not infer infrastructure independence from a Rust target's location or from `--lib`.
 
+## Choosing validation scope
+
+Follow the [validation rule](../../AGENTS.md#critical-guardrails-read-first):
+non-`main` checkpoints and draft PRs may contain disclosed incomplete or failing
+work. Use scoped validation during development; complete applicable checks and
+artifacts before declaring work ready to merge. Early review does not require
+merge readiness.
+
+**Work in progress** means changes are saved or available for review while
+implementation, applicable completion requirements, or required checks remain
+outstanding. **Ready to merge** means those requirements are complete, regressions
+introduced by the changes are resolved, and applicable required CI has passed.
+
+Before merging to or committing directly on `main`, all applicable required CI
+checks in `.github/workflows/` must pass for the PR head or merge candidate
+required by branch protection and merge-queue rules, or the exact state of a
+direct commit. Local result reuse does not waive this gate.
+
+Choose tests from the diff and affected consumers, not just the files edited.
+The following are starting points; combine rows when a change spans areas and
+broaden coverage when risk or failures warrant it.
+
+| Change | Relevant validation before merge readiness |
+| --- | --- |
+| Documentation only | `git diff --check`; review links, examples, and instruction consistency. Application tests are unnecessary unless executable content or behavior also changes. |
+| Isolated Rust crate | Rust formatting, `cargo check -p <package> --all-targets`, relevant Clippy checks, and focused tests. Include repository/API tests when behavior crosses those boundaries. |
+| Shared Rust code, workspace configuration, or dependencies | `cargo check --all-targets --workspace`, relevant formatting/Clippy checks, and tests for affected consumers. |
+| Web UI | From `web/`, run focused tests with `npm test -- <test-file>`, plus `npm run format:check`, `npm run lint`, and `npm run typecheck`; add contract checks or a build when affected. |
+| API contracts or platform/API versions | Relevant API and consumer tests; complete [generated API client validation](../../AGENTS.md#generated-api-client-validation). |
+| Schema or repository queries | Migration and relevant repository/integration tests on owned disposable PostgreSQL; complete [schema validation](../../AGENTS.md#schema-validation) and include resulting metadata changes when applicable. |
+| Authentication, permissions, or cross-service behavior | Relevant security/authorization and integration/E2E cases across affected boundaries, including rejection paths; isolated unit tests alone are insufficient. |
+| Executable scripts or deployment/test configuration | Applicable syntax, unit, and smoke/integration checks for the changed execution path; these are not documentation-only changes. |
+
+Cargo tests may need external services even with `--lib`. Follow the run identity,
+concurrency, and owned-infrastructure procedures below. For scoped Docker runs,
+use the existing runner's `--crate`, `--test`, or `--filter` controls.
+
+### Reusing results and handling failures
+
+Reuse a check only when subsequent changes cannot affect its result. Record the
+tested commit SHA, any uncommitted changes present during the run (for example,
+a saved diff), the command and result, and why reuse remains valid. A prose-only
+edit can preserve code-test evidence; shared library, dependency, configuration,
+fixture, or relevant environment changes require rerunning affected checks and
+consumer coverage. When the impact is uncertain, rerun. Reused local evidence
+does not replace required CI on the PR head or merge candidate.
+
+Fix regressions introduced by the task before declaring merge readiness. If a
+failure appears unrelated, record evidence such as an existing CI failure or a
+reproduction on the base revision with equivalent prerequisites. Without that
+evidence, report the cause as unresolved. Do not silently expand the task to fix
+unrelated failures or label them passed. Required CI failures still block merge,
+even when they predate the task.
+
+Unavailable local infrastructure may be disclosed and validation obtained in CI
+through an authorized non-`main` push. Pending or blocked checks remain gaps until
+results arrive. Follow the completion requirements for
+[schema validation](../../AGENTS.md#schema-validation),
+[generated API clients](../../AGENTS.md#generated-api-client-validation), and
+[warning cleanup](../../AGENTS.md#zero-warnings-policy). Other safety and
+resource-ownership rules still apply during work in progress.
+
+### Validation handoff
+
+Use this compact format in the handoff or PR description; no separate report file
+is required:
+
+```text
+Status: work in progress / ready to merge
+Validation: commands and results, tested revision and any uncommitted changes;
+            why the selected scope is appropriate; rationale for reused results
+Gaps: known failures (with baseline evidence if unrelated), blocked/unrun checks,
+      pending CI, and remaining work; or none
+```
+
+Use “work in progress” while applicable completion requirements or required checks
+remain outstanding. Update the report as results arrive so a reviewer or another
+agent can distinguish saved progress from merge readiness.
+
 ## Fast local checks
 
 ```bash
@@ -40,7 +119,43 @@ ATTUNE_TEST_RUN_ID=local1 \
 
 `ATTUNE_TEST_RUN_ID` must be 1–20 lowercase ASCII letters/digits, optionally with non-leading `-`. It makes database clones and the migration template attributable to one invocation, for example `attune_db_local1_<uuid>` and `attune_tpl_local1_<migration-hash>`.
 
+## CLI startup without a server
+
+```bash
+cargo build --locked -p attune-cli --bins
+python3 scripts/test_cli_startup.py --bin-dir target/debug
+```
+
+Run this against the unoptimized debug binaries, not only binaries built by
+`cargo test`, which uses the optimized test profile. The script checks version,
+help, local build information, nested command help, and completion scripts with
+an isolated empty home and no API credentials. On Linux, child processes use a
+1 MiB main-thread stack to reproduce Windows startup limits. On Windows, the
+native stack limit is unchanged. The Windows CLI workflow runs the same script.
+
 ## Docker-owned integration runs
+
+### Private pack-source authentication
+
+The normal API suite includes managed-index HTTPS Git installation and
+authenticated Git-to-archive fallback, plus synchronized source-header rotation,
+preservation, and removal tests. Run these against an owned test database:
+
+```bash
+ATTUNE_TEST_RUN_ID=source-auth1 cargo test -p attune-api --test pack_registry_tests source_auth:: -- --test-threads=4
+ATTUNE_TEST_RUN_ID=source-races1 cargo test -p attune-api --test pack_registry_tests source_header_races:: -- --test-threads=4
+```
+
+The HTTPS cases run on Unix and require Git, Python 3, `/bin/sh`, and IPv4/IPv6
+loopback. Each test starts private HTTPS origins and a fresh test subprocess
+with an isolated CA bundle. A test-only Git launcher supplies that CA to the
+real Git process and records its arguments; it does not supply credentials or
+disable certificate verification. No host trust stores or process-global
+environments are changed. The PostgreSQL tests observe actual advisory-lock
+waiters to order requests, rather than using fixed sleeps. These tests are not
+ignored and run in the standard CI API suite and Docker Rust-test image.
+
+### Runner commands
 
 Use the runner scripts rather than raw Compose. They generate or require explicit run identities, refuse existing project resources before startup/build, remove only stacks they started, and do not publish fixed host ports.
 
@@ -176,6 +291,29 @@ are not a browser/network TTFB measurement or p95 latency certification. See
 [the implementation checkpoint](../plans/artifacts-postgresql-implementation.md#implementation-checkpoint)
 for completed work and remaining measurements.
 
+The selected-history foundation has focused real repository/API regressions:
+
+```bash
+bash scripts/run-rust-integration-tests.sh --test artifact_execution_summary_diagnostics_tests
+bash scripts/run-rust-integration-tests.sh --test artifact_read_performance_tests --filter selected_history::
+```
+
+`explain_execution_summary_scan()` shares the execution-specific lateral selector's
+query builder, including read context, filters, cursor, ordering and candidate
+limit. A page of 20 is explained with candidate limit 21. Its report is a separate
+repository-generated EXPLAIN, not proof of the SQLx cached prepared plan. Older
+global-with-execution-filter EXPLAIN reports do not certify this lateral query.
+
+`RetainedHistory` is a private, bounded test fixture. It admits one real release
+and selected/probe executions, then grows inert historical read targets in
+bounded transactions using genuine pinned executable/schema data and captured
+artifact ownership. It does not clone runtime authority, receipts, signatures,
+origins or credentials. Historical versions are metadata-only, while accepted
+probes have tiny synthetic content. Its small integrity/rollback/selection tests
+do not certify independently executed workloads, protected-log transport, body
+capacity, or 100,000/604,800-row performance. Large opt-in profile/report wiring
+and measured resource budgets remain a subsequent milestone.
+
 The workload profile holds 64 event origins and graph depth constant while adding
 1, 7, 30, and 90 populated daily event leaves, plus a retained source in DEFAULT.
 These are added populated leaves. Fresh migrations may already have other daily
@@ -220,7 +358,11 @@ deployment retention forecast. Follow
 [Artifact-read acceptance](../deployment/artifact-read-acceptance.md) for rollout
 evidence and operator gates.
 
-`--with-notifier-tests` runs the notifier executable on the same run-owned server.
+`--with-notifier-tests` runs the notifier library test executable on the same
+run-owned server, not the binary's small URL-masking test target. Required library
+test identities are checked before database setup; `--notifier-profile` also
+requires its exact profile identity and generated report. Zero selected tests or
+an absent report never certify notifier coverage.
 Its database-only listener test is not ignored. It awaits channel registration,
 creates a deterministic UNLISTEN/reconnect gap, keeps the downstream receiver
 open, and proves that a missed durable artifact change is not replayed. A separate
@@ -257,9 +399,10 @@ requests, and 20 completed requests across four concurrent clients separately.
 It also measures 2/20/100 attached artifacts with bounded pages and a 10 MiB
 progress body excluded from summaries. Cache invalidation is not a cold database.
 
-Add `--paired-reference` to enforce the 90% query and 70% warm-p95 reduction gates
-against a controlled serial reader on the same fixture. It is not a historical
-revision comparison. Add `--notifier-profile` for database-backed per-identity
+The historical `--paired-reference` gate is blocked after the selected-version
+policy change: its aggregate-content reference no longer exercises equivalent
+authorization work. Do not claim the old 90% query/70% warm-p95 reductions as new
+selected-read acceptance. Add `--notifier-profile` for database-backed per-identity
 delivery/SQL measurements. See
 [the executable acceptance gates](../deployment/artifact-read-acceptance.md#executable-local-gates)
 for scope, sample ordering, and failure rules. The serial route exists only in the

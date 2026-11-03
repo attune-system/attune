@@ -216,7 +216,11 @@ impl WorkerService {
         }
 
         // Initialize database
-        let db = Database::new(&config.database).await?;
+        let db = Database::new_named(
+            &config.database,
+            attune_common::db::ConnectionIdentity::for_process("worker", "main"),
+        )
+        .await?;
         let pool = db.pool().clone();
         info!("Database connection established");
 

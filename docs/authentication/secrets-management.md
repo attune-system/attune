@@ -55,37 +55,44 @@ This allows for flexible secret management where more specific secrets override 
 
 ### Encrypted Value Format
 ```
-nonce:ciphertext
+Base64(nonce || ciphertext || authentication_tag)
 ```
 
-Both components are Base64-encoded:
+This is one Base64 string with no separator:
 - **Nonce**: 12-byte random value (96 bits) for AES-GCM
-- **Ciphertext**: Encrypted payload with authentication tag
+- **Ciphertext**: Encrypted payload followed by a 16-byte authentication tag
 
-Example:
+### Shared recorded-field encryption key derivation
+
+Key records themselves now use ID-bound HKDF-SHA-256 and AES-GCM authenticated
+context through `crypto::keystore`. The following shared derivation applies to
+recorded fields and other generic encrypted values, not Key rows. See
+[fingerprint remediation](../deployment/encryption-fingerprint-remediation.md)
+for the exact per-record contract and offline conversion limits.
+
+The AES key is derived from the configured server secret using SHA-256:
+
 ```
-Xk3mP9qRsT6uVwYz:SGVsbG8gV29ybGQhIFRoaXMgaXMgYW4gZW5jcnlwdGVkIG1lc3NhZ2U=
+aes_key = SHA256(configured_secret_utf8)
 ```
 
-### Encryption Key Derivation
-
-The encryption key is derived from the configured password using SHA-256:
-
-```
-encryption_key = SHA256(password)
-```
-
-This produces a 32-byte (256-bit) key suitable for AES-256.
+This produces a 32-byte key. The configured secret must contain at least 256 bits
+of cryptographically random entropy. A password or a length check alone does not
+meet that requirement.
 
 ### Key Hash Validation
 
 Each encrypted secret can optionally store the hash of the encryption key used to encrypt it:
 
 ```
-key_hash = SHA256(encryption_key)
+key_hash = hex(SHA256(b"attune:encryption-key-fingerprint\0" || aes_key))
 ```
 
-This allows validation that the correct key is being used for decryption.
+This allows validation without storing AES key material. Earlier fingerprints
+were the shared AES key itself. Existing Key ciphertext and historical shared
+metadata require coordinated conversion. See
+[encryption fingerprint remediation](../deployment/encryption-fingerprint-remediation.md)
+for storage coverage, rollout blockers and incident response.
 
 ## Configuration
 
@@ -241,8 +248,8 @@ Examples:
 ### Encryption Process
 
 ```rust
-// 1. Derive encryption key from password
-let key = SHA256(password);
+// 1. Derive AES key from a cryptographically random server secret
+let key = SHA256(configured_secret_utf8);
 
 // 2. Generate random nonce
 let nonce = random_bytes(12);
@@ -250,23 +257,20 @@ let nonce = random_bytes(12);
 // 3. Encrypt plaintext
 let ciphertext = AES256GCM.encrypt(key, nonce, plaintext);
 
-// 4. Format as "nonce:ciphertext" (base64-encoded)
-let encrypted_value = format!("{}:{}", 
-    base64(nonce), 
-    base64(ciphertext)
-);
+// 4. Encode once; ciphertext includes the authentication tag
+let encrypted_value = base64(concat(nonce, ciphertext));
 ```
 
 ### Decryption Process
 
 ```rust
-// 1. Parse "nonce:ciphertext" format
-let (nonce_b64, ciphertext_b64) = encrypted_value.split_once(':');
-let nonce = base64_decode(nonce_b64);
-let ciphertext = base64_decode(ciphertext_b64);
+// 1. Decode once, then split the first 12 bytes from ciphertext and tag
+let bytes = base64_decode(encrypted_value);
+let (nonce, ciphertext) = bytes.split_at(12);
 
 // 2. Validate encryption key hash (if present)
-if key_hash != SHA256(encryption_key) {
+let encryption_key = SHA256(configured_secret_utf8);
+if key_hash != hex(SHA256(concat(b"attune:encryption-key-fingerprint\0", encryption_key))) {
     return Error("Key mismatch");
 }
 
@@ -318,7 +322,7 @@ security:
 
 **Solution**:
 - Verify encryption key is correct
-- Check secret value format (should be "nonce:ciphertext")
+- Check secret value format, one Base64 string encoding nonce, ciphertext and tag
 - Try re-encrypting the secret
 
 ### Secrets Not Available in Action

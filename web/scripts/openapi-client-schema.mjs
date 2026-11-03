@@ -104,6 +104,9 @@ function resolveSchema(schema, document) {
       if (/~(?:[^01]|$)/.test(part)) return undefined;
       const key = part.replace(/~1/g, "/").replace(/~0/g, "~");
       if (!object(schema) || !Object.hasOwn(schema, key)) return undefined;
+      // Read-only JSON Pointer lookup, restricted to own properties, including
+      // legitimate schema names such as "constructor". No prototype is mutated.
+      // nosemgrep: javascript.lang.security.audit.prototype-pollution.prototype-pollution-loop.prototype-pollution-loop
       schema = schema[key];
     }
   }

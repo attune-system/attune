@@ -16,10 +16,12 @@ import {
   RESOURCE_ACTIONS,
 } from "@/pages/access-control/grantDraft";
 
-const RESOURCE_OPTIONS = Object.keys(RESOURCE_ACTIONS).map((value) => ({
-  value,
-  label: RESOURCE_META[value]?.label ?? value,
-}));
+const RESOURCE_OPTIONS = Object.keys(RESOURCE_ACTIONS)
+  .map((value) => ({
+    value,
+    label: RESOURCE_META[value]?.label ?? value,
+  }))
+  .sort((a, b) => a.label.localeCompare(b.label));
 
 export function GrantsEditor({
   drafts,
@@ -136,7 +138,11 @@ export function GrantsEditor({
                   <div className="block text-xs font-medium uppercase tracking-wide text-gray-500">
                     Permission specs
                   </div>
-                  <div className="mt-2 flex flex-wrap gap-2">
+                  <div
+                    role="group"
+                    aria-label="Permission specs"
+                    className="mt-2 flex flex-wrap gap-2"
+                  >
                     {validActions.map((action) => (
                       <label
                         key={action}

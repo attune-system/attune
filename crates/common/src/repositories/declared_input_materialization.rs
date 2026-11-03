@@ -411,11 +411,12 @@ impl DeclaredInputMaterializationRepository {
             DeclaredInputRepository::authorize_key(conn, permit, key.id, key.encrypted).await?;
             let origin = crate::key_access::key_origin(&key);
             let value = if key.encrypted {
-                crate::crypto::decrypt_json(
+                crate::crypto::keystore::decrypt_json(
                     &key.value,
                     encryption_key.ok_or_else(|| {
                         Error::invalid_state("Authored Key decryption is unavailable")
                     })?,
+                    key.id,
                 )?
             } else {
                 key.value

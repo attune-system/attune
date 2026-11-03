@@ -3,6 +3,12 @@
 Date: 2026-10-14
 Status: implementation and controlled local acceptance pass. Historical/deployed comparison and rollout remain unverified.
 
+These checkpoints describe the historical aggregate-disclosure implementation.
+The user-approved [selected-read follow-up](execution-scoped-artifact-reads.md)
+changes metadata/content policy and pagination. Its implementation and rollout
+require new evidence; the old paired-reference latency gate is not equivalent
+under that policy and is intentionally blocked rather than relabeled as passing.
+
 ## Implementation checkpoint
 
 ### Latest storage cycle, PostgreSQL 18 only

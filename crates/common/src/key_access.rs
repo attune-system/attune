@@ -115,10 +115,11 @@ where
             ));
         }
         let value = if key.encrypted {
-            crate::crypto::decrypt_json(
+            crate::crypto::keystore::decrypt_json(
                 &key.value,
                 encryption_key
                     .ok_or_else(|| Error::invalid_state("Key decryption is not configured"))?,
+                key.id,
             )?
         } else {
             key.value

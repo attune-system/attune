@@ -55,11 +55,14 @@ pub struct RegistryClient {
 
 impl RegistryClient {
     /// Create a new registry client
-    pub fn new(config: PackRegistryConfig) -> Result<Self> {
+    pub fn new(mut config: PackRegistryConfig) -> Result<Self> {
         let outbound_policy = OutboundUrlPolicy::from_config(&config)?;
-        for registry in &config.indices {
+        for registry in &mut config.indices {
             validate_remote_pack_url(&registry.url)?;
             validate_registry_headers(&registry.headers)?;
+            registry.source_headers = super::source_headers::normalize_source_headers(
+                std::mem::take(&mut registry.source_headers),
+            )?;
         }
 
         Ok(Self {
@@ -185,6 +188,25 @@ impl RegistryClient {
     pub fn clear_cache(&self) {
         if let Ok(mut cache) = self.cache.write() {
             cache.clear();
+        }
+    }
+
+    /// Credentials belong to the selected enabled index, not to any index that
+    /// happens to share the download host.
+    pub(super) fn source_headers(
+        &self,
+        registry_url: &str,
+        source_url: &url::Url,
+    ) -> Result<HashMap<String, String>> {
+        match self
+            .config
+            .indices
+            .iter()
+            .filter(|registry| registry.enabled && registry.url == registry_url)
+            .min_by_key(|registry| registry.priority)
+        {
+            Some(registry) => super::source_headers::headers_for_source(registry, source_url),
+            None => Ok(HashMap::new()),
         }
     }
 
@@ -444,8 +466,14 @@ pub fn validate_registry_headers(headers: &HashMap<String, String>) -> Result<()
         "x-real-ip",
     ];
 
+    let mut names = HashSet::new();
     for (name, value) in headers {
         let normalized = name.to_ascii_lowercase();
+        if !names.insert(normalized.clone()) {
+            return Err(Error::validation(
+                "Duplicate case-insensitive registry header name",
+            ));
+        }
         if MANAGED_HEADERS.contains(&normalized.as_str())
             || normalized.starts_with("proxy-")
             || normalized.starts_with("x-forwarded-")
@@ -717,6 +745,7 @@ mod tests {
                     enabled: true,
                     name: Some("Registry 3".to_string()),
                     headers: HashMap::new(),
+                    source_headers: HashMap::new(),
                 },
                 RegistryIndexConfig {
                     url: "https://registry1.example.com".to_string(),
@@ -724,6 +753,7 @@ mod tests {
                     enabled: true,
                     name: Some("Registry 1".to_string()),
                     headers: HashMap::new(),
+                    source_headers: HashMap::new(),
                 },
                 RegistryIndexConfig {
                     url: "https://registry2.example.com".to_string(),
@@ -731,6 +761,7 @@ mod tests {
                     enabled: true,
                     name: Some("Registry 2".to_string()),
                     headers: HashMap::new(),
+                    source_headers: HashMap::new(),
                 },
                 RegistryIndexConfig {
                     url: "https://disabled.example.com".to_string(),
@@ -738,6 +769,7 @@ mod tests {
                     enabled: false,
                     name: Some("Disabled".to_string()),
                     headers: HashMap::new(),
+                    source_headers: HashMap::new(),
                 },
             ],
             cache_ttl: 3600,
@@ -780,6 +812,7 @@ mod tests {
                 enabled: true,
                 name: None,
                 headers: HashMap::new(),
+                source_headers: HashMap::new(),
             }],
             approved_public_hosts: vec!["registry.example.com".to_string()],
             ..Default::default()
@@ -817,6 +850,49 @@ mod tests {
             ("X-Api-Key".to_string(), "secret".to_string()),
         ]))
         .is_ok());
+        assert!(validate_registry_headers(&HashMap::from([
+            ("Authorization".to_string(), "first".to_string()),
+            ("authorization".to_string(), "second".to_string()),
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn source_credentials_come_only_from_the_selected_enabled_index() {
+        let index = |path: &str, priority, enabled, token: &str| RegistryIndexConfig {
+            url: format!("https://registry.example.com/{path}"),
+            priority,
+            enabled,
+            name: None,
+            headers: HashMap::from([("Authorization".to_string(), token.to_string())]),
+            source_headers: HashMap::new(),
+        };
+        let client = RegistryClient::new(PackRegistryConfig {
+            indices: vec![
+                index("selected.json", 10, true, "lower-priority"),
+                index("other.json", 0, true, "other-token"),
+                index("selected.json", 1, true, "selected-token"),
+                index("disabled.json", 0, false, "disabled-token"),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        let source = url::Url::parse("https://registry.example.com/pack.zip").unwrap();
+        assert_eq!(
+            client
+                .source_headers("https://registry.example.com/selected.json", &source)
+                .unwrap()["authorization"],
+            "selected-token"
+        );
+        for index_url in [
+            "https://registry.example.com/disabled.json",
+            "https://registry.example.com/unknown.json",
+        ] {
+            assert!(client
+                .source_headers(index_url, &source)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[tokio::test]
@@ -879,6 +955,7 @@ mod tests {
             enabled: true,
             name: None,
             headers: HashMap::new(),
+            source_headers: HashMap::new(),
         };
         let config = PackRegistryConfig {
             indices: vec![registry("higher", 0), registry("lower", 1)],

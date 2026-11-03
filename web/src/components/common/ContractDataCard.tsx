@@ -33,6 +33,8 @@ class DisplayGraph {
         const segment = escaped.replace(/~1/g, "/").replace(/~0/g, "~");
         if (!isJsonObject(target) || !Object.hasOwn(target, segment))
           throw new Error("Missing bound reference");
+        // Read-only lookup of an own JSON property, never a prototype write.
+        // nosemgrep: javascript.lang.security.audit.prototype-pollution.prototype-pollution-loop.prototype-pollution-loop
         target = target[segment];
       }
       node = target;

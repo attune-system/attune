@@ -2,12 +2,10 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { ArtifactBodyState } from "./ArtifactBodyState";
 /**
  * Simplified version for list endpoints
  */
 export type ArtifactVersionSummary = {
-  body_state?: null | ArtifactBodyState;
   /**
    * MIME content type
    */
@@ -17,7 +15,7 @@ export type ArtifactVersionSummary = {
    */
   created: string;
   /**
-   * Who created this version
+   * Reserved; arbitrary creator metadata is never exposed by summaries.
    */
   created_by?: string | null;
   /**
@@ -25,16 +23,9 @@ export type ArtifactVersionSummary = {
    */
   execution?: number | null;
   /**
-   * Relative file path for disk-backed versions
-   */
-  file_path?: string | null;
-  /**
    * Version ID
    */
   id: number;
-  object_key?: string | null;
-  provider_version?: string | null;
-  sha256?: string | null;
   /**
    * Size of content in bytes
    */

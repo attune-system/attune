@@ -933,7 +933,6 @@ async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
 #[ignore = "integration test - requires PostgreSQL and versioned S3 storage"]
 async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames() -> Result<()> {
     use attune_common::{
-        crypto,
         repositories::{
             execution_secret_value::ExecutionSecretValueRepository,
             identity::UpdatePermissionSetInput,
@@ -952,7 +951,7 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
         .encryption_key
         .as_deref()
         .ok_or("fixture encryption key missing")?;
-    let key = KeyRepository::create(
+    let key = KeyRepository::create_encrypted_in_pool(
         harness.database.pool(),
         CreateKeyInput {
             local_ref: "object_stream_origin".into(),
@@ -966,9 +965,10 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
             owner_sensor_ref: None,
             name: "Object stream fixture origin".into(),
             encrypted: true,
-            encryption_key_hash: Some(crypto::hash_encryption_key(encryption)),
-            value: crypto::encrypt_json(&serde_json::json!("owned input fixture"), encryption)?,
+            encryption_key_hash: None,
+            value: serde_json::json!("owned input fixture"),
         },
+        encryption,
     )
     .await?;
     let provenance = SecretProvenance::key(attune_common::key_access::key_origin(&key));
@@ -1580,14 +1580,15 @@ async fn shared_volume_cross_process_locking_writer_loss_and_retention() -> Resu
     let mut maintenance = harness.replicas[0].state.config.maintenance.clone();
     maintenance.object_upload_abandon_seconds = 3600;
     maintenance.artifact_cleanup_batch_size = 10;
-    assert_eq!(
+    assert!(
         attune_supervisor::artifact_cleanup::cleanup_abandoned_shared_logs(
             harness.database.pool(),
             other_pod.as_ref(),
             &maintenance,
         )
-        .await?,
-        0
+        .await
+        .is_err(),
+        "an active flock must report deferred cleanup, not an empty success"
     );
     let claimed_state: String =
         sqlx::query_scalar("SELECT body_state::text FROM artifact_version WHERE id = $1")

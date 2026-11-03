@@ -78,6 +78,8 @@ export type { ApplyWorkQueueItemsResponse } from "./models/ApplyWorkQueueItemsRe
 export type { ApprovalPurpose } from "./models/ApprovalPurpose";
 export { ArtifactBodyState } from "./models/ArtifactBodyState";
 export { ArtifactClassification } from "./models/ArtifactClassification";
+export type { ArtifactCursorPage_ArtifactSummary } from "./models/ArtifactCursorPage_ArtifactSummary";
+export type { ArtifactCursorPage_ArtifactVersionSummary } from "./models/ArtifactCursorPage_ArtifactVersionSummary";
 export type { ArtifactJsonPatch } from "./models/ArtifactJsonPatch";
 export type { ArtifactStringPatch } from "./models/ArtifactStringPatch";
 export type { ArtifactSummary } from "./models/ArtifactSummary";
@@ -281,8 +283,6 @@ export type { PackWorkflowSyncResponse } from "./models/PackWorkflowSyncResponse
 export type { PackWorkflowValidationResponse } from "./models/PackWorkflowValidationResponse";
 export type { PaginatedResponse_ActionSearchHit } from "./models/PaginatedResponse_ActionSearchHit";
 export type { PaginatedResponse_ActionSummary } from "./models/PaginatedResponse_ActionSummary";
-export type { PaginatedResponse_ArtifactSummary } from "./models/PaginatedResponse_ArtifactSummary";
-export type { PaginatedResponse_ArtifactVersionSummary } from "./models/PaginatedResponse_ArtifactVersionSummary";
 export type { PaginatedResponse_AuditEventSummary } from "./models/PaginatedResponse_AuditEventSummary";
 export type { PaginatedResponse_DeclaredInputApprovalTarget } from "./models/PaginatedResponse_DeclaredInputApprovalTarget";
 export type { PaginatedResponse_EnforcementSummary } from "./models/PaginatedResponse_EnforcementSummary";
@@ -359,6 +359,8 @@ export type { RegisterRequest } from "./models/RegisterRequest";
 export type { RegistrationSummary } from "./models/RegistrationSummary";
 export type { RendererInputApprovalRequest } from "./models/RendererInputApprovalRequest";
 export type { ResolvedWorkQueueDispatchTuningResponse } from "./models/ResolvedWorkQueueDispatchTuningResponse";
+export type { ResourceConcurrency } from "./models/ResourceConcurrency";
+export type { ResourceParticipant } from "./models/ResourceParticipant";
 export type { RetentionConfig } from "./models/RetentionConfig";
 export { RetentionPolicyType } from "./models/RetentionPolicyType";
 export type { RetentionTargetConfig } from "./models/RetentionTargetConfig";

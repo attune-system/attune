@@ -2044,7 +2044,7 @@ impl InheritedInputRepository {
                 .bind(session.permit.binding_id).bind(approval).bind(hash(&origin_body)?).bind(origin_body).bind(serde_json::to_value(&target)?).execute(&mut *conn).await?;
         }
         let value = if key.encrypted {
-            crate::crypto::decrypt_json(&key.value, encryption_key)?
+            crate::crypto::keystore::decrypt_json(&key.value, encryption_key, key.id)?
         } else {
             key.value
         };

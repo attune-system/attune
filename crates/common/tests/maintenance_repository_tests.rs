@@ -2,6 +2,8 @@ use attune_common::repositories::maintenance::MaintenanceRepository;
 use serde_json::json;
 use sqlx::PgPool;
 
+#[path = "maintenance_repository_tests/bounded_metadata.rs"]
+mod bounded_metadata;
 mod helpers;
 use helpers::create_test_pool;
 

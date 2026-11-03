@@ -5,6 +5,7 @@
 import type { ConcurrencyPolicyRequest } from "./ConcurrencyPolicyRequest";
 import type { QuotaPolicyRequest } from "./QuotaPolicyRequest";
 import type { RateLimitPolicyRequest } from "./RateLimitPolicyRequest";
+import type { ResourceConcurrency } from "./ResourceConcurrency";
 export type UpdatePolicyRequest = {
   concurrency?: null | ConcurrencyPolicyRequest;
   description?: string | null;
@@ -13,5 +14,6 @@ export type UpdatePolicyRequest = {
   priority?: number | null;
   quotas?: Array<QuotaPolicyRequest> | null;
   rate_limit?: null | RateLimitPolicyRequest;
+  resource_concurrency?: null | ResourceConcurrency;
   tags?: Array<string> | null;
 };

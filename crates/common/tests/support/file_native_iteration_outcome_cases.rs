@@ -17,12 +17,12 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn ordinary_group_input_archive_keeps_file_after_raw_member_config_and_dispatch_gc() {
-    custody_case(false).await;
+    custody_case(false, false).await;
 }
 
 #[tokio::test]
 async fn one_original_member_revocation_cannot_be_hidden_by_the_other_members_ceiling() {
-    custody_case(true).await;
+    custody_case(true, false).await;
 }
 
 async fn setup() -> (TestDatabase, Fixture, Execution, WorkflowExecution) {
@@ -210,7 +210,12 @@ async fn setup() -> (TestDatabase, Fixture, Execution, WorkflowExecution) {
     (db, fixture, root, workflow)
 }
 
-async fn custody_case(revoke_member: bool) {
+#[tokio::test]
+async fn encryption_upgrade_preserves_iteration_members_and_original_revocation() {
+    custody_case(true, true).await;
+}
+
+async fn custody_case(revoke_member: bool, compatibility: bool) {
     let (db, fixture, root, workflow) = setup().await;
     let mut tx = db.begin().await.unwrap();
     let mut plan = Iteration::prepare(&mut tx, &root, "ordinary", None, KEY)
@@ -403,6 +408,9 @@ async fn custody_case(revoke_member: bool) {
     // Actual initial file reservation occurs after BOTH raw configs and member
     // executions/dispatch have gone. No raw-current-child fallback can pass.
     let held = hold(&db, &fixture, &receipt, directory.path(), &store).await;
+    if compatibility {
+        upgrade_held_file(&db, &held, &store, KEY).await;
+    }
     let pinned:Vec<Id>=sqlx::query_scalar("SELECT source FROM file_evidence_pin WHERE owner=$1 AND kind='runtime_authority_admission' AND source=ANY($2) ORDER BY source")
         .bind(held.version).bind(&admissions).fetch_all(db.pool()).await.unwrap();
     assert_eq!(pinned, admissions);

@@ -13,5 +13,9 @@ export type CreatePackRegistryIndexRequest = {
    * Optional explicit search order position. Omit to append to the end.
    */
   position?: number | null;
+  /**
+   * Exact HTTPS origins mapped to source-specific archive/Git headers.
+   */
+  source_headers?: Record<string, any>;
   url: string;
 };

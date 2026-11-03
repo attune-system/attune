@@ -2,6 +2,7 @@ import type {
   GrantConstraints,
   ParsedGrant,
 } from "@/components/access-control/grants";
+import type { RbacResource } from "@/api/models/RbacResource";
 
 // Pure grant <-> draft-form conversion logic for the permission-set editor,
 // kept in its own module (rather than inline in PermissionSetDetailPage.tsx)
@@ -34,17 +35,19 @@ export const RESOURCE_ACTIONS: Record<string, string[]> = {
   triggers: ["read", "create", "update", "delete", "decrypt"],
   executions: ["read", "update", "cancel", "decrypt"],
   events: ["read", "create", "decrypt"],
-  enforcements: ["read"],
-  inquiries: ["read", "create", "update", "delete", "respond"],
+  enforcements: ["read", "decrypt"],
+  inquiries: ["read", "create", "update", "delete", "respond", "decrypt"],
   keys: ["read", "create", "update", "delete", "decrypt", "use"],
   caches: ["read", "create", "update", "delete"],
   artifacts: ["read", "create", "update", "delete", "decrypt"],
   runtimes: ["read", "create", "update", "delete"],
-  workers: ["read"],
+  workers: ["read", "manage"],
+  dashboards: ["read", "create", "update", "delete"],
+  retention: ["read", "update"],
   identities: ["read", "create", "update", "delete"],
   permissions: ["read", "manage"],
   audit_log: ["read"],
-};
+} satisfies Record<RbacResource, string[]>;
 
 export const PACK_SCOPED_RESOURCES = new Set([
   "packs",

@@ -5,7 +5,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{io::Read, os::unix::fs::MetadataExt, path::PathBuf, time::Duration};
+#[cfg(unix)]
+use std::{io::Read, os::unix::fs::MetadataExt};
+use std::{path::PathBuf, time::Duration};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -68,6 +70,7 @@ fn denied() -> Error {
     Error::PermissionDenied("Original native generation proof unavailable".into())
 }
 
+#[cfg(unix)]
 fn management_file(path: &PathBuf, private: bool) -> Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
@@ -92,6 +95,13 @@ fn management_file(path: &PathBuf, private: bool) -> Result<Vec<u8>> {
         return Err(denied());
     }
     Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn management_file(_path: &PathBuf, _private: bool) -> Result<Vec<u8>> {
+    // Controller credentials require Unix ownership/mode and no-follow checks.
+    // Do not accept an unchecked file on platforms without that contract.
+    Err(denied())
 }
 
 impl VerifiedNativeOrigin {
@@ -241,5 +251,78 @@ impl VerifiedNativeOrigin {
             evidence: json!({"original":data,"attestation":text,"verification_key_sha256":URL_SAFE_NO_PAD.encode(crate::blob_store::sha256(key.as_bytes()))}),
             deadline,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_management_file_is_denied() {
+        let root = tempfile::tempdir().unwrap();
+        for private in [false, true] {
+            assert!(matches!(
+                management_file(&root.path().join("missing.pem"), private),
+                Err(Error::PermissionDenied(_))
+            ));
+        }
+        root.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn management_files_retain_unix_security_checks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("identity.pem");
+        std::fs::write(&path, b"controller identity").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // The test works for root and unprivileged runners without chown/sudo.
+        if path.metadata().unwrap().uid() == 0 {
+            assert_eq!(
+                management_file(&path, true).unwrap(),
+                b"controller identity"
+            );
+        } else {
+            assert!(matches!(
+                management_file(&path, true),
+                Err(Error::PermissionDenied(_))
+            ));
+        }
+
+        let link = root.path().join("link.pem");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(
+            management_file(&link, true),
+            Err(Error::PermissionDenied(_))
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o622)).unwrap();
+        assert!(matches!(
+            management_file(&path, false),
+            Err(Error::PermissionDenied(_))
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o604)).unwrap();
+        assert!(matches!(
+            management_file(&path, true),
+            Err(Error::PermissionDenied(_))
+        ));
+        root.close().unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn readable_management_files_are_denied_without_unix_security_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("identity.pem");
+        std::fs::write(&path, b"controller identity").unwrap();
+        for private in [false, true] {
+            assert!(matches!(
+                management_file(&path, private),
+                Err(Error::PermissionDenied(_))
+            ));
+        }
+        root.close().unwrap();
     }
 }

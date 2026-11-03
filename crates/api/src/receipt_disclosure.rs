@@ -1,4 +1,4 @@
-//! Receipt source preparation for human transports. This is not an IAM permit:
+//! Receipt source preparation for Access and legacy execution transports. This is not an IAM permit:
 //! G's current source/target matcher must still authorize every disclosed origin.
 use crate::{
     auth::middleware::AuthenticatedUser,
@@ -26,6 +26,12 @@ pub(crate) struct HumanReceiptGuard {
     sources_closed: bool,
     sensor_versions: BTreeSet<i64>,
     iam: Option<iam::HeldIam>,
+    // Token-named legacy caps plus their canonical metadata projection. These
+    // never contain the sponsor's full Access authority or recorded envelopes.
+    legacy_execution_iam: Option<(
+        crate::authz::AuthorizationSnapshot,
+        Vec<attune_common::rbac::Grant>,
+    )>,
     execution_origins: HashMap<i64, Vec<SecretProvenanceRow>>,
 }
 
@@ -48,12 +54,24 @@ impl HumanReceiptGuard {
         } else {
             None
         };
+        let legacy_execution_iam = if user.claims.token_type == TokenType::Execution {
+            Some(
+                crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(
+                    &mut transaction,
+                    user,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             transaction,
             frontier: InputReceiptFrontier::default(),
             sources_closed: false,
             sensor_versions: BTreeSet::new(),
             iam,
+            legacy_execution_iam,
             execution_origins: HashMap::new(),
         })
     }
@@ -140,14 +158,42 @@ impl HumanReceiptGuard {
     pub(crate) fn iam_snapshot(&self) -> Option<crate::authz::AuthorizationSnapshot> {
         self.iam.as_ref().map(iam::HeldIam::snapshot)
     }
+
+    /// A held Access snapshot or the separately retained legacy token caps.
+    /// Recorded credentials never enter either identity-based matcher.
+    pub(crate) fn credential_snapshot(&self) -> Option<crate::authz::AuthorizationSnapshot> {
+        self.iam_snapshot().or_else(|| {
+            self.legacy_execution_iam
+                .as_ref()
+                .map(|(snapshot, _)| snapshot.clone())
+        })
+    }
+
+    /// Preserve the existing metadata predicate's canonical legacy grants,
+    /// distinct from load_snapshot's ownership-narrowed disclosure grants.
+    pub(crate) fn visibility_snapshot(&self) -> Option<crate::authz::AuthorizationSnapshot> {
+        let mut snapshot = self.credential_snapshot()?;
+        if let Some((_, grants)) = &self.legacy_execution_iam {
+            snapshot.grants = grants.clone();
+        }
+        Some(snapshot)
+    }
     pub(crate) fn matches_iam(
         &self,
         caller: &attune_common::rbac::AuthorizationContext,
         grants: &[attune_common::rbac::Grant],
     ) -> bool {
-        self.iam
+        if let Some(iam) = &self.iam {
+            return iam.matches(caller, grants);
+        }
+        self.legacy_execution_iam
             .as_ref()
-            .is_none_or(|iam| iam.matches(caller, grants))
+            .is_none_or(|(snapshot, _)| {
+                snapshot.identity_id == caller.identity_id
+                    && snapshot.identity_attributes == caller.identity_attributes
+                    && snapshot.grants.iter().all(|grant| grants.contains(grant))
+                    && grants.iter().all(|grant| snapshot.grants.contains(grant))
+            })
     }
 
     /// Append selected sensor versions while collecting bytes, before ANY
@@ -158,7 +204,7 @@ impl HumanReceiptGuard {
         versions: &[i64],
     ) -> ApiResult<()> {
         use attune_common::repositories::{
-            artifact::{ArtifactRepository, ArtifactVersionRepository},
+            artifact::ArtifactVersionRepository,
             execution_secret_value::ExecutionSecretValueRepository,
             sensor_schema::{
                 SensorSchemaRepository, ENTITY_SENSOR_GENERATION_CONFIG,
@@ -219,14 +265,9 @@ impl HumanReceiptGuard {
             let selected = ArtifactVersionRepository::find_by_id(&mut *self.transaction, *version)
                 .await?
                 .ok_or_else(|| ApiError::Forbidden("Sensor log version unavailable".into()))?;
-            executions.extend(
-                ArtifactRepository::linked_execution_ids_bounded(
-                    &mut *self.transaction,
-                    selected.artifact,
-                    257,
-                )
-                .await?,
-            );
+            // A selected generation's delivery roots are above. Other versions
+            // of its shared artifact are not sources of this version.
+            executions.extend(selected.execution);
             if rows.len() > 256 || executions.len() > 256 {
                 return Err(ApiError::Forbidden(
                     "Sensor receipt graph exceeds its bound".into(),

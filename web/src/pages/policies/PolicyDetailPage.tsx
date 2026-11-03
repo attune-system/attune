@@ -130,6 +130,9 @@ export default function PolicyDetailPage() {
           <div className="text-sm font-medium text-gray-500">Features</div>
           <div className="mt-2 text-lg font-semibold text-gray-900">
             {[
+              policy.resource_concurrency
+                ? "Shared resource concurrency"
+                : null,
               policy.concurrency ? "Concurrency" : null,
               policy.rate_limit ? "Rate limit" : null,
               policy.quotas.length > 0 ? "Quotas" : null,
@@ -141,6 +144,32 @@ export default function PolicyDetailPage() {
       </div>
 
       <div className="mt-6 grid gap-6 lg:grid-cols-2">
+        {policy.resource_concurrency && (
+          <section className="rounded-lg bg-white p-6 shadow">
+            <h2 className="text-lg font-semibold">
+              Shared resource concurrency
+            </h2>
+            <p className="mt-3 text-sm">
+              Namespace: {policy.resource_concurrency.namespace}
+            </p>
+            <p className="text-sm">
+              Limit: {policy.resource_concurrency.limit}, exhaustion:{" "}
+              {policy.resource_concurrency.method}
+            </p>
+            <ul className="mt-3 space-y-2 text-sm">
+              {policy.resource_concurrency.participants.map((participant) => (
+                <li key={participant.action}>
+                  <code>{participant.action}</code>:{" "}
+                  <code>{participant.resource_parameter}</code>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-3 text-sm text-gray-600">
+              This constraint applies in addition to the effective standard
+              execution policy.
+            </p>
+          </section>
+        )}
         <section className="rounded-lg bg-white p-6 shadow">
           <h2 className="text-lg font-semibold text-gray-900">Concurrency</h2>
           {policy.concurrency ? (

@@ -537,8 +537,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PaginatedResponse<IdentitySummary>,
             PaginatedResponse<WorkflowSummary>,
             PaginationMeta,
-            PaginatedResponse<crate::dto::artifact::ArtifactSummary>,
-            PaginatedResponse<crate::dto::artifact::ArtifactVersionSummary>,
+            crate::dto::artifact::ArtifactCursorPage<crate::dto::artifact::ArtifactSummary>,
+            crate::dto::artifact::ArtifactCursorPage<crate::dto::artifact::ArtifactVersionSummary>,
             SuccessResponse,
 
             // Auth DTOs
@@ -683,6 +683,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PolicyScopeResponse,
             ConcurrencyPolicyRequest,
             ConcurrencyPolicyResponse,
+            attune_common::resource_concurrency::ResourceConcurrency,
+            attune_common::resource_concurrency::ResourceParticipant,
             RateLimitPolicyRequest,
             RateLimitPolicyResponse,
             QuotaPolicyRequest,

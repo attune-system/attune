@@ -15,7 +15,7 @@ use attune_common::{
         worker_delivery::{
             DeliveryContext, DeliveryOperation, DeliveryPermit, WorkerDeliveryRepository,
         },
-        Create, FindById, FindByRef,
+        FindById,
     },
     Error, Result,
 };
@@ -121,29 +121,24 @@ pub async fn allocate_log(
     {
         return Err(Error::PermissionDenied("Log owner identity changed".into()));
     }
-    let artifact = match ArtifactRepository::find_by_ref(&mut *tx, &reference).await? {
-        Some(artifact) => artifact,
-        None => {
-            ArtifactRepository::create(
-                &mut *tx,
-                CreateArtifactInput {
-                    r#ref: reference.clone(),
-                    scope: OwnerType::Action,
-                    owner: execution.action_ref.clone(),
-                    r#type: ArtifactType::FileText,
-                    visibility: ArtifactVisibility::Private,
-                    classification: attune_common::models::ArtifactClassification::RuntimeLog,
-                    retention_policy: policy,
-                    retention_limit: limit,
-                    name: None,
-                    description: None,
-                    content_type: Some("text/plain".into()),
-                    data: None,
-                },
-            )
-            .await?
-        }
-    };
+    let artifact = ArtifactRepository::create_or_get(
+        &mut tx,
+        CreateArtifactInput {
+            r#ref: reference.clone(),
+            scope: OwnerType::Action,
+            owner: execution.action_ref.clone(),
+            r#type: ArtifactType::FileText,
+            visibility: ArtifactVisibility::Private,
+            classification: attune_common::models::ArtifactClassification::RuntimeLog,
+            retention_policy: policy,
+            retention_limit: limit,
+            name: None,
+            description: None,
+            content_type: Some("text/plain".into()),
+            data: None,
+        },
+    )
+    .await?;
     ArtifactRepository::find_by_id_for_update(&mut tx, artifact.id)
         .await?
         .ok_or_else(|| Error::PermissionDenied("Worker log artifact unavailable".into()))?;

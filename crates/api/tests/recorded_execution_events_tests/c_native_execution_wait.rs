@@ -346,8 +346,8 @@ pub(super) async fn execution_wait(
         },
     )
     .await?;
-    let original = KeyRepository::create(
-        &mut *tx,
+    let original = KeyRepository::create_encrypted(
+        &mut tx,
         CreateKeyInput {
             local_ref: "c_wait_original".into(),
             owner_type: OwnerType::Pack,
@@ -360,9 +360,10 @@ pub(super) async fn execution_wait(
             owner_sensor_ref: None,
             name: "Original wait field".into(),
             encrypted: true,
-            encryption_key_hash: Some(attune_common::crypto::hash_encryption_key(key)),
-            value: attune_common::crypto::encrypt_json(&json!("native-wait-original"), key)?,
+            encryption_key_hash: None,
+            value: json!("native-wait-original"),
         },
+        key,
     )
     .await?;
     let consent = PermissionSetRepository::create(&mut *tx, CreatePermissionSetInput {
@@ -1188,9 +1189,10 @@ pub(super) async fn execution_wait(
         &fixture.ctx.pool,
         original.id,
         UpdateKeyInput {
-            value: Some(attune_common::crypto::encrypt_json(
+            value: Some(attune_common::crypto::keystore::encrypt_json(
                 &json!("new-current-key-value"),
                 key,
+                original.id,
             )?),
             ..Default::default()
         },

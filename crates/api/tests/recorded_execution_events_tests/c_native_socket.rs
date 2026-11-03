@@ -90,6 +90,10 @@ pub(super) async fn exercise(
     let frame = tokio::time::timeout(Duration::from_secs(5), socket.socket.next())
         .await?
         .unwrap()?;
+    assert!(
+        frame.is_text(),
+        "baseline metadata delivery requires a Text frame"
+    );
     let body: Value = serde_json::from_str(&frame.into_text()?)?;
     assert!(
         body["type"] == "notification" && body["payload"] == json!({"auth_mode":"deferred"}),
@@ -111,6 +115,12 @@ pub(super) async fn exercise(
         candidate.tx.send(notification)?;
         socket.expect_revoked_close().await?;
     } else {
+        // Keep the registered candidate and original absolute deadline. Start
+        // the target wait near expiry so it crosses that deadline without
+        // exceeding the notifier's independent five-second validation bound.
+        // Holding this lock for the entire thirty-second source lifetime would
+        // correctly close the socket before reaching the boundary under test.
+        super::c_native_transport::expires(deadline - chrono::Duration::seconds(3)).await?;
         let mut held = fixture.ctx.pool.begin().await?;
         ExecutionRepository::find_by_id_for_update(&mut held, execution)
             .await?
@@ -140,6 +150,10 @@ pub(super) async fn exercise(
             let frame = tokio::time::timeout(Duration::from_secs(5), socket.socket.next())
                 .await?
                 .unwrap()?;
+            assert!(
+                frame.is_text(),
+                "authorized metadata requires a Text frame, not a close/control frame"
+            );
             let body: Value = serde_json::from_str(&frame.into_text()?)?;
             assert!(
                 body["type"] == "notification"

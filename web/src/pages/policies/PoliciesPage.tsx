@@ -14,6 +14,13 @@ import {
 function FeatureBadges({ policy }: { policy: PolicySummary }) {
   return (
     <div className="flex flex-wrap gap-1">
+      {policy.resource_concurrency && (
+        <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">
+          Shared resource {policy.resource_concurrency.namespace}:{" "}
+          {policy.resource_concurrency.limit} /{" "}
+          {policy.resource_concurrency.method}
+        </span>
+      )}
       {policy.concurrency && (
         <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">
           Concurrency {policy.concurrency.limit} / {policy.concurrency.method}
@@ -30,6 +37,7 @@ function FeatureBadges({ policy }: { policy: PolicySummary }) {
         </span>
       )}
       {!policy.concurrency &&
+        !policy.resource_concurrency &&
         !policy.rate_limit &&
         policy.quotas.length === 0 && (
           <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-700">
@@ -80,7 +88,9 @@ export default function PoliciesPage() {
       (policy.description ?? "").toLowerCase().includes(normalizedSearch) ||
       policy.tags.some((tag) => tag.toLowerCase().includes(normalizedSearch));
     const matchesMethod =
-      method === "all" || policy.concurrency?.method === method;
+      method === "all" ||
+      policy.concurrency?.method === method ||
+      policy.resource_concurrency?.method === method;
     return matchesSearch && matchesMethod;
   });
   const pagination = data?.pagination;

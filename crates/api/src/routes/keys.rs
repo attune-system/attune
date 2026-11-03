@@ -512,8 +512,9 @@ pub async fn sign_key_jwt(
         .encryption_key
         .as_ref()
         .ok_or_else(|| ApiError::InternalServerError("Encryption key is not configured".into()))?;
-    let value = attune_common::crypto::decrypt_json(&key.value, encryption_key)
-        .map_err(|_| ApiError::InternalServerError("Signing key could not be opened".into()))?;
+    let value =
+        attune_common::crypto::keystore::decrypt_json(&key.value, encryption_key, key.id)
+            .map_err(|_| ApiError::InternalServerError("Signing key could not be opened".into()))?;
     let signing_key: attune_common::key_signing::JwtSigningKey = serde_json::from_value(value)
         .map_err(|_| {
             ApiError::InternalServerError(
@@ -684,11 +685,12 @@ pub async fn get_key(
                         )
                     })?;
 
-            let decrypted_value = attune_common::crypto::decrypt_json(&key.value, encryption_key)
-                .map_err(|e| {
-                tracing::error!("Failed to decrypt key '{}': {}", key_ref, e);
-                ApiError::InternalServerError(format!("Failed to decrypt key: {}", e))
-            })?;
+            let decrypted_value =
+                attune_common::crypto::keystore::decrypt_json(&key.value, encryption_key, key.id)
+                    .map_err(|e| {
+                    tracing::error!("Failed to decrypt key '{}': {}", key_ref, e);
+                    ApiError::InternalServerError(format!("Failed to decrypt key: {}", e))
+                })?;
 
             key.value = decrypted_value;
         } else {
@@ -888,34 +890,7 @@ pub async fn create_key(
         request.value.clone()
     };
 
-    // Validate plaintext before encryption, under the selected assignment.
-    let (value, encryption_key_hash) = if request.encrypted {
-        let encryption_key = state
-            .config
-            .security
-            .encryption_key
-            .as_ref()
-            .ok_or_else(|| {
-                ApiError::BadRequest(
-                    "Cannot encrypt: encryption key not configured on server".to_string(),
-                )
-            })?;
-
-        let encrypted_value = attune_common::crypto::encrypt_json(&plaintext, encryption_key)
-            .map_err(|e| {
-                tracing::error!("Failed to encrypt key value: {}", e);
-                ApiError::InternalServerError(format!("Failed to encrypt value: {}", e))
-            })?;
-
-        let key_hash = attune_common::crypto::hash_encryption_key(encryption_key);
-
-        (encrypted_value, Some(key_hash))
-    } else {
-        // Store in plaintext (not recommended for sensitive data)
-        (plaintext.clone(), None)
-    };
-
-    // Create key input
+    // The repository reserves the immutable ID before encrypting validated input.
     let key_input = CreateKeyInput {
         local_ref: request.local_ref,
         owner_type: request.owner_type,
@@ -928,11 +903,25 @@ pub async fn create_key(
         owner_sensor_ref: resolved_owner.owner_sensor_ref,
         name: request.name,
         encrypted: request.encrypted,
-        encryption_key_hash,
-        value,
+        encryption_key_hash: None,
+        value: plaintext,
     };
 
-    let mut key = KeyRepository::create(&mut *transaction, key_input).await?;
+    let mut key = if key_input.encrypted {
+        let master = state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "Cannot encrypt: encryption key not configured on server".into(),
+                )
+            })?;
+        KeyRepository::create_encrypted(&mut transaction, key_input, master).await?
+    } else {
+        KeyRepository::create(&mut *transaction, key_input).await?
+    };
     KeySchemaRepository::set(&mut transaction, key.id, assignment.as_ref()).await?;
     if let Some(authority) = &recorded {
         authority.ensure_fresh_on(&mut transaction).await?;
@@ -943,10 +932,11 @@ pub async fn create_key(
     if key.encrypted {
         let encryption_key = state.config.security.encryption_key.as_ref().unwrap();
         key.value =
-            attune_common::crypto::decrypt_json(&key.value, encryption_key).map_err(|e| {
-                tracing::error!("Failed to decrypt newly created key: {}", e);
-                ApiError::InternalServerError(format!("Failed to decrypt value: {}", e))
-            })?;
+            attune_common::crypto::keystore::decrypt_json(&key.value, encryption_key, key.id)
+                .map_err(|e| {
+                    tracing::error!("Failed to decrypt newly created key: {}", e);
+                    ApiError::InternalServerError(format!("Failed to decrypt value: {}", e))
+                })?;
     }
 
     emit_key_audit(
@@ -1108,7 +1098,11 @@ pub async fn update_key(
                         .ok_or_else(|| {
                             ApiError::InternalServerError("Encryption key is not configured".into())
                         })?;
-                attune_common::crypto::decrypt_json(&existing.value, encryption_key)?
+                attune_common::crypto::keystore::decrypt_json(
+                    &existing.value,
+                    encryption_key,
+                    existing.id,
+                )?
             } else {
                 existing.value.clone()
             }
@@ -1142,13 +1136,18 @@ pub async fn update_key(
                         )
                     })?;
 
-            let encrypted_value = attune_common::crypto::encrypt_json(&new_value, encryption_key)
-                .map_err(|e| {
+            let encrypted_value = attune_common::crypto::keystore::encrypt_json(
+                &new_value,
+                encryption_key,
+                existing.id,
+            )
+            .map_err(|e| {
                 tracing::error!("Failed to encrypt key value: {}", e);
                 ApiError::InternalServerError(format!("Failed to encrypt value: {}", e))
             })?;
 
-            let key_hash = attune_common::crypto::hash_encryption_key(encryption_key);
+            let key_hash =
+                attune_common::crypto::keystore::fingerprint(encryption_key, existing.id)?;
 
             (Some(encrypted_value), Some(should_encrypt), Some(key_hash))
         } else {
@@ -1225,11 +1224,15 @@ pub async fn update_key(
                 ApiError::InternalServerError("Encryption key not configured on server".to_string())
             })?;
 
-        updated_key.value = attune_common::crypto::decrypt_json(&updated_key.value, encryption_key)
-            .map_err(|e| {
-                tracing::error!("Failed to decrypt updated key '{}': {}", key_ref, e);
-                ApiError::InternalServerError(format!("Failed to decrypt value: {}", e))
-            })?;
+        updated_key.value = attune_common::crypto::keystore::decrypt_json(
+            &updated_key.value,
+            encryption_key,
+            updated_key.id,
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to decrypt updated key '{}': {}", key_ref, e);
+            ApiError::InternalServerError(format!("Failed to decrypt value: {}", e))
+        })?;
     }
     if let Some(authority) = &recorded {
         authority.ensure_fresh_on(&mut transaction).await?;

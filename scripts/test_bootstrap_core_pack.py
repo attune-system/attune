@@ -3,7 +3,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +17,53 @@ bootstrap = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bootstrap)
 
 READY = {"pack_publication": {"protocol_version": 1, "client_version": 1, "revision": bootstrap.BOOTSTRAP_REVISION, "authorization": "registrar", "components": sorted(bootstrap.BOOTSTRAP_COMPONENTS)}}
+
+
+class BootstrapTransportTests(unittest.TestCase):
+    def test_non_http_schemes_and_embedded_credentials_are_rejected_before_io(self):
+        for url in ("file:///etc/hosts", "ftp://example.invalid/core", "data:text/plain,secret",
+                    "http:///missing-host", "https://user:password@example.invalid/core"):
+            with self.subTest(url=url), mock.patch.object(bootstrap.urllib.request, "build_opener") as opener:
+                with self.assertRaises(ValueError):
+                    bootstrap.request(url)
+                opener.assert_not_called()
+
+    def test_http_works_but_redirects_never_forward_publication_credentials(self):
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                received.append((self.path, self.headers.get("Authorization")))
+                if self.path == "/ready":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'{"ready":true}')
+                else:
+                    self.send_response(302)
+                    self.send_header("Location", self.path.removeprefix("/redirect/"))
+                    self.end_headers()
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with bootstrap.request(base_url + "/ready") as response:
+                    self.assertEqual(json.load(response), {"ready": True})
+                for destination in (base_url + "/ready", "http://example.invalid/leak", "file:///etc/hosts"):
+                    with self.subTest(destination=destination):
+                        with self.assertRaises(urllib.error.HTTPError) as error:
+                            bootstrap.request(base_url + "/redirect/" + destination,
+                                              headers={"Authorization": "Bearer fixture"})
+                        error.exception.close()
+                self.assertEqual(len(received), 4, "redirect targets must never receive a request")
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
 
 
 class BootstrapCorePackTests(unittest.TestCase):

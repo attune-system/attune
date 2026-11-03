@@ -18,6 +18,7 @@ pub mod permissions;
 pub mod policy;
 pub mod runtime_policy;
 pub mod schema_types;
+mod source_headers;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ pub use loader::{PackComponentLoader, PackLoadResult};
 pub use outbound::{
     remote_url_origin_for_log, validate_remote_pack_url, OutboundUrlPolicy, ValidatedUrl,
 };
+pub use source_headers::normalize_source_origin;
 pub use storage::{
     calculate_directory_checksum, calculate_file_checksum, verify_checksum, PackReplacement,
     PackStorage,

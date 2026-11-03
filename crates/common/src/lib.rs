@@ -51,6 +51,7 @@ mod policy_control;
 pub mod queue_definition;
 pub mod rbac;
 pub mod repositories;
+pub mod resource_concurrency;
 pub mod runtime_authority;
 pub mod runtime_cache;
 pub mod runtime_detection;

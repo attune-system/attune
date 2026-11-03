@@ -6,24 +6,29 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.artifact_type import ArtifactType
-from ...models.paginated_response_artifact_summary import (
-    PaginatedResponseArtifactSummary,
+from ...models.artifact_cursor_page_artifact_summary import (
+    ArtifactCursorPageArtifactSummary,
 )
+from ...models.artifact_type import ArtifactType
 from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     execution_id: int,
     *,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
     type_: ArtifactType | None | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
 
-    params["page"] = page
+    json_cursor: None | str | Unset
+    if isinstance(cursor, Unset):
+        json_cursor = UNSET
+    else:
+        json_cursor = cursor
+    params["cursor"] = json_cursor
 
     params["per_page"] = per_page
 
@@ -51,9 +56,9 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | PaginatedResponseArtifactSummary | None:
+) -> Any | ArtifactCursorPageArtifactSummary | None:
     if response.status_code == 200:
-        response_200 = PaginatedResponseArtifactSummary.from_dict(response.json())
+        response_200 = ArtifactCursorPageArtifactSummary.from_dict(response.json())
 
         return response_200
 
@@ -69,7 +74,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | PaginatedResponseArtifactSummary]:
+) -> Response[Any | ArtifactCursorPageArtifactSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -82,15 +87,15 @@ def sync_detailed(
     execution_id: int,
     *,
     client: AuthenticatedClient,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
     type_: ArtifactType | None | Unset = UNSET,
-) -> Response[Any | PaginatedResponseArtifactSummary]:
-    """List a disclosure-eligible page of artifacts for a given execution.
+) -> Response[Any | ArtifactCursorPageArtifactSummary]:
+    """List metadata and the highest exact-execution version for each artifact.
 
     Args:
         execution_id (int):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
         type_ (ArtifactType | None | Unset):
 
@@ -99,12 +104,12 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | PaginatedResponseArtifactSummary]
+        Response[Any | ArtifactCursorPageArtifactSummary]
     """
 
     kwargs = _get_kwargs(
         execution_id=execution_id,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
         type_=type_,
     )
@@ -120,15 +125,15 @@ def sync(
     execution_id: int,
     *,
     client: AuthenticatedClient,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
     type_: ArtifactType | None | Unset = UNSET,
-) -> Any | PaginatedResponseArtifactSummary | None:
-    """List a disclosure-eligible page of artifacts for a given execution.
+) -> Any | ArtifactCursorPageArtifactSummary | None:
+    """List metadata and the highest exact-execution version for each artifact.
 
     Args:
         execution_id (int):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
         type_ (ArtifactType | None | Unset):
 
@@ -137,13 +142,13 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | PaginatedResponseArtifactSummary
+        Any | ArtifactCursorPageArtifactSummary
     """
 
     return sync_detailed(
         execution_id=execution_id,
         client=client,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
         type_=type_,
     ).parsed
@@ -153,15 +158,15 @@ async def asyncio_detailed(
     execution_id: int,
     *,
     client: AuthenticatedClient,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
     type_: ArtifactType | None | Unset = UNSET,
-) -> Response[Any | PaginatedResponseArtifactSummary]:
-    """List a disclosure-eligible page of artifacts for a given execution.
+) -> Response[Any | ArtifactCursorPageArtifactSummary]:
+    """List metadata and the highest exact-execution version for each artifact.
 
     Args:
         execution_id (int):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
         type_ (ArtifactType | None | Unset):
 
@@ -170,12 +175,12 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | PaginatedResponseArtifactSummary]
+        Response[Any | ArtifactCursorPageArtifactSummary]
     """
 
     kwargs = _get_kwargs(
         execution_id=execution_id,
-        page=page,
+        cursor=cursor,
         per_page=per_page,
         type_=type_,
     )
@@ -189,15 +194,15 @@ async def asyncio(
     execution_id: int,
     *,
     client: AuthenticatedClient,
-    page: int | Unset = UNSET,
+    cursor: None | str | Unset = UNSET,
     per_page: int | Unset = UNSET,
     type_: ArtifactType | None | Unset = UNSET,
-) -> Any | PaginatedResponseArtifactSummary | None:
-    """List a disclosure-eligible page of artifacts for a given execution.
+) -> Any | ArtifactCursorPageArtifactSummary | None:
+    """List metadata and the highest exact-execution version for each artifact.
 
     Args:
         execution_id (int):
-        page (int | Unset):
+        cursor (None | str | Unset):
         per_page (int | Unset):
         type_ (ArtifactType | None | Unset):
 
@@ -206,14 +211,14 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | PaginatedResponseArtifactSummary
+        Any | ArtifactCursorPageArtifactSummary
     """
 
     return (
         await asyncio_detailed(
             execution_id=execution_id,
             client=client,
-            page=page,
+            cursor=cursor,
             per_page=per_page,
             type_=type_,
         )

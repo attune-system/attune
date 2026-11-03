@@ -231,8 +231,11 @@ More specific secrets override less specific ones with the same name.
 
 **Encryption**:
 - Algorithm: AES-256-GCM (authenticated encryption)
-- Key derivation: SHA-256 hash of configured password
-- Format: `nonce:ciphertext` (Base64-encoded)
+- Key derivation: SHA-256 of the cryptographically random configured server secret
+- Format: one Base64 string encoding `nonce || ciphertext || authentication_tag`
+- Stored verifier: domain-separated SHA-256 of the AES key, never the AES key itself.
+  See [fingerprint remediation](../deployment/encryption-fingerprint-remediation.md)
+  before upgrading a populated installation.
 - Random nonce per encryption operation
 
 **Key Implementation Details**:

@@ -17,13 +17,21 @@ type FormFields = {
   url: string;
   enabled: boolean;
   headers: string;
+  sourceHeaders: string;
 };
 type IndexForm = FormFields &
   ({ kind: "create" } | { kind: "edit"; id: number });
 type Feedback = { kind: "success" | "error"; text: string };
 
 function newForm(): IndexForm {
-  return { kind: "create", name: "", url: "", enabled: true, headers: "{}" };
+  return {
+    kind: "create",
+    name: "",
+    url: "",
+    enabled: true,
+    headers: "{}",
+    sourceHeaders: "{}",
+  };
 }
 
 function parseHeaders(text: string): Record<string, string> {
@@ -46,6 +54,28 @@ function parseHeaders(text: string): Record<string, string> {
     entries.push([name, header]);
   }
   return Object.fromEntries(entries);
+}
+
+function parseSourceHeaders(
+  text: string,
+): Record<string, Record<string, string>> {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error("Source headers must be valid JSON keyed by HTTPS origin.");
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(
+      "Source headers must be a JSON object keyed by HTTPS origin.",
+    );
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([origin, headers]) => [
+      origin,
+      parseHeaders(JSON.stringify(headers)),
+    ]),
+  );
 }
 
 function errorMessage(error: unknown): string {
@@ -112,6 +142,7 @@ export default function PackIndicesModal({ onClose }: { onClose: () => void }) {
       url: index.url,
       enabled: index.enabled,
       headers: JSON.stringify(index.headers, null, 2),
+      sourceHeaders: JSON.stringify(index.source_headers, null, 2),
     });
     nameInput.current?.focus();
   }
@@ -125,11 +156,17 @@ export default function PackIndicesModal({ onClose }: { onClose: () => void }) {
         url: form.url.trim(),
         enabled: form.enabled,
         headers,
+        source_headers: parseSourceHeaders(form.sourceHeaders),
       };
       if (form.kind === "edit") {
         await updateIndex.mutateAsync({ id: form.id, data });
       } else {
-        if (Object.values(headers).includes("[REDACTED]")) {
+        if (
+          Object.values(headers).includes("[REDACTED]") ||
+          Object.values(data.source_headers).some((sourceHeaders) =>
+            Object.values(sourceHeaders).includes("[REDACTED]"),
+          )
+        ) {
           throw new Error(
             "Enter a value for each new HTTP header; [REDACTED] only preserves existing headers when editing.",
           );
@@ -332,6 +369,36 @@ export default function PackIndicesModal({ onClose }: { onClose: () => void }) {
                   to preserve a value, or use {"{}"} to remove all headers.
                 </p>
               </div>
+              <div>
+                <label
+                  htmlFor="index-source-headers"
+                  className="block text-sm font-medium mb-1"
+                >
+                  Source headers by origin
+                </label>
+                <textarea
+                  id="index-source-headers"
+                  rows={5}
+                  spellCheck={false}
+                  autoComplete="off"
+                  value={form.sourceHeaders}
+                  onChange={(event) =>
+                    setForm({ ...form, sourceHeaders: event.target.value })
+                  }
+                  placeholder={
+                    '{"https://artifacts.example.com":{"Authorization":"Bearer token"}}'
+                  }
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg font-mono text-sm"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  JSON object mapping exact HTTPS origins to headers for archive
+                  downloads and Git clones. Same-origin values override index
+                  headers. Other origins receive only their own headers. No
+                  paths or wildcards; network approval is still required. Values
+                  are encrypted. Keep [REDACTED] to preserve a value for the
+                  same origin and header, or use {"{}"} to remove all overrides.
+                </p>
+              </div>
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
@@ -409,6 +476,13 @@ export default function PackIndicesModal({ onClose }: { onClose: () => void }) {
                         : "Checked after earlier indices"}
                       . Headers:{" "}
                       {Object.keys(index.headers).join(", ") || "none"}.
+                      {Object.keys(index.source_headers).length > 0 && (
+                        <span>
+                          {" "}
+                          Source header origins:{" "}
+                          {Object.keys(index.source_headers).join(", ")}.
+                        </span>
+                      )}
                     </div>
                     {isPinnedUrl(index.url) && (
                       <p className="text-xs text-amber-800">

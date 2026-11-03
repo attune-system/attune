@@ -2236,10 +2236,14 @@ fn decrypt_key_for_display(
         .ok_or_else(|| {
             ApiError::InternalServerError("Encryption key not configured on server".to_string())
         })?;
-    let decrypted =
-        attune_common::crypto::decrypt_json(&key.value, encryption_key).map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to decrypt key '{}': {}", key.r#ref, e))
-        })?;
+    let decrypted = attune_common::crypto::keystore::decrypt_json(
+        &key.value,
+        encryption_key,
+        key.id,
+    )
+    .map_err(|e| {
+        ApiError::InternalServerError(format!("Failed to decrypt key '{}': {}", key.r#ref, e))
+    })?;
 
     Ok(Some(decrypted))
 }

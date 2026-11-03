@@ -201,6 +201,29 @@ impl EventOriginSnapshot {
 }
 
 pub struct EventOriginRepository;
+
+pub(in crate::repositories) fn convert_encryption_metadata(
+    value: &serde_json::Value,
+    conversion: &super::encryption_conversion::VerifierConversion<'_>,
+) -> Result<serde_json::Value> {
+    let mut snapshot: EventOriginSnapshot = serde_json::from_value(value.clone())?;
+    snapshot.validate()?;
+    if serde_json::to_value(&snapshot)? != *value {
+        return Err(corrupt());
+    }
+    let evidence = serde_json::to_value(snapshot.evidence()?)?;
+    for field in snapshot
+        .payload
+        .iter_mut()
+        .chain(snapshot.config.iter_mut())
+    {
+        conversion.prepared(field)?;
+    }
+    if serde_json::to_value(snapshot.evidence()?)? != evidence {
+        return Err(corrupt());
+    }
+    Ok(serde_json::to_value(snapshot)?)
+}
 fn denied() -> Error {
     Error::PermissionDenied("Exact event source is unavailable".into())
 }

@@ -1728,6 +1728,7 @@ impl RuntimeAuthorityRepository {
 
     /// Must be called within the transaction that performs the protected effect.
     /// It never loads the requesting human or the approval issuer.
+    #[tracing::instrument(name = "runtime_authority_validation", level = "debug", skip_all)]
     pub async fn validate_execution_credential(
         connection: &mut PgConnection,
         credential: &RuntimeCredentialBinding,
@@ -1749,6 +1750,7 @@ impl RuntimeAuthorityRepository {
             })?;
         let (policy, policy_fence) =
             lock_policy_with_deadline(connection, initial.policy_revision).await?;
+        tracing::debug!(stage = "policy", "Runtime authority stage completed");
         let authority = &initial.authority;
         let status = lock_runtime_owner(
             connection,
@@ -1756,6 +1758,7 @@ impl RuntimeAuthorityRepository {
             authority,
         )
         .await?;
+        tracing::debug!(stage = "owner", "Runtime authority stage completed");
         if status != "running" {
             return Err(Error::PermissionDenied(
                 "Execution no longer permits runtime effects".into(),
@@ -1781,6 +1784,7 @@ impl RuntimeAuthorityRepository {
             ));
         }
         let dependency_fence = validate_admission_dependencies(connection, &record).await?;
+        tracing::debug!(stage = "dependencies", "Runtime authority stage completed");
         let attempt: Option<Uuid> = sqlx::query_scalar(
             "SELECT attempt FROM runtime_authority_execution_fence \
              WHERE execution = $1 AND admission = $2 FOR SHARE",
@@ -1800,6 +1804,7 @@ impl RuntimeAuthorityRepository {
             &record.authority.grants.iter().collect::<Vec<_>>(),
         )
         .await?;
+        tracing::debug!(stage = "approvals", "Runtime authority stage completed");
         let effect_fence = policy_fence
             .intersect(&dependency_fence)
             .intersect(&approvals.fence);
@@ -1829,6 +1834,10 @@ impl RuntimeAuthorityRepository {
             BTreeSet::new()
         };
         effect_fence.ensure_fresh_on(connection).await?;
+        tracing::debug!(
+            stage = "database_clock",
+            "Runtime authority stage completed"
+        );
         Ok(ValidatedRuntimeAuthority {
             record,
             approvals: approvals.ids,
@@ -1861,6 +1870,7 @@ impl RuntimeAuthorityRepository {
     }
 }
 
+#[tracing::instrument(name = "runtime_sponsor_validation", level = "debug", skip_all)]
 pub(crate) async fn lock_sponsor(
     connection: &mut PgConnection,
     owner: &PackAuthorityOwner,
@@ -1870,6 +1880,7 @@ pub(crate) async fn lock_sponsor(
             .bind(owner.pack_id)
             .fetch_optional(&mut *connection)
             .await?;
+    tracing::debug!(stage = "pack_lookup", "Runtime authority stage completed");
     if reference.as_deref() != Some(owner.pack_ref.as_str()) {
         return Err(Error::PermissionDenied(
             "Runtime sponsor pack is unavailable".into(),
@@ -1880,6 +1891,10 @@ pub(crate) async fn lock_sponsor(
             .bind(owner.pack_id)
             .fetch_optional(&mut *connection)
             .await?;
+    tracing::debug!(
+        stage = "sponsor_binding",
+        "Runtime authority stage completed"
+    );
     if identity != Some(owner.sponsor_identity_id) {
         return Err(Error::PermissionDenied(
             "Runtime sponsor ownership is unavailable".into(),
@@ -1887,6 +1902,10 @@ pub(crate) async fn lock_sponsor(
     }
     let sponsor =
         IdentityRepository::find_by_id_for_share(connection, owner.sponsor_identity_id).await?;
+    tracing::debug!(
+        stage = "sponsor_identity",
+        "Runtime authority stage completed"
+    );
     if sponsor.is_none_or(|identity| identity.frozen) {
         return Err(Error::PermissionDenied(
             "System runtime sponsor is suspended".into(),

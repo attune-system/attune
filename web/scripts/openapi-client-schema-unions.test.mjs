@@ -10,6 +10,19 @@ const branch = (tag, literal) => ({
   properties: { [tag]: { type: "string", enum: [literal] } },
 });
 
+test("local references never follow inherited properties, but allow own prototype-like names", () => {
+  for (const name of ["constructor", "__proto__", "prototype"]) {
+    const schemas = { Model: { oneOf: [branch("kind", "a"), ref(name)] } };
+    Object.setPrototypeOf(schemas, { [name]: branch("kind", "b") });
+    assert.deepEqual(discriminatedModels(document(schemas)), []);
+    Object.defineProperty(schemas, name, {
+      value: branch("kind", "b"),
+      enumerable: true,
+    });
+    assert.deepEqual(discriminatedModels(document(schemas)), ["Model"]);
+  }
+});
+
 // Retained wire shapes from openapi-public-input-binary.json. These models
 // intentionally have no explicit OpenAPI discriminator.
 const approvalPurpose = {

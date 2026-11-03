@@ -218,9 +218,12 @@ secrets. Their plaintext also requires read access to every recorded Key, plus
 decrypt access for encrypted Keys. Streams recheck these origins before each
 frame. Service mirroring and status/alert stderr excerpts remain disabled for
 these potentially sensitive generations.
-The bundled `core.admin` role grants trigger management, not `triggers:decrypt`.
-Assign an explicit sensor-scoped decrypt grant when an operator needs plaintext
-logs from an SDK-capable sensor.
+Catalog revision 3 adds global `triggers:decrypt` to the bundled `core.admin`
+permission set, alongside the other supported disclosure grants. Earlier catalogs
+omit this authority. For operators who do not need full administrator access,
+assign sensor-scoped `triggers:update` and `triggers:decrypt` grants instead.
+The decrypt requirement does not imply that a particular log line contains a
+secret; it protects logs from a generation capable of obtaining pack-owned Keys.
 
 ## Key values and approved operations
 
@@ -298,6 +301,16 @@ Secret action outputs conservatively inherit all secret input origins because ar
 Sensitive actions also encrypt raw stdout and error text, so those fields cannot duplicate protected structured output.
 Runtime-log reads require execution read and decrypt authority plus disclosure rights on every recorded secret origin when inputs or declared outputs are sensitive.
 This check covers direct execution streams and runtime-log artifacts.
+
+For human Access-token runtime-log browsing, safe artifact headers and visible
+version summaries are metadata, not grants to disclose a body. Content authority
+is evaluated against the exact selected version and its producing execution (or
+sensor generation), including all of that content's required recorded sources.
+Unrelated versions in the same shared action-level log container neither grant
+nor deny access to the selected body. Each selected source graph remains bounded,
+and guarded chunks/frames recheck revocation and freshness. Recorded credentials
+retain their separate typed-consumer restrictions. See
+[Artifact reads](../api/artifact-reads.md) for metadata fields and selection rules.
 
 Workers recheck recorded key origins before restoring secret action parameters.
 Local caller-supplied values can pass through unattributed batches without granting key or API authority.

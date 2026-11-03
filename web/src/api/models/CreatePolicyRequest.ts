@@ -6,6 +6,7 @@ import type { ConcurrencyPolicyRequest } from "./ConcurrencyPolicyRequest";
 import type { PolicyScopeRequest } from "./PolicyScopeRequest";
 import type { QuotaPolicyRequest } from "./QuotaPolicyRequest";
 import type { RateLimitPolicyRequest } from "./RateLimitPolicyRequest";
+import type { ResourceConcurrency } from "./ResourceConcurrency";
 export type CreatePolicyRequest = {
   concurrency?: null | ConcurrencyPolicyRequest;
   description?: string | null;
@@ -15,6 +16,7 @@ export type CreatePolicyRequest = {
   quotas?: Array<QuotaPolicyRequest>;
   rate_limit?: null | RateLimitPolicyRequest;
   ref: string;
+  resource_concurrency?: null | ResourceConcurrency;
   scope: PolicyScopeRequest;
   tags?: Array<string>;
 };

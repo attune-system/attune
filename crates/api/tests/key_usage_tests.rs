@@ -2,7 +2,6 @@ mod helpers;
 
 use attune_common::{
     auth::jwt::{generate_execution_token_with_permission_sets, validate_token, JwtConfig},
-    crypto,
     models::{
         ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
     },
@@ -28,6 +27,117 @@ use attune_common::{
 use axum::http::StatusCode;
 use helpers::{Result, TestContext};
 use serde_json::{json, Value};
+
+#[tokio::test]
+async fn key_api_binds_ciphertext_to_identity_across_rename_update_and_encryption_toggles(
+) -> Result<()> {
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let identity = validate_token(ctx.token().unwrap(), &jwt_config(&ctx))?
+        .sub
+        .parse::<i64>()?;
+    grant(
+        &ctx,
+        identity,
+        "fixture.key_isolation",
+        json!([
+            {"resource":"keys","actions":["create","read","decrypt","update"],
+             "constraints":{"refs":["system.isolation_a","system.isolation_b"]}}
+        ]),
+    )
+    .await?;
+    let value = json!({"credential":"synthetic-api-only"});
+    for local in ["isolation_a", "isolation_b"] {
+        let response = ctx
+            .post(
+                "/api/v1/keys",
+                json!({"local_ref":local,"owner_type":"system",
+            "name":local,"value":value,"encrypted":true}),
+                ctx.token(),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.json::<Value>().await?["data"]["value"], value);
+    }
+    let a = KeyRepository::find_by_ref(&ctx.pool, "system.isolation_a")
+        .await?
+        .unwrap();
+    let b = KeyRepository::find_by_ref(&ctx.pool, "system.isolation_b")
+        .await?
+        .unwrap();
+    assert_ne!(a.id, b.id);
+    assert!(
+        a.encryption_key_hash != b.encryption_key_hash,
+        "Records must have distinct verifiers"
+    );
+    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+    assert_eq!(
+        attune_common::crypto::keystore::decrypt_json(&a.value, master, a.id)?,
+        value
+    );
+    assert!(attune_common::crypto::keystore::decrypt_json(&a.value, master, b.id).is_err());
+    let path = "/api/v1/keys/system.isolation_a";
+    assert_eq!(
+        ctx.put(path, json!({"name":"Renamed isolation key"}), ctx.token())
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let renamed = KeyRepository::find_by_ref(&ctx.pool, "system.isolation_a")
+        .await?
+        .unwrap();
+    assert_eq!(renamed.id, a.id);
+    assert_eq!(renamed.value, a.value);
+    assert!(renamed.encryption_key_hash == a.encryption_key_hash);
+    assert_eq!(
+        ctx.get(path, ctx.token()).await?.json::<Value>().await?["data"]["value"],
+        value
+    );
+    let updated = json!({"credential":"synthetic-updated-only"});
+    assert_eq!(
+        ctx.put(path, json!({"value":updated}), ctx.token())
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    for encrypted in [false, true] {
+        let response = ctx
+            .put(path, json!({"encrypted":encrypted}), ctx.token())
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<Value>().await?["data"]["value"], updated);
+        let stored = KeyRepository::find_by_ref(&ctx.pool, "system.isolation_a")
+            .await?
+            .unwrap();
+        assert_eq!(stored.id, a.id);
+        if encrypted {
+            assert_eq!(
+                attune_common::crypto::keystore::decrypt_json(&stored.value, master, stored.id)?,
+                updated
+            );
+        } else {
+            assert_eq!(stored.value, updated);
+            assert!(stored.encryption_key_hash.is_none());
+        }
+    }
+    // Exercise the real read boundary against a database-level ciphertext move.
+    KeyRepository::update(
+        &ctx.pool,
+        b.id,
+        attune_common::repositories::key::UpdateKeyInput {
+            value: Some(a.value),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(
+        ctx.get("/api/v1/keys/system.isolation_b", ctx.token())
+            .await?
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze() -> Result<()> {
@@ -454,15 +564,18 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
     ctx.get(&artifact_stream_path, Some(&refresh_token))
         .await?
         .assert_status(StatusCode::UNAUTHORIZED);
+    // Artifact delivery masks selected-source disclosure denials as 404,
+    // including sensor-backed versions relabeled as general artifacts. The
+    // dedicated sensor-log endpoint retains its explicit 403 contract.
     ctx.get(&artifact_stream_path, Some(&read_token))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::NOT_FOUND);
     ctx.get(&sensor_log_path, Some(&read_token))
         .await?
         .assert_status(StatusCode::FORBIDDEN);
     ctx.get(&artifact_log_path, Some(&read_token))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::NOT_FOUND);
     ArtifactRepository::update(
         &ctx.pool,
         artifact.id,
@@ -477,7 +590,7 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
     .await?;
     ctx.get(&artifact_log_path, Some(&read_token))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::NOT_FOUND);
     ArtifactRepository::update(
         &ctx.pool,
         artifact.id,
@@ -570,7 +683,7 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
         .assert_status(StatusCode::OK)
         .into_response();
     let encryption = ctx.state.config.security.encryption_key.as_ref().unwrap();
-    let sdk_key = KeyRepository::create(
+    let sdk_key = KeyRepository::create_encrypted_in_pool(
         &ctx.pool,
         CreateKeyInput {
             local_ref: "runtime_sdk".into(),
@@ -584,9 +697,10 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
             owner_sensor_ref: None,
             name: "Runtime SDK fixture".into(),
             encrypted: true,
-            encryption_key_hash: Some(crypto::hash_encryption_key(encryption)),
-            value: crypto::encrypt_json(&json!("runtime-sdk-secret-fixture"), encryption)?,
+            encryption_key_hash: None,
+            value: json!("runtime-sdk-secret-fixture"),
         },
+        encryption,
     )
     .await?;
     // Implicit pack access remains available independently of installer access.
@@ -833,7 +947,7 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
         .assert_status(StatusCode::FORBIDDEN);
     ctx.get(&artifact_log_path, Some(&read_token))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::NOT_FOUND);
     assert!(attune_api::secret_disclosure::authorize_sensor_runtime_log(
         &ctx.state,
         &read_user,
@@ -894,7 +1008,7 @@ async fn system_key(
     value: Value,
 ) -> Result<attune_common::models::Key> {
     let encryption = ctx.state.config.security.encryption_key.as_ref().unwrap();
-    Ok(KeyRepository::create(
+    Ok(KeyRepository::create_encrypted_in_pool(
         &ctx.pool,
         CreateKeyInput {
             local_ref: local_ref.into(),
@@ -908,9 +1022,10 @@ async fn system_key(
             owner_sensor_ref: None,
             name: format!("{local_ref} fixture key"),
             encrypted: true,
-            encryption_key_hash: Some(crypto::hash_encryption_key(encryption)),
-            value: crypto::encrypt_json(&value, encryption)?,
+            encryption_key_hash: None,
+            value,
         },
+        encryption,
     )
     .await?)
 }
@@ -1489,10 +1604,34 @@ async fn execution_decrypt_does_not_override_recorded_key_disclosure_authority()
     let response = ctx
         .get(&format!("/api/v1/artifacts/{}", artifact.id), ctx.token())
         .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let header: Value = response.json().await?;
+    for field in [
+        "data",
+        "description",
+        "meta",
+        "file_path",
+        "content_type",
+        "size_bytes",
+    ] {
+        assert!(
+            header["data"].get(field).is_none(),
+            "header exposed {field}"
+        );
+    }
+    let response = ctx
+        .get(
+            &format!("/api/v1/artifacts/{}/versions/1", artifact.id),
+            ctx.token(),
+        )
+        .await?;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     grant(&ctx,identity,"fixture.key_decrypt",json!([{ "resource":"keys","actions":["decrypt"],"constraints":{"owner_types":["system"],"refs":["system.salesforce_signer"]}}])).await?;
     let response = ctx
-        .get(&format!("/api/v1/artifacts/{}", artifact.id), ctx.token())
+        .get(
+            &format!("/api/v1/artifacts/{}/versions/1", artifact.id),
+            ctx.token(),
+        )
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let response = ctx

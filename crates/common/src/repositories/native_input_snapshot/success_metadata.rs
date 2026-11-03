@@ -72,6 +72,41 @@ pub(super) struct SuccessSource {
     value_digest: String,
 }
 
+pub(super) fn convert_encryption_metadata(
+    source: &mut SuccessSource,
+    conversion: &crate::repositories::encryption_conversion::VerifierConversion<'_>,
+    depth: usize,
+) -> Result<()> {
+    for witness in &mut source.empty_sources {
+        super::empty_success::convert_encryption_metadata(witness, conversion, depth)?;
+    }
+    for (_, fields) in &mut source.child_input_fields {
+        super::encryption_conversion::fields(fields, conversion)?;
+    }
+    for fields in [
+        &mut source.config_fields,
+        &mut source.result_fields,
+        &mut source.variable_fields,
+    ] {
+        super::encryption_conversion::fields(fields, conversion)?;
+    }
+    for contributor in &source.root_contributors {
+        contributor.validate()?;
+    }
+    for child in &mut source.children {
+        super::result_view::convert_encryption_metadata(child, conversion)?;
+    }
+    for leaf in &mut source.leaves {
+        if hash(&leaf.proof)? != leaf.proof_digest {
+            return Err(denied());
+        }
+        let mut fingerprint = Some(leaf.key_hash.clone());
+        conversion.field(&leaf.encrypted_value, &mut fingerprint)?;
+        leaf.key_hash = fingerprint.ok_or_else(denied)?;
+    }
+    Ok(())
+}
+
 fn serialize_archived_parent<S: serde::Serializer>(
     parent: &Execution,
     serializer: S,

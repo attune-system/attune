@@ -566,46 +566,70 @@ pub(crate) async fn artifact_summaries(
     pool: &PgPool,
     user: &AuthenticatedUser,
     filters: &attune_common::repositories::artifact::ArtifactSearchFilters,
-) -> ApiResult<
-    attune_common::repositories::artifact::ArtifactSearchResult<
-        attune_common::repositories::artifact::ArtifactSummaryRow,
-    >,
-> {
-    use attune_common::repositories::artifact::{ArtifactSearchResult, ARTIFACT_READ_BATCH_SIZE};
+    cursor: &crate::artifact_cursor::Cursor,
+    execution_scoped: bool,
+) -> ApiResult<crate::dto::artifact::ArtifactCursorPage<crate::dto::artifact::ArtifactSummary>> {
+    use crate::{artifact_cursor::Position, dto::artifact::ArtifactSummary};
     let mut source = pool.begin().await?;
     let authority = user
         .recorded_runtime_authority(&mut source)
         .await?
         .ok_or_else(|| ApiError::Forbidden("Recorded authority required".into()))?;
     let fence = authority.effect_fence().clone();
-    source.commit().await?;
-    let mut after = None;
-    let mut rows = Vec::new();
-    let mut total = 0;
-    loop {
-        let candidates = ArtifactRepository::scan_summaries(pool, filters, None, after).await?;
-        let count = candidates.len();
-        let Some(last) = candidates.last() else {
-            break;
-        };
-        after = Some((last.created, last.id));
-        for candidate in candidates {
-            match artifact_read(pool, user, candidate.id).await {
-                Ok(()) => {
-                    if total >= i64::from(filters.offset) && rows.len() < filters.limit as usize {
-                        rows.push(candidate);
-                    }
-                    total += 1;
-                }
-                Err(ApiError::Forbidden(_) | ApiError::NotFound(_)) => {}
-                Err(error) => return Err(error),
-            }
+    if execution_scoped {
+        let execution = filters.execution.ok_or_else(|| {
+            ApiError::BadRequest("Execution artifact selection requires an execution".into())
+        })?;
+        // Keep the existing SDK own-execution exemption; standard artifact
+        // access does not itself grant a general execution-read permission.
+        if execution != authority.credential_binding().execution_id {
+            crate::recorded_disclosure::require_target(
+                &mut source,
+                &authority,
+                RuntimeTarget::Execution(execution),
+                &[Action::Read],
+            )
+            .await?;
         }
-        if count < ARTIFACT_READ_BATCH_SIZE {
-            break;
+    }
+    source.commit().await?;
+    // One bounded candidate page, not an unbounded search for readable rows.
+    // Empty pages retain a cursor when denied candidates precede more history.
+    let mut candidate_filters = filters.clone();
+    candidate_filters.limit = filters.limit + 1;
+    let mut candidates: Vec<ArtifactSummary> = if execution_scoped {
+        ArtifactRepository::scan_execution_summaries(
+            pool,
+            &candidate_filters,
+            None,
+            cursor.artifact_after(),
+        )
+        .await?
+        .into_iter()
+        .map(ArtifactSummary::from)
+        .collect()
+    } else {
+        ArtifactRepository::scan_summaries(pool, &candidate_filters, None, cursor.artifact_after())
+            .await?
+            .into_iter()
+            .map(ArtifactSummary::from)
+            .collect()
+    };
+    let has_more = candidates.len() > filters.limit as usize;
+    candidates.truncate(filters.limit as usize);
+    let after = candidates.last().map(|row| Position::Artifact {
+        created: row.created,
+        id: row.id,
+    });
+    let mut rows = Vec::new();
+    for candidate in candidates {
+        match artifact_read(pool, user, candidate.id).await {
+            Ok(()) => rows.push(candidate),
+            Err(ApiError::Forbidden(_) | ApiError::NotFound(_)) => {}
+            Err(error) => return Err(error),
         }
     }
     let mut connection = pool.acquire().await?;
     fence.ensure_fresh_on(&mut connection).await?;
-    Ok(ArtifactSearchResult { rows, total })
+    cursor.scanned_page(rows, has_more, after)
 }

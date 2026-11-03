@@ -61,6 +61,8 @@ use wait_completion::WaitCompletionSource;
 pub use wait_completion::{NativeWaitCompletionEvidence, NativeWaitCompletionRegistration};
 
 const MAX_BYTES: usize = 1024 * 1024;
+mod encryption_conversion;
+pub(in crate::repositories) use encryption_conversion::convert_encryption_metadata;
 mod prospective_wait;
 pub use prospective_wait::{PreparedWaitRegistration, RegisteredInitialWait};
 #[derive(Clone, Serialize, Deserialize)]

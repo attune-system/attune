@@ -150,6 +150,7 @@ impl PolicyListParams {
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct CreatePolicyRequest {
+    pub resource_concurrency: Option<attune_common::resource_concurrency::ResourceConcurrency>,
     #[validate(length(min = 1, max = 255))]
     #[schema(example = "core.limit_echo")]
     pub r#ref: String,
@@ -187,6 +188,9 @@ pub struct CreatePolicyRequest {
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct UpdatePolicyRequest {
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub resource_concurrency:
+        Option<Option<attune_common::resource_concurrency::ResourceConcurrency>>,
     #[validate(length(min = 1, max = 255))]
     #[schema(example = "Limit echo executions")]
     pub name: Option<String>,
@@ -231,6 +235,7 @@ pub struct UpdatePolicyRequest {
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PolicySummary {
+    pub resource_concurrency: Option<attune_common::resource_concurrency::ResourceConcurrency>,
     pub id: i64,
     pub r#ref: String,
     pub name: String,
@@ -249,6 +254,7 @@ pub struct PolicySummary {
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PolicyResponse {
+    pub resource_concurrency: Option<attune_common::resource_concurrency::ResourceConcurrency>,
     pub id: i64,
     pub r#ref: String,
     pub name: String,
@@ -269,6 +275,7 @@ impl From<Policy> for PolicySummary {
     fn from(policy: Policy) -> Self {
         let detail = PolicyResponse::from(policy);
         Self {
+            resource_concurrency: detail.resource_concurrency,
             id: detail.id,
             r#ref: detail.r#ref,
             name: detail.name,
@@ -299,6 +306,7 @@ impl From<Policy> for PolicyResponse {
 
         Self {
             id: policy.id,
+            resource_concurrency: policy.resource_concurrency.map(|value| value.0),
             r#ref: policy.r#ref,
             name: policy.name,
             description: policy.description,

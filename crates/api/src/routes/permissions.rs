@@ -1542,59 +1542,7 @@ fn validate_permission_grants(grants: &serde_json::Value) -> ApiResult<()> {
 }
 
 fn validate_grant_actions(grant: &attune_common::rbac::Grant) -> ApiResult<()> {
-    let allowed = match grant.resource {
-        Resource::Packs => &[
-            Action::Read,
-            Action::Create,
-            Action::Install,
-            Action::Configure,
-            Action::Delete,
-        ][..],
-        Resource::Actions => &[
-            Action::Read,
-            Action::Create,
-            Action::Update,
-            Action::Delete,
-            Action::Execute,
-        ][..],
-        Resource::Policies => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Queues => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::QueueItems => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Rules => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Triggers => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Executions => &[
-            Action::Read,
-            Action::Update,
-            Action::Cancel,
-            Action::Decrypt,
-        ][..],
-        Resource::Events => &[Action::Read, Action::Decrypt][..],
-        Resource::Enforcements => &[Action::Read, Action::Decrypt][..],
-        Resource::Inquiries => &[
-            Action::Read,
-            Action::Create,
-            Action::Update,
-            Action::Delete,
-            Action::Respond,
-        ][..],
-        Resource::Keys => &[
-            Action::Read,
-            Action::Create,
-            Action::Update,
-            Action::Delete,
-            Action::Decrypt,
-            Action::Use,
-        ][..],
-        Resource::Caches => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Artifacts => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Runtimes => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Workers => &[Action::Read, Action::Manage][..],
-        Resource::Dashboards => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Retention => &[Action::Read, Action::Update][..],
-        Resource::Identities => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
-        Resource::Permissions => &[Action::Read, Action::Manage][..],
-        Resource::AuditLog => &[Action::Read][..],
-    };
+    let allowed = grant.resource.supported_actions();
 
     if grant.actions.is_empty() || grant.actions.iter().any(|action| !allowed.contains(action)) {
         return Err(ApiError::BadRequest(format!(
@@ -1917,6 +1865,69 @@ async fn set_identity_frozen(
 mod tests {
     use super::validate_permission_grants;
     use serde_json::json;
+
+    #[test]
+    fn editor_grant_options_pass_the_actual_permission_validator() {
+        let options: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            include_str!("../../../../web/src/test/fixtures/permission-grant-options.json"),
+        )
+        .unwrap();
+        for (resource, actions) in options {
+            validate_permission_grants(&json!([{
+                "resource": resource,
+                "actions": actions,
+            }]))
+            .unwrap_or_else(|error| panic!("Editor options for {resource} rejected: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn every_supported_resource_action_is_authorable() {
+        use attune_common::rbac::Resource;
+        for resource in Resource::ALL {
+            validate_permission_grants(&json!([{
+                "resource": resource,
+                "actions": resource.supported_actions()
+            }]))
+            .unwrap_or_else(|error| panic!("{resource:?} rejected: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn global_disclosure_and_event_publication_grants_are_valid() {
+        for (resource, action) in [
+            ("packs", "decrypt"),
+            ("queues", "decrypt"),
+            ("queue_items", "decrypt"),
+            ("rules", "decrypt"),
+            ("triggers", "decrypt"),
+            ("artifacts", "decrypt"),
+            ("inquiries", "decrypt"),
+            ("events", "create"),
+        ] {
+            validate_permission_grants(&json!([{
+                "resource": resource,
+                "actions": [action]
+            }]))
+            .unwrap_or_else(|error| panic!("{resource}:{action} rejected: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn unrelated_unsupported_actions_remain_invalid() {
+        for (resource, action) in [
+            ("caches", "decrypt"),
+            ("workers", "delete"),
+            ("retention", "execute"),
+            ("permissions", "create"),
+        ] {
+            assert!(validate_permission_grants(&json!([{
+                "resource": resource,
+                "actions": [action]
+            }]))
+            .is_err());
+        }
+    }
 
     #[test]
     fn cache_owner_refs_accept_owner_and_namespace_scopes() {

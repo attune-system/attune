@@ -24,15 +24,20 @@ fn stage(label: &'static str) {
 
 #[tokio::test]
 async fn ordinary_completion_and_action_data_view_keep_files_after_each_raw_child_is_gone() {
-    custody_case(false).await;
+    custody_case(false, false).await;
 }
 
 #[tokio::test]
 async fn ordinary_archives_require_actual_typed_release_and_original_child_contract() {
-    custody_case(true).await;
+    custody_case(true, false).await;
 }
 
-async fn custody_case(negatives: bool) {
+#[tokio::test]
+async fn encryption_upgrade_preserves_completion_and_result_view_history() {
+    custody_case(false, true).await;
+}
+
+async fn custody_case(negatives: bool, compatibility: bool) {
     stage(if negatives {
         "negative-case/start"
     } else {
@@ -558,6 +563,16 @@ async fn custody_case(negatives: bool) {
         files.push(hold(&db, &fixture, receipt, directory.path(), &store).await);
     }
     stage("file/both-holds-complete");
+    if compatibility {
+        let mut before = Vec::new();
+        for file in &files {
+            before.push(read_file_payload(&db, file, &store, KEY).await);
+        }
+        encryption_compatibility::legacy_upgrade_roundtrip(&db, KEY).await;
+        for (file, expected) in files.iter().zip(before) {
+            assert_eq!(read_file_payload(&db, file, &store, KEY).await, expected);
+        }
+    }
     let expected_children = children.iter().map(|child| child.id).collect::<Vec<_>>();
     let pinned:Vec<Id>=sqlx::query_scalar("SELECT source FROM file_evidence_pin WHERE owner=$1 AND kind='native_identity:execution' AND source=ANY($2) ORDER BY source")
         .bind(files[1].version).bind(&expected_children).fetch_all(db.pool()).await.unwrap();

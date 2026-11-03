@@ -33,6 +33,26 @@ pub(crate) struct WaitCompletionSource {
     values: Vec<(Id, InputSite)>,
     pub(crate) origins: Vec<SecretOrigin>,
 }
+
+pub(super) fn convert_encryption_metadata(
+    source: &mut WaitCompletionSource,
+    conversion: &crate::repositories::encryption_conversion::VerifierConversion<'_>,
+    depth: usize,
+) -> Result<()> {
+    if hash(&serde_json::to_value(&source.original)?)? != source.original_digest {
+        return Err(denied());
+    }
+    super::encryption_conversion::convert_body(&mut source.original, conversion, depth)?;
+    source.original_digest = hash(&serde_json::to_value(&source.original)?)?;
+    for fields in [
+        &mut source.config_fields,
+        &mut source.result_fields,
+        &mut source.variable_fields,
+    ] {
+        super::encryption_conversion::fields(fields, conversion)?;
+    }
+    Ok(())
+}
 impl WaitCompletionSource {
     pub(super) fn original_authority(&self) -> &SelectedRuntimeAuthority {
         &self.original.authority

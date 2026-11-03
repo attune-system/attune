@@ -511,7 +511,9 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
     std::fs::write(source.join("queues/00_acceptance.yaml"), ACCEPTANCE_QUEUE)?;
     let mut metadata: serde_json::Value =
         serde_yaml_ng::from_str(&std::fs::read_to_string(source.join("pack.yaml"))?)?;
-    metadata["version"] = json!("1.0.5");
+    let mut next_version = semver::Version::parse(metadata["version"].as_str().unwrap())?;
+    next_version.patch = next_version.patch.checked_add(1).unwrap();
+    metadata["version"] = json!(next_version.to_string());
     metadata["config"]["max_action_timeout"] = json!(600);
     metadata["config"]["enable_debug_logging"] = json!(true);
     std::fs::write(

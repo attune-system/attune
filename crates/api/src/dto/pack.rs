@@ -202,6 +202,9 @@ pub struct PackRegistryIndexResponse {
     pub enabled: bool,
     #[schema(value_type = Object)]
     pub headers: JsonValue,
+    /// Exact source origins mapped to redacted archive/Git request headers.
+    #[schema(value_type = Object)]
+    pub source_headers: JsonValue,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }
@@ -209,7 +212,8 @@ pub struct PackRegistryIndexResponse {
 impl From<attune_common::models::PackRegistryIndex> for PackRegistryIndexResponse {
     fn from(index: attune_common::models::PackRegistryIndex) -> Self {
         let headers = index.headers.clone();
-        Self::from_index_and_headers(index, headers)
+        let source_headers = index.source_headers.clone();
+        Self::from_index_and_headers(index, headers, source_headers)
     }
 }
 
@@ -217,6 +221,7 @@ impl PackRegistryIndexResponse {
     pub fn from_index_and_headers(
         index: attune_common::models::PackRegistryIndex,
         headers: JsonValue,
+        source_headers: JsonValue,
     ) -> Self {
         Self {
             id: index.id,
@@ -225,6 +230,7 @@ impl PackRegistryIndexResponse {
             position: index.position,
             enabled: index.enabled,
             headers: redact_header_values(headers),
+            source_headers: redact_source_header_values(source_headers),
             created: index.created,
             updated: index.updated,
         }
@@ -237,6 +243,18 @@ fn redact_header_values(headers: JsonValue) -> JsonValue {
             headers
                 .into_iter()
                 .map(|(name, _)| (name, JsonValue::String("[REDACTED]".to_string())))
+                .collect(),
+        ),
+        _ => serde_json::json!({}),
+    }
+}
+
+fn redact_source_header_values(source_headers: JsonValue) -> JsonValue {
+    match source_headers {
+        JsonValue::Object(origins) => JsonValue::Object(
+            origins
+                .into_iter()
+                .map(|(origin, headers)| (origin, redact_header_values(headers)))
                 .collect(),
         ),
         _ => serde_json::json!({}),
@@ -260,6 +278,10 @@ pub struct CreatePackRegistryIndexRequest {
     #[serde(default = "default_empty_object")]
     #[schema(value_type = Object)]
     pub headers: JsonValue,
+    /// Exact HTTPS origins mapped to source-specific archive/Git headers.
+    #[serde(default = "default_empty_object")]
+    #[schema(value_type = Object)]
+    pub source_headers: JsonValue,
 }
 
 /// Request to update a configured pack registry index.
@@ -277,6 +299,9 @@ pub struct UpdatePackRegistryIndexRequest {
     pub enabled: Option<bool>,
     #[schema(value_type = Option<Object>, nullable = true)]
     pub headers: Option<JsonValue>,
+    /// Omit to preserve existing source headers; use {} to clear them.
+    #[schema(value_type = Option<Object>, nullable = true)]
+    pub source_headers: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -1201,10 +1226,14 @@ mod tests {
             serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(omitted.name, None);
         assert_eq!(omitted.headers, None);
+        assert_eq!(omitted.source_headers, None);
         let cleared: UpdatePackRegistryIndexRequest =
             serde_json::from_value(serde_json::json!({"name":null,"headers":{}})).unwrap();
         assert_eq!(cleared.name, Some(None));
         assert_eq!(cleared.headers, Some(serde_json::json!({})));
+        let cleared: UpdatePackRegistryIndexRequest =
+            serde_json::from_value(serde_json::json!({"source_headers": {}})).unwrap();
+        assert_eq!(cleared.source_headers, Some(serde_json::json!({})));
     }
 
     #[test]
@@ -1256,6 +1285,23 @@ mod tests {
         }));
         assert_eq!(redacted["Authorization"], "[REDACTED]");
         assert_eq!(redacted["X-Api-Key"], "[REDACTED]");
+        assert!(!redacted.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn registry_response_redacts_source_header_values() {
+        let redacted = redact_source_header_values(serde_json::json!({
+            "https://artifacts.example.com": {"Authorization": "Bearer archive-secret"},
+            "https://git.example.com": {"X-Api-Key": "git-secret"}
+        }));
+        assert_eq!(
+            redacted["https://artifacts.example.com"]["Authorization"],
+            "[REDACTED]"
+        );
+        assert_eq!(
+            redacted["https://git.example.com"]["X-Api-Key"],
+            "[REDACTED]"
+        );
         assert!(!redacted.to_string().contains("secret"));
     }
 }

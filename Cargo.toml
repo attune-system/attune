@@ -23,7 +23,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.2"
 edition = "2021"
 authors = ["David Culbreth"]
 license = "Apache-2.0"
@@ -70,7 +70,7 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 validator = { version = "0.20", features = ["derive"] }
 
 # CLI
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
 # Message queue / PubSub
 # RabbitMQ

@@ -29,7 +29,7 @@ pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, e
 
 /// Columns selected in all Policy queries. Must match the `Policy` model's `FromRow` fields.
 pub const POLICY_COLUMNS: &str = "id, ref, pack, pack_ref, action, action_ref, effective_enabled AS enabled, enabled_override, priority, \
-    parameters, method, threshold, rate_limit_max_executions, rate_limit_window_seconds, quotas, \
+    parameters, method, threshold, rate_limit_max_executions, rate_limit_window_seconds, quotas, resource_concurrency, \
     name, description, tags, retired_at, created, updated";
 
 /// Filters for [`ActionRepository::list_search`].
@@ -1061,6 +1061,23 @@ impl ActionRepository {
 /// Repository for Policy operations
 pub struct PolicyRepository;
 
+fn policy_write_error(error: sqlx::Error) -> Error {
+    if let sqlx::Error::Database(database) = &error {
+        let message = match database.constraint() {
+            Some("resource_concurrency_participant_pkey") => Some("An action already participates in another enabled shared resource policy"),
+            _ if database.message() == "Shared resource participants must reference existing actions" => Some("Shared resource participants must reference existing actions"),
+            Some("execution_resource_admission_policy_id_fkey") => Some("Shared resource policy still has active or waiting executions"),
+            Some("resource_policy_separate_controls") => Some("Shared resource policies cannot contain standard controls or target a single action"),
+            _ if database.message() == "Resource policy cannot be edited while executions are active or waiting" => Some("Resource policy cannot be edited while executions are active or waiting"),
+            _ => None,
+        };
+        if let Some(message) = message {
+            return Error::validation(message);
+        }
+    }
+    error.into()
+}
+
 impl Repository for PolicyRepository {
     type Entity = Policy;
 
@@ -1072,6 +1089,7 @@ impl Repository for PolicyRepository {
 /// Input for creating a new policy
 #[derive(Debug, Clone)]
 pub struct CreatePolicyInput {
+    pub resource_concurrency: Option<JsonValue>,
     pub r#ref: String,
     pub pack: Option<Id>,
     pub pack_ref: Option<String>,
@@ -1093,6 +1111,7 @@ pub struct CreatePolicyInput {
 /// Input for updating a policy
 #[derive(Debug, Clone, Default)]
 pub struct UpdatePolicyInput {
+    pub resource_concurrency: Option<Option<JsonValue>>,
     pub enabled: Option<bool>,
     pub priority: Option<i32>,
     pub parameters: Option<Vec<String>>,
@@ -1352,13 +1371,19 @@ impl Create for PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(resource) = &input.resource_concurrency {
+            serde_json::from_value::<crate::resource_concurrency::ResourceConcurrency>(
+                resource.clone(),
+            )?
+            .validate()?;
+        }
         // Try to insert - database will enforce uniqueness constraint
         let policy = sqlx::query_as::<_, Policy>(&format!(
             r#"
             INSERT INTO policy (ref, pack, pack_ref, action, action_ref, enabled, priority,
                                  parameters, method, threshold, rate_limit_max_executions,
-                                 rate_limit_window_seconds, quotas, name, description, tags)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                                 rate_limit_window_seconds, quotas, name, description, tags, resource_concurrency)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             RETURNING {}
             "#,
             POLICY_COLUMNS
@@ -1379,16 +1404,20 @@ impl Create for PolicyRepository {
         .bind(&input.name)
         .bind(&input.description)
         .bind(&input.tags)
+        .bind(&input.resource_concurrency)
         .fetch_one(executor)
         .await
         .map_err(|e| {
             // Convert unique constraint violation to AlreadyExists error
             if let sqlx::Error::Database(db_err) = &e {
+                if db_err.constraint() == Some("resource_concurrency_participant_pkey") {
+                    return policy_write_error(e);
+                }
                 if db_err.is_unique_violation() {
                     return Error::already_exists("Policy", "ref", &input.r#ref);
                 }
             }
-            e.into()
+            policy_write_error(e)
         })?;
 
         Ok(policy)
@@ -1403,8 +1432,19 @@ impl Update for PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(Some(resource)) = &input.resource_concurrency {
+            serde_json::from_value::<crate::resource_concurrency::ResourceConcurrency>(
+                resource.clone(),
+            )?
+            .validate()?;
+        }
         let mut query = QueryBuilder::new("UPDATE policy SET ");
         let mut has_updates = false;
+
+        if let Some(resource) = &input.resource_concurrency {
+            query.push("resource_concurrency = ").push_bind(resource);
+            has_updates = true;
+        }
 
         if let Some(enabled) = input.enabled {
             if has_updates {
@@ -1515,7 +1555,11 @@ impl Update for PolicyRepository {
         query.push(" RETURNING ");
         query.push(POLICY_COLUMNS);
 
-        let policy = query.build_query_as::<Policy>().fetch_one(executor).await?;
+        let policy = query
+            .build_query_as::<Policy>()
+            .fetch_one(executor)
+            .await
+            .map_err(policy_write_error)?;
 
         Ok(policy)
     }
@@ -1530,7 +1574,8 @@ impl Delete for PolicyRepository {
         let result = sqlx::query("DELETE FROM policy WHERE id = $1")
             .bind(id)
             .execute(executor)
-            .await?;
+            .await
+            .map_err(policy_write_error)?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -1629,7 +1674,7 @@ impl PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM policy WHERE effective_enabled AND retired_at IS NULL AND action = $1 ORDER BY priority DESC, created DESC LIMIT 1",
+            "SELECT {} FROM policy WHERE resource_concurrency IS NULL AND effective_enabled AND retired_at IS NULL AND action = $1 ORDER BY priority DESC, created DESC LIMIT 1",
             POLICY_COLUMNS
         );
         let policy = sqlx::query_as::<_, Policy>(&query)
@@ -1646,7 +1691,7 @@ impl PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM policy WHERE effective_enabled AND retired_at IS NULL AND pack = $1 AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
+            "SELECT {} FROM policy WHERE resource_concurrency IS NULL AND effective_enabled AND retired_at IS NULL AND pack = $1 AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
             POLICY_COLUMNS
         );
         let policy = sqlx::query_as::<_, Policy>(&query)
@@ -1663,7 +1708,7 @@ impl PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM policy WHERE effective_enabled AND retired_at IS NULL AND pack IS NULL AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
+            "SELECT {} FROM policy WHERE resource_concurrency IS NULL AND effective_enabled AND retired_at IS NULL AND pack IS NULL AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
             POLICY_COLUMNS
         );
         let policy = sqlx::query_as::<_, Policy>(&query)

@@ -18,6 +18,8 @@ Database trigger or API publisher
 
 `PostgresListener` opens one dedicated PostgreSQL connection and calls `listen_all()` once with the complete channel list. It parses each channel payload as JSON. A message must contain a string `entity_type` and a numeric `entity_id`; malformed messages are logged and discarded.
 
+After 60 seconds without a notification, the notifier probes that same LISTEN connection with a protocol ping and a 10-second deadline. A receive error, probe error, or probe timeout discards the socket. Reconnection starts after one second and retries every five seconds after failures. Each connection/subscription attempt has a 10-second deadline and subscribes to the complete channel list once. The vendored SQLx listener's opt-in `abort_on_drop()` closes dedicated sockets directly, so failed or cancelled operations cannot leave background `UNLISTEN` cleanup waiting on a broken connection. The separate authorization pool does not establish LISTEN connection health.
+
 The subscriber manager first selects connections whose filters match the message. The WebSocket server then checks whether each identity may read the referenced entity. It shares one authorization result among connections with the same authorization snapshot.
 
 Sources: [`PostgresListener`](../../crates/notifier/src/postgres_listener.rs), [`SubscriberManager`](../../crates/notifier/src/subscriber_manager.rs), [WebSocket dispatch](../../crates/notifier/src/websocket_server.rs#L612-L730).

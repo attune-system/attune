@@ -756,11 +756,22 @@ Use different secrets for different environments:
 
 ### Key Derivation
 
-The server's encryption key (configured in `security.encryption_key`) is hashed using SHA-256 to derive the actual AES-256 key:
+Each Key record uses HKDF-SHA-256 from the configured high-entropy server secret,
+with domain-separated context containing its immutable positive `key.id`. The
+same ID also binds AES-GCM additional authenticated data:
 
 ```
-AES_KEY = SHA256(encryption_key)
+AES_KEY = HKDF_SHA256(configured_secret, keystore_salt, keystore_domain || key_id)
 ```
+
+Use a cryptographically random server secret with at least 256 bits of entropy.
+Persisted Key verifiers use
+`hex(SHA256(b"attune:keystore:key-fingerprint\0" || AES_KEY))`, not `hex(AES_KEY)`.
+Other encrypted field classes retain their separate shared encryption contract.
+Earlier verifiers exposed the shared AES key. Historical Key ciphertext requires
+explicit re-encryption, and retained graph conversion is still blocked. Read
+[fingerprint remediation](../deployment/encryption-fingerprint-remediation.md)
+before upgrading a populated installation.
 
 ### Encrypted Value Format
 
@@ -780,7 +791,8 @@ Where:
 - **Confidentiality**: AES-256 encryption prevents unauthorized reading
 - **Authenticity**: GCM mode prevents tampering and forgery
 - **Non-deterministic**: Random nonces ensure same plaintext produces different ciphertexts
-- **Forward Security**: Key rotation possible (requires re-encrypting all secrets)
+- **Key rotation**: Requires re-encrypting all protected stores. This scheme does
+  not provide forward secrecy for historical ciphertext after AES key disclosure.
 
 ---
 
