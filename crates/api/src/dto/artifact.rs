@@ -167,13 +167,16 @@ pub struct ArtifactResponse {
     pub name: Option<String>,
 
     /// Description
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
     /// MIME content type
     #[schema(example = "text/plain")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
 
     /// Size of the latest version in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<i64>,
 
     /// Structured data (progress entries, metadata, etc.)
@@ -211,8 +214,11 @@ pub struct ArtifactSummary {
     /// MIME content type
     pub content_type: Option<String>,
 
-    /// Size of latest version in bytes
+    /// Display size: execution-selected when scoped; omitted for global runtime logs.
     pub size_bytes: Option<i64>,
+
+    /// Highest version for the requested execution; null for global browsing.
+    pub selected_version: Option<ArtifactVersionSummary>,
 
     /// Owner scope
     pub scope: OwnerType,
@@ -229,6 +235,7 @@ pub struct ArtifactSummary {
 
 /// Query parameters for filtering artifacts
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactQueryParams {
     /// Filter by owner scope type
     pub scope: Option<OwnerType>,
@@ -251,10 +258,8 @@ pub struct ArtifactQueryParams {
     /// Search by name (case-insensitive substring match)
     pub name: Option<String>,
 
-    /// Page number (1-based)
-    #[serde(default = "default_page")]
-    #[param(example = 1, minimum = 1)]
-    pub page: u32,
+    /// Opaque continuation bound to this endpoint and its filters.
+    pub cursor: Option<String>,
 
     /// Items per page
     #[serde(default = "default_per_page")]
@@ -263,42 +268,32 @@ pub struct ArtifactQueryParams {
 }
 
 impl ArtifactQueryParams {
-    pub fn pagination(&self) -> Result<super::common::PaginationParams, String> {
-        artifact_pagination(self.page, self.per_page)
-    }
-
-    pub fn offset(&self) -> u32 {
-        self.page.saturating_sub(1).saturating_mul(self.per_page)
-    }
-
-    pub fn limit(&self) -> u32 {
-        self.per_page.min(100)
+    pub fn validate(&self) -> Result<(), String> {
+        validate_artifact_page_size(self.per_page)
     }
 }
 
 /// Bounded version-history pages, with the artifact list's v1 parameter names.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactPageParams {
-    #[serde(default = "default_page")]
-    #[param(example = 1, minimum = 1)]
-    pub page: u32,
+    pub cursor: Option<String>,
     #[serde(default = "default_per_page")]
     #[param(example = 20, minimum = 1, maximum = 100)]
     pub per_page: u32,
 }
 
 impl ArtifactPageParams {
-    pub fn pagination(&self) -> Result<super::common::PaginationParams, String> {
-        artifact_pagination(self.page, self.per_page)
+    pub fn validate(&self) -> Result<(), String> {
+        validate_artifact_page_size(self.per_page)
     }
 }
 
 /// Execution-scoped artifact pages. The execution identity comes from the path.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionArtifactQueryParams {
-    #[serde(default = "default_page")]
-    #[param(example = 1, minimum = 1)]
-    pub page: u32,
+    pub cursor: Option<String>,
     #[serde(default = "default_per_page")]
     #[param(example = 20, minimum = 1, maximum = 100)]
     pub per_page: u32,
@@ -307,29 +302,24 @@ pub struct ExecutionArtifactQueryParams {
 }
 
 impl ExecutionArtifactQueryParams {
-    pub fn pagination(&self) -> Result<super::common::PaginationParams, String> {
-        artifact_pagination(self.page, self.per_page)
+    pub fn validate(&self) -> Result<(), String> {
+        validate_artifact_page_size(self.per_page)
     }
 }
 
-fn artifact_pagination(
-    page: u32,
-    per_page: u32,
-) -> Result<super::common::PaginationParams, String> {
-    if page == 0 || !(1..=100).contains(&per_page) {
-        return Err("Use page >= 1 and per_page between 1 and 100".into());
+fn validate_artifact_page_size(per_page: u32) -> Result<(), String> {
+    if !(1..=100).contains(&per_page) {
+        return Err("Use per_page between 1 and 100".into());
     }
-    (page - 1)
-        .checked_mul(per_page)
-        .ok_or_else(|| "Pagination offset exceeds the supported range".to_string())?;
-    Ok(super::common::PaginationParams {
-        page,
-        page_size: per_page,
-    })
+    Ok(())
 }
 
-fn default_page() -> u32 {
-    1
+/// Count-free v1 artifact collection response. Pages are not historical snapshots.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ArtifactCursorPage<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 fn default_per_page() -> u32 {
@@ -517,22 +507,8 @@ pub struct ArtifactVersionSummary {
     /// Size of content in bytes
     pub size_bytes: Option<i64>,
 
-    /// Relative file path for disk-backed versions
+    /// Reserved; arbitrary creator metadata is never exposed by summaries.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_path: Option<String>,
-
-    pub body_state: Option<ArtifactBodyState>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub object_key: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_version: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-
-    /// Who created this version
     pub created_by: Option<String>,
 
     /// Creation timestamp
@@ -567,6 +543,33 @@ impl From<attune_common::models::artifact::Artifact> for ArtifactResponse {
     }
 }
 
+impl ArtifactResponse {
+    /// Explicit human runtime-log header allowlist. No aggregate latest fields,
+    /// descriptions, arbitrary data, or body/provenance records are disclosed.
+    pub fn runtime_log_header(
+        header: attune_common::repositories::artifact::ArtifactMetadataRow,
+    ) -> Self {
+        Self {
+            id: header.id,
+            r#ref: header.r#ref,
+            scope: header.scope,
+            owner: header.owner,
+            r#type: header.r#type,
+            visibility: header.visibility,
+            classification: header.classification,
+            retention_policy: header.retention_policy,
+            retention_limit: header.retention_limit,
+            name: header.name,
+            description: None,
+            content_type: None,
+            size_bytes: None,
+            data: None,
+            created: header.created,
+            updated: header.updated,
+        }
+    }
+}
+
 impl From<attune_common::models::artifact::Artifact> for ArtifactSummary {
     fn from(a: attune_common::models::artifact::Artifact) -> Self {
         Self {
@@ -576,8 +579,17 @@ impl From<attune_common::models::artifact::Artifact> for ArtifactSummary {
             visibility: a.visibility,
             classification: a.classification,
             name: a.name,
-            content_type: a.content_type,
-            size_bytes: a.size_bytes,
+            content_type: if a.classification == ArtifactClassification::RuntimeLog {
+                None
+            } else {
+                a.content_type
+            },
+            size_bytes: if a.classification == ArtifactClassification::RuntimeLog {
+                None
+            } else {
+                a.size_bytes
+            },
+            selected_version: None,
             scope: a.scope,
             owner: a.owner,
             created: a.created,
@@ -595,13 +607,40 @@ impl From<attune_common::repositories::artifact::ArtifactSummaryRow> for Artifac
             visibility: a.visibility,
             classification: a.classification,
             name: a.name,
-            content_type: a.content_type,
-            size_bytes: a.size_bytes,
+            content_type: if a.classification == ArtifactClassification::RuntimeLog {
+                None
+            } else {
+                a.content_type
+            },
+            size_bytes: if a.classification == ArtifactClassification::RuntimeLog {
+                None
+            } else {
+                a.size_bytes
+            },
+            selected_version: None,
             scope: a.scope,
             owner: a.owner,
             created: a.created,
             updated: a.updated,
         }
+    }
+}
+
+impl From<attune_common::repositories::artifact::ExecutionArtifactSummaryRow> for ArtifactSummary {
+    fn from(row: attune_common::repositories::artifact::ExecutionArtifactSummaryRow) -> Self {
+        let mut summary = Self::from(row.artifact);
+        summary.content_type = row.selected_content_type.clone();
+        summary.size_bytes = row.selected_size_bytes;
+        summary.selected_version = Some(ArtifactVersionSummary {
+            id: row.selected_id,
+            version: row.selected_version,
+            execution: row.selected_execution,
+            content_type: row.selected_content_type,
+            size_bytes: row.selected_size_bytes,
+            created_by: None,
+            created: row.selected_created,
+        });
+        summary
     }
 }
 
@@ -644,19 +683,13 @@ impl ArtifactVersionResponse {
 
 impl From<attune_common::models::artifact_version::ArtifactVersion> for ArtifactVersionSummary {
     fn from(v: attune_common::models::artifact_version::ArtifactVersion) -> Self {
-        let file_body = v.file_path.is_some() || v.object_key.is_some();
         Self {
             id: v.id,
             version: v.version,
             execution: v.execution,
             content_type: v.content_type,
             size_bytes: v.size_bytes,
-            file_path: v.file_path,
-            body_state: v.body_state,
-            object_key: v.object_key,
-            provider_version: v.provider_version,
-            sha256: v.sha256,
-            created_by: if file_body { None } else { v.created_by },
+            created_by: None,
             created: v.created,
         }
     }
@@ -666,19 +699,13 @@ impl From<attune_common::repositories::artifact::ArtifactVersionSummaryRow>
     for ArtifactVersionSummary
 {
     fn from(v: attune_common::repositories::artifact::ArtifactVersionSummaryRow) -> Self {
-        let file_body = v.file_path.is_some() || v.object_key.is_some();
         Self {
             id: v.id,
             version: v.version,
             execution: v.execution,
             content_type: v.content_type,
             size_bytes: v.size_bytes,
-            file_path: v.file_path,
-            body_state: v.body_state,
-            object_key: v.object_key,
-            provider_version: v.provider_version,
-            sha256: v.sha256,
-            created_by: if file_body { None } else { v.created_by },
+            created_by: None,
             created: v.created,
         }
     }
@@ -692,7 +719,7 @@ mod tests {
     fn test_query_params_defaults() {
         let json = r#"{}"#;
         let params: ArtifactQueryParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.page, 1);
+        assert!(params.cursor.is_none());
         assert_eq!(params.per_page, 20);
         assert!(params.scope.is_none());
         assert!(params.r#type.is_none());
@@ -711,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn test_query_params_offset() {
+    fn test_query_params_accepts_cursor() {
         let params = ArtifactQueryParams {
             scope: None,
             owner: None,
@@ -720,14 +747,15 @@ mod tests {
             classification: None,
             execution: None,
             name: None,
-            page: 3,
+            cursor: Some("opaque".into()),
             per_page: 20,
         };
-        assert_eq!(params.offset(), 40);
+        assert!(params.validate().is_ok());
+        assert_eq!(params.cursor.as_deref(), Some("opaque"));
     }
 
     #[test]
-    fn test_query_params_limit_cap() {
+    fn test_query_params_rejects_unbounded_limit() {
         let params = ArtifactQueryParams {
             scope: None,
             owner: None,
@@ -736,10 +764,10 @@ mod tests {
             classification: None,
             execution: None,
             name: None,
-            page: 1,
+            cursor: None,
             per_page: 200,
         };
-        assert_eq!(params.limit(), 100);
+        assert!(params.validate().is_err());
     }
 
     #[test]

@@ -96,9 +96,22 @@ pub(crate) struct SensorRuleProofCache {
 }
 
 impl SensorRuleProofCache {
+    #[cfg(test)]
     pub(crate) async fn prepare_generations(
         &mut self,
         db: &sqlx::PgPool,
+        ids: &[Id],
+    ) -> ApiResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut connection = db.acquire().await?;
+        self.prepare_generations_on(&mut connection, ids).await
+    }
+
+    pub(crate) async fn prepare_generations_on(
+        &mut self,
+        db: &mut sqlx::PgConnection,
         ids: &[Id],
     ) -> ApiResult<()> {
         let missing = ids
@@ -109,7 +122,8 @@ impl SensorRuleProofCache {
             .into_iter()
             .collect::<Vec<_>>();
         for batch in missing.chunks(64) {
-            let rows = ManagedSensorMetadataRepository::prepare_exact_bindings(db, batch).await?;
+            let rows =
+                ManagedSensorMetadataRepository::prepare_exact_bindings(&mut *db, batch).await?;
             for id in batch {
                 self.generations.insert(*id, None);
             }
@@ -126,9 +140,22 @@ impl SensorRuleProofCache {
             .and_then(Option::as_ref)
             .is_some_and(|prepared| same_binding(&prepared.binding, &generation.binding))
     }
+    #[cfg(test)]
     pub(crate) async fn load_many(
         &mut self,
         db: &sqlx::PgPool,
+        requests: &[(RuleOriginSource, &SensorDisclosureRow, Option<Id>)],
+    ) -> ApiResult<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let mut connection = db.acquire().await?;
+        self.load_many_on(&mut connection, requests).await
+    }
+
+    pub(crate) async fn load_many_on(
+        &mut self,
+        db: &mut sqlx::PgConnection,
         requests: &[(RuleOriginSource, &SensorDisclosureRow, Option<Id>)],
     ) -> ApiResult<()> {
         let mut keys = BTreeSet::new();
@@ -142,7 +169,7 @@ impl SensorRuleProofCache {
         }
         let mut proofs = std::collections::BTreeMap::new();
         for batch in keys.into_iter().collect::<Vec<_>>().chunks(64) {
-            proofs.extend(SensorRuleOriginRepository::find_many(db, batch).await?);
+            proofs.extend(SensorRuleOriginRepository::find_many(&mut *db, batch).await?);
         }
         for (source, generation, actual_pack) in requests {
             if self.records.contains_key(&source.key()) {

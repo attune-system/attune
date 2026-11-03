@@ -291,6 +291,29 @@ are not a browser/network TTFB measurement or p95 latency certification. See
 [the implementation checkpoint](../plans/artifacts-postgresql-implementation.md#implementation-checkpoint)
 for completed work and remaining measurements.
 
+The selected-history foundation has focused real repository/API regressions:
+
+```bash
+bash scripts/run-rust-integration-tests.sh --test artifact_execution_summary_diagnostics_tests
+bash scripts/run-rust-integration-tests.sh --test artifact_read_performance_tests --filter selected_history::
+```
+
+`explain_execution_summary_scan()` shares the execution-specific lateral selector's
+query builder, including read context, filters, cursor, ordering and candidate
+limit. A page of 20 is explained with candidate limit 21. Its report is a separate
+repository-generated EXPLAIN, not proof of the SQLx cached prepared plan. Older
+global-with-execution-filter EXPLAIN reports do not certify this lateral query.
+
+`RetainedHistory` is a private, bounded test fixture. It admits one real release
+and selected/probe executions, then grows inert historical read targets in
+bounded transactions using genuine pinned executable/schema data and captured
+artifact ownership. It does not clone runtime authority, receipts, signatures,
+origins or credentials. Historical versions are metadata-only, while accepted
+probes have tiny synthetic content. Its small integrity/rollback/selection tests
+do not certify independently executed workloads, protected-log transport, body
+capacity, or 100,000/604,800-row performance. Large opt-in profile/report wiring
+and measured resource budgets remain a subsequent milestone.
+
 The workload profile holds 64 event origins and graph depth constant while adding
 1, 7, 30, and 90 populated daily event leaves, plus a retained source in DEFAULT.
 These are added populated leaves. Fresh migrations may already have other daily
@@ -335,7 +358,11 @@ deployment retention forecast. Follow
 [Artifact-read acceptance](../deployment/artifact-read-acceptance.md) for rollout
 evidence and operator gates.
 
-`--with-notifier-tests` runs the notifier executable on the same run-owned server.
+`--with-notifier-tests` runs the notifier library test executable on the same
+run-owned server, not the binary's small URL-masking test target. Required library
+test identities are checked before database setup; `--notifier-profile` also
+requires its exact profile identity and generated report. Zero selected tests or
+an absent report never certify notifier coverage.
 Its database-only listener test is not ignored. It awaits channel registration,
 creates a deterministic UNLISTEN/reconnect gap, keeps the downstream receiver
 open, and proves that a missed durable artifact change is not replayed. A separate
@@ -372,9 +399,10 @@ requests, and 20 completed requests across four concurrent clients separately.
 It also measures 2/20/100 attached artifacts with bounded pages and a 10 MiB
 progress body excluded from summaries. Cache invalidation is not a cold database.
 
-Add `--paired-reference` to enforce the 90% query and 70% warm-p95 reduction gates
-against a controlled serial reader on the same fixture. It is not a historical
-revision comparison. Add `--notifier-profile` for database-backed per-identity
+The historical `--paired-reference` gate is blocked after the selected-version
+policy change: its aggregate-content reference no longer exercises equivalent
+authorization work. Do not claim the old 90% query/70% warm-p95 reductions as new
+selected-read acceptance. Add `--notifier-profile` for database-backed per-identity
 delivery/SQL measurements. See
 [the executable acceptance gates](../deployment/artifact-read-acceptance.md#executable-local-gates)
 for scope, sample ordering, and failure rules. The serial route exists only in the

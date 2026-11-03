@@ -564,15 +564,18 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
     ctx.get(&artifact_stream_path, Some(&refresh_token))
         .await?
         .assert_status(StatusCode::UNAUTHORIZED);
+    // Artifact delivery masks selected-source disclosure denials as 404,
+    // including sensor-backed versions relabeled as general artifacts. The
+    // dedicated sensor-log endpoint retains its explicit 403 contract.
     ctx.get(&artifact_stream_path, Some(&read_token))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::NOT_FOUND);
     ctx.get(&sensor_log_path, Some(&read_token))
         .await?
         .assert_status(StatusCode::FORBIDDEN);
     ctx.get(&artifact_log_path, Some(&read_token))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::NOT_FOUND);
     ArtifactRepository::update(
         &ctx.pool,
         artifact.id,
@@ -587,7 +590,7 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
     .await?;
     ctx.get(&artifact_log_path, Some(&read_token))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::NOT_FOUND);
     ArtifactRepository::update(
         &ctx.pool,
         artifact.id,
@@ -944,7 +947,7 @@ async fn admitted_sensor_signing_uses_explicit_use_grants_after_installer_freeze
         .assert_status(StatusCode::FORBIDDEN);
     ctx.get(&artifact_log_path, Some(&read_token))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::NOT_FOUND);
     assert!(attune_api::secret_disclosure::authorize_sensor_runtime_log(
         &ctx.state,
         &read_user,
@@ -1601,10 +1604,34 @@ async fn execution_decrypt_does_not_override_recorded_key_disclosure_authority()
     let response = ctx
         .get(&format!("/api/v1/artifacts/{}", artifact.id), ctx.token())
         .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let header: Value = response.json().await?;
+    for field in [
+        "data",
+        "description",
+        "meta",
+        "file_path",
+        "content_type",
+        "size_bytes",
+    ] {
+        assert!(
+            header["data"].get(field).is_none(),
+            "header exposed {field}"
+        );
+    }
+    let response = ctx
+        .get(
+            &format!("/api/v1/artifacts/{}/versions/1", artifact.id),
+            ctx.token(),
+        )
+        .await?;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     grant(&ctx,identity,"fixture.key_decrypt",json!([{ "resource":"keys","actions":["decrypt"],"constraints":{"owner_types":["system"],"refs":["system.salesforce_signer"]}}])).await?;
     let response = ctx
-        .get(&format!("/api/v1/artifacts/{}", artifact.id), ctx.token())
+        .get(
+            &format!("/api/v1/artifacts/{}/versions/1", artifact.id),
+            ctx.token(),
+        )
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let response = ctx

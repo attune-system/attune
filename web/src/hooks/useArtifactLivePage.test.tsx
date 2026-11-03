@@ -8,14 +8,14 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useArtifactLivePage } from "./useArtifactLivePage";
 
-describe("live artifact offset pagination", () => {
+describe("live artifact cursor pagination", () => {
   const disposables: (() => void)[] = [];
   afterEach(() => disposables.splice(0).forEach((dispose) => dispose()));
 
   function browse(paused = false, initialPage = 2) {
     const client = new QueryClient();
-    const first = ["artifacts", "list", { page: 1 }];
-    const second = ["artifacts", "list", { page: 2 }];
+    const first = ["artifacts", "list", { cursor: undefined }];
+    const second = ["artifacts", "list", { cursor: "older" }];
     client.setQueryData(first, { items: ["old first-page rows"] });
     client.setQueryData(second, { items: ["old second-page rows"] });
     client.setQueryData(["artifacts", 42], { name: "unrelated detail" });
@@ -103,7 +103,7 @@ describe("live artifact offset pagination", () => {
     const client = new QueryClient();
     const key = ["artifacts", "execution", 42];
     const progress = [...key, { type: "progress", perPage: 1 }];
-    const oldPage = [...key, { page: 2, perPage: 20 }];
+    const oldPage = [...key, { cursor: "older", perPage: 20 }];
     client.setQueryData(progress, { items: ["progress summary"] });
     client.setQueryData(oldPage, { items: ["older browse"] });
     const wrapper = ({ children }: { children: ReactNode }) => (
@@ -145,7 +145,7 @@ describe("live artifact offset pagination", () => {
     key: Array<string | number>;
   }>)("resets $scope pages on affected refreshes", async ({ scope, key }) => {
     const client = new QueryClient();
-    const old = [...key, { page: 2 }];
+    const old = [...key, { cursor: "older" }];
     client.setQueryData(old, { items: ["old rows"] });
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -172,10 +172,13 @@ describe("live artifact offset pagination", () => {
   it("mounts a fresh first-page query rather than refetching the old active page", async () => {
     const client = new QueryClient();
     for (const page of [1, 2])
-      client.setQueryData(["artifacts", "list", { page }], {
-        page,
-        fresh: false,
-      });
+      client.setQueryData(
+        ["artifacts", "list", { cursor: page === 1 ? undefined : "older" }],
+        {
+          page,
+          fresh: false,
+        },
+      );
     const fetch = vi.fn(async (page: number) => ({ page, fresh: true }));
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -184,7 +187,11 @@ describe("live artifact offset pagination", () => {
       () => {
         const [page, setPage] = useState(2);
         const query = useQuery({
-          queryKey: ["artifacts", "list", { page }],
+          queryKey: [
+            "artifacts",
+            "list",
+            { cursor: page === 1 ? undefined : "older" },
+          ],
           queryFn: () => fetch(page),
           staleTime: Infinity,
         });
@@ -206,7 +213,7 @@ describe("live artifact offset pagination", () => {
     );
     expect(fetch).toHaveBeenCalledExactlyOnceWith(1);
     expect(
-      client.getQueryData(["artifacts", "list", { page: 2 }]),
+      client.getQueryData(["artifacts", "list", { cursor: "older" }]),
     ).toBeUndefined();
   });
 });

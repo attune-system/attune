@@ -68,7 +68,8 @@ async fn distinct_event_and_inquiry_chains_grow_by_frontier_not_source_count() -
         ]),
     )
     .await?;
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     let mut report = Vec::new();
     for kind in [
         EVENT_SOURCE_PAYLOAD,
@@ -312,7 +313,8 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
     ComponentConfigurationRepository::lock_selection(&mut tx).await?;
     let revision = ComponentConfigurationRepository::bind_pack(&mut tx, &pack, None, None).await?;
     tx.commit().await?;
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     let mut report = Vec::new();
     for kind in [
         EVENT_SOURCE_PAYLOAD,
@@ -361,26 +363,6 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
             assert_eq!(sample.queries.source_payload_reads, 0);
             samples.push((count, sample));
         }
-        // Predeclared: 1 and 64 fit one frontier batch. The 65th origin
-        // may add one set of source/binding/provenance reads, not 64 lookups.
-        assert_eq!(
-            samples[0].1.queries.source_scope_reads, samples[1].1.queries.source_scope_reads,
-            "{kind}"
-        );
-        assert_eq!(
-            samples[0].1.queries.graph_record_reads, samples[1].1.queries.graph_record_reads,
-            "{kind}"
-        );
-        assert!(
-            samples[1].1.queries.application_statements() <= 25,
-            "{kind}: within-batch application query budget exceeded: {}",
-            serde_json::to_string(&samples)?
-        );
-        assert!(
-            samples[2].1.queries.application_statements() <= 40,
-            "{kind}: cross-batch application query budget exceeded: {}",
-            serde_json::to_string(&samples)?
-        );
         let expired = match origins.last().ok_or("source origin missing")? {
             SecretOrigin::Entity { entity_id, .. } => *entity_id,
             _ => return Err("expected fixture entity origin".into()),
@@ -416,6 +398,47 @@ async fn event_inquiry_and_component_sources_have_constant_within_batch_query_co
     }
     save_report("non-execution-source-frontiers", &report)?;
     ctx.cleanup().await?;
+    // First exercise EVERY kind, including its expired-source denial, and save
+    // the complete numeric report. A budget failure must not silently prevent
+    // inquiry options/response or component-configuration coverage.
+    for (kind, samples) in &report {
+        for (_, sample) in samples {
+            assert_selected_content_query_safety(&sample.queries);
+        }
+        // The historical 25/40 ceilings covered the aggregate metadata reader,
+        // not selected content's transaction/current IAM/version pin. Add only
+        // the explicitly enumerated fixed guard work; keep all statements in the
+        // report and preserve the 15-statement extra-frontier limit separately.
+        assert_eq!(
+            samples[0].1.queries.source_scope_reads, samples[1].1.queries.source_scope_reads,
+            "{kind}"
+        );
+        assert_eq!(
+            samples[0].1.queries.graph_record_reads, samples[1].1.queries.graph_record_reads,
+            "{kind}"
+        );
+        assert_eq!(
+            samples[0].1.queries.application_statements(),
+            samples[1].1.queries.application_statements(),
+            "{kind}: within-batch application queries grew"
+        );
+        assert!(
+            samples[1].1.queries.application_statements() <= selected_content_query_ceiling(25),
+            "{kind}: within-batch selected-content query budget exceeded: {}",
+            serde_json::to_string(samples)?
+        );
+        assert!(
+            samples[2].1.queries.application_statements() <= selected_content_query_ceiling(40),
+            "{kind}: cross-batch selected-content query budget exceeded: {}",
+            serde_json::to_string(samples)?
+        );
+        assert!(
+            samples[2].1.queries.application_statements()
+                <= samples[1].1.queries.application_statements() + 15,
+            "{kind}: the 65th origin exceeded one additional frontier batch: {}",
+            serde_json::to_string(samples)?
+        );
+    }
     Ok(())
 }
 
@@ -452,7 +475,8 @@ async fn exact_event_sources_survive_default_repair_and_partition_twins_but_not_
         vec![entity_origin(EVENT_SOURCE_PAYLOAD, id)],
     )
     .await?;
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     assert_eq!(ctx.get(&path, ctx.token()).await?.status(), StatusCode::OK);
     let config = fixture_maintenance_config();
     assert_eq!(
@@ -625,7 +649,8 @@ async fn sensor_generation_rule_and_delivery_sources_are_batched_and_keep_record
         {"resource":"rules","actions":["read","decrypt"],"constraints":{"pack_refs":[action.pack_ref]}}
     ])).await?;
     let mut report = Vec::new();
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     let mut sequence = 0i64;
     for kind in [
         ENTITY_SENSOR_GENERATION_CONFIG,
@@ -722,24 +747,6 @@ async fn sensor_generation_rule_and_delivery_sources_are_batched_and_keep_record
             assert_eq!(sample.queries.source_payload_reads, 0);
             samples.push((count, sample));
         }
-        assert_eq!(
-            samples[0].1.queries.source_scope_reads, samples[1].1.queries.source_scope_reads,
-            "{kind}"
-        );
-        assert_eq!(
-            samples[0].1.queries.graph_record_reads, samples[1].1.queries.graph_record_reads,
-            "{kind}"
-        );
-        assert!(
-            samples[1].1.queries.application_statements() <= 25,
-            "{kind}: within-batch application query budget exceeded: {}",
-            serde_json::to_string(&samples)?
-        );
-        assert!(
-            samples[2].1.queries.application_statements() <= 40,
-            "{kind}: cross-batch application query budget exceeded: {}",
-            serde_json::to_string(&samples)?
-        );
         if kind != ENTITY_SENSOR_GENERATION_CONFIG {
             sqlx::query("UPDATE rule SET retired_at = NOW() WHERE id = $1")
                 .bind(last_rule)
@@ -755,6 +762,44 @@ async fn sensor_generation_rule_and_delivery_sources_are_batched_and_keep_record
     }
     save_report("sensor-source-frontiers", &report)?;
     ctx.cleanup().await?;
+    // Do not let a generation-config performance failure skip rule-config or
+    // delivery-config disclosure and original-rule-survival checks above.
+    for (kind, samples) in &report {
+        for (_, sample) in samples {
+            assert_selected_content_query_safety(&sample.queries);
+        }
+        assert_eq!(
+            samples[0].1.queries.source_scope_reads, samples[1].1.queries.source_scope_reads,
+            "{kind}"
+        );
+        assert_eq!(
+            samples[0].1.queries.graph_record_reads, samples[1].1.queries.graph_record_reads,
+            "{kind}"
+        );
+        assert_eq!(
+            samples[0].1.queries.application_statements(),
+            samples[1].1.queries.application_statements(),
+            "{kind}: within-batch application queries grew"
+        );
+        // Same selected-content fixed guard allowance as the non-sensor origin
+        // fixture; source payload/ciphertext and batching gates are unchanged.
+        assert!(
+            samples[1].1.queries.application_statements() <= selected_content_query_ceiling(25),
+            "{kind}: within-batch selected-content query budget exceeded: {}",
+            serde_json::to_string(samples)?
+        );
+        assert!(
+            samples[2].1.queries.application_statements() <= selected_content_query_ceiling(40),
+            "{kind}: cross-batch selected-content query budget exceeded: {}",
+            serde_json::to_string(samples)?
+        );
+        assert!(
+            samples[2].1.queries.application_statements()
+                <= samples[1].1.queries.application_statements() + 15,
+            "{kind}: the 65th origin exceeded one additional frontier batch: {}",
+            serde_json::to_string(samples)?
+        );
+    }
     Ok(())
 }
 
@@ -789,7 +834,8 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
     )
     .await?;
     link(&ctx, log, destination).await?;
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     let trigger = trigger(&ctx).await?;
     sqlx::query("UPDATE trigger SET reference_visibility = 'private' WHERE id = $1")
         .bind(trigger.id)
@@ -883,7 +929,7 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
         StatusCode::BAD_REQUEST
     );
 
-    // Repository corruption is an error, not a successful empty list. Delete
+    // Repository corruption is a content error, not a masked denial. Delete
     // and recreate only this fixture's immutable source with corrupt evidence.
     replace_grants(
         &ctx,
@@ -930,15 +976,16 @@ async fn constrained_event_and_participant_inquiry_origins_keep_their_endpoint_p
         ctx.get(&path, ctx.token()).await?.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
-    assert_eq!(
-        ctx.get(
+    assert_safe_runtime_log_header(&ctx, log).await?;
+    let metadata = ctx
+        .get(
             &format!("/api/v1/executions/{destination}/artifacts"),
-            ctx.token()
+            ctx.token(),
         )
-        .await?
-        .status(),
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
+        .await?;
+    assert_eq!(metadata.status(), StatusCode::OK);
+    let metadata: Value = metadata.json().await?;
+    assert_eq!(metadata["items"][0]["id"], log);
     ctx.cleanup().await?;
     Ok(())
 }
@@ -972,7 +1019,8 @@ async fn distinct_public_action_fallbacks_are_batched_but_never_grant_decrypt() 
         ]),
     )
     .await?;
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     let mut origins = Vec::new();
     let mut measurements = Vec::new();
     for count in [1, 64] {
@@ -1006,16 +1054,6 @@ async fn distinct_public_action_fallbacks_are_batched_but_never_grant_decrypt() 
         measurements[1].1.queries.source_scope_reads
     );
     save_report("public-action-fallback-frontier", &measurements)?;
-    // Type discovery is connection-local and can occur even after a warm-up
-    // request. Keep it in the report, not in the application query budget.
-    let queries = &measurements[1].1.queries;
-    assert!(
-        queries.application_statements() <= 25,
-        "public action fallback query budget exceeded: application={}, driver_metadata={}, total={}",
-        queries.application_statements(),
-        queries.driver_metadata_reads(),
-        queries.statements
-    );
     replace_grants(&ctx, "fixture.artifact_reader", json!([
         {"resource":"actions","actions":["read","execute"]},
         {"resource":"executions","actions":["read","decrypt"],"constraints":{"refs":[action_ref]}}
@@ -1025,6 +1063,21 @@ async fn distinct_public_action_fallbacks_are_batched_but_never_grant_decrypt() 
         StatusCode::NOT_FOUND
     );
     ctx.cleanup().await?;
+    // PG18 measured 30 application statements at both 1 and 64 origins on the
+    // selected-content route. Permit only the subsequent four structural-owner
+    // survival reads, rather than its old metadata ceiling of 25. Run the
+    // decrypt-denial assertion above before judging this performance budget.
+    for (_, sample) in &measurements {
+        assert_selected_content_query_safety(&sample.queries);
+    }
+    let queries = &measurements[1].1.queries;
+    assert_eq!(
+        measurements[0].1.queries.application_statements(),
+        queries.application_statements()
+    );
+    assert!(queries.application_statements() <= 30 + SELECTED_CONTENT_OWNER_SURVIVAL_QUERIES,
+        "public action fallback selected-content query budget exceeded: application={}, driver_metadata={}, total={}",
+        queries.application_statements(), queries.driver_metadata_reads(), queries.statements);
     Ok(())
 }
 
@@ -1062,7 +1115,8 @@ async fn inquiry_origins_recheck_fresh_identity_attributes_after_a_parent_snapsh
     grant(&ctx, "fixture.attribute_inquiry", json!([
         {"resource":"inquiries","actions":["read","decrypt"],"constraints":{"attributes":{"team":"ops"}}}
     ])).await?;
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     assert_eq!(ctx.get(&path, ctx.token()).await?.status(), StatusCode::OK);
     // Deliberately leave the access-token attribute cache warm. Inquiry access
     // has always fetched fresh attributes even when its parent consumer did not.
@@ -1125,7 +1179,8 @@ async fn execution_input_and_output_origins_share_one_frontier_provenance_read()
         input.push(entity_origin(ENTITY_EXECUTION_CONFIG, source.id));
         output.push(entity_origin(ENTITY_EXECUTION_RESULT, source.id));
     }
-    let path = format!("/api/v1/artifacts/{log}");
+    let path = format!("/api/v1/artifacts/{log}/versions/1");
+    assert_safe_runtime_log_header(&ctx, log).await?;
     let mut samples = Vec::new();
     for origins in [input.clone(), input.into_iter().chain(output).collect()] {
         secret_origins(&ctx, destination, origins).await?;
@@ -1185,7 +1240,8 @@ async fn distinct_workflow_ancestries_keep_source_queries_constant_within_a_batc
             origins.push(execution_origin(child.id));
         }
         secret_origins(&ctx, destination, origins.clone()).await?;
-        let path = format!("/api/v1/artifacts/{log}");
+        let path = format!("/api/v1/artifacts/{log}/versions/1");
+        assert_safe_runtime_log_header(&ctx, log).await?;
         let _ = ctx.get(&path, ctx.token()).await?.bytes().await?;
         let (sample, body) = measure(&ctx, &path).await?;
         assert_eq!(sample.status, 200, "{body}");
@@ -1197,10 +1253,19 @@ async fn distinct_workflow_ancestries_keep_source_queries_constant_within_a_batc
         samples[1].1.queries.graph_record_reads
     );
     save_report("distinct-ancestry-frontiers", &samples)?;
-    // A newly acquired pool connection may still discover PostgreSQL enum
-    // types. Report those statements, but keep the application budget separate.
+    // This now opens protected selected content (30 application queries at both
+    // 1/64 sources in PG18), not the historical metadata route (ceiling 20).
+    // Fixed guard/owner work is enumerated at selected_content_query_ceiling;
+    // neither driver discovery nor security work is hidden from the report.
+    for (_, sample) in &samples {
+        assert_selected_content_query_safety(&sample.queries);
+    }
+    assert_eq!(
+        samples[0].1.queries.application_statements(),
+        samples[1].1.queries.application_statements()
+    );
     assert!(
-        samples[1].1.queries.application_statements() <= 20,
+        samples[1].1.queries.application_statements() <= selected_content_query_ceiling(20),
         "distinct ancestry statement ceiling exceeded: {}",
         serde_json::to_string(&samples[1])?
     );

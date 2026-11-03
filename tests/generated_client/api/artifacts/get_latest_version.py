@@ -7,18 +7,32 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.get_latest_version_response_200 import GetLatestVersionResponse200
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     id: int,
+    *,
+    version_id: int | None | Unset = UNSET,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    json_version_id: int | None | Unset
+    if isinstance(version_id, Unset):
+        json_version_id = UNSET
+    else:
+        json_version_id = version_id
+    params["version_id"] = json_version_id
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/api/v1/artifacts/{id}/versions/latest".format(
             id=quote(str(id), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -57,11 +71,13 @@ def sync_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
+    version_id: int | None | Unset = UNSET,
 ) -> Response[Any | GetLatestVersionResponse200]:
     """Get the latest version's metadata and JSON content
 
     Args:
         id (int):
+        version_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -73,6 +89,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         id=id,
+        version_id=version_id,
     )
 
     response = client.get_httpx_client().request(
@@ -86,11 +103,13 @@ def sync(
     id: int,
     *,
     client: AuthenticatedClient,
+    version_id: int | None | Unset = UNSET,
 ) -> Any | GetLatestVersionResponse200 | None:
     """Get the latest version's metadata and JSON content
 
     Args:
         id (int):
+        version_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -103,6 +122,7 @@ def sync(
     return sync_detailed(
         id=id,
         client=client,
+        version_id=version_id,
     ).parsed
 
 
@@ -110,11 +130,13 @@ async def asyncio_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
+    version_id: int | None | Unset = UNSET,
 ) -> Response[Any | GetLatestVersionResponse200]:
     """Get the latest version's metadata and JSON content
 
     Args:
         id (int):
+        version_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -126,6 +148,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         id=id,
+        version_id=version_id,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -137,11 +160,13 @@ async def asyncio(
     id: int,
     *,
     client: AuthenticatedClient,
+    version_id: int | None | Unset = UNSET,
 ) -> Any | GetLatestVersionResponse200 | None:
     """Get the latest version's metadata and JSON content
 
     Args:
         id (int):
+        version_id (int | None | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -155,5 +180,6 @@ async def asyncio(
         await asyncio_detailed(
             id=id,
             client=client,
+            version_id=version_id,
         )
     ).parsed
