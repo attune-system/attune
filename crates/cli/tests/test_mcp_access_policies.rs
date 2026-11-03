@@ -30,7 +30,11 @@ fn command(root: &std::path::Path) -> Command {
 fn stdio_access_policies_load_default_and_environment_selection() {
     let root = tempfile::tempdir().unwrap();
     let policy = root.path().join("policies.yaml");
-    std::fs::write(&policy, "default_policy: observer\npolicies:\n  observer:\n    access_mode: read-only\n    allowed_tools: [events_get, actions_execute]\n  disabled:\n    access_mode: full\n    allowed_tools: []\n").unwrap();
+    std::fs::write(
+        &policy,
+        "default_policy: observer\npolicies:\n  observer:\n  - events_get\n  disabled: []\n",
+    )
+    .unwrap();
     let input = [
         json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"actions_execute","arguments":{"ref":"core.echo"}}}),
@@ -72,7 +76,7 @@ fn invalid_access_policy_fails_startup_before_attempting_login() {
     let policy = root.path().join("policies.yaml");
     std::fs::write(
         &policy,
-        "default_policy: observer\npolicies:\n  observer:\n    access_mode: read-only\n",
+        "default_policy: observer\npolicies:\n  observer:\n  - events_get\n",
     )
     .unwrap();
     command(root.path())
@@ -120,7 +124,11 @@ fn user_policies_are_discovered_locally_and_read_only_needs_no_file() {
         .assert()
         .success();
     // Custom policies belong only to this user, with no explicit file flag.
-    std::fs::write(&policy_path, "default_policy: my-operator\npolicies:\n  my-operator:\n    access_mode: full\n    allowed_tools: [actions_execute]\n").unwrap();
+    std::fs::write(
+        &policy_path,
+        "default_policy: my-operator\npolicies:\n  my-operator:\n  - actions_execute\n",
+    )
+    .unwrap();
     let output = command(root.path())
         .write_stdin(input.clone())
         .assert()
@@ -193,20 +201,9 @@ fn builtin_full_access_needs_no_file_and_enables_the_complete_stdio_catalog() {
         .stdout
         .clone();
     assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), full);
-    let output = command(root.path())
-        .args(["--access-mode", "full"])
-        .write_stdin(input)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let safe: Value = serde_json::from_slice(&output).unwrap();
-    assert!(safe["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|tool| tool["annotations"]["readOnlyHint"] == true));
+    for flag in ["--access-mode", "--allowed-tool"] {
+        command(root.path()).args([flag, "full"]).assert().failure();
+    }
 }
 
 #[test]
@@ -255,4 +252,71 @@ fn builtin_stdio_read_only_catalog_exactly_matches_full_access_read_only_annotat
         expected,
         "read-only must include every published read tool and exclude every modifying tool"
     );
+}
+
+#[test]
+fn custom_policy_exposes_exactly_the_named_list_including_modifying_tools() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("policies.yaml");
+    std::fs::write(
+        &path,
+        "policies:\n  mixed: [events_get, actions_execute]\n  empty: []\n",
+    )
+    .unwrap();
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"executions_cancel","arguments":{"id":7}}}),
+    ].into_iter().map(|request| format!("{request}\n")).collect::<String>();
+    for selected in ["mixed", "empty"] {
+        let output = command(root.path())
+            .args([
+                "--policy-config",
+                path.to_str().unwrap(),
+                "--access-policy",
+                selected,
+            ])
+            .write_stdin(input.clone())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let replies = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let tools = replies[0]["result"]["tools"].as_array().unwrap();
+        if selected == "mixed" {
+            assert_eq!(tools.len(), 2);
+            assert!(tools
+                .iter()
+                .any(|tool| tool["name"] == "events_get"
+                    && tool["annotations"]["readOnlyHint"] == true));
+            assert!(tools.iter().any(|tool| tool["name"] == "actions_execute"
+                && tool["annotations"]["readOnlyHint"] == false));
+        } else {
+            assert!(tools.is_empty());
+        }
+        assert_eq!(replies[1]["result"]["isError"], true);
+        assert!(replies[1]
+            .to_string()
+            .contains("disabled by MCP access policy"));
+    }
+}
+
+#[test]
+fn nested_policy_objects_are_rejected_instead_of_silently_expanding_access() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("policies.yaml");
+    std::fs::write(
+        &path,
+        "policies:\n  old: {access_mode: full, allowed_tools: [actions_execute]}\n",
+    )
+    .unwrap();
+    command(root.path())
+        .args(["--policy-config", path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid MCP policy config"));
 }
