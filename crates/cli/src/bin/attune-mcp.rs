@@ -51,6 +51,26 @@ struct Cli {
     #[arg(long, env = "ATTUNE_MCP_TRANSPORT", default_value = "stdio")]
     transport: Transport,
 
+    /// User-owned access policies file (defaults to the Attune user config directory)
+    #[arg(long, env = "ATTUNE_MCP_POLICY_CONFIG")]
+    policy_config: Option<PathBuf>,
+
+    /// User access policy, or built-in read-only (separate from the login profile)
+    #[arg(long, env = "ATTUNE_MCP_ACCESS_POLICY")]
+    access_policy: Option<String>,
+
+    /// Further restrict an access policy; cannot expand the selected policy
+    #[arg(long, env = "ATTUNE_MCP_ACCESS_MODE")]
+    access_mode: Option<AccessMode>,
+
+    /// Only expose these exact tool names (repeatable; env is comma-separated)
+    #[arg(
+        long = "allowed-tool",
+        env = "ATTUNE_MCP_ALLOWED_TOOLS",
+        value_delimiter = ','
+    )]
+    allowed_tools: Option<Vec<String>>,
+
     /// Listen address for the HTTP transport
     #[arg(long, env = "ATTUNE_MCP_LISTEN_ADDR", default_value = "0.0.0.0:8090")]
     listen_addr: String,
@@ -94,9 +114,143 @@ enum Transport {
     Http,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AccessMode {
+    Full,
+    ReadOnly,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolPolicy {
+    #[serde(rename = "access_mode")]
+    mode: AccessMode,
+    allowed_tools: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccessPolicies {
+    default_policy: Option<String>,
+    policies: HashMap<String, ToolPolicy>,
+}
+
+impl AccessPolicies {
+    fn select(self, name: Option<&str>) -> Result<ToolPolicy> {
+        // Validate all policies, including inactive ones, so typos fail at startup.
+        for (name, policy) in &self.policies {
+            anyhow::ensure!(
+                !matches!(name.as_str(), "read-only" | "full-access"),
+                "MCP policy name '{name}' is reserved for a built-in access policy"
+            );
+            ToolPolicy::new(policy.mode, policy.allowed_tools.clone())?;
+        }
+        let name = name
+            .or(self.default_policy.as_deref())
+            .unwrap_or("read-only");
+        if let Some(policy) = self.policies.get(name) {
+            return Ok(policy.clone());
+        }
+        if name == "read-only" {
+            return Ok(ToolPolicy::read_only());
+        }
+        if name == "full-access" {
+            return ToolPolicy::new(AccessMode::Full, None);
+        }
+        Err(anyhow!("Unknown MCP access policy '{name}'"))
+    }
+}
+
+fn build_tool_policy(cli: &Cli) -> Result<ToolPolicy> {
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .context("Failed to determine user config directory")?;
+    build_tool_policy_with_default(cli, &config_dir.join("attune/mcp-policies.yaml"))
+}
+
+fn build_tool_policy_with_default(cli: &Cli, user_path: &std::path::Path) -> Result<ToolPolicy> {
+    let limits = ToolPolicy::new(
+        cli.access_mode.unwrap_or(AccessMode::Full),
+        cli.allowed_tools.clone(),
+    )?;
+    let path = cli.policy_config.as_deref().unwrap_or(user_path);
+    let policies = match std::fs::read_to_string(path) {
+        Ok(content) => serde_yaml_ng::from_str::<AccessPolicies>(&content)
+            .context("Invalid MCP policy config")?,
+        Err(error) if cli.policy_config.is_none() && error.kind() == io::ErrorKind::NotFound => {
+            // No automatic installation or config writes. The built-in default
+            // needs no file and never depends on what grants the user holds.
+            AccessPolicies {
+                default_policy: None,
+                policies: HashMap::new(),
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read MCP policy config '{}'", path.display()))
+        }
+    };
+    let mut policy = policies.select(cli.access_policy.as_deref())?;
+    // Startup flags can only narrow a named policy, never expand it.
+    if limits.mode == AccessMode::ReadOnly {
+        policy.mode = AccessMode::ReadOnly;
+    }
+    if let Some(names) = limits.allowed_tools {
+        policy.allowed_tools = Some(
+            names
+                .into_iter()
+                .filter(|name| {
+                    policy
+                        .allowed_tools
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(name))
+                })
+                .collect(),
+        );
+    }
+    Ok(policy)
+}
+
+impl ToolPolicy {
+    fn read_only() -> Self {
+        Self {
+            mode: AccessMode::ReadOnly,
+            allowed_tools: None,
+        }
+    }
+
+    fn new(mode: AccessMode, allowed_tools: Option<Vec<String>>) -> Result<Self> {
+        if let Some(names) = &allowed_tools {
+            let catalog = tool_defs();
+            for name in names {
+                anyhow::ensure!(
+                    catalog.iter().any(|tool| tool.name == name),
+                    "Unknown MCP allowed tool '{name}'"
+                );
+            }
+        }
+        Ok(Self {
+            mode,
+            allowed_tools,
+        })
+    }
+
+    fn allows(&self, tool: &ToolDef) -> bool {
+        (self.mode == AccessMode::Full || tool.read_only)
+            && self
+                .allowed_tools
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|name| name == tool.name))
+    }
+}
+
 #[derive(Clone)]
 struct ToolDef {
     name: &'static str,
+    // Required for every tool so new tools receive an explicit access review.
+    read_only: bool,
     title: &'static str,
     description: &'static str,
     input_schema: fn() -> Value,
@@ -117,6 +271,7 @@ struct McpServer {
     cache_refreshes: HashMap<String, CacheRefreshMetadata>,
     cache_refresh_order: VecDeque<String>,
     packs_check_access: PacksCheckAccess,
+    tool_policy: ToolPolicy,
 }
 
 #[derive(Clone)]
@@ -156,7 +311,13 @@ impl McpServer {
             cache_refreshes: HashMap::new(),
             cache_refresh_order: VecDeque::new(),
             packs_check_access,
+            tool_policy: ToolPolicy::read_only(),
         }
+    }
+
+    fn tool_allowed(&self, tool: &ToolDef) -> bool {
+        self.tool_policy.allows(tool)
+            && (tool.name != "packs_check" || self.packs_check_available())
     }
 
     fn packs_check_available(&self) -> bool {
@@ -209,7 +370,11 @@ impl McpServer {
                         "name": "attune-mcp",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Use Attune tools for discovery, execution, queue interaction, artifacts, events, and inquiries. Event creation is intentionally omitted because Attune restricts direct event emission to sensor and execution token flows."
+                    "instructions": if self.tool_policy.mode == AccessMode::ReadOnly {
+                        "Attune MCP is in read-only mode. Use the available tools for information and inspection only. Tool access is also limited by the configured allowlist and Attune API permissions."
+                    } else {
+                        "Use available Attune tools for discovery, execution, queue interaction, artifacts, events, and inquiries. Tool access is limited by server configuration and Attune API permissions. Event creation is intentionally omitted."
+                    }
                 });
                 Ok(id.map(|id| success_response(id, result)))
             }
@@ -218,13 +383,14 @@ impl McpServer {
             "tools/list" => {
                 let tools = tool_defs()
                     .iter()
-                    .filter(|tool| tool.name != "packs_check" || self.packs_check_available())
+                    .filter(|tool| self.tool_allowed(tool))
                     .map(|tool| {
                         json!({
                             "name": tool.name,
                             "title": tool.title,
                             "description": tool.description,
                             "inputSchema": (tool.input_schema)(),
+                            "annotations": { "readOnlyHint": tool.read_only },
                         })
                     })
                     .collect::<Vec<_>>();
@@ -289,13 +455,25 @@ impl McpServer {
         }
     }
 
-    /// Check if an error looks like an authentication/authorization failure.
+    /// Permission denials are normal tool results, never a reason to re-login.
     fn is_auth_error(err: &anyhow::Error) -> bool {
+        if let Some(error) = err.downcast_ref::<attune_cli::client::ApiRequestError>() {
+            return error.status == reqwest::StatusCode::UNAUTHORIZED;
+        }
         let msg = err.to_string();
         msg.contains("401") || msg.contains("Unauthorized") || msg.contains("token expired")
     }
 
     async fn call_tool(&mut self, tool_name: &str, args: &Map<String, Value>) -> Result<Value> {
+        let catalog = tool_defs();
+        let tool = catalog
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .ok_or_else(|| anyhow!("Unknown tool '{tool_name}'"))?;
+        anyhow::ensure!(
+            self.tool_policy.allows(tool),
+            "Tool '{tool_name}' is disabled by MCP access policy"
+        );
         match tool_name {
             "info_get" => serde_json::to_value(
                 attune_cli::info::get_info("attune-mcp", &self.profile, &mut self.client).await,
@@ -1291,19 +1469,19 @@ impl McpServer {
 fn tool_defs() -> &'static [ToolDef] {
     &[
         ToolDef {
-            name: "info_get",
+            name: "info_get", read_only: true,
             title: "Get local and server build information",
             description: "Identify the local MCP binary and the API server for its selected profile. Reports semantic versions and full compiled Git SHAs separately. Server errors are reported without hiding local build information.",
             input_schema: info_schema,
         },
         ToolDef {
-            name: "actions_list",
+            name: "actions_list", read_only: true,
             title: "List actions",
             description: "List Attune actions visible to the authenticated user.",
             input_schema: pagination_schema,
         },
         ToolDef {
-            name: "actions_search",
+            name: "actions_search", read_only: true,
             title: "Search actions",
             description:
                 "Search Attune actions by keyword (whitespace-separated tokens AND-matched against \
@@ -1312,294 +1490,294 @@ fn tool_defs() -> &'static [ToolDef] {
             input_schema: actions_search_schema,
         },
         ToolDef {
-            name: "actions_get",
+            name: "actions_get", read_only: true,
             title: "Get action",
             description: "Fetch detailed metadata for a single action by ref.",
             input_schema: ref_schema,
         },
         ToolDef {
-            name: "actions_execute",
+            name: "actions_execute", read_only: false,
             title: "Execute action",
             description:
                 "Create and queue an execution for an Attune action with structured parameters.",
             input_schema: action_execute_schema,
         },
         ToolDef {
-            name: "artifacts_list",
+            name: "artifacts_list", read_only: true,
             title: "List artifacts",
             description: "List one bounded artifact page visible to the authenticated user. Returns items, next_cursor, and has_more; pass next_cursor as cursor to continue, including after an empty resumable page.",
             input_schema: artifact_cursor_schema,
         },
         ToolDef {
-            name: "artifacts_get",
+            name: "artifacts_get", read_only: true,
             title: "Get artifact",
             description: "Fetch a single artifact by ref.",
             input_schema: ref_schema,
         },
         ToolDef {
-            name: "events_list",
+            name: "events_list", read_only: true,
             title: "List events",
             description: "List recorded Attune events for observability and correlation.",
             input_schema: pagination_schema,
         },
         ToolDef {
-            name: "events_get",
+            name: "events_get", read_only: true,
             title: "Get event",
             description: "Fetch a single recorded event by numeric ID.",
             input_schema: id_schema,
         },
         ToolDef {
-            name: "executions_get",
+            name: "executions_get", read_only: true,
             title: "Get execution",
             description: "Fetch a single execution by numeric ID.",
             input_schema: id_schema,
         },
         ToolDef {
-            name: "executions_list",
+            name: "executions_list", read_only: true,
             title: "List executions",
             description: "List recent executions with optional filtering by status, action_ref, trace_tag, or top-level only. Useful for monitoring action runs and debugging.",
             input_schema: executions_list_schema,
         },
         ToolDef {
-            name: "traces_get_report",
+            name: "traces_get_report", read_only: true,
             title: "Get trace report",
             description: "Fetch a full cross-system activity report for an exact trace tag.",
             input_schema: trace_report_schema,
         },
         ToolDef {
-            name: "executions_cancel",
+            name: "executions_cancel", read_only: false,
             title: "Cancel execution",
             description: "Request cancellation for a queued or running execution.",
             input_schema: id_schema,
         },
         ToolDef {
-            name: "rules_get",
+            name: "rules_get", read_only: true,
             title: "Get rule",
             description: "Fetch a single rule definition by ref.",
             input_schema: ref_schema,
         },
         ToolDef {
-            name: "rules_update_trace_tag_template",
+            name: "rules_update_trace_tag_template", read_only: false,
             title: "Update rule trace tag template",
             description:
                 "Set or clear a rule trace_tag_template used for executions created from that rule.",
             input_schema: ref_with_trace_tag_schema,
         },
         ToolDef {
-            name: "inquiries_list",
+            name: "inquiries_list", read_only: true,
             title: "List inquiries",
             description: "List visible inquiries with inquiry-specific filters and pagination metadata. Requires an Attune access token or execution token; visibility still follows inquiry and execution permissions.",
             input_schema: inquiries_list_schema,
         },
         ToolDef {
-            name: "inquiries_get",
+            name: "inquiries_get", read_only: true,
             title: "Get inquiry",
             description: "Fetch one visible inquiry and its stored response options. Requires an Attune access token or execution token; visibility still follows inquiry and execution permissions.",
             input_schema: id_schema,
         },
         ToolDef {
-            name: "inquiries_respond",
+            name: "inquiries_respond", read_only: false,
             title: "Respond to inquiry",
             description: "Respond to a pending inquiry with either a stored option ref or a response object. Requires an Attune access token or execution token and authorization to answer the inquiry.",
             input_schema: inquiry_respond_schema,
         },
         ToolDef {
-            name: "execution_inquiries_create",
+            name: "execution_inquiries_create", read_only: false,
             title: "Create execution inquiry",
             description: "Create an inquiry for the current execution. Requires an execution token with inquiries:create permission; access tokens are rejected by the API.",
             input_schema: execution_inquiry_create_schema,
         },
         ToolDef {
-            name: "execution_inquiries_cancel",
+            name: "execution_inquiries_cancel", read_only: false,
             title: "Cancel execution inquiry",
             description: "Cancel a pending inquiry created by the current execution. Requires that creator execution's execution token; access tokens are rejected by the API.",
             input_schema: id_schema,
         },
-        ToolDef { name: "queues_update_requester_grouping", title: "Set requester grouping", description: "Explicitly select aggregate or separate queue batches. Preserves unrelated queue config. Requires current queues:update authority. Example: {ref: ops.inbox, grouping: separate}.", input_schema: interoperability::grouping_schema },
-        ToolDef { name: "packs_reset_config", title: "Reset pack configuration overrides", description: "Remove named whole-field overrides using release defaults without fetching plaintext. Requires packs:configure and confirm_reset=true. Example: {ref: example, fields: [retries], confirm_reset: true}.", input_schema: interoperability::reset_schema },
-        ToolDef { name: "permission_sets_export", title: "Export authored permission definition", description: "Export the canonical authorable definition, never effective grants or current target substitutions. Requires ordinary permission management visibility. Example: {ref: example.worker}.", input_schema: interoperability::export_schema },
-        ToolDef { name: "permission_sets_import", title: "Import authored permission definition", description: "Update an existing permission set from its canonical export with confirm_import=true. Target ref must match. Platform/retired sets remain protected; server readmission validation is unchanged. No filesystem access.", input_schema: interoperability::import_schema },
+        ToolDef { name: "queues_update_requester_grouping", read_only: false, title: "Set requester grouping", description: "Explicitly select aggregate or separate queue batches. Preserves unrelated queue config. Requires current queues:update authority. Example: {ref: ops.inbox, grouping: separate}.", input_schema: interoperability::grouping_schema },
+        ToolDef { name: "packs_reset_config", read_only: false, title: "Reset pack configuration overrides", description: "Remove named whole-field overrides using release defaults without fetching plaintext. Requires packs:configure and confirm_reset=true. Example: {ref: example, fields: [retries], confirm_reset: true}.", input_schema: interoperability::reset_schema },
+        ToolDef { name: "permission_sets_export", read_only: true, title: "Export authored permission definition", description: "Export the canonical authorable definition, never effective grants or current target substitutions. Requires ordinary permission management visibility. Example: {ref: example.worker}.", input_schema: interoperability::export_schema },
+        ToolDef { name: "permission_sets_import", read_only: false, title: "Import authored permission definition", description: "Update an existing permission set from its canonical export with confirm_import=true. Target ref must match. Platform/retired sets remain protected; server readmission validation is unchanged. No filesystem access.", input_schema: interoperability::import_schema },
         ToolDef {
-            name: "queues_list",
+            name: "queues_list", read_only: true,
             title: "List queues",
             description: "List work queue definitions visible to the authenticated user.",
             input_schema: pagination_schema,
         },
         ToolDef {
-            name: "queues_get",
+            name: "queues_get", read_only: true,
             title: "Get queue",
             description: "Fetch a single work queue definition by ref.",
             input_schema: ref_schema,
         },
         ToolDef {
-            name: "queues_update_trace_tag_template",
+            name: "queues_update_trace_tag_template", read_only: false,
             title: "Update queue trace tag template",
             description:
                 "Set or clear a queue trace_tag_template used for dispatch executions.",
             input_schema: ref_with_trace_tag_schema,
         },
         ToolDef {
-            name: "queues_enqueue",
+            name: "queues_enqueue", read_only: false,
             title: "Enqueue queue item",
             description:
                 "Submit a new work item into a queue-backed Attune workflow or session inbox.",
             input_schema: queue_enqueue_schema,
         },
         ToolDef {
-            name: "workflows_list",
+            name: "workflows_list", read_only: true,
             title: "List workflows",
             description: "List workflow definitions visible to the authenticated user.",
             input_schema: pagination_schema,
         },
         ToolDef {
-            name: "schema_types_list", title: "List named schemas",
+            name: "schema_types_list", read_only: true, title: "List named schemas",
             description: "List a bounded page of installed non-sensitive type schemas. Authentication is sufficient; this grants no Key or execution rights.",
             input_schema: || json!({"type": "object", "properties": {"pack_ref": {"type": "string"}, "q": {"type": "string"}, "page": {"type": "integer", "minimum": 1}, "page_size": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": false}),
         },
-        ToolDef { name: "schema_types_get", title: "Get named schema", description: "Fetch the original installed type definition, preserving authored references.", input_schema: ref_schema },
-        ToolDef { name: "schema_types_inspect", title: "Inspect named schema", description: "Fetch a self-contained resolved rendering graph and selected immutable revisions.", input_schema: ref_schema },
+        ToolDef { name: "schema_types_get", read_only: true, title: "Get named schema", description: "Fetch the original installed type definition, preserving authored references.", input_schema: ref_schema },
+        ToolDef { name: "schema_types_inspect", read_only: true, title: "Inspect named schema", description: "Fetch a self-contained resolved rendering graph and selected immutable revisions.", input_schema: ref_schema },
         ToolDef {
-            name: "schema_types_preview", title: "Preview value schema", description: "Compile an authenticated authoring preview. It does not select a runtime binding or authorize values.",
+            name: "schema_types_preview", read_only: true, title: "Preview value schema", description: "Compile an authenticated authoring preview. It does not select a runtime binding or authorize values.",
             input_schema: || json!({"type": "object", "properties": {"context": {"enum": ["flat_document", "single_value"]}, "schema": {"type": ["object", "boolean"]}}, "required": ["context", "schema"], "additionalProperties": false}),
         },
         ToolDef {
-            name: "workflows_get",
+            name: "workflows_get", read_only: true,
             title: "Get workflow",
             description: "Fetch a single workflow definition by ref.",
             input_schema: ref_schema,
         },
         ToolDef {
-            name: "packs_list",
+            name: "packs_list", read_only: true,
             title: "List packs",
             description: "List installed Attune packs visible to the authenticated user.",
             input_schema: pagination_schema,
         },
-        ToolDef { name: "pack_approvals_list", title: "List external approvals", description: "List a bounded page of a pack's fixed external approvals, including expired/revoked records. Requires an access token and pack read permission.", input_schema: pack_actions_schema },
-        ToolDef { name: "pack_input_approvals_issue", title: "Approve declared input", description: "Issue fixed input-only consent for an exact retained declaration. Use policy_revision plus invocation_binding BEFORE execution, or renderer_execution. Requires an access token, packs:read and current issuer coverage of the fixed keys/packs read/decrypt grants. Purpose is declaration-bound; this never selects SDK permission refs. Issuer inactivity is not revocation. Expiry and explicit revocation still deny.", input_schema: attune_cli::input_approval::issue_schema },
-        ToolDef { name: "pack_input_approval_targets_list", title: "Discover input consent targets", description: "Discover one bounded page of exact retained declaration targets before an execution exists. Requires Access-token packs:read and current source component plus actual action visibility. Hidden invocations are filtered before count and paging. Omit policy_revision for the pack's current policy. Metadata is not consent, an execution permit or SDK authority.", input_schema: input_approval_targets_schema },
-        ToolDef { name: "pack_input_approvals_list", title: "List shared approval ledger", description: "List a bounded page of the shared pack approval ledger, including input and runtime approvals and expired/revoked records. There is no input-only list filter. Requires an access token and packs:read.", input_schema: pack_actions_schema },
-        ToolDef { name: "pack_input_approvals_get", title: "Inspect input consent record", description: "Get an approval ID from the shared pack ledger. Returns the server's public fixed scope, expiry and revocation record without reconstructing private declaration proof. Requires an access token and packs:read.", input_schema: pack_approval_id_schema },
-        ToolDef { name: "pack_input_approvals_revoke", title: "Revoke input consent", description: "Explicitly revoke an approval in the shared pack ledger. Inspect the ID first. Requires confirm_revocation=true, an access token, packs:read, and permission management or current coverage of the approved grants. Human inactivity alone is not revocation.", input_schema: pack_approval_revoke_schema },
-        ToolDef { name: "pack_approvals_get", title: "Inspect external approval", description: "Inspect fixed scope, issuer attribution, expiry and explicit revocation. Human issuer inactivity does not revoke runtime approval.", input_schema: pack_approval_id_schema },
-        ToolDef { name: "pack_approvals_issue", title: "Issue external approval", description: "Issue fixed external grants after current issuer authority validation. No personal IAM assignment is created. Requires an access token.", input_schema: pack_approval_issue_schema },
-        ToolDef { name: "pack_approvals_replace", title: "Replace external approval", description: "Issue a new fixed approval and revoke its predecessor atomically. Requires confirm_revocation=true. Existing runs do not automatically acquire the new approval.", input_schema: pack_approval_replace_schema },
-        ToolDef { name: "pack_approvals_revoke", title: "Revoke external approval", description: "Explicitly revoke runtime authority, idempotently. Requires confirm_revocation=true; disabling human login is separate.", input_schema: pack_approval_revoke_schema },
+        ToolDef { name: "pack_approvals_list", read_only: true, title: "List external approvals", description: "List a bounded page of a pack's fixed external approvals, including expired/revoked records. Requires an access token and pack read permission.", input_schema: pack_actions_schema },
+        ToolDef { name: "pack_input_approvals_issue", read_only: false, title: "Approve declared input", description: "Issue fixed input-only consent for an exact retained declaration. Use policy_revision plus invocation_binding BEFORE execution, or renderer_execution. Requires an access token, packs:read and current issuer coverage of the fixed keys/packs read/decrypt grants. Purpose is declaration-bound; this never selects SDK permission refs. Issuer inactivity is not revocation. Expiry and explicit revocation still deny.", input_schema: attune_cli::input_approval::issue_schema },
+        ToolDef { name: "pack_input_approval_targets_list", read_only: true, title: "Discover input consent targets", description: "Discover one bounded page of exact retained declaration targets before an execution exists. Requires Access-token packs:read and current source component plus actual action visibility. Hidden invocations are filtered before count and paging. Omit policy_revision for the pack's current policy. Metadata is not consent, an execution permit or SDK authority.", input_schema: input_approval_targets_schema },
+        ToolDef { name: "pack_input_approvals_list", read_only: true, title: "List shared approval ledger", description: "List a bounded page of the shared pack approval ledger, including input and runtime approvals and expired/revoked records. There is no input-only list filter. Requires an access token and packs:read.", input_schema: pack_actions_schema },
+        ToolDef { name: "pack_input_approvals_get", read_only: true, title: "Inspect input consent record", description: "Get an approval ID from the shared pack ledger. Returns the server's public fixed scope, expiry and revocation record without reconstructing private declaration proof. Requires an access token and packs:read.", input_schema: pack_approval_id_schema },
+        ToolDef { name: "pack_input_approvals_revoke", read_only: false, title: "Revoke input consent", description: "Explicitly revoke an approval in the shared pack ledger. Inspect the ID first. Requires confirm_revocation=true, an access token, packs:read, and permission management or current coverage of the approved grants. Human inactivity alone is not revocation.", input_schema: pack_approval_revoke_schema },
+        ToolDef { name: "pack_approvals_get", read_only: true, title: "Inspect external approval", description: "Inspect fixed scope, issuer attribution, expiry and explicit revocation. Human issuer inactivity does not revoke runtime approval.", input_schema: pack_approval_id_schema },
+        ToolDef { name: "pack_approvals_issue", read_only: false, title: "Issue external approval", description: "Issue fixed external grants after current issuer authority validation. No personal IAM assignment is created. Requires an access token.", input_schema: pack_approval_issue_schema },
+        ToolDef { name: "pack_approvals_replace", read_only: false, title: "Replace external approval", description: "Issue a new fixed approval and revoke its predecessor atomically. Requires confirm_revocation=true. Existing runs do not automatically acquire the new approval.", input_schema: pack_approval_replace_schema },
+        ToolDef { name: "pack_approvals_revoke", read_only: false, title: "Revoke external approval", description: "Explicitly revoke runtime authority, idempotently. Requires confirm_revocation=true; disabling human login is separate.", input_schema: pack_approval_revoke_schema },
         ToolDef {
-            name: "packs_get",
+            name: "packs_get", read_only: true,
             title: "Get pack",
             description: "Fetch detailed metadata for a single pack by ref, including its configuration schema and current configuration values.",
             input_schema: ref_schema,
         },
         ToolDef {
-            name: "packs_update_config",
+            name: "packs_update_config", read_only: false,
             title: "Update pack configuration",
             description: "Update the configuration values for a pack. The config object is merged with the pack's conf_schema. Requires packs:configure permission.",
             input_schema: packs_update_config_schema,
         },
         ToolDef {
-            name: "packs_get_actions",
+            name: "packs_get_actions", read_only: true,
             title: "List pack actions",
             description: "List one bounded page of actions belonging to a specific pack by ref.",
             input_schema: pack_actions_schema,
         },
         ToolDef {
-            name: "packs_check",
+            name: "packs_check", read_only: true,
             title: "Check local pack",
             description: "Validate metadata in a local pack directory without contacting Attune. The path is resolved on the attune-mcp server host, not the MCP client host.",
             input_schema: pack_check_schema,
         },
         ToolDef {
-            name: "cache_namespaces_list",
+            name: "cache_namespaces_list", read_only: true,
             title: "List cache namespaces",
             description: "List accessible cache namespaces, optionally restricted to one owner scope.",
             input_schema: cache_namespace_list_schema,
         },
         ToolDef {
-            name: "cache_namespace_get",
+            name: "cache_namespace_get", read_only: true,
             title: "Get cache namespace",
             description: "Fetch metadata and policy for an owner-scoped cache namespace.",
             input_schema: cache_namespace_schema,
         },
         ToolDef {
-            name: "cache_namespace_create",
+            name: "cache_namespace_create", read_only: false,
             title: "Create cache namespace",
             description: "Create an owner-scoped cache namespace. Ownership cannot later be changed.",
             input_schema: cache_namespace_policy_schema,
         },
         ToolDef {
-            name: "cache_namespace_update",
+            name: "cache_namespace_update", read_only: false,
             title: "Update cache namespace policy",
             description: "Update one or more mutable policy fields for a cache namespace.",
             input_schema: cache_namespace_policy_schema,
         },
         ToolDef {
-            name: "cache_namespace_delete",
+            name: "cache_namespace_delete", read_only: false,
             title: "Delete cache namespace",
             description: "Tombstone a cache namespace and make its generations unavailable.",
             input_schema: cache_namespace_schema,
         },
         ToolDef {
-            name: "cache_entry_get",
+            name: "cache_entry_get", read_only: true,
             title: "Get cache entry",
             description: "Read one cache value from the active or a retained generation. Values may contain sensitive business data.",
             input_schema: cache_entry_get_schema,
         },
         ToolDef {
-            name: "cache_entries_get_many",
+            name: "cache_entries_get_many", read_only: true,
             title: "Get multiple cache entries",
             description: "Read up to 1000 cache values from the active or a retained generation.",
             input_schema: cache_entries_get_many_schema,
         },
         ToolDef {
-            name: "cache_entries_scan",
+            name: "cache_entries_scan", read_only: true,
             title: "Scan cache entries",
             description: "Read one bounded cache page. Use the returned cursor for the next page; no unbounded scan is exposed.",
             input_schema: cache_entries_scan_schema,
         },
         ToolDef {
-            name: "cache_generations_list",
+            name: "cache_generations_list", read_only: true,
             title: "List cache generations",
             description: "List immutable generations for an owner-scoped cache namespace.",
             input_schema: cache_generation_list_schema,
         },
         ToolDef {
-            name: "cache_generation_get",
+            name: "cache_generation_get", read_only: true,
             title: "Get cache generation",
             description: "Fetch validation and lifecycle details for one cache generation.",
             input_schema: cache_generation_schema,
         },
         ToolDef {
-            name: "cache_refresh_begin",
+            name: "cache_refresh_begin", read_only: false,
             title: "Begin cache refresh",
             description: "Create an idempotent staging generation. Optional source_generation_id clones the observed active snapshot inside PostgreSQL and requires cache-read as well as cache-write permission.",
             input_schema: cache_refresh_begin_schema,
         },
         ToolDef {
-            name: "cache_refresh_upload_chunk",
+            name: "cache_refresh_upload_chunk", read_only: false,
             title: "Upload cache refresh chunk",
             description: "Upload one bounded chunk. Staging clones accept replacements and deletions keyed by external_id; chunk_index tracks order and retries, not record positions. Requires explicit cache-write permission.",
             input_schema: cache_refresh_upload_schema,
         },
         ToolDef {
-            name: "cache_live_apply",
+            name: "cache_live_apply", read_only: false,
             title: "Apply live cache changes",
             description: "Atomically apply complete-record upserts and deletions keyed by external_id to a durable live cache. Requires expected_revision and a stable request_id for identical retries. Optional source_revision commits with the records. Live caches cannot be scanned or iterated.",
             input_schema: cache_live_apply_schema,
         },
         ToolDef {
-            name: "cache_refresh_seal",
+            name: "cache_refresh_seal", read_only: false,
             title: "Seal cache refresh",
             description: "Validate a fully uploaded staging generation using begin-time expected metadata. Supply expected_chunk_count when begin was performed by another MCP process.",
             input_schema: cache_refresh_seal_schema,
         },
         ToolDef {
-            name: "cache_refresh_promote",
+            name: "cache_refresh_promote", read_only: false,
             title: "Promote cache refresh",
             description: "Atomically publish a ready generation with an optimistic active-generation precondition.",
             input_schema: cache_refresh_promote_schema,
         },
         ToolDef {
-            name: "cache_refresh_abort",
+            name: "cache_refresh_abort", read_only: false,
             title: "Abort cache refresh",
             description: "Abandon a staging generation. This destructive operation requires explicit cache-write permission.",
             input_schema: cache_generation_schema,
@@ -2665,6 +2843,7 @@ fn selected_auth_mode(cli: &Cli, config: &CliConfig) -> Result<AuthMode> {
 }
 
 async fn build_server(cli: &Cli) -> Result<McpServer> {
+    let tool_policy = build_tool_policy(cli)?;
     let mut config = build_config(cli)?;
     let effective_api_url = config.effective_api_url(&cli.api_url);
     let auth_mode = selected_auth_mode(cli, &config)?;
@@ -2702,6 +2881,8 @@ async fn build_server(cli: &Cli) -> Result<McpServer> {
     tracing::info!(
         api_url = %sanitize_url_for_display(&effective_api_url),
         transport = ?cli.transport,
+        access_mode = ?tool_policy.mode,
+        allowed_tools = ?tool_policy.allowed_tools,
         auth_mode = %match auth_mode {
             AuthMode::ExecutionToken => "execution_token",
             AuthMode::ExplicitToken => "explicit_token",
@@ -2743,12 +2924,14 @@ async fn build_server(cli: &Cli) -> Result<McpServer> {
         }
     };
 
-    Ok(McpServer::new(
+    let mut server = McpServer::new(
         ApiClient::from_config(&config, &cli.api_url),
         config.current_profile.clone(),
         credentials,
         packs_check_access,
-    ))
+    );
+    server.tool_policy = tool_policy;
+    Ok(server)
 }
 
 async fn run_stdio(server: &mut McpServer) -> Result<()> {
@@ -2864,6 +3047,469 @@ mod tests {
 
     fn test_server(api_url: String) -> McpServer {
         test_server_with_access(api_url, PacksCheckAccess::Unrestricted)
+    }
+
+    #[tokio::test]
+    async fn builtin_policy_catalogs_exactly_match_registered_tools_and_published_read_only_hints()
+    {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        fn published_tools(response: &Value) -> BTreeMap<String, bool> {
+            let tools = response["result"]["tools"]
+                .as_array()
+                .expect("tools/list array");
+            let mut by_name = BTreeMap::new();
+            for tool in tools {
+                let name = tool["name"].as_str().expect("tool name");
+                let read_only = tool["annotations"]["readOnlyHint"]
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("{name} must publish a boolean readOnlyHint"));
+                assert!(
+                    by_name.insert(name.to_owned(), read_only).is_none(),
+                    "duplicate advertised tool: {name}"
+                );
+            }
+            by_name
+        }
+
+        let registry = tool_defs();
+        let registered_names = registry
+            .iter()
+            .map(|tool| tool.name)
+            .collect::<BTreeSet<_>>();
+        assert!(!registered_names.is_empty());
+        assert_eq!(
+            registered_names.len(),
+            registry.len(),
+            "duplicate registered tool names"
+        );
+        let api = MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        for (transport, filesystem_access, packs_check_enabled) in [
+            ("stdio", PacksCheckAccess::Unrestricted, true),
+            (
+                "http without filesystem roots",
+                PacksCheckAccess::Disabled,
+                false,
+            ),
+            (
+                "http with filesystem roots",
+                PacksCheckAccess::Allowlisted(vec![root.path().to_path_buf()]),
+                true,
+            ),
+        ] {
+            let mut server = test_server_with_access(api.uri(), filesystem_access);
+            server.tool_policy = AccessPolicies {
+                default_policy: None,
+                policies: HashMap::new(),
+            }
+            .select(Some("full-access"))
+            .unwrap();
+            let request = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
+            let full_response = server.handle_request(&request).await.unwrap().unwrap();
+            let full_tools = published_tools(&full_response);
+            // Compare against the complete registry, not a fixed list or count.
+            // Only the existing transport-specific filesystem restriction applies.
+            let expected_full = registered_names
+                .iter()
+                .copied()
+                .filter(|name| packs_check_enabled || *name != "packs_check")
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                full_tools.keys().cloned().collect::<BTreeSet<_>>(),
+                expected_full,
+                "full-access must publish the complete available catalog for {transport}"
+            );
+
+            // Derive expected read-only membership from the public full-access
+            // response, independently of the private policy/classification fields.
+            let expected_read_only = full_tools
+                .iter()
+                .filter(|(_, read_only)| **read_only)
+                .map(|(name, read_only)| (name.clone(), *read_only))
+                .collect::<BTreeMap<_, _>>();
+            server.tool_policy = AccessPolicies {
+                default_policy: None,
+                policies: HashMap::new(),
+            }
+            .select(Some("read-only"))
+            .unwrap();
+            let read_only_response = server.handle_request(&request).await.unwrap().unwrap();
+            assert_eq!(
+                published_tools(&read_only_response),
+                expected_read_only,
+                "read-only must publish exactly the tools marked readOnlyHint=true for {transport}"
+            );
+
+            // Hidden modifying tools must also reject direct invocation; hiding
+            // a name from tools/list alone would not enforce the policy.
+            for (name, read_only) in &full_tools {
+                if *read_only {
+                    continue;
+                }
+                let denied = server
+                    .handle_request(&json!({
+                        "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                        "params":{"name":name, "arguments":{}}
+                    }))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(denied["result"]["isError"], true, "{name} on {transport}");
+                assert!(
+                    denied.to_string().contains("disabled by MCP access policy"),
+                    "{name} must be rejected by policy before argument validation on {transport}"
+                );
+            }
+        }
+        assert!(
+            api.received_requests().await.unwrap().is_empty(),
+            "discovery and policy-denied tools must not contact the Attune API"
+        );
+    }
+
+    #[test]
+    fn builtin_access_policies_default_safe_and_full_access_explicitly_allows_every_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-policies.yaml");
+        let mut cli = Cli::try_parse_from(["attune-mcp"]).unwrap();
+        let policy = build_tool_policy_with_default(&cli, &path).unwrap();
+        for tool in tool_defs() {
+            assert_eq!(policy.allows(tool), tool.read_only, "{}", tool.name);
+        }
+        assert!(!path.exists());
+        // A legacy-style mode flag must not silently expand the safe default.
+        cli.access_mode = Some(AccessMode::Full);
+        let policy = build_tool_policy_with_default(&cli, &path).unwrap();
+        assert_eq!(policy.mode, AccessMode::ReadOnly);
+        cli.access_policy = Some("full-access".into());
+        let full = build_tool_policy_with_default(&cli, &path).unwrap();
+        assert!(tool_defs().iter().all(|tool| full.allows(tool)));
+        cli.access_mode = Some(AccessMode::ReadOnly);
+        let restricted = build_tool_policy_with_default(&cli, &path).unwrap();
+        assert!(tool_defs()
+            .iter()
+            .all(|tool| restricted.allows(tool) == tool.read_only));
+        cli.access_mode = None;
+        cli.allowed_tools = Some(vec!["events_get".into()]);
+        let restricted = build_tool_policy_with_default(&cli, &path).unwrap();
+        assert!(tool_defs()
+            .iter()
+            .all(|tool| restricted.allows(tool) == (tool.name == "events_get")));
+        // User policy files may deliberately select either built-in default.
+        cli.access_policy = None;
+        cli.allowed_tools = None;
+        std::fs::write(&path, "default_policy: full-access\npolicies: {}\n").unwrap();
+        let full = build_tool_policy_with_default(&cli, &path).unwrap();
+        assert!(tool_defs().iter().all(|tool| full.allows(tool)));
+        // Built-in names are stable and cannot be shadowed by user definitions.
+        for name in ["read-only", "full-access"] {
+            std::fs::write(
+                &path,
+                format!("policies:\n  {name}:\n    access_mode: full\n"),
+            )
+            .unwrap();
+            assert!(build_tool_policy_with_default(&cli, &path)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved"));
+        }
+    }
+
+    #[test]
+    fn access_policies_validate_selection_and_reject_misconfiguration() {
+        let yaml = r#"
+default_policy: observer
+policies:
+  observer:
+    access_mode: read-only
+  operator:
+    access_mode: full
+    allowed_tools: [actions_list, actions_execute]
+  disabled:
+    access_mode: full
+    allowed_tools: []
+"#;
+        let parse = || serde_yaml_ng::from_str::<AccessPolicies>(yaml).unwrap();
+        let catalog = tool_defs();
+        let execute = catalog
+            .iter()
+            .find(|t| t.name == "actions_execute")
+            .unwrap();
+        let list = catalog.iter().find(|t| t.name == "actions_list").unwrap();
+        assert!(!parse().select(None).unwrap().allows(execute));
+        let operator = parse().select(Some("operator")).unwrap();
+        assert!(operator.allows(execute));
+        assert!(operator.allows(list));
+        assert!(!parse().select(Some("disabled")).unwrap().allows(list));
+        assert!(parse().select(Some("missing")).is_err());
+        assert!(serde_yaml_ng::from_str::<AccessPolicies>(
+            &yaml.replace("allowed_tools: []", "allowed_tool: []")
+        )
+        .is_err());
+        assert!(serde_yaml_ng::from_str::<AccessPolicies>(
+            &yaml.replace("actions_execute", "actions_exceute")
+        )
+        .unwrap()
+        .select(None)
+        .is_err());
+        assert_eq!(
+            serde_yaml_ng::from_str::<AccessPolicies>(
+                &yaml.replace("default_policy: observer", "")
+            )
+            .unwrap()
+            .select(None)
+            .unwrap()
+            .mode,
+            AccessMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn access_policy_startup_limits_only_narrow_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policies.yaml");
+        std::fs::write(&path, "default_policy: operator\npolicies:\n  operator:\n    access_mode: full\n    allowed_tools: [actions_list, actions_execute]\n").unwrap();
+        let mut cli = Cli::try_parse_from(["attune-mcp"]).unwrap();
+        cli.policy_config = Some(path.clone());
+        cli.access_mode = Some(AccessMode::ReadOnly);
+        cli.allowed_tools = Some(vec!["actions_execute".into(), "events_list".into()]);
+        let policy = build_tool_policy(&cli).unwrap();
+        assert!(tool_defs().iter().all(|t| !policy.allows(t)));
+        cli.access_policy = Some("missing".into());
+        assert!(build_tool_policy(&cli).is_err());
+        cli.access_policy = None;
+        std::fs::write(path, "policies: invalid").unwrap();
+        assert!(build_tool_policy(&cli).is_err());
+        assert!(Cli::try_parse_from(["attune-mcp", "--access-policy", "observer"]).is_ok());
+        assert!(Cli::try_parse_from(["attune-mcp", "--access-mode", "readonly"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_is_a_ceiling_and_missing_user_grants_do_not_break_the_session() {
+        let api = MockServer::start().await;
+        // A policy permits both operations without asserting that the user
+        // holds either grant. The API remains authoritative for each target.
+        let policy = serde_yaml_ng::from_str::<AccessPolicies>(
+            "default_policy: mine\npolicies:\n  mine:\n    access_mode: full\n    allowed_tools: [actions_execute, events_get]\n"
+        ).unwrap().select(None).unwrap();
+        for (action_ref, status, body) in [
+            (
+                "production.deploy",
+                403,
+                json!({"error":"Unauthorized for this action", "code":"PERMISSION_DENIED"}),
+            ),
+            ("sandbox.echo", 200, json!({"data":{"id":7}})),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/api/v1/executions/execute"))
+                .and(body_json(json!({"action_ref":action_ref})))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .expect(1)
+                .mount(&api)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"id":42}})))
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server(api.uri());
+        server.tool_policy = policy;
+        server.credentials = Some(LoginCredentials {
+            api_url: api.uri(),
+            login: "limited-user".into(),
+            password: "unused".into(),
+        });
+        let mut replies = Vec::new();
+        for (name, arguments) in [
+            ("actions_execute", json!({"action_ref":"production.deploy"})),
+            ("events_get", json!({"id":42})),
+            ("actions_execute", json!({"action_ref":"sandbox.echo"})),
+            ("executions_cancel", json!({"id":7})),
+        ] {
+            replies.push(
+                server
+                    .handle_request(&json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":name, "arguments":arguments}}))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(replies[0]["result"]["structuredContent"]["status"], 403);
+        assert_eq!(
+            replies[0]["result"]["structuredContent"]["code"],
+            "PERMISSION_DENIED"
+        );
+        assert_eq!(replies[1]["result"]["isError"], false);
+        assert_eq!(replies[2]["result"]["isError"], false);
+        assert!(replies[3]
+            .to_string()
+            .contains("disabled by MCP access policy"));
+        // Exactly the three policy-permitted requests, with no re-login,
+        // permission-management requests, or attempt at the excluded cancel.
+        assert_eq!(api.received_requests().await.unwrap().len(), 3);
+        api.verify().await;
+    }
+
+    #[tokio::test]
+    async fn read_only_policy_hides_and_rejects_every_mutation_before_api_or_reauth() {
+        let api = MockServer::start().await;
+        for name in [
+            "actions_execute",
+            "executions_cancel",
+            "queues_enqueue",
+            "inquiries_respond",
+            "execution_inquiries_create",
+            "execution_inquiries_cancel",
+            "packs_update_config",
+            "packs_reset_config",
+            "permission_sets_import",
+            "pack_approvals_issue",
+            "pack_approvals_replace",
+            "pack_approvals_revoke",
+            "pack_input_approvals_issue",
+            "pack_input_approvals_revoke",
+            "cache_namespace_create",
+            "cache_namespace_update",
+            "cache_namespace_delete",
+            "cache_refresh_begin",
+            "cache_refresh_upload_chunk",
+            "cache_live_apply",
+            "cache_refresh_seal",
+            "cache_refresh_promote",
+            "cache_refresh_abort",
+        ] {
+            assert!(
+                !tool_defs()
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .unwrap()
+                    .read_only,
+                "{name}"
+            );
+        }
+        let mut server = test_server(api.uri());
+        server.tool_policy = ToolPolicy::new(AccessMode::ReadOnly, None).unwrap();
+        server.credentials = Some(LoginCredentials {
+            api_url: api.uri(),
+            login: "privileged".into(),
+            password: "unused".into(),
+        });
+        let response = server
+            .handle_request(&json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"}))
+            .await
+            .unwrap()
+            .unwrap();
+        let advertised = response["result"]["tools"].as_array().unwrap();
+        for tool in tool_defs() {
+            assert_eq!(
+                advertised.iter().any(|t| t["name"] == tool.name),
+                tool.read_only,
+                "{}",
+                tool.name
+            );
+            if tool.read_only {
+                assert_eq!(
+                    advertised.iter().find(|t| t["name"] == tool.name).unwrap()["annotations"]
+                        ["readOnlyHint"],
+                    true
+                );
+                continue;
+            }
+            let response = server
+                .handle_request(&json!({
+                    "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                    "params":{"name":tool.name, "arguments":{}}
+                }))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response["result"]["isError"], true, "{}", tool.name);
+            assert!(response
+                .to_string()
+                .contains("disabled by MCP access policy"));
+        }
+        assert!(api.received_requests().await.unwrap().is_empty());
+        let init = server
+            .handle_request(&json!({"id":3,"method":"initialize"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn http_access_policy_allows_reads_and_rejects_unlisted_and_write_tools() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"id":42}})))
+            .expect(1)
+            .mount(&api)
+            .await;
+        let mut server = test_server_with_access(api.uri(), PacksCheckAccess::Disabled);
+        server.tool_policy = serde_yaml_ng::from_str::<AccessPolicies>(
+            "default_policy: observer\npolicies:\n  observer:\n    access_mode: read-only\n    allowed_tools: [events_get, actions_execute, packs_check]\n"
+        ).unwrap().select(None).unwrap();
+        let app = Router::new()
+            .route("/mcp", post(http_mcp))
+            .with_state(Arc::new(Mutex::new(server)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let mut replies = Vec::new();
+        for (method, params) in [
+            ("tools/list", json!({})),
+            (
+                "tools/call",
+                json!({"name":"events_get","arguments":{"id":42}}),
+            ),
+            (
+                "tools/call",
+                json!({"name":"actions_execute","arguments":{"ref":"core.echo"}}),
+            ),
+            ("tools/call", json!({"name":"events_list"})),
+            (
+                "tools/call",
+                json!({"name":"packs_check","arguments":{"path":"/"}}),
+            ),
+        ] {
+            replies.push(
+                client
+                    .post(format!("http://{addr}/mcp"))
+                    .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<Value>()
+                    .await
+                    .unwrap(),
+            );
+        }
+        stop.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(replies[0]["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(replies[1]["result"]["isError"], false);
+        for reply in &replies[2..] {
+            assert_eq!(reply["result"]["isError"], true);
+        }
+        assert_eq!(api.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3160,12 +3806,14 @@ mod tests {
             .current_profile_mut()
             .expect("default profile")
             .api_url = api_url;
-        McpServer::new(
+        let mut server = McpServer::new(
             ApiClient::from_config(&config, &None),
             config.current_profile.clone(),
             None,
             packs_check_access,
-        )
+        );
+        server.tool_policy = ToolPolicy::new(AccessMode::Full, None).unwrap();
+        server
     }
 
     #[test]
@@ -4398,6 +5046,10 @@ mod tests {
             profile: None,
             api_url: None,
             transport: Transport::Stdio,
+            access_mode: Some(AccessMode::Full),
+            allowed_tools: None,
+            policy_config: None,
+            access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),
             packs_check_roots: Vec::new(),
             auth_token: Some("access".to_string()),
@@ -4422,6 +5074,10 @@ mod tests {
             profile: None,
             api_url: None,
             transport: Transport::Stdio,
+            access_mode: Some(AccessMode::Full),
+            allowed_tools: None,
+            policy_config: None,
+            access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),
             packs_check_roots: Vec::new(),
             auth_token: None,
@@ -4446,6 +5102,10 @@ mod tests {
             profile: None,
             api_url: None,
             transport: Transport::Stdio,
+            access_mode: Some(AccessMode::Full),
+            allowed_tools: None,
+            policy_config: None,
+            access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),
             packs_check_roots: Vec::new(),
             auth_token: Some("explicit".to_string()),
