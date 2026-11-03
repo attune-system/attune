@@ -1,0 +1,27 @@
+# Optional starter file to copy into YOUR Attune user config directory as
+# mcp-policies.yaml. This file is not installed or loaded from the repository.
+# Select your custom policies with --access-policy; restart after edits.
+# All operations remain subject to YOUR current Attune permissions, which may
+# allow fewer tools/resources than this policy. Missing grants do not prevent
+# loading a policy. Nothing here assigns or expands permissions in Attune.
+# Built-ins read-only (the default) and full-access need no file.
+# Opt in to all tools with --access-policy full-access.
+default_policy: read-only
+policies:
+  my-incident-reader:
+    access_mode: read-only
+    allowed_tools:
+      - events_list
+      - events_get
+      - executions_list
+      - executions_get
+      - traces_get_report
+  my-operator:
+    access_mode: full
+    allowed_tools:
+      - actions_list
+      - actions_get
+      - actions_execute
+      - executions_list
+      - executions_get
+      - executions_cancel

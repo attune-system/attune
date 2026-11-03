@@ -109,6 +109,112 @@ Container deployment surfaces:
 - Docker Compose includes an optional `mcp` profile-backed service on port `8090`.
 - The Helm chart includes an optional `mcp.enabled` deployment/service, disabled by default.
 
+#### User-managed MCP access policies
+
+MCP defaults to a built-in **read-only** policy. No policy file is
+installed or created. Custom policies are owned and edited by each user, and
+are independent of the Attune login profile selected by `--profile`.
+
+The server discovers `attune/mcp-policies.yaml` beneath the operating system's
+user config directory (`$XDG_CONFIG_HOME/attune/mcp-policies.yaml`, or
+`~/.config/attune/mcp-policies.yaml` on Linux). You can create this optional
+file with your own policy names and tool allowlists:
+
+```yaml
+default_policy: read-only
+policies:
+  my-incident-reader:
+    access_mode: read-only
+    allowed_tools: [events_list, events_get, executions_list, executions_get]
+  my-operator:
+    access_mode: full
+    allowed_tools: [actions_list, actions_get, actions_execute, executions_get]
+```
+
+The built-in policies are `read-only` and `full-access`; both work without a
+policy file. Their names are reserved. `full-access` permits all MCP tools,
+subject to the authenticated user's Attune permissions and transport restrictions.
+The custom policies above are examples. With no
+`default_policy` in the file, `read-only` is selected. Select one of your own
+policies at startup:
+
+```bash
+# Built-in read-only, using your production login profile
+attune-mcp --profile prod
+
+# Explicitly allow all MCP tools, within your Attune permissions
+attune-mcp --profile prod --access-policy full-access
+
+# Select a policy from your local policy file
+attune-mcp --profile prod --access-policy my-operator
+
+# Optional explicit path for a user-managed file elsewhere
+attune-mcp --profile prod --policy-config "$HOME/.config/attune/mcp-policies.yaml" --access-policy my-incident-reader
+```
+
+A local MCP client can select your policy in its server configuration:
+
+```json
+{
+  "mcpServers": {
+    "attune-production": {
+      "command": "attune-mcp",
+      "args": ["--profile", "prod", "--access-policy", "my-incident-reader"]
+    }
+  }
+}
+```
+
+Use `ATTUNE_MCP_POLICY_CONFIG` for an explicit file path and
+`ATTUNE_MCP_ACCESS_POLICY` for policy selection. For containers, mount your
+file read-only and point that process at it. `ATTUNE_MCP_ACCESS_MODE` or
+`--access-mode` accepts `full` or `read-only`. `--allowed-tool NAME` (repeatable),
+or comma-separated `ATTUNE_MCP_ALLOWED_TOOLS`, further restricts exact tool
+names. These limits intersect with a selected policy and cannot expand it.
+Use `--access-policy full-access` to opt in to the full MCP tool surface.
+`--access-mode full` alone cannot expand the default read-only policy.
+Containers use the same built-in default; mounting your
+optional user policy file lets you select your own policy.
+
+Effective access is always **the user's Attune permissions intersected with the
+MCP policy's allowed operations**. A policy is a ceiling, never a grant or a
+list of permissions the user must hold. Loading it does not validate that the
+user has every permission it mentions, request additional grants, or modify
+Attune IAM. A policy can therefore be shared with a less-privileged user and
+still load normally. Attune enforces that user's current permissions and
+resource constraints on each API request.
+
+- `read-only` permits inspection, search, schema previews, bounded cache reads,
+  and local pack validation. It blocks execution, cancellation, queue writes,
+  inquiry responses, configuration changes, cache mutations, and approval changes.
+- An omitted `allowed_tools` permits all tools eligible for the access mode;
+  `allowed_tools: []` permits none. Names are exact, without wildcards.
+- Custom policies require `access_mode`. Unknown tool names, unknown YAML
+  fields, invalid/unreadable files, and unknown selected policy names fail
+  startup. A missing optional user file simply uses the built-in default;
+  a missing explicit `--policy-config` file is an error.
+- Both transports hide policy-excluded tools from `tools/list` and reject
+  direct calls to them before API access. The tool catalog describes the
+  policy's permitted operations; it does not promise authority over every
+  target. Permissions can vary by resource and change during a session.
+- An API permission denial is returned for that individual call with its
+  diagnostic status. It does not invalidate the policy, disable the tool
+  for other resources, trigger a new login, or terminate the MCP session.
+  Subsequent permitted requests continue to work. Denials are never turned
+  into a successful write or a misleading empty result.
+- Policies are selected at startup. Restart after editing the file or switching
+  policies. Tool arguments cannot select a policy. HTTP uses one access
+  policy for all clients of that process; use separate processes for separate
+  user credentials and policies. HTTP filesystem restrictions still apply.
+
+Read-only tools can return sensitive information the identity is permitted to
+read. Use your tool allowlist and Attune's resource permissions to limit that
+access. Keep your policy file, launcher configuration, and credentials under
+your control. MCP restrictions apply only to requests through that process;
+the same identity's CLI and web permissions are unchanged.
+
+See [the optional user policy example](../../examples/mcp/policies.yaml).
+
 ### Authentication
 
 #### Login
