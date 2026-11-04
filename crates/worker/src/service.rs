@@ -17,7 +17,7 @@ use attune_common::auth::WorkerTokenProvider;
 use attune_common::config::Config;
 use attune_common::db::Database;
 use attune_common::error::{Error, Result};
-use attune_common::models::{pack_install::PackInstallStatus, ExecutionStatus};
+use attune_common::models::{pack_install::PackInstallStatus, Execution, ExecutionStatus};
 use attune_common::mq::{
     config::MessageQueueConfig as MqConfig, routing_keys, ActionChangedPayload, Connection,
     Consumer, ConsumerConfig, ExecutionCancelRequestedPayload, ExecutionCompletedPayload,
@@ -1631,25 +1631,8 @@ impl WorkerService {
                     "Execution {} already in {:?} state, skipping",
                     execution_id, exec.status
                 );
-                // If it was Canceling, finalize to Cancelled
-                if exec.status == ExecutionStatus::Canceling {
-                    let _ = Self::publish_status_update(
-                        &db_pool,
-                        &publisher,
-                        execution_id,
-                        ExecutionStatus::Cancelled,
-                        None,
-                        Some("Cancelled before execution started".to_string()),
-                    )
-                    .await;
-                    let _ = Self::publish_completion_notification(
-                        &db_pool,
-                        &publisher,
-                        execution_id,
-                        ExecutionStatus::Cancelled,
-                    )
-                    .await;
-                }
+                // The cancellation owner persists the terminal transition. Do not
+                // announce Cancelled while the durable row is still Canceling.
                 return Ok(());
             }
             let release_id = exec.pack_release.ok_or_else(|| {
@@ -1683,8 +1666,6 @@ impl WorkerService {
             &publisher,
             execution_id,
             ExecutionStatus::Running,
-            None,
-            None,
         )
         .await
         {
@@ -1692,123 +1673,45 @@ impl WorkerService {
             // Continue anyway - we'll update the database directly
         }
 
-        // Execute the action (with cancellation support)
-        match executor
-            .execute_with_cancel(execution_id, cancel_token.clone())
+        // Publish only persisted terminal states. The normal path reuses UPDATE
+        // RETURNING; exceptional errors may need one read to discover whether a
+        // terminal transition actually committed.
+        let execution = match executor
+            .execute_with_cancel_outcome(execution_id, cancel_token)
             .await
         {
-            Ok(result) => {
-                // Check if this was a cancellation
-                let was_cancelled = cancel_token.is_cancelled()
-                    || result
-                        .error
-                        .as_deref()
-                        .is_some_and(|e| e.contains("cancelled"));
-
-                if was_cancelled {
-                    info!(
-                        "Execution {} was cancelled in {}ms",
-                        execution_id, result.duration_ms
-                    );
-
-                    // Publish status: cancelled
-                    if let Err(e) = Self::publish_status_update(
-                        &db_pool,
-                        &publisher,
-                        execution_id,
-                        ExecutionStatus::Cancelled,
-                        None,
-                        Some("Cancelled by user".to_string()),
-                    )
-                    .await
-                    {
-                        error!("Failed to publish cancelled status: {}", e);
-                    }
-
-                    // Publish completion notification for queue management
-                    if let Err(e) = Self::publish_completion_notification(
-                        &db_pool,
-                        &publisher,
-                        execution_id,
-                        ExecutionStatus::Cancelled,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to publish completion notification for cancelled execution {}: {}",
-                            execution_id, e
-                        );
-                    }
-                } else {
-                    info!(
-                        "Execution {} completed successfully in {}ms",
-                        execution_id, result.duration_ms
-                    );
-
-                    // Publish status: completed
-                    if let Err(e) = Self::publish_status_update(
-                        &db_pool,
-                        &publisher,
-                        execution_id,
-                        ExecutionStatus::Completed,
-                        result.result.clone(),
-                        None,
-                    )
-                    .await
-                    {
-                        error!("Failed to publish success status: {}", e);
-                    }
-
-                    // Publish completion notification for queue management
-                    if let Err(e) = Self::publish_completion_notification(
-                        &db_pool,
-                        &publisher,
-                        execution_id,
-                        ExecutionStatus::Completed,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to publish completion notification for execution {}: {}",
-                            execution_id, e
-                        );
-                        // Continue - this is important for queue management but not fatal
-                    }
+            Ok(outcome) => {
+                if let Err(error) = outcome.result {
+                    error!("Execution {} failed: {}", execution_id, error);
                 }
+                outcome.execution
             }
-            Err(e) => {
-                error!("Execution {} failed: {}", execution_id, e);
-
-                // Publish status: failed
-                if let Err(e) = Self::publish_status_update(
-                    &db_pool,
-                    &publisher,
-                    execution_id,
-                    ExecutionStatus::Failed,
-                    None,
-                    Some(e.to_string()),
-                )
-                .await
-                {
-                    error!("Failed to publish failure status: {}", e);
-                }
-
-                // Publish completion notification for queue management
-                if let Err(e) = Self::publish_completion_notification(
-                    &db_pool,
-                    &publisher,
-                    execution_id,
-                    ExecutionStatus::Failed,
-                )
-                .await
-                {
-                    error!(
-                        "Failed to publish completion notification for execution {}: {}",
-                        execution_id, e
-                    );
-                    // Continue - this is important for queue management but not fatal
-                }
+            Err(error) => {
+                error!("Execution {} failed: {}", execution_id, error);
+                ExecutionRepository::find_by_id(&db_pool, execution_id)
+                    .await?
+                    .ok_or_else(|| Error::not_found("execution", "id", execution_id.to_string()))?
             }
+        };
+
+        if !is_worker_terminal_status(execution.status) {
+            return Err(Error::Internal(format!(
+                "Execution {} has no persisted terminal state after execution ({:?})",
+                execution_id, execution.status
+            )));
+        }
+
+        if let Err(error) = Self::publish_persisted_status_update(&publisher, &execution).await {
+            error!(
+                "Failed to publish terminal status for execution {}: {}",
+                execution_id, error
+            );
+        }
+        if let Err(error) = Self::publish_completion_notification(&publisher, &execution).await {
+            error!(
+                "Failed to publish completion notification for execution {}: {}",
+                execution_id, error
+            );
         }
 
         Ok(())
@@ -1989,8 +1892,6 @@ impl WorkerService {
         publisher: &Publisher,
         execution_id: i64,
         status: ExecutionStatus,
-        _result: Option<serde_json::Value>,
-        _error: Option<String>,
     ) -> Result<()> {
         // Fetch execution to get action_ref and previous status
         let execution = ExecutionRepository::find_by_id(db_pool, execution_id)
@@ -2002,25 +1903,7 @@ impl WorkerService {
                 ))
             })?;
 
-        let new_status_str = match status {
-            ExecutionStatus::Running => "running",
-            ExecutionStatus::Completed => "completed",
-            ExecutionStatus::Failed => "failed",
-            ExecutionStatus::Canceling => "canceling",
-            ExecutionStatus::Cancelled => "cancelled",
-            ExecutionStatus::Timeout => "timeout",
-            _ => "unknown",
-        };
-
-        let previous_status_str = format!("{:?}", execution.status).to_lowercase();
-
-        let payload = ExecutionStatusChangedPayload {
-            execution_id,
-            action_ref: execution.action_ref,
-            previous_status: previous_status_str,
-            new_status: new_status_str.to_string(),
-            changed_at: Utc::now(),
-        };
+        let payload = execution_status_payload(&execution, status);
 
         let message_type = MessageType::ExecutionStatusChanged;
 
@@ -2034,44 +1917,29 @@ impl WorkerService {
         Ok(())
     }
 
+    async fn publish_persisted_status_update(
+        publisher: &Publisher,
+        execution: &Execution,
+    ) -> Result<()> {
+        let payload = execution_status_payload(execution, execution.status);
+        let envelope = MessageEnvelope::new(MessageType::ExecutionStatusChanged, payload)
+            .with_source("worker");
+        publisher
+            .publish_envelope(&envelope)
+            .await
+            .map_err(|error| {
+                Error::Internal(format!("Failed to publish status update: {}", error))
+            })?;
+        Ok(())
+    }
+
     /// Publish execution completion notification for queue management
     async fn publish_completion_notification(
-        db_pool: &PgPool,
         publisher: &Publisher,
-        execution_id: i64,
-        final_status: ExecutionStatus,
+        execution: &Execution,
     ) -> Result<()> {
-        // Fetch execution to get action_id and other required fields
-        let execution = ExecutionRepository::find_by_id(db_pool, execution_id)
-            .await?
-            .ok_or_else(|| {
-                Error::Internal(format!(
-                    "Execution {} not found after completion",
-                    execution_id
-                ))
-            })?;
-
-        // Extract action_id - it should always be present for valid executions
-        let action_id = execution.action.ok_or_else(|| {
-            Error::Internal(format!(
-                "Execution {} has no associated action",
-                execution_id
-            ))
-        })?;
-
-        info!(
-            "Publishing completion notification for execution {} (action_id: {})",
-            execution_id, action_id
-        );
-
-        let payload = ExecutionCompletedPayload {
-            execution_id: execution.id,
-            action_id,
-            action_ref: execution.action_ref.clone(),
-            status: format!("{:?}", final_status),
-            result: execution.result.clone(),
-            completed_at: Utc::now(),
-        };
+        let execution_id = execution.id;
+        let payload = execution_completion_payload(execution)?;
 
         let envelope =
             MessageEnvelope::new(MessageType::ExecutionCompleted, payload).with_source("worker");
@@ -2087,6 +1955,55 @@ impl WorkerService {
 
         Ok(())
     }
+}
+
+// Keep the existing previous-status semantics until transitions return their
+// locked predecessor. A post-update row cannot establish that predecessor.
+fn execution_status_payload(
+    execution: &Execution,
+    status: ExecutionStatus,
+) -> ExecutionStatusChangedPayload {
+    ExecutionStatusChangedPayload {
+        execution_id: execution.id,
+        action_ref: execution.action_ref.clone(),
+        previous_status: format!("{:?}", execution.status).to_lowercase(),
+        new_status: format!("{:?}", status).to_lowercase(),
+        changed_at: Utc::now(),
+    }
+}
+
+fn is_worker_terminal_status(status: ExecutionStatus) -> bool {
+    matches!(
+        status,
+        ExecutionStatus::Completed
+            | ExecutionStatus::Failed
+            | ExecutionStatus::Timeout
+            | ExecutionStatus::Cancelled
+            | ExecutionStatus::Abandoned
+    )
+}
+
+fn execution_completion_payload(execution: &Execution) -> Result<ExecutionCompletedPayload> {
+    if !is_worker_terminal_status(execution.status) {
+        return Err(Error::Internal(format!(
+            "Execution {} is not terminal",
+            execution.id
+        )));
+    }
+    let action_id = execution.action.ok_or_else(|| {
+        Error::Internal(format!(
+            "Execution {} has no associated action",
+            execution.id
+        ))
+    })?;
+    Ok(ExecutionCompletedPayload {
+        execution_id: execution.id,
+        action_id,
+        action_ref: execution.action_ref.clone(),
+        status: format!("{:?}", execution.status),
+        result: execution.result.clone(),
+        completed_at: Utc::now(),
+    })
 }
 
 fn validate_mq_pack_ref(pack_ref: &str, message_type: &str) -> std::result::Result<(), MqError> {
@@ -2645,6 +2562,59 @@ async fn mark_pack_install_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persisted_execution(status: ExecutionStatus) -> Execution {
+        serde_json::from_value(serde_json::json!({
+            "id": 123,
+            "action": 456,
+            "action_ref": "core.echo",
+            "status": status,
+            "permission_set_refs": [],
+            "retry_count": 0,
+            "result": {"stdout": "[REDACTED]", "exit_code": 1},
+            "created": "2026-11-04T12:00:00Z",
+            "updated": "2026-11-04T12:00:01Z"
+        }))
+        .expect("persisted execution fixture")
+    }
+
+    #[test]
+    fn terminal_messages_use_durable_status_and_protected_result() {
+        for (status, completion_status, changed_status) in [
+            (ExecutionStatus::Completed, "Completed", "completed"),
+            (ExecutionStatus::Failed, "Failed", "failed"),
+            (ExecutionStatus::Timeout, "Timeout", "timeout"),
+            (ExecutionStatus::Cancelled, "Cancelled", "cancelled"),
+            (ExecutionStatus::Abandoned, "Abandoned", "abandoned"),
+        ] {
+            let execution = persisted_execution(status);
+            let completed = execution_completion_payload(&execution).unwrap();
+            let changed = execution_status_payload(&execution, execution.status);
+            assert_eq!(completed.status, completion_status);
+            assert_eq!(changed.new_status, changed_status);
+            assert_eq!(completed.result, execution.result);
+            assert_eq!(completed.result.unwrap()["stdout"], "[REDACTED]");
+            assert_eq!(completed.execution_id, execution.id);
+            assert_eq!(changed.execution_id, execution.id);
+            assert_eq!(completed.action_id, execution.action.unwrap());
+        }
+    }
+
+    #[test]
+    fn completion_rejects_unpersisted_terminal_state() {
+        for status in [
+            ExecutionStatus::Requested,
+            ExecutionStatus::Scheduling,
+            ExecutionStatus::Scheduled,
+            ExecutionStatus::Running,
+            ExecutionStatus::Canceling,
+        ] {
+            assert!(execution_completion_payload(&persisted_execution(status)).is_err());
+        }
+        let mut execution = persisted_execution(ExecutionStatus::Failed);
+        execution.action = None;
+        assert!(execution_completion_payload(&execution).is_err());
+    }
 
     #[test]
     fn test_queue_name_format() {
