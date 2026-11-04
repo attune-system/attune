@@ -269,3 +269,21 @@ they do not establish database/MQ lifecycle or performance acceptance.
   `localStorage` unavailable. Its source/dependencies are unchanged by this task;
   baseline reproduction and an invocation using `--no-experimental-webstorage`
   are in progress. No frontend behavior change is being made for that issue.
+
+### Startup hardening and validation follow-up
+
+- Assigned executions now start only from Scheduled. In-flight duplicate MQ
+  deliveries retain the original cancellation token instead of overwriting it.
+  Added cancellation-token and repository duplicate-start regressions.
+- Missing action/schema-binding failures now persist a fixed, safe diagnostic
+  before parameter restoration or code launch. Added repository-backed coverage
+  proving Failed status and no allocated logs for those prelaunch errors.
+- All eight stream-admission API tests passed, including the new empty/incomplete
+  cases on both reader paths. All 41 existing frontend artifact tests passed with
+  `NODE_OPTIONS=--no-experimental-webstorage` and `--pool=threads --maxWorkers=1`.
+  The default Node 26 invocation failed, and intermediate fork-worker attempts
+  timed out; these are retained as environment/validation limitations rather than
+  hidden retries. No frontend source changes were required.
+- Scoped common/worker/API all-targets Clippy passed with warnings denied before
+  the latest startup additions. A new unused test import was removed; the final
+  startup and new trigger regressions still need their focused validation.

@@ -227,9 +227,9 @@ impl ExecutionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let allowed = if status == ExecutionStatus::Running {
-            let mut allowed = vec![ExecutionStatus::Scheduled, ExecutionStatus::Running];
+            let mut allowed = vec![ExecutionStatus::Scheduled];
             if worker.is_none() {
-                allowed.push(ExecutionStatus::Requested);
+                allowed.extend([ExecutionStatus::Requested, ExecutionStatus::Running]);
             }
             allowed
         } else if matches!(

@@ -26,6 +26,22 @@ and pins later reads and deletes to that version. API replicas may use separate
 provider clients, but they must use the same bucket, prefix, credentials policy,
 and PostgreSQL database.
 
+## Empty execution output
+
+Execution stdout and stderr allocate independently on their first nonempty write.
+A successful or failed action that stays silent creates no log artifact version,
+stream or stream-delivery permit. Whitespace still counts as output. Execution
+attempt registration remains independent of output.
+
+The worker records positive per-stream capture state only after capture has
+settled. A terminal stream known to be empty returns SSE `done` at cursor `0`
+without a discovery grace period. A nonzero resume cursor is invalid for that
+stream. Capture/allocation failure, cancellation during first allocation, a
+crashed worker, or supervisor settlement without positive capture evidence must
+not become successful empty output; missing or incomplete logs retain their
+existing error behavior. Fresh allocation under an already-canceling recorded
+execution is still denied and is reported as incomplete capture.
+
 ## Size worker log buffers
 
 Object-backed writers start at `artifacts.log_segment_initial_bytes`, 64 KiB by
