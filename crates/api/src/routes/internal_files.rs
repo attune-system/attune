@@ -2081,9 +2081,16 @@ async fn seal_log_stream(
             .await
             .map_err(map_repository_error)?;
         trace.stage("encrypted_seal_proof");
-        let proof =
-            encrypted_log_seal_proof(&mut transaction, &state, &user, &version, &stream, &headers)
-                .await?;
+        let proof = encrypted_log_seal_proof(
+            &mut transaction,
+            &state,
+            &user,
+            &version,
+            &stream,
+            &headers,
+            &effect,
+        )
+        .await?;
         let mut verifier = proof.as_ref().map(|proof| {
             attune_common::runtime_log_completion::FrameVerifier::new(
                 state
@@ -2114,8 +2121,12 @@ async fn seal_log_stream(
                 .map_err(map_transport_error)?
                 .is_some()
             {
-                let permit = attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_version(&mut transaction,version.id)
-                .await.map_err(map_transport_error)?.ok_or_else(|| (StatusCode::FORBIDDEN,"Worker delivery permit unavailable".into()))?;
+                let (_, permit, _) = effect.worker.as_ref().ok_or_else(|| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "Worker delivery proof unavailable".into(),
+                    )
+                })?;
                 transport
                     .inspect_log_file(file_path, Some(permit.max_bytes as u64))
                     .await
@@ -2270,42 +2281,35 @@ async fn seal_log_stream(
         }
 
         trace.stage("publication_revalidation");
-        let current_version =
-            ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
-                .await
-                .map_err(map_repository_error)?
-                .ok_or_else(|| {
-                    (
-                        StatusCode::CONFLICT,
-                        "Log artifact disappeared while sealing".to_string(),
-                    )
-                })?;
-        let locked = LogStreamRepository::lock(&mut transaction, stream.id)
-            .await
-            .map_err(map_repository_error)?;
-        check_delivery_bounds(
-            &mut transaction,
-            &user,
-            artifact_version,
-            Some(stream.id),
-            DeliveryOperation::Seal {
-                sequences: locked.next_sequence,
-                bytes: size,
-            },
-        )
-        .await?;
-        if locked.backend == LogStreamBackend::ObjectSegments
-            && ArtifactUploadGrantRepository::active_log_segment_exists(
-                &mut *transaction,
+        // These rows have remained locked since version_and_stream_locks;
+        // storage verification cannot release them. Reuse that locked snapshot.
+        let current_version = &version;
+        let locked = &stream;
+        if let Some((_, permit, _)) = &effect.worker {
+            if !permit.allows(
+                Some(stream.id),
+                DeliveryOperation::Seal {
+                    sequences: locked.next_sequence,
+                    bytes: size,
+                },
+            ) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Worker delivery exceeds seal bounds".into(),
+                ));
+            }
+        } else {
+            check_delivery_bounds(
+                &mut transaction,
+                &user,
                 artifact_version,
+                Some(stream.id),
+                DeliveryOperation::Seal {
+                    sequences: locked.next_sequence,
+                    bytes: size,
+                },
             )
-            .await
-            .map_err(map_repository_error)?
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                "A log segment upload is still settling".to_string(),
-            ));
+            .await?;
         }
         if locked.sealed {
             if log_stream_seal_is_complete(
@@ -2333,21 +2337,6 @@ async fn seal_log_stream(
             return Err((
                 StatusCode::CONFLICT,
                 "Log stream was concurrently sealed with different state".to_string(),
-            ));
-        }
-        if locked.backend != stream.backend {
-            return Err((
-                StatusCode::CONFLICT,
-                "Log stream backend changed while sealing".to_string(),
-            ));
-        }
-        if locked.backend == LogStreamBackend::ObjectSegments
-            && (locked.next_sequence != stream.next_sequence
-                || locked.total_bytes != stream.total_bytes)
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                "Log stream changed while sealing".to_string(),
             ));
         }
         if current_version.body_state != Some(ArtifactBodyState::Pending) {
@@ -2461,6 +2450,7 @@ async fn encrypted_log_seal_proof(
     version: &attune_common::models::artifact_version::ArtifactVersion,
     stream: &LogStream,
     headers: &HeaderMap,
+    effect: &crate::recorded_files::FileMutationProof,
 ) -> Result<Option<EncryptedLogSeal>, (StatusCode, String)> {
     use attune_common::repositories::worker_delivery::WorkerDeliveryRepository;
     let denied = || {
@@ -2469,9 +2459,12 @@ async fn encrypted_log_seal_proof(
             "Authenticated encrypted log final manifest required".into(),
         )
     };
-    let permit = WorkerDeliveryRepository::for_version(tx, version.id)
-        .await
-        .map_err(map_transport_error)?;
+    let permit = match &effect.worker {
+        Some((_, permit, _)) => Some(permit.clone()),
+        None => WorkerDeliveryRepository::for_version(tx, version.id)
+            .await
+            .map_err(map_transport_error)?,
+    };
     let encoding = version
         .meta
         .as_ref()
@@ -2494,11 +2487,14 @@ async fn encrypted_log_seal_proof(
         .map_err(map_transport_error)?
         .ok_or_else(denied)?;
     let permit = permit.ok_or_else(denied)?;
-    let context =
-        WorkerDeliveryRepository::for_execution(tx, version.execution.ok_or_else(denied)?)
-            .await
-            .map_err(map_transport_error)?
-            .ok_or_else(denied)?;
+    let context = effect
+        .worker
+        .as_ref()
+        .map(|(context, _, _)| context.clone())
+        .ok_or_else(denied)?;
+    if version.execution != Some(context.execution) {
+        return Err(denied());
+    }
     if credential.permit != permit.id
         || permit.context != context.id
         || permit.log_stream != Some(stream.id)
