@@ -298,9 +298,11 @@ struct ExecutionLogArtifacts {
 }
 
 #[derive(Clone, Copy)]
-struct LogRetentionSettings {
+struct LogAllocationSettings {
     policy: RetentionPolicyType,
     limit: i32,
+    segment_bytes: u64,
+    flush_interval_ms: u64,
 }
 
 impl ActionExecutor {
@@ -883,14 +885,16 @@ impl ActionExecutor {
         Ok(versions)
     }
 
-    fn effective_action_log_retention(&self, action: &Action) -> LogRetentionSettings {
-        LogRetentionSettings {
+    fn effective_action_log_settings(&self, action: &Action) -> LogAllocationSettings {
+        LogAllocationSettings {
             policy: action
                 .log_retention_policy
                 .unwrap_or(self.execution_log_retention_policy),
             limit: action
                 .log_retention_limit
                 .unwrap_or(self.execution_log_retention_limit),
+            segment_bytes: self.log_segment_config.max_segment_bytes as u64,
+            flush_interval_ms: self.log_segment_config.flush_interval_ms,
         }
     }
 
@@ -1621,7 +1625,7 @@ impl ActionExecutor {
             } else {
                 LogStreamBackend::ObjectSegments
             };
-            let retention = self.effective_action_log_retention(action);
+            let retention = self.effective_action_log_settings(action);
             let config = self.log_segment_config;
             let artifacts_dir = self.artifacts_dir.clone();
             let api_url = self.api_url.clone();
@@ -1671,9 +1675,6 @@ impl ActionExecutor {
                             backend,
                         )
                         .await?;
-                        attune_common::repositories::log_stream::LogStreamRepository::create_with_backend(
-                            &pool, version, backend, config.max_segment_bytes as u64, config.flush_interval_ms,
-                        ).await?;
                         (file_path, version, transport)
                     };
                     let writer = if backend == LogStreamBackend::SharedFile {
@@ -1731,7 +1732,7 @@ impl ActionExecutor {
         artifacts_dir: &Path,
         transport: &dyn ArtifactFileTransport,
         execution: &Execution,
-        retention: LogRetentionSettings,
+        retention: LogAllocationSettings,
         stream: ExecutionLogArtifactStream,
         backend: LogStreamBackend,
     ) -> Result<(PathBuf, String, i64)> {
@@ -1796,6 +1797,14 @@ impl ActionExecutor {
                 "stream": stream.as_str(),
                 "execution_id": execution.id,
             }),
+        )
+        .await?;
+        attune_common::repositories::log_stream::LogStreamRepository::create_with_backend_with_conn(
+            &mut transaction,
+            version.id,
+            backend,
+            retention.segment_bytes,
+            retention.flush_interval_ms,
         )
         .await?;
         transaction.commit().await?;
@@ -2563,6 +2572,33 @@ mod tests {
                 .unwrap(),
             );
         }
+        let failed = ActionExecutor::allocate_execution_log_artifact_with(
+            database.pool(),
+            directory.path(),
+            &transport,
+            &executions[0],
+            LogAllocationSettings {
+                policy: RetentionPolicyType::Versions,
+                limit: 1,
+                segment_bytes: 0,
+                flush_interval_ms: 100,
+            },
+            ExecutionLogArtifactStream::Stderr,
+            LogStreamBackend::SharedFile,
+        )
+        .await;
+        assert!(
+            failed.is_err(),
+            "Invalid stream settings must fail allocation"
+        );
+        assert!(
+            ArtifactRepository::list(database.pool())
+                .await
+                .unwrap()
+                .iter()
+                .all(|artifact| artifact.owner != action_ref),
+            "Stream creation failure must roll back the artifact and version"
+        );
         let start = tokio::sync::Barrier::new(executions.len());
         let allocations = futures::future::join_all(executions.iter().map(|execution| {
             let (database, directory, transport, start) =
@@ -2574,9 +2610,11 @@ mod tests {
                     directory.path(),
                     transport,
                     execution,
-                    LogRetentionSettings {
+                    LogAllocationSettings {
                         policy: RetentionPolicyType::Versions,
                         limit: 1,
+                        segment_bytes: 65_536,
+                        flush_interval_ms: 100,
                     },
                     ExecutionLogArtifactStream::Stderr,
                     LogStreamBackend::SharedFile,
@@ -2598,6 +2636,12 @@ mod tests {
         let paths: HashSet<_> = allocations.iter().map(|(_, path, _)| path).collect();
         assert_eq!(paths.len(), executions.len());
         for (_, path, version) in allocations {
+            assert!(
+                attune_common::repositories::log_stream::LogStreamRepository::find_by_artifact_version(
+                    database.pool(), version,
+                ).await.unwrap().is_some(),
+                "Every committed log version must have its stream",
+            );
             assert_eq!(
                 ArtifactVersionRepository::find_unique_by_file_path(database.pool(), &path)
                     .await

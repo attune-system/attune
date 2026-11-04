@@ -305,3 +305,19 @@ they do not establish database/MQ lifecycle or performance acceptance.
   policy files/docs. Worker, common, API, executor, migrations and workspace
   dependencies are identical, so those unrelated CLI differences are outside
   the benchmark workloads. Baseline service/agent builds are still running.
+
+### Allocation atomicity and trace correlation
+
+- Unrecorded execution allocation now creates the artifact, version and stream
+  in one transaction, matching recorded allocation. The concurrent-allocation
+  regression also forces stream-creation failure and verifies rollback.
+- Capture tasks retain their parent execution span. Shared append, segment
+  commit and seal spans contain execution/version identifiers without logging
+  bytes, manifests or credentials.
+- The versioned object-storage correctness harness passed: the direct-storage
+  authority case and all nine cross-replica correctness cases passed. Its owned
+  RustFS resources were torn down successfully. Four load/prerequisite cases
+  remain outside that correctness selection.
+- The final current-source security, worker and workspace checks are pending.
+  Benchmark tooling is opt-in and still needs its first full-stack run; no
+  latency reduction has been measured yet.
