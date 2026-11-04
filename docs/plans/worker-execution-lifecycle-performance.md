@@ -287,3 +287,21 @@ they do not establish database/MQ lifecycle or performance acceptance.
 - Scoped common/worker/API all-targets Clippy passed with warnings denied before
   the latest startup additions. A new unused test import was removed; the final
   startup and new trigger regressions still need their focused validation.
+
+### Capture evidence and seal-source follow-up
+
+- Capture state now derives from the retained per-stream allocation evidence,
+  not `ExecutionResult.stdout`: successful JSON parsing intentionally clears that
+  convenience string. Unknown evidence remains unknown. Added a focused parsed-
+  stdout regression and a JSON stdout benchmark workload.
+- Purpose-specific worker seal requests retain structural path/uniqueness checks
+  but acquire source authority only in the actual seal transaction, before all
+  target/file effects. Other credential paths retain their preflight behavior.
+- API generation completed with no generated client changes. Client checking
+  against that fresh exported spec passed; workspace, spec and client versions
+  all remain 0.10.2. Subsequent worker/private seal-helper changes do not alter
+  the exported DTOs or spec, so that contract evidence remains applicable.
+- The frozen v0.10.2 source differs from the starting commit only in MCP CLI
+  policy files/docs. Worker, common, API, executor, migrations and workspace
+  dependencies are identical, so those unrelated CLI differences are outside
+  the benchmark workloads. Baseline service/agent builds are still running.
