@@ -1917,16 +1917,6 @@ async fn enqueue_queue_item_in_transaction(
                     },
                 )
                 .await?;
-            let refs = queue
-                .permission_set_refs
-                .as_deref()
-                .unwrap_or(&action.default_execution_permission_set_refs);
-            attune_common::delegation::require_execution_refs_for_share(
-                connection,
-                Some(identity),
-                refs,
-            )
-            .await?;
         }
         attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(connection,
             snapshot.executable.action.pack,
@@ -1935,6 +1925,22 @@ async fn enqueue_queue_item_in_transaction(
     } else {
         snapshot
     };
+    if human_ad_hoc {
+        // Defaults belong to the admitted immutable target, which may differ
+        // from the catalog/release snapshot used to identify the action above.
+        let refs = queue.permission_set_refs.as_deref().unwrap_or(
+            &snapshot
+                .executable
+                .action
+                .default_execution_permission_set_refs,
+        );
+        attune_common::delegation::require_execution_refs_for_share(
+            connection,
+            requested_by_identity,
+            refs,
+        )
+        .await?;
+    }
     let current_actions =
         attune_common::repositories::action::ActionRepository::find_by_refs_for_share(
             connection,

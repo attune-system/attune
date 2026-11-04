@@ -981,6 +981,40 @@ async fn human_ad_hoc_dispatch_case(mode: attune_common::models::WorkQueueBatchM
         },
     )
     .await?;
+    WorkQueueRepository::update(
+        &fixture.ctx.pool,
+        queue.id,
+        attune_common::repositories::work_queue::UpdateWorkQueueInput {
+            permission_set_refs: Some(attune_common::repositories::Patch::Set(vec![
+                "recorded_emitter.events".into(),
+            ])),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let denied = fixture
+        .ctx
+        .post(
+            &endpoint,
+            json!({"payload":{"message":"undelegated API selection"}}),
+            Some(token),
+        )
+        .await?;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        denied.text().await?
+    );
+    WorkQueueRepository::update(
+        &fixture.ctx.pool,
+        queue.id,
+        attune_common::repositories::work_queue::UpdateWorkQueueInput {
+            permission_set_refs: Some(attune_common::repositories::Patch::Set(vec![])),
+            ..Default::default()
+        },
+    )
+    .await?;
     for index in 0..if mode == attune_common::models::WorkQueueBatchMode::Single {
         1
     } else {
