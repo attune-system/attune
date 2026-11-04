@@ -2,7 +2,8 @@
 
 Status: local implementation and scoped acceptance complete in
 `perf/worker-execution-lifecycle`; work in progress for merge readiness until
-required CI and the existing ad hoc admission test gaps are resolved.
+required CI passes. The ad hoc admission follow-up below resolves the four
+original E2E gaps, with final repository verification complete.
 
 ## Objective and baseline
 
@@ -370,6 +371,64 @@ Additional evidence:
   `reader-drained-validation.json` (tested `170b778b` plus saved diff)
 - `.scratch/worker-lifecycle-reports/validation-latest/` (logs and binary hashes)
 
+## Ad hoc admission follow-up (2026-11-04)
+
+The unchanged baseline and the performance treatment both failed three ad hoc
+workflow retry cases and one ad hoc queue acknowledgement case because those
+paths lacked recorded invocation authority. Checkpoint `b203e913` saved the
+completed performance work before addressing them. Runtime changes are frozen
+at `ece3c859`; `88897bf0` completes the API fixtures.
+
+- Wholly ad hoc workflow retries retain their explicit active executor and
+  recheck delegated refs and ordinary secret origins. They copy the immutable
+  executable, schema, parameters, and encrypted input records, preserve task and
+  retry lineage, and recover the same Requested successor after backoff. A
+  missing or revoked recorded admission cannot enter this path.
+- Human acceptance through an ad hoc queue to a published action checks current
+  action-execute and delegation authority, then records the target **Action**
+  invocation, queue template, schema, input authority, and historical requester.
+  Single and batch dispatches validate every contributor and target policy.
+  Execution-origin acceptance keeps its independent source-admission dependency.
+  Queue association remains separate from pack management.
+- Migration `20261104000001_ad_hoc_queue_human_acceptance.sql` permits a null
+  source admission; repository validation restricts that shape to human acceptance.
+  Existing admission requirements and coordinated credential readiness remain
+  enforced. No recorded checksums were rewritten or operator databases reset.
+
+Fresh API, executor, notifier, supervisor, and injected-agent images use
+`ece3c859`. Both storage modes passed the unchanged original **27-case** E2E
+selection, including all four formerly failing cases. Each also passed four
+release-backed retry/queue cases and two subscription-first reader cases:
+**66 passed total**, with the configured **1,000 ms** capture finalization default.
+These bounded correctness cases do not establish default-window load capacity.
+The earlier 960 performance observations retain their original frozen revisions
+and ten-second capture configuration; they were not relabelled or rerun here.
+
+Additional validation passed: two ad hoc retry repository cases, all ten queue
+API cases, and 46 queue-consumer cases. Four existing broker-only consumer cases
+remain explicitly ignored. Early fixture runs exposed incorrect registration
+status, namespace, and missing policy admission/activation setup; their logs are
+retained alongside the corrected passing runs. Fresh PostgreSQL 18 migration
+and `cargo sqlx prepare --workspace -- --all-targets` passed; there are no SQLx
+query macros to regenerate. Warnings-denied Clippy passed for common, API,
+executor, worker, and supervisor, followed by the final API fixture targets.
+
+The web client was regenerated and checked using the OpenAPI spec exported by
+the verified API image. There are no generated changes; workspace, spec, and
+client versions remain `0.10.2`. Full authority repository verification passed
+all **269 cases** in 1206.54 seconds on an idle owned PostgreSQL instance.
+
+Evidence is retained under `.scratch/worker-lifecycle-reports/`:
+
+- `adhoc-volume-3c5a06eeec/` and `adhoc-api-8da341e992/`: exact selections,
+  image/source identities, API build info, binary hashes, and verified teardown.
+- The final API fixtures were tested as `ece3c859` plus
+  `.scratch/ad-hoc-fixture-fixes.diff`, SHA-256
+  `7b48334587ef2d59b992b8933cb12467d7d996ac65e04b05658b00c3e6781791`.
+- `ad-hoc-validation/validation.json` records commands, results, authority binary
+  identity, fixture provenance, and cleanup. Both E2E projects and the disposable
+  PostgreSQL instance were removed after awaited teardown.
+
 ## Validation handoff
 
 Status: work in progress for merge readiness; local scoped acceptance complete.
@@ -380,7 +439,7 @@ the four native Python cases use the file hash retained in the Docker manifest.
 Later documentation/commit bookkeeping preserves those code bytes. Workspace
 checking is reused for unaffected consumers; current common/worker/API all-target
 Clippy covers the final private reader and fixture changes. No exported types,
-dependencies or schema changed in that follow-up.
+dependencies or schema changed in that reader follow-up.
 
 | Check | Result / scope |
 | --- | --- |
@@ -390,7 +449,7 @@ dependencies or schema changed in that follow-up.
 | Worker `cargo test --lib` | 196 passed. |
 | `recorded_input_restoration_tests` | 7 passed, including rejected admission INSERT replay and safe early failure. |
 | `worker_execution_transition_tests` | 2 passed, including guarded starts and terminal fencing. |
-| `runtime_authority_repository_tests` | All 269 passed on an idle host in 1191.91 s; includes native retry materialization and revocation/expiry after waits. |
+| `runtime_authority_repository_tests` | All 269 passed in the original idle run (1191.91 s) and again after admission changes (1206.54 s); includes native retry materialization and revocation/expiry after waits. |
 | `recorded_execution_events_tests recorded_file_completion_cases::` | Final 14 passed after joined fixture teardown. |
 | `recorded_execution_events_tests worker_live_streams::` | Final 12 passed, including both reader entry points during actual sealing. |
 | `execution_log_stream_admission_api_tests` | Final 8 passed across ordinary/protected empty and unknown readers. |
@@ -401,7 +460,7 @@ dependencies or schema changed in that follow-up.
 | Artifact-page UI selection | 41 passed with `NODE_OPTIONS=--no-experimental-webstorage`, thread pool, one worker. |
 | Matched E2E performance selection | Four runs passed all 12 profiles; 960 measured complete-output executions. |
 | Subscription-first E2E selection | Both baseline modes and treatment shared-file passed both cases. Initial treatment API had one failure; the fixed API passed all six cases across three repetitions. |
-| Treatment E2E regression selection | Original selection: 23 passed / 4 failed on both modes, reproduced below. New release-backed native selection: all 4 passed. |
+| Treatment E2E regression selection | Historical performance selection: 23 passed / 4 failed on both modes. Admission follow-up: all 27 original cases plus 6 companions passed in each mode (66 total). |
 
 All database Cargo tests used owned disposable PostgreSQL, unique run identities
 and four test threads. A first authority run during image builds had 266 passes
@@ -422,19 +481,14 @@ contract evidence remains applicable to later private helpers and worker changes
 
 ### Remaining concerns
 
-- Four existing ad hoc E2E cases (three workflow retries and queue
-  acknowledgement) fail because recorded invocation authority is missing. The unchanged baseline reproduced
-  the same four failures, with the same executor diagnostics, under matching API
-  storage/configuration. Baseline also failed parallel workflow failure isolation
-  by reporting Completed; treatment passed that case. Existing admission and
-  coordinated credential readiness gates were not weakened to make E2E pass.
 - Per-execution seal HTTP calls are correlated for API mode. Other internal HTTP
   request classes remain whole-run counts, and baseline phase decomposition is
   unavailable. First calls do not prove a cold OS cache; the ten-second capture
   window does not establish capacity at the product's one-second default.
 - Required CI, full unfiltered Rust/E2E suites, and the separate storage load lane
   remain unrun. Six deferred deployment cases are not passing release evidence.
-  No schema migrations changed, so there is no schema/offline metadata update.
+  The admission follow-up adds the forward migration validated above; the
+  performance and reader changes themselves did not alter the schema.
 
 Owned stack/volume/network teardown completed for all four measured runs and the
 reader/native Docker follow-up. The owned PostgreSQL and RustFS correctness

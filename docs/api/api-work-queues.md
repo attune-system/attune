@@ -85,6 +85,10 @@ policy revocation. Ad hoc tunables must use literal values on this path. Drain
 accepted items before changing dispatch behavior. A recorded execution's enqueue
 additionally retains its originating execution admission as a dependency.
 
+Apply `20261104000001_ad_hoc_queue_human_acceptance.sql` and update the API,
+executors, workers, and other admission consumers together. Historical pending
+items without an accepted dispatch binding need cancellation and a new enqueue.
+
 ## Selector-based item maintenance
 
 Administrators can preview and bulk-maintain unprocessed queue items with PostgreSQL SQL/JSONPath selectors:
