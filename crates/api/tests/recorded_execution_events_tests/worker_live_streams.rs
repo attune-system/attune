@@ -1323,16 +1323,25 @@ async fn human_live_reader_reauthorizes_a_log_sealed_during_selection() -> Resul
         };
         let stopped = log._server.stop().await;
         drop(log);
+        fixture
+            .ctx
+            .state
+            .execution_log_streams
+            .drain_releases()
+            .await;
+        let leases = attune_common::repositories::execution_log_stream_lease::ExecutionLogStreamLeaseRepository::active_count(&fixture.ctx.pool).await;
         let cleaned = fixture.ctx.cleanup().await;
         stopped?;
         cleaned?;
+        assert_eq!(
+            leases?, 0,
+            "owned stream leases must be released before pool teardown"
+        );
         let (status, body) = observation?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("sealed-during-selection"), "{body}");
-        if !artifact_route {
-            assert!(body.contains("event: done"), "{body}");
-            assert!(!body.contains("event: error"), "{body}");
-        }
+        assert!(body.contains("event: done"), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
     }
     Ok(())
 }

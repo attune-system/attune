@@ -1,6 +1,8 @@
 # Worker execution lifecycle performance
 
-Status: work in progress in `perf/worker-execution-lifecycle`.
+Status: local implementation and scoped acceptance complete in
+`perf/worker-execution-lifecycle`; work in progress for merge readiness until
+required CI and the existing ad hoc admission test gaps are resolved.
 
 ## Objective and baseline
 
@@ -39,8 +41,9 @@ matched end-to-end observations are recorded below.
   tooling; leave existing development resources alone.
 - [x] Measure receipt, preparation, process start/exit, log finalization,
   terminal persistence, and completion publication separately.
-- [ ] Capture statement counts, SQL time, pool acquisition, lock waits, and
-  internal HTTP calls, correlated by execution without logging secret data.
+- [x] Capture statement counts, SQL time, pool acquisition, lock waits, and
+  internal seal HTTP calls with execution/version correlation. Report aggregate
+  counters and attribution limits explicitly; do not log secret data.
 - [x] Exercise warm and cold release states, serial and concurrent executions,
   shared-file and segmented storage. Keep workloads identical for reruns.
 - [x] Include echo, silent success/failure, stderr-only failure, and both streams.
@@ -138,11 +141,11 @@ change; capture an unchanged baseline before claiming performance improvements.
 - [x] Add focused cases for silent success/failure, stdout only, stderr only,
   both streams, whitespace, empty writes, truncation, first-write allocation
   failure, cancellation during allocation, and sealing failure.
-- [ ] Exercise encrypted shared-file and segmented storage, subscription before
+- [x] Exercise encrypted shared-file and segmented storage, subscription before
   first output, terminal empty output, reconnects, and protected readers.
 - [x] Cover expired approvals, revoked/dependent admissions, stale attempts,
   mismatched owners, and concurrent mutations. Keep security failure cases.
-- [ ] Verify persisted states agree with messages and queue/workflow completion
+- [x] Verify persisted states agree with messages and queue/workflow completion
   remains correct, including retries and early preparation failures.
 - [x] Repeat identical baseline workloads; report latency and statement counts
   by phase. Do not promise a latency target before measuring the baseline.
@@ -297,11 +300,16 @@ Serial treatment phase p50 values (ms):
 Capture settlement remains the dominant worker cost for output-producing actions.
 Correlated worker pool acquisitions had medians 0.134 ms (shared file) and
 0.123 ms (API); those traces exclude pre-start SQL outside the execution span.
-PostgreSQL logs retain waits exceeding 50 ms. API route counters are whole-run
-observations, including warmups and ancillary tests: baseline API recorded 768
-seal requests and treatment 333; segment direct-upload/PUT counts were 385/385
-and 386/386. Sanitized route templates and log rotation prevent exact per-execution
-HTTP attribution. These counters are not normalized measured-execution savings.
+PostgreSQL logs retain waits exceeding 50 ms. Complete API-mode logs contain 768 baseline and 333 treatment seal requests
+across warmups, measured executions and ancillary tests. Each request matches
+one unique successful seal publication carrying its artifact-version ID; mapping
+those IDs through the measured reports gives **480 → 200 seal HTTP calls** for
+240 measured executions per revision. Silent executions go from two calls to
+zero, one-output executions from two to one, and both-output executions retain
+two. The correlation evidence is `seal-http-by-execution.json` in each API report.
+Segment direct-upload/PUT counts remain whole-run observations (385/385 before,
+386/386 after), not measured-execution savings. Sanitized route templates and
+rotated shared-file API logs limit attribution beyond the retained seal evidence.
 
 Raw reports, per-profile statement deltas, worker/API/PostgreSQL traces, source,
 agent, harness and image hashes, dependency versions and awaited cleanup logs:
@@ -321,34 +329,79 @@ An initial fixture check also used a DTO field that is not exported; the correct
 fixture checks the stored JSON contract through PostgreSQL. Setup failures and
 the excluded one-second diagnostic runs remain in the raw evidence.
 
+## Reader and native-completion acceptance
+
+Subscription before first output exposed a segmented-log selection race. Sealing
+publishes the provider descriptor after discovery selected Pending; strict
+selected-version validation then rejected that stale model. A lock-controlled
+regression reproduced HTTP 403 before the fix. Execution readers now reauthorize
+the same newly Ready version once, repeating full source, IAM, identity and
+freshness checks with immutable version/path checks. Human artifact streams enter
+the typed live-log pin before the duplicate generic preflight; denial masking and
+other artifact paths retain their checks. Both entry points verify bytes and EOF
+while a real seal is queued ahead of their target locks.
+
+An initial follow-up proved the execution route but exposed the artifact route's
+remaining preflight, which was then corrected. The first full passing stream run
+also surfaced asynchronous lease-release tasks touching a closed fixture pool.
+`TestContext::cleanup` now drains those tasks before closing the pool. The final
+12 stream, eight SSE admission, and 14 seal cases all passed with zero lease-release
+cleanup warnings; the new race case also verifies zero active leases before cleanup.
+
+The owned Docker follow-up passed both subscription-first cases in **three
+consecutive repetitions** and all four release-backed native cases: eventual
+retry success, retry exhaustion, first-attempt success, and queue acknowledgement
+with lease release. These fixtures publish normal action/workflow/queue metadata
+and use empty action API selections. No readiness gate, grant or admission guard
+was relaxed. The original ad hoc failures remain recorded separately.
+
+Docker verified API build identity `170b778b6b0490b18d40acc207bd3b66290c4205`
+and its image/binary hashes; workers reuse `ca202d5f` binaries. The final artifact-
+stream routing follow-up is covered by repository tests using the latest API
+router and real encrypted-log transport. It does not execute in those Docker
+execution-stream/native cases, so their evidence remains applicable. The measured
+profiles likewise do not call either human stream route; their frozen-checkpoint
+measurements are retained without relabelling them as a new-head benchmark.
+
+Additional evidence:
+
+- `.scratch/worker-lifecycle-reports/worker-treat-readerfix-api-a08c4d678f-probes/`
+- `.scratch/worker-lifecycle-reports/reader-drained-source.diff` and
+  `reader-drained-validation.json` (tested `170b778b` plus saved diff)
+- `.scratch/worker-lifecycle-reports/validation-latest/` (logs and binary hashes)
+
 ## Validation handoff
 
-Status: work in progress; local streaming follow-up and required CI pending.
+Status: work in progress for merge readiness; local scoped acceptance complete.
 
-Validation applies to `ca202d5f` functional source plus the stated benchmark
-fixture commits; the pending reader fix needs its own validation. Subsequent
-prose/comment-only changes preserve the corresponding code-test evidence.
+Performance source is `ca202d5f` with the identical stated harness on both
+revisions. Final Rust reader checks use `170b778b` plus the saved source diff;
+the four native Python cases use the file hash retained in the Docker manifest.
+Later documentation/commit bookkeeping preserves those code bytes. Workspace
+checking is reused for unaffected consumers; current common/worker/API all-target
+Clippy covers the final private reader and fixture changes. No exported types,
+dependencies or schema changed in that follow-up.
 
 | Check | Result / scope |
 | --- | --- |
-| `cargo fmt --all -- --check`, `git diff --check` | Passed; final rerun pending reader fix. |
+| `cargo fmt --all -- --check`, `git diff --check` | Passed. |
 | `SQLX_OFFLINE=true cargo check --all-targets --workspace` | Passed without warnings. |
 | Scoped common/worker/API `cargo clippy --all-targets --no-deps -- -D warnings` | Passed. |
 | Worker `cargo test --lib` | 196 passed. |
 | `recorded_input_restoration_tests` | 7 passed, including rejected admission INSERT replay and safe early failure. |
 | `worker_execution_transition_tests` | 2 passed, including guarded starts and terminal fencing. |
 | `runtime_authority_repository_tests` | All 269 passed on an idle host in 1191.91 s; includes native retry materialization and revocation/expiry after waits. |
-| `recorded_execution_events_tests recorded_file_completion_cases::` | 14 focused seal cases passed on the current executable. |
-| `recorded_execution_events_tests worker_live_streams::` | Initial 11 passed; new selection-race regression pending. |
-| `execution_log_stream_admission_api_tests` | 8 passed across ordinary/protected empty and unknown readers. |
+| `recorded_execution_events_tests recorded_file_completion_cases::` | Final 14 passed after joined fixture teardown. |
+| `recorded_execution_events_tests worker_live_streams::` | Final 12 passed, including both reader entry points during actual sealing. |
+| `execution_log_stream_admission_api_tests` | Final 8 passed across ordinary/protected empty and unknown readers. |
 | Worker integration executables | 8 truncation, 2 runtime-access and 7 secret-handling cases passed. |
 | Shared release cache / completion marker / clock fences | Focused cases passed; concurrency, mutation, replacement, eviction and conservative unknown capture are covered. |
 | Versioned-storage correctness harness | 1 direct-storage authority plus 9 cross-replica correctness cases passed; four load/prerequisite cases excluded. |
 | `npm run generate:api`, `npm run check:api` | Passed, no generated changes; workspace/spec/client remain 0.10.2. No subsequent exported DTO changes. |
 | Artifact-page UI selection | 41 passed with `NODE_OPTIONS=--no-experimental-webstorage`, thread pool, one worker. |
 | Matched E2E performance selection | Four runs passed all 12 profiles; 960 measured complete-output executions. |
-| Subscription-first E2E selection | Both baseline modes and treatment shared-file passed both cases; treatment API had one pass and one failure; follow-up pending. |
-| Treatment E2E regression selection | 23 passed / 4 failed on both storage modes; baseline reproduction below. |
+| Subscription-first E2E selection | Both baseline modes and treatment shared-file passed both cases. Initial treatment API had one failure; the fixed API passed all six cases across three repetitions. |
+| Treatment E2E regression selection | Original selection: 23 passed / 4 failed on both modes, reproduced below. New release-backed native selection: all 4 passed. |
 
 All database Cargo tests used owned disposable PostgreSQL, unique run identities
 and four test threads. A first authority run during image builds had 266 passes
@@ -369,27 +422,23 @@ contract evidence remains applicable to later private helpers and worker changes
 
 ### Remaining concerns
 
-- The subscription-first API-backed treatment run exposed a human live-log
-  selection race: sealing can publish the provider descriptor between pending
-  discovery and the retained version check. A lock-controlled regression reproduced HTTP 403 before the fix. Human live
-  selection now repeats full authorization once for the same version after a
-  Pending → Ready segment-descriptor transition, with immutable identity/path
-  checks. The latest workspace check passes; runtime follow-up is pending.
-  Completion and retained bytes were correct; streaming acceptance is not yet
-  complete.
-- Three native workflow retry cases and queue acknowledgement fail because
-  recorded invocation authority is missing. The unchanged baseline reproduced
+- Four existing ad hoc E2E cases (three workflow retries and queue
+  acknowledgement) fail because recorded invocation authority is missing. The unchanged baseline reproduced
   the same four failures, with the same executor diagnostics, under matching API
   storage/configuration. Baseline also failed parallel workflow failure isolation
   by reporting Completed; treatment passed that case. Existing admission and
   coordinated credential readiness gates were not weakened to make E2E pass.
-- Exact per-execution HTTP attribution and baseline phase decomposition are not
-  established by these traces. First-call observations do not prove a cold OS
-  cache, and the ten-second fixture window is not default-window capacity proof.
+- Per-execution seal HTTP calls are correlated for API mode. Other internal HTTP
+  request classes remain whole-run counts, and baseline phase decomposition is
+  unavailable. First calls do not prove a cold OS cache; the ten-second capture
+  window does not establish capacity at the product's one-second default.
 - Required CI, full unfiltered Rust/E2E suites, and the separate storage load lane
   remain unrun. Six deferred deployment cases are not passing release evidence.
   No schema migrations changed, so there is no schema/offline metadata update.
 
-Owned stack/volume/network teardown completed for all four measured runs. The
-owned PostgreSQL and RustFS correctness harnesses were also removed; the new
-reader regression currently uses a separately owned disposable PostgreSQL.
+Owned stack/volume/network teardown completed for all four measured runs and the
+reader/native Docker follow-up. The owned PostgreSQL and RustFS correctness
+harnesses were removed after awaited shutdown; final ownership checks are retained
+with the evidence. Source snapshots and image/build caches remain available for
+replay. Per-test pack deletion can be refused while immutable releases are pinned;
+the owning disposable stack teardown removes those run-owned resources.
