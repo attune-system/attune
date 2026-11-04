@@ -276,6 +276,56 @@ count. Multipart implementation details can produce more wire requests. Pool and
 stream peaks use 5 ms sampling, so a shorter spike can fall between samples.
 This is a bounded regression measurement, not a production capacity test.
 
+## Measure worker completion latency
+
+The opt-in lifecycle profile uses an exclusively owned full-stack E2E project.
+It publishes a small workload pack and runs echo, silent success/failure,
+stderr failure, both streams, and structured JSON stdout. Each profile separates
+its first invocation, warms workers, then records at least 20 samples at
+concurrency 1 and 4. First invocation is not proof of a cold filesystem cache.
+
+Use the same benchmark test and Compose override on both source revisions.
+Record their hashes, source revisions, build profile, host and storage mode.
+Build the images first, allow compilation to finish, then measure on an idle
+host. Set `ATTUNE_BUILD_GIT_SHA` during image builds to the full tested commit;
+this also invalidates cached package builds when source mtimes are older.
+
+```bash
+export ATTUNE_E2E_RUN_ID="worker-profile-$(date -u +%Y%m%d%H%M%S)-$$"
+export ATTUNE_E2E_PROJECT_NAME="attune-$ATTUNE_E2E_RUN_ID"
+export ATTUNE_E2E_COMPOSE_OVERRIDE="$PWD/docker-compose.worker-lifecycle-benchmark.yaml"
+export ATTUNE_WORKER_BENCHMARK_REVISION="$(git rev-parse HEAD)"
+export ATTUNE_BUILD_GIT_SHA="$ATTUNE_WORKER_BENCHMARK_REVISION"
+export ATTUNE_WORKER_BENCHMARK_TRANSPORT=volume # use api for object segments
+export ATTUNE_WORKER_BENCHMARK_EXPECT_LAZY=1 # use 0 for the eager baseline
+bash scripts/run-integration-tests.sh \
+  -m performance -k test_worker_lifecycle_profile -s
+```
+
+The runner tears down only its own project. To collect service traces, use
+`--no-teardown`, capture `docker compose` logs with the same project and all three
+Compose files, then explicitly tear down that owned project with `down --volumes`.
+Use a fresh project for every repeat and storage mode. Keep workload sample counts
+and debug logging identical. Ordinary E2E invocations exclude performance tests.
+
+The `WORKER_LIFECYCLE_REPORT` JSON contains request-to-terminal PostgreSQL
+notification latency, request-to-observed MQ completion latency, raw sample IDs,
+artifact versions, stream counts, database-wide statement-call/SQL-time deltas,
+and p50/p95/p99 completion observations. MQ observation polls a dedicated owned
+management queue every 10 ms, so it includes polling and management overhead;
+it does not measure exact broker arrival. SQL totals include orchestration and
+background jobs. With `pg_stat_statements.track=all`, nested SQL contributes
+to the totals, so summed SQL time is not elapsed wall-clock time. Worker debug
+logs provide lifecycle phases and SQL/pool traces;
+API traces and version IDs correlate seal requests. PostgreSQL logs lock waits
+longer than 50 ms. No arbitrary latency target is asserted by this test.
+
+The lazy expectation additionally checks independent per-stream allocation,
+zero log versions for silence, terminal capture markers, backend selection and
+persisted/MQ status agreement. Recorded/encrypted authority cases remain in the
+repository/API and versioned-storage correctness suites; a default rollout-mode
+benchmark does not replace those security checks.
+
 ## Recover failed streams
 
 Use the metrics endpoint first:
