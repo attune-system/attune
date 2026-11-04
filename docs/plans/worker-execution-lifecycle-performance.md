@@ -375,3 +375,38 @@ source checks remain pending; the checklist does not claim those results yet.
   will be retained with benchmark evidence.
 - The benchmark passes syntax, Compose configuration and pytest collection
   checks. Full-stack execution and measured acceptance remain pending.
+
+### Isolated acceptance and benchmark fixture checkpoint
+
+- The complete authority suite passed on an otherwise idle host: all 269 cases
+  passed in 1191.91 seconds. No source changes were made between the contended
+  failing run and this run. The original three failures and their circumstances
+  remain recorded above; the isolated run repeats the full coverage.
+- All 14 focused seal cases passed using the current test executable. The
+  additional worker integration executables passed: eight truncation, two
+  runtime-access and seven secret-handling cases. Both empty-stream API routes
+  passed their eight admission/reader cases.
+- Artifact-page UI tests passed all 41 cases with Node's experimental webstorage
+  disabled. The default invocation failed because this host's Node 26 exposes
+  an incompatible localStorage; an intermediate fork-pool attempt timed out.
+  No web source was changed. Required CI remains pending.
+- The observer now uses an expiring durable classic queue, supported by the
+  owned RabbitMQ 4 broker's default policy, and deletes it explicitly. Fixture
+  checks inspect the stored output contract through PostgreSQL because the
+  action DTO does not expose output_format. These fixes precede accepted runs.
+- A subscription-first regression uses an owned local HTTP gate and empty
+  execution permission refs. It does not enable the deliberately disabled
+  recorded-credential rollout. Both schema variants passed on the baseline;
+  treatment and API-backed runs are pending.
+- Diagnostic runs using the product's one-second finalization window observed
+  incomplete capture under concurrent storage contention on this host. The
+  baseline had 30 incomplete captures among 240 measured executions; the
+  treatment stopped at its first measured incomplete capture. These runs are
+  excluded from latency comparisons. Both revisions now use the same explicit
+  ten-second benchmark-only window and assert complete capture plus sealed,
+  ready log versions. Product defaults and authority deadlines are unchanged.
+- The matched baseline shared-file run passed all 12 profiles (20 measured
+  executions each), plus both subscription-first cases. Source, harness, image,
+  dependency and agent hashes, raw observations, traces, and awaited cleanup
+  evidence are retained under .scratch/worker-lifecycle-reports. Treatment and
+  API-backed measurements are still in progress.

@@ -299,7 +299,7 @@ export ATTUNE_BUILD_GIT_SHA="$ATTUNE_WORKER_BENCHMARK_REVISION"
 export ATTUNE_WORKER_BENCHMARK_TRANSPORT=volume # use api for object segments
 export ATTUNE_WORKER_BENCHMARK_EXPECT_LAZY=1 # use 0 for the eager baseline
 bash scripts/run-integration-tests.sh \
-  -m performance -k test_worker_lifecycle_profile -s
+  -k test_worker_lifecycle_profile -m performance -s
 ```
 
 The runner tears down only its own project. To collect service traces, use
@@ -312,13 +312,23 @@ The `WORKER_LIFECYCLE_REPORT` JSON contains request-to-terminal PostgreSQL
 notification latency, request-to-observed MQ completion latency, raw sample IDs,
 artifact versions, stream counts, database-wide statement-call/SQL-time deltas,
 and p50/p95/p99 completion observations. MQ observation polls a dedicated owned
-management queue every 10 ms, so it includes polling and management overhead;
-it does not measure exact broker arrival. SQL totals include orchestration and
+management queue every 10 ms, so it includes polling and management overhead.
+The observer is an additional expiring durable classic queue, explicitly deleted
+after the run; both revisions incur its overhead.
+It does not measure exact broker arrival. SQL totals include orchestration and
 background jobs. With `pg_stat_statements.track=all`, nested SQL contributes
 to the totals, so summed SQL time is not elapsed wall-clock time. Worker debug
 logs provide lifecycle phases and SQL/pool traces;
 API traces and version IDs correlate seal requests. PostgreSQL logs lock waits
 longer than 50 ms. No arbitrary latency target is asserted by this test.
+
+The benchmark override gives both revisions a 10-second capture-finalization
+window. A diagnostic run with the product's 1-second default recorded incomplete
+capture during concurrent storage waits on this host. The benchmark requires
+complete capture and sealed, ready output on both revisions; increasing this
+fixture window avoids comparing truncated work. It leaves product defaults,
+execution timeouts and authority deadlines unchanged. Record this setting with
+results; these measurements do not establish default-window capture capacity.
 
 The lazy expectation additionally checks independent per-stream allocation,
 zero log versions for silence, terminal capture markers, backend selection and
