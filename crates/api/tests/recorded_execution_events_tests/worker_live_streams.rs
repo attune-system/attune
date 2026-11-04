@@ -34,6 +34,15 @@ pub(super) struct WorkerLog {
 }
 
 struct RouterServer(tokio::task::JoinHandle<()>);
+impl RouterServer {
+    async fn stop(&mut self) -> Result<()> {
+        self.0.abort();
+        match (&mut self.0).await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            result => result.map_err(Into::into),
+        }
+    }
+}
 impl Drop for RouterServer {
     fn drop(&mut self) {
         self.0.abort();
@@ -1204,5 +1213,126 @@ async fn worker_live_fixed_reader_cannot_borrow_producers_later_generic_source_g
     drop(body);
     drop(log);
     fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+/// Queue a real seal ahead of the human reader's target locks, so discovery
+/// sees Pending and authorization sees publication's new segment descriptor.
+/// A sleep cannot establish this ordering.
+#[tokio::test]
+async fn human_live_reader_reauthorizes_a_log_sealed_during_selection() -> Result<()> {
+    for artifact_route in [false, true] {
+        let fixture = worker_fixture().await?;
+        let mut log = WorkerLog::allocate(&fixture, LogStreamBackend::ObjectSegments).await?;
+        grant_human(&fixture, exact_log_grants(&log)).await?;
+        log.append(&fixture, b"sealed-during-selection").await?;
+        let observation: Result<_> = {
+            let mut blocker = Some(fixture.ctx.pool.begin().await?);
+            let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut **blocker.as_mut().unwrap())
+                .await?;
+            ArtifactVersionRepository::find_by_id_for_update(
+                blocker.as_mut().unwrap(),
+                log.version,
+            )
+            .await?
+            .unwrap();
+            let uri = if artifact_route {
+                format!("/api/v1/artifacts/{}/stream", log.artifact)
+            } else {
+                format!("/api/v1/executions/{}/logs/stdout/stream", log.execution)
+            };
+            let request = Request::builder()
+                .uri(uri)
+                .header(
+                    "authorization",
+                    format!("Bearer {}", fixture.ctx.token.as_deref().unwrap()),
+                )
+                .body(Body::empty())?;
+            let seal = log.seal(&fixture);
+            tokio::pin!(seal);
+            let pool = &fixture.ctx.pool;
+            let waiters = move |count| async move {
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    loop {
+                        let blocked: i64 = sqlx::query_scalar(
+                            "WITH RECURSIVE blocked(pid) AS ( \
+                         SELECT pid FROM pg_stat_activity WHERE datname=current_database() \
+                         AND $1=ANY(pg_blocking_pids(pid)) UNION \
+                         SELECT p.pid FROM pg_stat_activity p JOIN blocked b \
+                         ON b.pid=ANY(pg_blocking_pids(p.pid)) WHERE p.datname=current_database()) \
+                         SELECT count(*) FROM blocked",
+                        )
+                        .bind(blocker_pid)
+                        .fetch_one(pool)
+                        .await?;
+                        if blocked >= count {
+                            return Ok::<_, sqlx::Error>(());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await??;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            };
+            let mut seal_finished = false;
+            let result = async {
+                tokio::select! {
+                    result = &mut seal => {
+                        seal_finished = true;
+                        return Err(format!("seal completed before its version lock was released: {result:?}").into());
+                    }
+                    result = waiters(1) => result?,
+                }
+                let reader = fixture.ctx.app.clone().oneshot(request);
+                tokio::pin!(reader);
+                tokio::select! {
+                    result = &mut reader => return Err(format!("reader completed before its retained target locks: {:?}", result.map(|r| r.status())).into()),
+                    result = waiters(2) => result?,
+                }
+                blocker.take().unwrap().rollback().await?;
+                let (sealed, response) = tokio::join!(&mut seal, &mut reader);
+                seal_finished = true;
+                sealed?;
+                let response = response?;
+                let status = response.status();
+                let body = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    axum::body::to_bytes(response.into_body(), 1024 * 1024),
+                )
+                .await??;
+                let body = String::from_utf8(body.to_vec())?;
+                Ok::<_, Box<dyn std::error::Error>>((status, body))
+            }
+            .await;
+            // Release the diagnostic blocker and join the real writer even if
+            // a readiness predicate failed. Cleanup is part of the observation.
+            let rollback = match blocker.take() {
+                Some(blocker) => blocker.rollback().await.map_err(Into::into),
+                None => Ok::<_, Box<dyn std::error::Error>>(()),
+            };
+            let settled = if seal_finished {
+                Ok(())
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(15), &mut seal)
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+                    .and_then(|result| result)
+            };
+            rollback.and(settled).and(result)
+        };
+        let stopped = log._server.stop().await;
+        drop(log);
+        let cleaned = fixture.ctx.cleanup().await;
+        stopped?;
+        cleaned?;
+        let (status, body) = observation?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("sealed-during-selection"), "{body}");
+        if !artifact_route {
+            assert!(body.contains("event: done"), "{body}");
+            assert!(!body.contains("event: error"), "{body}");
+        }
+    }
     Ok(())
 }

@@ -11,8 +11,8 @@ nonzero-exit failure, while preserving cancellation, timeout, authorization,
 secret protection, storage settlement, and queue/workflow completion contracts.
 
 Initial inspection used commit `880b1b2a138a335eb549c08452f0d3440de68d41`.
-The inspected worker lifecycle paths match tag `v0.10.2`. Findings are static;
-no end-to-end timings or speedup claims have yet been established.
+The inspected worker lifecycle paths match tag `v0.10.2`;
+matched end-to-end observations are recorded below.
 
 ## Invariants
 
@@ -35,15 +35,15 @@ no end-to-end timings or speedup claims have yet been established.
 
 ### 1. Baseline and lifecycle observability
 
-- [ ] Provision an owned, isolated v0.10.2 instance using repository lifecycle
+- [x] Provision an owned, isolated v0.10.2 instance using repository lifecycle
   tooling; leave existing development resources alone.
-- [ ] Measure receipt, preparation, process start/exit, log finalization,
+- [x] Measure receipt, preparation, process start/exit, log finalization,
   terminal persistence, and completion publication separately.
 - [ ] Capture statement counts, SQL time, pool acquisition, lock waits, and
   internal HTTP calls, correlated by execution without logging secret data.
-- [ ] Exercise warm and cold release states, serial and concurrent executions,
+- [x] Exercise warm and cold release states, serial and concurrent executions,
   shared-file and segmented storage. Keep workloads identical for reruns.
-- [ ] Include echo, silent success/failure, stderr-only failure, and both streams.
+- [x] Include echo, silent success/failure, stderr-only failure, and both streams.
   Record sample sizes and latency distributions; process duration currently
   includes log finalization and excludes preparation/terminal reporting.
 
@@ -135,18 +135,18 @@ change; capture an unchanged baseline before claiming performance improvements.
 
 ### 8. Validation and measured acceptance
 
-- [ ] Add focused cases for silent success/failure, stdout only, stderr only,
+- [x] Add focused cases for silent success/failure, stdout only, stderr only,
   both streams, whitespace, empty writes, truncation, first-write allocation
   failure, cancellation during allocation, and sealing failure.
 - [ ] Exercise encrypted shared-file and segmented storage, subscription before
   first output, terminal empty output, reconnects, and protected readers.
-- [ ] Cover expired approvals, revoked/dependent admissions, stale attempts,
+- [x] Cover expired approvals, revoked/dependent admissions, stale attempts,
   mismatched owners, and concurrent mutations. Keep security failure cases.
 - [ ] Verify persisted states agree with messages and queue/workflow completion
   remains correct, including retries and early preparation failures.
-- [ ] Repeat identical baseline workloads; report latency and statement counts
+- [x] Repeat identical baseline workloads; report latency and statement counts
   by phase. Do not promise a latency target before measuring the baseline.
-- [ ] Run formatting, affected crate checks/tests, relevant database and storage
+- [x] Run formatting, affected crate checks/tests, relevant database and storage
   integration suites, Clippy as applicable, and workspace checks. Follow
   `docs/testing/running-tests.md`; disclose unrun coverage and pending CI.
 
@@ -178,235 +178,218 @@ deployment to an existing environment remain outside the current authorization.
 - `crates/api/src/routes/executions.rs` and protected stream helpers: log readers.
 - `crates/common/src/pack_transport/volume.rs`: receipt-time archive verification.
 
-## Progress
+## Implementation checkpoints
 
-Historical checkpoints follow; later entries supersede earlier pending items.
+The functional worker/common/API performance changes were frozen at
+`ca202d5f721051377543e1618bd623d169f228fb` for measurement. The test fixtures were
+subsequently committed at `231c6ec0` and `618ddc09`. Terminal state reuse, guarded
+starts, immutable preparation, existing-admission validation, lazy independent
+capture, positive empty-output evidence, seal reuse, and release verification
+are implemented. Admission creation still belongs to the admission owner;
+validation does not silently repair missing records.
 
-- Separate worktree: `/mnt/wdc/attune-worktrees/worker-execution-lifecycle`,
-  branch `perf/worker-execution-lifecycle`, based on `880b1b2a`.
-- Terminal handlers now return the persisted row to the worker service. Both
-  terminal messages use that row, removing their two normal-path execution
-  reads. Existing public executor methods retain process-result/error behavior.
-- Nonzero exits, timeouts, and cancellations report the persisted status.
-  Preparation/catastrophic errors that successfully persist Failed carry that
-  row too. Other errors perform one recovery read and cannot announce completion
-  for a nonterminal row. Pre-start Canceling no longer fabricates Cancelled
-  notifications without a durable transition.
-- Added pure service tests for terminal status/message agreement, protected
-  persisted results, nonterminal rejection, and missing action metadata.
-- Accurate previous-status reporting remains unresolved: the existing status
-  event convention uses the loaded row's status. A returned terminal row cannot
-  reveal its locked predecessor. Startup transition/cancellation races also
-  remain to be addressed with repository-owned transition support.
-- Lazy stream allocation, admission/sealing changes, immutable context reuse,
-  release verification, full-stack validation, and baseline measurements remain
-  unimplemented. No measured performance claim is made.
+Combined stdout/stderr sealing was evaluated and left independent. Lazy capture
+removes unused seals without coupling failures or adding multi-stream lock order.
+The ordinary artifact query excludes log versions; zero-byte ordinary files retain
+their existing settlement. A first allocation after a recorded execution enters
+Canceling still fails its existing launch fence and records incomplete capture.
 
-### Initial slice validation
+The bounded shared-volume cache trusts coherent Unix file identity, size, mtime
+and ctime plus immutable extracted releases. It rehashes after mutation,
+replacement, removal or eviction, and on platforms without reusable identity.
+A marker alone is not proof. Hashing runs outside Tokio; concurrent receipts
+share one verification. The distribution documentation records this trust model.
 
-Tested base `880b1b2a` plus the uncommitted worker executor/service changes in
-this worktree. These checks cover worker compilation and message construction;
-they do not establish database/MQ lifecycle or performance acceptance.
+## Matched measurements (2026-11-04)
 
-- `cargo fmt --all -- --check`: passed.
-- `git diff --check`: passed.
-- `SQLX_OFFLINE=true cargo check -p attune-worker --all-targets`: passed without warnings.
-- `ATTUNE_TEST_RUN_ID=worker-lifecycle1 SQLX_OFFLINE=true cargo test -p attune-worker --lib service::tests:: -- --test-threads=4`:
-  12 passed, 178 filtered out; no database or broker required by this selection.
-- `SQLX_OFFLINE=true cargo clippy -p attune-worker --all-targets --no-deps -- -D warnings`: passed.
-- Database/MQ lifecycle tests, workspace validation, and required CI remain unrun.
+Baseline: `v0.10.2`, `6906b96846eb83299cfb9b8a740ccf8854b25e8e`.
+Only four CLI MCP policy/docs files differ from the task's `880b1b2a` starting
+commit; worker, common, API, executor, migrations and workspace dependencies match.
+Treatment: `ca202d5f721051377543e1618bd623d169f228fb`.
 
-### Lifecycle and lazy-capture checkpoint (work in progress)
+Both revisions used the same published workload, observer, harness SHA-256
+`b2000877ad666efb083e123d7d233ef11630d92b3f7fee92fcd2aec7d63ff102`
+and Compose override SHA-256
+`aca96f6ffbd4b7b012a48930923cd9f8eb752e3a55d5561227242b7cba74150b`.
+Each owned fresh stack ran six workloads at concurrency 1 and 4, 20 measured
+executions per profile: 240 per stack, 960 across all four stacks. First calls
+and 16 warmups per workload were recorded separately. Measured worker IDs had
+to belong to the warmed set. First release receipt does not establish a cold OS
+page cache, and one first call is not a latency distribution.
 
-- Added repository-owned atomic worker transitions returning the locked previous
-  status and updated row in one statement. Startup returns its row directly to
-  preparation and publishes Running only after persistence. Terminal state and
-  assignment guards reject stale updates; missing-action failures persist Failed.
-- Shared immutable schema bindings and authorized input-secret paths across
-  preparation, log policy selection, and result protection. Completion still
-  closes runtime reads and queries recorded runtime origins.
-- Ordinary file settlement excludes log streams in its repository query.
-- Delivery freshness checks share one PostgreSQL clock sample. Existing-admission
-  validation now avoids admission/attempt inserts while retaining executable,
-  owner, policy, approval, dependency and attempt fences. Delivery helpers reuse
-  its fence within the transaction.
-- Each stream allocates on its first nonempty write. Empty writes and unused
-  sealing allocate nothing. Failed/cancelled initialization is latched. Prepared
-  allocation returns its permit directly to transport construction. Allocated
-  paths are retained for terminal result construction.
-- Worker completion records per-stream capture state. Both SSE reader paths
-  recognize positively known empty streams, reject nonzero cursors on them, and
-  keep missing/failed/crashed capture distinct from silence.
-- Added tracing phase timings for receipt/materialization, preparation, process
-  wait, capture settlement, ordinary artifacts, persistence and publication.
-- Validation so far: two repository transition tests passed twice (including the
-  concurrent terminal race); both delivery-fence unit tests passed; 12 worker
-  service tests and all 15 log-writer tests passed, including four new lazy-state
-  regressions. These scoped results do not certify untested admission/reader
-  integration behavior. The API all-targets check and ordinary-file test are
-  ongoing. Full lifecycle/storage/security tests and measurements remain pending.
-- Warm release verification and seal-path query reuse remain unimplemented.
+Images were built before measurement, using release musl agents and repository
+Compose services. Stacks ran sequentially without concurrent compilation.
+Docker supplied eight CPUs and 16,765,710,336 bytes of memory. PostgreSQL 18,
+RabbitMQ 4.3.6 and verbose SQL instrumentation were shared experimental inputs.
+API-backed segments used the filesystem object backend; S3 latency is not measured.
+Each profile required complete capture and sealed, ready versions on both revisions.
 
-### Warm release and seal checkpoint (work in progress)
+Both revisions used a **10,000 ms benchmark-only capture-finalization budget**.
+Earlier diagnostic runs at the product's 1,000 ms default are excluded: baseline
+capture was incomplete for 30/240 measured executions, and treatment stopped at
+its first measured incomplete capture. The default remains unchanged. These
+results do not establish capacity within that default window. Action timeouts,
+approval bounds, attempt fences and grant expiry were not extended.
 
-- Warm Unix release verification reuses a bounded, per-transport file-identity
-  proof; mutations and replacements force rehashing. Hashing streams in bounded
-  buffers off Tokio threads. Non-Unix consumers retain full verification. The
-  storage trust/invalidation contract is documented in
-  `docs/deployment/pack-candidate-distribution.md`.
-- Sealing reuses the already-authorized worker context and permit for encrypted
-  proof, shared-file limits and operation bounds. Version/stream rows remain
-  locked continuously across storage verification, so the duplicate locked reads
-  and second active-upload lookup were removed. Final deadline checks remain.
-- Added route-level tests for normal/protected empty streams, failed/unknown
-  capture, terminal statuses and offsets. Added a statement-trigger regression
-  that rejects any admission/attempt INSERT during existing-binding validation.
-- All five volume-transport tests and all five manifest/capture-marker tests
-  passed. The five existing recorded-worker tests passed (including stale owner,
-  terminal delivery and admission revocation). The new trigger regression and
-  API reader/seal tests are pending. The ordinary zero-byte file regression passed.
-- API/worker all-targets validation passed for the prior lifecycle checkpoint.
-  Subsequent seal changes still need the queued compiler/Clippy/integration runs.
-- The existing frontend artifact test suite failed with Node 26's global
-  `localStorage` unavailable. Its source/dependencies are unchanged by this task;
-  baseline reproduction and an invocation using `--no-experimental-webstorage`
-  are in progress. No frontend behavior change is being made for that issue.
+Latency below is request to observed MQ completion, including 10 ms polling
+and management overhead. SQL calls are database-wide `pg_stat_statements`
+deltas divided by 20; `track=all` includes nested SQL, orchestration and background
+work. Summed SQL execution time is not wall-clock time. Values are rounded.
 
-### Startup hardening and validation follow-up
+| Storage | Workload | Concurrency | p50 ms, before → after | p95 ms, before → after | SQL calls/execution, before → after |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Shared file | echo | 1 | 689 → 507 | 811 → 720 | 1291 → 731 |
+| Shared file | echo | 4 | 1972 → 1246 | 2351 → 1482 | 1276 → 712 |
+| Shared file | silent_success | 1 | 614 → 200 | 671 → 337 | 1241 → 495 |
+| Shared file | silent_success | 4 | 1604 → 448 | 1962 → 545 | 1217 → 474 |
+| Shared file | silent_failure | 1 | 685 → 206 | 762 → 291 | 1299 → 490 |
+| Shared file | silent_failure | 4 | 2122 → 430 | 2504 → 504 | 1247 → 475 |
+| Shared file | stderr_failure | 1 | 780 → 466 | 844 → 529 | 1414 → 737 |
+| Shared file | stderr_failure | 4 | 2306 → 1334 | 2668 → 1535 | 1351 → 707 |
+| Shared file | both | 1 | 874 → 627 | 1100 → 733 | 1541 → 962 |
+| Shared file | both | 4 | 2496 → 2089 | 2903 → 2427 | 1425 → 961 |
+| Shared file | json_stdout | 1 | 827 → 514 | 932 → 646 | 1488 → 779 |
+| Shared file | json_stdout | 4 | 2327 → 1453 | 2971 → 1763 | 1438 → 742 |
+| API segments | echo | 1 | 520 → 392 | 580 → 455 | 1366 → 824 |
+| API segments | echo | 4 | 1036 → 817 | 2249 → 1028 | 1323 → 799 |
+| API segments | silent_success | 1 | 406 → 217 | 507 → 250 | 1127 → 508 |
+| API segments | silent_success | 4 | 783 → 480 | 867 → 543 | 1074 → 482 |
+| API segments | silent_failure | 1 | 399 → 221 | 458 → 350 | 1140 → 494 |
+| API segments | silent_failure | 4 | 723 → 529 | 827 → 627 | 1106 → 488 |
+| API segments | stderr_failure | 1 | 476 → 350 | 630 → 406 | 1434 → 811 |
+| API segments | stderr_failure | 4 | 919 → 782 | 1002 → 948 | 1359 → 794 |
+| API segments | both | 1 | 498 → 373 | 644 → 521 | 1658 → 1140 |
+| API segments | both | 4 | 1054 → 852 | 1235 → 990 | 1634 → 1088 |
+| API segments | json_stdout | 1 | 526 → 422 | 703 → 655 | 1479 → 854 |
+| API segments | json_stdout | 4 | 1275 → 877 | 1722 → 1062 | 1381 → 816 |
 
-- Assigned executions now start only from Scheduled. In-flight duplicate MQ
-  deliveries retain the original cancellation token instead of overwriting it.
-  Added cancellation-token and repository duplicate-start regressions.
-- Missing action/schema-binding failures now persist a fixed, safe diagnostic
-  before parameter restoration or code launch. Added repository-backed coverage
-  proving Failed status and no allocated logs for those prelaunch errors.
-- All eight stream-admission API tests passed, including the new empty/incomplete
-  cases on both reader paths. All 41 existing frontend artifact tests passed with
-  `NODE_OPTIONS=--no-experimental-webstorage` and `--pool=threads --maxWorkers=1`.
-  The default Node 26 invocation failed, and intermediate fork-worker attempts
-  timed out; these are retained as environment/validation limitations rather than
-  hidden retries. No frontend source changes were required.
-- Scoped common/worker/API all-targets Clippy passed with warnings denied before
-  the latest startup additions. A new unused test import was removed; the final
-  startup and new trigger regressions still need their focused validation.
+All 24 p50 and p95 observations decreased. This is a bounded local comparison,
+not a statistical confidence claim or production capacity result. At n=20 the
+reported nearest-rank p99 is the maximum. One maximum worsened: serial API echo
+was 1,685 ms on treatment versus 589 ms on baseline, despite lower p50/p95.
+The raw samples and interactive comparison retain that outlier.
 
-### Capture evidence and seal-source follow-up
+Silent success/failure allocated zero log versions/streams on treatment, versus
+two per execution on baseline. Stdout-only and stderr-only allocated one each;
+both-output allocated two. Parsed JSON stdout retained capture evidence after
+its convenience stdout string was cleared. All measured treatment failure
+notifications agreed with persisted Failed; baseline published Completed for
+these ordinary failures.
 
-- Capture state now derives from the retained per-stream allocation evidence,
-  not `ExecutionResult.stdout`: successful JSON parsing intentionally clears that
-  convenience string. Unknown evidence remains unknown. Added a focused parsed-
-  stdout regression and a JSON stdout benchmark workload.
-- Purpose-specific worker seal requests retain structural path/uniqueness checks
-  but acquire source authority only in the actual seal transaction, before all
-  target/file effects. Other credential paths retain their preflight behavior.
-- API generation completed with no generated client changes. Client checking
-  against that fresh exported spec passed; workspace, spec and client versions
-  all remain 0.10.2. Subsequent worker/private seal-helper changes do not alter
-  the exported DTOs or spec, so that contract evidence remains applicable.
-- The frozen v0.10.2 source differs from the starting commit only in MCP CLI
-  policy files/docs. Worker, common, API, executor, migrations and workspace
-  dependencies are identical, so those unrelated CLI differences are outside
-  the benchmark workloads. Baseline service/agent builds are still running.
+Treatment phase spans were present for all 480 measured executions, including
+materialization, preparation, process wait, capture settlement, ordinary artifact
+settlement, terminal persistence, terminal publication and receipt-to-publication.
+The process-wait span includes spawn/stdin delivery/wait; public duration_ms still
+includes capture and excludes preparation. Baseline lacks the new phase labels,
+so no before/after phase decomposition is claimed.
 
-### Allocation atomicity and trace correlation
+Serial treatment phase p50 values (ms):
 
-- Unrecorded execution allocation now creates the artifact, version and stream
-  in one transaction, matching recorded allocation. The concurrent-allocation
-  regression also forces stream-creation failure and verifies rollback.
-- Capture tasks retain their parent execution span. Shared append, segment
-  commit and seal spans contain execution/version identifiers without logging
-  bytes, manifests or credentials.
-- The versioned object-storage correctness harness passed: the direct-storage
-  authority case and all nine cross-replica correctness cases passed. Its owned
-  RustFS resources were torn down successfully. Four load/prerequisite cases
-  remain outside that correctness selection.
-- The final current-source security, worker and workspace checks are pending.
-  Benchmark tooling is opt-in and still needs its first full-stack run; no
-  latency reduction has been measured yet.
+| Storage | Workload | Preparation | Process wait | Capture settlement | Receipt → publication |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Shared file | echo | 43.36 | 3.02 | 275.82 | 357.72 |
+| Shared file | silent_success | 32.14 | 3.68 | 0.17 | 68.49 |
+| Shared file | both | 32.30 | 3.81 | 419.25 | 491.05 |
+| API segments | echo | 32.36 | 2.96 | 141.61 | 212.88 |
+| API segments | silent_success | 32.23 | 3.98 | 0.11 | 68.06 |
+| API segments | both | 32.20 | 3.99 | 141.77 | 213.36 |
 
-### Implementation complete; acceptance checks in progress
+Capture settlement remains the dominant worker cost for output-producing actions.
+Correlated worker pool acquisitions had medians 0.134 ms (shared file) and
+0.123 ms (API); those traces exclude pre-start SQL outside the execution span.
+PostgreSQL logs retain waits exceeding 50 ms. API route counters are whole-run
+observations, including warmups and ancillary tests: baseline API recorded 768
+seal requests and treatment 333; segment direct-upload/PUT counts were 385/385
+and 386/386. Sanitized route templates and log rotation prevent exact per-execution
+HTTP attribution. These counters are not normalized measured-execution savings.
 
-Implementation sequence items 2–7 are complete. Combined stdout/stderr sealing
-was evaluated and left independent: lazy capture already removes unused seals,
-and a combined endpoint would add multi-stream lock ordering and coupled failure
-semantics. Ordinary artifact settlement keeps per-artifact updates; the filtered
-query removes all log versions from that path without changing file durability.
+Raw reports, per-profile statement deltas, worker/API/PostgreSQL traces, source,
+agent, harness and image hashes, dependency versions and awaited cleanup logs:
 
-The benchmark harness and Compose configuration pass Python syntax and Compose
-configuration checks. The harness uses an actual published fixture pack so JSON
-stdout has a recorded JSON output contract. Measured acceptance and final current-
-source checks remain pending; the checklist does not claim those results yet.
+- `.scratch/worker-lifecycle-reports/worker-base-volume-993f085b46-volume/`
+- `.scratch/worker-lifecycle-reports/worker-treat-volume-fc085a3e01-volume/`
+- `.scratch/worker-lifecycle-reports/worker-base-api-a5a994adba-api/`
+- `.scratch/worker-lifecycle-reports/worker-treat-api-a00c4e797d-api/`
+- `.scratch/worker-lifecycle-reports/comparison.json` and `comparison.html`
 
-- Current-source live-stream authorization tests passed: all 11 cases on shared
-  files/object segments, including corrupt seals, revocation and expiry after
-  decoder waits, and fixed-origin disclosure. This is additional to the earlier
-  14 seal-operation and nine versioned-storage correctness cases.
-- Docker Desktop cannot bind the external worktree path. Full-stack runs use
-  verified snapshots under the original repository's Docker-shared `.scratch`
-  directory. No Docker settings or development stack resources were changed.
-  Baseline image build completed successfully; treatment images are building.
+Docker Desktop cannot mount the external worktree. Hash-verified source snapshots
+under the original repository's Docker-shared `.scratch` supplied the owned runs;
+Docker sharing preferences and existing development resources were not changed.
+RabbitMQ's default policy rejected the first transient observer queue. The
+accepted fixture uses an expiring durable classic queue with explicit deletion.
+An initial fixture check also used a DTO field that is not exported; the corrected
+fixture checks the stored JSON contract through PostgreSQL. Setup failures and
+the excluded one-second diagnostic runs remain in the raw evidence.
 
-### Final compilation and contended authority run
+## Validation handoff
 
-- Runtime source remains `ca202d5f`; later changes in this checkpoint are the
-  benchmark harness, its Compose override and documentation.
-- All 196 worker library tests, all seven recorded-input/worker-boundary tests,
-  both worker-transition repository tests, and all 11 live-stream authorization
-  tests passed. The new admission INSERT-rejection and safe prelaunch regressions
-  are included in those totals.
-- Full workspace all-targets checking and scoped common/worker/API all-targets
-  Clippy with warnings denied passed. The three remaining worker integration
-  executables (secret handling, runtime access and truncation) compiled.
-- The broad authority run completed 269 cases: 266 passed and three failed while
-  image builds and diagnostic executables competed for resources. Retained-batch
-  reclamation was deferred, an empty-wait cleanup exceeded its original consent
-  budget, and an iteration preparation was denied after a 10-second approval was
-  issued. The retained-batch case passed alone. These failures remain recorded;
-  a complete isolated run is required before accepting that suite.
-- The passing versioned-storage test binary contains the new seal-authorization
-  helper. Its functional API/common paths are unchanged by the subsequent
-  tracing and unrecorded-worker-allocation edits, so its nine correctness cases
-  and direct-storage authority result remain applicable. The idle validation
-  will separately repeat the 14 focused seal cases using the current live-stream
-  test executable, with binary hashes retained as evidence.
-- Both musl image builds emit the same linker warning about deprecated
-  optimization setting `1`; the unchanged baseline exhibits it too. Host
-  workspace checks and warnings-denied Clippy are clean. Detailed build logs
-  will be retained with benchmark evidence.
-- The benchmark passes syntax, Compose configuration and pytest collection
-  checks. Full-stack execution and measured acceptance remain pending.
+Status: work in progress; local streaming follow-up and required CI pending.
 
-### Isolated acceptance and benchmark fixture checkpoint
+Validation applies to `ca202d5f` functional source plus the stated benchmark
+fixture commits; the pending reader fix needs its own validation. Subsequent
+prose/comment-only changes preserve the corresponding code-test evidence.
 
-- The complete authority suite passed on an otherwise idle host: all 269 cases
-  passed in 1191.91 seconds. No source changes were made between the contended
-  failing run and this run. The original three failures and their circumstances
-  remain recorded above; the isolated run repeats the full coverage.
-- All 14 focused seal cases passed using the current test executable. The
-  additional worker integration executables passed: eight truncation, two
-  runtime-access and seven secret-handling cases. Both empty-stream API routes
-  passed their eight admission/reader cases.
-- Artifact-page UI tests passed all 41 cases with Node's experimental webstorage
-  disabled. The default invocation failed because this host's Node 26 exposes
-  an incompatible localStorage; an intermediate fork-pool attempt timed out.
-  No web source was changed. Required CI remains pending.
-- The observer now uses an expiring durable classic queue, supported by the
-  owned RabbitMQ 4 broker's default policy, and deletes it explicitly. Fixture
-  checks inspect the stored output contract through PostgreSQL because the
-  action DTO does not expose output_format. These fixes precede accepted runs.
-- A subscription-first regression uses an owned local HTTP gate and empty
-  execution permission refs. It does not enable the deliberately disabled
-  recorded-credential rollout. Both schema variants passed on the baseline;
-  treatment and API-backed runs are pending.
-- Diagnostic runs using the product's one-second finalization window observed
-  incomplete capture under concurrent storage contention on this host. The
-  baseline had 30 incomplete captures among 240 measured executions; the
-  treatment stopped at its first measured incomplete capture. These runs are
-  excluded from latency comparisons. Both revisions now use the same explicit
-  ten-second benchmark-only window and assert complete capture plus sealed,
-  ready log versions. Product defaults and authority deadlines are unchanged.
-- The matched baseline shared-file run passed all 12 profiles (20 measured
-  executions each), plus both subscription-first cases. Source, harness, image,
-  dependency and agent hashes, raw observations, traces, and awaited cleanup
-  evidence are retained under .scratch/worker-lifecycle-reports. Treatment and
-  API-backed measurements are still in progress.
+| Check | Result / scope |
+| --- | --- |
+| `cargo fmt --all -- --check`, `git diff --check` | Passed; final rerun pending reader fix. |
+| `SQLX_OFFLINE=true cargo check --all-targets --workspace` | Passed without warnings. |
+| Scoped common/worker/API `cargo clippy --all-targets --no-deps -- -D warnings` | Passed. |
+| Worker `cargo test --lib` | 196 passed. |
+| `recorded_input_restoration_tests` | 7 passed, including rejected admission INSERT replay and safe early failure. |
+| `worker_execution_transition_tests` | 2 passed, including guarded starts and terminal fencing. |
+| `runtime_authority_repository_tests` | All 269 passed on an idle host in 1191.91 s; includes native retry materialization and revocation/expiry after waits. |
+| `recorded_execution_events_tests recorded_file_completion_cases::` | 14 focused seal cases passed on the current executable. |
+| `recorded_execution_events_tests worker_live_streams::` | Initial 11 passed; new selection-race regression pending. |
+| `execution_log_stream_admission_api_tests` | 8 passed across ordinary/protected empty and unknown readers. |
+| Worker integration executables | 8 truncation, 2 runtime-access and 7 secret-handling cases passed. |
+| Shared release cache / completion marker / clock fences | Focused cases passed; concurrency, mutation, replacement, eviction and conservative unknown capture are covered. |
+| Versioned-storage correctness harness | 1 direct-storage authority plus 9 cross-replica correctness cases passed; four load/prerequisite cases excluded. |
+| `npm run generate:api`, `npm run check:api` | Passed, no generated changes; workspace/spec/client remain 0.10.2. No subsequent exported DTO changes. |
+| Artifact-page UI selection | 41 passed with `NODE_OPTIONS=--no-experimental-webstorage`, thread pool, one worker. |
+| Matched E2E performance selection | Four runs passed all 12 profiles; 960 measured complete-output executions. |
+| Subscription-first E2E selection | Both baseline modes and treatment shared-file passed both cases; treatment API had one pass and one failure; follow-up pending. |
+| Treatment E2E regression selection | 23 passed / 4 failed on both storage modes; baseline reproduction below. |
+
+All database Cargo tests used owned disposable PostgreSQL, unique run identities
+and four test threads. A first authority run during image builds had 266 passes
+and three failures: retained-batch reclamation was deferred, empty-wait cleanup
+exceeded its consent budget, and a ten-second approval expired before iteration
+preparation. The retained-batch case passed alone, then the complete identical
+269-case suite passed with no source change on an idle host. No failing cases
+were dropped. The initial UI invocation hit this host's Node 26 localStorage
+behavior; an intermediate fork-pool attempt timed out before the passing run.
+Both musl builds emit the same pre-existing deprecated linker optimization `1`
+warning; host checking and warnings-denied Clippy are clean.
+
+Versioned-storage evidence is reused because its passing binary contains the
+new seal authorization helper, and its API/common storage paths were unchanged
+by the subsequent tracing and unrecorded-worker allocation edits. It exercises
+real versioned storage, not the filesystem performance backend. Exported API
+contract evidence remains applicable to later private helpers and worker changes.
+
+### Remaining concerns
+
+- The subscription-first API-backed treatment run exposed a human live-log
+  selection race: sealing can publish the provider descriptor between pending
+  discovery and the retained version check. A lock-controlled regression reproduced HTTP 403 before the fix. Human live
+  selection now repeats full authorization once for the same version after a
+  Pending → Ready segment-descriptor transition, with immutable identity/path
+  checks. The latest workspace check passes; runtime follow-up is pending.
+  Completion and retained bytes were correct; streaming acceptance is not yet
+  complete.
+- Three native workflow retry cases and queue acknowledgement fail because
+  recorded invocation authority is missing. The unchanged baseline reproduced
+  the same four failures, with the same executor diagnostics, under matching API
+  storage/configuration. Baseline also failed parallel workflow failure isolation
+  by reporting Completed; treatment passed that case. Existing admission and
+  coordinated credential readiness gates were not weakened to make E2E pass.
+- Exact per-execution HTTP attribution and baseline phase decomposition are not
+  established by these traces. First-call observations do not prove a cold OS
+  cache, and the ten-second fixture window is not default-window capacity proof.
+- Required CI, full unfiltered Rust/E2E suites, and the separate storage load lane
+  remain unrun. Six deferred deployment cases are not passing release evidence.
+  No schema migrations changed, so there is no schema/offline metadata update.
+
+Owned stack/volume/network teardown completed for all four measured runs. The
+owned PostgreSQL and RustFS correctness harnesses were also removed; the new
+reader regression currently uses a separately owned disposable PostgreSQL.
