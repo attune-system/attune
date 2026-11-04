@@ -303,6 +303,7 @@ impl CompletionTransport {
         }))
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(execution_id = self.context.execution, artifact_version = self.permit.artifact_version))]
     async fn append_shared(&self, path: &str, bytes: &[u8]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let (_, permit, effect) = WorkerDeliveryRepository::require(
@@ -407,12 +408,14 @@ impl ArtifactFileTransport for CompletionTransport {
     async fn append_log_file(&self, path: &str, bytes: &[u8]) -> Result<()> {
         self.append_shared(path, bytes).await
     }
+    #[tracing::instrument(level = "debug", skip_all, fields(execution_id = self.context.execution, artifact_version = version, sequence))]
     async fn commit_log_segment(&self, version: i64, sequence: i64, bytes: &[u8]) -> Result<()> {
         self.api.commit_log_segment(version, sequence, bytes).await
     }
     async fn seal_log_stream(&self, version: i64, truncated: bool) -> Result<()> {
         self.api.seal_log_stream(version, truncated).await
     }
+    #[tracing::instrument(level = "debug", skip_all, fields(execution_id = self.context.execution, artifact_version = version))]
     async fn seal_log_stream_with_manifest(
         &self,
         version: i64,

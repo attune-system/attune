@@ -2045,7 +2045,12 @@ struct SealLogQuery {
     truncated: bool,
 }
 
-#[tracing::instrument(name = "log_stream_seal", level = "debug", skip_all)]
+#[tracing::instrument(
+    name = "log_stream_seal",
+    level = "debug",
+    skip_all,
+    fields(artifact_version)
+)]
 async fn seal_log_stream(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -2053,6 +2058,7 @@ async fn seal_log_stream(
     Query(query): Query<SealLogQuery>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    tracing::Span::current().record("artifact_version", artifact_version);
     let version = authorize_seal_log_version(&state, &user, artifact_version).await?;
     let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
         .await
