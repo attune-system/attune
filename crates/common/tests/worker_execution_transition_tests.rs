@@ -78,6 +78,18 @@ async fn worker_transitions_return_the_locked_predecessor_and_reject_stale_assig
         .unwrap();
         assert_eq!(running.previous_status, ExecutionStatus::Scheduled);
         assert!(running.execution.started_at.is_some());
+        assert!(
+            ExecutionRepository::transition_worker(
+                db.pool(),
+                execution.id,
+                Some(worker),
+                ExecutionStatus::Running,
+                None
+            )
+            .await
+            .is_err(),
+            "a duplicate delivery must not start the process twice"
+        );
         ExecutionRepository::update(
             db.pool(),
             execution.id,

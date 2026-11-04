@@ -1525,7 +1525,10 @@ impl WorkerService {
                             let cancel_token = CancellationToken::new();
                             {
                                 let mut tokens = cancel_tokens.lock().await;
-                                tokens.insert(execution_id, cancel_token.clone());
+                                if !register_execution_cancel_token(&mut tokens, execution_id, cancel_token.clone()) {
+                                    info!(execution_id, "Ignoring duplicate delivery for an in-flight execution");
+                                    return Ok(());
+                                }
                             }
                             {
                                 let pending = pending_cancellations.lock().await;
@@ -1939,6 +1942,19 @@ impl WorkerService {
         );
 
         Ok(())
+    }
+}
+
+fn register_execution_cancel_token(
+    tokens: &mut HashMap<i64, CancellationToken>,
+    execution_id: i64,
+    token: CancellationToken,
+) -> bool {
+    if let std::collections::hash_map::Entry::Vacant(entry) = tokens.entry(execution_id) {
+        entry.insert(token);
+        true
+    } else {
+        false
     }
 }
 
@@ -2600,6 +2616,26 @@ mod tests {
         let mut execution = persisted_execution(ExecutionStatus::Failed);
         execution.action = None;
         assert!(execution_completion_payload(&execution).is_err());
+    }
+
+    #[test]
+    fn duplicate_delivery_preserves_the_original_cancellation_token() {
+        let mut tokens = HashMap::new();
+        let original = CancellationToken::new();
+        let duplicate = CancellationToken::new();
+        assert!(register_execution_cancel_token(
+            &mut tokens,
+            42,
+            original.clone()
+        ));
+        assert!(!register_execution_cancel_token(
+            &mut tokens,
+            42,
+            duplicate.clone()
+        ));
+        tokens.get(&42).unwrap().cancel();
+        assert!(original.is_cancelled());
+        assert!(!duplicate.is_cancelled());
     }
 
     #[test]

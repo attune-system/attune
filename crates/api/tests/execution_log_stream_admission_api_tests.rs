@@ -28,10 +28,7 @@ async fn stream_fixture_kind(ctx: &TestContext, sensitive: bool) -> Result<(i64,
     let action_ref = format!("{}.tail", pack.r#ref);
     let action = create_test_action(&ctx.pool, pack.id, &pack.r#ref, &action_ref).await?;
     if sensitive {
-        use attune_common::repositories::{
-            action::{ActionRepository, UpdateActionInput},
-            Update,
-        };
+        use attune_common::repositories::action::{ActionRepository, UpdateActionInput};
         ActionRepository::update(
             &ctx.pool,
             action.id,

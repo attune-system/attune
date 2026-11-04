@@ -483,13 +483,7 @@ impl ActionExecutor {
             Ok(action) => action,
             Err(error) => {
                 let transition = self
-                    .handle_execution_failure(
-                        execution_id,
-                        None,
-                        None,
-                        Some("Failed to load pinned action"),
-                        None,
-                    )
+                    .fail_before_preparation(execution_id, "Failed to load pinned action")
                     .await?;
                 return Ok(ExecutionOutcome {
                     transition,
@@ -500,7 +494,21 @@ impl ActionExecutor {
 
         let preparation_started = std::time::Instant::now();
         let mut preparation = ExecutionPreparation {
-            binding: self.schema_binding(execution_id).await?,
+            binding: match self.schema_binding(execution_id).await {
+                Ok(binding) => binding,
+                Err(error) => {
+                    let transition = self
+                        .fail_before_preparation(
+                            execution_id,
+                            "Execution schema binding unavailable",
+                        )
+                        .await?;
+                    return Ok(ExecutionOutcome {
+                        transition,
+                        result: Err(error),
+                    });
+                }
+            },
             parameter_secret_paths: None,
             stdout_path: Arc::new(OnceLock::new()),
             stderr_path: Arc::new(OnceLock::new()),
@@ -654,6 +662,24 @@ impl ActionExecutor {
             transition,
             result: Ok(result),
         })
+    }
+
+    /// No parameters were restored and no code was launched at this point.
+    /// Persist only a fixed diagnostic: there is no usable contract for safely
+    /// including arbitrary action/schema errors or earlier attempt output.
+    async fn fail_before_preparation(
+        &self,
+        execution_id: i64,
+        message: &'static str,
+    ) -> Result<ExecutionTransition> {
+        ExecutionRepository::transition_worker(
+            &self.pool,
+            execution_id,
+            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            ExecutionStatus::Failed,
+            Some(serde_json::json!({"succeeded":false,"error":message})),
+        )
+        .await
     }
 
     /// Load action from database using execution data
@@ -1562,6 +1588,7 @@ impl ActionExecutor {
                 self.mirror_runtime_stdout_to_stdio && !sensitive_inputs,
                 self.mirror_runtime_stderr_to_stdio && !sensitive_inputs,
             );
+        let execution = Arc::new(execution.clone());
         let make_writer = |stream: ExecutionLogArtifactStream,
                            mirror_source: Option<
             attune_common::runtime_log_mirror::RuntimeLogSource,
