@@ -570,6 +570,8 @@ impl TestContext {
     #[allow(dead_code)] // This shared helper is compiled by tests that use Drop recovery only.
     pub async fn cleanup(mut self) -> Result<()> {
         self.app = axum::Router::new();
+        self.state.execution_log_streams.begin_shutdown();
+        self.state.execution_log_streams.drain_releases().await;
         self.state
             .file_transfers
             .drain(std::time::Duration::from_secs(1))

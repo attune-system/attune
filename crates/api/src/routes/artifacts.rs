@@ -4293,7 +4293,8 @@ pub async fn stream_artifact(
     };
 
     ensure_selected_version_id(&selector, &ver)?;
-    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
+    // The typed live-log pin performs complete selected-version disclosure,
+    // including reauthorization when sealing races pending discovery.
     if user.claims.token_type == TokenType::Access
         && ver
             .meta
@@ -4302,9 +4303,17 @@ pub async fn stream_artifact(
             .and_then(serde_json::Value::as_str)
             == Some(attune_common::runtime_read_log::ENCODING)
     {
-        let pin = crate::live_logs::LogPin::select(&state, &user, ver).await?;
+        let pin = crate::live_logs::LogPin::select(&state, &user, ver)
+            .await
+            .map_err(|error| {
+                crate::artifact_reads::mask_detail_denial(
+                    error,
+                    format!("Artifact with ID {} not found", id),
+                )
+            })?;
         return Ok(verified_body_sse(pin.response(state, user).await?));
     }
+    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
     if protected_log_marker(&ver) {
         return Ok(verified_body_sse(
             download_human_encrypted_log(state, user, artifact, ver).await?,

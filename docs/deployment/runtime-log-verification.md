@@ -336,6 +336,25 @@ persisted/MQ status agreement. Recorded/encrypted authority cases remain in the
 repository/API and versioned-storage correctness suites; a default rollout-mode
 benchmark does not replace those security checks.
 
+Attach the companion functional checks to the owned stack left running with
+`--no-teardown`:
+
+```bash
+bash scripts/run-integration-tests.sh --no-build --no-startup --no-teardown \
+  -k 'test_worker_log_stream_discovered_after_subscription or test_worker_managed_retry_completion or test_worker_managed_queue_completion'
+```
+
+Collect the traces and tear down that same owned project afterward. For a fresh
+functional run, choose a new run/project identity and omit `--no-startup`.
+
+The subscription checks hold output behind an owned HTTP gate, subscribe before
+allocation, then verify delivery, EOF, reconnects and empty stderr. Published
+release fixtures verify native retry lineage and queue acknowledgement. Action
+API selections stay empty; these tests do not enable coordinated credential
+readiness or repair absent ad hoc admissions. The repository's lock-controlled
+reader case separately covers sealing between pending discovery and authorization
+through both execution and artifact stream entry points.
+
 ## Recover failed streams
 
 Use the metrics endpoint first:
