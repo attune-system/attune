@@ -893,10 +893,17 @@ async fn human_ad_hoc_dispatch_case(mode: attune_common::models::WorkQueueBatchM
         FindByRef,
     };
     let fixture = fixture(false).await?;
+    let mut activation = fixture.ctx.pool.begin().await?;
+    RuntimeAuthorityRepository::activate_policy(&mut activation, fixture.policy_id).await?;
+    activation.commit().await?;
     let registered = fixture.ctx.post("/auth/register", json!({
         "login":"ad-hoc-queue-human", "password":"TestPassword123!", "display_name":"Queue requester"
     }), None).await?;
-    assert_eq!(registered.status(), StatusCode::CREATED);
+    assert!(
+        registered.status().is_success(),
+        "{}",
+        registered.text().await?
+    );
     let body: Value = registered.json().await?;
     let token = body["data"]["access_token"].as_str().unwrap();
     let human = IdentityRepository::find_by_login(&fixture.ctx.pool, "ad-hoc-queue-human")
@@ -930,7 +937,7 @@ async fn human_ad_hoc_dispatch_case(mode: attune_common::models::WorkQueueBatchM
     let queue = WorkQueueRepository::create(
         &fixture.ctx.pool,
         CreateWorkQueueInput {
-            r#ref: "fixture.human_ad_hoc".into(),
+            r#ref: "recorded_emitter.human_ad_hoc".into(),
             pack: Some(fixture.pack_id),
             pack_ref: Some("recorded_emitter".into()),
             is_adhoc: true,
@@ -978,6 +985,20 @@ async fn human_ad_hoc_dispatch_case(mode: attune_common::models::WorkQueueBatchM
         CreatePermissionAssignmentInput {
             identity: human.id,
             permset: execute.id,
+        },
+    )
+    .await?;
+    // The policy deliberately retains definitions independently of current IAM.
+    // Seed its name in IAM too, so this rejection proves lack of delegation.
+    PermissionSetRepository::create(
+        &fixture.ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "recorded_emitter.events".into(),
+            pack: Some(fixture.pack_id),
+            pack_ref: Some("recorded_emitter".into()),
+            label: None,
+            description: None,
+            grants: json!([{"resource":"events","actions":["create"]}]),
         },
     )
     .await?;
