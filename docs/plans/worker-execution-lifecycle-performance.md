@@ -244,3 +244,28 @@ they do not establish database/MQ lifecycle or performance acceptance.
   integration behavior. The API all-targets check and ordinary-file test are
   ongoing. Full lifecycle/storage/security tests and measurements remain pending.
 - Warm release verification and seal-path query reuse remain unimplemented.
+
+### Warm release and seal checkpoint (work in progress)
+
+- Warm Unix release verification reuses a bounded, per-transport file-identity
+  proof; mutations and replacements force rehashing. Hashing streams in bounded
+  buffers off Tokio threads. Non-Unix consumers retain full verification. The
+  storage trust/invalidation contract is documented in
+  `docs/deployment/pack-candidate-distribution.md`.
+- Sealing reuses the already-authorized worker context and permit for encrypted
+  proof, shared-file limits and operation bounds. Version/stream rows remain
+  locked continuously across storage verification, so the duplicate locked reads
+  and second active-upload lookup were removed. Final deadline checks remain.
+- Added route-level tests for normal/protected empty streams, failed/unknown
+  capture, terminal statuses and offsets. Added a statement-trigger regression
+  that rejects any admission/attempt INSERT during existing-binding validation.
+- All five volume-transport tests and all five manifest/capture-marker tests
+  passed. The five existing recorded-worker tests passed (including stale owner,
+  terminal delivery and admission revocation). The new trigger regression and
+  API reader/seal tests are pending. The ordinary zero-byte file regression passed.
+- API/worker all-targets validation passed for the prior lifecycle checkpoint.
+  Subsequent seal changes still need the queued compiler/Clippy/integration runs.
+- The existing frontend artifact test suite failed with Node 26's global
+  `localStorage` unavailable. Its source/dependencies are unchanged by this task;
+  baseline reproduction and an invocation using `--no-experimental-webstorage`
+  are in progress. No frontend behavior change is being made for that issue.

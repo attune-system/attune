@@ -231,6 +231,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_stream_requires_terminal_positive_capture_evidence() {
+        use crate::models::ExecutionStatus;
+        let mut execution: crate::models::Execution = serde_json::from_value(serde_json::json!({
+            "id": 1, "action_ref": "core.echo", "status": "completed", "permission_set_refs": [],
+            "retry_count": 0, "created": "2026-11-04T00:00:00Z", "updated": "2026-11-04T00:00:01Z",
+            "result": {"runtime_log_capture":{"stdout":"empty", "stderr":"captured"}}
+        }))
+        .unwrap();
+        assert!(execution_stream_is_empty(&execution, "stdout"));
+        assert!(!execution_stream_is_empty(&execution, "stderr"));
+        assert!(!execution_stream_is_empty(&execution, "other"));
+        for status in [
+            ExecutionStatus::Running,
+            ExecutionStatus::Canceling,
+            ExecutionStatus::Abandoned,
+        ] {
+            execution.status = status;
+            assert!(!execution_stream_is_empty(&execution, "stdout"));
+        }
+        execution.status = ExecutionStatus::Failed;
+        execution.result.as_mut().unwrap()["logs_incomplete"] = serde_json::json!(true);
+        assert!(!execution_stream_is_empty(&execution, "stdout"));
+        execution.result = Some(serde_json::json!({}));
+        assert!(!execution_stream_is_empty(&execution, "stdout"));
+    }
+
+    #[test]
     fn zero_plaintext_nonzero_empty_frames_require_exact_manifest() {
         let key = "empty-frame-manifest-key-at-least-32-bytes";
         let zero = FrameTotals::default().manifest(1, 2).unwrap();

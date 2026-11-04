@@ -409,3 +409,33 @@ async fn worker_rechecks_terminal_and_explicit_admission_revocation() {
         .is_err());
     fixture.db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn existing_authority_validation_never_replays_admission_or_attempt_inserts() {
+    let fixture = fixture(true).await;
+    // Statement triggers also reject INSERT ... ON CONFLICT DO NOTHING. Counts
+    // alone would miss the redundant creation work this path used to replay.
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_recreated_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'existing validation attempted an admission insert'; END $$;
+         CREATE TRIGGER reject_admission_insert BEFORE INSERT ON runtime_authority_admission
+         FOR EACH STATEMENT EXECUTE FUNCTION reject_recreated_admission();
+         CREATE TRIGGER reject_attempt_insert BEFORE INSERT ON runtime_authority_execution_attempt
+         FOR EACH STATEMENT EXECUTE FUNCTION reject_recreated_admission();
+         CREATE TRIGGER reject_fence_insert BEFORE INSERT ON runtime_authority_execution_fence
+         FOR EACH STATEMENT EXECUTE FUNCTION reject_recreated_admission();",
+    )
+    .execute(&fixture.db)
+    .await
+    .unwrap();
+    let mut tx = fixture.db.begin().await.unwrap();
+    for _ in 0..2 {
+        let record = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::require(
+            &mut tx,
+            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(fixture.execution),
+        ).await.unwrap();
+        assert_eq!(record.id, fixture.admission);
+    }
+    tx.rollback().await.unwrap();
+    fixture.db.cleanup().await.unwrap();
+}
