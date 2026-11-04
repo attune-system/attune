@@ -146,7 +146,9 @@ async fn register_queue_admin(ctx: &TestContext) -> String {
         &format!("queue_admin_{}", uuid::Uuid::new_v4().simple()),
         json!([
             {"resource": "queues", "actions": ["read", "create", "update", "delete"]},
-            {"resource": "queue_items", "actions": ["read", "create", "update", "delete"]}
+            {"resource": "queue_items", "actions": ["read", "create", "update", "delete"]},
+            // Human acceptance through an ad hoc queue also invokes its target action.
+            {"resource": "actions", "actions": ["execute"]}
         ]),
     )
     .await
