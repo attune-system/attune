@@ -523,9 +523,9 @@ impl ExecutionAdmissionRepository {
             let mut next_fence =
                 RuntimeAuthorityRepository::selected_effect_fence(connection, &authority).await?;
             if queue.is_adhoc {
-                next_fence = next_fence.intersect(
-                    &super::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::source_effect_fence(connection, item.id).await?,
-                );
+                if let Some(source) = super::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::source_effect_fence(connection, item.id).await? {
+                    next_fence = next_fence.intersect(&source);
+                }
             }
             effect_fence = Some(match effect_fence {
                 Some(fence) => fence.intersect(&next_fence),
@@ -562,6 +562,9 @@ impl ExecutionAdmissionRepository {
             }
             Self::check_policy_snapshot(connection, &authority, snapshot).await?;
             match &authority.attribution {
+                RequestAttribution::Human { actor } if queue.is_adhoc => {
+                    attribution.insert(item.id, Some(actor.clone()));
+                }
                 RequestAttribution::ParentExecution { .. } if queue.is_adhoc => {
                     // The retained accepted-item manifest keeps the actual
                     // source execution admission and its historical attribution.
@@ -607,7 +610,10 @@ impl ExecutionAdmissionRepository {
         }
         let mut authority = selected.ok_or_else(|| Error::validation("Queue batch is empty"))?;
         authority.attempt = Uuid::new_v4();
-        if !queue.is_adhoc || queue.batch_mode == crate::models::WorkQueueBatchMode::Batch {
+        if !queue.is_adhoc
+            || queue.batch_mode == crate::models::WorkQueueBatchMode::Batch
+            || matches!(authority.attribution, RequestAttribution::Human { .. })
+        {
             authority.attribution = RequestAttribution::QueueBatch {
                 queue_ref: queue.r#ref.clone(),
                 items: attribution,

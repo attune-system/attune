@@ -894,7 +894,10 @@ impl WorkQueueDispatcher {
             initial_admission = Some(record.id);
             attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_queue_execution(&mut tx, execution.id, &items.iter().map(|item| item.id).collect::<Vec<_>>()).await?;
             if accepted_queue.is_some()
-                && queue.batch_mode == attune_common::models::WorkQueueBatchMode::Batch
+                && matches!(
+                    admission.authority().attribution,
+                    attune_common::runtime_authority::RequestAttribution::QueueBatch { .. }
+                )
             {
                 // record_admission permits only this newly staged record to be
                 // unsealed. Seal ALL accepted contributors and independent source

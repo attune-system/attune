@@ -1888,8 +1888,46 @@ async fn enqueue_queue_item_in_transaction(
         )
         .await?
     };
-    let snapshot = if recorded_ad_hoc {
-        recorded::dispatch_target(connection, user, snapshot.executable.action.id).await?;
+    let human_ad_hoc = queue.is_adhoc
+        && !snapshot.executable.action.is_adhoc
+        && user.claims.token_type == TokenType::Access;
+    if queue.is_adhoc && !snapshot.executable.action.is_adhoc && !recorded_ad_hoc && !human_ad_hoc {
+        return Err(ApiError::Forbidden("Published-action queue dispatch requires an access token or a recorded execution admission".into()));
+    }
+    let snapshot = if recorded_ad_hoc || human_ad_hoc {
+        if recorded_ad_hoc {
+            recorded::dispatch_target(connection, user, snapshot.executable.action.id).await?;
+        } else {
+            let identity = requested_by_identity
+                .ok_or_else(|| ApiError::Unauthorized("Item requester unavailable".into()))?;
+            let action = &snapshot.executable.action;
+            let mut context = AuthorizationContext::new(identity);
+            context.target_id = Some(action.id);
+            context.target_ref = Some(action.r#ref.clone());
+            context.pack_ref = Some(action.pack_ref.clone());
+            state
+                .authorization_service()
+                .authorize_access_fresh(
+                    connection,
+                    user,
+                    AuthorizationCheck {
+                        resource: Resource::Actions,
+                        action: RbacAction::Execute,
+                        context,
+                    },
+                )
+                .await?;
+            let refs = queue
+                .permission_set_refs
+                .as_deref()
+                .unwrap_or(&action.default_execution_permission_set_refs);
+            attune_common::delegation::require_execution_refs_for_share(
+                connection,
+                Some(identity),
+                refs,
+            )
+            .await?;
+        }
         attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(connection,
             snapshot.executable.action.pack,
             attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Action, snapshot.executable.action.id),
@@ -1937,15 +1975,28 @@ async fn enqueue_queue_item_in_transaction(
         &binding,
     )
     .await?;
-    if recorded_ad_hoc {
-        let parent = requested_by_execution.ok_or_else(|| {
-            ApiError::Forbidden("Recorded item source execution unavailable".into())
-        })?;
+    if recorded_ad_hoc || human_ad_hoc {
+        use attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource;
+        let source = if recorded_ad_hoc {
+            AdHocQueueSource::Execution(requested_by_execution.ok_or_else(|| {
+                ApiError::Forbidden("Recorded item source execution unavailable".into())
+            })?)
+        } else {
+            AdHocQueueSource::Human(attune_common::runtime_authority::HumanAttribution {
+                identity_id: requested_by_identity
+                    .ok_or_else(|| ApiError::Unauthorized("Item requester unavailable".into()))?,
+                login: user.login().to_string(),
+            })
+        };
         attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::accept(
-            connection, queue, &item, parent, &snapshot,
+            connection, queue, &item, source, &snapshot,
         )
         .await?;
-        attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(connection, "execution", parent, "queue_item", item.id).await?;
+        if recorded_ad_hoc {
+            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(connection, "execution", requested_by_execution.ok_or_else(|| ApiError::Forbidden("Recorded item source execution unavailable".into()))?, "queue_item", item.id).await?;
+        } else {
+            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_human(connection, "queue_item", item.id, requested_by_identity.ok_or_else(|| ApiError::Unauthorized("Item requester unavailable".into()))?).await?;
+        }
     } else if !queue.is_adhoc {
         let actor = requested_by_identity
             .filter(|_| user.claims.token_type == TokenType::Access)

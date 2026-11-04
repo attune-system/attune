@@ -868,6 +868,231 @@ async fn recorded_ad_hoc_batch_seals_every_independent_source_before_authority_u
     ad_hoc_literal_dispatch_case(attune_common::models::WorkQueueBatchMode::Batch).await
 }
 
+#[tokio::test]
+async fn human_ad_hoc_single_dispatch_retains_action_admission_and_requester() -> Result<()> {
+    human_ad_hoc_dispatch_case(attune_common::models::WorkQueueBatchMode::Single).await
+}
+
+#[tokio::test]
+async fn human_ad_hoc_batch_dispatch_retains_action_admission_and_requesters() -> Result<()> {
+    human_ad_hoc_dispatch_case(attune_common::models::WorkQueueBatchMode::Batch).await
+}
+
+async fn human_ad_hoc_dispatch_case(mode: attune_common::models::WorkQueueBatchMode) -> Result<()> {
+    use attune_common::repositories::{
+        accepted_batch_dependency::AcceptedBatchDependencyRepository as Batches,
+        action::{ActionRepository, UpdateActionInput},
+        ad_hoc_queue_admission::AdHocQueueAdmissionRepository as AdHoc,
+        execution_runtime_admission::ExecutionAdmissionRepository as Admissions,
+        identity::{
+            CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            PermissionAssignmentRepository, PermissionSetRepository,
+        },
+        recorded_input_authority::RecordedInputAuthorityRepository as Inputs,
+        work_queue::{CreateWorkQueueInput, WorkQueueItemRepository, WorkQueueRepository},
+        FindByRef,
+    };
+    let fixture = fixture(false).await?;
+    let registered = fixture.ctx.post("/auth/register", json!({
+        "login":"ad-hoc-queue-human", "password":"TestPassword123!", "display_name":"Queue requester"
+    }), None).await?;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let body: Value = registered.json().await?;
+    let token = body["data"]["access_token"].as_str().unwrap();
+    let human = IdentityRepository::find_by_login(&fixture.ctx.pool, "ad-hoc-queue-human")
+        .await?
+        .unwrap();
+    // This test owns the new account and removes its automatic baseline grants
+    // to prove that queue-item permission alone cannot invoke a managed action.
+    sqlx::query("DELETE FROM permission_assignment WHERE identity=$1")
+        .bind(human.id)
+        .execute(&fixture.ctx.pool)
+        .await?;
+    sqlx::query("DELETE FROM identity_role_assignment WHERE identity=$1")
+        .bind(human.id)
+        .execute(&fixture.ctx.pool)
+        .await?;
+    let items_grant = PermissionSetRepository::create(&fixture.ctx.pool, CreatePermissionSetInput {
+        r#ref:"fixture.human_queue_items".into(), pack:None, pack_ref:None, label:None, description:None,
+        grants:json!([{"resource":"queue_items","actions":["read","create"]},{"resource":"queues","actions":["read"]}]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &fixture.ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: human.id,
+            permset: items_grant.id,
+        },
+    )
+    .await?;
+    let action = ActionRepository::find_by_ref(&fixture.ctx.pool, "recorded_emitter.emit")
+        .await?
+        .unwrap();
+    let queue = WorkQueueRepository::create(
+        &fixture.ctx.pool,
+        CreateWorkQueueInput {
+            r#ref: "fixture.human_ad_hoc".into(),
+            pack: Some(fixture.pack_id),
+            pack_ref: Some("recorded_emitter".into()),
+            is_adhoc: true,
+            label: "Human ad hoc queue".into(),
+            description: None,
+            enabled: true,
+            accepting_new_items: true,
+            dispatch_action: Some(action.id),
+            dispatch_action_ref: action.r#ref.clone(),
+            default_priority: 0,
+            allow_pending_update: true,
+            update_strategy: attune_common::models::WorkQueueUpdateStrategy::Replace,
+            batch_mode: mode,
+            item_schema: json!({"message":{"type":"string"}}),
+            action_params: json!({}),
+            trace_tag_template: None,
+            permission_set_refs: Some(vec![]),
+            config: json!({}),
+            reference_visibility: Default::default(),
+            reference_allowed_pack_refs: vec![],
+        },
+    )
+    .await?;
+    let endpoint = format!("/api/v1/queues/{}/items", queue.r#ref);
+    let denied = fixture
+        .ctx
+        .post(
+            &endpoint,
+            json!({"payload":{"message":"denied"}}),
+            Some(token),
+        )
+        .await?;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        denied.text().await?
+    );
+    let execute = PermissionSetRepository::create(&fixture.ctx.pool, CreatePermissionSetInput {
+        r#ref:"fixture.human_queue_execute".into(), pack:None, pack_ref:None, label:None, description:None,
+        grants:json!([{"resource":"actions","actions":["execute"],"constraints":{"refs":[action.r#ref.clone()]}}]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &fixture.ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: human.id,
+            permset: execute.id,
+        },
+    )
+    .await?;
+    for index in 0..if mode == attune_common::models::WorkQueueBatchMode::Single {
+        1
+    } else {
+        2
+    } {
+        let response = fixture
+            .ctx
+            .post(
+                &endpoint,
+                json!({"payload":{"message":format!("item {index}")}}),
+                Some(token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "{}",
+            response.text().await?
+        );
+    }
+    IdentityRepository::update(
+        &fixture.ctx.pool,
+        human.id,
+        UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(IdentityRepository::delete(&fixture.ctx.pool, human.id).await?);
+    ActionRepository::update(
+        &fixture.ctx.pool,
+        action.id,
+        UpdateActionInput {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let items = WorkQueueItemRepository::search_with_conn(
+        &mut tx,
+        &attune_common::repositories::work_queue::WorkQueueItemSearchFilters {
+            queue: Some(queue.id),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await?
+    .rows;
+    let pinned = AdHoc::template(&mut tx, &queue, &items).await?.unwrap();
+    assert!(pinned.is_adhoc);
+    let snapshot = serde_json::from_value(items[0].executable_snapshot.clone().unwrap())?;
+    let selected = Admissions::queue_batch(&mut tx, &pinned, &items, &snapshot).await?;
+    let expected_actors = items
+        .iter()
+        .map(|item| {
+            (
+                item.id,
+                Some(attune_common::runtime_authority::HumanAttribution {
+                    identity_id: human.id,
+                    login: human.login.clone(),
+                }),
+            )
+        })
+        .collect();
+    assert_eq!(
+        selected.authority().attribution,
+        RequestAttribution::QueueBatch {
+            queue_ref: queue.r#ref.clone(),
+            items: expected_actors
+        }
+    );
+    let dispatch = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            config: Some(json!({})),
+            status: ExecutionStatus::Requested,
+            permission_set_refs: vec![],
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?;
+    let admission = selected
+        .attach(&mut tx, RuntimeOwner::Execution(dispatch.id))
+        .await?;
+    let ids: Vec<_> = items.iter().map(|item| item.id).collect();
+    Inputs::capture_queue_execution(&mut tx, dispatch.id, &ids).await?;
+    Batches::capture(&mut tx, admission.id, &ids).await?;
+    RuntimeAuthorityRepository::retained_admission_fence(&mut tx, admission.id).await?;
+    let proofs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM runtime_accepted_batch_item WHERE admission=$1")
+            .bind(admission.id)
+            .fetch_one(&mut *tx)
+            .await?;
+    assert_eq!(proofs, ids.len() as i64);
+    let sources: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_accepted_batch_item WHERE admission=$1 AND source_admission IS NOT NULL").bind(admission.id).fetch_one(&mut *tx).await?;
+    assert_eq!(
+        sources, 0,
+        "human acceptance must not invent execution lineage"
+    );
+    RuntimeAuthorityRepository::revoke_policy(&mut tx, selected.authority().policy_id).await?;
+    assert!(Admissions::queue_batch(&mut tx, &pinned, &items, &snapshot)
+        .await
+        .is_err());
+    tx.rollback().await?;
+    fixture.ctx.cleanup().await
+}
+
 async fn ad_hoc_literal_dispatch_case(
     mode: attune_common::models::WorkQueueBatchMode,
 ) -> Result<()> {
