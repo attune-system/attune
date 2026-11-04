@@ -2053,7 +2053,7 @@ async fn seal_log_stream(
     Query(query): Query<SealLogQuery>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let version = authorize_log_version(&state, &user, artifact_version).await?;
+    let version = authorize_seal_log_version(&state, &user, artifact_version).await?;
     let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
         .await
         .map_err(map_repository_error)?
@@ -2561,6 +2561,47 @@ fn validate_log_snapshot(
         ));
     }
     Ok(())
+}
+
+/// Structural path validation is not an authority grant. Purpose-specific worker
+/// seals acquire their source fence once, in the actual sealing transaction,
+/// before any version/file effects. Other credential types keep their preflight.
+async fn authorize_seal_log_version(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    artifact_version: i64,
+) -> Result<attune_common::models::artifact_version::ArtifactVersion, (StatusCode, String)> {
+    let Some(credential) =
+        attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
+    else {
+        return authorize_log_version(state, user, artifact_version).await;
+    };
+    if credential.version != artifact_version {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Worker delivery version mismatch".into(),
+        ));
+    }
+    let version = ArtifactVersionRepository::find_by_id(&state.db, artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact version not found".into()))?;
+    let path = version.file_path.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Log artifact version has no authorization path".into(),
+        )
+    })?;
+    let bound = validate_file_path_binding(state, path)
+        .await?
+        .ok_or_else(|| (StatusCode::FORBIDDEN, "Worker log path unavailable".into()))?;
+    if bound.id != version.id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Worker log path binding changed".into(),
+        ));
+    }
+    Ok(version)
 }
 
 async fn authorize_log_version(
@@ -4326,43 +4367,50 @@ fn map_pack_archive_repository_error(error: attune_common::error::Error) -> (Sta
     )
 }
 
+async fn validate_file_path_binding(
+    state: &Arc<AppState>,
+    file_path: &str,
+) -> Result<Option<attune_common::models::artifact_version::ArtifactVersion>, (StatusCode, String)>
+{
+    ValidatedRelativePath::new(file_path).map_err(map_transport_error)?;
+    let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
+    let version = ArtifactVersionRepository::find_unique_by_file_path(&mut *conn, file_path)
+        .await
+        .map_err(map_repository_error)?;
+    let guarded = attune_common::repositories::file_origin::FileOriginRepository::guarded_path(
+        &mut conn, file_path,
+    )
+    .await
+    .map_err(map_transport_error)?;
+    if (file_path.starts_with("files/versions/") && version.is_none())
+        || (guarded
+            && match version.as_ref() {
+                Some(version) => {
+                    attune_common::repositories::file_origin::FileOriginRepository::find(
+                        &mut conn, version.id,
+                    )
+                    .await
+                    .map_err(map_transport_error)?
+                    .is_none()
+                }
+                None => true,
+            })
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Version staging has no live source binding".into(),
+        ));
+    }
+    Ok(version)
+}
+
 async fn authorize_file_transfer(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     file_path: &str,
     operation: FileOperation,
 ) -> Result<(), (StatusCode, String)> {
-    ValidatedRelativePath::new(file_path).map_err(map_transport_error)?;
-    {
-        let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
-        let version = ArtifactVersionRepository::find_unique_by_file_path(&mut *conn, file_path)
-            .await
-            .map_err(map_repository_error)?;
-        let guarded = attune_common::repositories::file_origin::FileOriginRepository::guarded_path(
-            &mut conn, file_path,
-        )
-        .await
-        .map_err(map_transport_error)?;
-        if (file_path.starts_with("files/versions/") && version.is_none())
-            || (guarded
-                && match version.as_ref() {
-                    Some(version) => {
-                        attune_common::repositories::file_origin::FileOriginRepository::find(
-                            &mut conn, version.id,
-                        )
-                        .await
-                        .map_err(map_transport_error)?
-                        .is_none()
-                    }
-                    None => true,
-                })
-        {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Version staging has no live source binding".into(),
-            ));
-        }
-    }
+    validate_file_path_binding(state, file_path).await?;
 
     if operation == FileOperation::Mutate
         && !crate::recorded_consumers::is_recorded(user).map_err(map_api_error)?
