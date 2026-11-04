@@ -5,6 +5,30 @@ use crate::{runtime_read_log, Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Positive evidence of intentional silence, recorded only after worker capture
+/// settled. Missing metadata (including crash/supervisor settlement) is unknown.
+/// Callers still authorize execution visibility before interpreting this marker.
+pub fn execution_stream_is_empty(execution: &crate::models::Execution, stream: &str) -> bool {
+    matches!(
+        execution.status,
+        crate::models::ExecutionStatus::Completed
+            | crate::models::ExecutionStatus::Failed
+            | crate::models::ExecutionStatus::Cancelled
+            | crate::models::ExecutionStatus::Timeout
+    ) && matches!(stream, "stdout" | "stderr")
+        && execution.result.as_ref().is_some_and(|result| {
+            result
+                .get("logs_incomplete")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+                && result
+                    .get("runtime_log_capture")
+                    .and_then(|capture| capture.get(stream))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("empty")
+        })
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalLogManifest {

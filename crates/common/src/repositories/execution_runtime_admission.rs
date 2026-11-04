@@ -1131,11 +1131,17 @@ impl ExecutionAdmissionRepository {
         connection: &mut PgConnection,
         owner: RuntimeOwner,
     ) -> Result<RuntimeAdmissionRecord> {
-        let record = Self::find(connection, owner).await?.ok_or_else(|| {
-            Error::PermissionDenied("Recorded invocation authority is unavailable".into())
-        })?;
-        // Reuse the canonical lock/digest/sponsor/approval/revocation fence.
-        RuntimeAuthorityRepository::record_admission(connection, owner, &record.authority).await
+        Ok(Self::require_with_fence(connection, owner).await?.0)
+    }
+
+    pub async fn require_with_fence(
+        connection: &mut PgConnection,
+        owner: RuntimeOwner,
+    ) -> Result<(
+        RuntimeAdmissionRecord,
+        super::runtime_authority::ApprovalEffectFence,
+    )> {
+        RuntimeAuthorityRepository::require_existing_admission(connection, owner).await
     }
 
     /// Native effects under the executing action's nonempty selection use its

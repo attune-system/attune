@@ -2804,6 +2804,10 @@ pub async fn stream_execution_log(
     }
     let stream_state = Arc::clone(&state);
 
+    let empty_stream_name = match stream_name {
+        ExecutionLogStream::Stdout => "stdout",
+        ExecutionLogStream::Stderr => "stderr",
+    };
     let initial_state = ExecutionLogTailState::WaitingForStream {
         execution_id: id,
         terminal_since: None,
@@ -2869,8 +2873,27 @@ pub async fn stream_execution_log(
                             ))
                         }
                         Ok(None) => {
-                            let terminal =
-                                execution_log_execution_terminal(&stream_state, execution_id).await;
+                            let (terminal, empty) = execution_log_terminal_state(
+                                &stream_state,
+                                execution_id,
+                                empty_stream_name,
+                            )
+                            .await;
+                            if empty {
+                                let event = if start_offset == 0 {
+                                    Event::default()
+                                        .id("0")
+                                        .event("done")
+                                        .data("Log stream is empty")
+                                } else {
+                                    execution_log_error_event(
+                                        "offset_beyond_end",
+                                        "Log cursor is beyond the empty stream",
+                                        false,
+                                    )
+                                };
+                                return Some((Ok(event), ExecutionLogTailState::Finished));
+                            }
                             let now = tokio::time::Instant::now();
                             let (terminal_since, expired) =
                                 advance_terminal_grace(terminal, terminal_since, now);
@@ -3307,21 +3330,35 @@ fn execution_log_is_complete(sealed: bool, cursor: u64, total_bytes: u64) -> boo
 }
 
 async fn execution_log_execution_terminal(state: &AppState, execution_id: i64) -> bool {
+    execution_log_terminal_state(state, execution_id, "")
+        .await
+        .0
+}
+
+async fn execution_log_terminal_state(
+    state: &AppState,
+    execution_id: i64,
+    stream: &str,
+) -> (bool, bool) {
     state.execution_log_streams.record_tail_database_query();
-    ExecutionRepository::find_by_id(&state.db, execution_id)
+    let execution = ExecutionRepository::find_by_id(&state.db, execution_id)
         .await
         .ok()
-        .flatten()
-        .is_some_and(|execution| {
-            matches!(
-                execution.status,
-                ExecutionStatus::Completed
-                    | ExecutionStatus::Failed
-                    | ExecutionStatus::Cancelled
-                    | ExecutionStatus::Timeout
-                    | ExecutionStatus::Abandoned
-            )
-        })
+        .flatten();
+    execution.map_or((false, false), |execution| {
+        let terminal = matches!(
+            execution.status,
+            ExecutionStatus::Completed
+                | ExecutionStatus::Failed
+                | ExecutionStatus::Cancelled
+                | ExecutionStatus::Timeout
+                | ExecutionStatus::Abandoned
+        );
+        (
+            terminal,
+            attune_common::runtime_log_completion::execution_stream_is_empty(&execution, stream),
+        )
+    })
 }
 
 fn advance_terminal_grace(

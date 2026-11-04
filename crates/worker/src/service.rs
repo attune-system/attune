@@ -26,8 +26,8 @@ use attune_common::mq::{
     PublisherConfig, RuntimeChangedPayload,
 };
 use attune_common::repositories::{
-    execution::ExecutionRepository, FindById, FindByRef, PackInstallRepository, PackRepository,
-    PackTestRepository,
+    execution::{ExecutionRepository, ExecutionTransition},
+    FindById, FindByRef, PackInstallRepository, PackRepository, PackTestRepository,
 };
 use attune_common::runtime_cache::purge_pack_runtime_environments;
 use attune_common::runtime_detection::runtime_aliases_match_filter;
@@ -1601,6 +1601,7 @@ impl WorkerService {
         envelope: MessageEnvelope<ExecutionScheduledPayload>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
+        let received_at = std::time::Instant::now();
         let execution_id = envelope.payload.execution_id;
 
         info!(
@@ -1660,40 +1661,37 @@ impl WorkerService {
                 })?;
         }
 
-        // Publish status: running
-        if let Err(e) = Self::publish_status_update(
-            &db_pool,
-            &publisher,
+        debug!(
             execution_id,
-            ExecutionStatus::Running,
-        )
-        .await
-        {
-            error!("Failed to publish running status: {}", e);
-            // Continue anyway - we'll update the database directly
+            phase = "release_materialization",
+            elapsed_us = received_at.elapsed().as_micros() as u64,
+            "Worker lifecycle phase"
+        );
+        let started = executor.start_execution(execution_id).await?;
+        if let Err(error) = Self::publish_persisted_status_update(&publisher, &started).await {
+            error!("Failed to publish running status: {}", error);
         }
 
         // Publish only persisted terminal states. The normal path reuses UPDATE
         // RETURNING; exceptional errors may need one read to discover whether a
         // terminal transition actually committed.
-        let execution = match executor
-            .execute_with_cancel_outcome(execution_id, cancel_token)
+        let transition = match executor
+            .execute_started_outcome(started.execution, cancel_token)
             .await
         {
             Ok(outcome) => {
                 if let Err(error) = outcome.result {
                     error!("Execution {} failed: {}", execution_id, error);
                 }
-                outcome.execution
+                outcome.transition
             }
             Err(error) => {
                 error!("Execution {} failed: {}", execution_id, error);
-                ExecutionRepository::find_by_id(&db_pool, execution_id)
-                    .await?
-                    .ok_or_else(|| Error::not_found("execution", "id", execution_id.to_string()))?
+                return Err(error);
             }
         };
 
+        let execution = &transition.execution;
         if !is_worker_terminal_status(execution.status) {
             return Err(Error::Internal(format!(
                 "Execution {} has no persisted terminal state after execution ({:?})",
@@ -1701,18 +1699,32 @@ impl WorkerService {
             )));
         }
 
-        if let Err(error) = Self::publish_persisted_status_update(&publisher, &execution).await {
+        let publication_started = std::time::Instant::now();
+        if let Err(error) = Self::publish_persisted_status_update(&publisher, &transition).await {
             error!(
                 "Failed to publish terminal status for execution {}: {}",
                 execution_id, error
             );
         }
-        if let Err(error) = Self::publish_completion_notification(&publisher, &execution).await {
+        if let Err(error) = Self::publish_completion_notification(&publisher, execution).await {
             error!(
                 "Failed to publish completion notification for execution {}: {}",
                 execution_id, error
             );
         }
+
+        debug!(
+            execution_id,
+            phase = "terminal_publication",
+            elapsed_us = publication_started.elapsed().as_micros() as u64,
+            "Worker lifecycle phase"
+        );
+        debug!(
+            execution_id,
+            phase = "receipt_to_publication",
+            elapsed_us = received_at.elapsed().as_micros() as u64,
+            "Worker lifecycle phase"
+        );
 
         Ok(())
     }
@@ -1886,42 +1898,15 @@ impl WorkerService {
         Ok(())
     }
 
-    /// Publish execution status update
-    async fn publish_status_update(
-        db_pool: &PgPool,
-        publisher: &Publisher,
-        execution_id: i64,
-        status: ExecutionStatus,
-    ) -> Result<()> {
-        // Fetch execution to get action_ref and previous status
-        let execution = ExecutionRepository::find_by_id(db_pool, execution_id)
-            .await?
-            .ok_or_else(|| {
-                Error::Internal(format!(
-                    "Execution {} not found for status update",
-                    execution_id
-                ))
-            })?;
-
-        let payload = execution_status_payload(&execution, status);
-
-        let message_type = MessageType::ExecutionStatusChanged;
-
-        let envelope = MessageEnvelope::new(message_type, payload).with_source("worker");
-
-        publisher
-            .publish_envelope(&envelope)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to publish status update: {}", e)))?;
-
-        Ok(())
-    }
-
     async fn publish_persisted_status_update(
         publisher: &Publisher,
-        execution: &Execution,
+        transition: &ExecutionTransition,
     ) -> Result<()> {
-        let payload = execution_status_payload(execution, execution.status);
+        let payload = execution_status_payload(
+            &transition.execution,
+            transition.previous_status,
+            transition.execution.status,
+        );
         let envelope = MessageEnvelope::new(MessageType::ExecutionStatusChanged, payload)
             .with_source("worker");
         publisher
@@ -1957,16 +1942,15 @@ impl WorkerService {
     }
 }
 
-// Keep the existing previous-status semantics until transitions return their
-// locked predecessor. A post-update row cannot establish that predecessor.
 fn execution_status_payload(
     execution: &Execution,
+    previous_status: ExecutionStatus,
     status: ExecutionStatus,
 ) -> ExecutionStatusChangedPayload {
     ExecutionStatusChangedPayload {
         execution_id: execution.id,
         action_ref: execution.action_ref.clone(),
-        previous_status: format!("{:?}", execution.status).to_lowercase(),
+        previous_status: format!("{:?}", previous_status).to_lowercase(),
         new_status: format!("{:?}", status).to_lowercase(),
         changed_at: Utc::now(),
     }
@@ -2589,9 +2573,11 @@ mod tests {
         ] {
             let execution = persisted_execution(status);
             let completed = execution_completion_payload(&execution).unwrap();
-            let changed = execution_status_payload(&execution, execution.status);
+            let changed =
+                execution_status_payload(&execution, ExecutionStatus::Running, execution.status);
             assert_eq!(completed.status, completion_status);
             assert_eq!(changed.new_status, changed_status);
+            assert_eq!(changed.previous_status, "running");
             assert_eq!(completed.result, execution.result);
             assert_eq!(completed.result.unwrap()["stdout"], "[REDACTED]");
             assert_eq!(completed.execution_id, execution.id);

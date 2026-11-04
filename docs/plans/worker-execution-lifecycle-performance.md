@@ -159,9 +159,9 @@ change; capture an unchanged baseline before claiming performance improvements.
 5. Seal-path query reduction and release verification optimization.
 6. Combined validation and before/after measurements.
 
-Changes remain work in progress until applicable checks pass. Creating or editing
-this plan and implementing in a separate worktree does not authorize commits,
-pushes, PR creation, merging, releasing, or deployment to an existing environment.
+Changes remain work in progress until applicable checks pass. The user authorized
+checkpoint commits on this branch. Pushes, PR creation, merging, releasing, and
+deployment to an existing environment remain outside the current authorization.
 
 ## Entry points
 
@@ -213,3 +213,34 @@ they do not establish database/MQ lifecycle or performance acceptance.
   12 passed, 178 filtered out; no database or broker required by this selection.
 - `SQLX_OFFLINE=true cargo clippy -p attune-worker --all-targets --no-deps -- -D warnings`: passed.
 - Database/MQ lifecycle tests, workspace validation, and required CI remain unrun.
+
+### Lifecycle and lazy-capture checkpoint (work in progress)
+
+- Added repository-owned atomic worker transitions returning the locked previous
+  status and updated row in one statement. Startup returns its row directly to
+  preparation and publishes Running only after persistence. Terminal state and
+  assignment guards reject stale updates; missing-action failures persist Failed.
+- Shared immutable schema bindings and authorized input-secret paths across
+  preparation, log policy selection, and result protection. Completion still
+  closes runtime reads and queries recorded runtime origins.
+- Ordinary file settlement excludes log streams in its repository query.
+- Delivery freshness checks share one PostgreSQL clock sample. Existing-admission
+  validation now avoids admission/attempt inserts while retaining executable,
+  owner, policy, approval, dependency and attempt fences. Delivery helpers reuse
+  its fence within the transaction.
+- Each stream allocates on its first nonempty write. Empty writes and unused
+  sealing allocate nothing. Failed/cancelled initialization is latched. Prepared
+  allocation returns its permit directly to transport construction. Allocated
+  paths are retained for terminal result construction.
+- Worker completion records per-stream capture state. Both SSE reader paths
+  recognize positively known empty streams, reject nonzero cursors on them, and
+  keep missing/failed/crashed capture distinct from silence.
+- Added tracing phase timings for receipt/materialization, preparation, process
+  wait, capture settlement, ordinary artifacts, persistence and publication.
+- Validation so far: two repository transition tests passed twice (including the
+  concurrent terminal race); both delivery-fence unit tests passed; 12 worker
+  service tests and all 15 log-writer tests passed, including four new lazy-state
+  regressions. These scoped results do not certify untested admission/reader
+  integration behavior. The API all-targets check and ordinary-file test are
+  ongoing. Full lifecycle/storage/security tests and measurements remain pending.
+- Warm release verification and seal-path query reuse remain unimplemented.
