@@ -189,7 +189,7 @@ impl ApprovalEffectFence {
         }
     }
 
-    fn check_at(&self, now: DateTime<Utc>) -> Result<()> {
+    pub(crate) fn check_at(&self, now: DateTime<Utc>) -> Result<()> {
         if self.earliest_expiry.is_some_and(|expiry| expiry <= now) {
             return Err(Error::PermissionDenied(
                 "Validated external approval expired before effect or disclosure".into(),
@@ -1478,6 +1478,87 @@ impl RuntimeAuthorityRepository {
         Ok(Some(policy))
     }
 
+    /// Validate an existing binding without replaying admission/attempt creation.
+    /// Keep the same schema -> policy -> owner -> admission -> approval ordering
+    /// as record_admission, including immutable executable and dependency checks.
+    pub(crate) async fn require_existing_admission(
+        connection: &mut PgConnection,
+        owner: RuntimeOwner,
+    ) -> Result<(RuntimeAdmissionRecord, ApprovalEffectFence)> {
+        let (kind, id) = owner.parts();
+        SchemaTypeRepository::lock_selection(connection).await?;
+        let query = format!("SELECT {ADMISSION_COLUMNS} FROM runtime_authority_admission WHERE owner_kind=$1 AND owner_id=$2");
+        let initial: RuntimeAdmissionRecord = sqlx::query_as(&query)
+            .bind(kind)
+            .bind(id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| {
+                Error::PermissionDenied("Recorded invocation authority is unavailable".into())
+            })?;
+        let (policy, policy_fence) =
+            lock_policy_with_deadline(connection, initial.policy_revision).await?;
+        initial.validate(&policy)?;
+        lock_runtime_owner(connection, owner, &initial.authority).await?;
+        validate_owner_executable(connection, owner, &initial.authority, &policy.policy).await?;
+        let record: RuntimeAdmissionRecord = sqlx::query_as(&format!("{query} FOR SHARE"))
+            .bind(kind)
+            .bind(id)
+            .fetch_one(&mut *connection)
+            .await?;
+        record.validate(&policy)?;
+        if record.revoked_at.is_some()
+            || record.id != initial.id
+            || record.authority != initial.authority
+        {
+            return Err(Error::PermissionDenied(
+                "Runtime admission changed or was revoked".into(),
+            ));
+        }
+        if let RuntimeOwner::Execution(execution) = owner {
+            let retained: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM runtime_authority_execution_attempt a
+                 JOIN runtime_authority_execution_fence f ON f.execution=a.execution AND f.admission=a.admission
+                 WHERE a.execution=$1 AND a.admission=$2 AND a.attempt=$3 FOR SHARE OF a,f)"
+            ).bind(execution).bind(record.id).bind(record.authority.attempt).fetch_one(&mut *connection).await?;
+            if !retained {
+                return Err(Error::PermissionDenied(
+                    "Recorded execution attempt is unavailable".into(),
+                ));
+            }
+        }
+        if let crate::runtime_authority::RequestAttribution::ParentExecution { execution_id } =
+            &record.authority.attribution
+        {
+            let retained: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM runtime_admission_dependency d
+                 JOIN runtime_authority_admission parent ON parent.id=d.dependency
+                 WHERE d.admission=$1 AND parent.owner_kind='execution' AND parent.owner_id=$2)",
+            )
+            .bind(record.id)
+            .bind(execution_id)
+            .fetch_one(&mut *connection)
+            .await?;
+            if !retained {
+                return Err(Error::PermissionDenied(
+                    "Parent admission dependency is unavailable".into(),
+                ));
+            }
+        }
+        let approvals = validate_approvals(
+            connection,
+            &record.authority.owner,
+            &record.authority.grants.iter().collect::<Vec<_>>(),
+        )
+        .await?;
+        let dependencies = validate_admission_dependencies(connection, &record).await?;
+        let fence = policy_fence
+            .intersect(&approvals.fence)
+            .intersect(&dependencies);
+        fence.ensure_fresh_on(connection).await?;
+        Ok((record, fence))
+    }
+
     pub async fn record_admission(
         connection: &mut PgConnection,
         owner: RuntimeOwner,
@@ -1490,39 +1571,7 @@ impl RuntimeAuthorityRepository {
             lock_policy_with_deadline(connection, authority.policy_id).await?;
         authority.validate_against(&policy.policy)?;
         lock_runtime_owner(connection, owner, authority).await?;
-        let admitted_executable =
-            super::managed_executable::ManagedExecutableRepository::resolve_invocation(
-                connection,
-                &policy.policy,
-                &authority.binding,
-            )
-            .await?;
-        let snapshot_query = match owner {
-            RuntimeOwner::Execution(_) => {
-                "SELECT executable_snapshot,action FROM execution WHERE id = $1 FOR SHARE"
-            }
-            RuntimeOwner::Enforcement(_) => {
-                "SELECT executable_snapshot,NULL::BIGINT FROM enforcement WHERE id = $1 FOR SHARE"
-            }
-        };
-        let (actual, action_id): (
-            Option<Json<crate::models::ExecutionExecutableSnapshot>>,
-            Option<Id>,
-        ) = sqlx::query_as(snapshot_query)
-            .bind(owner_id)
-            .fetch_one(&mut *connection)
-            .await?;
-        let actual = actual.ok_or_else(|| {
-            Error::PermissionDenied("Runtime owner has no immutable executable metadata".into())
-        })?;
-        if action_id.is_some_and(|id| id != admitted_executable.executable.action.id)
-            || serde_json::to_value(&actual.executable)?
-                != serde_json::to_value(&admitted_executable.executable)?
-        {
-            return Err(Error::PermissionDenied(
-                "Runtime owner metadata differs from its immutable admitted executable".into(),
-            ));
-        }
+        validate_owner_executable(connection, owner, authority, &policy.policy).await?;
         let approvals = validate_approvals(
             connection,
             &authority.owner,
@@ -2128,6 +2177,49 @@ async fn validate_admission_dependencies_inner(
     }
     fence.ensure_fresh()?;
     Ok(fence)
+}
+
+async fn validate_owner_executable(
+    connection: &mut PgConnection,
+    owner: RuntimeOwner,
+    authority: &SelectedRuntimeAuthority,
+    policy: &RuntimePolicy,
+) -> Result<()> {
+    let (_, owner_id) = owner.parts();
+    let admitted_executable =
+        super::managed_executable::ManagedExecutableRepository::resolve_invocation(
+            connection,
+            policy,
+            &authority.binding,
+        )
+        .await?;
+    let snapshot_query = match owner {
+        RuntimeOwner::Execution(_) => {
+            "SELECT executable_snapshot,action FROM execution WHERE id = $1 FOR SHARE"
+        }
+        RuntimeOwner::Enforcement(_) => {
+            "SELECT executable_snapshot,NULL::BIGINT FROM enforcement WHERE id = $1 FOR SHARE"
+        }
+    };
+    let (actual, action_id): (
+        Option<Json<crate::models::ExecutionExecutableSnapshot>>,
+        Option<Id>,
+    ) = sqlx::query_as(snapshot_query)
+        .bind(owner_id)
+        .fetch_one(&mut *connection)
+        .await?;
+    let actual = actual.ok_or_else(|| {
+        Error::PermissionDenied("Runtime owner has no immutable executable metadata".into())
+    })?;
+    if action_id.is_some_and(|id| id != admitted_executable.executable.action.id)
+        || serde_json::to_value(&actual.executable)?
+            != serde_json::to_value(&admitted_executable.executable)?
+    {
+        return Err(Error::PermissionDenied(
+            "Runtime owner metadata differs from its immutable admitted executable".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn lock_runtime_owner(

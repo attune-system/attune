@@ -506,6 +506,13 @@ pub async fn execute_streaming_cancellable(
             )
         }
     };
+    let process_wait_elapsed_us = start.elapsed().as_micros() as u64;
+    let settlement_started = Instant::now();
+    tracing::debug!(
+        phase = "process_wait",
+        elapsed_us = process_wait_elapsed_us,
+        "Worker lifecycle phase"
+    );
     let (wait_result, mut was_cancelled, mut was_timed_out, stdin_write_error) = wait;
 
     let output_results = async {
@@ -607,6 +614,11 @@ pub async fn execute_streaming_cancellable(
     }
 
     // Handle process wait result
+    tracing::debug!(
+        phase = "log_capture_settlement",
+        elapsed_us = settlement_started.elapsed().as_micros() as u64,
+        "Worker lifecycle phase"
+    );
     let (exit_code, process_error) = match wait_result {
         Ok(status) => (status.code().unwrap_or(-1), None),
         Err(e) => {

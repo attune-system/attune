@@ -34,11 +34,14 @@ use attune_common::repositories::artifact::{
     classify_artifact, default_content_type_for_artifact, ArtifactRepository,
     ArtifactVersionRepository, CreateArtifactInput, UpdateArtifactInput,
 };
-use attune_common::repositories::execution::{ExecutionRepository, UpdateExecutionInput};
+use attune_common::repositories::execution::{
+    ExecutionRepository, ExecutionTransition, UpdateExecutionInput,
+};
 use attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository;
 use attune_common::repositories::runtime::WorkerRepository;
 use attune_common::repositories::runtime::SELECT_COLUMNS as RUNTIME_SELECT_COLUMNS;
 use attune_common::repositories::runtime_version::RuntimeVersionRepository;
+use attune_common::repositories::schema_contract::ActionSchemaBinding;
 use attune_common::repositories::{FindById, FindByRef, Update};
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::secret_values::{
@@ -52,7 +55,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -63,7 +66,7 @@ use crate::secrets::SecretManager;
 /// A persisted terminal row and the process outcome. Preparation failures can
 /// have a durable Failed row even though no process result exists.
 pub(crate) struct ExecutionOutcome {
-    pub execution: Execution,
+    pub transition: ExecutionTransition,
     pub result: Result<ExecutionResult>,
 }
 
@@ -184,6 +187,19 @@ fn emit_runtime_log_truncation_events(execution_id: i64, result: &ExecutionResul
 }
 
 fn record_incomplete_runtime_logs(result_data: &mut serde_json::Value, result: &ExecutionResult) {
+    let state = |empty: bool, truncated: bool| {
+        if result.logs_incomplete {
+            "incomplete"
+        } else if empty && !truncated {
+            "empty"
+        } else {
+            "captured"
+        }
+    };
+    result_data["runtime_log_capture"] = serde_json::json!({
+        "stdout": state(result.stdout.is_empty(), result.stdout_truncated),
+        "stderr": state(result.stderr.is_empty(), result.stderr_truncated),
+    });
     if result.logs_incomplete {
         result_data["logs_incomplete"] = serde_json::json!(true);
     }
@@ -248,6 +264,15 @@ impl ExecutionLogArtifactStream {
             Self::Stderr => "stderr",
         }
     }
+}
+
+/// Execution-scoped immutable contract and the authorized input paths observed
+/// while restoring parameters. Runtime reads/origins remain live at completion.
+struct ExecutionPreparation {
+    binding: ActionSchemaBinding,
+    parameter_secret_paths: Option<Vec<String>>,
+    stdout_path: Arc<OnceLock<PathBuf>>,
+    stderr_path: Arc<OnceLock<PathBuf>>,
 }
 
 struct ExecutionLogArtifacts {
@@ -428,42 +453,87 @@ impl ActionExecutor {
         execution_id: i64,
         cancel_token: CancellationToken,
     ) -> Result<ExecutionOutcome> {
+        let transition = self.start_execution(execution_id).await?;
+        self.execute_started_outcome(transition.execution, cancel_token)
+            .await
+    }
+
+    pub(crate) async fn start_execution(&self, execution_id: i64) -> Result<ExecutionTransition> {
+        ExecutionRepository::transition_worker(
+            &self.pool,
+            execution_id,
+            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            ExecutionStatus::Running,
+            None,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip_all, fields(execution_id = execution.id))]
+    pub(crate) async fn execute_started_outcome(
+        &self,
+        execution: Execution,
+        cancel_token: CancellationToken,
+    ) -> Result<ExecutionOutcome> {
+        let execution_id = execution.id;
         info!("Starting execution: {}", execution_id);
 
-        // Update execution status to running
-        if let Err(e) = self
-            .update_execution_status(execution_id, ExecutionStatus::Running)
+        // Load action from database
+        let action = match self.load_action(&execution).await {
+            Ok(action) => action,
+            Err(error) => {
+                let transition = self
+                    .handle_execution_failure(
+                        execution_id,
+                        None,
+                        None,
+                        Some("Failed to load pinned action"),
+                        None,
+                    )
+                    .await?;
+                return Ok(ExecutionOutcome {
+                    transition,
+                    result: Err(error),
+                });
+            }
+        };
+
+        let preparation_started = std::time::Instant::now();
+        let mut preparation = ExecutionPreparation {
+            binding: self.schema_binding(execution_id).await?,
+            parameter_secret_paths: None,
+            stdout_path: Arc::new(OnceLock::new()),
+            stderr_path: Arc::new(OnceLock::new()),
+        };
+        // The immutable contract is shared by validation, capture and redaction.
+        let mut context = match self
+            .prepare_execution_context(&execution, &action, &mut preparation)
             .await
         {
-            error!("Failed to update execution status to running: {}", e);
-            return Err(e);
-        }
-
-        // Load execution from database
-        let execution = self.load_execution(execution_id).await?;
-
-        // Load action from database
-        let action = self.load_action(&execution).await?;
-
-        // Prepare execution context
-        let mut context = match self.prepare_execution_context(&execution, &action).await {
             Ok(ctx) => ctx,
             Err(e) => {
                 error!("Failed to prepare execution context: {}", e);
-                let execution = self
+                let transition = self
                     .handle_execution_failure(
                         execution_id,
                         Some(&action),
                         None,
                         Some(&format!("Failed to prepare execution context: {}", e)),
+                        Some(&preparation),
                     )
                     .await?;
                 return Ok(ExecutionOutcome {
-                    execution,
+                    transition,
                     result: Err(e),
                 });
             }
         };
+
+        debug!(
+            phase = "preparation",
+            elapsed_us = preparation_started.elapsed().as_micros() as u64,
+            "Worker lifecycle phase"
+        );
 
         // Attach the cancellation token so the process executor can monitor it
         context.cancel_token = Some(cancel_token.clone());
@@ -471,6 +541,7 @@ impl ActionExecutor {
         // Execute the action
         // Note: execute_action should rarely return Err - most failures should be
         // captured in ExecutionResult with non-zero exit codes
+        let process_started = std::time::Instant::now();
         let result = match self.execute_action(context).await {
             Ok(result) => result,
             Err(e) => {
@@ -482,21 +553,28 @@ impl ActionExecutor {
                     );
                 }
                 // This should only happen for unrecoverable errors like runtime not found
-                let execution = self
+                let transition = self
                     .handle_execution_failure(
                         execution_id,
                         Some(&action),
                         None,
                         Some(&format!("Action execution failed: {}", e)),
+                        Some(&preparation),
                     )
                     .await?;
                 return Ok(ExecutionOutcome {
-                    execution,
+                    transition,
                     result: Err(e),
                 });
             }
         };
 
+        debug!(
+            phase = "process_and_capture",
+            elapsed_us = process_started.elapsed().as_micros() as u64,
+            "Worker lifecycle phase"
+        );
+        let artifacts_started = std::time::Instant::now();
         // Store artifacts
         if let Err(e) = self.store_execution_artifacts(execution_id, &result).await {
             warn!("Failed to store artifacts: {}", e);
@@ -512,6 +590,12 @@ impl ActionExecutor {
             // Don't fail the execution just because artifact finalization failed
         }
 
+        debug!(
+            phase = "ordinary_artifact_settlement",
+            elapsed_us = artifacts_started.elapsed().as_micros() as u64,
+            "Worker lifecycle phase"
+        );
+        let terminal_started = std::time::Instant::now();
         // Update execution with result
         let is_success = result.is_success();
         debug!(
@@ -529,20 +613,31 @@ impl ActionExecutor {
                 .as_deref()
                 .is_some_and(|e| e.contains("cancelled"));
 
-        let execution = if was_cancelled {
-            self.handle_execution_cancelled(execution_id, &action, &result)
+        let transition = if was_cancelled {
+            self.handle_execution_cancelled(execution_id, &action, &result, &preparation)
                 .await?
         } else if result.timed_out {
-            self.handle_execution_timeout(execution_id, &action, &result)
+            self.handle_execution_timeout(execution_id, &action, &result, &preparation)
                 .await?
         } else if is_success {
-            self.handle_execution_success(execution_id, &action, &result)
+            self.handle_execution_success(execution_id, &action, &result, &preparation)
                 .await?
         } else {
-            self.handle_execution_failure(execution_id, Some(&action), Some(&result), None)
-                .await?
+            self.handle_execution_failure(
+                execution_id,
+                Some(&action),
+                Some(&result),
+                None,
+                Some(&preparation),
+            )
+            .await?
         };
 
+        debug!(
+            phase = "terminal_persistence",
+            elapsed_us = terminal_started.elapsed().as_micros() as u64,
+            "Worker lifecycle phase"
+        );
         info!(
             "Execution {} completed: {}",
             execution_id,
@@ -556,18 +651,9 @@ impl ActionExecutor {
         );
 
         Ok(ExecutionOutcome {
-            execution,
+            transition,
             result: Ok(result),
         })
-    }
-
-    /// Load execution from database
-    async fn load_execution(&self, execution_id: i64) -> Result<Execution> {
-        debug!("Loading execution: {}", execution_id);
-
-        ExecutionRepository::find_by_id(&self.pool, execution_id)
-            .await?
-            .ok_or_else(|| Error::not_found("Execution", "id", execution_id.to_string()))
     }
 
     /// Load action from database using execution data
@@ -770,6 +856,7 @@ impl ActionExecutor {
         &self,
         execution: &Execution,
         action: &Action,
+        preparation: &mut ExecutionPreparation,
     ) -> Result<ExecutionContext> {
         debug!(
             "Preparing execution context for execution: {}",
@@ -782,15 +869,16 @@ impl ActionExecutor {
         let mut parameters = HashMap::new();
 
         let restored_config = if let Some(config) = &execution.config {
-            Some(
-                self.secret_manager
-                    .restore_execution_parameters(execution.id, config.clone())
-                    .await?,
-            )
+            let (config, paths) = self
+                .secret_manager
+                .restore_execution_parameters_with_paths(execution.id, config.clone())
+                .await?;
+            preparation.parameter_secret_paths = Some(paths);
+            Some(config)
         } else {
             None
         };
-        let binding = self.schema_binding(execution.id).await?;
+        let binding = &preparation.binding;
         let input_contract = attune_common::value_schema::CompiledContract::new(&binding.input)
             .map_err(|error| {
                 Error::Validation(format!("Invalid stored input contract: {error}"))
@@ -1098,7 +1186,7 @@ impl ActionExecutor {
             None
         };
         let log_artifacts = self
-            .allocate_execution_log_artifacts(execution, action)
+            .allocate_execution_log_artifacts(execution, action, preparation)
             .await?;
 
         let context = ExecutionContext {
@@ -1126,7 +1214,7 @@ impl ActionExecutor {
             parameter_delivery: action.parameter_delivery,
             parameter_format: action.parameter_format,
             output_format: action.output_format,
-            out_schema: binding.output,
+            out_schema: binding.output.clone(),
             cancel_token: None,
         };
 
@@ -1429,25 +1517,37 @@ impl ActionExecutor {
         &self,
         execution: &Execution,
         action: &Action,
+        preparation: &ExecutionPreparation,
     ) -> Result<ExecutionLogArtifacts> {
-        let binding = self.schema_binding(execution.id).await?;
-        let mut connection = self.pool.acquire().await?;
-        let recorded = attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(
-            &mut connection, execution.id,
-        ).await?.is_some();
-        drop(connection);
-        let log_encryption_key = if recorded {
-            Some(self.secret_manager.encryption_key().ok_or_else(|| {
-                Error::PermissionDenied("Recorded logs require encryption".into())
-            })?)
+        // Registration establishes the attempt's authority even for silent code.
+        // Per-stream metadata is deferred to the first nonempty write.
+        let delivery = crate::completion::register(
+            &self.pool,
+            execution,
+            self.worker_id.load(Ordering::Acquire),
+            self.worker_instance,
+        )
+        .await?;
+        let log_encryption_key = if delivery.is_some() {
+            Some(
+                self.secret_manager
+                    .encryption_key()
+                    .ok_or_else(|| {
+                        Error::PermissionDenied("Recorded logs require encryption".into())
+                    })?
+                    .to_owned(),
+            )
         } else {
             None
         };
-        let sensitive_inputs = attune_common::value_schema::CompiledContract::new(&binding.input)
-            .map_err(|error| Error::Validation(format!("Invalid stored input contract: {error}")))?
-            .declares_secrets()
-            || recorded;
-        let (stdout_mirror_source, stderr_mirror_source) =
+        let sensitive_inputs =
+            attune_common::value_schema::CompiledContract::new(&preparation.binding.input)
+                .map_err(|error| {
+                    Error::Validation(format!("Invalid stored input contract: {error}"))
+                })?
+                .declares_secrets()
+                || delivery.is_some();
+        let (stdout_mirror, stderr_mirror) =
             attune_common::runtime_log_mirror::select_mirror_sources(
                 attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
                     execution_id: execution.id,
@@ -1462,179 +1562,124 @@ impl ActionExecutor {
                 self.mirror_runtime_stdout_to_stdio && !sensitive_inputs,
                 self.mirror_runtime_stderr_to_stdio && !sensitive_inputs,
             );
-        let retention = self.effective_action_log_retention(action);
-        let backend = if self.transport.transport_mode() == "volume" {
-            LogStreamBackend::SharedFile
-        } else {
-            LogStreamBackend::ObjectSegments
-        };
-        let delivery = crate::completion::register(
-            &self.pool,
-            execution,
-            self.worker_id.load(Ordering::Acquire),
-            self.worker_instance,
-        )
-        .await?;
-        if recorded != delivery.is_some() {
-            return Err(Error::PermissionDenied(
-                "Execution admission changed during log preparation".into(),
-            ));
-        }
-        let (stdout_path, stdout_version, stderr_path, stderr_version) =
-            if let Some(context) = &delivery {
-                let (stdout_path, stdout_version) = crate::completion::allocate_log(
-                    &self.pool,
-                    execution,
-                    context,
-                    "stdout",
-                    backend,
-                    self.execution_log_retention_policy,
-                    self.execution_log_retention_limit,
-                    self.log_segment_config.max_segment_bytes as u64,
-                    self.log_segment_config.flush_interval_ms,
-                    self.max_stdout_bytes,
-                )
-                .await?;
-                let (stderr_path, stderr_version) = crate::completion::allocate_log(
-                    &self.pool,
-                    execution,
-                    context,
-                    "stderr",
-                    backend,
-                    self.execution_log_retention_policy,
-                    self.execution_log_retention_limit,
-                    self.log_segment_config.max_segment_bytes as u64,
-                    self.log_segment_config.flush_interval_ms,
-                    self.max_stderr_bytes,
-                )
-                .await?;
-                (stdout_path, stdout_version, stderr_path, stderr_version)
+        let make_writer = |stream: ExecutionLogArtifactStream,
+                           mirror_source: Option<
+            attune_common::runtime_log_mirror::RuntimeLogSource,
+        >,
+                           path: Arc<OnceLock<PathBuf>>| {
+            let pool = self.pool.clone();
+            let execution = execution.clone();
+            let delivery = delivery.clone();
+            let encryption_key = log_encryption_key.clone();
+            let transport = self.transport.clone();
+            let backend = if transport.transport_mode() == "volume" {
+                LogStreamBackend::SharedFile
             } else {
-                let (_, stdout_path, stdout_version) = Self::allocate_execution_log_artifact_with(
-                    &self.pool,
-                    &self.artifacts_dir,
-                    self.transport.as_ref(),
-                    execution,
-                    retention,
-                    ExecutionLogArtifactStream::Stdout,
-                    backend,
-                )
-                .await?;
-                let (_, stderr_path, stderr_version) = Self::allocate_execution_log_artifact_with(
-                    &self.pool,
-                    &self.artifacts_dir,
-                    self.transport.as_ref(),
-                    execution,
-                    retention,
-                    ExecutionLogArtifactStream::Stderr,
-                    backend,
-                )
-                .await?;
-                (stdout_path, stdout_version, stderr_path, stderr_version)
+                LogStreamBackend::ObjectSegments
             };
-        let stdout_transport = if delivery.is_some() {
-            crate::completion::CompletionTransport::for_version(
-                &self.pool,
-                stdout_version,
-                self.worker_id.load(Ordering::Acquire),
-                self.worker_instance,
-                self.transport.clone(),
-                &self.api_url,
-                &self.jwt_config,
+            let retention = self.effective_action_log_retention(action);
+            let config = self.log_segment_config;
+            let artifacts_dir = self.artifacts_dir.clone();
+            let api_url = self.api_url.clone();
+            let jwt = self.jwt_config.clone();
+            let is_stdout = matches!(stream, ExecutionLogArtifactStream::Stdout);
+            let max_bytes = if is_stdout {
+                self.max_stdout_bytes
+            } else {
+                self.max_stderr_bytes
+            };
+            let initialized_mirror = mirror_source.clone();
+            BoundedLogFileWriter::lazy(
+                move || async move {
+                    let (file_path, version, transport) = if let Some(context) = &delivery {
+                        let allocation = crate::completion::allocate_log_prepared(
+                            &pool,
+                            &execution,
+                            context,
+                            stream.as_str(),
+                            backend,
+                            retention.policy,
+                            retention.limit,
+                            config.max_segment_bytes as u64,
+                            config.flush_interval_ms,
+                            max_bytes,
+                        )
+                        .await?;
+                        let path = allocation.path.clone();
+                        let version = allocation.version;
+                        let transport = crate::completion::CompletionTransport::from_prepared(
+                            &pool,
+                            context.clone(),
+                            allocation,
+                            transport,
+                            &api_url,
+                            &jwt,
+                        )?;
+                        (path, version, transport)
+                    } else {
+                        let (_, file_path, version) = Self::allocate_execution_log_artifact_with(
+                            &pool,
+                            &artifacts_dir,
+                            transport.as_ref(),
+                            &execution,
+                            retention,
+                            stream,
+                            backend,
+                        )
+                        .await?;
+                        attune_common::repositories::log_stream::LogStreamRepository::create_with_backend(
+                            &pool, version, backend, config.max_segment_bytes as u64, config.flush_interval_ms,
+                        ).await?;
+                        (file_path, version, transport)
+                    };
+                    let writer = if backend == LogStreamBackend::SharedFile {
+                        transport
+                            .write_file(&file_path, b"", Some("text/plain"))
+                            .await?;
+                        BoundedLogFileWriter::from_shared_file_writer(
+                            attune_common::log_stream::SharedFileLogWriter::new(
+                                transport,
+                                version,
+                                file_path.clone(),
+                            ),
+                            max_bytes,
+                            is_stdout,
+                            config.finalization_timeout_ms,
+                        )
+                    } else {
+                        BoundedLogFileWriter::from_segmented_writer(
+                            attune_common::log_stream::SegmentedLogWriter::new(
+                                transport, version, config,
+                            )?,
+                            max_bytes,
+                            is_stdout,
+                        )
+                    }
+                    .with_encryption(encryption_key.as_deref(), execution.id, version)
+                    .with_mirror_source(initialized_mirror);
+                    let relative = ValidatedRelativePath::new(&file_path)?;
+                    path.set(artifacts_dir.join(relative.as_path()))
+                        .map_err(|_| Error::invalid_state("Log writer initialized twice"))?;
+                    Ok(writer)
+                },
+                max_bytes,
+                is_stdout,
+                config.finalization_timeout_ms,
+                mirror_source,
             )
-            .await?
-        } else {
-            self.transport.clone()
         };
-        let stderr_transport = if delivery.is_some() {
-            crate::completion::CompletionTransport::for_version(
-                &self.pool,
-                stderr_version,
-                self.worker_id.load(Ordering::Acquire),
-                self.worker_instance,
-                self.transport.clone(),
-                &self.api_url,
-                &self.jwt_config,
-            )
-            .await?
-        } else {
-            self.transport.clone()
-        };
-        for (version_id, file_path, transport) in [
-            (stdout_version, stdout_path.as_str(), &stdout_transport),
-            (stderr_version, stderr_path.as_str(), &stderr_transport),
-        ] {
-            if delivery.is_none() {
-                attune_common::repositories::log_stream::LogStreamRepository::create_with_backend(
-                    &self.pool,
-                    version_id,
-                    backend,
-                    self.log_segment_config.max_segment_bytes as u64,
-                    self.log_segment_config.flush_interval_ms,
-                )
-                .await?;
-            }
-            if backend == LogStreamBackend::SharedFile {
-                transport
-                    .write_file(file_path, b"", Some("text/plain"))
-                    .await?;
-            }
-        }
-        if backend == LogStreamBackend::SharedFile {
-            Ok(ExecutionLogArtifacts {
-                stdout_writer: BoundedLogFileWriter::from_shared_file_writer(
-                    attune_common::log_stream::SharedFileLogWriter::new(
-                        stdout_transport,
-                        stdout_version,
-                        stdout_path,
-                    ),
-                    self.max_stdout_bytes,
-                    true,
-                    self.log_segment_config.finalization_timeout_ms,
-                )
-                .with_encryption(log_encryption_key, execution.id, stdout_version)
-                .with_mirror_source(stdout_mirror_source),
-                stderr_writer: BoundedLogFileWriter::from_shared_file_writer(
-                    attune_common::log_stream::SharedFileLogWriter::new(
-                        stderr_transport,
-                        stderr_version,
-                        stderr_path,
-                    ),
-                    self.max_stderr_bytes,
-                    false,
-                    self.log_segment_config.finalization_timeout_ms,
-                )
-                .with_encryption(log_encryption_key, execution.id, stderr_version)
-                .with_mirror_source(stderr_mirror_source),
-            })
-        } else {
-            let stdout_writer = attune_common::log_stream::SegmentedLogWriter::new(
-                stdout_transport,
-                stdout_version,
-                self.log_segment_config,
-            )?;
-            let stderr_writer = attune_common::log_stream::SegmentedLogWriter::new(
-                stderr_transport,
-                stderr_version,
-                self.log_segment_config,
-            )?;
-            Ok(ExecutionLogArtifacts {
-                stdout_writer: BoundedLogFileWriter::from_segmented_writer(
-                    stdout_writer,
-                    self.max_stdout_bytes,
-                    true,
-                )
-                .with_encryption(log_encryption_key, execution.id, stdout_version)
-                .with_mirror_source(stdout_mirror_source),
-                stderr_writer: BoundedLogFileWriter::from_segmented_writer(
-                    stderr_writer,
-                    self.max_stderr_bytes,
-                    false,
-                )
-                .with_encryption(log_encryption_key, execution.id, stderr_version)
-                .with_mirror_source(stderr_mirror_source),
-            })
-        }
+        Ok(ExecutionLogArtifacts {
+            stdout_writer: make_writer(
+                ExecutionLogArtifactStream::Stdout,
+                stdout_mirror,
+                preparation.stdout_path.clone(),
+            ),
+            stderr_writer: make_writer(
+                ExecutionLogArtifactStream::Stderr,
+                stderr_mirror,
+                preparation.stderr_path.clone(),
+            ),
+        })
     }
 
     async fn allocate_execution_log_artifact_with(
@@ -1802,9 +1847,11 @@ impl ActionExecutor {
     /// stats each file via the transport, and updates `size_bytes` on both the
     /// version row and the parent artifact row.
     async fn finalize_file_artifacts(&self, execution_id: i64) -> Result<()> {
-        let versions =
-            ArtifactVersionRepository::find_file_versions_by_execution(&self.pool, execution_id)
-                .await?;
+        let versions = ArtifactVersionRepository::find_ordinary_file_versions_by_execution(
+            &self.pool,
+            execution_id,
+        )
+        .await?;
 
         if versions.is_empty() {
             return Ok(());
@@ -1820,15 +1867,6 @@ impl ActionExecutor {
         let mut latest_size_per_artifact: HashMap<i64, (i32, i64)> = HashMap::new();
 
         for ver in &versions {
-            if attune_common::repositories::log_stream::LogStreamRepository::find_by_artifact_version(
-                &self.pool,
-                ver.id,
-            )
-            .await?
-            .is_some()
-            {
-                continue;
-            }
             let file_path = match &ver.file_path {
                 Some(fp) => fp,
                 None => continue,
@@ -1977,7 +2015,8 @@ impl ActionExecutor {
         execution_id: i64,
         action: &Action,
         result: &ExecutionResult,
-    ) -> Result<Execution> {
+        preparation: &ExecutionPreparation,
+    ) -> Result<ExecutionTransition> {
         info!(
             "Execution {} succeeded (exit_code={}, duration={}ms)",
             execution_id, result.exit_code, result.duration_ms
@@ -1998,10 +2037,7 @@ impl ActionExecutor {
 
         // Include stderr log path only if stderr is non-empty and non-whitespace
         if !result.stderr.trim().is_empty() {
-            if let Some(stderr_path) = self
-                .latest_execution_log_path(execution_id, ExecutionLogArtifactStream::Stderr)
-                .await?
-            {
+            if let Some(stderr_path) = preparation.stderr_path.get() {
                 result_data["stderr_log"] = serde_json::json!(stderr_path.to_string_lossy());
             }
         }
@@ -2014,7 +2050,7 @@ impl ActionExecutor {
 
         record_incomplete_runtime_logs(&mut result_data, result);
         result_data = self
-            .redact_execution_result_data(execution_id, action, result_data)
+            .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
             .await?;
 
         let input = UpdateExecutionInput {
@@ -2023,7 +2059,14 @@ impl ActionExecutor {
             ..Default::default()
         };
 
-        ExecutionRepository::update(&self.pool, execution_id, input).await
+        ExecutionRepository::transition_worker(
+            &self.pool,
+            execution_id,
+            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            input.status.expect("terminal status"),
+            input.result,
+        )
+        .await
     }
 
     fn copy_reserved_queue_ack(
@@ -2043,6 +2086,7 @@ impl ActionExecutor {
         execution_id: i64,
         action: &Action,
         result_data: JsonValue,
+        preparation: Option<&ExecutionPreparation>,
     ) -> Result<JsonValue> {
         let mut origin_tx = self.pool.begin().await?;
         let mut runtime_reads =
@@ -2052,17 +2096,31 @@ impl ActionExecutor {
             )
             .await?;
         origin_tx.commit().await?;
-        let parameter_secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-            &self.pool,
-            attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
-            execution_id,
-        )
-        .await?;
-        let paths = parameter_secrets
-            .into_iter()
-            .map(|secret| secret.json_path)
-            .collect::<Vec<_>>();
-        let binding = self.schema_binding(execution_id).await?;
+        let loaded_paths;
+        let paths = match preparation.and_then(|context| context.parameter_secret_paths.as_deref())
+        {
+            Some(paths) => paths,
+            None => {
+                loaded_paths = ExecutionSecretValueRepository::find_stored_by_entity(
+                    &self.pool,
+                    attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
+                    execution_id,
+                )
+                .await?
+                .into_iter()
+                .map(|secret| secret.json_path)
+                .collect::<Vec<_>>();
+                &loaded_paths
+            }
+        };
+        let loaded_binding;
+        let binding = match preparation {
+            Some(context) => &context.binding,
+            None => {
+                loaded_binding = self.schema_binding(execution_id).await?;
+                &loaded_binding
+            }
+        };
         let mut runtime_origins = attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(
             &self.pool, &[execution_id],
         ).await?;
@@ -2079,7 +2137,7 @@ impl ActionExecutor {
             binding.output.as_ref(),
             action.output_format,
             execution_id,
-            &paths,
+            paths,
             &runtime_origins,
         )?;
         let (result_data, secret_inputs) =
@@ -2140,7 +2198,8 @@ impl ActionExecutor {
         action: Option<&Action>,
         result: Option<&ExecutionResult>,
         error_message: Option<&str>,
-    ) -> Result<Execution> {
+        preparation: Option<&ExecutionPreparation>,
+    ) -> Result<ExecutionTransition> {
         if let Some(r) = result {
             error!(
                 execution_id,
@@ -2178,9 +2237,7 @@ impl ActionExecutor {
 
             // Include stderr log path only if stderr is non-empty and non-whitespace
             if !exec_result.stderr.trim().is_empty() {
-                if let Some(stderr_path) = self
-                    .latest_execution_log_path(execution_id, ExecutionLogArtifactStream::Stderr)
-                    .await?
+                if let Some(stderr_path) = preparation.and_then(|context| context.stderr_path.get())
                 {
                     result_data["stderr_log"] = serde_json::json!(stderr_path.to_string_lossy());
                 }
@@ -2246,7 +2303,7 @@ impl ActionExecutor {
         }
         if let Some(action) = action {
             result_data = self
-                .redact_execution_result_data(execution_id, action, result_data)
+                .redact_execution_result_data(execution_id, action, result_data, preparation)
                 .await?;
         }
 
@@ -2256,7 +2313,14 @@ impl ActionExecutor {
             ..Default::default()
         };
 
-        ExecutionRepository::update(&self.pool, execution_id, input).await
+        ExecutionRepository::transition_worker(
+            &self.pool,
+            execution_id,
+            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            input.status.expect("terminal status"),
+            input.result,
+        )
+        .await
     }
 
     async fn handle_execution_cancelled(
@@ -2264,7 +2328,8 @@ impl ActionExecutor {
         execution_id: i64,
         action: &Action,
         result: &ExecutionResult,
-    ) -> Result<Execution> {
+        preparation: &ExecutionPreparation,
+    ) -> Result<ExecutionTransition> {
         emit_runtime_log_truncation_events(execution_id, result);
         let mut result_data = serde_json::json!({
             "succeeded": false,
@@ -2279,10 +2344,7 @@ impl ActionExecutor {
         }
 
         if !result.stderr.trim().is_empty() {
-            if let Some(stderr_path) = self
-                .latest_execution_log_path(execution_id, ExecutionLogArtifactStream::Stderr)
-                .await?
-            {
+            if let Some(stderr_path) = preparation.stderr_path.get() {
                 result_data["stderr_log"] = serde_json::json!(stderr_path.to_string_lossy());
             }
         }
@@ -2306,7 +2368,7 @@ impl ActionExecutor {
         record_incomplete_runtime_logs(&mut result_data, result);
 
         result_data = self
-            .redact_execution_result_data(execution_id, action, result_data)
+            .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
             .await?;
 
         let input = UpdateExecutionInput {
@@ -2315,7 +2377,14 @@ impl ActionExecutor {
             ..Default::default()
         };
 
-        ExecutionRepository::update(&self.pool, execution_id, input).await
+        ExecutionRepository::transition_worker(
+            &self.pool,
+            execution_id,
+            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            input.status.expect("terminal status"),
+            input.result,
+        )
+        .await
     }
 
     /// Persist a terminal `Timeout` status for an execution that exceeded its
@@ -2325,7 +2394,8 @@ impl ActionExecutor {
         execution_id: i64,
         action: &Action,
         result: &ExecutionResult,
-    ) -> Result<Execution> {
+        preparation: &ExecutionPreparation,
+    ) -> Result<ExecutionTransition> {
         emit_runtime_log_truncation_events(execution_id, result);
         let mut result_data = serde_json::json!({
             "succeeded": false,
@@ -2343,10 +2413,7 @@ impl ActionExecutor {
         }
 
         if !result.stderr.trim().is_empty() {
-            if let Some(stderr_path) = self
-                .latest_execution_log_path(execution_id, ExecutionLogArtifactStream::Stderr)
-                .await?
-            {
+            if let Some(stderr_path) = preparation.stderr_path.get() {
                 result_data["stderr_log"] = serde_json::json!(stderr_path.to_string_lossy());
             }
         }
@@ -2370,7 +2437,7 @@ impl ActionExecutor {
         record_incomplete_runtime_logs(&mut result_data, result);
 
         result_data = self
-            .redact_execution_result_data(execution_id, action, result_data)
+            .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
             .await?;
 
         let input = UpdateExecutionInput {
@@ -2379,60 +2446,14 @@ impl ActionExecutor {
             ..Default::default()
         };
 
-        ExecutionRepository::update(&self.pool, execution_id, input).await
-    }
-
-    /// Update execution status
-    async fn update_execution_status(
-        &self,
-        execution_id: i64,
-        status: ExecutionStatus,
-    ) -> Result<()> {
-        debug!(
-            "Updating execution {} status to: {:?}",
-            execution_id, status
-        );
-
-        if status == ExecutionStatus::Running {
-            let mut conn = self.pool.acquire().await?;
-            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut conn,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                    execution_id,
-                ),
-            )
-            .await?
-            .is_some()
-            {
-                attune_common::repositories::worker_delivery::WorkerDeliveryRepository::start(
-                    &mut conn,
-                    execution_id,
-                    self.worker_id.load(Ordering::Acquire),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-
-        let started_at = if status == ExecutionStatus::Running {
-            Some(chrono::Utc::now())
-        } else {
-            None
-        };
-
-        let input = UpdateExecutionInput {
-            status: Some(status),
-            started_at,
-            ..Default::default()
-        };
-
-        let execution = ExecutionRepository::find_by_id(&self.pool, execution_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Execution {} not found", execution_id))?;
-
-        ExecutionRepository::update_loaded(&self.pool, &execution, input).await?;
-
-        Ok(())
+        ExecutionRepository::transition_worker(
+            &self.pool,
+            execution_id,
+            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            input.status.expect("terminal status"),
+            input.result,
+        )
+        .await
     }
 }
 

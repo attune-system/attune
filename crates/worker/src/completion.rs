@@ -36,7 +36,6 @@ pub async fn register(
     {
         return Ok(None);
     }
-    ExecutionAdmissionRepository::require(&mut tx, RuntimeOwner::Execution(execution.id)).await?;
     let execution = ExecutionRepository::find_by_id(&mut *tx, execution.id)
         .await?
         .ok_or_else(|| Error::PermissionDenied("Recorded execution unavailable".into()))?;
@@ -81,6 +80,41 @@ pub async fn allocate_log(
     flush_ms: u64,
     max_bytes: usize,
 ) -> Result<(String, i64)> {
+    let allocation = allocate_log_prepared(
+        pool,
+        execution,
+        context,
+        stream,
+        backend,
+        policy,
+        limit,
+        segment_bytes,
+        flush_ms,
+        max_bytes,
+    )
+    .await?;
+    Ok((allocation.path, allocation.version))
+}
+
+pub(crate) struct PreparedLogAllocation {
+    pub path: String,
+    pub version: i64,
+    permit: DeliveryPermit,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn allocate_log_prepared(
+    pool: &PgPool,
+    execution: &Execution,
+    context: &DeliveryContext,
+    stream: &str,
+    backend: LogStreamBackend,
+    policy: RetentionPolicyType,
+    limit: i32,
+    segment_bytes: u64,
+    flush_ms: u64,
+    max_bytes: usize,
+) -> Result<PreparedLogAllocation> {
     let mut tx = pool.begin().await?;
     if context.execution != execution.id {
         return Err(Error::PermissionDenied(
@@ -170,7 +204,7 @@ pub async fn allocate_log(
     let plaintext_cap =
         u64::try_from(max_bytes).map_err(|_| Error::validation("Log byte cap overflow"))?;
     let wire_cap = attune_common::runtime_read_log::maximum_encoded_bytes(plaintext_cap)?;
-    WorkerDeliveryRepository::bind_encrypted_log(
+    let permit = WorkerDeliveryRepository::bind_encrypted_log(
         &mut tx,
         context,
         version.id,
@@ -188,12 +222,13 @@ pub async fn allocate_log(
     .await?;
     effect.ensure_fresh_on(&mut tx).await?;
     tx.commit().await?;
-    Ok((
-        version
+    Ok(PreparedLogAllocation {
+        path: version
             .file_path
             .ok_or_else(|| Error::invalid_state("Missing log path"))?,
-        version.id,
-    ))
+        version: version.id,
+        permit,
+    })
 }
 
 pub struct CompletionTransport {
@@ -211,6 +246,34 @@ impl std::fmt::Debug for CompletionTransport {
 }
 
 impl CompletionTransport {
+    /// Only allocations returned by the committed, fenced allocation transaction
+    /// can supply this permit. Actual append/seal effects revalidate authority.
+    pub(crate) fn from_prepared(
+        pool: &PgPool,
+        context: DeliveryContext,
+        allocation: PreparedLogAllocation,
+        underlying: Arc<dyn ArtifactFileTransport>,
+        api_url: &str,
+        config: &JwtConfig,
+    ) -> Result<Arc<dyn ArtifactFileTransport>> {
+        if allocation.permit.context != context.id
+            || allocation.permit.artifact_version != allocation.version
+        {
+            return Err(Error::PermissionDenied(
+                "Prepared log allocation mismatch".into(),
+            ));
+        }
+        let token = attune_common::worker_delivery::mint(&context, &allocation.permit, config)?;
+        let api = ApiTransport::new(api_url, &token, underlying.base_dir())?;
+        Ok(Arc::new(Self {
+            pool: pool.clone(),
+            context,
+            permit: allocation.permit,
+            underlying,
+            api,
+        }))
+    }
+
     pub async fn for_version(
         pool: &PgPool,
         version: i64,

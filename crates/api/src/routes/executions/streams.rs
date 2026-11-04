@@ -308,129 +308,152 @@ pub(super) async fn protected_log(
             finished,
             permit,
             lost,
-        )| async move {
-            if finished {
-                return None;
-            }
-            let result = async {
-                if body.is_none() {
-                    let execution = log_execution(&state, &user, execution_id).await?;
-                    if execution.action_ref != action_ref {
-                        return Err(ApiError::Forbidden("Execution source changed".into()));
-                    }
-                    if let Some(artifact) =
-                        ArtifactRepository::find_by_ref(&state.db, &reference).await?
-                    {
-                        if let Some(version) =
-                            ArtifactVersionRepository::find_by_artifact_and_execution(
-                                &state.db,
-                                artifact.id,
-                                execution_id,
-                            )
-                            .await?
-                        {
-                            let pin =
-                                crate::live_logs::LogPin::select(&state, &user, version).await?;
-                            body = Some(
-                                pin.response(state.clone(), user.clone())
-                                    .await?
-                                    .into_body()
-                                    .into_data_stream(),
-                            );
-                        }
-                    }
+        )| {
+            let name = name.clone();
+            async move {
+                if finished {
+                    return None;
+                }
+                let result = async {
                     if body.is_none() {
-                        if matches!(
-                            execution.status,
-                            attune_common::models::ExecutionStatus::Completed
-                                | attune_common::models::ExecutionStatus::Failed
-                                | attune_common::models::ExecutionStatus::Cancelled
-                                | attune_common::models::ExecutionStatus::Timeout
-                                | attune_common::models::ExecutionStatus::Abandoned
-                        ) {
-                            return Err(ApiError::NotFound(
-                                "Execution finished without a retained log stream".into(),
+                        let execution = log_execution(&state, &user, execution_id).await?;
+                        if execution.action_ref != action_ref {
+                            return Err(ApiError::Forbidden("Execution source changed".into()));
+                        }
+                        if let Some(artifact) =
+                            ArtifactRepository::find_by_ref(&state.db, &reference).await?
+                        {
+                            if let Some(version) =
+                                ArtifactVersionRepository::find_by_artifact_and_execution(
+                                    &state.db,
+                                    artifact.id,
+                                    execution_id,
+                                )
+                                .await?
+                            {
+                                let pin = crate::live_logs::LogPin::select(&state, &user, version)
+                                    .await?;
+                                body = Some(
+                                    pin.response(state.clone(), user.clone())
+                                        .await?
+                                        .into_body()
+                                        .into_data_stream(),
+                                );
+                            }
+                        }
+                        if body.is_none() {
+                            if attune_common::runtime_log_completion::execution_stream_is_empty(
+                                &execution, &name,
+                            ) {
+                                if start > 0 {
+                                    return Err(ApiError::BadRequest(
+                                        "Log cursor is beyond the empty stream".into(),
+                                    ));
+                                }
+                                return Ok((
+                                    Event::default()
+                                        .id("0")
+                                        .event("done")
+                                        .data("Log stream is empty"),
+                                    true,
+                                ));
+                            }
+                            if matches!(
+                                execution.status,
+                                attune_common::models::ExecutionStatus::Completed
+                                    | attune_common::models::ExecutionStatus::Failed
+                                    | attune_common::models::ExecutionStatus::Cancelled
+                                    | attune_common::models::ExecutionStatus::Timeout
+                                    | attune_common::models::ExecutionStatus::Abandoned
+                            ) {
+                                return Err(ApiError::NotFound(
+                                    "Execution finished without a retained log stream".into(),
+                                ));
+                            }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            // The discovery query/sleep is not a reusable permit.
+                            log_execution(&state, &user, execution_id).await?;
+                            return Ok((
+                                Event::default()
+                                    .event("waiting")
+                                    .data("Log allocation pending"),
+                                false,
                             ));
                         }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        // The discovery query/sleep is not a reusable permit.
-                        log_execution(&state, &user, execution_id).await?;
-                        return Ok((
-                            Event::default()
-                                .event("waiting")
-                                .data("Log allocation pending"),
-                            false,
-                        ));
                     }
-                }
-                loop {
-                    let bytes = body.as_mut().unwrap().try_next().await.map_err(|_| {
-                        ApiError::Forbidden(
-                            "Execution log is incomplete or authority expired".into(),
-                        )
-                    })?;
-                    if lost.is_cancelled()
-                        || state.execution_log_streams.shutdown_token().is_cancelled()
-                    {
-                        return Err(ApiError::Forbidden(
-                            "Execution log stream lease ended".into(),
-                        ));
-                    }
-                    let Some(bytes) = bytes else {
-                        if cursor < start {
+                    loop {
+                        let bytes = body.as_mut().unwrap().try_next().await.map_err(|_| {
+                            ApiError::Forbidden(
+                                "Execution log is incomplete or authority expired".into(),
+                            )
+                        })?;
+                        if lost.is_cancelled()
+                            || state.execution_log_streams.shutdown_token().is_cancelled()
+                        {
+                            return Err(ApiError::Forbidden(
+                                "Execution log stream lease ended".into(),
+                            ));
+                        }
+                        let Some(bytes) = bytes else {
+                            if cursor < start {
+                                return Err(ApiError::BadRequest(
+                                    "Log cursor is beyond the verified plaintext length".into(),
+                                ));
+                            }
+                            return Ok((
+                                Event::default()
+                                    .id(cursor.to_string())
+                                    .event("done")
+                                    .data("Log stream verified"),
+                                true,
+                            ));
+                        };
+                        if bytes.is_empty() {
+                            return Ok((Event::default().event("waiting").data(""), false));
+                        }
+                        let before = cursor;
+                        cursor = cursor
+                            .checked_add(bytes.len() as u64)
+                            .ok_or_else(|| ApiError::BadRequest("Log cursor overflow".into()))?;
+                        if cursor <= start {
+                            continue;
+                        }
+                        let skip = start.saturating_sub(before) as usize;
+                        let bytes = &bytes[skip..];
+                        if first
+                            && start > 0
+                            && bytes.first().is_some_and(|byte| byte & 0xc0 == 0x80)
+                        {
                             return Err(ApiError::BadRequest(
-                                "Log cursor is beyond the verified plaintext length".into(),
+                                "Log cursor is inside a UTF-8 code point".into(),
                             ));
                         }
-                        return Ok((
-                            Event::default()
-                                .id(cursor.to_string())
-                                .event("done")
-                                .data("Log stream verified"),
-                            true,
-                        ));
-                    };
-                    if bytes.is_empty() {
-                        return Ok((Event::default().event("waiting").data(""), false));
+                        let event = Event::default()
+                            .id(cursor.to_string())
+                            .event(if first { "content" } else { "append" })
+                            .data(String::from_utf8_lossy(bytes));
+                        first = false;
+                        return Ok((event, false));
                     }
-                    let before = cursor;
-                    cursor = cursor
-                        .checked_add(bytes.len() as u64)
-                        .ok_or_else(|| ApiError::BadRequest("Log cursor overflow".into()))?;
-                    if cursor <= start {
-                        continue;
-                    }
-                    let skip = start.saturating_sub(before) as usize;
-                    let bytes = &bytes[skip..];
-                    if first && start > 0 && bytes.first().is_some_and(|byte| byte & 0xc0 == 0x80) {
-                        return Err(ApiError::BadRequest(
-                            "Log cursor is inside a UTF-8 code point".into(),
-                        ));
-                    }
-                    let event = Event::default()
-                        .id(cursor.to_string())
-                        .event(if first { "content" } else { "append" })
-                        .data(String::from_utf8_lossy(bytes));
-                    first = false;
-                    return Ok((event, false));
                 }
+                .await;
+                let (event, finished) = match result {
+                    Ok(value) => value,
+                    Err(_) => (
+                        Event::default()
+                            .event("error")
+                            .data("Execution log delivery is unavailable or incomplete"),
+                        true,
+                    ),
+                };
+                Some((
+                    Ok::<_, std::convert::Infallible>(event),
+                    (
+                        state, user, reference, action_ref, body, cursor, first, finished, permit,
+                        lost,
+                    ),
+                ))
             }
-            .await;
-            let (event, finished) = match result {
-                Ok(value) => value,
-                Err(_) => (
-                    Event::default()
-                        .event("error")
-                        .data("Execution log delivery is unavailable or incomplete"),
-                    true,
-                ),
-            };
-            Some((
-                Ok::<_, std::convert::Infallible>(event),
-                (
-                    state, user, reference, action_ref, body, cursor, first, finished, permit, lost,
-                ),
-            ))
         },
     );
     Ok((
