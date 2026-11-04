@@ -1479,8 +1479,8 @@ impl RuntimeAuthorityRepository {
     }
 
     /// Validate an existing binding without replaying admission/attempt creation.
-    /// Keep the same schema -> policy -> owner -> admission -> approval ordering
-    /// as record_admission, including immutable executable and dependency checks.
+    /// Lock schema -> policy -> owner -> retained admission before checking
+    /// approvals/dependencies; validate the same immutable executable contract.
     pub(crate) async fn require_existing_admission(
         connection: &mut PgConnection,
         owner: RuntimeOwner,

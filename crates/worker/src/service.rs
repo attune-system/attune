@@ -1676,8 +1676,8 @@ impl WorkerService {
         }
 
         // Publish only persisted terminal states. The normal path reuses UPDATE
-        // RETURNING; exceptional errors may need one read to discover whether a
-        // terminal transition actually committed.
+        // RETURNING. An error without a committed transition cannot announce a
+        // terminal state.
         let transition = match executor
             .execute_started_outcome(started.execution, cancel_token)
             .await
