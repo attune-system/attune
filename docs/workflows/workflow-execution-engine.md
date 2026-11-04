@@ -464,6 +464,19 @@ freshness, page-retry, or failed-page fields.
 
 ## Retry Strategies
 
+Retries preserve the failed attempt's executable snapshot, schema, parameters,
+encrypted input records, task/index lineage, and original execution ID. They do
+not rerender templates or resolve new defaults. Duplicate completion delivery
+reuses an existing successor. Recovery republishes that same Requested row after
+its committed backoff deadline.
+
+Managed tasks require their retained invocation and accepted-input evidence;
+missing or revoked evidence cannot fall back to human IAM. Wholly ad hoc
+workflows and tasks retain their explicit active executor, recheck delegated
+permission refs and ordinary secret origins, and acquire no pack runtime
+authority. Their retry recovery requires the source execution row to survive.
+Cancellation and workflow/task eligibility checks apply before publication.
+
 ### Constant Backoff
 
 Fixed delay between retries:

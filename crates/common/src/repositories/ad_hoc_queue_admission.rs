@@ -14,6 +14,10 @@ use crate::{
 use sqlx::PgConnection;
 
 pub struct AdHocQueueAdmissionRepository;
+pub enum AdHocQueueSource {
+    Execution(Id),
+    Human(crate::runtime_authority::HumanAttribution),
+}
 impl AdHocQueueAdmissionRepository {
     /// Single dispatch retains its parent directly. Batch dispatch seals A's
     /// bounded accepted-item dependency manifest before consuming authority.
@@ -39,7 +43,7 @@ impl AdHocQueueAdmissionRepository {
         conn: &mut PgConnection,
         queue: &WorkQueue,
         item: &WorkQueueItem,
-        parent: Id,
+        source: AdHocQueueSource,
         snapshot: &ExecutionExecutableSnapshot,
     ) -> Result<()> {
         Self::validate_shape(queue)?;
@@ -48,21 +52,51 @@ impl AdHocQueueAdmissionRepository {
         {
             return Err(Error::validation("Ad-hoc accepted item target mismatch"));
         }
-        let source_admission =
-            ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(parent)).await?;
-        use super::FindById;
-        let source = super::execution::ExecutionRepository::find_by_id(&mut *conn, parent)
-            .await?
-            .and_then(|execution| execution.executable_snapshot)
-            .ok_or_else(|| {
-                Error::PermissionDenied("Ad-hoc acceptance source executable unavailable".into())
-            })?;
         crate::action_visibility::ensure_action_reference_allowed(
             &snapshot.executable.action,
-            Some(&source.executable.action.pack_ref),
+            queue.pack_ref.as_deref(),
             "queue dispatch",
             &queue.r#ref,
         )?;
+        use super::FindById;
+        let (source_admission, attribution) = match source {
+            AdHocQueueSource::Execution(parent) => {
+                let admission =
+                    ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(parent))
+                        .await?;
+                let source = super::execution::ExecutionRepository::find_by_id(&mut *conn, parent)
+                    .await?
+                    .and_then(|execution| execution.executable_snapshot)
+                    .ok_or_else(|| {
+                        Error::PermissionDenied(
+                            "Ad-hoc acceptance source executable unavailable".into(),
+                        )
+                    })?;
+                crate::action_visibility::ensure_action_reference_allowed(
+                    &snapshot.executable.action,
+                    Some(&source.executable.action.pack_ref),
+                    "queue dispatch",
+                    &queue.r#ref,
+                )?;
+                if item.requested_by_execution != Some(parent) {
+                    return Err(Error::validation("Ad-hoc source execution mismatch"));
+                }
+                (
+                    Some(admission.id),
+                    RequestAttribution::ParentExecution {
+                        execution_id: parent,
+                    },
+                )
+            }
+            AdHocQueueSource::Human(actor) => {
+                if item.requested_by_identity != Some(actor.identity_id)
+                    || item.requested_by_execution.is_some()
+                {
+                    return Err(Error::validation("Ad-hoc human requester mismatch"));
+                }
+                (None, RequestAttribution::Human { actor })
+            }
+        };
         let refs = queue.permission_set_refs.as_deref().unwrap_or(
             &snapshot
                 .executable
@@ -77,9 +111,7 @@ impl AdHocQueueAdmissionRepository {
             },
             snapshot,
             refs,
-            RequestAttribution::ParentExecution {
-                execution_id: parent,
-            },
+            attribution,
             super::runtime_target::RuntimeTarget::Component(
                 super::runtime_target::ComponentTarget::Action,
                 snapshot.executable.action.id,
@@ -112,7 +144,7 @@ impl AdHocQueueAdmissionRepository {
         let schema_digest = crate::value_schema::digest(&binding)
             .map_err(|_| Error::validation("Invalid accepted action schema"))?;
         sqlx::query("INSERT INTO work_queue_item_ad_hoc_dispatch(item,source_admission,template,template_digest,schema_binding,schema_digest) VALUES ($1,$2,$3,$4,$5,$6)")
-            .bind(item.id).bind(source_admission.id).bind(template).bind(digest).bind(binding).bind(schema_digest).execute(&mut *conn).await?;
+            .bind(item.id).bind(source_admission).bind(template).bind(digest).bind(binding).bind(schema_digest).execute(&mut *conn).await?;
         admission.ensure_fresh_on(conn).await
     }
 
@@ -131,7 +163,7 @@ impl AdHocQueueAdmissionRepository {
         }
         let mut accepted = None;
         for item in items {
-            let row: Option<(Id, serde_json::Value, String)> = sqlx::query_as("SELECT source_admission,template,template_digest FROM work_queue_item_ad_hoc_dispatch WHERE item = $1 FOR SHARE")
+            let row: Option<(Option<Id>, serde_json::Value, String)> = sqlx::query_as("SELECT source_admission,template,template_digest FROM work_queue_item_ad_hoc_dispatch WHERE item = $1 FOR SHARE")
                 .bind(item.id).fetch_optional(&mut *conn).await?;
             let Some((source_admission, body, expected)) = row else {
                 if ExecutionAdmissionRepository::has_queue_item_admission(conn, items).await? {
@@ -141,20 +173,20 @@ impl AdHocQueueAdmissionRepository {
                 }
                 return Ok(None);
             };
-            let source =
-                super::runtime_authority::RuntimeAuthorityRepository::require_retained_admission(
-                    conn,
-                    source_admission,
-                )
-                .await?;
             let attribution: serde_json::Value = sqlx::query_scalar("SELECT authority->'attribution' FROM work_queue_item_runtime_admission WHERE item = $1")
                 .bind(item.id).fetch_one(&mut *conn).await?;
-            if source.owner_kind != "execution"
-                || attribution
-                    != serde_json::to_value(RequestAttribution::ParentExecution {
-                        execution_id: source.owner_id,
-                    })?
-            {
+            let attribution: RequestAttribution = serde_json::from_value(attribution)?;
+            let valid_source = if let Some(id) = source_admission {
+                let source = super::runtime_authority::RuntimeAuthorityRepository::require_retained_admission(conn, id).await?;
+                source.owner_kind == "execution"
+                    && attribution
+                        == (RequestAttribution::ParentExecution {
+                            execution_id: source.owner_id,
+                        })
+            } else {
+                matches!(attribution, RequestAttribution::Human { .. })
+            };
+            if !valid_source {
                 return Err(Error::PermissionDenied(
                     "Ad-hoc dispatch source admission mismatch".into(),
                 ));
@@ -193,12 +225,20 @@ impl AdHocQueueAdmissionRepository {
     pub async fn source_effect_fence(
         conn: &mut PgConnection,
         item: Id,
-    ) -> Result<super::runtime_authority::ApprovalEffectFence> {
-        let source: Id = sqlx::query_scalar(
+    ) -> Result<Option<super::runtime_authority::ApprovalEffectFence>> {
+        let source: Option<Id> = sqlx::query_scalar(
             "SELECT source_admission FROM work_queue_item_ad_hoc_dispatch WHERE item = $1 FOR SHARE",
         ).bind(item).fetch_one(&mut *conn).await?;
-        super::runtime_authority::RuntimeAuthorityRepository::retained_admission_fence(conn, source)
-            .await
+        match source {
+            Some(source) => {
+                super::runtime_authority::RuntimeAuthorityRepository::retained_admission_fence(
+                    conn, source,
+                )
+                .await
+                .map(Some)
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn require_drained(conn: &mut PgConnection, queue: Id) -> Result<()> {

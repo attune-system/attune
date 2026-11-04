@@ -50,6 +50,12 @@ tasks:
   - name: permitted_single
     action: adhoc_workflow_delegation_it.consume
     permission_set_refs: "{{ parameters.refs }}"
+  - name: retry_single
+    action: adhoc_workflow_delegation_it.consume
+    permission_set_refs: "{{ parameters.refs }}"
+    retry:
+      count: 2
+      delay: 0
 "#;
         let files = [
             (
