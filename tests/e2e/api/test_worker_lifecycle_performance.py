@@ -57,9 +57,10 @@ class CompletionObserver:
         self.threads = []
 
     def __enter__(self):
-        self.session.put(self.queue_url, json={"durable":False,"auto_delete":False,
-            "arguments":{"x-expires":600000}}, timeout=10).raise_for_status()
         try:
+            # Supported by the broker's default policy, including RabbitMQ 4.
+            self.session.put(self.queue_url, json={"durable":True,"auto_delete":False,
+                "arguments":{"x-expires":600000,"x-queue-type":"classic"}}, timeout=10).raise_for_status()
             self.session.post(self.bind_url, json={"routing_key":"execution.completed","arguments":{}}, timeout=10).raise_for_status()
             for target in (self.database_loop, self.broker_loop):
                 thread = threading.Thread(target=self.run, args=(target,))
@@ -122,7 +123,9 @@ class CompletionObserver:
             thread.join(timeout=12)
         alive = [thread.name for thread in self.threads if thread.is_alive()]
         try:
-            self.session.delete(self.queue_url, timeout=10).raise_for_status()
+            response = self.session.delete(self.queue_url, timeout=10)
+            if response.status_code != 404:
+                response.raise_for_status()
         finally:
             self.session.close()
         assert not alive, f"completion observers did not stop: {alive}"
@@ -157,15 +160,24 @@ def test_worker_lifecycle_profile(client, tmp_path):
         }))
         scenarios.append((name, f"{pack_ref}.{name}", {}, status, stdout, stderr))
     client.upload_pack(str(pack))
-    assert client.get_action_by_ref(f"{pack_ref}.json_stdout")["output_format"] == "json"
 
     report = {"source_revision": os.environ["ATTUNE_WORKER_BENCHMARK_REVISION"],
               "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "capture_finalization_budget_ms": int(os.environ["ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS"]),
               "samples_per_profile": samples, "clock": "monotonic request to observed PostgreSQL/MQ completion; MQ observation polls management at 10ms",
-              "scope": "owned full-stack; SQL totals include orchestration and background activity; phase timings are in worker logs",
+              "scope": "owned full-stack; SQL totals include orchestration and background activity; MQ uses an additional expiring durable classic observer queue; phase timings are in worker logs",
               "backend": os.getenv("ATTUNE_WORKER_BENCHMARK_TRANSPORT", "volume"), "profiles": [], "first_invocations": {}}
     # This extension and its counters belong exclusively to this disposable stack.
     with psycopg.connect(db_url, autocommit=True) as observer, psycopg.connect(db_url, autocommit=True) as listener:
+        assert observer.execute("SELECT output_format::text FROM action WHERE ref=%s", (f"{pack_ref}.json_stdout",)).fetchone()[0] == "json"
+        expected_workers = {f"worker-{kind}-01" for kind in ("shell", "python", "node", "full")}
+        readiness_deadline = time.monotonic() + 180
+        while True:
+            active_workers = {name for (name,) in observer.execute("SELECT name FROM worker WHERE status IN ('active','busy')")}
+            if expected_workers <= active_workers:
+                break
+            assert time.monotonic() < readiness_deadline, f"benchmark workers not ready: {sorted(expected_workers-active_workers)}"
+            time.sleep(0.1)
         observer.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         listener.execute("LISTEN execution_status_changed")
 
@@ -198,12 +210,15 @@ def test_worker_lifecycle_profile(client, tmp_path):
                     after = _statements(observer)
                     ids = list(values)
                     streams = observer.execute(
-                        "SELECT av.execution, av.meta->>'stream', s.backend::text, count(*) FROM artifact_version av "
+                        "SELECT av.execution, av.meta->>'stream', s.backend::text, count(*), bool_and(s.sealed AND av.body_state='ready') FROM artifact_version av "
                         "JOIN log_stream s ON s.artifact_version=av.id WHERE av.execution=ANY(%s) "
                         "GROUP BY av.execution,av.meta->>'stream',s.backend", (ids,)).fetchall()
-                    counts = Counter({(execution, stream): count for execution, stream, backend, count in streams})
+                    counts = Counter({(execution, stream): count for execution, stream, backend, count, _ in streams})
                     expected_backend = "shared_file" if report["backend"] == "volume" else "object_segments"
-                    assert all(backend == expected_backend for _, _, backend, _ in streams), "storage backend differs from the requested profile"
+                    assert all(backend == expected_backend for _, _, backend, _, _ in streams), "storage backend differs from the requested profile"
+                    assert all(ready for _, _, _, _, ready in streams), "measured output must be sealed and ready"
+                    results = observer.execute("SELECT id,result FROM execution WHERE id=ANY(%s)", (ids,)).fetchall()
+                    assert all(not result.get("logs_incomplete", False) for _, result in results), "measured output capture must be complete"
                     if expect_lazy:
                         for execution in ids:
                             assert counts[execution, "stdout"] == stdout
@@ -217,7 +232,7 @@ def test_worker_lifecycle_profile(client, tmp_path):
                             assert version_counts.get(execution, 0) == stdout+stderr
                         if stdout + stderr == 0:
                             assert observer.execute("SELECT count(*) FROM artifact WHERE owner=%s", (reference,)).fetchone()[0] == 0
-                        for execution, result in observer.execute("SELECT id,result FROM execution WHERE id=ANY(%s)", (ids,)):
+                        for execution, result in results:
                             capture = result["runtime_log_capture"]
                             assert capture == {"stdout":"captured" if stdout else "empty", "stderr":"captured" if stderr else "empty"}, (execution, capture)
                             if name == "json_stdout":
