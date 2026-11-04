@@ -1,0 +1,34 @@
+# Used only with the owned E2E runner. No fixed ports or external resources.
+services:
+  postgres:
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "pg_stat_statements.track=all", "-c", "log_lock_waits=on", "-c", "deadlock_timeout=50ms"]
+  api:
+    environment:
+      RUST_LOG: info,tower_http=debug,sqlx::query=debug,sqlx::pool::acquire=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"
+  worker-shell:
+    environment:
+      RUST_LOG: info,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"
+      ATTUNE__ARTIFACTS__TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
+  worker-python:
+    environment:
+      RUST_LOG: info,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"
+      ATTUNE__ARTIFACTS__TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
+  worker-node:
+    environment:
+      RUST_LOG: info,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"
+      ATTUNE__ARTIFACTS__TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
+  worker-full:
+    environment:
+      RUST_LOG: info,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"
+      ATTUNE__ARTIFACTS__TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
+  e2e-tests:
+    environment:
+      ATTUNE_WORKER_BENCHMARK_SAMPLES: ${ATTUNE_WORKER_BENCHMARK_SAMPLES:-20}
+      ATTUNE_WORKER_BENCHMARK_TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
+      ATTUNE_WORKER_BENCHMARK_EXPECT_LAZY: ${ATTUNE_WORKER_BENCHMARK_EXPECT_LAZY:-0}
+      ATTUNE_WORKER_BENCHMARK_REVISION: ${ATTUNE_WORKER_BENCHMARK_REVISION:?set the tested source revision}

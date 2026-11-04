@@ -56,81 +56,81 @@ change; capture an unchanged baseline before claiming performance improvements.
   execution outcome instead of discarding it.
 - [x] Construct status-change and completion messages from that persisted row,
   removing publication-time execution rereads and raw-result cloning.
-- [ ] Correct ordinary failure, timeout, and cancellation reporting, including
+- [x] Correct ordinary failure, timeout, and cancellation reporting, including
   accurate previous-state information and early preparation errors.
-- [ ] Review startup reads: use a guarded Running transition with returned data
+- [x] Review startup reads: use a guarded Running transition with returned data
   where safe, preserving cancellation, assignment, and MQ release validation.
-- [ ] Keep public executor callers and notification consumers coherent. Cover
+- [x] Keep public executor callers and notification consumers coherent. Cover
   existing failure paths where persistence itself fails; never invent a durable
   successful terminal transition.
 
 ### 3. Execution-scoped immutable preparation context
 
-- [ ] Load and validate the immutable schema binding once for input validation,
+- [x] Load and validate the immutable schema binding once for input validation,
   log sensitivity, and output protection.
-- [ ] Carry pinned executable metadata, log settings, and authorized parameter
+- [x] Carry pinned executable metadata, log settings, and authorized parameter
   secret paths through preparation and completion.
-- [ ] Remove redundant secret-owner/execution reads only where the existing
+- [x] Remove redundant secret-owner/execution reads only where the existing
   authorization contract can be preserved.
-- [ ] Continue closing runtime reads and collecting mutable secret origins at
+- [x] Continue closing runtime reads and collecting mutable secret origins at
   completion. Do not bypass redaction based only on an empty schema or absent
   API permission sets.
 
 ### 4. Existing-admission validation and freshness
 
-- [ ] Separate creation/idempotent admission recording from validation of an
+- [x] Separate creation/idempotent admission recording from validation of an
   existing retained admission. `ExecutionAdmissionRepository::require` currently
   replays `record_admission`, including executable resolution and conflict-ignored
   admission/attempt/fence inserts.
-- [ ] Pass validated source/context/permit records between helpers within a
+- [x] Pass validated source/context/permit records between helpers within a
   transaction rather than rediscovering them.
-- [ ] Consolidate each delivery freshness check to one PostgreSQL wall-clock
+- [x] Consolidate each delivery freshness check to one PostgreSQL wall-clock
   sample checking both approval and delivery bounds.
-- [ ] Retain source and dependency locks and final checks after target/file
+- [x] Retain source and dependency locks and final checks after target/file
   waits; do not substitute process-clock or cross-transaction cached authority.
 
 ### 5. Independent lazy stream allocation
 
-- [ ] Replace eager stdout/stderr allocation with uninitialized writer state
+- [x] Replace eager stdout/stderr allocation with uninitialized writer state
   holding execution-level context and stream-specific settings.
-- [ ] On the first nonempty write, allocate the artifact/version/stream/permit
+- [x] On the first nonempty write, allocate the artifact/version/stream/permit
   transactionally and return identifiers, path, and permit directly to the writer.
-- [ ] Initialize encryption after the version ID exists and before encoding
+- [x] Initialize encryption after the version ID exists and before encoding
   the first frame. Preserve bounded buffers, truncation notices, and manifests.
-- [ ] Reuse initialized writers for subsequent writes. Empty writes and sealing
+- [x] Reuse initialized writers for subsequent writes. Empty writes and sealing
   an unused writer cause no stream database allocation, file initialization,
   segment task, or seal request.
-- [ ] Retain execution-level delivery registration independently of log output.
-- [ ] Define cancellation during first allocation, failed allocation retries,
+- [x] Retain execution-level delivery registration independently of log output.
+- [x] Define cancellation during first allocation, failed allocation retries,
   and partial initialization behavior. Latch failures; prevent duplicate active
   writers or orphan publication from being reported as intentional silence.
 
 ### 6. Log settlement, cleanup, and reader semantics
 
-- [ ] Thread validated records through seal authorization, manifest verification,
+- [x] Thread validated records through seal authorization, manifest verification,
   bounds checks, and publication. Keep locked rereads that detect real races.
-- [ ] Carry allocated log metadata to result construction instead of rediscovering
+- [x] Carry allocated log metadata to result construction instead of rediscovering
   stderr paths. Preserve ordinary stderr whitespace/display behavior.
-- [ ] Exclude log streams in the ordinary file-finalization repository query,
+- [x] Exclude log streams in the ordinary file-finalization repository query,
   removing per-version exclusion queries. Batch compatible metadata size updates
   where useful and preserve zero-byte non-log file artifacts.
-- [ ] Treat terminal absence of a lazily allocated stream as successful empty
+- [x] Treat terminal absence of a lazily allocated stream as successful empty
   output unless capture metadata indicates failure. Define behavior for crashes
   and supervisor-settled executions where capture completeness is unknown.
-- [ ] Update protected and ordinary readers, UI behavior, subscription discovery,
+- [x] Update protected and ordinary readers, UI behavior, subscription discovery,
   reconnect/offset handling, and completion wakeups. An absent active stream
   remains discoverable after its first write; do not wait a terminal grace period
   for a positively known empty stream.
-- [ ] Evaluate combined sealing only if it reduces work without violating lock
+- [x] Evaluate combined sealing only if it reduces work without violating lock
   order, independent manifests, failure isolation, or storage settlement.
 
 ### 7. Warm release verification
 
-- [ ] Remove synchronous full-archive read/hash from every shared-volume receipt.
-- [ ] Verify during materialization and reuse verification only under an explicit
+- [x] Remove synchronous full-archive read/hash from every shared-volume receipt.
+- [x] Verify during materialization and reuse verification only under an explicit
   immutable-release integrity contract. Define invalidation for replacement,
   eviction, and shared-volume mutation; a marker alone is not proof of integrity.
-- [ ] Move remaining blocking archive work off Tokio executor threads and
+- [x] Move remaining blocking archive work off Tokio executor threads and
   coordinate concurrent materialization. Verify new/unverified content by digest.
 
 ### 8. Validation and measured acceptance
@@ -179,6 +179,8 @@ deployment to an existing environment remain outside the current authorization.
 - `crates/common/src/pack_transport/volume.rs`: receipt-time archive verification.
 
 ## Progress
+
+Historical checkpoints follow; later entries supersede earlier pending items.
 
 - Separate worktree: `/mnt/wdc/attune-worktrees/worker-execution-lifecycle`,
   branch `perf/worker-execution-lifecycle`, based on `880b1b2a`.
@@ -321,3 +323,55 @@ they do not establish database/MQ lifecycle or performance acceptance.
 - The final current-source security, worker and workspace checks are pending.
   Benchmark tooling is opt-in and still needs its first full-stack run; no
   latency reduction has been measured yet.
+
+### Implementation complete; acceptance checks in progress
+
+Implementation sequence items 2–7 are complete. Combined stdout/stderr sealing
+was evaluated and left independent: lazy capture already removes unused seals,
+and a combined endpoint would add multi-stream lock ordering and coupled failure
+semantics. Ordinary artifact settlement keeps per-artifact updates; the filtered
+query removes all log versions from that path without changing file durability.
+
+The benchmark harness and Compose configuration pass Python syntax and Compose
+configuration checks. The harness uses an actual published fixture pack so JSON
+stdout has a recorded JSON output contract. Measured acceptance and final current-
+source checks remain pending; the checklist does not claim those results yet.
+
+- Current-source live-stream authorization tests passed: all 11 cases on shared
+  files/object segments, including corrupt seals, revocation and expiry after
+  decoder waits, and fixed-origin disclosure. This is additional to the earlier
+  14 seal-operation and nine versioned-storage correctness cases.
+- Docker Desktop cannot bind the external worktree path. Full-stack runs use
+  verified snapshots under the original repository's Docker-shared `.scratch`
+  directory. No Docker settings or development stack resources were changed.
+  Baseline image build completed successfully; treatment images are building.
+
+### Final compilation and contended authority run
+
+- Runtime source remains `ca202d5f`; later changes in this checkpoint are the
+  benchmark harness, its Compose override and documentation.
+- All 196 worker library tests, all seven recorded-input/worker-boundary tests,
+  both worker-transition repository tests, and all 11 live-stream authorization
+  tests passed. The new admission INSERT-rejection and safe prelaunch regressions
+  are included in those totals.
+- Full workspace all-targets checking and scoped common/worker/API all-targets
+  Clippy with warnings denied passed. The three remaining worker integration
+  executables (secret handling, runtime access and truncation) compiled.
+- The broad authority run completed 269 cases: 266 passed and three failed while
+  image builds and diagnostic executables competed for resources. Retained-batch
+  reclamation was deferred, an empty-wait cleanup exceeded its original consent
+  budget, and an iteration preparation was denied after a 10-second approval was
+  issued. The retained-batch case passed alone. These failures remain recorded;
+  a complete isolated run is required before accepting that suite.
+- The passing versioned-storage test binary contains the new seal-authorization
+  helper. Its functional API/common paths are unchanged by the subsequent
+  tracing and unrecorded-worker-allocation edits, so its nine correctness cases
+  and direct-storage authority result remain applicable. The idle validation
+  will separately repeat the 14 focused seal cases using the current live-stream
+  test executable, with binary hashes retained as evidence.
+- Both musl image builds emit the same linker warning about deprecated
+  optimization setting `1`; the unchanged baseline exhibits it too. Host
+  workspace checks and warnings-denied Clippy are clean. Detailed build logs
+  will be retained with benchmark evidence.
+- The benchmark passes syntax, Compose configuration and pytest collection
+  checks. Full-stack execution and measured acceptance remain pending.
