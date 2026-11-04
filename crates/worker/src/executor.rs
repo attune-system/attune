@@ -60,6 +60,13 @@ use crate::artifacts::ArtifactManager;
 use crate::runtime::{BoundedLogFileWriter, ExecutionContext, ExecutionResult, RuntimeRegistry};
 use crate::secrets::SecretManager;
 
+/// A persisted terminal row and the process outcome. Preparation failures can
+/// have a durable Failed row even though no process result exists.
+pub(crate) struct ExecutionOutcome {
+    pub execution: Execution,
+    pub result: Result<ExecutionResult>,
+}
+
 /// Action executor that orchestrates execution flow
 pub struct ActionExecutor {
     pool: PgPool,
@@ -411,6 +418,16 @@ impl ActionExecutor {
         execution_id: i64,
         cancel_token: CancellationToken,
     ) -> Result<ExecutionResult> {
+        self.execute_with_cancel_outcome(execution_id, cancel_token)
+            .await?
+            .result
+    }
+
+    pub(crate) async fn execute_with_cancel_outcome(
+        &self,
+        execution_id: i64,
+        cancel_token: CancellationToken,
+    ) -> Result<ExecutionOutcome> {
         info!("Starting execution: {}", execution_id);
 
         // Update execution status to running
@@ -433,14 +450,18 @@ impl ActionExecutor {
             Ok(ctx) => ctx,
             Err(e) => {
                 error!("Failed to prepare execution context: {}", e);
-                self.handle_execution_failure(
-                    execution_id,
-                    Some(&action),
-                    None,
-                    Some(&format!("Failed to prepare execution context: {}", e)),
-                )
-                .await?;
-                return Err(e);
+                let execution = self
+                    .handle_execution_failure(
+                        execution_id,
+                        Some(&action),
+                        None,
+                        Some(&format!("Failed to prepare execution context: {}", e)),
+                    )
+                    .await?;
+                return Ok(ExecutionOutcome {
+                    execution,
+                    result: Err(e),
+                });
             }
         };
 
@@ -461,14 +482,18 @@ impl ActionExecutor {
                     );
                 }
                 // This should only happen for unrecoverable errors like runtime not found
-                self.handle_execution_failure(
-                    execution_id,
-                    Some(&action),
-                    None,
-                    Some(&format!("Action execution failed: {}", e)),
-                )
-                .await?;
-                return Err(e);
+                let execution = self
+                    .handle_execution_failure(
+                        execution_id,
+                        Some(&action),
+                        None,
+                        Some(&format!("Action execution failed: {}", e)),
+                    )
+                    .await?;
+                return Ok(ExecutionOutcome {
+                    execution,
+                    result: Err(e),
+                });
             }
         };
 
@@ -504,19 +529,19 @@ impl ActionExecutor {
                 .as_deref()
                 .is_some_and(|e| e.contains("cancelled"));
 
-        if was_cancelled {
+        let execution = if was_cancelled {
             self.handle_execution_cancelled(execution_id, &action, &result)
-                .await?;
+                .await?
         } else if result.timed_out {
             self.handle_execution_timeout(execution_id, &action, &result)
-                .await?;
+                .await?
         } else if is_success {
             self.handle_execution_success(execution_id, &action, &result)
-                .await?;
+                .await?
         } else {
             self.handle_execution_failure(execution_id, Some(&action), Some(&result), None)
-                .await?;
-        }
+                .await?
+        };
 
         info!(
             "Execution {} completed: {}",
@@ -530,7 +555,10 @@ impl ActionExecutor {
             }
         );
 
-        Ok(result)
+        Ok(ExecutionOutcome {
+            execution,
+            result: Ok(result),
+        })
     }
 
     /// Load execution from database
@@ -1949,7 +1977,7 @@ impl ActionExecutor {
         execution_id: i64,
         action: &Action,
         result: &ExecutionResult,
-    ) -> Result<()> {
+    ) -> Result<Execution> {
         info!(
             "Execution {} succeeded (exit_code={}, duration={}ms)",
             execution_id, result.exit_code, result.duration_ms
@@ -1995,9 +2023,7 @@ impl ActionExecutor {
             ..Default::default()
         };
 
-        ExecutionRepository::update(&self.pool, execution_id, input).await?;
-
-        Ok(())
+        ExecutionRepository::update(&self.pool, execution_id, input).await
     }
 
     fn copy_reserved_queue_ack(
@@ -2114,7 +2140,7 @@ impl ActionExecutor {
         action: Option<&Action>,
         result: Option<&ExecutionResult>,
         error_message: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Execution> {
         if let Some(r) = result {
             error!(
                 execution_id,
@@ -2230,9 +2256,7 @@ impl ActionExecutor {
             ..Default::default()
         };
 
-        ExecutionRepository::update(&self.pool, execution_id, input).await?;
-
-        Ok(())
+        ExecutionRepository::update(&self.pool, execution_id, input).await
     }
 
     async fn handle_execution_cancelled(
@@ -2240,7 +2264,7 @@ impl ActionExecutor {
         execution_id: i64,
         action: &Action,
         result: &ExecutionResult,
-    ) -> Result<()> {
+    ) -> Result<Execution> {
         emit_runtime_log_truncation_events(execution_id, result);
         let mut result_data = serde_json::json!({
             "succeeded": false,
@@ -2291,9 +2315,7 @@ impl ActionExecutor {
             ..Default::default()
         };
 
-        ExecutionRepository::update(&self.pool, execution_id, input).await?;
-
-        Ok(())
+        ExecutionRepository::update(&self.pool, execution_id, input).await
     }
 
     /// Persist a terminal `Timeout` status for an execution that exceeded its
@@ -2303,7 +2325,7 @@ impl ActionExecutor {
         execution_id: i64,
         action: &Action,
         result: &ExecutionResult,
-    ) -> Result<()> {
+    ) -> Result<Execution> {
         emit_runtime_log_truncation_events(execution_id, result);
         let mut result_data = serde_json::json!({
             "succeeded": false,
@@ -2357,9 +2379,7 @@ impl ActionExecutor {
             ..Default::default()
         };
 
-        ExecutionRepository::update(&self.pool, execution_id, input).await?;
-
-        Ok(())
+        ExecutionRepository::update(&self.pool, execution_id, input).await
     }
 
     /// Update execution status
