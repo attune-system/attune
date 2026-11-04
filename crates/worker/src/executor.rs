@@ -186,19 +186,27 @@ fn emit_runtime_log_truncation_events(execution_id: i64, result: &ExecutionResul
     }
 }
 
-fn record_incomplete_runtime_logs(result_data: &mut serde_json::Value, result: &ExecutionResult) {
-    let state = |empty: bool, truncated: bool| {
+fn record_runtime_log_capture(
+    result_data: &mut serde_json::Value,
+    result: &ExecutionResult,
+    allocation: Option<(bool, bool)>,
+) {
+    // Structured stdout is removed from ExecutionResult.stdout after parsing.
+    // Allocation evidence, rather than that string, proves whether bytes arrived.
+    let state = |allocated: Option<bool>| {
         if result.logs_incomplete {
             "incomplete"
-        } else if empty && !truncated {
-            "empty"
         } else {
-            "captured"
+            match allocated {
+                Some(true) => "captured",
+                Some(false) => "empty",
+                None => "unknown",
+            }
         }
     };
     result_data["runtime_log_capture"] = serde_json::json!({
-        "stdout": state(result.stdout.is_empty(), result.stdout_truncated),
-        "stderr": state(result.stderr.is_empty(), result.stderr_truncated),
+        "stdout": state(allocation.map(|(stdout, _)| stdout)),
+        "stderr": state(allocation.map(|(_, stderr)| stderr)),
     });
     if result.logs_incomplete {
         result_data["logs_incomplete"] = serde_json::json!(true);
@@ -273,6 +281,15 @@ struct ExecutionPreparation {
     parameter_secret_paths: Option<Vec<String>>,
     stdout_path: Arc<OnceLock<PathBuf>>,
     stderr_path: Arc<OnceLock<PathBuf>>,
+}
+
+impl ExecutionPreparation {
+    fn log_allocation(&self) -> (bool, bool) {
+        (
+            self.stdout_path.get().is_some(),
+            self.stderr_path.get().is_some(),
+        )
+    }
 }
 
 struct ExecutionLogArtifacts {
@@ -2075,7 +2092,7 @@ impl ActionExecutor {
             Self::copy_reserved_queue_ack(&mut result_data, parsed_result);
         }
 
-        record_incomplete_runtime_logs(&mut result_data, result);
+        record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
             .await?;
@@ -2326,7 +2343,11 @@ impl ActionExecutor {
         }
 
         if let Some(result) = result {
-            record_incomplete_runtime_logs(&mut result_data, result);
+            record_runtime_log_capture(
+                &mut result_data,
+                result,
+                preparation.map(ExecutionPreparation::log_allocation),
+            );
         }
         if let Some(action) = action {
             result_data = self
@@ -2392,7 +2413,7 @@ impl ActionExecutor {
             Self::copy_reserved_queue_ack(&mut result_data, parsed_result);
         }
 
-        record_incomplete_runtime_logs(&mut result_data, result);
+        record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
 
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
@@ -2461,7 +2482,7 @@ impl ActionExecutor {
             Self::copy_reserved_queue_ack(&mut result_data, parsed_result);
         }
 
-        record_incomplete_runtime_logs(&mut result_data, result);
+        record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
 
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
@@ -2494,6 +2515,24 @@ mod tests {
     use attune_common::repositories::Create;
     use attune_common::test_database::TestDatabase;
     use chrono::Utc;
+
+    #[test]
+    fn parsed_stdout_is_captured_even_when_the_result_stdout_string_is_empty() {
+        let mut result =
+            ExecutionResult::success(String::new(), Some(serde_json::json!({"answer":42})), 1);
+        let mut metadata = serde_json::json!({});
+        record_runtime_log_capture(&mut metadata, &result, Some((true, false)));
+        assert_eq!(
+            metadata["runtime_log_capture"],
+            serde_json::json!({"stdout":"captured","stderr":"empty"})
+        );
+        record_runtime_log_capture(&mut metadata, &result, None);
+        assert_eq!(metadata["runtime_log_capture"]["stdout"], "unknown");
+        result.logs_incomplete = true;
+        record_runtime_log_capture(&mut metadata, &result, Some((false, false)));
+        assert_eq!(metadata["runtime_log_capture"]["stdout"], "incomplete");
+        assert_eq!(metadata["runtime_log_capture"]["stderr"], "incomplete");
+    }
 
     #[tokio::test]
     async fn concurrent_first_log_allocations_share_one_artifact_and_distinct_paths() {
