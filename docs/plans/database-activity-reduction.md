@@ -499,3 +499,45 @@ the container and its volume; absence of both resources was independently
 verified. Ownership and cleanup results are retained in
 `.scratch/database-activity/db-cleanup.json`. No deployment or database reset is
 part of this work.
+
+## Broader measurement campaign — 2026-11-05
+
+A fresh full-stack campaign is in progress. Runtime checkpoints are the original
+pre-worker-optimization `6906b968`, the validated worker treatment `ece3c859`
+(runtime source/build inputs identical to worker PR head `6dc75148`), and the
+database-reduction checkpoint `747832c9`. Validated baseline image identities are
+retained; the database treatment service/agent images are rebuilt. Python test
+instrumentation and observer images are identical across phases and recorded
+separately from runtime source revisions.
+
+Primary comparisons use six action workloads, serial and concurrency-four
+profiles, shared-file and API/object-segment transports, and 100 measured samples
+per profile. Each action's first invocation and 16 warmup executions remain
+separate. All primary runs use the same 10,000 ms capture-finalization budget;
+current-treatment 1,000 ms default-budget probes are separate 20-sample runs.
+The primary dataset is intended to contain 7,200 measured executions across the
+three checkpoints and two transports. No passing run or speedup is claimed until
+collection and provenance/teardown checks complete.
+
+Each disposable stack includes eight enabled empty queues, a 60-second settling
+interval, and a 60-second idle measurement. This exercises capacity observations
+rather than measuring a stack with no enabled queues. Counter snapshots separate
+top-level/nested SQL and observer statements, collect server execution time, WAL
+and block counters, and reject resets/evictions. Nested time and WAL can overlap
+parent accounting; top-level totals are reported separately. The statement table
+is sized to 50,000 entries on every stack to retain startup and workload entries.
+
+Execution clocks separately record HTTP-request-to-observed durable terminal
+notification and HTTP-request-to-observed MQ completion. The latter includes
+management polling and is not exact publication time. Original-baseline incorrect
+failure message statuses remain recorded defects, not silently accepted as
+correct behavior. Whole-stack SQL/profile totals include background work and
+must not be described as attributed worker round trips.
+
+Raw snapshots, manifests, build logs, image identities and analysis scripts are
+retained under `.scratch/database-measurements/`. Collection runs sequentially
+after image compilation to avoid compiler load contaminating runtime latency.
+Both snapshots receive the same instrumentation overlays; runtime inputs remain
+frozen. The original baselines are reused only with explicit image/source
+provenance; they are measured again on fresh owned stacks, not compared solely
+against historic timings.
