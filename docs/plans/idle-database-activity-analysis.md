@@ -1,6 +1,7 @@
 # Idle database activity: source analysis and implementation opportunities
 
-Date: 2026-11-05. Status: analysis complete; proposals below are not implemented.
+Date: 2026-11-05. Status: initial queue/retention slice implemented and scoped-tested;
+outbox wakeups, inquiry scheduling and connection reuse remain proposals.
 Code inspected: `2ad41436`. Evidence: the six accepted primary matrices in the
 [measurement report](../testing/benchmarks/database-activity-2026-11-05/README.md),
 plus a fresh examination of retained idle-window service logs. No services were
@@ -202,3 +203,57 @@ Validation: read-only source/log analysis; all six primary logs confirm the
 retention override. Documentation links and diff whitespace checks pass. No
 runtime change was made, so application suites were not rerun. The earlier
 capture-completeness failure and required CI remain separate merge-readiness gaps.
+
+
+## Initial implementation slice
+
+Started from merged main `4846e607` on `perf/idle-database-activity`.
+The first slice implements items 2–4 without changing polling intervals:
+
+- `latest_terminal_for_queue` is read only for concurrency-one queues with a
+  positive inter-execution delay. Existing delay calculation and capacity checks
+  are unchanged for that case.
+- Each existing bounded enabled-queue page gets one repository `EXISTS` readiness
+  snapshot for queued/retry items. Empty queues skip tunable resolution, capacity/
+  history reads and protected lease preparation. The hint takes no row locks and
+  conveys no authority. If every queue has work, it is an additional bounded
+  indexed read per poll; active-load overhead needs separate measurement. The original transaction rechecks and leases ready
+  candidates. Recovery runs before the hint, independently. A newly ready item
+  missed by the snapshot is considered on the next unchanged five-second poll.
+- Retention target seeds use one typed `unnest` insert rather than 16 inserts.
+  The singleton insert remains separate: initialization issues two statements
+  instead of 17, and ordinary load issues four instead of 19. `ON CONFLICT DO
+  NOTHING`, current persisted values, keep-forever NULLs, missing-target repair,
+  and normal settings reload behavior remain intact.
+
+Queue coverage exercises all item states, selected-queue isolation, empty input
+and a leased item returning to retry. Retention coverage includes concurrent
+repair of a missing target while preserving operator values. These repository
+checks complement existing lease/coalescing/admission and dispatcher delay tests.
+
+These are source-level work reductions; no new whole-stack speedup or normal-
+cadence idle savings are claimed by this checkpoint. Outbox wakeup changes need
+notification/reconnect/deadline coverage and are not bundled into this slice.
+
+
+### Validation handoff for this slice
+
+Status: **work in progress** for merge readiness and the remaining idle plan.
+
+Validation runs use stock PostgreSQL 18 on owned disposable infrastructure,
+unique `ATTUNE_TEST_RUN_ID` values, and four test threads. Tested source is
+`4846e607` plus the retained `.scratch/idle-implementation/runtime.diff`:
+
+- `cargo test -p attune-common --test work_queue_repository_tests -- --nocapture --test-threads=4`: 11 passed, zero failed/ignored.
+- `cargo test -p attune-common --lib repositories::retention:: -- --nocapture --test-threads=4`: 15 passed, zero failed/ignored; 1,254 outside the filter.
+- `cargo test -p attune-executor --lib queue_dispatcher::tests:: -- --nocapture --test-threads=4`: 18 passed, zero failed/ignored; 299 outside the filter.
+
+Clippy for common/executor with `--all-targets --no-deps -- -D warnings`,
+`cargo fmt --all -- --check`, and `git diff --check` pass. Full commands,
+run identities and logs remain under `.scratch/idle-implementation/`.
+The exploratory full-suite statement-counter snapshot evicted entries and is
+retained only as diagnostic data, not used as a savings measurement. Normal-cadence full-stack measurements, active
+load comparisons, end-to-end queue dispatch/recovery checks and required CI are
+not completed by these scoped tests. No schema, migration or public API contract
+changes are introduced. Outbox delivery timing, retention cadence and connection
+ownership/disposal are unchanged by this slice.
