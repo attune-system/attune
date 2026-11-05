@@ -308,20 +308,8 @@ impl WorkQueueDispatcher {
     async fn dispatch_ready_batches_for_queue(&self, queue: &WorkQueue) -> Result<()> {
         let context =
             Self::resolve_queue_context(&self.pool, self.encryption_key.as_deref(), queue).await?;
-        let active_dispatches = WorkQueueDispatchRepository::search(
-            &self.pool,
-            &WorkQueueDispatchSearchFilters {
-                queue: Some(queue.id),
-                statuses: Some(vec![
-                    WorkQueueDispatchStatus::Leased,
-                    WorkQueueDispatchStatus::Dispatched,
-                ]),
-                limit: 1,
-                ..Default::default()
-            },
-        )
-        .await?
-        .total;
+        let active_dispatches =
+            WorkQueueDispatchRepository::count_active_for_queue(&self.pool, queue.id).await?;
 
         let active_dispatches = active_dispatches.min(u64::from(u32::MAX)) as u32;
         if active_dispatches >= context.concurrency {
