@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{FromRow, PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::models::log_stream::WorkflowLogOutboxRecord;
@@ -16,6 +16,17 @@ pub enum DeliveryRebase {
     Sealed,
     Incompatible,
 }
+
+/// State observed by the same statement that attempts the fenced claim.
+#[derive(Debug)]
+pub enum WorkflowLogClaim {
+    Claimed(WorkflowLogOutboxRecord),
+    /// A live head exists but is locked, leased, delayed, or otherwise unavailable.
+    Pending,
+    Empty,
+}
+
+pub const WORKFLOW_LOG_WAKEUP_CHANNEL: &str = "workflow_log_outbox_ready";
 
 pub struct WorkflowLogOutboxRepository;
 
@@ -152,9 +163,22 @@ impl WorkflowLogOutboxRepository {
         owner: Uuid,
         lease: Duration,
     ) -> Result<Option<WorkflowLogOutboxRecord>> {
+        Ok(
+            match Self::claim_next_with_state(pool, owner, lease).await? {
+                WorkflowLogClaim::Claimed(record) => Some(record),
+                WorkflowLogClaim::Pending | WorkflowLogClaim::Empty => None,
+            },
+        )
+    }
+
+    pub async fn claim_next_with_state(
+        pool: &PgPool,
+        owner: Uuid,
+        lease: Duration,
+    ) -> Result<WorkflowLogClaim> {
         let lease_milliseconds = i64::try_from(lease.as_millis())
             .map_err(|_| Error::validation("workflow log claim lease is too large"))?;
-        sqlx::query_as(
+        let row = sqlx::query(
             "WITH candidate AS ( \
                  SELECT item.id \
                  FROM workflow_log_outbox item \
@@ -175,19 +199,36 @@ impl WorkflowLogOutboxRepository {
                  WHERE item.id = candidate.id \
                   RETURNING item.id, item.workflow_execution, item.sequence, item.kind, \
                             item.payload, item.claimed_by, item.attempt_count \
-              ) \
+              ), resolved AS ( \
               SELECT claimed.id, claimed.workflow_execution, claimed.sequence, claimed.kind, \
                      claimed.payload, workflow.execution AS parent_execution, \
                     execution.action_ref, claimed.claimed_by, claimed.attempt_count \
              FROM claimed \
              JOIN workflow_execution workflow ON workflow.id = claimed.workflow_execution \
-             JOIN execution ON execution.id = workflow.execution",
+             JOIN execution ON execution.id = workflow.execution \
+             ) SELECT record.id, record.workflow_execution, record.sequence, record.kind, \
+                      record.payload, record.parent_execution, record.action_ref, \
+                      record.claimed_by, record.attempt_count, \
+                      CASE WHEN record.id IS NOT NULL THEN FALSE ELSE EXISTS( \
+                          SELECT 1 FROM workflow_log_outbox pending \
+                          WHERE pending.is_head AND pending.delivered_at IS NULL \
+                            AND pending.failed_at IS NULL \
+                      ) END AS pending \
+             FROM (VALUES (1)) AS singleton(dummy) LEFT JOIN resolved record ON TRUE",
         )
         .bind(owner)
         .bind(lease_milliseconds)
-        .fetch_optional(pool)
-        .await
-        .map_err(Into::into)
+        .fetch_one(pool)
+        .await?;
+        if row.try_get::<Option<i64>, _>("id")?.is_some() {
+            Ok(WorkflowLogClaim::Claimed(
+                WorkflowLogOutboxRecord::from_row(&row)?,
+            ))
+        } else if row.try_get::<bool, _>("pending")? {
+            Ok(WorkflowLogClaim::Pending)
+        } else {
+            Ok(WorkflowLogClaim::Empty)
+        }
     }
 
     pub async fn assign_delivery_sequence(

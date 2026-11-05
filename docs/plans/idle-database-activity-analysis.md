@@ -1,7 +1,7 @@
 # Idle database activity: source analysis and implementation opportunities
 
-Date: 2026-11-05. Status: initial queue/retention slice implemented and scoped-tested;
-outbox wakeups, inquiry scheduling and connection reuse remain proposals.
+Date: 2026-11-05. Status: queue/retention and workflow-log wakeup slices implemented
+and scoped-tested; inquiry scheduling and connection reuse remain proposals.
 Code inspected: `2ad41436`. Evidence: the six accepted primary matrices in the
 [measurement report](../testing/benchmarks/database-activity-2026-11-05/README.md),
 plus a fresh examination of retained idle-window service logs. No services were
@@ -257,3 +257,63 @@ load comparisons, end-to-end queue dispatch/recovery checks and required CI are
 not completed by these scoped tests. No schema, migration or public API contract
 changes are introduced. Outbox delivery timing, retention cadence and connection
 ownership/disposal are unchanged by this slice.
+
+
+## Workflow-log wakeup slice
+
+The next slice implements item 1 with commit-time empty NOTIFY hints and a
+same-statement claimed/pending/empty result. Only genuinely empty outboxes with
+a healthy listener use the new 4–5 second fallback. Pending heads and listener
+outages retain 100 ms polling; existing error backoff stays one second.
+
+A dedicated one-connection listener pool avoids consuming work-pool capacity.
+Connect attempts run inside the dispatcher future, so shutdown/cancellation can
+close their owned sockets without a detached background listener. Every
+registration/reconnection causes a durable scan; newly committed head changes
+wake normal delivery. Atomic claims, FIFO promotion and all effect fences remain
+in their existing paths. The [runtime log section](../workflows/workflow-execution-engine.md#durable-workflow-activity-logs)
+documents timing and rollout.
+
+Validation includes the existing delivery/retention/replica/shutdown cases plus
+commit/rollback visibility, insert-before-wait, explicit requeue, lost-listener
+recovery, future retry/lease eligibility without a later hint, bounded empty
+fallback, stalled connection setup and dedicated-socket cancellation. A
+statement-level counter in an exclusively owned test database measures empty
+claim attempts for two running dispatchers over ten seconds before checking
+append/seal FIFO delivery. It does not require a metrics extension or claim a
+whole-system speedup.
+
+### Workflow-log validation record
+
+The final delivery suite passes **29 cases**, zero failures/ignores, using
+`cargo test -p attune-executor --lib workflow::log::tests:: -- --nocapture --test-threads=4`.
+This includes 21 existing cases and eight wakeup/lifecycle cases. The final
+source starts from `032ad109` plus the retained
+`.scratch/outbox-wakeup/runtime.diff`; no runtime edits follow that capture.
+
+The two-dispatcher probe observed **six claim statements in 10,007 ms** after
+listener registration, then delivered eight appends and a seal exactly once in
+FIFO order. This short window can include initial post-subscription scans. It is
+an isolated component budget check with an owned statement-trigger counter,
+not a matched whole-stack performance comparison. The counter adds its own
+fixture-only write per claim; no CPU, WAL or throughput savings are inferred.
+Pending-head polling and reconnect fallback remain separate from this genuinely
+empty interval.
+
+Fresh stock PostgreSQL 18 migrations and workspace SQLx preparation pass. SQLx
+reports no macro queries found and produces no metadata changes; the dynamic
+claim SQL is covered by the repository-backed delivery cases. Validation logs,
+commands, run identities and probe output remain under `.scratch/outbox-wakeup/`.
+Clippy for common/executor all targets with warnings denied, workspace
+formatting, explicit formatting of the included wakeup tests, and diff checks
+pass on the final source. The earlier internal dead-code warning was fixed by
+making the single-step bool adapter test-only; runtime dispatch uses the typed
+claim outcome. Fresh migration bytes are applied without rewriting any recorded
+checksum. Owned listener sessions, the PostgreSQL container and its volume are
+checked absent before completing teardown.
+
+Status remains **work in progress** for merge readiness. Full-stack E2E, real
+object storage, sustained-backlog/large-replica load, normal-cadence idle baselines
+and required CI remain outstanding. The earlier shared-file capture-completeness
+observation is not addressed by this notification slice. No API schema/client
+change or retention scheduling change is included.
