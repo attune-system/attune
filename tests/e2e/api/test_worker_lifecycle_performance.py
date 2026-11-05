@@ -46,6 +46,13 @@ def _statements(connection):
             for query, top, calls, elapsed, wal, read, hit, count in rows}
 
 
+def _stats_epoch(connection):
+    dealloc, reset = connection.execute(
+        "SELECT dealloc,stats_reset FROM pg_stat_statements_info"
+    ).fetchone()
+    return {"dealloc": dealloc, "stats_reset": reset.isoformat()}
+
+
 def _statement_deltas(before, after):
     return {query: {"calls": values[0]-before.get(query, (0,)*6)[0],
                     "sql_exec_ms": values[1]-before.get(query, (0,)*6)[1],
@@ -211,6 +218,10 @@ def test_worker_lifecycle_profile(client, tmp_path):
             time.sleep(0.1)
         observer.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         listener.execute("LISTEN execution_status_changed")
+        report["postgres_settings"] = dict(observer.execute(
+            "SELECT name,setting FROM pg_settings WHERE name IN "
+            "('server_version','pg_stat_statements.track','pg_stat_statements.max',"
+            "'fsync','synchronous_commit','shared_buffers','max_connections')"))
 
         def cohort(action_ref, parameters, expected_status, concurrency, completion):
             def submit():
@@ -225,16 +236,35 @@ def test_worker_lifecycle_profile(client, tmp_path):
                 started = dict(pool.map(lambda _: submit(), range(concurrency)))
             return completion.wait(started, expected_status, expect_lazy)
 
+        # Include enabled empty queues so the capacity-query optimization is
+        # actually exercised during idle and execution measurements.
+        idle_queues = []
+        for index in range(8):
+            reference = f"adhoc.database_measurement_{index}"
+            response = client.session.post(f"{client.base_url}/api/v1/queues", json={
+                "ref": reference, "label": "Database measurement idle queue",
+                "dispatch_action_ref": "core.echo", "enabled": True,
+                "accepting_new_items": True, "batch_mode": "single",
+                "item_schema": {}, "config": {"ack_contract": {"version": 2}},
+            }, timeout=30)
+            assert response.status_code == 201, response.text
+            idle_queues.append(response.json()["data"]["id"])
+        report["enabled_empty_queue_ids"] = idle_queues
         # Fixed-duration observation, not readiness synchronization. Both revisions
         # use the same settling and measurement intervals with identical replicas.
         time.sleep(60)
+        idle_epoch = _stats_epoch(observer)
         idle_before = _statements(observer)
+        idle_start_wall = time.time()
         idle_start = time.monotonic()
         time.sleep(60)
         idle_after = _statements(observer)
+        assert _stats_epoch(observer) == idle_epoch, "idle counters reset or evicted"
         idle = _statement_deltas(idle_before, idle_after)
-        report["idle"] = {"seconds": time.monotonic()-idle_start,
+        report["idle"] = {"start_wall_time": idle_start_wall, "end_wall_time": time.time(), "seconds": time.monotonic()-idle_start,
                           **_statement_totals(idle), "statement_deltas": idle}
+        assert any("SELECT COUNT(*) FROM work_queue_dispatch" in " ".join(query.split())
+                   for query in idle), "idle queues did not exercise capacity observation"
         report["sql_timing_note"] = "Top-level and nested times overlap; summed sql_exec_ms is legacy inclusive work, not independent elapsed time."
         with CompletionObserver(listener) as completion:
             for name, reference, parameters, status, stdout, stderr in scenarios:
@@ -245,11 +275,14 @@ def test_worker_lifecycle_profile(client, tmp_path):
                     warmed.update(cohort(reference, parameters, status, 4, completion))
                 warm_workers = {worker for (worker,) in observer.execute("SELECT DISTINCT worker FROM execution WHERE id=ANY(%s)", (list(warmed),))}
                 for concurrency in (1, 4):
+                    epoch = _stats_epoch(observer)
+                    profile_start_wall = time.time()
                     before = _statements(observer)
                     values = {}
                     while len(values) < samples:
                         values.update(cohort(reference, parameters, status, min(concurrency, samples-len(values)), completion))
                     after = _statements(observer)
+                    assert _stats_epoch(observer) == epoch, "profile counters reset or evicted"
                     ids = list(values)
                     streams = observer.execute(
                         "SELECT av.execution, av.meta->>'stream', s.backend::text, count(*), bool_and(s.sealed AND av.body_state='ready') FROM artifact_version av "
@@ -281,6 +314,7 @@ def test_worker_lifecycle_profile(client, tmp_path):
                                 assert result["data"] == {"answer": 42} and not result.get("stdout")
                     deltas = _statement_deltas(before, after)
                     report["profiles"].append({"scenario": name, "concurrency": concurrency,
+                        "start_wall_time": profile_start_wall, "end_wall_time": time.time(),
                         "samples": values, "execution_ids": ids, "artifact_versions": dict(versions),
                         **_percentiles([value["observed_completion_ms"] for value in values.values()]), **_statement_totals(deltas),
                         "statement_deltas": deltas, "allocated_stream_rows": sum(counts.values())})

@@ -4,29 +4,29 @@ services:
     command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "pg_stat_statements.track=all", "-c", "log_lock_waits=on", "-c", "deadlock_timeout=50ms"]
   api:
     environment:
-      RUST_LOG: info,tower_http=debug,sqlx::query=debug,sqlx::pool::acquire=debug
+      RUST_LOG: info,attune::graph_transaction=debug,tower_http=debug,sqlx::query=debug,sqlx::pool::acquire=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
   worker-shell:
     environment:
-      RUST_LOG: info,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
+      RUST_LOG: info,attune::graph_transaction=debug,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
       ATTUNE__ARTIFACTS__TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
       ATTUNE__ARTIFACTS__LOG_FINALIZATION_TIMEOUT_MS: "${ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS:-10000}"
   worker-python:
     environment:
-      RUST_LOG: info,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
+      RUST_LOG: info,attune::graph_transaction=debug,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
       ATTUNE__ARTIFACTS__TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
       ATTUNE__ARTIFACTS__LOG_FINALIZATION_TIMEOUT_MS: "${ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS:-10000}"
   worker-node:
     environment:
-      RUST_LOG: info,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
+      RUST_LOG: info,attune::graph_transaction=debug,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
       ATTUNE__ARTIFACTS__TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
       ATTUNE__ARTIFACTS__LOG_FINALIZATION_TIMEOUT_MS: "${ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS:-10000}"
   worker-full:
     environment:
-      RUST_LOG: info,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
+      RUST_LOG: info,attune::graph_transaction=debug,attune_worker=debug,sqlx::query=debug,sqlx::pool::acquire=debug,reqwest=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
       ATTUNE__ARTIFACTS__TRANSPORT: ${ATTUNE_WORKER_BENCHMARK_TRANSPORT:-volume}
       ATTUNE__ARTIFACTS__LOG_FINALIZATION_TIMEOUT_MS: "${ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS:-10000}"
@@ -40,17 +40,17 @@ services:
 
   executor:
     environment:
-      RUST_LOG: info,sqlx::query=debug,sqlx::pool::acquire=debug
+      RUST_LOG: info,attune::graph_transaction=debug,sqlx::query=debug,sqlx::pool::acquire=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
   executor-2:
     environment:
-      RUST_LOG: info,sqlx::query=debug,sqlx::pool::acquire=debug
+      RUST_LOG: info,attune::graph_transaction=debug,sqlx::query=debug,sqlx::pool::acquire=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
   supervisor:
     environment:
-      RUST_LOG: info,sqlx::query=debug,sqlx::pool::acquire=debug
+      RUST_LOG: info,attune::graph_transaction=debug,sqlx::query=debug,sqlx::pool::acquire=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
   notifier:
     environment:
-      RUST_LOG: info,sqlx::query=debug,sqlx::pool::acquire=debug
+      RUST_LOG: info,attune::graph_transaction=debug,sqlx::query=debug,sqlx::pool::acquire=debug
       ATTUNE__DATABASE__LOG_STATEMENTS: "true"
