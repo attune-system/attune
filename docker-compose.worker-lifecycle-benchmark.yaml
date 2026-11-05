@@ -37,3 +37,20 @@ services:
       ATTUNE_WORKER_BENCHMARK_EXPECT_LAZY: ${ATTUNE_WORKER_BENCHMARK_EXPECT_LAZY:-0}
       ATTUNE_WORKER_BENCHMARK_REVISION: ${ATTUNE_WORKER_BENCHMARK_REVISION:?set the tested source revision}
       ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS: "${ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS:-10000}"
+
+  executor:
+    environment:
+      RUST_LOG: info,sqlx::query=debug,sqlx::pool::acquire=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"
+  executor-2:
+    environment:
+      RUST_LOG: info,sqlx::query=debug,sqlx::pool::acquire=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"
+  supervisor:
+    environment:
+      RUST_LOG: info,sqlx::query=debug,sqlx::pool::acquire=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"
+  notifier:
+    environment:
+      RUST_LOG: info,sqlx::query=debug,sqlx::pool::acquire=debug
+      ATTUNE__DATABASE__LOG_STATEMENTS: "true"

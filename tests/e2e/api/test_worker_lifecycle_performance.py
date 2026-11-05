@@ -33,10 +33,41 @@ def _percentiles(values):
 
 
 def _statements(connection):
-    return {query: (calls, elapsed) for query, calls, elapsed in connection.execute(
-        "SELECT query, sum(calls)::bigint, sum(total_exec_time) FROM pg_stat_statements "
-        "WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) GROUP BY query"
-    )}
+    # Keep nested SQL distinct; its execution time overlaps its parent's time.
+    rows = connection.execute(
+        "SELECT query, toplevel, sum(calls)::bigint, sum(total_exec_time), "
+        "sum(wal_bytes), sum(shared_blks_read), sum(shared_blks_hit), sum(rows) "
+        "FROM pg_stat_statements "
+        "WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) "
+        "GROUP BY query,toplevel"
+    )
+    return {query + (" /* profile:top */" if top else " /* profile:nested */"):
+            (calls, elapsed, int(wal), int(read), int(hit), int(count))
+            for query, top, calls, elapsed, wal, read, hit, count in rows}
+
+
+def _statement_deltas(before, after):
+    return {query: {"calls": values[0]-before.get(query, (0,)*6)[0],
+                    "sql_exec_ms": values[1]-before.get(query, (0,)*6)[1],
+                    "wal_bytes": values[2]-before.get(query, (0,)*6)[2],
+                    "shared_blks_read": values[3]-before.get(query, (0,)*6)[3],
+                    "shared_blks_hit": values[4]-before.get(query, (0,)*6)[4],
+                    "rows": values[5]-before.get(query, (0,)*6)[5],
+                    "toplevel": query.endswith("/* profile:top */"),
+                    "observer": "pg_stat_statements" in query}
+            for query, values in after.items()
+            if values[0]-before.get(query, (0,)*6)[0] > 0}
+
+
+def _statement_totals(deltas):
+    return {"statement_calls": sum(x["calls"] for x in deltas.values()),
+            "sql_exec_ms": sum(x["sql_exec_ms"] for x in deltas.values()),
+            "top_level_statement_calls": sum(x["calls"] for x in deltas.values() if x["toplevel"]),
+            "nested_statement_calls": sum(x["calls"] for x in deltas.values() if not x["toplevel"]),
+            "top_level_exec_ms": sum(x["sql_exec_ms"] for x in deltas.values() if x["toplevel"]),
+            "nested_exec_ms": sum(x["sql_exec_ms"] for x in deltas.values() if not x["toplevel"]),
+            "observer_statement_calls": sum(x["calls"] for x in deltas.values() if x["observer"]),
+            "top_level_wal_bytes": sum(x["wal_bytes"] for x in deltas.values() if x["toplevel"])}
 
 
 class CompletionObserver:
@@ -194,6 +225,17 @@ def test_worker_lifecycle_profile(client, tmp_path):
                 started = dict(pool.map(lambda _: submit(), range(concurrency)))
             return completion.wait(started, expected_status, expect_lazy)
 
+        # Fixed-duration observation, not readiness synchronization. Both revisions
+        # use the same settling and measurement intervals with identical replicas.
+        time.sleep(60)
+        idle_before = _statements(observer)
+        idle_start = time.monotonic()
+        time.sleep(60)
+        idle_after = _statements(observer)
+        idle = _statement_deltas(idle_before, idle_after)
+        report["idle"] = {"seconds": time.monotonic()-idle_start,
+                          **_statement_totals(idle), "statement_deltas": idle}
+        report["sql_timing_note"] = "Top-level and nested times overlap; summed sql_exec_ms is legacy inclusive work, not independent elapsed time."
         with CompletionObserver(listener) as completion:
             for name, reference, parameters, status, stdout, stderr in scenarios:
                 # Warm preparation/release state is explicit and excluded from samples.
@@ -237,13 +279,9 @@ def test_worker_lifecycle_profile(client, tmp_path):
                             assert capture == {"stdout":"captured" if stdout else "empty", "stderr":"captured" if stderr else "empty"}, (execution, capture)
                             if name == "json_stdout":
                                 assert result["data"] == {"answer": 42} and not result.get("stdout")
-                    deltas = {query: {"calls": calls-before.get(query, (0, 0))[0],
-                                      "sql_exec_ms": elapsed-before.get(query, (0, 0))[1]}
-                              for query, (calls, elapsed) in after.items()
-                              if calls-before.get(query, (0, 0))[0] > 0}
+                    deltas = _statement_deltas(before, after)
                     report["profiles"].append({"scenario": name, "concurrency": concurrency,
                         "samples": values, "execution_ids": ids, "artifact_versions": dict(versions),
-                        **_percentiles([value["observed_completion_ms"] for value in values.values()]), "statement_calls": sum(value["calls"] for value in deltas.values()),
-                        "sql_exec_ms": sum(value["sql_exec_ms"] for value in deltas.values()),
+                        **_percentiles([value["observed_completion_ms"] for value in values.values()]), **_statement_totals(deltas),
                         "statement_deltas": deltas, "allocated_stream_rows": sum(counts.values())})
     print("WORKER_LIFECYCLE_REPORT=" + json.dumps(report, sort_keys=True))
