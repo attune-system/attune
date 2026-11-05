@@ -1,0 +1,12 @@
+{
+  "warning": "warning: linker stderr: ignoring deprecated linker optimization setting '1'",
+  "baseline_revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+  "baseline_source_equivalent_to": "4846e6073c72325afd9583a550cc772dcd342057",
+  "baseline_line_numbers": [
+    278
+  ],
+  "build_flags_and_dockerfile_unchanged": true,
+  "new_warning": false,
+  "baseline_log_sha256": "06174450a9be0f5b95ac3a873340b5a79cd026ed9018d132bff6edafca545db3",
+  "current_log_sha256": "c616b4c57be350217bd1bebd1350c8af50200e78f43b020035af1f630c31e7ec"
+}

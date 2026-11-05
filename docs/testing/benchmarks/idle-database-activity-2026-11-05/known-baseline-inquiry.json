@@ -1,0 +1,59 @@
+{
+  "baseline_revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+  "baseline_source_equivalent_to": "4846e6073c72325afd9583a550cc772dcd342057",
+  "current_revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+  "baseline_passed": 32,
+  "baseline_failed": 3,
+  "current_passed": 32,
+  "current_failed": 3,
+  "failure_names": [
+    "tests/e2e/tier2/test_t2_06_inquiry.py::test_inquiry_list_filters_by_creator_execution",
+    "tests/e2e/tier2/test_t2_06_inquiry.py::test_inquiry_rejects_invalid_response_before_releasing_task",
+    "tests/e2e/tier2/test_t2_06_inquiry.py::test_inquiry_response_releases_guarded_workflow_task"
+  ],
+  "identical_preparation_error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness",
+  "baseline_executions": [
+    {
+      "id": 22,
+      "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness",
+      "status": "failed",
+      "action_ref": "test_pack_local.create_inquiry"
+    },
+    {
+      "id": 20,
+      "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness",
+      "status": "failed",
+      "action_ref": "test_pack_local.create_inquiry"
+    },
+    {
+      "id": 24,
+      "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness",
+      "status": "failed",
+      "action_ref": "test_pack_local.create_inquiry"
+    }
+  ],
+  "current_executions": [
+    {
+      "id": 20,
+      "action_ref": "test_pack_local.create_inquiry",
+      "status": "failed",
+      "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness"
+    },
+    {
+      "id": 22,
+      "action_ref": "test_pack_local.create_inquiry",
+      "status": "failed",
+      "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness"
+    },
+    {
+      "id": 24,
+      "action_ref": "test_pack_local.create_inquiry",
+      "status": "failed",
+      "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness"
+    }
+  ],
+  "credential_guard_and_inquiry_fixture_unchanged": true,
+  "readiness_guard_remains_off": true,
+  "tests_not_ignored_or_reclassified": true,
+  "owned_resources_removed": true
+}

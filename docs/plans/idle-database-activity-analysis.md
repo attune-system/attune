@@ -1,8 +1,10 @@
 # Idle database activity: source analysis and implementation opportunities
 
-Date: 2026-11-05. Status: queue/retention and workflow-log wakeup slices implemented
-and validated with safe leader-session reuse. Combined measurements and required
-CI remain in progress; inquiry scheduling is a separate follow-up.
+Date: 2026-11-05. Status: queue/retention, workflow-log wakeups and safe
+leader-session reuse are implemented and locally validated. The completed
+normal-cadence campaign is linked below; current merge readiness is reported in
+[PR #26](https://github.com/attune-system/attune/pull/26). Inquiry scheduling and
+physical-cleanup connection reuse remain separate follow-ups.
 Code inspected: `2ad41436`. Evidence: the six accepted primary matrices in the
 [measurement report](../testing/benchmarks/database-activity-2026-11-05/README.md),
 plus a fresh examination of retained idle-window service logs. That original
@@ -389,7 +391,7 @@ Commands, identities, differences and result provenance are retained under
 
 The supplemental default-budget E2E selection is **32 passed / 3 failed** on
 both treatment `0c37e1dd` and baseline images `747832c9`, whose runtime/build
-inputs are byte-equivalent to merged main `4846e607`. The same three cases fail:
+source files match merged main `4846e607`. The same three cases fail:
 
 - `test_inquiry_response_releases_guarded_workflow_task`
 - `test_inquiry_rejects_invalid_response_before_releasing_task`
@@ -420,3 +422,37 @@ whole-stack idle or latency results. Pending CI still prevents a merge-ready
 status. The earlier instrumented shared-file capture-budget stress limit is not
 resolved by these tests; neither full deployment certification nor many-replica,
 busy-queue, S3, CPU or saturated-capacity performance is claimed.
+
+
+## Completed normal-cadence campaign
+
+The [retained report and interactive comparison](../testing/benchmarks/idle-database-activity-2026-11-05/README.md)
+contain six fresh-stack matrices, 7,200 measured executions, identical collector
+bytes and dependency/base-image checks, three paired six-minute idle comparisons,
+actual persisted settings and maintenance deadlines, complete output/counter
+assertions, reader checks, and verified teardown. The extra shared-file pair
+reverses the initial run order and retains both trials separately.
+
+Idle top-level SQL falls consistently by about 67%, from 3,377–3,398/minute to
+1,108–1,111/minute. The repeated pair confirms the same reduction. Outbox claims
+fall from roughly 1,170 to 26/minute; per-empty-queue capacity and latest-terminal
+queries disappear, replaced by 24 readiness snapshots/minute. Target seeding
+falls from 16 calls/minute to one. Connection setup statements also decline,
+with their proxy/census limitation retained. Inquiry/wait/callback rates remain
+unchanged, and each executor may hold one additional listener backend.
+
+The active-workload result is modestly lower SQL/job and inconclusive latency.
+Initial shared-file median paired p50/p95 changes are +0.9%/+8.3%; the reversed
+repeat has −3.4%/−6.0%. API/object segments have −0.1%/+3.4%. The initial tail
+direction does not repeat. No general execution-latency, CPU, capacity or WAL
+improvement is established. Aggregate idle DB execution time is small in absolute
+terms; the report retains raw totals and statement-counter overhead separately.
+The result supports the implemented idle-work cleanup without turning the
+remaining low-cost pollers into a performance priority by count alone.
+
+The measured runtime remains `0c37e1dd`; later documentation-only edits do not
+change its runtime, schema, dependency or macro-query inputs. All fourteen CI
+checks pass on that runtime commit. The final PR head must independently satisfy
+required CI before merge; the PR carries the current validation handoff. The
+three matched baseline inquiry failures, documented deferred coverage and the
+existing musl linker warning remain disclosed limitations, not passing evidence.

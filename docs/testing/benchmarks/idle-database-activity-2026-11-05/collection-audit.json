@@ -1,0 +1,236 @@
+{
+  "accepted_measurements": [
+    {
+      "run": "attune-idle-ready-base-volume-40d6cb1b",
+      "kind": "baseline",
+      "backend": "volume",
+      "trial": 1,
+      "revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+      "profiles": 12,
+      "measured_executions": 1200,
+      "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+      "report_sha256": "5e8215f2104ab9bcbdee2f6a6e96eb3a2bb54c937a0e5aa240ebea983930ada9",
+      "manifest_sha256": "2151b0040eb1e5462eb56efa0ae48dcbb3ebc8aa980c6127797326c1c7dcae35",
+      "all_output_and_counter_assertions_passed": true,
+      "reader_checks_exit_code": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run": "attune-idle-ready-current-volume-706e6dae",
+      "kind": "current",
+      "backend": "volume",
+      "trial": 1,
+      "revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+      "profiles": 12,
+      "measured_executions": 1200,
+      "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+      "report_sha256": "949f556bdc5d43d6312280f5cd50becdcc5e81c460de1393cbde367b965ce132",
+      "manifest_sha256": "d682698c87730e84cc23e5accc5c275cdcf350a8fb597b117156bcb0703271ef",
+      "all_output_and_counter_assertions_passed": true,
+      "reader_checks_exit_code": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run": "attune-idle-ready-baseline-api-696f2eb5",
+      "kind": "baseline",
+      "backend": "api",
+      "trial": 1,
+      "revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+      "profiles": 12,
+      "measured_executions": 1200,
+      "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+      "report_sha256": "0dc5e2993c7847833ba821f37491e5b581e12b0a9a174b6e1267d6071697181a",
+      "manifest_sha256": "8af8899f6512981ff551cb9c5e543ed0ccf72d0782f17a07c1d42a33a3b292a4",
+      "all_output_and_counter_assertions_passed": true,
+      "reader_checks_exit_code": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run": "attune-idle-ready-current-api-0c750f7e",
+      "kind": "current",
+      "backend": "api",
+      "trial": 1,
+      "revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+      "profiles": 12,
+      "measured_executions": 1200,
+      "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+      "report_sha256": "4993067522722ecc6478a0a2daeefae81d331416437554353f2e10df395e1eac",
+      "manifest_sha256": "2325d7bf2583141c3eb65421a406e4524e4876304eaffb443872a2ea4c5e22c9",
+      "all_output_and_counter_assertions_passed": true,
+      "reader_checks_exit_code": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run": "attune-idle-ready-repeat-current-vol-cf3658d9",
+      "kind": "current",
+      "backend": "volume",
+      "trial": 2,
+      "revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+      "profiles": 12,
+      "measured_executions": 1200,
+      "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+      "report_sha256": "37334067ea4ff0a811b75dc138e09f3adabeab1ee0c5b4b8776c6e4c5d4ef489",
+      "manifest_sha256": "989a9cfddeb221d076ac0633f81377263e800b4bc4e7930439ac657e6c77ac01",
+      "all_output_and_counter_assertions_passed": true,
+      "reader_checks_exit_code": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run": "attune-idle-ready-repeat-base-vol-4761def1",
+      "kind": "baseline",
+      "backend": "volume",
+      "trial": 2,
+      "revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+      "profiles": 12,
+      "measured_executions": 1200,
+      "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+      "report_sha256": "d2bdcd45148d79b2a31c8e945fd33845f4c06fa9ae3eef2b20a78b3db102d049",
+      "manifest_sha256": "912a9bf47e7aec9b771fe84f81f235fefb6381ac9b127c440b710b8d92b676f1",
+      "all_output_and_counter_assertions_passed": true,
+      "reader_checks_exit_code": 0,
+      "cleanup_verified": true
+    }
+  ],
+  "total_measured_executions": 7200,
+  "measurement_runs_discarded": 0,
+  "preliminary_build_stopped": {
+    "revision": "ca5fa44567e475892d89bbf981a7085a7695ac51",
+    "exit_code": 130,
+    "reason": "Listener drain-budget review fix found before treatment collection; rebuilt all treatment runtime images at0c37e1dd. No measurements collected from this build."
+  },
+  "default_budget_correctness": {
+    "baseline_revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+    "baseline_source_equivalent_to": "4846e6073c72325afd9583a550cc772dcd342057",
+    "current_revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+    "baseline_passed": 32,
+    "baseline_failed": 3,
+    "current_passed": 32,
+    "current_failed": 3,
+    "failure_names": [
+      "tests/e2e/tier2/test_t2_06_inquiry.py::test_inquiry_list_filters_by_creator_execution",
+      "tests/e2e/tier2/test_t2_06_inquiry.py::test_inquiry_rejects_invalid_response_before_releasing_task",
+      "tests/e2e/tier2/test_t2_06_inquiry.py::test_inquiry_response_releases_guarded_workflow_task"
+    ],
+    "identical_preparation_error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness",
+    "baseline_executions": [
+      {
+        "id": 22,
+        "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness",
+        "status": "failed",
+        "action_ref": "test_pack_local.create_inquiry"
+      },
+      {
+        "id": 20,
+        "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness",
+        "status": "failed",
+        "action_ref": "test_pack_local.create_inquiry"
+      },
+      {
+        "id": 24,
+        "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness",
+        "status": "failed",
+        "action_ref": "test_pack_local.create_inquiry"
+      }
+    ],
+    "current_executions": [
+      {
+        "id": 20,
+        "action_ref": "test_pack_local.create_inquiry",
+        "status": "failed",
+        "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness"
+      },
+      {
+        "id": 22,
+        "action_ref": "test_pack_local.create_inquiry",
+        "status": "failed",
+        "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness"
+      },
+      {
+        "id": 24,
+        "action_ref": "test_pack_local.create_inquiry",
+        "status": "failed",
+        "error": "Failed to prepare execution context: Permission denied: Recorded execution credentials require coordinated admission, consumers and completion readiness"
+      }
+    ],
+    "credential_guard_and_inquiry_fixture_unchanged": true,
+    "readiness_guard_remains_off": true,
+    "tests_not_ignored_or_reclassified": true,
+    "owned_resources_removed": true
+  },
+  "runtime_code_ci": {
+    "checks": [
+      {
+        "conclusion": "SUCCESS",
+        "name": "Detect Changed Paths",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "golden (ubuntu-24.04)",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "windows-cli",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "golden (macos-26)",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Security Blocking Checks",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Security Advisory Checks",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Rustfmt",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Release Configuration Checks",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Clippy",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Tests",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Full-stack smoke tests",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Cargo Audit & Deny",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Web Blocking Checks",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "name": "Web Advisory Checks",
+        "status": "COMPLETED"
+      }
+    ],
+    "head": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8"
+  },
+  "final_pr_head_must_pass_required_ci": true
+}
