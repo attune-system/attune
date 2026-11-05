@@ -2747,6 +2747,28 @@ impl ArtifactVersionRepository {
             .map_err(Into::into)
     }
 
+    /// Ordinary file settlement excludes streams, whose writers own sealing and
+    /// accounting. Preserve empty non-log files.
+    pub async fn find_ordinary_file_versions_by_execution<'e, E>(
+        executor: E,
+        execution_id: i64,
+    ) -> Result<Vec<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "SELECT {} FROM artifact_version av
+             WHERE av.file_path IS NOT NULL AND av.execution=$1
+             AND NOT EXISTS(SELECT 1 FROM log_stream s WHERE s.artifact_version=av.id)",
+            Self::select_columns_with_alias("av")
+        );
+        sqlx::query_as(&query)
+            .bind(execution_id)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Find all versions with an external body for artifact deletion.
     pub async fn find_file_versions_by_artifact<'e, E>(
         executor: E,

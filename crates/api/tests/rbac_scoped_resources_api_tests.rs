@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use helpers::*;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 use attune_common::{
     auth::jwt::STANDARD_EXECUTION_ACCESS_REF,
@@ -16,17 +17,20 @@ use attune_common::{
         action::{ActionRepository, CreateActionInput},
         artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
         component_lifecycle::PackProjectionIds,
+        executable_snapshot::ExecutableSnapshotRepository,
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
         },
         key::{CreateKeyInput, KeyRepository},
+        runtime_authority::RuntimeAuthorityRepository,
         work_queue::{
             CreateWorkQueueInput, UpdateWorkQueueItemInput, WorkQueueItemRepository,
             WorkQueueRepository,
         },
         Create, FindByRef, Update,
     },
+    runtime_authority::{InvocationBinding, InvocationPolicy, RuntimePolicy},
 };
 
 mod helpers;
@@ -293,6 +297,38 @@ async fn create_pack_with_action(
     )
     .await?;
 
+    // These are published targets: queue acceptance needs the same active
+    // action invocation policy as ordinary execution, even with no API grants.
+    let mut tx = ctx.pool.begin().await?;
+    let owner = RuntimeAuthorityRepository::ensure_owner(&mut tx, pack.id).await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action_ref(&mut *tx, &action.r#ref).await?;
+    let policy = RuntimeAuthorityRepository::capture_policy(
+        &mut tx,
+        &RuntimePolicy {
+            owner,
+            release_id: snapshot.release.id,
+            release_digest: snapshot.release.digest.clone(),
+            concrete_targets: BTreeMap::new(),
+            invocations: vec![InvocationPolicy {
+                binding: InvocationBinding::Action {
+                    action_ref: action.r#ref.clone(),
+                },
+                target_release_id: snapshot.release.id,
+                target_release_digest: snapshot.release.digest.clone(),
+                permission_sets: BTreeMap::new(),
+                standard_access: false,
+                foreign_workflow_policy: None,
+                metadata_revision: None,
+                source_id: None,
+                dispatch_template_digest: None,
+            }],
+        },
+    )
+    .await?;
+    RuntimeAuthorityRepository::activate_policy(&mut tx, policy.id).await?;
+    tx.commit().await?;
+
     Ok((pack, action))
 }
 
@@ -546,6 +582,29 @@ async fn test_queue_admin_like_crud_and_pending_item_guards() {
         .expect("Failed to create adhoc queue");
     assert_eq!(create_queue.status(), StatusCode::CREATED);
 
+    // Queue CRUD does not grant permission to invoke its published target.
+    // Reusing this item key below also verifies rejection leaves no pending item.
+    let denied = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items", queue_ref),
+            json!({"item_key": "order-123", "payload": {"state": "queued"}}),
+            Some(&token),
+        )
+        .await
+        .expect("Queue-only enqueue request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let token = register_scoped_user(
+        &ctx,
+        &format!("queue_executor_{}", uuid::Uuid::new_v4().simple()),
+        json!([
+            {"resource": "queues", "actions": ["read", "create", "update", "delete"]},
+            {"resource": "actions", "actions": ["execute"], "constraints": {"refs": [action.r#ref]}}
+        ]),
+    )
+    .await
+    .expect("Failed to register authorized queue invoker");
+
     let enqueue = ctx
         .post(
             &format!("/api/v1/queues/{}/items", queue_ref),
@@ -558,8 +617,9 @@ async fn test_queue_admin_like_crud_and_pending_item_guards() {
         )
         .await
         .expect("Failed to enqueue queue item");
-    assert_eq!(enqueue.status(), StatusCode::CREATED);
+    let enqueue_status = enqueue.status();
     let enqueue_body: serde_json::Value = enqueue.json().await.expect("Invalid enqueue response");
+    assert_eq!(enqueue_status, StatusCode::CREATED, "{enqueue_body}");
     let item_id = enqueue_body["data"]["id"]
         .as_i64()
         .expect("Missing queue item id");
@@ -782,6 +842,29 @@ async fn test_pack_scoped_queue_permissions_cover_definitions_and_items() {
         .expect("Failed to get blocked queue");
     assert_eq!(get_blocked.status(), StatusCode::NOT_FOUND);
 
+    let denied = ctx
+        .post(
+            "/api/v1/queues/python_example.scoped_queue/items",
+            json!({"item_key": "job-1", "payload": {"hello": "world"}}),
+            Some(&token),
+        )
+        .await
+        .expect("Scoped queue-only enqueue request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let token = register_scoped_user(
+        &ctx,
+        &format!("queue_scoped_executor_{}", uuid::Uuid::new_v4().simple()),
+        json!([
+            {"resource": "queues", "actions": ["read", "create", "update", "delete"],
+             "constraints": {"pack_refs": [allowed_pack.r#ref]}},
+            {"resource": "actions", "actions": ["execute"],
+             "constraints": {"refs": [allowed_action.r#ref]}}
+        ]),
+    )
+    .await
+    .expect("Failed to register scoped queue invoker");
+
     let enqueue_allowed = ctx
         .post(
             "/api/v1/queues/python_example.scoped_queue/items",
@@ -793,11 +876,16 @@ async fn test_pack_scoped_queue_permissions_cover_definitions_and_items() {
         )
         .await
         .expect("Failed to enqueue allowed queue item");
-    assert_eq!(enqueue_allowed.status(), StatusCode::CREATED);
+    let enqueue_allowed_status = enqueue_allowed.status();
     let enqueue_allowed_body: serde_json::Value = enqueue_allowed
         .json()
         .await
         .expect("Invalid allowed enqueue body");
+    assert_eq!(
+        enqueue_allowed_status,
+        StatusCode::CREATED,
+        "{enqueue_allowed_body}"
+    );
     let item_id = enqueue_allowed_body["data"]["id"]
         .as_i64()
         .expect("Missing item id");

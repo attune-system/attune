@@ -64,14 +64,30 @@ accept the field inside `config`; detail inspection returns the stored value.
 The CLI preserves other configuration fields when changing this setting.
 
 Grouping does not transfer input authority or permission to inspect private
-results and logs. Each item keeps its own requester attribution. The production
-dispatcher still requires homogeneous requester authority for Key resolution and
-execution API grants until recorded queue admission is connected. The grouping
-control does not bypass those checks or complete the managed-pack runtime rollout.
+results and logs. Each item keeps its own requester attribution. Recorded queue
+admission validates every item's accepted authority independently; contributors'
+grants are never combined. Dispatches without recorded authority still require a
+single requester for Key resolution and execution API grants. The grouping
+control does not bypass coordinated execution-credential readiness checks.
 
 ## Dispatch execution permissions
 
 Work queues can also define `permission_set_refs` to control the execution-scoped API token granted to executions dispatched from that queue. Omit or set `permission_set_refs` to `null` to inherit the dispatch action's defaults, set it to `[]` to force no execution API token, or set one or more permission-set refs to grant that exact execution access. API-created queue overrides must be delegable by the caller.
+
+An API-created queue remains ad hoc even when associated with a pack. Human
+enqueue to a published action requires `actions:execute` for that action and
+delegation of the selected permission refs, in addition to item-create access.
+Acceptance pins the target Action invocation, queue dispatch template, action
+schema, requester attribution, and input authority. It does not invent a
+pack-managed Queue invocation or depend on the queue creator's current IAM.
+Single and batch dispatches validate those accepted records, including target
+policy revocation. Ad hoc tunables must use literal values on this path. Drain
+accepted items before changing dispatch behavior. A recorded execution's enqueue
+additionally retains its originating execution admission as a dependency.
+
+Apply `20261104000001_ad_hoc_queue_human_acceptance.sql` and update the API,
+executors, workers, and other admission consumers together. Historical pending
+items without an accepted dispatch binding need cancellation and a new enqueue.
 
 ## Selector-based item maintenance
 

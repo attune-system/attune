@@ -11835,6 +11835,11 @@ tasks:
             .expect("clean workflow fixture and code release");
     }
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/adhoc_workflow_delegation_fixture/retry.rs"
+    ));
+
     #[tokio::test]
     async fn cancelled_workflow_child_cancels_workflow_and_parent() {
         let fixture = InquirySchedulerFixture::create().await;

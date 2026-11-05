@@ -1,5 +1,6 @@
-//! Identical-input workflow retries. Prepare retained evidence before acquiring
-//! scheduler/workflow/execution target locks; never render or recapture inputs.
+//! Identical-input workflow retries. Recorded tasks retain accepted authority;
+//! wholly ad-hoc workflows recheck their live owner and ordinary secret origins.
+//! Prepare sources before target locks; never render or recapture inputs.
 use super::{
     accepted_execution_source::{prepare_observation, same_execution},
     declared_input_materialization::DeclaredInputMaterializationRepository as Materialization,
@@ -28,7 +29,7 @@ pub struct NativeRetryMaterializationRepository;
 pub struct PreparedNativeRetry {
     source: Execution,
     workflow: WorkflowExecution,
-    admission: ExecutionAdmission,
+    admission: Option<ExecutionAdmission>,
     schema: ActionSchemaBinding,
     fields: Vec<StoredSecretValue>,
     receipts: Vec<ReceiptContext>,
@@ -39,7 +40,7 @@ pub struct PreparedRetryPublication {
     retry: Execution,
     workflow: Id,
     source: PublicationSource,
-    fence: ApprovalEffectFence,
+    fence: Option<ApprovalEffectFence>,
     receipts: Vec<ReceiptContext>,
     schema: ActionSchemaBinding,
     fields: Vec<StoredSecretValue>,
@@ -99,7 +100,7 @@ impl NativeRetryMaterializationRepository {
             retry: child.clone(),
             workflow: task.workflow_execution,
             source: PublicationSource::InitialTask,
-            fence,
+            fence: Some(fence),
             receipts,
             schema,
             fields,
@@ -128,6 +129,20 @@ impl NativeRetryMaterializationRepository {
             .await?;
         if !due {
             return Ok(None);
+        }
+        if is_unrecorded_ad_hoc(conn, retry).await? {
+            let sources: Vec<Id> = sqlx::query_scalar("SELECT id FROM execution WHERE parent=$1 AND ((retry_count=0 AND id=$2) OR original_execution=$2) AND retry_count=$3 AND workflow_task->>'workflow_execution'=$4 AND workflow_task->>'task_name'=$5 AND (workflow_task->'task_index') IS NOT DISTINCT FROM $6::JSONB AND (workflow_task->'task_batch') IS NOT DISTINCT FROM $7::JSONB ORDER BY id LIMIT 2")
+                .bind(retry.parent).bind(retry.original_execution.ok_or_else(denied)?)
+                .bind(retry.retry_count - 1).bind(task.workflow_execution.to_string()).bind(&task.task_name)
+                .bind(serde_json::to_value(task)?.get("task_index").cloned())
+                .bind(serde_json::to_value(task)?.get("task_batch").cloned())
+                .fetch_all(&mut *conn).await?;
+            let [source] = sources.as_slice() else {
+                return Err(denied());
+            };
+            return Self::prepare_publication(conn, retry, *source, key)
+                .await
+                .map(Some);
         }
         let sources: Vec<Id> = sqlx::query_scalar("SELECT original.owner_id FROM runtime_admission_dependency edge JOIN runtime_authority_admission target ON target.id=edge.admission JOIN runtime_authority_admission original ON original.id=edge.dependency WHERE target.owner_kind='execution' AND target.owner_id=$1 AND edge.dependency_kind='retry' AND original.owner_kind='execution' ORDER BY original.owner_id LIMIT 2")
             .bind(retry.id).fetch_all(&mut *conn).await?;
@@ -166,17 +181,28 @@ impl NativeRetryMaterializationRepository {
             .ok_or_else(denied)?;
         same_execution(expected, &actual)?;
         let snapshot = actual.executable_snapshot.as_ref().ok_or_else(denied)?;
-        let admission = ExecutionAdmissionRepository::inherit(
-            conn,
-            RuntimeOwner::Execution(actual.id),
-            snapshot,
-        )
-        .await?;
+        let admission = if is_unrecorded_ad_hoc(conn, &actual).await? {
+            validate_ad_hoc(conn, &actual).await?;
+            None
+        } else {
+            Some(
+                ExecutionAdmissionRepository::inherit(
+                    conn,
+                    RuntimeOwner::Execution(actual.id),
+                    snapshot,
+                )
+                .await?,
+            )
+        };
         let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, actual.id)
             .await?
             .ok_or_else(denied)?;
         schema.validate()?;
-        let (fields, receipts) = prepare_observation(conn, &actual, &schema, key).await?;
+        let (fields, receipts) = if admission.is_some() {
+            prepare_observation(conn, &actual, &schema, key).await?
+        } else {
+            (ad_hoc_fields(conn, &actual).await?, Vec::new())
+        };
         let prepared = PreparedNativeRetry {
             source: actual,
             workflow: workflow.clone(),
@@ -199,6 +225,9 @@ impl NativeRetryMaterializationRepository {
         key: &str,
     ) -> Result<PreparedRetryPublication> {
         let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
+        if is_unrecorded_ad_hoc(conn, retry).await? {
+            return prepare_ad_hoc_publication(conn, retry, PublicationSource::Retry(source)).await;
+        }
         let admission =
             ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(retry.id)).await?;
         let fence =
@@ -223,7 +252,7 @@ impl NativeRetryMaterializationRepository {
             retry: retry.clone(),
             workflow: task.workflow_execution,
             source: PublicationSource::Retry(source),
-            fence,
+            fence: Some(fence),
             receipts,
             schema,
             fields,
@@ -236,7 +265,14 @@ impl NativeRetryMaterializationRepository {
 
 impl PreparedNativeRetry {
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
-        self.admission.ensure_fresh_on(conn).await?;
+        if let Some(admission) = &self.admission {
+            admission.ensure_fresh_on(conn).await?;
+        } else {
+            validate_ad_hoc(conn, &self.source).await?;
+            if ad_hoc_fields(conn, &self.source).await? != self.fields {
+                return Err(denied());
+            }
+        }
         for receipt in &self.receipts {
             receipt.ensure_fresh_on(conn).await?;
         }
@@ -359,9 +395,11 @@ impl PreparedNativeRetry {
         .await?;
         // attach invokes canonical DeclaredInputRepository::copy_deliveries,
         // which checks identical config and the real inherited admission edge.
-        self.admission
-            .attach(conn, RuntimeOwner::Execution(retry.id))
-            .await?;
+        if let Some(admission) = &self.admission {
+            admission
+                .attach(conn, RuntimeOwner::Execution(retry.id))
+                .await?;
+        }
         RuleAuthorityRepository::copy_execution(conn, actual.id, retry.id).await?;
         RecordedInputAuthorityRepository::copy(conn, "execution", actual.id, "execution", retry.id)
             .await?;
@@ -376,7 +414,11 @@ impl PreparedNativeRetry {
         )
         .await?;
         // Only this newly created retry may receive its first acceptance seal.
-        let receipts = Materialization::seal_execution_inputs(conn, retry.id, &self.key).await?;
+        let receipts = if self.admission.is_some() {
+            Materialization::seal_execution_inputs(conn, retry.id, &self.key).await?
+        } else {
+            Vec::new()
+        };
         for receipt in &receipts {
             receipt.ensure_fresh_on(conn).await?;
         }
@@ -474,7 +516,14 @@ impl PreparedRetryPublication {
         self.ensure_fresh_on(conn).await
     }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
-        self.fence.ensure_fresh_on(conn).await?;
+        if let Some(fence) = &self.fence {
+            fence.ensure_fresh_on(conn).await?;
+        } else {
+            validate_ad_hoc(conn, &self.retry).await?;
+            if ad_hoc_fields(conn, &self.retry).await? != self.fields {
+                return Err(denied());
+            }
+        }
         if let Some(cache) = &self.cache {
             cache.ensure_fresh_on(conn).await?;
         }
@@ -483,6 +532,131 @@ impl PreparedRetryPublication {
         }
         Ok(())
     }
+}
+
+// Ad-hoc workflows retain human delegation and ordinary secret origins. They
+// never acquire a pack policy merely by sharing a pack ref. Both parent and task
+// must be ad hoc, and recorded evidence must never fall back to this path.
+async fn is_unrecorded_ad_hoc(conn: &mut PgConnection, execution: &Execution) -> Result<bool> {
+    Ok(execution
+        .executable_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.executable.action.is_adhoc)
+        && ExecutionAdmissionRepository::find(conn, RuntimeOwner::Execution(execution.id))
+            .await?
+            .is_none())
+}
+
+async fn validate_ad_hoc(conn: &mut PgConnection, execution: &Execution) -> Result<()> {
+    let actual = ExecutionRepository::find_by_id(&mut *conn, execution.id)
+        .await?
+        .ok_or_else(denied)?;
+    same_execution(execution, &actual)?;
+    if !is_unrecorded_ad_hoc(conn, execution).await? {
+        return Err(denied());
+    }
+    let parent = ExecutionRepository::find_by_id(&mut *conn, execution.parent.ok_or_else(denied)?)
+        .await?
+        .ok_or_else(denied)?;
+    if !is_unrecorded_ad_hoc(conn, &parent).await?
+        || execution.executor.is_none()
+        || parent.executor != execution.executor
+        || !active(parent.status)
+    {
+        return Err(denied());
+    }
+    let accepted: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM runtime_accepted_input WHERE execution=ANY($1))",
+    )
+    .bind(vec![execution.id, parent.id])
+    .fetch_one(&mut *conn)
+    .await?;
+    if accepted {
+        return Err(denied());
+    }
+    crate::delegation::require_execution_refs_for_share(
+        conn,
+        execution.executor,
+        &execution.permission_set_refs,
+    )
+    .await
+}
+
+async fn ad_hoc_fields(
+    conn: &mut PgConnection,
+    execution: &Execution,
+) -> Result<Vec<StoredSecretValue>> {
+    let fields =
+        Secrets::find_stored_by_entity(&mut *conn, ENTITY_EXECUTION_CONFIG, execution.id).await?;
+    crate::key_access::authorize_execution_parameter_key_origins_with_conn(
+        conn,
+        execution.id,
+        execution.executor,
+        &fields,
+    )
+    .await?;
+    Ok(fields)
+}
+
+async fn prepare_ad_hoc_publication(
+    conn: &mut PgConnection,
+    retry: &Execution,
+    source: PublicationSource,
+) -> Result<PreparedRetryPublication> {
+    if retry.status != ExecutionStatus::Requested || retry.worker.is_some() {
+        return Err(denied());
+    }
+    validate_ad_hoc(conn, retry).await?;
+    let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
+    let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, retry.id)
+        .await?
+        .ok_or_else(denied)?;
+    schema.validate()?;
+    let fields = ad_hoc_fields(conn, retry).await?;
+    if let PublicationSource::Retry(id) = source {
+        let original = ExecutionRepository::find_by_id(&mut *conn, id)
+            .await?
+            .ok_or_else(denied)?;
+        validate_ad_hoc(conn, &original).await?;
+        let previous = original.workflow_task.as_ref().ok_or_else(denied)?;
+        if !matches!(
+            original.status,
+            ExecutionStatus::Failed | ExecutionStatus::Timeout
+        ) || original.parent != retry.parent
+            || original.executor != retry.executor
+            || original.config != retry.config
+            || original.env_vars != retry.env_vars
+            || original.permission_set_refs != retry.permission_set_refs
+            || serde_json::to_value(&original.executable_snapshot)?
+                != serde_json::to_value(&retry.executable_snapshot)?
+            || original.original_execution.unwrap_or(original.id)
+                != retry.original_execution.ok_or_else(denied)?
+            || original.retry_count.checked_add(1) != Some(retry.retry_count)
+            || previous.retry_count != original.retry_count
+            || task.retry_count != retry.retry_count
+            || previous.workflow_execution != task.workflow_execution
+            || previous.task_name != task.task_name
+            || previous.task_index != task.task_index
+            || previous.task_batch != task.task_batch
+            || SchemaContractRepository::find(conn, BindingOwner::Execution, id)
+                .await?
+                .as_ref()
+                != Some(&schema)
+            || ad_hoc_fields(conn, &original).await? != fields
+        {
+            return Err(denied());
+        }
+    }
+    Ok(PreparedRetryPublication {
+        retry: retry.clone(),
+        workflow: task.workflow_execution,
+        source,
+        fence: None,
+        receipts: Vec::new(),
+        schema,
+        fields,
+        cache: None,
+    })
 }
 
 async fn lock_workflow(conn: &mut PgConnection, workflow: Id) -> Result<()> {

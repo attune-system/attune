@@ -1,5 +1,6 @@
 //! Re-publication of an EXISTING admitted/accepted Requested execution. Nothing
 //! here inherits, attaches, initializes, seals, renders, or selects new authority.
+//! Ad-hoc workflow continuations instead retain their live-owner checks.
 use super::{
     accepted_execution_source::{prepare_observation, same_execution},
     execution::{ExecutionRepository, SELECT_COLUMNS},

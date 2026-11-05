@@ -2322,6 +2322,28 @@ impl Delete for WorkQueueDispatchRepository {
 }
 
 impl WorkQueueDispatchRepository {
+    /// Observe active dispatches without fetching rows that the poller discards.
+    /// This is an unlocked count; the dispatcher's admission and lease recovery
+    /// protocol remains the caller's responsibility.
+    pub async fn count_active_for_queue<'e, E>(executor: E, queue: Id) -> Result<u64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let active = vec![
+            WorkQueueDispatchStatus::Leased,
+            WorkQueueDispatchStatus::Dispatched,
+        ];
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_queue_dispatch \
+             WHERE queue = $1 AND status = ANY($2::work_queue_dispatch_status_enum[])",
+        )
+        .bind(queue)
+        .bind(active)
+        .fetch_one(executor)
+        .await?;
+        Ok(count.max(0) as u64)
+    }
+
     pub async fn list_by_executions<'e, E>(
         executor: E,
         execution_ids: &[Id],

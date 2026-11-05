@@ -1,0 +1,168 @@
+{
+  "not_pooled_with_primary": true,
+  "runs": [
+    {
+      "run": "dbm-after-volume-1000-472f2328",
+      "kind": "after",
+      "backend": "volume",
+      "budget_ms": 1000,
+      "exit_code": 1,
+      "cleanup_verified": true,
+      "classification": "separate default-budget probe",
+      "completed_profiles": 1,
+      "samples_in_completed_profiles": 20,
+      "revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+      "harness_sha256": "c47a10e5cc46b9b6cfeaa6ac4f8e4d69f0934b739e97230aa00cb068a08da7af",
+      "runtime_images": {
+        "api": "sha256:97341ff83e7a9b6bc5ada440da64e36a752c462e46e7ac14485d9e60a8ddbfab",
+        "executor": "sha256:87ba73c1cc3370c703d9c35963bf8d17816c26b1c80cbce392049a335a2da4b7",
+        "executor-2": "sha256:fb7dbc485d108d95c18746470019051a4dc0d440cd4dbba16550b05dacf3c5e2",
+        "notifier": "sha256:23d5fcb2342f58995c0def97d1d9bd499ca4af0a130827b2c62cffe968f54284",
+        "supervisor": "sha256:7c6e9d174e2789531af098c2948255f22cad58a2376711eabbca831c0ae043c1",
+        "init-agent": "sha256:27fbfe53e14315b719f0b56d16aa0e1701bca2fd0ca13d21901133f930297973",
+        "pack-release-upgrade": "sha256:802e8bde87b111df97c957fa3b7e490cbb529c9385a491417a2d0ffbaa6ca467"
+      },
+      "samples_per_profile": 20,
+      "report_sha256": "e3103752334b12d5a543c152105aa80150fe5ffa97049c313ac0eebd6be8f6bb",
+      "profiles": [
+        {
+          "scenario": "echo",
+          "concurrency": 1,
+          "n": 20,
+          "terminal_p50_ms": 408.86967099504545,
+          "terminal_p95_ms": 491.45578499883413
+        }
+      ],
+      "failed_profile": {
+        "scenario": "echo",
+        "concurrency": 4
+      },
+      "failure": "AssertionError: measured output must be sealed and ready",
+      "failed_profile_sample_coverage": "20 completions reached the output readiness check; their individual timings were not emitted because validation failed before the next partial report.",
+      "capture_settlement_events_at_least_1000ms": [
+        {
+          "worker": "worker-node",
+          "execution_id": 51,
+          "elapsed_ms": 1001.2
+        }
+      ]
+    },
+    {
+      "run": "dbm-after-api-1000-66adda9a",
+      "kind": "after",
+      "backend": "api",
+      "budget_ms": 1000,
+      "exit_code": 0,
+      "cleanup_verified": true,
+      "classification": "separate default-budget probe",
+      "completed_profiles": 12,
+      "samples_in_completed_profiles": 240,
+      "revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+      "harness_sha256": "c47a10e5cc46b9b6cfeaa6ac4f8e4d69f0934b739e97230aa00cb068a08da7af",
+      "runtime_images": {
+        "api": "sha256:97341ff83e7a9b6bc5ada440da64e36a752c462e46e7ac14485d9e60a8ddbfab",
+        "executor": "sha256:87ba73c1cc3370c703d9c35963bf8d17816c26b1c80cbce392049a335a2da4b7",
+        "executor-2": "sha256:fb7dbc485d108d95c18746470019051a4dc0d440cd4dbba16550b05dacf3c5e2",
+        "notifier": "sha256:23d5fcb2342f58995c0def97d1d9bd499ca4af0a130827b2c62cffe968f54284",
+        "supervisor": "sha256:7c6e9d174e2789531af098c2948255f22cad58a2376711eabbca831c0ae043c1",
+        "init-agent": "sha256:27fbfe53e14315b719f0b56d16aa0e1701bca2fd0ca13d21901133f930297973",
+        "pack-release-upgrade": "sha256:802e8bde87b111df97c957fa3b7e490cbb529c9385a491417a2d0ffbaa6ca467"
+      },
+      "samples_per_profile": 20,
+      "report_sha256": "3e55e7c9f6d67e77d6980b5dfb974cb62c3ec5cf89337e0e1ba2f7a0a4bc1a40",
+      "profiles": [
+        {
+          "scenario": "echo",
+          "concurrency": 1,
+          "n": 20,
+          "terminal_p50_ms": 339.1319799993653,
+          "terminal_p95_ms": 418.05356300028507
+        },
+        {
+          "scenario": "echo",
+          "concurrency": 4,
+          "n": 20,
+          "terminal_p50_ms": 705.0527430110378,
+          "terminal_p95_ms": 990.5535240104655
+        },
+        {
+          "scenario": "silent_success",
+          "concurrency": 1,
+          "n": 20,
+          "terminal_p50_ms": 172.73456099792384,
+          "terminal_p95_ms": 247.28784899343736
+        },
+        {
+          "scenario": "silent_success",
+          "concurrency": 4,
+          "n": 20,
+          "terminal_p50_ms": 400.43408500787336,
+          "terminal_p95_ms": 510.6362180085853
+        },
+        {
+          "scenario": "silent_failure",
+          "concurrency": 1,
+          "n": 20,
+          "terminal_p50_ms": 181.90097701153718,
+          "terminal_p95_ms": 215.4027600045083
+        },
+        {
+          "scenario": "silent_failure",
+          "concurrency": 4,
+          "n": 20,
+          "terminal_p50_ms": 399.1211429965915,
+          "terminal_p95_ms": 501.253013004316
+        },
+        {
+          "scenario": "stderr_failure",
+          "concurrency": 1,
+          "n": 20,
+          "terminal_p50_ms": 298.12325300008524,
+          "terminal_p95_ms": 375.6464809994213
+        },
+        {
+          "scenario": "stderr_failure",
+          "concurrency": 4,
+          "n": 20,
+          "terminal_p50_ms": 627.5110999995377,
+          "terminal_p95_ms": 716.0442880121991
+        },
+        {
+          "scenario": "both",
+          "concurrency": 1,
+          "n": 20,
+          "terminal_p50_ms": 323.4392990125343,
+          "terminal_p95_ms": 408.90003900858574
+        },
+        {
+          "scenario": "both",
+          "concurrency": 4,
+          "n": 20,
+          "terminal_p50_ms": 755.8125729992753,
+          "terminal_p95_ms": 890.3358950046822
+        },
+        {
+          "scenario": "json_stdout",
+          "concurrency": 1,
+          "n": 20,
+          "terminal_p50_ms": 387.6143770030467,
+          "terminal_p95_ms": 564.007313005277
+        },
+        {
+          "scenario": "json_stdout",
+          "concurrency": 4,
+          "n": 20,
+          "terminal_p50_ms": 872.1286229992984,
+          "terminal_p95_ms": 1007.5465069967322
+        }
+      ],
+      "capture_settlement_events_at_least_1000ms": [
+        {
+          "worker": "worker-full",
+          "execution_id": 297,
+          "elapsed_ms": 1001.592
+        }
+      ]
+    }
+  ]
+}

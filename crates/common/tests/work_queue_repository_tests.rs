@@ -27,17 +27,22 @@ async fn create_queue_fixture() -> (
     attune_common::models::work_queue::WorkQueue,
 ) {
     let pool = create_test_pool().await.expect("test pool");
+    let queue = create_queue(&pool).await;
+    (pool, queue)
+}
+
+async fn create_queue(pool: &sqlx::PgPool) -> attune_common::models::work_queue::WorkQueue {
     let pack = PackFixture::new_unique("queue_repo")
-        .create(&pool)
+        .create(pool)
         .await
         .expect("pack");
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "dispatch")
-        .create(&pool)
+        .create(pool)
         .await
         .expect("action");
 
-    let queue = WorkQueueRepository::create(
-        &pool,
+    WorkQueueRepository::create(
+        pool,
         CreateWorkQueueInput {
             r#ref: format!("{}.inbox", pack.r#ref),
             pack: Some(pack.id),
@@ -73,9 +78,7 @@ async fn create_queue_fixture() -> (
         },
     )
     .await
-    .expect("queue");
-
-    (pool, queue)
+    .expect("queue")
 }
 
 #[tokio::test]
@@ -1038,6 +1041,102 @@ async fn work_queue_item_repository_falls_back_to_fifo_when_group_value_is_missi
     assert_eq!(leased.len(), 2);
     assert_eq!(leased[0].id, first.id);
     assert_eq!(leased[1].id, second.id);
+}
+
+#[tokio::test]
+async fn active_dispatch_count_is_queue_scoped_and_tracks_terminal_transitions() {
+    let (db, queue) = create_queue_fixture().await;
+    assert_eq!(
+        WorkQueueDispatchRepository::count_active_for_queue(&db, queue.id)
+            .await
+            .unwrap(),
+        0
+    );
+    // A second queue in the same database makes cross-queue leakage observable.
+    let other = create_queue(&db).await;
+    let mut active_ids = Vec::new();
+    for (index, status) in [
+        WorkQueueDispatchStatus::Leased,
+        WorkQueueDispatchStatus::Dispatched,
+        WorkQueueDispatchStatus::Completed,
+        WorkQueueDispatchStatus::Failed,
+        WorkQueueDispatchStatus::Released,
+        WorkQueueDispatchStatus::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for target in [&queue, &other] {
+            let dispatch = WorkQueueDispatchRepository::create(
+                &db,
+                CreateWorkQueueDispatchInput {
+                    id: None,
+                    queue: target.id,
+                    queue_ref: target.r#ref.clone(),
+                    execution: target.id * 100 + index as i64,
+                    status,
+                    leased_item_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+            if target.id == queue.id
+                && matches!(
+                    status,
+                    WorkQueueDispatchStatus::Leased | WorkQueueDispatchStatus::Dispatched
+                )
+            {
+                active_ids.push(dispatch.id);
+            }
+        }
+    }
+    let search = WorkQueueDispatchRepository::search(
+        &db,
+        &WorkQueueDispatchSearchFilters {
+            queue: Some(queue.id),
+            statuses: Some(vec![
+                WorkQueueDispatchStatus::Leased,
+                WorkQueueDispatchStatus::Dispatched,
+            ]),
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(search.rows.len(), 1);
+    assert_eq!(search.total, 2);
+    assert_eq!(
+        WorkQueueDispatchRepository::count_active_for_queue(&db, queue.id)
+            .await
+            .unwrap(),
+        search.total
+    );
+    for (index, dispatch) in active_ids.into_iter().enumerate() {
+        WorkQueueDispatchRepository::update(
+            &db,
+            dispatch,
+            UpdateWorkQueueDispatchInput {
+                status: Some(WorkQueueDispatchStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            WorkQueueDispatchRepository::count_active_for_queue(&db, queue.id)
+                .await
+                .unwrap(),
+            1 - index as u64
+        );
+    }
+    assert_eq!(
+        WorkQueueDispatchRepository::count_active_for_queue(&db, other.id)
+            .await
+            .unwrap(),
+        2
+    );
+    db.cleanup().await.unwrap();
 }
 
 #[tokio::test]

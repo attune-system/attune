@@ -400,11 +400,21 @@ impl ExecutionAdmissionRepository {
             .await?
             .is_some()
         {
-            Self::require(connection, RuntimeOwner::Execution(execution)).await?;
+            let (_, fence) =
+                Self::require_with_fence(connection, RuntimeOwner::Execution(execution)).await?;
             Self::require_input_liveness(connection, execution).await?;
-            if let Some(authorities) = super::recorded_input_authority::RecordedInputAuthorityRepository::queue_authorities(connection, execution).await? {
-                return Ok(authorities);
-            }
+            let authorities = match super::recorded_input_authority::RecordedInputAuthorityRepository::queue_authorities(connection, execution).await? {
+                Some(authorities) => authorities,
+                None => Self::load_recorded_input_authority(connection, execution)
+                    .await?
+                    .into_iter()
+                    .collect(),
+            };
+            // Input metadata may wait behind an editor. Keep the already-held
+            // source locks, but check expiry again after that wait. The reuse is
+            // limited to this call: later calls revalidate even on the same tx.
+            fence.ensure_fresh_on(connection).await?;
+            return Ok(authorities);
         }
         Ok(Self::input_authority(connection, execution, identity)
             .await?
@@ -523,9 +533,9 @@ impl ExecutionAdmissionRepository {
             let mut next_fence =
                 RuntimeAuthorityRepository::selected_effect_fence(connection, &authority).await?;
             if queue.is_adhoc {
-                next_fence = next_fence.intersect(
-                    &super::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::source_effect_fence(connection, item.id).await?,
-                );
+                if let Some(source) = super::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::source_effect_fence(connection, item.id).await? {
+                    next_fence = next_fence.intersect(&source);
+                }
             }
             effect_fence = Some(match effect_fence {
                 Some(fence) => fence.intersect(&next_fence),
@@ -562,6 +572,9 @@ impl ExecutionAdmissionRepository {
             }
             Self::check_policy_snapshot(connection, &authority, snapshot).await?;
             match &authority.attribution {
+                RequestAttribution::Human { actor } if queue.is_adhoc => {
+                    attribution.insert(item.id, Some(actor.clone()));
+                }
                 RequestAttribution::ParentExecution { .. } if queue.is_adhoc => {
                     // The retained accepted-item manifest keeps the actual
                     // source execution admission and its historical attribution.
@@ -607,7 +620,10 @@ impl ExecutionAdmissionRepository {
         }
         let mut authority = selected.ok_or_else(|| Error::validation("Queue batch is empty"))?;
         authority.attempt = Uuid::new_v4();
-        if !queue.is_adhoc || queue.batch_mode == crate::models::WorkQueueBatchMode::Batch {
+        if !queue.is_adhoc
+            || queue.batch_mode == crate::models::WorkQueueBatchMode::Batch
+            || matches!(authority.attribution, RequestAttribution::Human { .. })
+        {
             authority.attribution = RequestAttribution::QueueBatch {
                 queue_ref: queue.r#ref.clone(),
                 items: attribution,
@@ -709,28 +725,12 @@ impl ExecutionAdmissionRepository {
             .await?
             .is_some()
         {
-            Self::require(connection, RuntimeOwner::Execution(execution)).await?;
+            let (_, fence) =
+                Self::require_with_fence(connection, RuntimeOwner::Execution(execution)).await?;
             Self::require_input_liveness(connection, execution).await?;
-            if let Some(authority) =
-                super::recorded_input_authority::RecordedInputAuthorityRepository::load(
-                    connection,
-                    "execution",
-                    execution,
-                )
-                .await?
-            {
-                return Ok(Some(authority));
-            }
-            return match super::rule_authority::RuleAuthorityRepository::runtime(
-                connection,
-                "execution",
-                execution,
-            )
-            .await?
-            {
-                Some(snapshot) => Ok(Some(snapshot.input_authority(connection).await?)),
-                None => Ok(None),
-            };
+            let authority = Self::load_recorded_input_authority(connection, execution).await?;
+            fence.ensure_fresh_on(connection).await?;
+            return Ok(authority);
         }
         let row = super::execution::ExecutionRepository::find_by_id(&mut *connection, execution)
             .await?
@@ -748,6 +748,35 @@ impl ExecutionAdmissionRepository {
             connection, execution, identity,
         )
         .await
+    }
+
+    /// Only call after validating and locking the recorded admission and input
+    /// liveness on this connection. The caller checks its retained expiry fence
+    /// after these reads; this helper never grants authority on its own.
+    async fn load_recorded_input_authority(
+        connection: &mut PgConnection,
+        execution: Id,
+    ) -> Result<Option<crate::delegation::DelegationAuthority>> {
+        if let Some(authority) =
+            super::recorded_input_authority::RecordedInputAuthorityRepository::load(
+                connection,
+                "execution",
+                execution,
+            )
+            .await?
+        {
+            return Ok(Some(authority));
+        }
+        match super::rule_authority::RuleAuthorityRepository::runtime(
+            connection,
+            "execution",
+            execution,
+        )
+        .await?
+        {
+            Some(snapshot) => Ok(Some(snapshot.input_authority(connection).await?)),
+            None => Ok(None),
+        }
     }
 
     /// Production workflow persistence boundary. The caller owns the transaction
@@ -1131,11 +1160,17 @@ impl ExecutionAdmissionRepository {
         connection: &mut PgConnection,
         owner: RuntimeOwner,
     ) -> Result<RuntimeAdmissionRecord> {
-        let record = Self::find(connection, owner).await?.ok_or_else(|| {
-            Error::PermissionDenied("Recorded invocation authority is unavailable".into())
-        })?;
-        // Reuse the canonical lock/digest/sponsor/approval/revocation fence.
-        RuntimeAuthorityRepository::record_admission(connection, owner, &record.authority).await
+        Ok(Self::require_with_fence(connection, owner).await?.0)
+    }
+
+    pub async fn require_with_fence(
+        connection: &mut PgConnection,
+        owner: RuntimeOwner,
+    ) -> Result<(
+        RuntimeAdmissionRecord,
+        super::runtime_authority::ApprovalEffectFence,
+    )> {
+        RuntimeAuthorityRepository::require_existing_admission(connection, owner).await
     }
 
     /// Native effects under the executing action's nonempty selection use its

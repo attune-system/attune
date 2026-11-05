@@ -156,6 +156,14 @@ pub const SELECT_COLUMNS: &str = "\
     worker, status, trace_tag, result, retry_count, max_retries, retry_reason, \
     original_execution, started_at, timeout_seconds, workflow_task, created, updated";
 
+/// An atomic transition with the status locked immediately before it.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExecutionTransition {
+    #[sqlx(flatten)]
+    pub execution: Execution,
+    pub previous_status: ExecutionStatus,
+}
+
 pub struct ExecutionRepository;
 
 /// The fields required by execution visibility and runtime-log authorization.
@@ -205,6 +213,71 @@ impl From<&Execution> for ExecutionAuthorizationRow {
 }
 
 impl ExecutionRepository {
+    /// Return the locked predecessor and updated row in one round trip. Stale
+    /// deliveries cannot resurrect a terminal or canceling execution at startup.
+    /// An absent worker is reserved for direct, unassigned executor callers.
+    pub async fn transition_worker<'e, E>(
+        executor: E,
+        id: Id,
+        worker: Option<Id>,
+        status: ExecutionStatus,
+        result: Option<JsonDict>,
+    ) -> Result<ExecutionTransition>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let allowed = if status == ExecutionStatus::Running {
+            let mut allowed = vec![ExecutionStatus::Scheduled];
+            if worker.is_none() {
+                allowed.extend([ExecutionStatus::Requested, ExecutionStatus::Running]);
+            }
+            allowed
+        } else if matches!(
+            status,
+            ExecutionStatus::Completed
+                | ExecutionStatus::Failed
+                | ExecutionStatus::Timeout
+                | ExecutionStatus::Cancelled
+        ) {
+            vec![ExecutionStatus::Running, ExecutionStatus::Canceling]
+        } else {
+            return Err(Error::validation("Unsupported worker transition"));
+        };
+        let columns = SELECT_COLUMNS
+            .split(',')
+            .map(|column| format!("changed.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "WITH prior AS MATERIALIZED (
+                SELECT id, status FROM execution
+                WHERE id=$1 AND ($2::BIGINT IS NULL OR worker=$2) AND status=ANY($3)
+                FOR UPDATE
+             ), changed AS (
+                UPDATE execution SET status=$4,
+                    result=CASE WHEN $5 THEN $6 ELSE result END,
+                    started_at=CASE WHEN $4='running' THEN COALESCE(started_at,NOW()) ELSE started_at END,
+                    updated=NOW()
+                WHERE id=(SELECT id FROM prior)
+                RETURNING {SELECT_COLUMNS}
+             ) SELECT {columns}, prior.status AS previous_status FROM changed JOIN prior USING(id)"
+        );
+        sqlx::query_as(&query)
+            .bind(id)
+            .bind(worker)
+            .bind(allowed)
+            .bind(status)
+            .bind(result.is_some())
+            .bind(result)
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| {
+                Error::PermissionDenied(
+                    "Worker execution transition is stale or unavailable".into(),
+                )
+            })
+    }
+
     /// One-shot initialization of a value-free execution inserted by this
     /// transaction. This is deliberately NOT a general config update operation.
     /// The caller renders/validates against its retained contract first; config

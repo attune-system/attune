@@ -79,6 +79,15 @@ async fn create_pack_with_action(
     )
     .await
     .expect("activate test pack release");
+    admit_dispatch_fixture(
+        ctx,
+        &pack,
+        attune_common::runtime_authority::InvocationBinding::Action {
+            action_ref: action.r#ref.clone(),
+        },
+    )
+    .await
+    .expect("admit published dispatch action");
 
     (pack, action)
 }
@@ -146,7 +155,9 @@ async fn register_queue_admin(ctx: &TestContext) -> String {
         &format!("queue_admin_{}", uuid::Uuid::new_v4().simple()),
         json!([
             {"resource": "queues", "actions": ["read", "create", "update", "delete"]},
-            {"resource": "queue_items", "actions": ["read", "create", "update", "delete"]}
+            {"resource": "queue_items", "actions": ["read", "create", "update", "delete"]},
+            // Human acceptance through an ad hoc queue also invokes its target action.
+            {"resource": "actions", "actions": ["execute"]}
         ]),
     )
     .await
@@ -217,18 +228,34 @@ async fn admit_queue_fixture(
     pack: &attune_common::models::Pack,
     queue: &attune_common::models::work_queue::WorkQueue,
 ) -> Result<i64> {
+    admit_dispatch_fixture(
+        ctx,
+        pack,
+        attune_common::runtime_authority::InvocationBinding::Queue {
+            queue_ref: queue.r#ref.clone(),
+            action_ref: queue.dispatch_action_ref.clone(),
+        },
+    )
+    .await
+}
+
+async fn admit_dispatch_fixture(
+    ctx: &TestContext,
+    pack: &attune_common::models::Pack,
+    binding: attune_common::runtime_authority::InvocationBinding,
+) -> Result<i64> {
     use attune_common::{
         repositories::{
             executable_snapshot::ExecutableSnapshotRepository,
             runtime_authority::RuntimeAuthorityRepository,
         },
-        runtime_authority::{InvocationBinding, InvocationPolicy, RuntimePolicy},
+        runtime_authority::{InvocationPolicy, RuntimePolicy},
     };
     use std::collections::BTreeMap;
     let mut tx = ctx.pool.begin().await?;
     let owner = RuntimeAuthorityRepository::ensure_owner(&mut tx, pack.id).await?;
     let snapshot =
-        ExecutableSnapshotRepository::resolve_for_action_ref(&mut *tx, &queue.dispatch_action_ref)
+        ExecutableSnapshotRepository::resolve_for_action_ref(&mut *tx, binding.action_ref())
             .await?;
     let policy = RuntimeAuthorityRepository::capture_policy(
         &mut tx,
@@ -238,10 +265,7 @@ async fn admit_queue_fixture(
             release_digest: snapshot.release.digest.clone(),
             concrete_targets: BTreeMap::new(),
             invocations: vec![InvocationPolicy {
-                binding: InvocationBinding::Queue {
-                    queue_ref: queue.r#ref.clone(),
-                    action_ref: queue.dispatch_action_ref.clone(),
-                },
+                binding,
                 target_release_id: snapshot.release.id,
                 target_release_digest: snapshot.release.digest.clone(),
                 permission_sets: BTreeMap::new(),

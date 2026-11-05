@@ -16,6 +16,10 @@ use helpers::{create_test_action, create_test_pack, TestContext};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 async fn stream_fixture(ctx: &TestContext) -> Result<(i64, String)> {
+    stream_fixture_kind(ctx, false).await
+}
+
+async fn stream_fixture_kind(ctx: &TestContext, sensitive: bool) -> Result<(i64, String)> {
     let pack = create_test_pack(
         &ctx.pool,
         &format!("stream_{}", uuid::Uuid::new_v4().simple()),
@@ -23,6 +27,18 @@ async fn stream_fixture(ctx: &TestContext) -> Result<(i64, String)> {
     .await?;
     let action_ref = format!("{}.tail", pack.r#ref);
     let action = create_test_action(&ctx.pool, pack.id, &pack.r#ref, &action_ref).await?;
+    if sensitive {
+        use attune_common::repositories::action::{ActionRepository, UpdateActionInput};
+        ActionRepository::update(
+            &ctx.pool,
+            action.id,
+            UpdateActionInput {
+                param_schema: Some(serde_json::json!({"secret":{"type":"string","secret":true}})),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     helpers::activate_test_pack_release_with_projections(
         &ctx.pool,
         &pack,
@@ -81,7 +97,7 @@ async fn stream_fixture(ctx: &TestContext) -> Result<(i64, String)> {
             pack_ref: None,
             label: None,
             description: None,
-            grants: serde_json::json!([{"resource":"executions","actions":["read"],
+            grants: serde_json::json!([{"resource":"executions","actions": if sensitive { vec!["read", "decrypt"] } else { vec!["read"] },
             "constraints":{"ids":[execution.id]}}]),
         },
     )
@@ -462,5 +478,95 @@ async fn server_shutdown_waits_for_reconnect_and_lease_release() -> Result<()> {
         ExecutionLogStreamLeaseRepository::active_count(&ctx.pool).await?,
         0
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_empty_logs_finish_without_stream_rows_on_both_reader_paths() -> Result<()> {
+    use attune_common::repositories::{execution::UpdateExecutionInput, Update};
+    for sensitive in [false, true] {
+        let ctx = TestContext::new_with_stream_limits(4, 4)
+            .await?
+            .with_auth()
+            .await?;
+        let (id, token) = stream_fixture_kind(&ctx, sensitive).await?;
+        for status in [
+            ExecutionStatus::Completed,
+            ExecutionStatus::Failed,
+            ExecutionStatus::Cancelled,
+            ExecutionStatus::Timeout,
+        ] {
+            ExecutionRepository::update(&ctx.pool, id, UpdateExecutionInput {
+                status: Some(status), result: Some(serde_json::json!({"runtime_log_capture":{"stdout":"empty","stderr":"empty"}})),
+                ..Default::default()
+            }).await?;
+            for stream in ["stdout", "stderr"] {
+                let response = ctx
+                    .get(
+                        &format!("/api/v1/executions/{id}/logs/{stream}/stream"),
+                        Some(&token),
+                    )
+                    .await?;
+                assert_eq!(response.status(), StatusCode::OK);
+                let text = tokio::time::timeout(Duration::from_secs(5), response.text()).await??;
+                assert!(
+                    text.contains("event: done"),
+                    "sensitive={sensitive}, {status:?}: {text}"
+                );
+                assert!(!text.contains("event: error"), "{text}");
+                let response = ctx
+                    .get(
+                        &format!("/api/v1/executions/{id}/logs/{stream}/stream?offset=1"),
+                        Some(&token),
+                    )
+                    .await?;
+                let text = tokio::time::timeout(Duration::from_secs(5), response.text()).await??;
+                assert!(text.contains("event: error"), "{text}");
+                assert!(!text.contains("event: done"), "{text}");
+                wait_for_no_leases(&ctx).await?;
+            }
+        }
+        wait_for_no_leases(&ctx).await?;
+        ctx.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_or_incomplete_capture_never_becomes_successful_empty_output() -> Result<()> {
+    use attune_common::repositories::{execution::UpdateExecutionInput, Update};
+    for sensitive in [false, true] {
+        let ctx = TestContext::new_with_stream_limits(2, 2)
+            .await?
+            .with_auth()
+            .await?;
+        let (id, token) = stream_fixture_kind(&ctx, sensitive).await?;
+        for result in [
+            serde_json::json!({}),
+            serde_json::json!({"logs_incomplete":true,"runtime_log_capture":{"stdout":"empty"}}),
+        ] {
+            ExecutionRepository::update(
+                &ctx.pool,
+                id,
+                UpdateExecutionInput {
+                    status: Some(ExecutionStatus::Failed),
+                    result: Some(result),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let response = ctx
+                .get(
+                    &format!("/api/v1/executions/{id}/logs/stdout/stream"),
+                    Some(&token),
+                )
+                .await?;
+            let text = tokio::time::timeout(Duration::from_secs(10), response.text()).await??;
+            assert!(text.contains("event: error"), "{text}");
+            assert!(!text.contains("event: done"), "{text}");
+        }
+        wait_for_no_leases(&ctx).await?;
+        ctx.cleanup().await?;
+    }
     Ok(())
 }

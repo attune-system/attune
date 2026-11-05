@@ -2055,10 +2055,43 @@ pub(crate) async fn authorize_human_live_log(
     let selected = ArtifactVersionRepository::find_by_id(&state.db, pin.version)
         .await?
         .ok_or_else(denied)?;
-    let receipts = crate::artifact_reads::ArtifactReads::authorize_selected_version_with_receipts(
-        state, user, &artifact, &selected,
-    )
-    .await?;
+    let receipts =
+        match crate::artifact_reads::ArtifactReads::authorize_selected_version_with_receipts(
+            state, user, &artifact, &selected,
+        )
+        .await
+        {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                // Sealing a segmented log publishes its provider descriptor. If it
+                // raced discovery, reauthorize the now-ready selection once. This
+                // repeats all source/IAM/freshness checks; a denial is never a permit.
+                if !matches!(error, ApiError::Forbidden(_))
+                    || pin.backend != LogStreamBackend::ObjectSegments
+                    || selected.body_state != Some(ArtifactBodyState::Pending)
+                    || selected.provider_version.is_some()
+                {
+                    return Err(error);
+                }
+                let ready = ArtifactVersionRepository::find_by_id(&state.db, pin.version)
+                    .await?
+                    .ok_or_else(denied)?;
+                if ready.body_state != Some(ArtifactBodyState::Ready)
+                    || ready.artifact != selected.artifact
+                    || ready.version != selected.version
+                    || ready.execution != selected.execution
+                    || ready.file_path != selected.file_path
+                    || ready.object_key != selected.object_key
+                    || ready.provider_version.is_none()
+                {
+                    return Err(error);
+                }
+                crate::artifact_reads::ArtifactReads::authorize_selected_version_with_receipts(
+                    state, user, &artifact, &ready,
+                )
+                .await?
+            }
+        };
     let (owner, active) = {
         let mut held = receipts.lock().await;
         let conn = held.connection();
@@ -4260,7 +4293,8 @@ pub async fn stream_artifact(
     };
 
     ensure_selected_version_id(&selector, &ver)?;
-    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
+    // The typed live-log pin performs complete selected-version disclosure,
+    // including reauthorization when sealing races pending discovery.
     if user.claims.token_type == TokenType::Access
         && ver
             .meta
@@ -4269,9 +4303,17 @@ pub async fn stream_artifact(
             .and_then(serde_json::Value::as_str)
             == Some(attune_common::runtime_read_log::ENCODING)
     {
-        let pin = crate::live_logs::LogPin::select(&state, &user, ver).await?;
+        let pin = crate::live_logs::LogPin::select(&state, &user, ver)
+            .await
+            .map_err(|error| {
+                crate::artifact_reads::mask_detail_denial(
+                    error,
+                    format!("Artifact with ID {} not found", id),
+                )
+            })?;
         return Ok(verified_body_sse(pin.response(state, user).await?));
     }
+    authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
     if protected_log_marker(&ver) {
         return Ok(verified_body_sse(
             download_human_encrypted_log(state, user, artifact, ver).await?,

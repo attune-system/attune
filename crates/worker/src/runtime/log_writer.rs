@@ -81,8 +81,20 @@ pub struct BoundedLogWriter {
 ///
 /// When constructed with a path, it opens the file directly (legacy/volume mode).
 /// When constructed with a pre-opened `BoxAsyncWriter`, it uses that writer (transport mode).
+type LogInitializer = Box<
+    dyn FnOnce() -> Pin<
+            Box<
+                dyn std::future::Future<Output = attune_common::Result<BoundedLogFileWriter>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 pub struct BoundedLogFileWriter {
-    writer: RuntimeLogWriter,
+    writer: Option<RuntimeLogWriter>,
+    initializer: Option<LogInitializer>,
+    initialization_failed: bool,
     encryption: Option<LogEncryption>,
     mirror_source: Option<attune_common::runtime_log_mirror::RuntimeLogSource>,
     finalization_timeout_ms: u64,
@@ -213,6 +225,51 @@ impl BoundedLogWriter {
 }
 
 impl BoundedLogFileWriter {
+    /// Poll allocation only for the first nonempty write. A cancelled or failed
+    /// initialization is latched and cannot later be sealed as intentional silence.
+    pub fn lazy<F, Fut>(
+        initializer: F,
+        max_bytes: usize,
+        is_stdout: bool,
+        finalization_timeout_ms: u64,
+        mirror_source: Option<attune_common::runtime_log_mirror::RuntimeLogSource>,
+    ) -> Self
+    where
+        F: FnOnce() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = attune_common::Result<Self>> + Send + 'static,
+    {
+        Self {
+            writer: None,
+            initializer: Some(Box::new(|| Box::pin(initializer()))),
+            initialization_failed: false,
+            encryption: None,
+            mirror_source,
+            finalization_timeout_ms,
+            max_bytes,
+            truncated: false,
+            data_bytes_written: 0,
+            truncation_notice: if is_stdout {
+                TRUNCATION_NOTICE_STDOUT
+            } else {
+                TRUNCATION_NOTICE_STDERR
+            },
+        }
+    }
+
+    async fn initialize(&mut self) -> std::io::Result<()> {
+        if self.initialization_failed {
+            return Err(std::io::Error::other("Runtime log allocation failed"));
+        }
+        if let Some(initializer) = self.initializer.take() {
+            self.initialization_failed = true;
+            let writer = initializer()
+                .await
+                .map_err(|_| std::io::Error::other("Runtime log allocation failed"))?;
+            *self = writer;
+        }
+        Ok(())
+    }
+
     pub fn from_segmented_writer(
         writer: attune_common::log_stream::SegmentedLogWriter,
         max_bytes: usize,
@@ -220,7 +277,9 @@ impl BoundedLogFileWriter {
     ) -> Self {
         let finalization_timeout_ms = writer.finalization_timeout_ms();
         Self {
-            writer: RuntimeLogWriter::Segmented(writer),
+            writer: Some(RuntimeLogWriter::Segmented(writer)),
+            initializer: None,
+            initialization_failed: false,
             encryption: None,
             mirror_source: None,
             finalization_timeout_ms,
@@ -242,7 +301,9 @@ impl BoundedLogFileWriter {
         finalization_timeout_ms: u64,
     ) -> Self {
         Self {
-            writer: RuntimeLogWriter::SharedFile(writer),
+            writer: Some(RuntimeLogWriter::SharedFile(writer)),
+            initializer: None,
+            initialization_failed: false,
             encryption: None,
             mirror_source: None,
             finalization_timeout_ms,
@@ -261,6 +322,8 @@ impl BoundedLogFileWriter {
         if buf.is_empty() || self.truncated {
             return Ok(());
         }
+
+        self.initialize().await?;
 
         let effective_limit = self.max_bytes.saturating_sub(NOTICE_RESERVE_BYTES);
         let remaining_space = effective_limit.saturating_sub(self.data_bytes_written);
@@ -311,7 +374,12 @@ impl BoundedLogFileWriter {
 
     async fn write_protected(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let Some(encryption) = &mut self.encryption else {
-            return self.writer.write_all(bytes).await;
+            return self
+                .writer
+                .as_ref()
+                .expect("initialized log writer")
+                .write_all(bytes)
+                .await;
         };
         let mut remaining = bytes;
         while !remaining.is_empty() {
@@ -331,7 +399,11 @@ impl BoundedLogFileWriter {
                 &encryption.pending,
             )
             .map_err(|_| std::io::Error::other("Protected log encryption failed"))?;
-            self.writer.write_all(&frame).await?;
+            self.writer
+                .as_ref()
+                .expect("initialized log writer")
+                .write_all(&frame)
+                .await?;
             encryption
                 .totals
                 .record(&frame, encryption.pending.len())
@@ -364,6 +436,14 @@ impl BoundedLogFileWriter {
     }
 
     pub async fn seal(mut self) -> attune_common::Result<()> {
+        if self.initialization_failed {
+            return Err(attune_common::Error::execution(
+                "Runtime log allocation failed or was cancelled",
+            ));
+        }
+        if self.initializer.is_some() {
+            return Ok(());
+        }
         if let Some(encryption) = &mut self.encryption {
             if !encryption.pending.is_empty() {
                 let frame = attune_common::runtime_read_log::encode(
@@ -374,6 +454,8 @@ impl BoundedLogFileWriter {
                     &encryption.pending,
                 )?;
                 self.writer
+                    .as_ref()
+                    .expect("initialized log writer")
                     .write_all(&frame)
                     .await
                     .map_err(|_| attune_common::Error::execution("Protected log write failed"))?;
@@ -390,7 +472,11 @@ impl BoundedLogFileWriter {
             ),
             None => None,
         };
-        self.writer.seal(self.truncated, manifest).await
+        self.writer
+            .take()
+            .expect("initialized log writer")
+            .seal(self.truncated, manifest)
+            .await
     }
 
     pub fn finalization_timeout_ms(&self) -> u64 {
@@ -422,6 +508,102 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
+
+    fn lazy_shared(
+        allocations: Arc<std::sync::atomic::AtomicUsize>,
+        transport: Arc<RecordingSharedTransport>,
+    ) -> BoundedLogFileWriter {
+        BoundedLogFileWriter::lazy(
+            move || async move {
+                allocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BoundedLogFileWriter::from_shared_file_writer(
+                    attune_common::log_stream::SharedFileLogWriter::new(
+                        transport,
+                        42,
+                        "lazy.log".into(),
+                    ),
+                    1024,
+                    true,
+                    1000,
+                ))
+            },
+            1024,
+            true,
+            1000,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn lazy_empty_writes_and_seal_allocate_nothing() {
+        let allocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = Arc::new(RecordingSharedTransport::default());
+        let mut writer = lazy_shared(allocations.clone(), transport.clone());
+        writer.write_all(b"").await.unwrap();
+        writer.seal().await.unwrap();
+        assert_eq!(allocations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(transport.seals.lock().unwrap().is_empty());
+        assert!(transport.appends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lazy_streams_allocate_independently_on_whitespace_and_only_once() {
+        let allocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = Arc::new(RecordingSharedTransport::default());
+        let mut stdout = lazy_shared(allocations.clone(), transport.clone());
+        let stderr = lazy_shared(allocations.clone(), transport.clone());
+        stdout.write_all(b" ").await.unwrap();
+        stdout.write_all(b"more").await.unwrap();
+        stdout.seal().await.unwrap();
+        stderr.seal().await.unwrap();
+        assert_eq!(allocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(*transport.appends.lock().unwrap(), b" more");
+        assert_eq!(transport.seals.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lazy_allocation_failure_is_latched() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = attempts.clone();
+        let mut writer = BoundedLogFileWriter::lazy(
+            move || async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(attune_common::Error::execution(
+                    "injected allocation failure",
+                ))
+            },
+            1024,
+            true,
+            1000,
+            None,
+        );
+        assert!(writer.write_all(b"one").await.is_err());
+        assert!(writer.write_all(b"two").await.is_err());
+        assert!(writer.seal().await.is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_lazy_allocation_cannot_seal_as_empty() {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut writer = BoundedLogFileWriter::lazy(
+            move || async move {
+                started.send(()).unwrap();
+                std::future::pending().await
+            },
+            1024,
+            true,
+            1000,
+            None,
+        );
+        let mut write = Box::pin(writer.write_all(b"one"));
+        tokio::select! {
+            _ = ready => {},
+            result = &mut write => panic!("allocation unexpectedly ended: {result:?}"),
+        }
+        drop(write);
+        assert!(writer.seal().await.is_err());
+    }
 
     #[derive(Debug, Default)]
     struct RecordingSharedTransport {

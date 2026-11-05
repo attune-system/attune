@@ -1,0 +1,107 @@
+{
+  "runs": [
+    {
+      "run": "dbm-legacy-volume-10000-b4074655",
+      "kind": "legacy",
+      "backend": "volume",
+      "budget_ms": 10000,
+      "exit_code": 1,
+      "cleanup_verified": true,
+      "classification": "rejected pilot",
+      "reason": "Post-run validator incorrectly required a Git SHA from the original API, which reports unknown. Preserved and excluded; rerun accepted only after checking the seven archived exact runtime image identities.",
+      "report_sha256": "35ab534330ab22aa7a3da2bf0d263a4edf560efeff2ad8e528983495e44608f5",
+      "completed_profiles": 12
+    },
+    {
+      "run": "dbm-legacy-volume-10000-29cb2d88",
+      "kind": "legacy",
+      "backend": "volume",
+      "budget_ms": 10000,
+      "exit_code": 0,
+      "cleanup_verified": true,
+      "classification": "accepted primary",
+      "completed_profiles": 12,
+      "samples": 1200
+    },
+    {
+      "run": "dbm-before-volume-10000-e8726853",
+      "kind": "before",
+      "backend": "volume",
+      "budget_ms": 10000,
+      "exit_code": 0,
+      "cleanup_verified": true,
+      "classification": "accepted primary",
+      "completed_profiles": 12,
+      "samples": 1200
+    },
+    {
+      "run": "dbm-after-volume-10000-70d69eb7",
+      "kind": "after",
+      "backend": "volume",
+      "budget_ms": 10000,
+      "exit_code": 0,
+      "cleanup_verified": true,
+      "classification": "accepted primary",
+      "completed_profiles": 12,
+      "samples": 1200
+    },
+    {
+      "run": "dbm-after-api-10000-8de4e00c",
+      "kind": "after",
+      "backend": "api",
+      "budget_ms": 10000,
+      "exit_code": 0,
+      "cleanup_verified": true,
+      "classification": "accepted primary",
+      "completed_profiles": 12,
+      "samples": 1200
+    },
+    {
+      "run": "dbm-before-api-10000-3e60d244",
+      "kind": "before",
+      "backend": "api",
+      "budget_ms": 10000,
+      "exit_code": 0,
+      "cleanup_verified": true,
+      "classification": "accepted primary",
+      "completed_profiles": 12,
+      "samples": 1200
+    },
+    {
+      "run": "dbm-legacy-api-10000-e2b6d7d2",
+      "kind": "legacy",
+      "backend": "api",
+      "budget_ms": 10000,
+      "exit_code": 0,
+      "cleanup_verified": true,
+      "classification": "accepted primary",
+      "completed_profiles": 12,
+      "samples": 1200
+    },
+    {
+      "run": "dbm-after-volume-1000-472f2328",
+      "kind": "after",
+      "backend": "volume",
+      "budget_ms": 1000,
+      "exit_code": 1,
+      "cleanup_verified": true,
+      "classification": "separate default-budget probe",
+      "completed_profiles": 1,
+      "samples_in_completed_profiles": 20
+    },
+    {
+      "run": "dbm-after-api-1000-66adda9a",
+      "kind": "after",
+      "backend": "api",
+      "budget_ms": 1000,
+      "exit_code": 0,
+      "cleanup_verified": true,
+      "classification": "separate default-budget probe",
+      "completed_profiles": 12,
+      "samples_in_completed_profiles": 240
+    }
+  ],
+  "primary_samples": 7200,
+  "primary_profiles": 72,
+  "rejected_pilot_not_pooled": true
+}

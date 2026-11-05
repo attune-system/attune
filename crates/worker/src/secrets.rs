@@ -53,6 +53,16 @@ impl SecretManager {
         execution_id: i64,
         redacted_config: JsonValue,
     ) -> Result<JsonValue> {
+        self.restore_execution_parameters_with_paths(execution_id, redacted_config)
+            .await
+            .map(|(config, _)| config)
+    }
+
+    pub(crate) async fn restore_execution_parameters_with_paths(
+        &self,
+        execution_id: i64,
+        redacted_config: JsonValue,
+    ) -> Result<(JsonValue, Vec<String>)> {
         let mut transaction = self.pool.begin().await?;
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
             &mut transaction,
@@ -64,6 +74,10 @@ impl SecretManager {
             execution_id,
         )
         .await?;
+        let paths = secrets
+            .iter()
+            .map(|secret| secret.json_path.clone())
+            .collect();
         use attune_common::repositories::FindById;
         let execution = attune_common::repositories::execution::ExecutionRepository::find_by_id(
             &mut *transaction,
@@ -80,7 +94,7 @@ impl SecretManager {
             )
             .await?;
             transaction.commit().await?;
-            return Ok(redacted_config);
+            return Ok((redacted_config, paths));
         }
 
         let encryption_key = self
@@ -128,7 +142,7 @@ impl SecretManager {
         for receipt in &receipts {
             receipt.ensure_fresh()?;
         }
-        Ok(restored)
+        Ok((restored, paths))
     }
 
     /// Compute hash of the encryption key.
