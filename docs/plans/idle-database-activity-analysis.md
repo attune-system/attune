@@ -1,12 +1,13 @@
 # Idle database activity: source analysis and implementation opportunities
 
 Date: 2026-11-05. Status: queue/retention and workflow-log wakeup slices implemented
-and scoped-tested; safe leader-session reuse is under validation. Inquiry
-scheduling remains a separate follow-up.
+and validated with safe leader-session reuse. Combined measurements and required
+CI remain in progress; inquiry scheduling is a separate follow-up.
 Code inspected: `2ad41436`. Evidence: the six accepted primary matrices in the
 [measurement report](../testing/benchmarks/database-activity-2026-11-05/README.md),
-plus a fresh examination of retained idle-window service logs. No services were
-started and no production settings were changed for this analysis.
+plus a fresh examination of retained idle-window service logs. That original
+source-only analysis started no services or production changes. Implementation
+and owned-infrastructure validation records follow below.
 
 ## Important correction to the earlier idle interpretation
 
@@ -359,3 +360,63 @@ resubscribing on the next idle wait. A real PostgreSQL burst case buffers more
 than the drain budget, checks backend closure, delivers work with the listener
 absent, and verifies fresh subscription. This follow-up requires rerunning the
 workflow-log suite and building new treatment images before measurement.
+
+
+## Combined validation and baseline gaps
+
+Status: **work in progress** while normal-cadence comparisons and required CI
+complete. The measured runtime is frozen at `0c37e1dd`. The later listener-budget
+fix changes only wakeup draining, its regression test, and documentation;
+supervisor, queue, and retention inputs from `ca5fa445` are unchanged.
+
+The combined local pass has **157 passing tests**, zero failed/ignored in those
+selected Rust suites:
+
+- Supervisor: 58, including five leader reuse/contention/drop/cancellation/error cases.
+- Work-queue repository: 11; retention repository: 15.
+- Queue dispatcher: 18; workflow-log delivery/lifecycle: 30, including the new burst case.
+- API queue/RBAC: 25, including both queue-permission cases from the earlier CI regression.
+
+`cargo check --workspace --all-targets` and common/executor/supervisor Clippy with
+all targets and `-D warnings` pass. Workspace formatting, explicit formatting of
+the included wakeup tests, script syntax, bootstrap tests and isolation guards
+pass. Fresh stock PostgreSQL 18.6 migrations pass. Workspace SQLx preparation
+from `59c152b9` is reused: migration bytes and macro-query inputs are unchanged,
+and that run found no macro queries or metadata changes. The local native test
+container and volume are independently checked absent after all sessions close.
+Commands, identities, differences and result provenance are retained under
+`.scratch/idle-readiness/`.
+
+The supplemental default-budget E2E selection is **32 passed / 3 failed** on
+both treatment `0c37e1dd` and baseline images `747832c9`, whose runtime/build
+inputs are byte-equivalent to merged main `4846e607`. The same three cases fail:
+
+- `test_inquiry_response_releases_guarded_workflow_task`
+- `test_inquiry_rejects_invalid_response_before_releasing_task`
+- `test_inquiry_list_filters_by_creator_execution`
+
+All three creator actions stop before inquiry creation with the identical error:
+`Recorded execution credentials require coordinated admission, consumers and completion readiness`.
+The worker credential/admission code and inquiry fixture are unchanged by this
+branch. The recorded-consumer readiness guard remains off, as documented in
+[supported deployment scope](../testing/supported-deployment-scope.md).
+No guard, assertion, or test status is changed to make these cases pass. They are
+actual baseline failures and a coverage gap, not additional deferred-test
+exceptions or proof of inquiry E2E support. Both fresh E2E stacks have verified
+container, network, and volume teardown. Their matching results and preparation
+errors are retained in `.scratch/idle-readiness/known-baseline-inquiry.json`.
+
+The musl image build repeats the archived baseline linker warning
+`ignoring deprecated linker optimization setting '1'`. Cargo/linker flags and
+Dockerfiles are unchanged; this is not a new compiler warning. Baseline and
+current log evidence is retained in `baseline-linker-warning.json`. Native
+workspace checking and Clippy remain warning-free.
+
+The normal-cadence campaign uses separately owned stacks, identical collector
+bytes, runtime/infrastructure image checks, actual persisted settings and
+maintenance deadlines, six-minute idle windows, complete output assertions and
+a separate default-budget correctness run. It must finish before claiming new
+whole-stack idle or latency results. Pending CI still prevents a merge-ready
+status. The earlier instrumented shared-file capture-budget stress limit is not
+resolved by these tests; neither full deployment certification nor many-replica,
+busy-queue, S3, CPU or saturated-capacity performance is claimed.
