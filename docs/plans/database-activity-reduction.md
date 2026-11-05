@@ -596,3 +596,23 @@ committed CSV/JSON exports preserve individual primary latencies, profile
 counters, worker phases, observed API holder timings and provenance. All nine
 campaign stacks have verified owned-resource cleanup. Required CI and unfiltered
 workspace/full-stack suites have not run for this local branch.
+
+
+### Idle attribution correction and implementation analysis — 2026-11-05
+
+A follow-up source/log investigation found that the E2E runner globally sets
+retention to **two seconds** during startup. All six primary supervisor logs
+confirm that interval. The 4,860–5,301 supervisor events/minute above include
+22–24 full maintenance cycles per minute; they are not production-default idle.
+Paired execution results still describe identical accelerated maintenance across
+phases, but normal-cadence performance is not established. Production ranking
+of supervisor work requires a fresh baseline with actual persisted settings
+recorded. Avoid extrapolating the earlier idle totals to a normal installation.
+
+The [idle database activity analysis](idle-database-activity-analysis.md) ranks
+specific implementation candidates and their safeguards: empty workflow-log
+wakeups, unnecessary previous-dispatch reads, batched queue readiness hints,
+retention seeding in configuration reads, inquiry ownership/deadlines and safe
+connection reuse. The first three are stronger immediate candidates than
+changing maintenance cadences. Estimates are explicitly unmeasured; no runtime
+implementation is included in this follow-up.

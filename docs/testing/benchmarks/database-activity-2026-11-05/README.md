@@ -5,6 +5,14 @@ the first database activity reductions on fresh disposable full-stack instances.
 The comparison separates database work from time to completion: lower query
 counts alone do not establish a latency improvement.
 
+> **Idle baseline correction (2026-11-05):** The E2E runner sets persisted
+> retention to **2 seconds**, not the normal 3,600 seconds. All six runs confirm
+> that accelerated cadence. The reported idle counts describe this test setup;
+> they do not establish production-default supervisor load or hotspot ranking.
+> See the [idle source analysis](../../../plans/idle-database-activity-analysis.md)
+> and `idle-follow-up.json`. Matched execution comparisons remain observations
+> under identical accelerated maintenance, rather than normal-cadence evidence.
+
 ## Results
 
 **The combined changes reduced database calls and median completion time in all 24 matched profiles.** The first database-specific slice reduced top-level SQL calls in all 24 profiles beyond the worker checkpoint, but its incremental latency/tail and WAL results are mixed. These are measured comparisons on this instrumented host, not a general production speedup guarantee.
@@ -73,7 +81,7 @@ an exact reconciliation of server calls.
 | Service | Shared-file events/min | API-segment events/min |
 | --- | ---: | ---: |
 | Supervisor | 4,859.6 | 5,300.8 |
-| Both executors combined | 2,468.8 | 2,469.4 |
+| Both executors combined | 2,468.8 | 2,469.5 |
 | API | 125.9 | 127.9 |
 | Four workers combined | 24.0 | 24.0 |
 | Notifier, with no subscribed clients | 0 observed | 0 observed |
@@ -82,8 +90,9 @@ an exact reconciliation of server calls.
 The executor workflow-log outbox candidate statement alone executes **1,170 times
 in each one-minute database-checkpoint idle window**. Supervisor configuration
 initialization and maintenance admission also recur with no submitted work.
-These support prioritizing the plan's idle outbox dispatch and maintenance
-cadence/configuration opportunities. They do not justify weakening delivery
+The outbox pattern supports idle dispatch work. The supervisor ranking must
+be reassessed at normal retention cadence; accelerated maintenance inflates its
+share. See the follow-up correction above. They do not justify weakening delivery
 fences, retention independence, or admission ownership.
 
 Worker → database execution-scoped SQLx events decrease by approximately **18
