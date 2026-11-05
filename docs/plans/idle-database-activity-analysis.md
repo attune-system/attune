@@ -1,7 +1,8 @@
 # Idle database activity: source analysis and implementation opportunities
 
 Date: 2026-11-05. Status: queue/retention and workflow-log wakeup slices implemented
-and scoped-tested; inquiry scheduling and connection reuse remain proposals.
+and scoped-tested; safe leader-session reuse is under validation. Inquiry
+scheduling remains a separate follow-up.
 Code inspected: `2ad41436`. Evidence: the six accepted primary matrices in the
 [measurement report](../testing/benchmarks/database-activity-2026-11-05/README.md),
 plus a fresh examination of retained idle-window service logs. No services were
@@ -317,3 +318,35 @@ object storage, sustained-backlog/large-replica load, normal-cadence idle baseli
 and required CI remain outstanding. The earlier shared-file capture-completeness
 observation is not addressed by this notification slice. No API schema/client
 change or retention scheduling change is included.
+
+
+## Leader-session reuse and normal-cadence measurement work
+
+The leader connection now has a narrow RAII owner. A failed lock attempt may
+return the connection to the pool; a successful acquisition may return it only
+after PostgreSQL reports a successful advisory unlock. SQL errors, a false
+unlock result, panic, and cancellation discard the socket. No session access is
+exposed to maintenance jobs, and no transaction or session setting is changed
+on this connection. SQLx readiness/health checking and pool return are awaited.
+Physical-cleanup and probe connections keep their existing disposal fences:
+there is no established clean-completion contract for reusing those sockets.
+
+Tests cover same-backend reuse, a competing leader, drop, task cancellation,
+a terminated backend, and an unacknowledged unlock. These changes are a work in
+progress until those tests and the affected supervisor lifecycle tests pass.
+They do not change maintenance due times or ownership.
+
+The full-stack runner accepts `ATTUNE_E2E_RETENTION_PROFILE=default` to leave
+persisted deployment settings intact; the default remains `accelerated` for
+cache correctness coverage. The performance collector records actual retention
+configuration and maintenance schedules, accepts explicit settling/idle windows,
+and recognizes both the old capacity-query family and the new queue readiness
+query. This permits equivalent baseline/treatment observations without asserting
+that obsolete work must remain present. All execution/output checks remain.
+
+Inquiry timeout, wait, and callback ownership is deliberately unchanged in this
+slice. A replacement needs API-only availability, notification-loss recovery,
+MQ wakeup handling, callback retry deadlines, and lease recovery coverage.
+Adding a listener to each existing owner also adds persistent backends; a lower
+statement count alone cannot establish a net resource improvement. Use the
+normal-cadence measurements to decide whether that larger change is warranted.
