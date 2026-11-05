@@ -1,6 +1,6 @@
 # Repository wide database activity reduction plan
 
-Status: initial implementation in progress; broad workload attribution and later phases remain outstanding.
+Status: initial slice implemented and measured across 7,200 executions; default shared-file capture, production attribution, and later phases remain outstanding.
 Date: 2026-11-04.
 
 ## Objective and scope
@@ -486,9 +486,11 @@ Schema and public API contracts are unchanged; SQLx metadata and generated-clien
 updates are not applicable to this slice.
 
 Status: **work in progress** for the broader plan and merge readiness. Required CI
-has not run for this local branch. Full unfiltered Rust/E2E suites, a new full-stack
-worker benchmark, multi-instance idle workloads, database/server execution time,
-lock occupancy, workload WAL, and production ranking remain outstanding. The
+has not run for this local branch. At this code checkpoint, full unfiltered
+Rust/E2E suites and broader performance measurements remained outstanding. The
+campaign below supplies full-stack execution/idle counters, server time, WAL,
+and observed API holder timings; it does not supply full lock occupancy or
+production ranking. The
 single-operation query trace supports only this contained reduction. Workflow-wait
 batching, policy-graph traversal reuse, idle workflow-log dispatch, inquiry ownership,
 log batching, and the remaining write/metadata opportunities are not implemented
@@ -502,7 +504,8 @@ part of this work.
 
 ## Broader measurement campaign — 2026-11-05
 
-A fresh full-stack campaign is in progress. Runtime checkpoints are the original
+The fresh full-stack campaign is complete; see the
+[measurement report and compact dataset](../testing/benchmarks/database-activity-2026-11-05/README.md). Runtime checkpoints are the original
 pre-worker-optimization `6906b968`, the validated worker treatment `ece3c859`
 (runtime source/build inputs identical to worker PR head `6dc75148`), and the
 database-reduction checkpoint `747832c9`. Validated baseline image identities are
@@ -515,9 +518,12 @@ profiles, shared-file and API/object-segment transports, and 100 measured sample
 per profile. Each action's first invocation and 16 warmup executions remain
 separate. All primary runs use the same 10,000 ms capture-finalization budget;
 current-treatment 1,000 ms default-budget probes are separate 20-sample runs.
-The primary dataset is intended to contain 7,200 measured executions across the
-three checkpoints and two transports. No passing run or speedup is claimed until
-collection and provenance/teardown checks complete.
+The accepted primary dataset contains **7,200 measured executions** across the
+three checkpoints and two transports, with 72 complete profiles. All configured
+primary correctness checks and 12 post-matrix reader probes pass; provenance,
+counter epoch and teardown checks pass. The initial pilot rejected by an
+incorrect original-build Git-metadata assumption is preserved and excluded.
+The report records the corrected image-identity validation and fresh rerun.
 
 Each disposable stack includes eight enabled empty queues, a 60-second settling
 interval, and a 60-second idle measurement. This exercises capacity observations
@@ -537,7 +543,56 @@ must not be described as attributed worker round trips.
 Raw snapshots, manifests, build logs, image identities and analysis scripts are
 retained under `.scratch/database-measurements/`. Collection runs sequentially
 after image compilation to avoid compiler load contaminating runtime latency.
-Both snapshots receive the same instrumentation overlays; runtime inputs remain
+All three snapshots receive the same instrumentation overlays; runtime inputs remain
 frozen. The original baselines are reused only with explicit image/source
 provenance; they are measured again on fresh owned stacks, not compared solely
 against historic timings.
+
+
+### Measured outcome and next priorities
+
+Combined original → database-checkpoint top-level SQL/job falls **52.9% with
+shared files and 48.0% with API segments**. Median durable completion improves in
+all 24 matched profiles; p95 improves in 22. Beyond the worker checkpoint, the
+first database slice removes **9.1% / 8.7%** of top-level calls/job, with roughly
+18 fewer execution-scoped worker SQLx events/job. Original worker client-event
+attribution is unavailable because its execution spans are absent. Background
+work is included in whole-database totals; no round-trip attribution is claimed.
+
+Incremental completion medians improve in 20/24 profiles, while p95 improves in
+11/24. Shared-file PostgreSQL execution time rises 3.7% despite fewer queries;
+API execution time falls 9.7%. Incremental WAL does not improve consistently.
+These results support the contained read reduction, not a uniform latency,
+contention or write-volume improvement.
+
+The 1,000 ms shared-file probe passes serial echo then fails concurrency-four
+echo's sealed/ready output assertion. Its failed-profile timings are unavailable
+because validation stops before report emission. The separate API default probe
+passes all 240 measured executions and its two reader cases. No matched default
+worker-baseline run was performed here, so the shared-file failure's introduction
+is unresolved. The 10,000 ms primary lane remains distinct; production timeout
+configuration and assertions are unchanged.
+
+Idle attribution places the supervisor at approximately 4,860–5,301 SQLx events/min
+and the two executors at 2,469 events/min in the database checkpoint. The empty
+workflow-log outbox candidate query executes 1,170 times/min. Worker heartbeats
+contribute 24 events/min across four workers. Exact per-service/client and server
+counts differ in coverage, and sensor SQLx attribution is absent. Idle-rate
+improvement is not established by the single one-minute windows.
+
+Next measured priorities are therefore idle outbox wakeups/claims, supervisor
+maintenance configuration/cadence work, and shared-file log sealing. Observed API
+seal holders remain expensive (database checkpoint p50 174.2 ms, p95 619.3 ms),
+while pool-acquisition p95 remains below 0.4 ms for instrumented services with
+events. Preserve delivery fences and independent maintenance budgets when
+working these opportunities. Workflow/permission-heavy paths, populated queues,
+real object storage, independent repeated trials and full holder occupancy still
+need measurement.
+
+Status: **work in progress** for the broader reduction plan and merge readiness.
+The measurement objective is complete with the default shared-file failure
+explicitly retained as a gap. Raw evidence stays in ignored scratch storage;
+committed CSV/JSON exports preserve individual primary latencies, profile
+counters, worker phases, observed API holder timings and provenance. All nine
+campaign stacks have verified owned-resource cleanup. Required CI and unfiltered
+workspace/full-stack suites have not run for this local branch.

@@ -1,0 +1,90 @@
+{
+  "runtime_image_revision": "ece3c859dc92709c38aa0fabf1040d77c168f07b",
+  "worker_pr_revision": "6dc75148f8d3e163f3f7f6b72f82d69dfd312fa1",
+  "identical_paths": [
+    "crates/common",
+    "crates/api/src",
+    "crates/executor",
+    "crates/worker",
+    "crates/notifier",
+    "crates/supervisor",
+    "Cargo.toml",
+    "Cargo.lock",
+    "docker",
+    "docker-compose.yaml",
+    "docker-compose.e2e.yaml",
+    "crates/api/Cargo.toml",
+    "docker/distributable/config.docker.yaml"
+  ],
+  "changed_paths": [],
+  "paths_absent_at_both_revisions": [
+    "config.docker.yaml"
+  ],
+  "comparisons": [
+    {
+      "path": "crates/common",
+      "runtime_image_git_object": "beb30fef5e66c2ff5a26c39c969f3e3093b21932",
+      "worker_pr_git_object": "beb30fef5e66c2ff5a26c39c969f3e3093b21932"
+    },
+    {
+      "path": "crates/api/src",
+      "runtime_image_git_object": "0e54438f4b401508bf7db22ffa117da72596b95d",
+      "worker_pr_git_object": "0e54438f4b401508bf7db22ffa117da72596b95d"
+    },
+    {
+      "path": "crates/executor",
+      "runtime_image_git_object": "728147e44717e590e0d56218a6d3f73e7ba809bf",
+      "worker_pr_git_object": "728147e44717e590e0d56218a6d3f73e7ba809bf"
+    },
+    {
+      "path": "crates/worker",
+      "runtime_image_git_object": "6c851cf5ae87b6f6f98a23cc5e09ec7cedc597b3",
+      "worker_pr_git_object": "6c851cf5ae87b6f6f98a23cc5e09ec7cedc597b3"
+    },
+    {
+      "path": "crates/notifier",
+      "runtime_image_git_object": "ea4fdc675371b23416fe3083db5218d232f1a062",
+      "worker_pr_git_object": "ea4fdc675371b23416fe3083db5218d232f1a062"
+    },
+    {
+      "path": "crates/supervisor",
+      "runtime_image_git_object": "2626298293eccbc36d0d1605eaa3450ea1b84228",
+      "worker_pr_git_object": "2626298293eccbc36d0d1605eaa3450ea1b84228"
+    },
+    {
+      "path": "Cargo.toml",
+      "runtime_image_git_object": "2e93a23a241222015ae8c1b7d08f436805810f3d",
+      "worker_pr_git_object": "2e93a23a241222015ae8c1b7d08f436805810f3d"
+    },
+    {
+      "path": "Cargo.lock",
+      "runtime_image_git_object": "40be74641ccaedc2dc64f9a5415a5769932c7319",
+      "worker_pr_git_object": "40be74641ccaedc2dc64f9a5415a5769932c7319"
+    },
+    {
+      "path": "docker",
+      "runtime_image_git_object": "a5d0fcf70864ba8723e788307a27408772a9c614",
+      "worker_pr_git_object": "a5d0fcf70864ba8723e788307a27408772a9c614"
+    },
+    {
+      "path": "docker-compose.yaml",
+      "runtime_image_git_object": "d2e84cdae8c9274807dfeceef0241eca56a5037d",
+      "worker_pr_git_object": "d2e84cdae8c9274807dfeceef0241eca56a5037d"
+    },
+    {
+      "path": "docker-compose.e2e.yaml",
+      "runtime_image_git_object": "f8765d141100b4bb7bc003d8da203b43c87d319e",
+      "worker_pr_git_object": "f8765d141100b4bb7bc003d8da203b43c87d319e"
+    },
+    {
+      "path": "crates/api/Cargo.toml",
+      "runtime_image_git_object": "7d7aef8c818874fbb097e6d19c6bc62d8e13c2e7",
+      "worker_pr_git_object": "7d7aef8c818874fbb097e6d19c6bc62d8e13c2e7"
+    },
+    {
+      "path": "docker/distributable/config.docker.yaml",
+      "runtime_image_git_object": "9793ea86f9489b90a1ef955bfef03a24684df636",
+      "worker_pr_git_object": "9793ea86f9489b90a1ef955bfef03a24684df636"
+    }
+  ]
+}
