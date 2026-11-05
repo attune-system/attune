@@ -50,7 +50,7 @@ def _stats_epoch(connection):
     dealloc, reset = connection.execute(
         "SELECT dealloc,stats_reset FROM pg_stat_statements_info"
     ).fetchone()
-    return {"dealloc": dealloc, "stats_reset": reset.isoformat()}
+    return {"dealloc": dealloc, "stats_reset": reset.isoformat() if reset is not None else None}
 
 
 def _statement_deltas(before, after):
@@ -318,4 +318,5 @@ def test_worker_lifecycle_profile(client, tmp_path):
                         "samples": values, "execution_ids": ids, "artifact_versions": dict(versions),
                         **_percentiles([value["observed_completion_ms"] for value in values.values()]), **_statement_totals(deltas),
                         "statement_deltas": deltas, "allocated_stream_rows": sum(counts.values())})
+                    print("WORKER_LIFECYCLE_PARTIAL_REPORT=" + json.dumps(report, sort_keys=True), flush=True)
     print("WORKER_LIFECYCLE_REPORT=" + json.dumps(report, sort_keys=True))

@@ -1,7 +1,7 @@
 # Used only with the owned E2E runner. No fixed ports or external resources.
 services:
   postgres:
-    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "pg_stat_statements.track=all", "-c", "log_lock_waits=on", "-c", "deadlock_timeout=50ms"]
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "pg_stat_statements.track=all", "-c", "pg_stat_statements.max=50000", "-c", "log_lock_waits=on", "-c", "deadlock_timeout=50ms"]
   api:
     environment:
       RUST_LOG: info,attune::graph_transaction=debug,tower_http=debug,sqlx::query=debug,sqlx::pool::acquire=debug
