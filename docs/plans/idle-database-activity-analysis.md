@@ -350,3 +350,12 @@ MQ wakeup handling, callback retry deadlines, and lease recovery coverage.
 Adding a listener to each existing owner also adds persistent backends; a lower
 statement count alone cannot establish a net resource improvement. Use the
 normal-cadence measurements to decide whether that larger change is warranted.
+
+
+A further listener review found that repeatedly consuming the full bounded hint
+batch could leave a slow replica behind global notification traffic. Reaching
+the drain budget now discards the listener, preserving durable work scans and
+resubscribing on the next idle wait. A real PostgreSQL burst case buffers more
+than the drain budget, checks backend closure, delivers work with the listener
+absent, and verifies fresh subscription. This follow-up requires rerunning the
+workflow-log suite and building new treatment images before measurement.

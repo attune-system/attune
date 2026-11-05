@@ -408,6 +408,55 @@ mod wakeup_tests {
     }
 
     #[tokio::test]
+    async fn notification_burst_discards_backlogged_listener_and_preserves_delivery() {
+        let (database, workflow) = test_workflow().await;
+        let pool = database.pool();
+        let owner = Uuid::new_v4();
+        let (mut wakeups, _tx, mut rx) = subscribe(pool, owner).await;
+        let first_pid = listener_pid(pool, owner).await;
+        let listener = wakeups.listener.as_mut().unwrap();
+        // Distinct fixture payloads prevent transaction-level coalescing. Send
+        // on the listener itself, then complete a second command so SQLx has
+        // buffered every earlier notification before testing the drain budget.
+        sqlx::query("SELECT pg_notify($1, n::text) FROM generate_series(1, 256) AS n")
+            .bind(attune_common::repositories::workflow_log_outbox::WORKFLOW_LOG_WAKEUP_CHANNEL)
+            .execute(&mut *listener)
+            .await
+            .unwrap();
+        sqlx::query("SELECT 1")
+            .execute(&mut *listener)
+            .await
+            .unwrap();
+        assert!(listener.next_buffered().is_some());
+        wakeups.drain_ready();
+        assert!(
+            wakeups.listener.is_none(),
+            "a saturated hint buffer must not keep an unread backend"
+        );
+        listener_gone(pool, owner).await;
+        enqueue(pool, workflow, b"durable work survives dropped hints").await;
+        let transport = Arc::new(RecordingTransport::new(pool.clone(), 0));
+        assert!(
+            WorkflowLogDispatcher::new(pool.clone(), transport.clone(), 1024, 500)
+                .dispatch_once()
+                .await
+                .unwrap()
+        );
+        assert_eq!(transport.operations(), vec!["append:0"]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while wakeups.listener.is_none() {
+                assert!(wakeups.wait(false, &mut rx).await);
+            }
+        })
+        .await
+        .expect("idle dispatcher must resubscribe after dropping a burst");
+        assert_ne!(first_pid, listener_pid(pool, owner).await);
+        wakeups.close().await;
+        listener_gone(pool, owner).await;
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unavailable_listener_does_not_block_polling_or_shutdown() {
         // Own the socket but never speak PostgreSQL: LISTEN setup remains stuck
         // while ordinary reconciliation and shutdown must stay responsive.

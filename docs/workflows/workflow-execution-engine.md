@@ -810,8 +810,10 @@ listener, empty checks stay at 100 ms. Connection attempts have a three-second
 budget and a one-second retry delay; they advance within the dispatcher's async
 future without blocking work polling. Existing delivery errors retain their
 one-second error backoff. Busy delivery drains a bounded batch of already-ready
-hints without waiting and cancels unfinished subscription attempts when work
-resumes. Unexpected dispatch errors discard the listener until
+hints without waiting. Reaching the drain budget discards the hint socket so a
+slow replica cannot retain a perpetually backlogged listener; durable scans
+continue and subscription resumes on the next idle wait. Busy delivery also
+cancels unfinished subscription attempts when work resumes. Unexpected dispatch errors discard the listener until
 reconciliation can resume, avoiding an indefinitely unread connection.
 
 Each executor may hold one additional, dedicated PostgreSQL backend for these hints,

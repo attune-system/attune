@@ -145,6 +145,11 @@ impl OutboxWakeups {
                 None => return,
             }
         }
+        // Repeatedly reaching the cap can leave a slow replica permanently
+        // behind global notification traffic. Discard hints rather than retain
+        // an unread backend through the backlog. Durable scans continue, and
+        // subscription resumes when the dispatcher next waits for work.
+        self.disconnect();
     }
 
     /// A dispatcher unable to process work must not keep an unread LISTEN
