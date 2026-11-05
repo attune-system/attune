@@ -400,11 +400,21 @@ impl ExecutionAdmissionRepository {
             .await?
             .is_some()
         {
-            Self::require(connection, RuntimeOwner::Execution(execution)).await?;
+            let (_, fence) =
+                Self::require_with_fence(connection, RuntimeOwner::Execution(execution)).await?;
             Self::require_input_liveness(connection, execution).await?;
-            if let Some(authorities) = super::recorded_input_authority::RecordedInputAuthorityRepository::queue_authorities(connection, execution).await? {
-                return Ok(authorities);
-            }
+            let authorities = match super::recorded_input_authority::RecordedInputAuthorityRepository::queue_authorities(connection, execution).await? {
+                Some(authorities) => authorities,
+                None => Self::load_recorded_input_authority(connection, execution)
+                    .await?
+                    .into_iter()
+                    .collect(),
+            };
+            // Input metadata may wait behind an editor. Keep the already-held
+            // source locks, but check expiry again after that wait. The reuse is
+            // limited to this call: later calls revalidate even on the same tx.
+            fence.ensure_fresh_on(connection).await?;
+            return Ok(authorities);
         }
         Ok(Self::input_authority(connection, execution, identity)
             .await?
@@ -715,28 +725,12 @@ impl ExecutionAdmissionRepository {
             .await?
             .is_some()
         {
-            Self::require(connection, RuntimeOwner::Execution(execution)).await?;
+            let (_, fence) =
+                Self::require_with_fence(connection, RuntimeOwner::Execution(execution)).await?;
             Self::require_input_liveness(connection, execution).await?;
-            if let Some(authority) =
-                super::recorded_input_authority::RecordedInputAuthorityRepository::load(
-                    connection,
-                    "execution",
-                    execution,
-                )
-                .await?
-            {
-                return Ok(Some(authority));
-            }
-            return match super::rule_authority::RuleAuthorityRepository::runtime(
-                connection,
-                "execution",
-                execution,
-            )
-            .await?
-            {
-                Some(snapshot) => Ok(Some(snapshot.input_authority(connection).await?)),
-                None => Ok(None),
-            };
+            let authority = Self::load_recorded_input_authority(connection, execution).await?;
+            fence.ensure_fresh_on(connection).await?;
+            return Ok(authority);
         }
         let row = super::execution::ExecutionRepository::find_by_id(&mut *connection, execution)
             .await?
@@ -754,6 +748,35 @@ impl ExecutionAdmissionRepository {
             connection, execution, identity,
         )
         .await
+    }
+
+    /// Only call after validating and locking the recorded admission and input
+    /// liveness on this connection. The caller checks its retained expiry fence
+    /// after these reads; this helper never grants authority on its own.
+    async fn load_recorded_input_authority(
+        connection: &mut PgConnection,
+        execution: Id,
+    ) -> Result<Option<crate::delegation::DelegationAuthority>> {
+        if let Some(authority) =
+            super::recorded_input_authority::RecordedInputAuthorityRepository::load(
+                connection,
+                "execution",
+                execution,
+            )
+            .await?
+        {
+            return Ok(Some(authority));
+        }
+        match super::rule_authority::RuleAuthorityRepository::runtime(
+            connection,
+            "execution",
+            execution,
+        )
+        .await?
+        {
+            Some(snapshot) => Ok(Some(snapshot.input_authority(connection).await?)),
+            None => Ok(None),
+        }
     }
 
     /// Production workflow persistence boundary. The caller owns the transaction
