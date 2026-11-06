@@ -143,7 +143,7 @@ impl StorageMaintenanceRepository {
         cutoff: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<ObjectBodyCandidate>> {
-        Self::body_candidates(pool, "av.object_key IS NOT NULL AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g WHERE g.artifact_version = av.id AND g.state = 'issued' AND g.settle_until > clock_timestamp()) AND (av.body_state = 'cleanup_claimed' OR (av.body_state = 'pending' AND av.body_updated < $1 AND (NOT EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id) OR EXISTS (SELECT 1 FROM log_stream ls JOIN execution e ON e.id = av.execution WHERE ls.artifact_version = av.id AND NOT ls.sealed AND e.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')))))", cutoff, limit).await
+        Self::body_candidates(pool, "abandoned", "av.object_key IS NOT NULL AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g WHERE g.artifact_version = av.id AND g.state = 'issued' AND g.settle_until > clock_timestamp()) AND (av.body_state = 'cleanup_claimed' OR (av.body_state = 'pending' AND av.body_updated < $1 AND (NOT EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id) OR EXISTS (SELECT 1 FROM log_stream ls JOIN execution e ON e.id = av.execution WHERE ls.artifact_version = av.id AND NOT ls.sealed AND e.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')))))", cutoff, limit).await
     }
 
     pub async fn abandoned_shared_log_pending(
@@ -444,6 +444,7 @@ impl StorageMaintenanceRepository {
     ) -> Result<Vec<ObjectBodyCandidate>> {
         Self::body_candidates(
             pool,
+            "deleting",
             "av.body_state = 'deleting' AND av.object_key IS NOT NULL AND av.body_updated < $1",
             cutoff,
             limit,
@@ -451,24 +452,85 @@ impl StorageMaintenanceRepository {
         .await
     }
 
+    /// Pending reservations request the existing supervisor continuation cadence;
+    /// an empty eligibility result must not mark a partial sweep complete.
+    pub async fn abandoned_discovery_pending(pool: &PgPool) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT last_id < high_water FROM object_body_discovery WHERE kind='abandoned'",
+        )
+        .fetch_one(pool)
+        .await?)
+    }
+
     async fn body_candidates(
         pool: &PgPool,
+        kind: &str,
         predicate: &str,
         cutoff: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<ObjectBodyCandidate>> {
+        // Reserve one PK-ordered window BEFORE expensive eligibility tests.
+        // A fixed high-water mark prevents continuous inserts starving wraparound.
+        // Reservations survive cancellation/restarts; skipped pages are revisited
+        // on the next sweep and never authorize physical or metadata deletion.
+        let limit = limit.clamp(1, 256);
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '2s'")
+            .execute(&mut *tx)
+            .await?;
+        let (mut last, mut high): (i64, i64) = sqlx::query_as(
+            "SELECT last_id, high_water FROM object_body_discovery WHERE kind=$1 FOR UPDATE",
+        )
+        .bind(kind)
+        .fetch_one(&mut *tx)
+        .await?;
+        if last >= high {
+            last = 0;
+            high = sqlx::query_scalar("SELECT coalesce(max(id), 0) FROM artifact_version")
+                .fetch_one(&mut *tx)
+                .await?;
+        }
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM artifact_version WHERE id > $1 AND id <= $2 ORDER BY id LIMIT $3",
+        )
+        .bind(last)
+        .bind(high)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        let next = ids.last().copied().unwrap_or(high);
+        sqlx::query("UPDATE object_body_discovery SET last_id=$2, high_water=$3 WHERE kind=$1")
+            .bind(kind)
+            .bind(next)
+            .bind(high)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let query = format!(
-            "SELECT av.id, av.artifact, av.object_key, av.provider_version, av.size_bytes, \
-                    av.sha256, av.file_path, av.legacy_snapshot_expires_at, av.xmin::text AS identity, \
+            "WITH candidates AS MATERIALIZED ( \
+                 SELECT id, artifact, object_key, provider_version, size_bytes, sha256, file_path, \
+                        legacy_snapshot_expires_at, xmin::text AS identity, body_state, body_updated, execution \
+                 FROM artifact_version WHERE id = ANY($2)) \
+             SELECT av.id, av.artifact, av.object_key, av.provider_version, av.size_bytes, \
+                    av.sha256, av.file_path, av.legacy_snapshot_expires_at, av.identity, \
                     (SELECT xmin::text FROM log_stream WHERE artifact_version=av.id) AS stream_identity \
-             FROM artifact_version av WHERE {predicate} AND file_evidence_version_eligible(av.id) ORDER BY av.body_updated, av.id LIMIT $2"
+             FROM candidates av WHERE {predicate} \
+               AND file_evidence_version_eligible(av.id) ORDER BY av.body_updated, av.id"
         );
-        sqlx::query_as(&query)
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '2s'")
+            .execute(&mut *tx)
+            .await?;
+        let result = sqlx::query_as(&query)
             .bind(cutoff)
-            .bind(limit.max(1))
-            .fetch_all(pool)
-            .await
-            .map_err(Into::into)
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     pub async fn mark_deleting_from_pending(

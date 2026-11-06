@@ -90,3 +90,33 @@ transport close does not certify their routing or cancellation support.
 These tests cover encoding, redaction, frame shape and exact-address retention.
 Live deadline, TLS, proxy and target-settlement behavior needs separate owned
 integration validation. This note does not claim those tests have passed.
+
+## Local transaction ownership remediation (2026-11-06)
+
+`src/transaction.rs` queues top-level rollback even when cancelled startup has
+not incremented depth. Uncertain nested startup quarantines reuse without
+rolling back the caller's outer transaction. `src/connection/{mod,establish}.rs`
+track that uncertainty and implement the paired core's `prepare_for_pool`:
+after draining protocol work require wire Idle, zero tracked depth, no startup
+uncertainty and no queued writes. Ordinary ping still supports transactions.
+These are local correctness changes, with no upstream acceptance implied.
+`tests/sqlx-session` in the Attune repository contains owned protocol-relay
+regressions; consult the task handoff for actual validation and remaining gaps.
+
+Interrupted nested commit/rollback also marks the session uncertain and suppresses
+that consumed transaction's automatic rollback once. RELEASE may have succeeded
+already; blindly rolling back its missing savepoint would abort the outer caller.
+The caller retains its tracked outer depth and can finish it explicitly, while
+pool reuse remains quarantined. This additional boundary has dedicated relay
+regressions; compilation alone does not establish their runtime result.
+
+Lifecycle warnings include process-local cumulative counters for interrupted
+startup, uncertain nested completion, and rejected pool reuse. They log operation
+categories and bounded protocol-state fields, without SQL, bind values, payloads,
+backend cancellation keys, or dynamic metric labels. Reuse rejection counts are
+not a count of application requests or committed/lost writes.
+
+Before taking top-level ownership, startup drains pending responses and rejects
+an already open/aborted wire-level transaction with zero client depth. Such a
+caller-owned raw boundary is neither adopted nor rolled back by rejected BEGIN.
+The caller may complete it explicitly; pool containment remains independent.

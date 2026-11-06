@@ -66,3 +66,14 @@ information without opening a socket. The paired driver tests packet encoding,
 format redaction and unsupported backend-key lengths. These source tests do not
 by themselves prove live cancellation routing, TLS behavior or proxy support.
 No upstream acceptance or runtime-validation claim is made by this note.
+
+## Local pool containment remediation (2026-11-06)
+
+`src/connection.rs` adds `prepare_for_pool` (default no-op for other drivers).
+`src/pool/connection.rs` invokes it after the final release ping and hooks,
+and bounds the entire return operation to five seconds; interrupted cleanup
+owns and drops its socket and capacity permit. `src/pool/inner.rs` checks after
+fresh initialization and before acquisition, including hook-issued SQL. The
+paired PostgreSQL implementation drains pending protocol responses and rejects
+unclean or uncertain sessions independently of transaction-start prevention.
+These changes are local and have not been accepted upstream.

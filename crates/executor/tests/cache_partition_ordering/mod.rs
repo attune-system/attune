@@ -1482,6 +1482,10 @@ impl CacheBrokerFixture {
     async fn try_connect(vhost: &str) -> anyhow::Result<Self> {
         let base = std::env::var("ATTUNE_TEST_CACHE_BROKER_URL")
             .map_err(|_| anyhow::anyhow!("broker tests require the owned cache protocol runner"))?;
+        Self::try_connect_at(&base, vhost).await
+    }
+
+    async fn try_connect_at(base: &str, vhost: &str) -> anyhow::Result<Self> {
         let connection = attune_common::mq::Connection::connect(&format!("{base}/{vhost}")).await?;
         // Keep each returned owner outside the later fallible setup future.
         // Errors propagate only after every currently owned teardown is awaited.

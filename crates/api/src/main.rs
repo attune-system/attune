@@ -401,9 +401,8 @@ async fn main() -> Result<()> {
     let audit_handle = attune_common::audit::spawn_writer(database.pool().clone());
     info!("Audit writer task started");
     let audit_emitter = audit_handle.emitter.clone();
-    // Detach the writer task so it lives as long as the process.
-    std::mem::forget(audit_handle.task);
 
+    let outcome = async {
     // Initialize application state (publisher starts as None)
     let state = Arc::new(AppState::new_with_audit(
         database.pool().clone(),
@@ -598,6 +597,10 @@ async fn main() -> Result<()> {
     info!("Shutting down Attune API Service");
 
     Ok(())
+    }.await;
+    // Includes startup failures after the writer was installed.
+    audit_handle.shutdown().await;
+    outcome
 }
 
 async fn shutdown_signal() {

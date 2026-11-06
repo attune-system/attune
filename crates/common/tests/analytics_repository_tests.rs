@@ -491,6 +491,47 @@ async fn native_reader_rejects_nested_call_without_rolling_back_caller() -> Resu
 }
 
 #[tokio::test]
+async fn native_reader_rejects_raw_caller_without_losing_its_write() -> Result<()> {
+    let database = fixture().await?;
+    let pool = database.pool();
+    let base = range().since - Duration::minutes(30);
+    let mut caller = pool.acquire().await?;
+    sqlx::query("BEGIN").execute(&mut *caller).await?;
+    sqlx::query("INSERT INTO event (trigger_ref, created) VALUES ('fixture.raw_caller', $1)")
+        .bind(base)
+        .execute(&mut *caller)
+        .await?;
+    let error = read::read(
+        &mut *caller,
+        SummaryKind::EventVolume,
+        base,
+        base + Duration::hours(1),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        attune_common::Error::Database(sqlx::Error::Protocol(_))
+    ));
+    sqlx::query("COMMIT").execute(&mut *caller).await?;
+    // Keep the caller checked out so this observation uses a different session.
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM event WHERE trigger_ref='fixture.raw_caller'")
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(
+        count, 1,
+        "rejected analytics startup must preserve caller commit authority"
+    );
+    drop(caller);
+    database.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_cancelled_bootstrap_keeps_connection_reuse_safe() -> Result<()> {
     use sqlx::Connection;
     let database = fixture().await?;

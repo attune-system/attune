@@ -779,3 +779,20 @@ Keep `replicaCount: 1` unless you intentionally want advisory-lock-protected sta
 - Record warning/action thresholds for cache capacity, cleanup backlog, WAL and replica lag, cache API SLOs, and backup/restore objectives in the deployment runbook. Persistent threshold breaches require quota/retention tuning or capacity expansion; isolate cache tables on dedicated PostgreSQL before they degrade the Attune control plane.
 - Move the data to an independent database/warehouse/search or object-storage system when it is not reconstructable, needs authoritative retention or general querying, primarily serves non-Attune consumers, or remains outside its SLO/capacity envelope after PostgreSQL isolation. A dedicated PostgreSQL cache cluster is an intermediate scaling step, not permission to turn Data Caches into a system of record.
 - Namespace and aggregate owner/deployment quotas are hard admission controls. Treat monitoring thresholds as earlier capacity warnings; quota rejection is the final guard and cleanup must physically delete entries before physical-byte capacity becomes available again.
+
+### Object body discovery windows
+
+Object body discovery reserves at most 256 artifact-version IDs per call, ordered
+by the existing primary key, before evaluating upload grants, stream state and
+file-evidence eligibility. `object_body_discovery` stores separate cursors for
+abandoned and deleting bodies. Each sweep fixes an upper ID boundary; continuous
+insertion therefore cannot postpone wraparound indefinitely. An empty result can
+mean an ineligible window rather than an empty backlog. The existing one-second
+metadata continuation cadence advances partial sweeps to later windows. Restarts retain progress.
+
+Reservation commits separately from eligibility evaluation. Cancellation or a
+statement deadline can skip a page for this sweep; the next sweep revisits it.
+Discovery transactions have local two-second statement deadlines. Cursor rows
+are progress only: the existing graph admission, pin, body identity and state
+checks still decide every claim/deletion. No new artifact index is introduced.
+This work is independent of graph-admission lock ordering and reclamation budgets.

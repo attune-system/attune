@@ -1018,8 +1018,7 @@ impl ExecutionRepository {
         task_name: &str,
         task_index: Option<i32>,
     ) -> Result<WorkflowTaskExecutionCreateOrGetResult> {
-        let mut conn = pool.acquire().await?;
-        sqlx::query("BEGIN").execute(&mut *conn).await?;
+        let mut conn = pool.begin().await?;
 
         let result = Self::create_workflow_task_if_absent_in_conn(
             &mut conn,
@@ -1033,11 +1032,11 @@ impl ExecutionRepository {
 
         match result {
             Ok(result) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                conn.commit().await?;
                 Ok(result)
             }
             Err(err) => {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback().await?;
                 Err(err)
             }
         }
@@ -1051,8 +1050,7 @@ impl ExecutionRepository {
         task_name: &str,
         task_index: Option<i32>,
     ) -> Result<WorkflowTaskExecutionCreateOrGetResult> {
-        let mut conn = pool.acquire().await?;
-        sqlx::query("BEGIN").execute(&mut *conn).await?;
+        let mut conn = pool.begin().await?;
         let result = Self::create_workflow_task_if_absent_in_conn(
             &mut conn,
             input,
@@ -1064,11 +1062,11 @@ impl ExecutionRepository {
         .await;
         match result {
             Ok(result) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                conn.commit().await?;
                 Ok(result)
             }
             Err(err) => {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback().await?;
                 Err(err)
             }
         }

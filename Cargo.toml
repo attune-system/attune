@@ -137,7 +137,7 @@ serial_test = "3.4"
 dashmap = "6.1"
 
 [patch.crates-io]
-# Narrow cancellation capability patch; versions remain at 0.8.6.
+# Cancellation and transaction/session ownership fixes; versions remain at 0.8.6.
 sqlx-core = { path = "vendor/sqlx-core-0.8.6" }
 sqlx-postgres = { path = "vendor/sqlx-postgres-0.8.6" }
 # Upstream Swagger still requires vulnerable zip versions. Keep its public API
