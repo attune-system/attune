@@ -487,7 +487,7 @@ impl ActionExecutor {
         } else {
             // Claim and attempt registration commit together. A duplicate or
             // stale delivery cannot establish another credential authority.
-            ExecutionRepository::find_by_id_for_update(&mut *tx, execution_id).await?
+            ExecutionRepository::find_by_id_for_update(&mut tx, execution_id).await?
                 .ok_or_else(|| Error::PermissionDenied("Execution unavailable".into()))?;
             attune_common::repositories::delegated_execution::DelegatedExecutionRepository::start(&mut tx, execution_id, worker).await?;
         }
