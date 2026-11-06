@@ -5735,6 +5735,183 @@ mod tests {
         assert!(!abandoned.iter().any(|candidate| candidate.id == version.id));
     }
 
+    // A real managed executable with explicit tokenless delegated authority.
+    // Transport tests may not substitute a dangling execution ID for ownership.
+    async fn delegated_log_owner(
+        pool: &sqlx::PgPool,
+    ) -> attune_common::Result<(i64, i64, i64, i64, String)> {
+        use attune_common::{
+            models::{ExecutionStatus, WorkerStatus, WorkerType},
+            repositories::{
+                action::{ActionRepository, CreateActionInput},
+                component_lifecycle::PackProjectionIds,
+                delegated_execution::DelegatedExecutionRepository as Delegated,
+                executable_snapshot::ExecutableSnapshotRepository,
+                execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
+                identity::{CreateIdentityInput, IdentityRepository},
+                pack::{CreatePackInput, PackRepository},
+                pack_release::{CreatePackReleaseInput, PackReleaseRepository},
+                runtime::{CreateWorkerInput, WorkerRepository},
+                schema_contract::{BindingOwner, SchemaContractRepository},
+                Update,
+            },
+        };
+        let mut tx = pool.begin().await?;
+        let owner = IdentityRepository::create(
+            &mut *tx,
+            CreateIdentityInput {
+                login: "shared-log-owner".into(),
+                display_name: None,
+                attributes: serde_json::json!({}),
+                password_hash: None,
+            },
+        )
+        .await?;
+        let pack = PackRepository::create(
+            &mut *tx,
+            CreatePackInput {
+                r#ref: "log_binding".into(),
+                label: "Log binding".into(),
+                description: None,
+                version: "1.0.0".into(),
+                conf_schema: serde_json::json!({}),
+                config: serde_json::json!({}),
+                meta: serde_json::json!({}),
+                tags: vec![],
+                runtime_deps: vec![],
+                dependencies: vec![],
+                is_standard: false,
+                installers: serde_json::json!({}),
+            },
+        )
+        .await?;
+        let action = ActionRepository::create(
+            &mut *tx,
+            CreateActionInput {
+                r#ref: "log_binding.echo".into(),
+                pack: pack.id,
+                pack_ref: pack.r#ref.clone(),
+                label: "Echo".into(),
+                description: None,
+                entrypoint: "echo".into(),
+                runtime: None,
+                enabled: true,
+                runtime_version_constraint: None,
+                required_worker_runtimes: serde_json::json!({}),
+                worker_selector: serde_json::json!({}),
+                worker_tolerations: serde_json::json!([]),
+                worker_affinity: serde_json::json!({}),
+                param_schema: None,
+                out_schema: None,
+                is_adhoc: false,
+                accesses_mcp: false,
+                default_execution_permission_set_refs: vec![],
+                reference_visibility: Default::default(),
+                reference_allowed_pack_refs: vec![],
+                log_retention_policy: None,
+                log_retention_limit: None,
+                artifact_retention_policy: None,
+                artifact_retention_limit: None,
+                timeout_seconds: None,
+            },
+        )
+        .await?;
+        let release = PackReleaseRepository::create_or_get(
+            &mut tx,
+            CreatePackReleaseInput {
+                pack: pack.id,
+                pack_ref: pack.r#ref.clone(),
+                version: pack.version.clone(),
+                digest: "1".repeat(64),
+                object_key: "packs/blobs/log-binding.tar.gz".into(),
+                provider_version: "e:fixture".into(),
+                content_path: "/packs/.releases/log_binding".into(),
+                archive_size: 1,
+                manifest: serde_json::json!({}),
+            },
+        )
+        .await?;
+        PackReleaseRepository::activate_projected(
+            &mut tx,
+            pack.id,
+            release.id,
+            &PackProjectionIds {
+                actions: vec![action.id],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let snapshot =
+            ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+        let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+        let execution = ExecutionRepository::create_pinned(
+            &mut *tx,
+            CreateExecutionInput {
+                action: Some(action.id),
+                action_ref: action.r#ref.clone(),
+                executor: Some(owner.id),
+                status: ExecutionStatus::Requested,
+                ..Default::default()
+            },
+            &snapshot,
+        )
+        .await?;
+        SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
+            .await?;
+        Delegated::select(&mut tx, execution.id, None).await?;
+        ExecutionRepository::initialize_config_with_conn(
+            &mut tx,
+            execution.id,
+            None,
+            &snapshot,
+            Some(serde_json::json!({})),
+            &[],
+        )
+        .await?;
+        let mut workers = Vec::new();
+        for name in ["log-assigned", "log-foreign"] {
+            workers.push(
+                WorkerRepository::create(
+                    &mut *tx,
+                    CreateWorkerInput {
+                        name: name.into(),
+                        worker_type: WorkerType::Local,
+                        runtime: None,
+                        host: None,
+                        port: None,
+                        status: Some(WorkerStatus::Active),
+                        capabilities: None,
+                        meta: None,
+                    },
+                )
+                .await?
+                .id,
+            );
+        }
+        ExecutionRepository::update(
+            &mut *tx,
+            execution.id,
+            UpdateExecutionInput {
+                worker: Some(workers[0]),
+                status: Some(ExecutionStatus::Scheduled),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Delegated::start(&mut tx, execution.id, workers[0]).await?;
+        ExecutionRepository::update(
+            &mut *tx,
+            execution.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Running),
+                ..Default::default()
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((owner.id, execution.id, workers[0], workers[1], action.r#ref))
+    }
+
     #[tokio::test]
     async fn shared_log_seal_stats_hashes_and_reads_the_authoritative_file() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
@@ -5755,12 +5932,31 @@ mod tests {
             root: directory.path().join("objects"),
         };
         let state = Arc::new(AppState::new(database.pool().clone(), config));
+        let (worker_identity, execution, assigned_worker, foreign_worker, action_ref) =
+            delegated_log_owner(&state.db)
+                .await
+                .expect("delegated log owner");
+        attune_common::auth::install_crypto_provider();
+        let scoped_worker = |worker: i64| {
+            use attune_common::auth::jwt::{generate_worker_token, validate_token, JwtConfig};
+            let config = JwtConfig {
+                secret: state.config.security.jwt_secret.clone().unwrap(),
+                access_token_expiration: 3600,
+                refresh_token_expiration: 86400,
+            };
+            let token =
+                generate_worker_token(worker_identity, &worker.to_string(), &config, Some(60))
+                    .expect("worker credential");
+            AuthenticatedUser {
+                claims: validate_token(&token, &config).expect("validated worker credential"),
+            }
+        };
         let artifact = ArtifactRepository::create(
             &state.db,
             CreateArtifactInput {
-                r#ref: "core.echo.stdout.log".to_string(),
+                r#ref: format!("{action_ref}.stdout.log"),
                 scope: OwnerType::Action,
-                owner: "core.echo".to_string(),
+                owner: action_ref,
                 r#type: ArtifactType::FileText,
                 visibility: ArtifactVisibility::Private,
                 classification: ArtifactClassification::RuntimeLog,
@@ -5780,7 +5976,7 @@ mod tests {
             &artifact.r#ref,
             LogStreamBackend::SharedFile,
             "text/plain".to_string(),
-            Some(42),
+            Some(execution),
             None,
             Some("worker".to_string()),
         )
@@ -5809,9 +6005,30 @@ mod tests {
         );
         assert!(!stream.sealed);
 
+        for denied in [user(TokenType::Worker, None), scoped_worker(foreign_worker)] {
+            assert_status_error(
+                seal_log_stream(
+                    State(state.clone()),
+                    RequireAuth(denied),
+                    Path(version.id),
+                    Query(SealLogQuery { truncated: true }),
+                    HeaderMap::new(),
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+            );
+        }
+        assert!(
+            !LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .sealed
+        );
+
         let response = seal_log_stream(
             State(state.clone()),
-            RequireAuth(user(TokenType::Worker, None)),
+            RequireAuth(scoped_worker(assigned_worker)),
             Path(version.id),
             Query(SealLogQuery { truncated: true }),
             HeaderMap::new(),
@@ -5850,5 +6067,26 @@ mod tests {
             bytes.extend_from_slice(&chunk.expect("chunk"));
         }
         assert_eq!(bytes, b"3456");
+        let mut tx = state.db.begin().await.unwrap();
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::close(
+            &mut tx, execution,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_status_error(
+            seal_log_stream(
+                State(state.clone()),
+                RequireAuth(scoped_worker(assigned_worker)),
+                Path(version.id),
+                Query(SealLogQuery { truncated: true }),
+                HeaderMap::new(),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+        drop(reader);
+        drop(state);
+        database.cleanup().await.expect("owned database cleanup");
     }
 }

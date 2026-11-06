@@ -183,20 +183,23 @@ impl CompletionListener {
 
     /// Process an execution completed message
     #[allow(clippy::too_many_arguments)] // Explicit service dependencies keep handler ownership clear.
-    async fn process_execution_completed(
-        pool: &PgPool,
-        publisher: &Publisher,
-        queue_manager: &ExecutionQueueManager,
-        round_robin_counter: &AtomicUsize,
-        artifacts_dir: &str,
-        workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    fn process_execution_completed<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        queue_manager: &'a ExecutionQueueManager,
+        round_robin_counter: &'a AtomicUsize,
+        artifacts_dir: &'a str,
+        workflow_log_transport: &'a Arc<
+            dyn attune_common::artifact_transport::ArtifactFileTransport,
+        >,
         workflow_log_segment_max_bytes: usize,
         workflow_log_flush_interval_ms: u64,
-        encryption_key: Option<&str>,
-        metadata_caches: &SchedulerMetadataCaches,
-        envelope: &MessageEnvelope<ExecutionCompletedPayload>,
-    ) -> Result<()> {
-        debug!(
+        encryption_key: Option<&'a str>,
+        metadata_caches: &'a SchedulerMetadataCaches,
+        envelope: &'a MessageEnvelope<ExecutionCompletedPayload>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            debug!(
             "Processing MQ message (type: {:?}, message_id: {}, correlation_id: {}, execution_id: {}, action_id: {})",
             envelope.message_type,
             envelope.message_id,
@@ -205,171 +208,172 @@ impl CompletionListener {
             envelope.payload.action_id,
         );
 
-        let execution_id = envelope.payload.execution_id;
-        let action_id = envelope.payload.action_id;
+            let execution_id = envelope.payload.execution_id;
+            let action_id = envelope.payload.action_id;
 
-        info!(
-            "Processing completion for execution: {} (action: {})",
-            execution_id, action_id
-        );
-
-        // Verify execution exists in database
-        let mut execution = ExecutionRepository::find_by_id(pool, execution_id).await?;
-
-        if let Some(ref exec) = execution.clone() {
-            execution = Some(
-                Self::handle_queue_dispatch_completion(pool, publisher, exec, encryption_key)
-                    .await?,
-            );
-        }
-
-        if let Some(ref exec) = execution {
-            debug!(
-                "Execution {} found with status: {:?}",
-                execution_id, exec.status
+            info!(
+                "Processing completion for execution: {} (action: {})",
+                execution_id, action_id
             );
 
-            Box::pin(ExecutionScheduler::release_target_waits(
-                pool,
-                publisher,
-                WorkflowTaskWaitTarget::Execution(exec.id),
-                encryption_key,
-            ))
-            .await?;
+            // Verify execution exists in database
+            let mut execution = ExecutionRepository::find_by_id(pool, execution_id).await?;
 
-            // Check if this execution is a workflow child task and advance the
-            // workflow orchestration (schedule successor tasks or complete the
-            // workflow).
-            if exec.workflow_task.is_some() {
-                info!(
-                    "Execution {} is a workflow task, advancing workflow",
-                    execution_id
+            if let Some(ref exec) = execution.clone() {
+                execution = Some(
+                    Self::handle_queue_dispatch_completion(pool, publisher, exec, encryption_key)
+                        .await?,
                 );
-                match ExecutionScheduler::maybe_retry_workflow_task(
+            }
+
+            if let Some(ref exec) = execution {
+                debug!(
+                    "Execution {} found with status: {:?}",
+                    execution_id, exec.status
+                );
+
+                Box::pin(ExecutionScheduler::release_target_waits(
                     pool,
                     publisher,
-                    exec,
+                    WorkflowTaskWaitTarget::Execution(exec.id),
                     encryption_key,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        info!(
+                ))
+                .await?;
+
+                // Check if this execution is a workflow child task and advance the
+                // workflow orchestration (schedule successor tasks or complete the
+                // workflow).
+                if exec.workflow_task.is_some() {
+                    info!(
+                        "Execution {} is a workflow task, advancing workflow",
+                        execution_id
+                    );
+                    match ExecutionScheduler::maybe_retry_workflow_task(
+                        pool,
+                        publisher,
+                        exec,
+                        encryption_key,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            info!(
                             "Execution {} scheduled a workflow retry; delaying workflow advancement",
                             execution_id
                         );
-                        return Ok(());
+                            return Ok(());
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            error!(
+                                "Failed to schedule workflow retry for execution {}: {}",
+                                execution_id, e
+                            );
+                            if let Some(mq_err) = Self::retryable_mq_error(&e) {
+                                return Err(mq_err.into());
+                            }
+                            // A refused/contended retry must not become ordinary
+                            // workflow advancement. Requeue the completion instead.
+                            return Err(e);
+                        }
                     }
-                    Ok(false) => {}
-                    Err(e) => {
+                    if let Err(e) = ExecutionScheduler::advance_workflow(
+                        pool,
+                        publisher,
+                        round_robin_counter,
+                        artifacts_dir,
+                        workflow_log_transport,
+                        workflow_log_segment_max_bytes,
+                        workflow_log_flush_interval_ms,
+                        encryption_key,
+                        exec,
+                        metadata_caches,
+                    )
+                    .await
+                    {
                         error!(
-                            "Failed to schedule workflow retry for execution {}: {}",
+                            "Failed to advance workflow for execution {}: {}",
                             execution_id, e
                         );
                         if let Some(mq_err) = Self::retryable_mq_error(&e) {
                             return Err(mq_err.into());
                         }
-                        // A refused/contended retry must not become ordinary
-                        // workflow advancement. Requeue the completion instead.
-                        return Err(e);
+                        // Non-retryable workflow advancement errors are logged but
+                        // do not fail the entire completion processing path.
                     }
                 }
-                if let Err(e) = ExecutionScheduler::advance_workflow(
-                    pool,
-                    publisher,
-                    round_robin_counter,
-                    artifacts_dir,
-                    workflow_log_transport,
-                    workflow_log_segment_max_bytes,
-                    workflow_log_flush_interval_ms,
-                    encryption_key,
-                    exec,
-                    metadata_caches,
-                )
-                .await
-                {
-                    error!(
-                        "Failed to advance workflow for execution {}: {}",
-                        execution_id, e
-                    );
-                    if let Some(mq_err) = Self::retryable_mq_error(&e) {
-                        return Err(mq_err.into());
-                    }
-                    // Non-retryable workflow advancement errors are logged but
-                    // do not fail the entire completion processing path.
-                }
+            } else {
+                warn!(
+                    "Execution {} not found in database, but still releasing queue slot",
+                    execution_id
+                );
             }
-        } else {
-            warn!(
-                "Execution {} not found in database, but still releasing queue slot",
-                execution_id
+
+            // Release queue slot for this action
+            info!(
+                "Releasing queue slot for action {} (execution {} completed)",
+                action_id, execution_id
             );
-        }
 
-        // Release queue slot for this action
-        info!(
-            "Releasing queue slot for action {} (execution {} completed)",
-            action_id, execution_id
-        );
-
-        match queue_manager.release_active_slot(execution_id).await {
-            Ok(release) => {
-                if let Some(release) = release {
-                    if let Some(next_execution_id) = release.next_execution_id {
-                        info!(
-                            "Queue slot released for action {}, next execution {} can proceed",
-                            action_id, next_execution_id
-                        );
-                        if let Err(republish_err) = Self::publish_execution_requested(
-                            pool,
-                            publisher,
-                            action_id,
-                            next_execution_id,
-                            encryption_key,
-                        )
-                        .await
-                        {
-                            queue_manager
-                                .restore_active_slot(execution_id, &release)
-                                .await?;
-                            return Err(republish_err);
+            match queue_manager.release_active_slot(execution_id).await {
+                Ok(release) => {
+                    if let Some(release) = release {
+                        if let Some(next_execution_id) = release.next_execution_id {
+                            info!(
+                                "Queue slot released for action {}, next execution {} can proceed",
+                                action_id, next_execution_id
+                            );
+                            if let Err(republish_err) = Self::publish_execution_requested(
+                                pool,
+                                publisher,
+                                action_id,
+                                next_execution_id,
+                                encryption_key,
+                            )
+                            .await
+                            {
+                                queue_manager
+                                    .restore_active_slot(execution_id, &release)
+                                    .await?;
+                                return Err(republish_err);
+                            }
+                        } else {
+                            debug!(
+                                "Queue slot released for action {}, no executions waiting",
+                                action_id
+                            );
                         }
                     } else {
                         debug!(
-                            "Queue slot released for action {}, no executions waiting",
-                            action_id
+                            "Execution {} had no active queue slot to release",
+                            execution_id
                         );
                     }
-                } else {
-                    debug!(
-                        "Execution {} had no active queue slot to release",
-                        execution_id
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to release queue slot for action {}: {}",
+                        action_id, e
                     );
+                    return Err(e);
                 }
             }
-            Err(e) => {
-                error!(
-                    "Failed to release queue slot for action {}: {}",
-                    action_id, e
+
+            // Get queue statistics for logging
+            if let Some(stats) = queue_manager.get_queue_stats(action_id).await {
+                debug!(
+                    "Queue stats for action {}: {} active, {} queued, {} total completed",
+                    action_id, stats.active_count, stats.queue_length, stats.total_completed
                 );
-                return Err(e);
             }
-        }
 
-        // Get queue statistics for logging
-        if let Some(stats) = queue_manager.get_queue_stats(action_id).await {
-            debug!(
-                "Queue stats for action {}: {} active, {} queued, {} total completed",
-                action_id, stats.active_count, stats.queue_length, stats.total_completed
+            info!(
+                "Successfully processed completion for execution: {} (action: {})",
+                execution_id, action_id
             );
-        }
 
-        info!(
-            "Successfully processed completion for execution: {} (action: {})",
-            execution_id, action_id
-        );
-
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn handle_queue_dispatch_completion(

@@ -534,10 +534,15 @@ impl DelegatedExecutionRepository {
         else {
             return Ok(());
         };
-        let open:Option<Id>=sqlx::query_scalar("SELECT execution FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND NOT closed FOR UPDATE").bind(execution).bind(attempt).fetch_optional(&mut *conn).await?;
+        // Hold closure out with a shared attempt lock. Serialize the bounded
+        // origin budget independently, avoiding concurrent readers upgrading
+        // their retained shared attempt locks to exclusive locks.
+        let open:Option<Id>=sqlx::query_scalar("SELECT execution FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND NOT closed FOR SHARE").bind(execution).bind(attempt).fetch_optional(&mut *conn).await?;
         if open.is_none() {
             return Err(denied());
         }
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('delegated_execution_key_origin'), hashtext($1::text))")
+            .bind(execution).execute(&mut *conn).await?;
         let body = serde_json::to_value(origin)?;
         let hash = digest(&body).map_err(|_| denied())?;
         let (count,bytes):(i64,i64)=sqlx::query_as("SELECT count(*),COALESCE(sum(octet_length(origin::TEXT)),0)::BIGINT FROM delegated_execution_key_origin WHERE execution=$1").bind(execution).fetch_one(&mut *conn).await?;

@@ -75,17 +75,22 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bin-dir', type=Path, default=ROOT / 'target/debug')
     parser.add_argument('--runtime-stack-bytes',type=int,default=0,help='Default: leave RUST_MIN_STACK unset; a positive value is an explicitly recorded diagnostic override')
+    parser.add_argument('--service-image', help='Run the supplied static release binaries in this Docker runtime image on an owned network')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
     evidence = args.output.resolve()
     run = 'authority-' + uuid.uuid4().hex[:12]
     containers, processes, logs = [], [], []
+    network = None
     secret = secrets.token_hex(24)
     result = {'run': run, 'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(), 'checks': []}
 
     result['runtime_stack_bytes']=args.runtime_stack_bytes
+    result['runtime']='docker' if args.service_image else 'host'
     result['binaries'] = {}
+    result['binary_paths'] = {}
     for binary in ['attune-api','attune-executor','attune-worker']:
+        result['binary_paths'][binary]=str((args.bin_dir / binary).resolve())
         with (args.bin_dir / binary).open('rb') as file:
             result['binaries'][binary]=hashlib.file_digest(file,'sha256').hexdigest()
     changed=sorted(set(subprocess.check_output(['git','diff','--name-only','origin/main'],cwd=ROOT,text=True).splitlines()+subprocess.check_output(['git','ls-files','--others','--exclude-standard'],cwd=ROOT,text=True).splitlines()))
@@ -101,8 +106,10 @@ def main():
         # Register ownership before invoking Docker: a client timeout may still
         # have created the container on the daemon.
         containers.append(name)
-        command(['docker', 'run', '-d', '--name', name, '--label', 'attune.authority.run=' + run,
-                 *sum((['-p', '127.0.0.1::' + str(port)] for port in ports), []), *extra, image], stdout=subprocess.DEVNULL)
+        command(['docker', 'create', '--name', name, '--label', 'attune.authority.run=' + run,
+                 *(['--network', network] if network else []),
+                 *sum((['-p', '127.0.0.1::' + str(port)] for port in ports), []), *extra, image], stdout=subprocess.DEVNULL, timeout=180)
+        command(['docker','start',name],stdout=subprocess.DEVNULL,timeout=180)
         return name
 
     def port(name, value):
@@ -110,6 +117,25 @@ def main():
 
     def psql(sql):
         return subprocess.check_output(['docker', 'exec', pg, 'psql', '-X', '-U', 'attune', '-d', 'attune', '-v', 'ON_ERROR_STOP=1', '-qAt', '-c', 'SET search_path TO attune,public; ' + sql], text=True, timeout=20).strip()
+
+    def service_command(binary, config, migrate=False):
+        if not args.service_image:
+            return [str(args.bin_dir.resolve() / binary), '--config', str(config), *(['--migrate'] if migrate else [])]
+        name=run+'-'+binary.removeprefix('attune-')+('-migrate' if migrate else '')
+        containers.append(name)
+        argv=['docker','run','--name',name,'--label','attune.authority.run='+run,
+              '--network',network,'--user',str(os.getuid())+':'+str(os.getgid()),
+              '--entrypoint','/usr/local/bin/attune-service',
+              '-v',str(evidence)+':'+str(evidence),
+              '-v',str((args.bin_dir/binary).resolve())+':/usr/local/bin/attune-service:ro',
+              '-e','ATTUNE__ENVIRONMENT=authority_acceptance','-e','RUST_LOG=info',
+              '-e','ATTUNE_WORKER_NAME='+run,
+              '-e','ATTUNE_API_URL=http://'+run+'-api:'+str(api_port)]
+        if args.runtime_stack_bytes:
+            argv += ['-e','RUST_MIN_STACK='+str(args.runtime_stack_bytes)]
+        if binary=='attune-api' and not migrate:
+            argv += ['-p','127.0.0.1:'+str(api_port)+':'+str(api_port)]
+        return [*argv,args.service_image,'--config',str(config),*(['--migrate'] if migrate else [])]
 
     def start(binary, config):
         log = (evidence / (binary + '.log')).open('w')
@@ -119,11 +145,21 @@ def main():
             env['RUST_MIN_STACK']=str(args.runtime_stack_bytes)
         else:
             env.pop('RUST_MIN_STACK',None)
-        proc = subprocess.Popen([str(args.bin_dir.resolve() / binary), '--config', str(config)], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(service_command(binary,config), cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
         processes.append(proc)
 
     try:
         wait_for(lambda: subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0, 180, 'Docker daemon')
+        if args.service_image:
+            result['service_image_ref']=args.service_image
+            command(['docker','pull',args.service_image],stdout=(evidence/'image-pull.log').open('w'),stderr=subprocess.STDOUT,timeout=300)
+            metadata=json.loads(subprocess.check_output(['docker','image','inspect',args.service_image],text=True))[0]
+            if not args.runtime_stack_bytes:
+                assert not any(value.startswith('RUST_MIN_STACK=') for value in metadata['Config'].get('Env',[])), 'runtime image overrides the default Rust stack'
+            args.service_image=metadata['Id']
+            result['service_image_id']=args.service_image
+            network=run
+            command(['docker','network','create','--label','attune.authority.run='+run,network],stdout=subprocess.DEVNULL)
         pg = docker_container('pg', 'postgres:18-alpine', [5432], ['-e', 'POSTGRES_HOST_AUTH_METHOD=trust', '-e', 'POSTGRES_USER=attune', '-e', 'POSTGRES_DB=attune', '--tmpfs', '/var/lib/postgresql'])
         broker = docker_container('mq', 'rabbitmq:4.3.6-management-alpine', [5672], ['-e', 'RABBITMQ_DEFAULT_USER=attune', '-e', 'RABBITMQ_DEFAULT_PASS=attune', '-e', 'RABBITMQ_DEFAULT_VHOST=' + run])
         wait_for(lambda: subprocess.run(['docker', 'exec', pg, 'pg_isready', '-h', '127.0.0.1', '-U', 'attune'], stdout=subprocess.DEVNULL, timeout=10).returncode == 0, 90, 'PostgreSQL')
@@ -135,6 +171,11 @@ def main():
         config['database'].update(url=f'postgresql://attune@127.0.0.1:{port(pg,5432)}/attune', schema='attune', max_connections=15)
         config['message_queue']['url'] = f'amqp://attune:attune@127.0.0.1:{port(broker,5672)}/{run}'
         config['server'].update(port=api_port, request_timeout=600, max_body_size=104857600)
+        if args.service_image:
+            config['database']['url']=f'postgresql://attune@{pg}:5432/attune'
+            config['message_queue']['url']=f'amqp://attune:attune@{broker}:5672/{run}'
+            config['server']['host']='0.0.0.0'
+
         config['log'].update(level='info', mirror_runtime_stdout_to_stdio=True, mirror_runtime_stderr_to_stdio=True)
         for key in ['packs_base_dir', 'runtime_envs_dir', 'artifacts_dir']:
             path = evidence / key
@@ -145,7 +186,7 @@ def main():
         config['worker'] = None
         cfg = evidence / 'config.json'
         cfg.write_text(json.dumps(config))
-        command([str(args.bin_dir.resolve() / 'attune-api'), '--config', str(cfg), '--migrate'], stdout=(evidence / 'migrations.log').open('w'), stderr=subprocess.STDOUT, timeout=180)
+        command(service_command('attune-api',cfg,migrate=True), stdout=(evidence / 'migrations.log').open('w'), stderr=subprocess.STDOUT, timeout=180)
         # Existing owned bootstrap seed, with production catalog role assignments.
         command(['docker', 'exec', '-i', '-e', 'DB_HOST=127.0.0.1', '-e', 'DB_NAME=attune', pg, 'sh'], input=(ROOT / 'docker/init-user.sh').read_bytes(), stdout=(evidence / 'init-user.log').open('w'), stderr=subprocess.STDOUT)
         wait_for(lambda: subprocess.run(['docker', 'exec', broker, 'rabbitmq-diagnostics', '-q', 'check_running'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0, 120, 'RabbitMQ')
@@ -414,6 +455,10 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
             cleanup = subprocess.run(['docker', 'rm', '-f', '-v', name], stdout=subprocess.DEVNULL, timeout=60)
             if cleanup.returncode:
                 failures.append(name)
+        if network:
+            cleanup=subprocess.run(['docker','network','rm',network],stdout=subprocess.DEVNULL,timeout=60)
+            if cleanup.returncode:
+                failures.append(network)
         result['cleanup_failures'] = failures
         (evidence / 'result.json').write_text(json.dumps(result, indent=2))
         print(json.dumps({'status': result.get('status'), 'checks': result['checks'], 'evidence': str(evidence), 'cleanup_failures': failures}))

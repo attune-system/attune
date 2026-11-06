@@ -388,19 +388,29 @@ async fn ordinary_artifact_content_preserves_nonrecorded_execution_credentials()
     };
     let numbered = attune_api::routes::artifacts::download_version(
         attune_api::auth::middleware::RequireAuth(user.clone()),
-        axum::extract::State(ctx.state.clone()), axum::extract::Path((id, 1)),
-        axum::extract::Query(Default::default()), axum::http::HeaderMap::new(),
+        axum::extract::State(ctx.state.clone()),
+        axum::extract::Path((id, 1)),
+        axum::extract::Query(Default::default()),
+        axum::http::HeaderMap::new(),
     );
-    assert!(std::mem::size_of_val(&numbered) <= 128 * 1024,
-        "numbered download future uses {} bytes", std::mem::size_of_val(&numbered));
+    assert!(
+        std::mem::size_of_val(&numbered) <= 128 * 1024,
+        "numbered download future uses {} bytes",
+        std::mem::size_of_val(&numbered)
+    );
     drop(numbered);
     let latest = attune_api::routes::artifacts::download_latest(
         attune_api::auth::middleware::RequireAuth(user),
-        axum::extract::State(ctx.state.clone()), axum::extract::Path(id),
-        axum::extract::Query(Default::default()), axum::http::HeaderMap::new(),
+        axum::extract::State(ctx.state.clone()),
+        axum::extract::Path(id),
+        axum::extract::Query(Default::default()),
+        axum::http::HeaderMap::new(),
     );
-    assert!(std::mem::size_of_val(&latest) <= 128 * 1024,
-        "latest download future uses {} bytes", std::mem::size_of_val(&latest));
+    assert!(
+        std::mem::size_of_val(&latest) <= 128 * 1024,
+        "latest download future uses {} bytes",
+        std::mem::size_of_val(&latest)
+    );
     drop(latest);
     for suffix in [
         "versions/1",

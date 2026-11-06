@@ -49,132 +49,137 @@ pub struct PreparedRequestedPublication {
 }
 
 impl RequestedExecutionPublicationRepository {
-    pub async fn prepare(
-        conn: &mut PgConnection,
-        expected: &Execution,
-        key: &str,
-    ) -> Result<Option<PreparedRequestedPublication>> {
-        let actual = ExecutionRepository::find_by_id(&mut *conn, expected.id)
-            .await?
-            .ok_or_else(denied)?;
-        same_execution(expected, &actual)?;
-        if actual.status != ExecutionStatus::Requested {
-            return Ok(None);
-        }
-        if actual.worker.is_some() {
-            return Err(denied());
-        }
-        let selection =
-            super::delegated_execution::DelegatedExecutionRepository::find(conn, actual.id).await?;
-        let continuation = if selection.mode == "delegated" && actual.workflow_task.is_none() {
-            super::delegated_execution::DelegatedExecutionRepository::validate(conn, actual.id)
-                .await?;
-            let schema = Schemas::find(conn, BindingOwner::Execution, actual.id)
+    pub fn prepare<'a>(
+        conn: &'a mut PgConnection,
+        expected: &'a Execution,
+        key: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<PreparedRequestedPublication>>> {
+        Box::pin(async move {
+            let actual = ExecutionRepository::find_by_id(&mut *conn, expected.id)
                 .await?
                 .ok_or_else(denied)?;
-            schema.validate()?;
-            let fields =
-                Secrets::find_stored_by_entity(&mut *conn, ENTITY_EXECUTION_CONFIG, actual.id)
-                    .await?;
-            let (ordinary, receipts) = super::immutable_input_origin::prepare_input_receipts(
-                conn,
-                ENTITY_EXECUTION_CONFIG,
-                actual.id,
-                &fields,
-                key,
-            )
-            .await?;
-            if !ordinary.is_empty() {
-                crate::key_access::authorize_execution_parameter_key_origins_with_conn(
-                    conn,
-                    actual.id,
-                    actual.executor,
-                    &ordinary,
-                )
-                .await?;
+            same_execution(expected, &actual)?;
+            if actual.status != ExecutionStatus::Requested {
+                return Ok(None);
             }
-            super::immutable_input_origin::bind_input_receipt_buffers(
-                conn,
-                ENTITY_EXECUTION_CONFIG,
-                actual.id,
-                &fields,
-            )
-            .await?;
-            Continuation::Standalone {
-                schema,
-                fields,
-                receipts,
-                fence: None,
-            }
-        } else if let Some(task) = &actual.workflow_task {
-            let prepared = if actual.retry_count > 0
-                || task.retry_count > 0
-                || actual.original_execution.is_some()
-            {
-                let Some(prepared) =
-                    Retries::prepare_requested_recovery(conn, &actual, key).await?
-                else {
-                    return Ok(None);
-                };
-                prepared
-            } else {
-                Retries::prepare_existing_workflow(conn, &actual, key).await?
-            };
-            Continuation::Workflow(prepared)
-        } else {
-            let admission = Admissions::require(conn, RuntimeOwner::Execution(actual.id)).await?;
-            // A task-scoped capsule cannot silently become standalone merely
-            // because mutable task metadata disappeared.
-            if matches!(
-                &admission.authority.binding,
-                crate::runtime_authority::InvocationBinding::WorkflowTask { .. }
-            ) {
+            if actual.worker.is_some() {
                 return Err(denied());
             }
-            if let crate::runtime_authority::RequestAttribution::ParentExecution { execution_id } =
-                &admission.authority.attribution
-            {
-                if actual.parent != Some(*execution_id) {
-                    return Err(denied());
+            let selection =
+                super::delegated_execution::DelegatedExecutionRepository::find(conn, actual.id)
+                    .await?;
+            let continuation = if selection.mode == "delegated" && actual.workflow_task.is_none() {
+                super::delegated_execution::DelegatedExecutionRepository::validate(conn, actual.id)
+                    .await?;
+                let schema = Schemas::find(conn, BindingOwner::Execution, actual.id)
+                    .await?
+                    .ok_or_else(denied)?;
+                schema.validate()?;
+                let fields =
+                    Secrets::find_stored_by_entity(&mut *conn, ENTITY_EXECUTION_CONFIG, actual.id)
+                        .await?;
+                let (ordinary, receipts) = super::immutable_input_origin::prepare_input_receipts(
+                    conn,
+                    ENTITY_EXECUTION_CONFIG,
+                    actual.id,
+                    &fields,
+                    key,
+                )
+                .await?;
+                if !ordinary.is_empty() {
+                    crate::key_access::authorize_execution_parameter_key_origins_with_conn(
+                        conn,
+                        actual.id,
+                        actual.executor,
+                        &ordinary,
+                    )
+                    .await?;
                 }
-            }
-            if actual.retry_count > 0 || actual.original_execution.is_some() {
-                if actual.retry_count <= 0 {
-                    return Err(denied());
+                super::immutable_input_origin::bind_input_receipt_buffers(
+                    conn,
+                    ENTITY_EXECUTION_CONFIG,
+                    actual.id,
+                    &fields,
+                )
+                .await?;
+                Continuation::Standalone {
+                    schema,
+                    fields,
+                    receipts,
+                    fence: None,
                 }
-                let sources: Vec<Id> = sqlx::query_scalar("SELECT original.id FROM runtime_admission_dependency edge JOIN runtime_authority_admission original ON original.id=edge.dependency WHERE edge.admission=$1 AND edge.dependency_kind='retry' AND original.owner_kind='execution' ORDER BY original.id LIMIT 2")
-                    .bind(admission.id).fetch_all(&mut *conn).await?;
-                let [source] = sources.as_slice() else {
-                    return Err(denied());
+            } else if let Some(task) = &actual.workflow_task {
+                let prepared = if actual.retry_count > 0
+                    || task.retry_count > 0
+                    || actual.original_execution.is_some()
+                {
+                    let Some(prepared) =
+                        Retries::prepare_requested_recovery(conn, &actual, key).await?
+                    else {
+                        return Ok(None);
+                    };
+                    prepared
+                } else {
+                    Retries::prepare_existing_workflow(conn, &actual, key).await?
                 };
-                let original = Authority::require_retained_admission(conn, *source).await?;
-                let mut selection = original.authority.0;
-                selection.attempt = admission.authority.attempt;
-                if selection != admission.authority.0 {
+                Continuation::Workflow(prepared)
+            } else {
+                let admission =
+                    Admissions::require(conn, RuntimeOwner::Execution(actual.id)).await?;
+                // A task-scoped capsule cannot silently become standalone merely
+                // because mutable task metadata disappeared.
+                if matches!(
+                    &admission.authority.binding,
+                    crate::runtime_authority::InvocationBinding::WorkflowTask { .. }
+                ) {
                     return Err(denied());
                 }
-            }
-            let fence = Authority::retained_admission_fence(conn, admission.id).await?;
-            let schema = Schemas::find(conn, BindingOwner::Execution, actual.id)
-                .await?
-                .ok_or_else(denied)?;
-            schema.validate()?;
-            let (fields, receipts) = prepare_observation(conn, &actual, &schema, key).await?;
-            Continuation::Standalone {
-                schema,
-                fields,
-                fence: Some(fence),
-                receipts,
-            }
-        };
-        let prepared = PreparedRequestedPublication {
-            execution: actual,
-            transaction: transaction(conn).await?,
-            continuation,
-            locked: OnceLock::new(),
-        };
-        prepared.ensure_fresh_on(conn).await?;
-        Ok(Some(prepared))
+                if let crate::runtime_authority::RequestAttribution::ParentExecution {
+                    execution_id,
+                } = &admission.authority.attribution
+                {
+                    if actual.parent != Some(*execution_id) {
+                        return Err(denied());
+                    }
+                }
+                if actual.retry_count > 0 || actual.original_execution.is_some() {
+                    if actual.retry_count <= 0 {
+                        return Err(denied());
+                    }
+                    let sources: Vec<Id> = sqlx::query_scalar("SELECT original.id FROM runtime_admission_dependency edge JOIN runtime_authority_admission original ON original.id=edge.dependency WHERE edge.admission=$1 AND edge.dependency_kind='retry' AND original.owner_kind='execution' ORDER BY original.id LIMIT 2")
+                    .bind(admission.id).fetch_all(&mut *conn).await?;
+                    let [source] = sources.as_slice() else {
+                        return Err(denied());
+                    };
+                    let original = Authority::require_retained_admission(conn, *source).await?;
+                    let mut selection = original.authority.0;
+                    selection.attempt = admission.authority.attempt;
+                    if selection != admission.authority.0 {
+                        return Err(denied());
+                    }
+                }
+                let fence = Authority::retained_admission_fence(conn, admission.id).await?;
+                let schema = Schemas::find(conn, BindingOwner::Execution, actual.id)
+                    .await?
+                    .ok_or_else(denied)?;
+                schema.validate()?;
+                let (fields, receipts) = prepare_observation(conn, &actual, &schema, key).await?;
+                Continuation::Standalone {
+                    schema,
+                    fields,
+                    fence: Some(fence),
+                    receipts,
+                }
+            };
+            let prepared = PreparedRequestedPublication {
+                execution: actual,
+                transaction: transaction(conn).await?,
+                continuation,
+                locked: OnceLock::new(),
+            };
+            prepared.ensure_fresh_on(conn).await?;
+            Ok(Some(prepared))
+        })
     }
 }
 
@@ -357,126 +362,130 @@ pub(crate) struct PreparedCachePublication {
     source: super::native_input_snapshot::NativeSourceEvidence,
 }
 
-pub(crate) async fn prepare_cache_publication(
-    conn: &mut PgConnection,
-    child: &Execution,
-    binding: &crate::runtime_authority::InvocationBinding,
-    key: &str,
-) -> Result<Option<PreparedCachePublication>> {
-    use super::{
-        declared_input_materialization::pointer_to_node,
-        inherited_input::InheritedInputRepository as Inputs,
-        native_input_snapshot::NativeInputSnapshotRepository as Snapshots,
-        workflow_cache_iteration::WorkflowCacheIterationRepository as Iterations,
-        workflow_policy::task_at_authored_path,
-    };
-    let crate::runtime_authority::InvocationBinding::WorkflowTask { task_path, .. } = binding
-    else {
-        return Err(denied());
-    };
-    let parent = ExecutionRepository::find_by_id(&mut *conn, child.parent.ok_or_else(denied)?)
-        .await?
-        .ok_or_else(denied)?;
-    let definition = &parent
-        .executable_snapshot
-        .as_ref()
-        .ok_or_else(denied)?
-        .executable
-        .workflow_definition
-        .as_ref()
-        .ok_or_else(denied)?
-        .definition;
-    let authored = task_at_authored_path(definition, task_path).ok_or_else(denied)?;
-    if authored
-        .get("iterate_cache")
-        .is_none_or(serde_json::Value::is_null)
-    {
-        return Ok(None);
-    }
-    let task = child.workflow_task.as_ref().ok_or_else(denied)?;
-    let index = task
-        .task_index
-        .filter(|index| *index >= 0)
-        .ok_or_else(denied)?;
-    if task.task_batch.is_none_or(|count| count <= 0) {
-        return Err(denied());
-    }
-    let batch = usize::try_from(task.task_batch.ok_or_else(denied)?).map_err(|_| denied())?;
-    let iteration =
-        Iterations::find_by_workflow_task(&mut *conn, task.workflow_execution, &task.task_name)
+pub(crate) fn prepare_cache_publication<'a>(
+    conn: &'a mut PgConnection,
+    child: &'a Execution,
+    binding: &'a crate::runtime_authority::InvocationBinding,
+    key: &'a str,
+) -> futures::future::BoxFuture<'a, Result<Option<PreparedCachePublication>>> {
+    Box::pin(async move {
+        use super::{
+            declared_input_materialization::pointer_to_node,
+            inherited_input::InheritedInputRepository as Inputs,
+            native_input_snapshot::NativeInputSnapshotRepository as Snapshots,
+            workflow_cache_iteration::WorkflowCacheIterationRepository as Iterations,
+            workflow_policy::task_at_authored_path,
+        };
+        let crate::runtime_authority::InvocationBinding::WorkflowTask { task_path, .. } = binding
+        else {
+            return Err(denied());
+        };
+        let parent = ExecutionRepository::find_by_id(&mut *conn, child.parent.ok_or_else(denied)?)
             .await?
             .ok_or_else(denied)?;
-    // Exact source keys only. Hold these SHARE pins before any workflow/owner
-    // UPDATE locks; final checks below never reconstruct or scan a source graph.
-    let _: Id = sqlx::query_scalar("SELECT id FROM workflow_cache_iteration WHERE id=$1 FOR SHARE")
-        .bind(iteration.id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or_else(denied)?;
-    let dispatch = child.original_execution.unwrap_or(child.id);
-    let assigned: Option<Id> = sqlx::query_scalar("SELECT execution_id FROM workflow_task_dispatch WHERE workflow_execution=$1 AND task_name=$2 AND task_index=$3 FOR SHARE")
+        let definition = &parent
+            .executable_snapshot
+            .as_ref()
+            .ok_or_else(denied)?
+            .executable
+            .workflow_definition
+            .as_ref()
+            .ok_or_else(denied)?
+            .definition;
+        let authored = task_at_authored_path(definition, task_path).ok_or_else(denied)?;
+        if authored
+            .get("iterate_cache")
+            .is_none_or(serde_json::Value::is_null)
+        {
+            return Ok(None);
+        }
+        let task = child.workflow_task.as_ref().ok_or_else(denied)?;
+        let index = task
+            .task_index
+            .filter(|index| *index >= 0)
+            .ok_or_else(denied)?;
+        if task.task_batch.is_none_or(|count| count <= 0) {
+            return Err(denied());
+        }
+        let batch = usize::try_from(task.task_batch.ok_or_else(denied)?).map_err(|_| denied())?;
+        let iteration =
+            Iterations::find_by_workflow_task(&mut *conn, task.workflow_execution, &task.task_name)
+                .await?
+                .ok_or_else(denied)?;
+        // Exact source keys only. Hold these SHARE pins before any workflow/owner
+        // UPDATE locks; final checks below never reconstruct or scan a source graph.
+        let _: Id =
+            sqlx::query_scalar("SELECT id FROM workflow_cache_iteration WHERE id=$1 FOR SHARE")
+                .bind(iteration.id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(denied)?;
+        let dispatch = child.original_execution.unwrap_or(child.id);
+        let assigned: Option<Id> = sqlx::query_scalar("SELECT execution_id FROM workflow_task_dispatch WHERE workflow_execution=$1 AND task_name=$2 AND task_index=$3 FOR SHARE")
         .bind(task.workflow_execution).bind(&task.task_name).bind(index).fetch_optional(&mut *conn).await?.flatten();
-    if assigned != Some(dispatch) {
-        return Err(denied());
-    }
-    // Exact slot lookup, not a membership inventory. Constant-input cache tasks
-    // still have a genuine page/dispatch even without a VALUE reference to item.
-    let bound: Vec<Id> = sqlx::query_scalar("SELECT snapshot FROM runtime_native_cache_frontier WHERE bound_iteration=$1 AND ordinal=$2 AND bound_transaction=prepared_transaction ORDER BY snapshot LIMIT 2 FOR SHARE")
+        if assigned != Some(dispatch) {
+            return Err(denied());
+        }
+        // Exact slot lookup, not a membership inventory. Constant-input cache tasks
+        // still have a genuine page/dispatch even without a VALUE reference to item.
+        let bound: Vec<Id> = sqlx::query_scalar("SELECT snapshot FROM runtime_native_cache_frontier WHERE bound_iteration=$1 AND ordinal=$2 AND bound_transaction=prepared_transaction ORDER BY snapshot LIMIT 2 FOR SHARE")
         .bind(iteration.id).bind(i64::from(index)).fetch_all(&mut *conn).await?;
-    let [snapshot] = bound.as_slice() else {
-        return Err(denied());
-    };
-    let storage = Snapshots::storage_evidence(conn, *snapshot).await?;
-    let cache = storage.cache().ok_or_else(denied)?;
-    if cache.iteration() != iteration.id
-        || cache.workflow() != task.workflow_execution
-        || cache.namespace() != iteration.namespace
-        || cache.generation() != iteration.generation
-        || cache.ordinal() != i64::from(index)
-        || cache.entries().len() != batch
-    {
-        return Err(denied());
-    }
-    let parent_admission = Admissions::require(conn, RuntimeOwner::Execution(parent.id)).await?;
-    let path = format!("/workflow{}/params", pointer_to_node(definition, authored)?);
-    let evidence = Snapshots::evidence(
-        conn,
-        *snapshot,
-        parent_admission.id,
-        &path,
-        "/item",
-        key,
-        false,
-    )
-    .await?;
-    let source = Snapshots::source_evidence(conn, storage.metadata(), key).await?;
-    if evidence.parents.len() > 256 {
-        return Err(denied());
-    }
-    let mut controls = Vec::new();
-    for (receipt, site) in evidence.parents {
-        let origin = crate::secret_provenance::SecretOrigin::Entity {
-            entity_type: site.kind.origin_kind(site.purpose),
-            entity_id: receipt,
-            path: site.path.clone(),
+        let [snapshot] = bound.as_slice() else {
+            return Err(denied());
         };
-        controls.push(Inputs::receipt_context(conn, &site, &origin, key).await?);
-    }
-    let prepared = PreparedCachePublication {
-        workflow: task.workflow_execution,
-        task: task.task_name.clone(),
-        index,
-        dispatch,
-        iteration: iteration.id,
-        namespace: iteration.namespace,
-        generation: iteration.generation,
-        snapshots: bound,
-        fence: evidence.fence,
-        controls,
-        source,
-    };
-    prepared.ensure_fresh_on(conn).await?;
-    Ok(Some(prepared))
+        let storage = Snapshots::storage_evidence(conn, *snapshot).await?;
+        let cache = storage.cache().ok_or_else(denied)?;
+        if cache.iteration() != iteration.id
+            || cache.workflow() != task.workflow_execution
+            || cache.namespace() != iteration.namespace
+            || cache.generation() != iteration.generation
+            || cache.ordinal() != i64::from(index)
+            || cache.entries().len() != batch
+        {
+            return Err(denied());
+        }
+        let parent_admission =
+            Admissions::require(conn, RuntimeOwner::Execution(parent.id)).await?;
+        let path = format!("/workflow{}/params", pointer_to_node(definition, authored)?);
+        let evidence = Snapshots::evidence(
+            conn,
+            *snapshot,
+            parent_admission.id,
+            &path,
+            "/item",
+            key,
+            false,
+        )
+        .await?;
+        let source = Snapshots::source_evidence(conn, storage.metadata(), key).await?;
+        if evidence.parents.len() > 256 {
+            return Err(denied());
+        }
+        let mut controls = Vec::new();
+        for (receipt, site) in evidence.parents {
+            let origin = crate::secret_provenance::SecretOrigin::Entity {
+                entity_type: site.kind.origin_kind(site.purpose),
+                entity_id: receipt,
+                path: site.path.clone(),
+            };
+            controls.push(Inputs::receipt_context(conn, &site, &origin, key).await?);
+        }
+        let prepared = PreparedCachePublication {
+            workflow: task.workflow_execution,
+            task: task.task_name.clone(),
+            index,
+            dispatch,
+            iteration: iteration.id,
+            namespace: iteration.namespace,
+            generation: iteration.generation,
+            snapshots: bound,
+            fence: evidence.fence,
+            controls,
+            source,
+        };
+        prepared.ensure_fresh_on(conn).await?;
+        Ok(Some(prepared))
+    })
 }
 
 impl PreparedCachePublication {

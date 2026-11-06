@@ -1242,11 +1242,11 @@ impl ExecutionAdmissionRepository {
         ).bind(kind).bind(id).fetch_optional(connection).await?)
     }
 
-    pub async fn require(
-        connection: &mut PgConnection,
+    pub fn require<'a>(
+        connection: &'a mut PgConnection,
         owner: RuntimeOwner,
-    ) -> Result<RuntimeAdmissionRecord> {
-        Ok(Self::require_with_fence(connection, owner).await?.0)
+    ) -> futures::future::BoxFuture<'a, Result<RuntimeAdmissionRecord>> {
+        Box::pin(async move { Ok(Self::require_with_fence(connection, owner).await?.0) })
     }
 
     pub async fn require_with_fence(

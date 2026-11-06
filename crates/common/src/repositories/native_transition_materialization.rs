@@ -911,12 +911,12 @@ impl NativeTransitionMaterializationRepository {
     /// Called in the owning transaction BEFORE the workflow advisory/row lock or
     /// cache iteration target locks. None means outside this incremental path's
     /// scope, never an authorization failure or permission fallback.
-    pub async fn prepare_for_completion(
-        conn: &mut PgConnection,
-        completed: &Execution,
-        key: &str,
-    ) -> Result<Option<PreparedNativeTransitions>> {
-        Self::prepare_completion(conn, completed, key, false).await
+    pub fn prepare_for_completion<'a>(
+        conn: &'a mut PgConnection,
+        completed: &'a Execution,
+        key: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<PreparedNativeTransitions>>> {
+        Self::prepare_completion(conn, completed, key, false)
     }
 
     // Owning successor planners select this mode only after proving the actual
@@ -929,203 +929,206 @@ impl NativeTransitionMaterializationRepository {
         Self::prepare_completion(conn, completed, key, true).await
     }
 
-    async fn prepare_completion(
-        conn: &mut PgConnection,
-        completed: &Execution,
-        key: &str,
+    fn prepare_completion<'a>(
+        conn: &'a mut PgConnection,
+        completed: &'a Execution,
+        key: &'a str,
         successor_activation: bool,
-    ) -> Result<Option<PreparedNativeTransitions>> {
-        let Some(metadata) = &completed.workflow_task else {
-            return Ok(None);
-        };
-        if metadata.task_index.is_some()
-            || !(matches!(
-                completed.status,
-                ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Timeout
-            ) || successor_activation
-                && matches!(
+    ) -> futures::future::BoxFuture<'a, Result<Option<PreparedNativeTransitions>>> {
+        Box::pin(async move {
+            let Some(metadata) = &completed.workflow_task else {
+                return Ok(None);
+            };
+            if metadata.task_index.is_some()
+                || !(matches!(
                     completed.status,
-                    ExecutionStatus::Cancelled | ExecutionStatus::Abandoned
-                ))
-        {
-            return Ok(None);
-        }
-        let actual_child = ExecutionRepository::find_by_id(&mut *conn, completed.id)
-            .await?
-            .ok_or_else(changed)?;
-        if serde_json::to_value(&actual_child)? != serde_json::to_value(completed)? {
-            return Err(changed());
-        }
-        let workflow =
-            WorkflowExecutionRepository::find_by_id(&mut *conn, metadata.workflow_execution)
-                .await?
-                .ok_or_else(changed)?;
-        if matches!(
-            workflow.status,
-            ExecutionStatus::Completed
-                | ExecutionStatus::Failed
-                | ExecutionStatus::Canceling
-                | ExecutionStatus::Cancelled
-                | ExecutionStatus::Timeout
-                | ExecutionStatus::Abandoned
-        ) {
-            return Ok(None);
-        }
-        let parent = ExecutionRepository::find_by_id(&mut *conn, workflow.execution)
-            .await?
-            .ok_or_else(changed)?;
-        if matches!(
-            parent.status,
-            ExecutionStatus::Canceling | ExecutionStatus::Cancelled
-        ) {
-            return Ok(None);
-        }
-        if !ExecutionAdmissionRepository::is_recorded(conn, parent.id).await? {
-            return Ok(None);
-        }
-        let snapshot = parent.executable_snapshot.as_ref().ok_or_else(changed)?;
-        let graph = &snapshot
-            .executable
-            .workflow_definition
-            .as_ref()
-            .ok_or_else(changed)?
-            .definition;
-        let empty_completion = if !successor_activation && !plain_tasks(graph)? {
-            let Some((empty, ordinary)) = super::native_failure_materialization::NativeFailureMaterializationRepository::empty_success_tasks(graph)? else { return Ok(None); };
-            if metadata.task_name != ordinary
-                || metadata.triggered_by.as_deref() != Some(empty.as_str())
-                || completed.parent != Some(parent.id)
-                || completed.status != ExecutionStatus::Completed
+                    ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Timeout
+                ) || successor_activation
+                    && matches!(
+                        completed.status,
+                        ExecutionStatus::Cancelled | ExecutionStatus::Abandoned
+                    ))
             {
                 return Ok(None);
             }
-            Some(super::native_input_snapshot::NativeInputSnapshotRepository::prepare_empty_success_witness(
+            let actual_child = ExecutionRepository::find_by_id(&mut *conn, completed.id)
+                .await?
+                .ok_or_else(changed)?;
+            if serde_json::to_value(&actual_child)? != serde_json::to_value(completed)? {
+                return Err(changed());
+            }
+            let workflow =
+                WorkflowExecutionRepository::find_by_id(&mut *conn, metadata.workflow_execution)
+                    .await?
+                    .ok_or_else(changed)?;
+            if matches!(
+                workflow.status,
+                ExecutionStatus::Completed
+                    | ExecutionStatus::Failed
+                    | ExecutionStatus::Canceling
+                    | ExecutionStatus::Cancelled
+                    | ExecutionStatus::Timeout
+                    | ExecutionStatus::Abandoned
+            ) {
+                return Ok(None);
+            }
+            let parent = ExecutionRepository::find_by_id(&mut *conn, workflow.execution)
+                .await?
+                .ok_or_else(changed)?;
+            if matches!(
+                parent.status,
+                ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+            ) {
+                return Ok(None);
+            }
+            if !ExecutionAdmissionRepository::is_recorded(conn, parent.id).await? {
+                return Ok(None);
+            }
+            let snapshot = parent.executable_snapshot.as_ref().ok_or_else(changed)?;
+            let graph = &snapshot
+                .executable
+                .workflow_definition
+                .as_ref()
+                .ok_or_else(changed)?
+                .definition;
+            let empty_completion = if !successor_activation && !plain_tasks(graph)? {
+                let Some((empty, ordinary)) = super::native_failure_materialization::NativeFailureMaterializationRepository::empty_success_tasks(graph)? else { return Ok(None); };
+                if metadata.task_name != ordinary
+                    || metadata.triggered_by.as_deref() != Some(empty.as_str())
+                    || completed.parent != Some(parent.id)
+                    || completed.status != ExecutionStatus::Completed
+                {
+                    return Ok(None);
+                }
+                Some(super::native_input_snapshot::NativeInputSnapshotRepository::prepare_empty_success_witness(
                 conn, &parent, &workflow, &empty, key).await?)
-        } else {
-            None
-        };
-        let bindings = DeclaredInputRepository::bindings(conn, parent.id).await?;
-        let task_path = super::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_task_site_path(
+            } else {
+                None
+            };
+            let bindings = DeclaredInputRepository::bindings(conn, parent.id).await?;
+            let task_path = super::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_task_site_path(
             conn, parent.id, &metadata.task_name, &completed.action_ref,
         ).await?;
-        let task = graph
-            .pointer(task_path.strip_prefix("/workflow").ok_or_else(changed)?)
-            .ok_or_else(changed)?;
-        if task
-            .get("iterate_cache")
-            .is_some_and(|value| !value.is_null())
-            || task.get("with_items").is_some_and(|value| !value.is_null())
-            || task.get("wait_for").is_some_and(|value| !value.is_null())
-        {
-            return Ok(None);
-        }
-        let Some(completion_task) = CanonicalCompletionTask::prepare(task)? else {
-            return Ok(None);
-        };
-        let canonical_next = completion_task.next().to_vec();
-        let next = canonical_next.as_slice();
-        // This canonical parser-derived condition is backed by the actual
-        // completed outcome, not an invented authored /next/0/when declaration.
-        if completion_task.legacy_publish() && completed.status != ExecutionStatus::Completed {
-            return Ok(None);
-        }
-        let staged = completion_uses_stages(graph, completed.status, successor_activation)?
-            || empty_completion.is_some();
-        let terminal_output_only = next.is_empty()
-            && (completed.status == ExecutionStatus::Completed
-                || graph
-                    .get("output_map")
-                    .and_then(Value::as_object)
-                    .is_some_and(|fields| !fields.is_empty()));
-        if !terminal_output_only && !eligible_for(next, staged)? {
-            return Ok(None);
-        }
-        let bindings: BTreeMap<_, _> = bindings
-            .into_iter()
-            .map(|binding| (binding.source_path.clone(), binding))
-            .collect();
-        let revision = crate::value_schema::digest(&serde_json::to_value(&snapshot.executable)?)
-            .map_err(|_| changed())?;
-        let original_secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-            &mut *conn,
-            crate::secret_values::ENTITY_WORKFLOW_VARIABLES,
-            parent.id,
-        )
-        .await?;
-        if original_secrets
-            .iter()
-            .any(|field| field.json_path.is_empty())
-        {
-            return Ok(None);
-        }
-        let Some(mut sources) = measure(
-            Op::RootSources,
-            prepare_sources(conn, &parent, Some(completed), &workflow, key),
-        )
-        .await
-        .map_err(|error| source_phase_error(error, "prepare completion sources", &task_path))?
-        else {
-            return Ok(None);
-        };
-        if completion_task.legacy_publish()
-            && !sources
-                .outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome.value("succeeded") == Some(Value::Bool(true)))
-        {
-            return Err(changed());
-        }
-        if staged && (!sources.completed || !workflow.failed_tasks.is_empty()) {
-            return Ok(None);
-        }
-        sources.ordinary_task_path = Some(task_path.clone());
-        sources.completion_task = Some(completion_task);
-        let transitions = Self::prepare_sequence(
-            conn,
-            parent.id,
-            &metadata.task_name,
-            &task_path,
-            next,
-            &workflow,
-            &bindings,
-            &sources,
-            &revision,
-            staged,
-            key,
-        )
-        .await?;
-        let output_controls = decision_controls(&transitions);
-        let output = prepare_output(
-            conn,
-            parent.id,
-            graph,
-            next,
-            &workflow,
-            &transitions,
-            &bindings,
-            &sources,
-            &output_controls,
-            &revision,
-            key,
-        )
-        .await?;
-        drop(output_controls);
-        let plan = PreparedNativeTransitions {
-            empty_completion,
-            workflow,
-            task_name: Some(metadata.task_name.clone()),
-            authored: next.to_vec(),
-            transitions,
-            original_secrets,
-            recorded: std::sync::OnceLock::new(),
-            output,
-            output_receipts: std::sync::OnceLock::new(),
-            inherited_controls: inherited_control_sources(&sources),
-            cache_sources: std::sync::Arc::new(sources),
-            cache_publication: std::sync::OnceLock::new(),
-        };
-        plan.ensure_fresh_on(conn).await?;
-        Ok(Some(plan))
+            let task = graph
+                .pointer(task_path.strip_prefix("/workflow").ok_or_else(changed)?)
+                .ok_or_else(changed)?;
+            if task
+                .get("iterate_cache")
+                .is_some_and(|value| !value.is_null())
+                || task.get("with_items").is_some_and(|value| !value.is_null())
+                || task.get("wait_for").is_some_and(|value| !value.is_null())
+            {
+                return Ok(None);
+            }
+            let Some(completion_task) = CanonicalCompletionTask::prepare(task)? else {
+                return Ok(None);
+            };
+            let canonical_next = completion_task.next().to_vec();
+            let next = canonical_next.as_slice();
+            // This canonical parser-derived condition is backed by the actual
+            // completed outcome, not an invented authored /next/0/when declaration.
+            if completion_task.legacy_publish() && completed.status != ExecutionStatus::Completed {
+                return Ok(None);
+            }
+            let staged = completion_uses_stages(graph, completed.status, successor_activation)?
+                || empty_completion.is_some();
+            let terminal_output_only = next.is_empty()
+                && (completed.status == ExecutionStatus::Completed
+                    || graph
+                        .get("output_map")
+                        .and_then(Value::as_object)
+                        .is_some_and(|fields| !fields.is_empty()));
+            if !terminal_output_only && !eligible_for(next, staged)? {
+                return Ok(None);
+            }
+            let bindings: BTreeMap<_, _> = bindings
+                .into_iter()
+                .map(|binding| (binding.source_path.clone(), binding))
+                .collect();
+            let revision =
+                crate::value_schema::digest(&serde_json::to_value(&snapshot.executable)?)
+                    .map_err(|_| changed())?;
+            let original_secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *conn,
+                crate::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                parent.id,
+            )
+            .await?;
+            if original_secrets
+                .iter()
+                .any(|field| field.json_path.is_empty())
+            {
+                return Ok(None);
+            }
+            let Some(mut sources) = measure(
+                Op::RootSources,
+                prepare_sources(conn, &parent, Some(completed), &workflow, key),
+            )
+            .await
+            .map_err(|error| source_phase_error(error, "prepare completion sources", &task_path))?
+            else {
+                return Ok(None);
+            };
+            if completion_task.legacy_publish()
+                && !sources
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.value("succeeded") == Some(Value::Bool(true)))
+            {
+                return Err(changed());
+            }
+            if staged && (!sources.completed || !workflow.failed_tasks.is_empty()) {
+                return Ok(None);
+            }
+            sources.ordinary_task_path = Some(task_path.clone());
+            sources.completion_task = Some(completion_task);
+            let transitions = Self::prepare_sequence(
+                conn,
+                parent.id,
+                &metadata.task_name,
+                &task_path,
+                next,
+                &workflow,
+                &bindings,
+                &sources,
+                &revision,
+                staged,
+                key,
+            )
+            .await?;
+            let output_controls = decision_controls(&transitions);
+            let output = prepare_output(
+                conn,
+                parent.id,
+                graph,
+                next,
+                &workflow,
+                &transitions,
+                &bindings,
+                &sources,
+                &output_controls,
+                &revision,
+                key,
+            )
+            .await?;
+            drop(output_controls);
+            let plan = PreparedNativeTransitions {
+                empty_completion,
+                workflow,
+                task_name: Some(metadata.task_name.clone()),
+                authored: next.to_vec(),
+                transitions,
+                original_secrets,
+                recorded: std::sync::OnceLock::new(),
+                output,
+                output_receipts: std::sync::OnceLock::new(),
+                inherited_controls: inherited_control_sources(&sources),
+                cache_sources: std::sync::Arc::new(sources),
+                cache_publication: std::sync::OnceLock::new(),
+            };
+            plan.ensure_fresh_on(conn).await?;
+            Ok(Some(plan))
+        })
     }
 
     // One canonical ordered program for genuine child and genuine group sources.

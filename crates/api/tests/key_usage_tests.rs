@@ -1293,6 +1293,99 @@ async fn named_execution_token_authority_is_bounded_by_current_active_executor()
     Ok(())
 }
 
+#[tokio::test]
+async fn delegated_key_mutation_responses_record_origins_and_parallel_reads_remain_fenced(
+) -> Result<()> {
+    use attune_common::repositories::delegated_execution::DelegatedExecutionRepository;
+    let ctx = TestContext::new().await?.with_auth().await?;
+    let identity = validate_token(ctx.token().unwrap(), &jwt_config(&ctx))?
+        .sub
+        .parse::<i64>()?;
+    grant(&ctx, identity, "fixture.key_read", json!([
+        {"resource":"keys","actions":["create","read","decrypt","update"],
+         "constraints":{"owner_types":["system"],"refs":["system.mutated_origin","system.created_origin"]}},
+        {"resource":"actions","actions":["read","execute"]}
+    ])).await?;
+    let existing = system_key(
+        &ctx,
+        "mutated_origin",
+        json!({"secret":"preserved-runtime-material"}),
+    )
+    .await?;
+    let execution = execution(&ctx, "mutation_origin", json!({})).await?;
+    let token = delegated_key_token(&ctx, execution, &["fixture.key_read".into()]).await?;
+    let response = ctx
+        .put(
+            "/api/v1/keys/system.mutated_origin",
+            json!({"name":"Updated name"}),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await?["data"]["value"]["secret"],
+        "preserved-runtime-material"
+    );
+    let origins: Vec<Value> =
+        sqlx::query_scalar("SELECT origin FROM delegated_execution_key_origin WHERE execution=$1")
+            .bind(execution)
+            .fetch_all(&ctx.pool)
+            .await?;
+    assert_eq!(
+        origins,
+        vec![serde_json::to_value(
+            attune_common::key_access::key_origin(&existing)
+        )?]
+    );
+    let response = ctx.post("/api/v1/keys", json!({"local_ref":"created_origin","owner_type":"system","name":"Created origin","value":{"secret":"new-runtime-material"},"encrypted":true}), Some(&token)).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.json::<Value>().await?["data"]["value"]["secret"],
+        "new-runtime-material"
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM delegated_execution_key_origin WHERE execution=$1",
+    )
+    .bind(execution)
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(
+        count, 2,
+        "each plaintext mutation response commits its actual origin"
+    );
+    let reads = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            ctx.get("/api/v1/keys/system.mutated_origin", Some(&token)),
+            ctx.get("/api/v1/keys/system.mutated_origin", Some(&token))
+        )
+    })
+    .await?;
+    assert_eq!(reads.0?.status(), StatusCode::OK);
+    assert_eq!(reads.1?.status(), StatusCode::OK);
+    let mut tx = ctx.pool.begin().await?;
+    DelegatedExecutionRepository::close(&mut tx, execution).await?;
+    tx.commit().await?;
+    assert_eq!(
+        ctx.put(
+            "/api/v1/keys/system.mutated_origin",
+            json!({"name":"Stale write"}),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        KeyRepository::find_by_ref(&ctx.pool, "system.mutated_origin")
+            .await?
+            .unwrap()
+            .name,
+        "Updated name"
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
 /// Consumer fixtures retain a real API-admitted selection and one worker claim.
 /// The production startup/process acceptance lives in test-execution-authority.py.
 async fn delegated_key_token(ctx: &TestContext, id: i64, refs: &[String]) -> Result<String> {
